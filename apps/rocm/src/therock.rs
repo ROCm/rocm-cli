@@ -511,6 +511,13 @@ struct PipRuntimeResolution {
     /// installed (no wheels) and we warn about it. `None` when a specific version
     /// was requested (the "latest" concept does not apply).
     newest_repo_version: Option<String>,
+    /// The exact requirement lines handed to `uv pip compile` to choose this
+    /// version set. This is the value that was sent, not a re-derivation of it,
+    /// so the preview can show what resolution actually asked for and an
+    /// acceptance test can hold it to the same extras the install plan names.
+    /// `None` on the canonical layout, which picks versions by scraping each
+    /// package's simple index rather than by resolving a requirement set.
+    version_resolution_specs: Option<Vec<String>>,
     package_versions: TheRockPipPackageVersions,
     /// The device payload the resolved source must supply for this host,
     /// decided against the targets that source actually publishes.
@@ -736,10 +743,33 @@ pub(crate) struct InstalledRuntimeManifest {
     pub read_only: bool,
     #[serde(default)]
     pub imported_from: Option<PathBuf>,
+    /// Whether the compiler toolchain (`devel`) is part of this install, so an
+    /// update reinstalls the same thing the user originally chose.
+    #[serde(default = "devel_default_for_legacy_manifest")]
+    pub devel: bool,
     pub installed_at_unix_ms: u128,
 }
 
+/// Manifests written before `devel` became opt-in always included the
+/// toolchain, so a missing field means it is present. Defaulting to `false`
+/// here would silently strip it on the next update.
+const fn devel_default_for_legacy_manifest() -> bool {
+    true
+}
+
 impl InstalledRuntimeManifest {
+    /// Whether this runtime has the compiler toolchain.
+    ///
+    /// Prefers the recorded `wheel_composition`, because those specs are what
+    /// `uv` was actually given — so the answer cannot drift from the install
+    /// the way a separately-written flag can. `devel` is the fallback for
+    /// tarball installs and for manifests written before compositions were
+    /// recorded; on a manifest older still it defaults to `true`, since every
+    /// install predating the flag shipped the toolchain.
+    pub(crate) fn includes_devel(&self) -> bool {
+        wheel_composition_includes_devel(self.wheel_composition.as_ref()).unwrap_or(self.devel)
+    }
+
     fn normalize_host_paths(mut self) -> Self {
         self.install_root = normalize_manifest_path(self.install_root);
         self.python_launcher = self
@@ -959,25 +989,63 @@ struct InstallSourceOverride<'a> {
     layout: Option<SourceLayout>,
 }
 
-/// Install a TheRock SDK runtime.
+/// What to install, as resolved from the `rocm install sdk` arguments.
 ///
-/// `consent` carries the *source* of any up-front approval rather than a bare
-/// bool, because the progress line names it: `--yes` and
-/// `--approve-replacing-active-default` both clear this gate, but only the
-/// former also approves a `sudo` system-package install, so collapsing them
-/// would print "Approved by --yes" on every install ROCm CLI's own
-/// terminal-less surfaces make.
-#[allow(clippy::too_many_arguments)]
+/// A struct rather than a parameter list: with `include_devel` added this is
+/// past the point where positional `bool`s at a call site say anything about
+/// what they mean.
+#[derive(Debug)]
+pub(crate) struct SdkInstallRequest<'a> {
+    pub channel: &'a str,
+    pub format: &'a str,
+    pub prefix: Option<PathBuf>,
+    pub version_selector: Option<RuntimeVersionSelector>,
+    pub family_override: Option<&'a str>,
+    pub dry_run: bool,
+    /// Install the compiler and headers alongside the runtime libraries.
+    pub include_devel: bool,
+    /// The *source* of any up-front approval rather than a bare bool, because
+    /// the progress line names it: `--yes` and
+    /// `--approve-replacing-active-default` both clear this gate, but only the
+    /// former also approves a `sudo` system-package install, so collapsing them
+    /// would print "Approved by --yes" on every install ROCm CLI's own
+    /// terminal-less surfaces make.
+    pub consent: SdkInstallConsent,
+}
+
+impl Default for SdkInstallRequest<'_> {
+    fn default() -> Self {
+        Self {
+            channel: "",
+            format: "",
+            prefix: None,
+            version_selector: None,
+            family_override: None,
+            dry_run: false,
+            include_devel: false,
+            // Withholding consent is the safe default: a caller that leaves it
+            // unset has granted nothing, so the gate prompts or refuses rather
+            // than silently displacing the active default runtime.
+            consent: SdkInstallConsent::Ask,
+        }
+    }
+}
+
+/// Install a TheRock SDK runtime.
 pub(crate) fn install_sdk(
     paths: &AppPaths,
-    channel: &str,
-    format: &str,
-    prefix: Option<PathBuf>,
-    version_selector: Option<RuntimeVersionSelector>,
-    family_override: Option<&str>,
-    dry_run: bool,
-    consent: SdkInstallConsent,
+    request: SdkInstallRequest<'_>,
 ) -> Result<SdkInstallResult> {
+    let SdkInstallRequest {
+        channel,
+        format,
+        prefix,
+        version_selector,
+        family_override,
+        dry_run,
+        include_devel,
+        consent,
+    } = request;
     let channel = TheRockChannel::parse(channel)?;
     ensure_install_format_supported(format)?;
     match format {
@@ -991,6 +1059,7 @@ pub(crate) fn install_sdk(
             },
             version_selector.as_ref(),
             dry_run,
+            include_devel,
             consent,
         ),
         "tarball" => {
@@ -1042,6 +1111,7 @@ pub(crate) fn install_sdk_for_update(
     family: &str,
     device_target: Option<&str>,
     source_layout_generation: Option<&str>,
+    include_devel: bool,
     dry_run: bool,
     activate_after_install: bool,
 ) -> Result<SdkInstallResult> {
@@ -1063,6 +1133,7 @@ pub(crate) fn install_sdk_for_update(
             },
             None,
             dry_run,
+            include_devel,
             consent,
         ),
         "tarball" => install_tarball_runtime(
@@ -1434,6 +1505,9 @@ fn resolve_latest_for_manifest(
                 &wheel_compatibility,
                 None,
                 Some(layout),
+                // An update re-resolves for the install it will reinstall, so it
+                // must resolve against the extras that runtime already has.
+                manifest.includes_devel(),
                 download_timeout_secs,
             )?;
             // Prefer the device payload this runtime was actually built with over
@@ -1455,9 +1529,11 @@ fn resolve_latest_for_manifest(
             // falls back to the version comparison rather than demanding a repair
             // this host could not perform.
             let wheel_composition = match &device_target {
-                AggregateDeviceTarget::Exact(_) => {
-                    Some(wheel_runtime_composition(&resolution, &device_target))
-                }
+                AggregateDeviceTarget::Exact(_) => Some(wheel_runtime_composition(
+                    &resolution,
+                    &device_target,
+                    manifest.includes_devel(),
+                )),
                 AggregateDeviceTarget::Undetermined(_) => None,
             };
             let target_runtime_key = wheel_composition.as_ref().map_or_else(
@@ -1640,6 +1716,7 @@ fn install_wheel_runtime(
     source_override: InstallSourceOverride<'_>,
     version_selector: Option<&RuntimeVersionSelector>,
     dry_run: bool,
+    include_devel: bool,
     consent: SdkInstallConsent,
 ) -> Result<SdkInstallResult> {
     let InstallSourceOverride {
@@ -1688,6 +1765,7 @@ fn install_wheel_runtime(
         &wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
     )?;
     let device_target = device_target_override.map_or_else(
         || resolution.device_target.clone(),
@@ -1704,7 +1782,7 @@ fn install_wheel_runtime(
     // usable target still composes a key here — from the `<undetermined>` extras
     // — which no real install can ever produce, and the refusal below stops it
     // from reaching a manifest.
-    let wheel_composition = wheel_runtime_composition(&resolution, &device_target);
+    let wheel_composition = wheel_runtime_composition(&resolution, &device_target, include_devel);
     progress_line(format!(
         "Found canonical TheRock aggregate version {} with a matching PyTorch stack for target family {}.",
         resolution.latest_version, resolution.family
@@ -1783,6 +1861,15 @@ fn install_wheel_runtime(
         "  platform_wheel_tags: {}",
         wheel_compatibility.platform_tags.join(",")
     );
+    // What resolution asked for, printed beside what the install will ask for.
+    // The two are produced by different code paths from the same `include_devel`
+    // and must name the same extras; showing only the second would hide a
+    // resolve that constrained the version choice by a toolchain the user
+    // declined. Absent on the canonical layout, which resolves by scraping each
+    // package's index instead of compiling a requirement set.
+    if let Some(specs) = resolution.version_resolution_specs.as_ref() {
+        let _ = writeln!(output, "  version_resolution_specs: {}", specs.join(" "));
+    }
     let _ = writeln!(
         output,
         "  package_specs: {}",
@@ -1954,7 +2041,14 @@ fn install_wheel_runtime(
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        "install TheRock devel SDK, torch stack, and resolved dependencies",
+        // Read back out of the specs `uv` is being handed on this very call
+        // rather than off `include_devel` a second time, so the line a user
+        // watches cannot name a toolchain the install is not requesting.
+        if wheel_composition_includes_devel(Some(&wheel_composition)).unwrap_or(include_devel) {
+            "install TheRock SDK with the compiler toolchain, torch stack, and resolved dependencies"
+        } else {
+            "install TheRock SDK, torch stack, and resolved dependencies"
+        },
     )?;
 
     progress_line("Checking the installed ROCm SDK...");
@@ -1987,6 +2081,7 @@ fn install_wheel_runtime(
         wheel_composition: Some(wheel_composition),
         read_only: false,
         imported_from: None,
+        devel: include_devel,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -2020,16 +2115,74 @@ fn install_wheel_runtime(
     Ok(SdkInstallResult::installed(output))
 }
 
-fn therock_pip_package_specs(
-    package_versions: &TheRockPipPackageVersions,
+/// The `rocm` wheel extras a given install asks for, excluding the device payload.
+///
+/// `devel` adds the compiler, headers, and static libraries — roughly doubling
+/// the download — and is only needed to *build* GPU code. Running models needs
+/// `libraries` alone, so the toolchain is installed only when asked for.
+///
+/// Two callers, and they are the two that must agree:
+///
+/// - [`therock_pip_package_specs`], which produces the specs `uv` installs and
+///   the specs recorded in the manifest, and
+/// - [`published_pip_requirements`], the requirement set `uv pip compile` is
+///   asked to resolve versions against on the ROCm 10 (`next`) layout.
+///
+/// Version resolution and install composition are separate code paths —
+/// resolution runs first and decides which versions exist, composition runs
+/// second and decides what is installed — so a flag threaded correctly through
+/// one says nothing about the other. Both go through this helper for that
+/// reason. Everything else that names the toolchain (the install progress line,
+/// `runtimes list`, `InstalledRuntimeManifest::includes_devel`) reads it back
+/// out of the composed specs rather than re-deciding it.
+const fn therock_sdk_extras(include_devel: bool) -> &'static str {
+    if include_devel {
+        "libraries,devel"
+    } else {
+        "libraries"
+    }
+}
+
+/// The requirement lines handed to `uv pip compile` to pick a mutually
+/// installable version set on the ROCm 10 (`next`) layout.
+///
+/// Unversioned for torch/torchvision/torchaudio on purpose: choosing those
+/// versions is what the resolve is for. The `rocm` extras, though, must match
+/// the ones [`therock_pip_package_specs`] will install — resolving against
+/// `devel` for someone who did not ask for it constrains the chosen versions by
+/// a toolchain they declined, and can fail the whole install with a
+/// toolchain-resolution error on a default `rocm install sdk`.
+fn published_pip_requirements(
+    rocm_version: &str,
     device_target: &str,
+    include_devel: bool,
 ) -> Vec<String> {
     let device_extra = format!("device-{device_target}");
     vec![
         format!(
-            "rocm[libraries,devel,{device_extra}]=={}",
-            package_versions.rocm
+            "rocm[{},{device_extra}]=={rocm_version}",
+            therock_sdk_extras(include_devel)
         ),
+        format!("torch[{device_extra}]"),
+        format!("torchvision[{device_extra}]"),
+        "torchaudio".to_owned(),
+    ]
+}
+
+/// Package specs for a wheel SDK install.
+///
+/// The `device-<target>` extra is separate from [`therock_sdk_extras`] and
+/// always present: it selects which GPU payload the wheels carry, not whether
+/// the toolchain comes with them.
+fn therock_pip_package_specs(
+    package_versions: &TheRockPipPackageVersions,
+    device_target: &str,
+    include_devel: bool,
+) -> Vec<String> {
+    let device_extra = format!("device-{device_target}");
+    let rocm_extras = format!("{},{device_extra}", therock_sdk_extras(include_devel));
+    vec![
+        format!("rocm[{rocm_extras}]=={}", package_versions.rocm),
         format!("torch[{device_extra}]=={}", package_versions.torch),
         format!(
             "torchvision[{device_extra}]=={}",
@@ -2045,16 +2198,39 @@ fn therock_pip_package_specs(
 fn wheel_runtime_composition(
     resolution: &PipRuntimeResolution,
     device_target: &AggregateDeviceTarget,
+    include_devel: bool,
 ) -> WheelRuntimeComposition {
     WheelRuntimeComposition {
         source_layout_generation: resolution.layout.generation().to_owned(),
         package_specs: therock_pip_package_specs(
             &resolution.package_versions,
             device_target.as_str(),
+            include_devel,
         ),
         rocm_sdk_target: matches!(device_target, AggregateDeviceTarget::Exact(_))
             .then(|| device_target.as_str().to_owned()),
     }
+}
+
+/// Whether a recorded composition installed the compiler toolchain, read back
+/// out of its `rocm[...]` extras.
+///
+/// Same reasoning as [`wheel_composition_device_target`]: the specs are stored
+/// verbatim, so the answer is derivable from what was actually installed and
+/// cannot drift from a second field. `None` for a manifest with no recorded
+/// composition — see [`InstalledRuntimeManifest::includes_devel`] for how that
+/// legacy case is resolved.
+fn wheel_composition_includes_devel(composition: Option<&WheelRuntimeComposition>) -> Option<bool> {
+    let composition = composition?;
+    composition.package_specs.iter().find_map(|spec| {
+        let extras = spec.strip_prefix("rocm[")?.split_once(']')?.0;
+        Some(
+            extras
+                .split(',')
+                .map(str::trim)
+                .any(|extra| extra == "devel"),
+        )
+    })
 }
 
 /// The GFX target a recorded composition installed, read back out of its
@@ -2733,6 +2909,8 @@ fn install_tarball_runtime(
         wheel_composition: None,
         read_only: false,
         imported_from: None,
+        // Tarball artifacts ship the whole SDK; the extra is a wheel concept.
+        devel: true,
         installed_at_unix_ms: unix_time_millis(),
     };
     save_runtime_manifest(paths, &manifest)?;
@@ -2749,6 +2927,7 @@ fn resolve_pip_runtime(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
 ) -> Result<PipRuntimeResolution> {
     resolve_pip_runtime_with_timeout(
         paths,
@@ -2757,6 +2936,7 @@ fn resolve_pip_runtime(
         wheel_compatibility,
         version_selector,
         layout_override,
+        include_devel,
         None,
     )
 }
@@ -2771,6 +2951,7 @@ fn resolve_pip_runtime_with_timeout(
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
     layout_override: Option<SourceLayout>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let family_resolution = resolve_family(paths, family_override)?;
@@ -2822,6 +3003,7 @@ fn resolve_pip_runtime_with_timeout(
         &source,
         wheel_compatibility,
         version_selector,
+        include_devel,
         download_timeout_secs,
     )
     .with_context(|| {
@@ -2834,6 +3016,10 @@ fn resolve_pip_runtime_with_timeout(
     })
 }
 
+/// `include_devel` reaches this far because version resolution, not only install
+/// composition, has to ask for the extras the caller actually requested — see
+/// [`published_pip_requirements`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_pip_runtime_from_index(
     paths: &AppPaths,
     channel: TheRockChannel,
@@ -2841,9 +3027,11 @@ fn resolve_pip_runtime_from_index(
     source: &ResolvedAggregateWheelSource,
     wheel_compatibility: &WheelCompatibility,
     version_selector: Option<&RuntimeVersionSelector>,
+    include_devel: bool,
     download_timeout_secs: Option<u64>,
 ) -> Result<PipRuntimeResolution> {
     let index_url = source.index_url.as_str();
+    let mut version_resolution_specs = None;
     let rocm_versions =
         load_simple_index_versions(paths, index_url, "rocm", None, download_timeout_secs)?;
     if matches!(channel, TheRockChannel::Release)
@@ -2880,14 +3068,16 @@ fn resolve_pip_runtime_from_index(
         // budget, not the single-fetch one — reusing the bare per-fetch value
         // here would make a startup check that budgets 2s per fetch reliably
         // time out a call doing 4 fetches' worth of work.
-        resolve_published_pip_package_versions(
+        let requirements = published_pip_requirements(&rocm_version, device_target, include_devel);
+        let versions = resolve_published_pip_package_versions(
             paths,
             index_url,
-            &rocm_version,
-            device_target,
+            &requirements,
             wheel_compatibility,
             download_timeout_secs.map(|secs| secs.saturating_mul(4)),
-        )?
+        )?;
+        version_resolution_specs = Some(requirements);
+        versions
     } else {
         let torch_versions = load_simple_index_versions(
             paths,
@@ -2946,6 +3136,7 @@ fn resolve_pip_runtime_from_index(
         layout: source.layout,
         latest_version,
         newest_repo_version,
+        version_resolution_specs,
         package_versions,
         device_target: source.device_target.clone(),
         published_device_targets: source.published_device_targets.clone(),
@@ -3333,11 +3524,13 @@ fn wait_with_output_bounded(mut child: Child, timeout: Option<Duration>) -> Resu
     }
 }
 
+/// `requirements` is passed in rather than composed here so that the lines sent
+/// to `uv` and the lines the resolution reports back (and the preview prints)
+/// are one value, not two that can disagree.
 fn resolve_published_pip_package_versions(
     paths: &AppPaths,
     index_url: &str,
-    rocm_version: &str,
-    device_target: &str,
+    requirements: &[String],
     compatibility: &WheelCompatibility,
     download_timeout_secs: Option<u64>,
 ) -> Result<TheRockPipPackageVersions> {
@@ -3345,10 +3538,7 @@ fn resolve_published_pip_package_versions(
         ensure_uv_binary(paths).context("failed to acquire uv for ROCm X metadata resolution")?;
     let python_version = uv_python_version(compatibility)?;
     let python_platform = uv_python_platform(compatibility)?;
-    let device_extra = format!("device-{device_target}");
-    let requirements = format!(
-        "rocm[libraries,devel,{device_extra}]=={rocm_version}\ntorch[{device_extra}]\ntorchvision[{device_extra}]\ntorchaudio\n"
-    );
+    let requirements = format!("{}\n", requirements.join("\n"));
     let mut child = Command::new(&uv)
         .args([
             "pip",
@@ -7701,7 +7891,7 @@ mod tests {
             torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
             compatibility_key: "7.13.0a20260513".to_owned(),
         };
-        let package_specs = therock_pip_package_specs(&package_versions, "gfx942");
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942", true);
 
         assert_eq!(
             package_specs,
@@ -7938,6 +8128,317 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    /// The default install skips the compiler toolchain, which is roughly half
+    /// the download and is only needed to build GPU code. The torch stack is
+    /// unaffected.
+    #[test]
+    fn pip_runtime_omits_devel_extra_by_default() {
+        let package_versions = TheRockPipPackageVersions {
+            rocm: "7.13.0a20260513".to_owned(),
+            torch: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            torchvision: "0.25.0+rocm7.13.0a20260513".to_owned(),
+            torchaudio: "2.10.0+rocm7.13.0a20260513".to_owned(),
+            compatibility_key: "7.13.0a20260513".to_owned(),
+        };
+
+        let package_specs = therock_pip_package_specs(&package_versions, "gfx942", false);
+
+        assert_eq!(
+            package_specs,
+            vec![
+                "rocm[libraries,device-gfx942]==7.13.0a20260513".to_owned(),
+                "torch[device-gfx942]==2.10.0+rocm7.13.0a20260513".to_owned(),
+                "torchvision[device-gfx942]==0.25.0+rocm7.13.0a20260513".to_owned(),
+                "torchaudio==2.10.0+rocm7.13.0a20260513".to_owned(),
+            ]
+        );
+        assert!(
+            !package_specs[0].contains("devel"),
+            "default install must not request the toolchain: {package_specs:?}"
+        );
+    }
+
+    fn devel_test_resolution() -> PipRuntimeResolution {
+        PipRuntimeResolution {
+            family: "gfx94X-dcgpu".to_owned(),
+            family_source: "detected".to_owned(),
+            index_url: "https://example.invalid/simple".to_owned(),
+            layout: SourceLayout::Canonical,
+            latest_version: "7.13.0".to_owned(),
+            newest_repo_version: None,
+            version_resolution_specs: None,
+            package_versions: TheRockPipPackageVersions {
+                rocm: "7.13.0".to_owned(),
+                torch: "2.11.0+rocm7.13.0".to_owned(),
+                torchvision: "0.26.0+rocm7.13.0".to_owned(),
+                torchaudio: "2.11.0+rocm7.13.0".to_owned(),
+                compatibility_key: "7.13.0".to_owned(),
+            },
+            device_target: AggregateDeviceTarget::Exact("gfx942".to_owned()),
+            published_device_targets: vec!["gfx942".to_owned()],
+        }
+    }
+
+    /// The seam the `--devel` flag actually travels through.
+    ///
+    /// `wheel_runtime_composition` produces the specs handed to `uv` AND the
+    /// specs recorded in the manifest, so hardcoding either polarity here is
+    /// the single change that would silently restore the old behaviour. Both
+    /// directions are pinned, and the device extra is asserted alongside so a
+    /// fix to one axis cannot quietly drop the other.
+    #[test]
+    fn wheel_composition_requests_the_toolchain_only_when_asked() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        let runtime_only = wheel_runtime_composition(&resolution, &target, false);
+        assert_eq!(
+            runtime_only.package_specs[0], "rocm[libraries,device-gfx942]==7.13.0",
+            "a default install must not request the toolchain: {:?}",
+            runtime_only.package_specs
+        );
+
+        let with_devel = wheel_runtime_composition(&resolution, &target, true);
+        assert_eq!(
+            with_devel.package_specs[0], "rocm[libraries,devel,device-gfx942]==7.13.0",
+            "--devel must reach the specs: {:?}",
+            with_devel.package_specs
+        );
+
+        // The two axes are independent: opting into the toolchain must not
+        // disturb the device payload, and vice versa.
+        assert_eq!(
+            runtime_only.package_specs[1..],
+            with_devel.package_specs[1..],
+            "devel must only affect the rocm spec"
+        );
+        assert_eq!(runtime_only.rocm_sdk_target, with_devel.rocm_sdk_target);
+    }
+
+    /// The other half of the same claim, on the *resolution* path.
+    ///
+    /// `uv pip compile` decides which versions exist before anything is
+    /// composed, so asking it for `devel` on a default install constrains the
+    /// version choice by a toolchain the user declined — and fails the install
+    /// outright when no version can satisfy it. That is a separate code path
+    /// from `wheel_runtime_composition` above, and the two must name the same
+    /// extras.
+    #[test]
+    fn version_resolution_requests_the_toolchain_only_when_asked() {
+        let runtime_only = published_pip_requirements("10.0.0", "gfx1200", false);
+        assert_eq!(
+            runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
+            "a default install must not resolve against the toolchain: {runtime_only:?}"
+        );
+
+        let with_devel = published_pip_requirements("10.0.0", "gfx1200", true);
+        assert_eq!(
+            with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
+            "--devel must reach the resolved requirements: {with_devel:?}"
+        );
+
+        // Only the `rocm` requirement carries the toolchain axis; the torch
+        // stack is unversioned here because choosing those versions is what the
+        // resolve is for.
+        assert_eq!(
+            runtime_only[1..],
+            with_devel[1..],
+            "devel must only affect the rocm requirement"
+        );
+        assert_eq!(
+            runtime_only[1..],
+            [
+                "torch[device-gfx1200]".to_owned(),
+                "torchvision[device-gfx1200]".to_owned(),
+                "torchaudio".to_owned(),
+            ]
+        );
+    }
+
+    /// Resolution and composition are two code paths reading one flag, and the
+    /// bug this pins is them disagreeing: the requirements handed to `uv` were
+    /// hardcoded to `devel` while the plan printed and installed `libraries`.
+    /// Asserting each in isolation cannot catch that; asserting they agree can.
+    #[test]
+    fn resolution_and_install_name_the_same_rocm_extras() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let requirements = published_pip_requirements(
+                &resolution.package_versions.rocm,
+                "gfx942",
+                include_devel,
+            );
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                rocm_requirement_extras(&requirements[0]),
+                rocm_requirement_extras(&composition.package_specs[0]),
+                "resolution and install must request the same rocm extras for \
+                 include_devel={include_devel}: {requirements:?} vs {:?}",
+                composition.package_specs
+            );
+        }
+    }
+
+    /// The `...` of a `rocm[...]==version` requirement.
+    fn rocm_requirement_extras(requirement: &str) -> &str {
+        requirement
+            .strip_prefix("rocm[")
+            .and_then(|rest| rest.split_once(']'))
+            .map_or_else(
+                || panic!("not a rocm extras requirement: {requirement}"),
+                |(extras, _)| extras,
+            )
+    }
+
+    /// The manifest answer is derived from the specs that were installed, so a
+    /// recorded composition and the `devel` field can never disagree.
+    #[test]
+    fn manifest_reads_devel_back_out_of_the_recorded_composition() {
+        let resolution = devel_test_resolution();
+        let target = AggregateDeviceTarget::Exact("gfx942".to_owned());
+
+        for include_devel in [false, true] {
+            let composition = wheel_runtime_composition(&resolution, &target, include_devel);
+            assert_eq!(
+                wheel_composition_includes_devel(Some(&composition)),
+                Some(include_devel),
+                "composition round-trip failed for include_devel={include_devel}"
+            );
+
+            // Even when the `devel` field contradicts the specs, the specs win:
+            // they are what `uv` was given.
+            let manifest = InstalledRuntimeManifest {
+                wheel_composition: Some(composition),
+                devel: !include_devel,
+                ..test_runtime_manifest(
+                    "release-wheel-gfx94X-dcgpu-7.13.0",
+                    "therock-release:gfx94X-dcgpu",
+                    1,
+                )
+            };
+            assert_eq!(
+                manifest.includes_devel(),
+                include_devel,
+                "the recorded specs must outrank a stale devel field"
+            );
+        }
+    }
+
+    /// A manifest from before compositions were recorded has only the field,
+    /// and one older still has neither — those installs all had the toolchain.
+    #[test]
+    fn manifest_without_a_composition_falls_back_to_the_devel_field() {
+        let without_composition = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: false,
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(!without_composition.includes_devel());
+
+        let legacy = InstalledRuntimeManifest {
+            wheel_composition: None,
+            devel: devel_default_for_legacy_manifest(),
+            ..test_runtime_manifest(
+                "release-wheel-gfx94X-dcgpu-7.13.0",
+                "therock-release:gfx94X-dcgpu",
+                1,
+            )
+        };
+        assert!(
+            legacy.includes_devel(),
+            "a manifest predating the flag must be treated as a toolchain install"
+        );
+    }
+
+    /// Writing a manifest over an existing one for the same `runtime_key`
+    /// REPLACES it — `devel` included — rather than merging with what was on
+    /// disk. That is the storage half of the reinstall-drift case: a user who
+    /// installed with `--devel` and later reinstalls without it keeps
+    /// `hipcc`/headers on disk while the manifest records `devel: false`, and
+    /// `apply_runtime_update` reinstalls from that field on the next `rocm
+    /// update`. Left as-is rather than fixed — the flag reflects what the most
+    /// recent install asked for, which is arguably correct; the drift risk is
+    /// that neither `rocm runtimes list` nor `rocm examine` surfaces `devel`,
+    /// so the state is invisible.
+    ///
+    /// LIMIT: this covers `save_runtime_manifest` only. It does NOT reach
+    /// `install_sdk`, which is what actually threads `include_devel` into the
+    /// manifest — that call needs `uv`, a live index, and a real `rocm_sdk`
+    /// probe, so it has no unit coverage here. Hardcoding `devel: true` at that
+    /// write site passes this test and the rest of the suite.
+    #[test]
+    fn save_runtime_manifest_replaces_devel_rather_than_merging() -> Result<()> {
+        let (root, paths) = test_paths("manifest-replaces-devel");
+        let install_root = root.join("install-root");
+        fs::create_dir_all(&install_root)?;
+        let with_devel = InstalledRuntimeManifest {
+            install_root,
+            ..test_runtime_manifest(
+                "release-wheel-gfx110X-all-7.13.0",
+                "therock-release:gfx110X-all",
+                1,
+            )
+        };
+        assert!(
+            with_devel.devel,
+            "test fixture should start with devel: true"
+        );
+        save_runtime_manifest(&paths, &with_devel)?;
+
+        let without_devel = InstalledRuntimeManifest {
+            devel: false,
+            installed_at_unix_ms: 2,
+            ..with_devel.clone()
+        };
+        save_runtime_manifest(&paths, &without_devel)?;
+
+        let manifests = load_runtime_manifests(&paths)?;
+        let reloaded = manifests
+            .iter()
+            .find(|manifest| manifest.runtime_key == with_devel.runtime_key)
+            .expect("manifest should still be registered under the same runtime_key");
+        assert!(
+            !reloaded.devel,
+            "saving a manifest must replace devel, not merge with the prior one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A manifest written before `devel` became opt-in has no such field, and
+    /// those installs all had the toolchain. Reading one back must not claim
+    /// otherwise, or the next update would silently strip it.
+    #[test]
+    fn legacy_manifest_without_devel_field_is_treated_as_having_it() {
+        let json = r#"{
+            "runtime_key": "release-wheel-gfx110X-all-7.13.0",
+            "runtime_id": "therock-release:gfx110X-all",
+            "channel": "release",
+            "format": "wheel",
+            "family": "gfx110X-all",
+            "family_source": "detected",
+            "version": "7.13.0",
+            "install_root": "/tmp/rocm-runtime",
+            "selected_artifact_url": "https://example.invalid/simple",
+            "installed_at_unix_ms": 1
+        }"#;
+
+        let manifest: InstalledRuntimeManifest =
+            serde_json::from_str(json).expect("legacy manifest should still parse");
+
+        assert!(
+            manifest.devel,
+            "a manifest predating the flag must be treated as a toolchain install"
+        );
     }
 
     #[test]
@@ -9319,13 +9820,13 @@ echo Python 3.12.10
 
         let error = install_sdk(
             &paths,
-            "release",
-            "tarball",
-            None,
-            None,
-            None,
-            true,
-            SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+            SdkInstallRequest {
+                channel: "release",
+                format: "tarball",
+                dry_run: true,
+                consent: SdkInstallConsent::Preapproved(SdkInstallApprovalSource::AssumeYes),
+                ..SdkInstallRequest::default()
+            },
         )
         .unwrap_err()
         .to_string();
@@ -10174,6 +10675,7 @@ echo Python 3.12.10
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         }
     }
