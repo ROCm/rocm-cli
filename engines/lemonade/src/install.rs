@@ -79,6 +79,10 @@ pub(crate) struct LemonadeInstallManifest {
     pub(crate) installed_at_unix_ms: u128,
 }
 
+/// Whether the embeddable archive must be extracted over the runtime tree.
+///
+/// Pure so the upgrade case is testable without a real archive. `installed`
+/// is the version recorded for the tree already on disk, if any.
 fn needs_extraction(
     reinstall: bool,
     installed: Option<&str>,

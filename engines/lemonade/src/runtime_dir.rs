@@ -12,6 +12,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The parts of *this* process's environment that decide where the child's
+/// runtime directory goes.
+///
+/// Captured into a value instead of being read inside
+/// [`crate::process::lemonade_process_environment_vars`] so the precedence is
+/// testable without mutating process-global env vars, which is `unsafe` and
+/// racy under parallel tests in edition 2024.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ParentRuntimeEnvironment {
     xdg_runtime_dir: Option<OsString>,
     home: Option<OsString>,

@@ -30,9 +30,9 @@ const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LemonadeProcessEnvironment {
-    pub(crate) rocm_root: Option<PathBuf>,
-    pub(crate) path_entries: Vec<PathBuf>,
-    pub(crate) library_entries: Vec<PathBuf>,
+    rocm_root: Option<PathBuf>,
+    path_entries: Vec<PathBuf>,
+    library_entries: Vec<PathBuf>,
     pub(crate) gpu_indices: Vec<u32>,
 }
 
@@ -204,13 +204,6 @@ fn apply_environment_vars(command: &mut ProcessCommand, vars: &[(&'static str, O
     }
 }
 
-/// The parts of *this* process's environment that decide where the child's
-/// runtime directory goes.
-///
-/// Captured into a value instead of being read inside
-/// [`lemonade_process_environment_vars`] so the precedence is testable without
-/// mutating process-global env vars, which is `unsafe` and racy under parallel
-/// tests in edition 2024.
 pub(crate) fn lemonade_process_environment_vars(
     env: &LemonadeProcessEnvironment,
     parent: &ParentRuntimeEnvironment,

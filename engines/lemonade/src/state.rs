@@ -66,7 +66,7 @@ pub(crate) fn reported_device(state: Option<&Value>, backend: &str) -> String {
 }
 
 /// The first pinned GPU ordinal recorded in service state, if any.
-pub(crate) fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
+fn first_gpu_index_from_state(state: &Value) -> Option<u32> {
     state
         .get("gpu_indices")
         .and_then(Value::as_array)
@@ -203,7 +203,7 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-pub(crate) fn write_state(path: &Path, value: &Value) -> Result<()> {
+fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -244,7 +244,7 @@ pub(crate) fn value_string(value: &Value, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-pub(crate) fn value_u32(value: &Value, key: &str) -> Option<u32> {
+fn value_u32(value: &Value, key: &str) -> Option<u32> {
     value
         .get(key)
         .and_then(Value::as_u64)
@@ -372,10 +372,7 @@ pub(crate) fn resolve_serve_gpu_indices(requested: &[u32]) -> Result<Vec<u32>> {
 /// auto/explicit/no-device policy can be unit-tested without real hardware.
 /// `usable` is the probe result: `None` (unprobeable) passes the request
 /// through; `Some(_)` is authoritative.
-pub(crate) fn resolve_gpu_indices_against(
-    requested: &[u32],
-    usable: Option<Vec<u32>>,
-) -> Result<Vec<u32>> {
+fn resolve_gpu_indices_against(requested: &[u32], usable: Option<Vec<u32>>) -> Result<Vec<u32>> {
     let Some(usable) = usable else {
         return Ok(requested.to_vec());
     };
@@ -459,7 +456,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
     ))
 }
 
-pub(crate) const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
+const fn device_policy_name(policy: &DevicePolicy) -> &'static str {
     match policy {
         DevicePolicy::GpuRequired => "gpu_required",
         DevicePolicy::GpuPreferred => "gpu_preferred",
