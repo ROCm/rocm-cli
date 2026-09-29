@@ -914,7 +914,12 @@ jobs:
             Write-Host "reclaim: terminating pid=$($p.ProcessId) cmd=$($p.CommandLine)"
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
           }
-          Write-Host "reclaim: $(@($leaked).Count) process(es) terminated"
+          # SIGNALLED, not terminated, for the same reason the bash summary says
+          # so: -ErrorAction SilentlyContinue swallows a Stop-Process that could
+          # not kill its target, and this count is the SELECTED set, so a
+          # process that survived is still counted. Weaker than the bash line,
+          # which at least counts only what it re-verified before signalling.
+          Write-Host "reclaim: $(@($leaked).Count) process(es) signalled"
 
       # Best-effort when rocm-smi is absent; when present, fail within the bounded
       # ceiling instead of letting a held or wedged GPU consume the full job cap.

@@ -2082,21 +2082,36 @@ permissions:
         let text = std::fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
             .replace("\r\n", "\n");
-        let after = text
-            .split_once("E2E_ROOTS=(")
-            .unwrap_or_else(|| panic!("{} must declare E2E_ROOTS=(", p.display()))
-            .1;
+        parse_e2e_roots(&text, &p.display().to_string())
+    }
 
-        // Comments come off BEFORE the closing `)` is located, not per line
-        // afterwards. An inline comment containing a `)` — `'/tmp/rocm-e2e'
-        // # see docs (section 3)` — otherwise closes the array at that paren,
-        // and every root below it vanishes from the parse. The test then fails
-        // in the mirror->script direction naming a root that is plainly still
-        // in the script, and a maintainer who follows that message deletes a
-        // real root from both PowerShell mirrors. Measured: that spelling made
-        // this test demand the deletion of `e2e-prewarm`, the root this whole
-        // change exists to add.
-        let decommented = after
+    /// The parsing half of [`reclaim_script_roots`], split out so every spelling
+    /// it must cope with is a standing test rather than a mutation somebody has
+    /// to remember to run by hand against the tracked script.
+    ///
+    /// That split is the point. The previous version of this parser could only
+    /// be exercised by editing `scripts/reclaim-gpu.sh` itself, so three legal
+    /// spellings of the same array reached review unnoticed — and the failure
+    /// they produced blamed the PowerShell mirrors, advising a maintainer to
+    /// delete a real root from Windows.
+    fn parse_e2e_roots(text: &str, origin: &str) -> Vec<String> {
+        // Comments come off BEFORE anything is located — before the array's
+        // START as well as its closing `)`. Two distinct mis-parses, one fix:
+        //
+        //   - an inline comment containing a `)` — `'/tmp/rocm-e2e'  # see docs
+        //     (section 3)` — closes the array at that paren, so every root below
+        //     it vanishes from the parse. The test then fails in the
+        //     mirror->script direction naming a root that is plainly still in
+        //     the script, and a maintainer who follows that message deletes a
+        //     real root from both PowerShell mirrors. Measured: that spelling
+        //     made this test demand the deletion of `e2e-prewarm`, the root this
+        //     whole change exists to add.
+        //   - a comment ABOVE the array that merely quotes the literal text
+        //     `E2E_ROOTS=(` would otherwise anchor the search inside that
+        //     sentence rather than at the declaration. This file already quotes
+        //     bash array syntax in prose (`E2E_ROOTS+=(` appears in a comment),
+        //     so that is a spelling a future header edit can reach.
+        let decommented = text
             .lines()
             .map(|l| {
                 if l.trim_start().starts_with('#') {
@@ -2108,8 +2123,11 @@ permissions:
             .collect::<Vec<_>>()
             .join("\n");
         let body = decommented
+            .split_once("E2E_ROOTS=(")
+            .unwrap_or_else(|| panic!("{origin} must declare E2E_ROOTS=("))
+            .1
             .split_once(')')
-            .unwrap_or_else(|| panic!("{} has an unterminated E2E_ROOTS array", p.display()))
+            .unwrap_or_else(|| panic!("{origin} has an unterminated E2E_ROOTS array"))
             .0;
 
         // Every non-empty line inside the array must parse into exactly one
@@ -2140,22 +2158,150 @@ permissions:
                     .filter(|inner| !inner.contains(q))
             });
             let Some(root) = parsed else {
+                // `strip_comment` splits on a literal " #" with no quote
+                // awareness, so a root whose VALUE contains that sequence —
+                // `'/tmp/e2e root #2'`, which bash itself accepts, since `#` is
+                // inert inside single quotes — arrives here already truncated
+                // and unterminated. Named in the message rather than fixed:
+                // this lands as a loud false failure, never a silent miss, and
+                // making the shared helper quote-aware for a spelling no root
+                // uses would be untested code on a path every other caller
+                // depends on.
                 panic!(
-                    "{}: E2E_ROOTS line `{line}` is not a single quoted root. This test's \
-                     parser did not understand it — that is NOT drift against the PowerShell \
-                     mirrors, so do not remove anything from them. Restore one quoted root \
-                     per line, or teach this parser the new spelling (EAI-8751)",
-                    p.display()
+                    "{origin}: E2E_ROOTS line `{line}` is not a single quoted root. This \
+                     test's parser did not understand it — that is NOT drift against the \
+                     PowerShell mirrors, so do not remove anything from them. Restore one \
+                     quoted root per line, or teach this parser the new spelling. Note the \
+                     line is shown after comment-stripping, so a root whose value contains \
+                     \" #\" appears truncated here (EAI-8751)"
                 );
             };
             roots.push(root.to_owned());
         }
         assert!(
             !roots.is_empty(),
-            "{} declared no E2E_ROOTS entries — the parser or the array shape changed",
-            p.display()
+            "{origin} declared no E2E_ROOTS entries — the parser or the array shape changed"
         );
         roots
+    }
+
+    /// An `E2E_ROOTS` array spelled the way the script spells it today, with
+    /// enough surrounding file to exercise the comment handling.
+    #[cfg(test)]
+    fn roots_fixture(body: &str) -> String {
+        format!(
+            "#!/usr/bin/env bash\n# a header comment\nset -euo pipefail\nE2E_ROOTS=(\n{body})\nENGINE_MARKERS=(\n  'llama-server'\n)\n"
+        )
+    }
+
+    /// Every spelling this parser must cope with, as a test rather than as a
+    /// mutation of the tracked script. Each of these was found by editing
+    /// `scripts/reclaim-gpu.sh` by hand during review; none of them could fail
+    /// CI afterwards, which is the gap this closes.
+    #[test]
+    fn e2e_roots_parser_accepts_legal_respellings_of_the_same_array() {
+        let canonical = vec!["/tmp/rocm-e2e".to_owned(), "e2e-shared".to_owned()];
+
+        // As written today.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // An inline comment containing a `)`. This closed the array early and
+        // made the test demand the deletion of a real root from Windows.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'  # see docs (section 3)\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // Double quotes, and a mix of both. Silently dropped the entry before.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  \"/tmp/rocm-e2e\"\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A full-line comment inside the array, indented or at column 0, and a
+        // blank line. All three are skipped rather than failing completeness.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n# flush left\n  # indented\n\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A comment ABOVE the array quoting the declaration's own text. The
+        // anchor must find the declaration, not the sentence about it.
+        let text = "#!/usr/bin/env bash\n# see how E2E_ROOTS=( is declared below\nE2E_ROOTS=(\n  '/tmp/rocm-e2e'\n  'e2e-shared'\n)\n";
+        assert_eq!(parse_e2e_roots(text, "fixture"), canonical);
+
+        // A root containing a space is preserved whole, which is what rules out
+        // tokenising the body on whitespace.
+        assert_eq!(
+            parse_e2e_roots(&roots_fixture("  '/tmp/rocm e2e'\n"), "fixture"),
+            vec!["/tmp/rocm e2e".to_owned()]
+        );
+    }
+
+    /// The other half: spellings the parser must REJECT, and reject as its own
+    /// misunderstanding rather than as drift against the PowerShell mirrors —
+    /// because the mirror-drift message tells a maintainer to delete a root
+    /// from Windows, and following it on a false positive is what makes this
+    /// worse than having no checker.
+    #[test]
+    fn e2e_roots_parser_rejects_unparsable_lines_without_blaming_the_mirrors() {
+        for (label, body) in [
+            (
+                "array folded onto one line",
+                "  '/tmp/rocm-e2e' 'e2e-shared'\n",
+            ),
+            ("unquoted entry", "  e2e-shared\n"),
+            ("unterminated quote", "  '/tmp/rocm-e2e\n"),
+            // `strip_comment` is not quote-aware, so this arrives truncated.
+            // Rejected loudly, never silently dropped.
+            ("value containing \" #\"", "  '/tmp/rocm e2e #2'\n"),
+        ] {
+            let text = roots_fixture(body);
+            let err = std::panic::catch_unwind(|| parse_e2e_roots(&text, "fixture"))
+                .expect_err(&format!("{label} must not parse"));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("did not understand"),
+                "{label} failed with the wrong message — it must not read as mirror drift: {msg}"
+            );
+            assert!(
+                msg.contains("do not remove anything from them"),
+                "{label} must tell the reader NOT to edit the mirrors: {msg}"
+            );
+        }
+    }
+
+    /// An empty array is a parser/shape change, not zero roots — and must not
+    /// sail through as "no roots declared, nothing to compare".
+    #[test]
+    fn e2e_roots_parser_rejects_an_empty_array() {
+        let err = std::panic::catch_unwind(|| parse_e2e_roots(&roots_fixture(""), "fixture"))
+            .expect_err("an empty E2E_ROOTS must not parse as success");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("declared no E2E_ROOTS entries"), "got: {msg}");
     }
 
     /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
