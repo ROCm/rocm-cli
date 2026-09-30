@@ -1192,11 +1192,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Deliberately NOT gated by the `changes` path filter: `cargo xtask
-    # check-architecture-doc` verifies every backtick-quoted path citation in
-    # docs/architecture.md still exists in the tracked tree, and the citations
-    # aren't limited to any fixed set of paths — the doc can cite any tracked
-    # file. A path-filter allowlist here would need to list every file the doc
-    # could ever cite and be kept current as citations are added, which is
+    # check-architecture-doc` fails, naming every one, if a path citation in
+    # docs/architecture.md isn't found where it's cited — scoped to its
+    # nearest heading's directories, or anywhere in the tracked tree for an
+    # unscoped citation — and the citations aren't limited to any fixed set
+    # of paths — the doc can cite any tracked file. A path-filter allowlist
+    # here would need to list every file the doc could ever cite and be kept
+    # current as citations are added, which is
     # exactly the kind of drift this check exists to catch; a rename/removal
     # of a currently-cited file wouldn't itself touch docs/architecture.md, so
     # gating on that path (as a prior version of this job did) could skip the

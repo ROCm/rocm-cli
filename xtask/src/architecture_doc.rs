@@ -745,14 +745,15 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
 /// found where it's cited (scoped to its nearest heading's directories, or
 /// anywhere in the tracked tree for an unscoped citation).
 ///
-/// This one-line delegation to [`check_doc_at`] is itself unproven: no test
-/// drives `run` end-to-end, so silently discarding `check_doc_at`'s result
-/// here (e.g. `let _ = check_doc_at(...); Ok(())`) would still leave every
-/// test green. [`check_doc_at`]'s own logic is covered directly against a
-/// fabricated root (see
-/// `check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation`), but
-/// proving this specific line would need `workspace_root()` itself to be
-/// swappable for a fabricated root — not worth adding just for this.
+/// This one-line delegation to [`check_doc_at`] has only its `Ok` direction
+/// exercised end-to-end, by `run_passes_against_the_real_doc`: silently
+/// discarding `check_doc_at`'s result here (e.g. `let _ =
+/// check_doc_at(...); Ok(())`) would still leave every test green.
+/// [`check_doc_at`]'s own logic is covered directly against a fabricated
+/// root (see `check_doc_at_fails_over_a_fabricated_root_with_a_stale_citation`),
+/// but proving this specific line's `Err` direction would need
+/// `workspace_root()` itself to be swappable for a fabricated root — not
+/// worth adding just for this.
 pub fn run() -> Result<()> {
     check_doc_at(&crate::paths::workspace_root()?)
 }
@@ -847,6 +848,16 @@ fn format_stale_citation(citation: &Citation) -> String {
     let is_scoped = is_scoped_extension(&citation.text);
     if citation.section_dirs.is_empty() || !is_scoped {
         format!("  `{}`", citation.text)
+    } else if citation.section_dirs.len() > 1 {
+        // `citation_exists` requires the file under *every* listed
+        // directory (see `multi_directory_citation_requires_every_directory_to_have_the_file`),
+        // so a bare comma list here ("expected under `a`, `b`") would read
+        // as a disjunction when the rule is a conjunction.
+        format!(
+            "  `{}` (expected under all of `{}`)",
+            citation.text,
+            citation.section_dirs.join("`, `")
+        )
     } else {
         format!(
             "  `{}` (expected under `{}`)",
@@ -1940,6 +1951,21 @@ See `apps/rocmd/src/main.rs` for the entry point.
         let apps_rocmd_lib = citation("lib.rs", &["apps/rocmd"]);
         let message = stale_message(&[&apps_rocmd_lib]);
         assert!(message.contains("`lib.rs` (expected under `apps/rocmd`)"));
+    }
+
+    #[test]
+    fn stale_message_reads_a_multi_directory_citation_as_a_conjunction() {
+        // Regression case: a reviewer found that a citation scoped to more
+        // than one directory (e.g. `lib.rs` under the `engines/lemonade`,
+        // `engines/vllm` heading, which `citation_exists` requires in EVERY
+        // listed directory) was hinted as "(expected under `a`, `b`)" — a
+        // bare comma list that reads as "either of these", not "both of
+        // these".
+        let both_engines = citation("lib.rs", &["engines/lemonade", "engines/vllm"]);
+        let message = stale_message(&[&both_engines]);
+        assert!(
+            message.contains("`lib.rs` (expected under all of `engines/lemonade`, `engines/vllm`)")
+        );
     }
 
     #[test]

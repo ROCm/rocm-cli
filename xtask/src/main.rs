@@ -101,8 +101,10 @@ enum Command {
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
-    /// Fail if any path cited (in backticks) in `docs/architecture.md` no
-    /// longer exists in the tracked tree, naming every stale citation.
+    /// Fail, naming every one, if a path cited (in backticks) in
+    /// `docs/architecture.md` isn't found where it's cited — scoped to its
+    /// nearest heading's directories, or anywhere in the tracked tree for an
+    /// unscoped citation.
     CheckArchitectureDoc,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
