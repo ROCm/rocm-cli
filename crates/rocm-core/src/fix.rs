@@ -1490,7 +1490,6 @@ mod tests {
     /// It takes the lock rather than a seam because exercising the env read IS
     /// the point — the escape hatch the contract guard advertises for exactly
     /// this case.
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     #[test]
     fn the_path_fix_reads_rocm_path_from_the_environment() {
         let _guard = PROCESS_ENV_TEST_LOCK
@@ -1504,15 +1503,12 @@ mod tests {
         let install = root.join("rocm-6.10.0");
         plant_install(&install);
 
-        let previous = std::env::var_os("ROCM_PATH");
-        // SAFETY: the lock above serializes every test in this process that
-        // touches this key, and the value is restored before it is released.
-        unsafe { std::env::set_var("ROCM_PATH", &install) };
+        // Restored on drop rather than on the next line, so a panic inside the
+        // resolver cannot leave this key pointing at the directory removed
+        // below. The lock above is what serializes it; see `RestoredEnvVar`.
+        let restore = crate::test_env::RestoredEnvVar::set("ROCM_PATH", &install);
         let found = newest_rocm_install_dir();
-        match &previous {
-            Some(value) => unsafe { std::env::set_var("ROCM_PATH", value) },
-            None => unsafe { std::env::remove_var("ROCM_PATH") },
-        }
+        drop(restore);
 
         std::fs::remove_dir_all(&root).ok();
 

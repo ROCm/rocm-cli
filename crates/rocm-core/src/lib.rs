@@ -34,6 +34,8 @@ pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
+#[cfg(test)]
+mod test_env;
 pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
@@ -12443,7 +12445,6 @@ Class Name:                Display
     /// not read the environment — so on their own the production lookup, and
     /// the key it names, could both be deleted without failing anything. This
     /// drives `engine_envs_dir` itself against a real variable.
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     #[test]
     fn engine_envs_dir_reads_its_root_from_the_environment() {
         let _guard = ENGINE_ENVS_ENV_TEST_LOCK
@@ -12452,15 +12453,14 @@ Class Name:                Display
         let (root, paths) = temp_app_paths("engine-envs-root-env");
         let override_root = root.join("runtime").join("engines");
 
-        let previous = std::env::var_os("ROCM_CLI_ENGINE_ENVS_ROOT");
-        // SAFETY: the lock above serializes every test in this process that
-        // touches this key, and the value is restored before it is released.
-        unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root) };
+        // Restored on drop rather than on the next line, so a panic inside
+        // `engine_envs_dir` cannot leave this key pointing at the directory
+        // removed below. The lock above is what serializes it; see
+        // `RestoredEnvVar`.
+        let restore =
+            crate::test_env::RestoredEnvVar::set("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
         let resolved = paths.engine_envs_dir("vllm");
-        match &previous {
-            Some(value) => unsafe { std::env::set_var("ROCM_CLI_ENGINE_ENVS_ROOT", value) },
-            None => unsafe { std::env::remove_var("ROCM_CLI_ENGINE_ENVS_ROOT") },
-        }
+        drop(restore);
 
         // Same scope as the seam test above: this pins that `engine_envs_dir`
         // reaches the variable, not that the value is host-normalised on the

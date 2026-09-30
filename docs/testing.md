@@ -92,9 +92,23 @@ partly:
   satisfy the guard — it cannot see which key a call names, because the keys
   are string literals it strips before scanning. This one is on you.
 
-Keep the mutation and the lock in the same test body. A `#[test]` that delegates
-its mutation to an unguarded helper is a known blind spot — the helper is a
-different scope, so the scan cannot see the two together.
+Restoring on the next line, as above, leaks the variable if the code under test
+panics — and because the lock is taken with `into_inner`, the next test to hold
+it reads what the panicking one left behind. `rocm-core`'s `RestoredEnvVar`
+(`crates/rocm-core/src/test_env.rs`) moves the restore into `Drop`, where
+unwinding runs it; prefer it where one exists. It restores but does not
+serialize, so the lock is still yours to take.
+
+Keep the mutation and the lock in the same test body. Three known blind spots,
+all of which the scan reports nothing for:
+
+- A `#[test]` that delegates its mutation to an unguarded helper — the helper is
+  a different scope, so the scan cannot see the two together.
+- A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
+  `#[rstest]`. Neither is used in this tree.
+- `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
+  `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
+  arms on.
 
 Run the cross-platform smoke test:
 
