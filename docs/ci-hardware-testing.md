@@ -20,9 +20,10 @@ newer run's merge-required (GitHub-hosted) checks would sit pending forever
 thus their own concurrency group — means an offline runner can only ever stall
 that workflow's own supersession, never `ci.yml`'s required checks. See
 `EAI-7548`. `xtask/src/workflow_contract.rs`'s
-`self_hosted_workflow_owns_the_gpu_lanes` test pins `e2e-gpu`,
-`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` by name in
-`e2e-selfhosted.yml`, so this split cannot be silently undone.
+`self_hosted_workflow_owns_the_gpu_lanes` test requires `e2e-gpu`,
+`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` to appear as job keys in
+`e2e-selfhosted.yml`, so a PR that moves one of these lanes back into
+`ci.yml` fails CI rather than merging unnoticed.
 
 ## The three-stage validation ladder
 
@@ -32,7 +33,7 @@ differs is when each runs and what hardware it covers.
 
 | Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
 |---|---|---|---|---|
-| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The 4 jobs in the Platforms table below | No — absent from the required-status-check list |
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The 4 jobs in the Platforms table below (`e2e-gpu-strix-ubuntu` runs both its `[release, nightly]` channel legs per PR, ROCMAI-125) | No — absent from the required-status-check list |
 | Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same 4 platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
 | Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same 4 per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
@@ -344,11 +345,12 @@ Pre-warm then:
 - prunes with `rocm storage remove-old-installs` after any install, update, or
   repair, so the multi-version cache stays bounded.
 
-`e2e-prewarm` also accepts mutually exclusive `--version`/`--build-date`
+`e2e-prewarm` will also accept mutually exclusive `--version`/`--build-date`
 flags (ROCMAI-430) that pin the SDK build the pre-warm resolves to instead of
-always tracking whatever the channel index currently serves; the unpinned
-invocation above is unaffected, and today no caller in this repo passes
-either flag yet (see "The three-stage validation ladder" above).
+always tracking whatever the channel index currently serves. That flag pair
+ships in PR #464, stacked on #415, neither merged as of this writing (see
+"The three-stage validation ladder" above) — the unpinned invocation above is
+what every lane in this tree runs today.
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
