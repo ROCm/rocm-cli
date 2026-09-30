@@ -29,8 +29,10 @@ use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 /// list has gone stale twice, and a grep for the function name is exact.
 ///
 /// "Unset" means whitespace-only, matching every caller's own emptiness test,
-/// so a row never looks populated while the command would reject the value as
-/// empty. Whether to trim the *value* before passing it on is a separate,
+/// so a row never looks populated while the value would actually be treated as
+/// unset — rejected outright for the two required fields (install-manager
+/// channel, serve-wizard model), silently omitted for the rest. Whether to
+/// trim the *value* before passing it on is a separate,
 /// caller-specific decision: onboarding's install prefix is written only by the
 /// folder browser and so is kept byte-exact, while the typed fields elsewhere
 /// are trimmed. See `onboarding::build_install_args` for that contrast.
