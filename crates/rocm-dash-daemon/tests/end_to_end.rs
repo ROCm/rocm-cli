@@ -523,9 +523,9 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
         "expected the reachable-but-failing contradiction message, got: {warnings:?}"
     );
     assert!(
-        !warnings
-            .iter()
-            .any(|w| w == "amd-smi unavailable (GPU device inaccessible or probe failed)"),
+        !warnings.iter().any(|w| w
+            == "amd-smi unavailable (not installed, unresolvable, or the GPU device is \
+                inaccessible)"),
         "must not fall back to the bare-metal inaccessible message when reachability was asserted: {warnings:?}"
     );
 }

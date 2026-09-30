@@ -433,15 +433,17 @@ pub async fn run_loop(
                 }
             }
         } else if gpu_init_done {
-            // `amd_smi_gpu_reachable` is only ever true on WSL (the wiring in
-            // `apps/rocm/src/dash.rs` gates the rocm-core verdict on
-            // `is_wsl_host()`) — it let the device pre-flight pass without a
-            // readable `/dev/kfd`, which doesn't exist on WSL anyway. If it was
-            // true and amd-smi *still* found nothing, that's a real contradiction
-            // worth calling out — plumbing readiness (e.g. `wsl_rocdxg_ready`) is
-            // not the same as amd-smi enumerating a supported GPU, and a generic
-            // "device inaccessible" message would flatly contradict what `examine`
-            // just told the same user.
+            // If the caller passed `amd_smi_gpu_reachable: true` (in practice,
+            // only the WSL wiring in `apps/rocm/src/dash.rs` does — it gates the
+            // rocm-core verdict on `is_wsl_host()`) and amd-smi *still* found
+            // nothing, that's a real contradiction worth calling out — plumbing
+            // readiness (e.g. `wsl_rocdxg_ready`) is not the same as amd-smi
+            // enumerating a supported GPU, and a generic "device inaccessible"
+            // message would flatly contradict what `examine` just told the same
+            // user. Otherwise (bare metal, or nothing told us the GPU is
+            // reachable) the device pre-flight itself may have failed, or it
+            // passed but the binary was missing/unresolvable/failed to run —
+            // both causes are named since either is possible here.
             warnings.push(if amd_smi_gpu_reachable {
                 "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
                  detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
@@ -449,7 +451,9 @@ pub async fn run_loop(
                  WSL yet"
                     .into()
             } else {
-                "amd-smi unavailable (GPU device inaccessible or probe failed)".into()
+                "amd-smi unavailable (not installed, unresolvable, or the GPU device is \
+                 inaccessible)"
+                    .into()
             });
             Vec::new()
         } else {

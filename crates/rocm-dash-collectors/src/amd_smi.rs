@@ -52,8 +52,9 @@ impl AmdSmiCollector {
     /// rather than any single device node this crate could probe directly).
     /// This crate deliberately does not depend on `rocm-core` to compute that
     /// verdict itself; the caller (`apps/rocm`, which already depends on it)
-    /// threads it through instead, so `serve`/`examine`/the dashboard never
-    /// disagree about whether a host's GPU is usable.
+    /// threads it through instead, so on WSL, `serve`/`examine`/the dashboard
+    /// never disagree about whether a host's GPU is usable. On bare metal the
+    /// caller always passes `false`, so this is still a plain `/dev/kfd` check.
     pub async fn detect_with_binary(
         binary: impl Into<OsString>,
         gpu_reachable: bool,
