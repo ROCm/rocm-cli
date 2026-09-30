@@ -4,18 +4,14 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# Release notes
+# ROCm CLI v0.1.0 Release notes
 
-## ROCm CLI v0.1.0
-
-*Released 2026-09-23.*
+## Release highlights
 
 This is the first stable release, moving off preview versioning
 (v0.1.0-preview.1 → v0.1.0). It adds ROCm 10 install support, vLLM wheel
 auto-discovery, non-interactive installs, and dozens of reliability fixes
 across install, serve, examine, diagnose, and the dashboard TUI.
-
-### New features
 
 - **ROCm 10 "next" install layout**: `rocm install` now supports it out of the
   box, without disturbing existing layouts ([#329]).
@@ -36,45 +32,45 @@ across install, serve, examine, diagnose, and the dashboard TUI.
 - **`version`** now shows the release tag/branch and commit hash, useful for bug
   reports ([#244]).
 
-### Bug fixes
+### Fixed
 
-- Fixed: Lemonade's ROCm llama.cpp backend staying pinned to an old version
+- Lemonade's ROCm llama.cpp backend staying pinned to an old version
   instead of tracking the active ROCm SDK ([#404]).
-- Fixed: dashboard not restoring the terminal on SIGTERM/SIGINT, and Ctrl-C not
+- Dashboard not restoring the terminal on SIGTERM/SIGINT, and Ctrl-C not
   reliably quitting ([#326]).
-- Fixed: `serve` race conditions and incorrect GPU selection through visibility
+- `serve` race conditions and incorrect GPU selection through visibility
   masks ([#267]).
-- Fixed: `examine` probing the ambient torch install instead of the active
+- `examine` probing the ambient torch install instead of the active
   runtime's ([#405]).
-- Fixed: ambiguous-runtime install errors in ComfyUI giving no actionable next
+- Ambiguous-runtime install errors in ComfyUI giving no actionable next
   step ([#328]).
-- Fixed: driver-install reporting and the `runtimes uninstall --yes` gate being
+- Driver-install reporting and the `runtimes uninstall --yes` gate being
   too loose ([#402]).
-- Fixed: `bench` missing the engine column and reporting unwindowed load
+- `bench` missing the engine column and reporting unwindowed load
   latency ([#327]).
-- Fixed: `dash --replay` accepting an invalid replay path and crashing into the
+- `dash --replay` accepting an invalid replay path and crashing into the
   TUI ([#331]).
-- Fixed: `install` requiring sudo even when already running as root ([#305]).
-- Fixed: `install` failing to resolve canonical ROCm streams ([#308]).
-- Fixed: `install` occasionally realigning a working GPU-kernel torch onto a
+- `install` requiring sudo even when already running as root ([#305]).
+- `install` failing to resolve canonical ROCm streams ([#308]).
+- `install` occasionally realigning a working GPU-kernel torch onto a
   broken one ([#314]).
-- Fixed: `examine` misreading the KFD gfx target from the node properties file
+- `examine` misreading the KFD gfx target from the node properties file
   ([#343]).
-- Fixed: `chat` not accepting a piped one-shot prompt from stdin ([#339]), and
+- `chat` not accepting a piped one-shot prompt from stdin ([#339]), and
   not telling the assistant which machine it's running on ([#321]).
-- Fixed: `rocm fix` failures going to stdout instead of stderr, sometimes
+- `rocm fix` failures going to stdout instead of stderr, sometimes
   dropping the log guard ([#350]).
-- Fixed: rollback path was silent and its single-level limit undocumented
+- Rollback path was silent and its single-level limit undocumented
   ([#345]).
-- Fixed: `runtimes list` legend drifting out of sync with its markers ([#344]).
-- Fixed: dashboard TUI stale "update freshness" warnings, missing activity glyph
+- `runtimes list` legend drifting out of sync with its markers ([#344]).
+- Dashboard TUI stale "update freshness" warnings, missing activity glyph
   key ([#357]), inconsistent marker/legend rendering ([#354]), and Section D
   navigation/job-completion visibility ([#361]).
-- Fixed: dialog behavior and dimmed-backdrop UX being inconsistent across TUI
+- Dialog behavior and dimmed-backdrop UX being inconsistent across TUI
   overlays ([#358]).
-- Fixed: `diagnose` and `rocm fix` using different wording for the same
+- `diagnose` and `rocm fix` using different wording for the same
   remediation flags ([#413]).
-- Fixed: unbounded local-service HTTP reads that could hang ([#348]), `http_get`
+- Unbounded local-service HTTP reads that could hang ([#348]), `http_get`
   connect phase not respecting the timeout ([#338]), and an HTTP read not
   retrying after signal interruption ([#252]).
 
