@@ -58,6 +58,9 @@ html_theme_options = {
     # crashes sphinx_book_theme's repository button.
     "repository_url": "https://github.com/ROCm/rocm-cli",
     "repository_branch": "main",
+    "version_list_link": (
+        "https://rocm.docs.amd.com/projects/rocm-cli/en/docs-v0.1.0/versions.html"
+    ),
 }
 html_title = f"{project} {version} documentation"
 # myst.header: `:start-after:` on included README sections strips the heading
