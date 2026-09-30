@@ -597,8 +597,7 @@ still pass if it is released after the plan is built. That is not an oversight t
 fix with another test: the only behaviour the wider span changes needs a service
 id to repeat across runs (a backwards clock step), and a test that instead tried
 to slip a launch in between the two phases would be racing a microsecond-wide
-window and would pass on a timing-lucky run rather than flake — the same defect
-`service-cleanup-07`'s wall-clock assertion exists to remove. The scope is a
+window and would pass on a timing-lucky run rather than flake. The scope is a
 documented conservative choice, not a covered property.
 
 Windows + Lemonade note: the Windows *managed* native-Lemonade server is launched
