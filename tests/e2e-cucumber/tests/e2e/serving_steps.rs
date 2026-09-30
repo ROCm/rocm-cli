@@ -631,13 +631,13 @@ async fn setup_lemonade_hf_checkpoint_model(world: &mut E2eWorld) {
 
 #[given("a large model is being served on GPU")]
 async fn setup_large_gpu_model(world: &mut E2eWorld) {
-    // Large-model nightly coverage follows the host's serving path. MI300X uses
-    // the dense BF16 model through vLLM; Strix Halo uses the hardware-verified
-    // UD-Q4_K_XL GGUF checkpoint through Lemonade. The scenario's @serve-timeout
-    // tag widens both the readiness poll and heavy-model inference timeout. For
-    // vLLM it also raises ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd),
-    // preventing the CLI's default readiness cap from terminating the server
-    // mid-load.
+    // Large-model nightly coverage follows the host's serving path. vLLM hosts
+    // (MI300X, MI350P) use the dense BF16 model; Lemonade hosts (Strix Halo,
+    // R9700, W7900) use the UD-Q4_K_XL GGUF checkpoint, hardware-verified on
+    // Strix Halo. The scenario's @serve-timeout tag widens both the readiness
+    // poll and heavy-model inference timeout. For vLLM it also raises
+    // ROCM_CLI_VLLM_READY_TIMEOUT_SECS (see isolate_cmd), preventing the CLI's
+    // default readiness cap from terminating the server mid-load.
     let (model, engine, ready_substr) =
         if e2e_cucumber::capability::host_capability().effective_serve_engine == "lemonade" {
             // ready_substr is the base name WITHOUT the quant. lemonade serves

@@ -1394,8 +1394,9 @@ jobs:
           echo "reclaimed"
 
       # Bounded wait, as in e2e-gpu. The pod requests `amd.com/gpu: 1`, so
-      # rocm-smi sees exactly the one card Kueue admitted it for. The floor is
-      # half of the R9700S's 32GB: high enough to catch a leftover serve still
+      # rocm-smi sees exactly the one card Kueue admitted it for. The floor stays
+      # at the shared 16 GiB default, which is a flat constant rather than a
+      # proportion of capacity: high enough to catch a leftover serve still
       # holding the card, low enough that a clean pod passes on the first poll.
       - name: GPU preflight (bounded wait for an available GPU)
         run: |
@@ -1642,8 +1643,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The runner can serve several jobs in a row, and its work volume outlives
-      # any one of them. Same reclaim as e2e-gpu, scoped to e2e leftovers only.
+      # The pod is usually fresh (the runner scales to zero between jobs), but the
+      # work volume is not, and two jobs can share one pod's life. Same reclaim as
+      # e2e-gpu, scoped to e2e leftovers only.
       - name: Reclaim GPU from stray E2E processes
         run: |
           pkill -f '/tmp/rocm-e2e.*llama-server' 2>/dev/null || true

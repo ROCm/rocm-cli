@@ -191,9 +191,10 @@ non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
 `e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-w7900`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
-MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
-checkpoint through Lemonade on Strix Halo.
+grid. The shared large-model scenario follows each lane's serve engine: it
+serves `Qwen/Qwen3.6-27B` through vLLM on the Instinct lanes (MI300X, MI350P),
+and the `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint (hardware-verified
+on Strix Halo) through Lemonade on every other lane (Strix Halo, R9700, W7900).
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on

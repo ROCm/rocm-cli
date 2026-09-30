@@ -1716,8 +1716,9 @@ esac
         for row in &self_hosted_rows {
             assert_eq!(
                 row[3], "no",
-                "self-hosted lane `{}` is continue-on-error, so the README must not \
-                 document it as blocking",
+                "self-hosted lane `{}` is not a required status check, so the README \
+                 must not document it as blocking (continue-on-error does not decide \
+                 this; see the header of e2e-selfhosted.yml)",
                 row[0]
             );
         }

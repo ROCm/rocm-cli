@@ -504,7 +504,8 @@ jobs:
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
           echo "reclaimed"
 
-      # Bounded wait for a free GPU. Floor is half of the R9700S's 32GB — high
+      # Bounded wait for a free GPU. The floor stays at the shared 16 GiB
+      # default, a flat constant rather than a proportion of capacity — high
       # enough to catch a leftover serve, low enough that a clean pod passes on
       # the first poll. Same as the per-PR rad3 lane.
       - name: GPU preflight (bounded wait for an available GPU)
@@ -690,9 +691,11 @@ jobs:
           rm -rf /tmp/rocm-e2e-* 2>/dev/null || true
           echo "reclaimed"
 
-      # Bounded wait for a free GPU. Floor is the shared 16 GiB default, a third
-      # of this card's 48GB — high enough to catch a leftover serve, low enough
-      # that a clean host passes on the first poll. Same as the per-PR W7900 lane.
+      # Bounded wait for a free GPU. The floor stays at the shared 16 GiB
+      # default, which is a flat constant rather than a proportion of capacity:
+      # it only has to be high enough to catch a leftover serve still holding
+      # the card, and low enough that a clean host passes on the first poll.
+      # Same as the per-PR W7900 lane — do NOT scale it down for a smaller part.
       - name: GPU preflight (bounded wait for an available GPU)
         run: |
           MIN_FREE_GIB="${GPU_PREFLIGHT_MIN_FREE_GIB:-16}"
