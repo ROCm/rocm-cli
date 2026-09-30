@@ -37,6 +37,13 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 
+`e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
+nightly]` axis — two concurrent legs on the same job, channel-suffixed
+artifact names — so the per-PR smoke gate proves the nightly channel boots on
+at least one platform without adding the axis (and its wall-clock cost) to
+every per-PR lane. This mirrors `nightly.yml`'s channel matrix from
+ROCMAI-429, applied to a single per-PR lane rather than all of them.
+
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
 `devlab-dispatch` label, so the pool never picks up a job by accident even
@@ -138,9 +145,11 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
-`nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
-`@nightly` scenarios included. Each joins its platforms'
+`e2e-selfhosted.yml`'s `e2e-report` covers the per-PR GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
+platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
+per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
+included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
@@ -234,6 +243,11 @@ self-hosted lane calls:
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
+
+(`e2e-gpu-strix-ubuntu`'s two channel-matrix legs pass `--channel ${{
+matrix.channel }}` instead, resolving to `release` or `nightly` per leg;
+every other lane is release-only and keeps the literal `--channel release`
+above.)
 
 before the suite. `rocm update` compares both the channel version and the wheel
 composition recorded in the runtime manifest (source-layout generation and exact

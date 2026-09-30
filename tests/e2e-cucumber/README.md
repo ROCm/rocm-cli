@@ -185,14 +185,17 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow covers the same hardware as the table above, as
-non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+The nightly workflow covers a strict superset of the hardware in the table
+above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
 `e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
-MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
-checkpoint through Lemonade on Strix Halo.
+grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
+counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
+so nightly is where their regression coverage now lives. The shared
+large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and the
+hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint through
+Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on
