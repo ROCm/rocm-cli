@@ -2052,6 +2052,89 @@ async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
     }
 }
 
+/// The mailbox `--send` offers to prefill, mirrored from
+/// `rocm_core::report_delivery::DESTINATION`. Kept as a literal rather than a
+/// dependency on `rocm-core`: this crate only runs the built binary, it does
+/// not link the library behind it.
+const REPORT_DESTINATION: &str = "ROCmCLI@amd.com";
+
+#[when("the user asks the CLI for a way to send a report, without asking to see the report first")]
+async fn user_asks_to_send_without_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--send"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and explains that the report must be requested too")]
+async fn assert_send_without_report_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "asking for a way to send a report without asking to see it first is an argument \
+         mistake, caught before anything is examined, so it exits the way any other bad \
+         argument combination does:\n{out}"
+    );
+    assert!(
+        out.contains("--report"),
+        "the refusal does not name the flag the user needed to add first:\n{out}"
+    );
+}
+
+/// Forces the headless branch deterministically: no display of any kind, no
+/// SSH-forwarded display, and no override asking for a browser regardless.
+/// Linux-only in effect, because the CLI under test only reads these on
+/// Linux — but the scenario that uses this is the one tagged
+/// `@requires-os:linux`, not this helper, so nothing here needs to branch on
+/// host.
+#[when("the user asks the CLI for a way to send a report, with no desktop available to open it on")]
+async fn user_asks_to_send_on_a_headless_machine(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["diagnose", "--report", "--send"],
+        &[
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("SSH_CONNECTION", ""),
+            ("SSH_CLIENT", ""),
+            ("SSH_TTY", ""),
+            ("ROCM_NO_BROWSER", ""),
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI prints the address to mail and a link, and starts nothing")]
+async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Same discriminator as `answer_names_nothing_identifying`: a refusal
+    // envelope has no `cli_version` field, so branch on its presence rather
+    // than asserting a shape that only a genuine report has.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(REPORT_DESTINATION),
+            "a headless machine was not given the address to mail by hand:\n{out}"
+        );
+        assert!(
+            out.contains("mailto:"),
+            "a headless machine was not given a link, only the sentence around it:\n{out}"
+        );
+        assert!(
+            !out.contains("was opened"),
+            "a mail client was reported opened on a machine with no desktop to open it on:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
 /// This machine's host name, or empty when it cannot be read.
 ///
 /// Read here rather than from the CLI: the assertion is that the name never
