@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
@@ -34,6 +35,7 @@ pub mod fix;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod report;
+pub mod report_delivery;
 pub mod runtime;
 #[cfg(test)]
 mod test_env;
