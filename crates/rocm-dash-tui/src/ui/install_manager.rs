@@ -552,6 +552,39 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_channel_and_prefix_render_placeholders() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let i = InstallManagerState {
+            channel: "   ".into(),
+            prefix: "   ".into(),
+            ..Default::default()
+        };
+        let jobs = State::default();
+        term.draw(|f| draw_install_manager(f, f.area(), &i, &jobs, &theme))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("(e.g. release)"),
+            "a whitespace-only channel must render the placeholder, not the literal spaces: {out:?}"
+        );
+        assert!(
+            out.contains("default managed folder"),
+            "a whitespace-only prefix must render the placeholder, not the literal spaces: {out:?}"
+        );
+    }
+
+    #[test]
     fn dry_run_launch_is_read_only_no_approval() {
         let mut ins = Some(InstallManagerState::default()); // dry_run = true
         let mut jobs = State::default();
