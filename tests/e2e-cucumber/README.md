@@ -175,8 +175,6 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
-| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon R9700 (self-hosted) | no |
-| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow

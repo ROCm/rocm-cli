@@ -260,9 +260,11 @@ mod tests {
 
     #[test]
     fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
-        // The nightly workflow exists to run *more* scenarios on the *same*
-        // platforms. If the two ever diverge, the nightly grid is comparing
-        // different hardware than the PR grid without saying so.
+        // The nightly workflow exists to run *more* scenarios on *at least*
+        // the per-PR platforms, plus lanes the per-PR smoke gate deliberately
+        // skips (e.g. rad3, mi350p -- ROCMAI-125). If a per-PR platform ever
+        // stopped running nightly, the nightly grid would be silently
+        // comparing different hardware than the PR grid.
         let lanes = |file: &str| {
             let names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -286,7 +288,12 @@ mod tests {
             names.dedup();
             names
         };
-        assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
+        let nightly = lanes("nightly.yml");
+        let per_pr = lanes("e2e-selfhosted.yml");
+        assert!(
+            per_pr.iter().all(|p| nightly.contains(p)),
+            "every per-PR platform must also run nightly: per_pr={per_pr:?} nightly={nightly:?}"
+        );
     }
 
     #[test]
