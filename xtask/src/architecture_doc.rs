@@ -10,8 +10,10 @@
 //! exist. A renamed or removed file then rots silently in the doc until a
 //! reader notices. This check makes the doc self-policing instead: it
 //! extracts every backtick-quoted path citation and fails, naming every one
-//! not found where it's cited (scoped to its nearest heading's directories,
-//! or anywhere in the tracked tree for an unscoped citation).
+//! not found where it's cited (scoped to its nearest heading's directories
+//! for a subsystem-specific `.rs` citation, at the repository root for a
+//! bare `.md`/`.toml` citation, or anywhere in the tracked tree for a bare
+//! directory name or an otherwise-unscoped citation).
 //!
 //! Same shape as [`crate::crate_edges`]: a reusable [`run`] plus
 //! `#[cfg(test)]` unit tests on the pure extraction/lookup helpers, and one
@@ -742,8 +744,10 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
 }
 
 /// Fetch the doc's current path citations and fail, naming every one not
-/// found where it's cited (scoped to its nearest heading's directories, or
-/// anywhere in the tracked tree for an unscoped citation).
+/// found where it's cited (scoped to its nearest heading's directories for a
+/// subsystem-specific `.rs` citation, at the repository root for a bare
+/// `.md`/`.toml` citation, or anywhere in the tracked tree for a bare
+/// directory name or an otherwise-unscoped citation).
 ///
 /// This one-line delegation to [`check_doc_at`] has only its `Ok` direction
 /// exercised end-to-end, by `run_passes_against_the_real_doc`: silently

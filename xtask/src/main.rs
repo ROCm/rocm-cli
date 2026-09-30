@@ -103,8 +103,10 @@ enum Command {
     CheckCrateEdges,
     /// Fail, naming every one, if a path cited (in backticks) in
     /// `docs/architecture.md` isn't found where it's cited — scoped to its
-    /// nearest heading's directories, or anywhere in the tracked tree for an
-    /// unscoped citation.
+    /// nearest heading's directories for a subsystem-specific `.rs`
+    /// citation, at the repository root for a bare `.md`/`.toml` citation,
+    /// or anywhere in the tracked tree for a bare directory name or an
+    /// otherwise-unscoped citation.
     CheckArchitectureDoc,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
