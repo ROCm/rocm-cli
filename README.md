@@ -322,8 +322,8 @@ haven't installed before, just as it does for a same-family upgrade.
 To approve without a prompt, for example in scripts or CI, where the prompt
 would otherwise refuse:
 
-- `--approve-replacing-active-default` approves the change of active default
-  only. The refusal message recommends it, and ROCm CLI's own non-interactive
+- `--approve-replacing-active-default` approves the change of active default.
+  The refusal message recommends it, and ROCm CLI's own non-interactive
   surfaces (chat, MCP, and the dashboard) pass it.
 - `--yes` gives the same approval and also approves installing required system
   packages, such as OpenMPI for vLLM. That requires `sudo`, so use it only where

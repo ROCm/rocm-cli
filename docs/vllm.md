@@ -13,6 +13,9 @@ The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
 `vllm` command visible to ROCm CLI.
 
+Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
+ROCm serving, or choose a different engine explicitly.
+
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
@@ -76,6 +79,8 @@ likely install an ABI-incompatible build, so the install fails closed instead
 with a message naming the detected version and pointing at
 `ROCM_CLI_VLLM_ROCM_INDEX_URL` as the way to install anyway.
 
+## Discovery paths and checks
+
 Supported discovery paths:
 
 - `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`
@@ -93,7 +98,9 @@ rocm-engine-vllm resolve-model Qwen/Qwen3.5-4B --device-policy gpu_required
 python scripts/vllm_therock_gpu_test.py --self-test
 ```
 
-GPU acceptance check:
+## GPU acceptance check
+
+Run the acceptance script against a built adapter:
 
 ```bash
 python3 scripts/vllm_therock_gpu_test.py \
@@ -108,6 +115,8 @@ ROCm libraries come from the managed TheRock SDK wheel directories. It rejects
 external vLLM command overrides and does not allow CPU fallback. It defaults
 to the active exact runtime key; if `--runtime-id` is passed, use an exact
 runtime key or an unambiguous runtime id.
+
+### Source build notes
 
 On WSL, the tested source build needed vLLM ROCm platform detection to use
 TheRock PyTorch device data when `amdsmi` is unavailable, and needed vLLM's
@@ -128,7 +137,9 @@ kernel. With the patch, the live acceptance harness passed on
 `facebook/opt-125m` and verified HIP/BLAS libraries loaded from the managed
 TheRock SDK wheel directories.
 
-Serving through ROCm CLI:
+## Serve a model
+
+Serve a model through ROCm CLI:
 
 ```bash
 rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
@@ -193,9 +204,6 @@ model-specific, so ROCm CLI never guesses one:
   `--tool-call-parser` implies `--enable-auto-tool-choice`, overrides any catalog
   default, and applies to vLLM only. Common values: `hermes`, `llama3_json`,
   `mistral`. Without it, plain chat still works but tool calls return HTTP 400.
-
-Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
-ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 
 ## Related resources
 

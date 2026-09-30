@@ -1,21 +1,17 @@
 root: index
 subtrees:
-  - caption: Demos
-    entries:
-      - file: demos
-        title: See ROCm CLI in action
   - caption: Install
     entries:
       - file: install/installation
   - caption: Getting started
     entries:
       - file: getting-started
-  - caption: Inference engines
+      - file: demos
+        title: See ROCm CLI in action
+  - caption: Use ROCm CLI
     entries:
       - file: engines/vllm
         title: vLLM adapter
-  - caption: Commands
-    entries:
       - file: commands
   - caption: About
     entries:

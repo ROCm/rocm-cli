@@ -26,10 +26,6 @@ The ROCm CLI public repository is located at
 .. grid:: 2
    :gutter: 3
 
-   .. grid-item-card:: Demos
-
-      * :doc:`See ROCm CLI in action <demos>`
-
    .. grid-item-card:: Install
 
       * :doc:`Installing ROCm CLI <install/installation>`
@@ -37,11 +33,9 @@ The ROCm CLI public repository is located at
    .. grid-item-card:: Getting started
 
       * :doc:`Getting started with ROCm CLI <getting-started>`
+      * :doc:`See ROCm CLI in action <demos>`
 
-   .. grid-item-card:: Inference engines
+   .. grid-item-card:: Use ROCm CLI
 
       * :doc:`vLLM adapter <engines/vllm>`
-
-   .. grid-item-card:: Commands
-
       * :doc:`Command reference <commands>`
