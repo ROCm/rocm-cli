@@ -1541,8 +1541,6 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # The runner can serve several jobs in a row, and its work volume outlives
-      # any one of them. Same reclaim as e2e-gpu, scoped to e2e leftovers only.
       # Reclaim the GPU before running: a serve leaked by a killed or
       # timed-out prior run (its Drop teardown never executed) keeps an engine
       # process on the card and starves this job's serves. Scoped to E2E-owned
