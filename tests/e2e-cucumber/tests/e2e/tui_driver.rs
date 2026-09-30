@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use e2e_cucumber::paced_download::is_intermediate_download_progress_frame;
 use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
@@ -375,6 +376,22 @@ impl TuiSession {
         self.reader_failure.take_message()
     }
 
+    /// Like [`Self::use_detail_size`], but keeps the standard 80-column width
+    /// and only grows the row count.
+    ///
+    /// For a journey whose later output (e.g. a multi-line install summary)
+    /// would otherwise scroll an earlier row off the visible 24-row screen
+    /// before an assertion can read it — with no scrollback (`vt100::Parser`
+    /// is constructed with 0 lines of it), a scrolled-off row reads as absent
+    /// whether or not it was ever actually cleared, silently turning a
+    /// negative assertion (e.g. "this spinner line is gone") into a
+    /// tautology. Widening to `DETAIL_COLS` would also change how much of a
+    /// long label fits before truncation, which is exactly what some of
+    /// these journeys are testing — so only rows grow here.
+    pub fn grow_rows(&mut self, rows: u16) -> Result<(), String> {
+        self.resize_to(rows, COLS)
+    }
+
     /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
@@ -694,6 +711,36 @@ impl TuiSession {
                 self.framed_screen()
             )),
         }
+    }
+
+    /// Waits for an intermediate (neither 0% nor 100%) download progress
+    /// frame, panicking with `context` on timeout. Shared by every PTY
+    /// scenario asserting a download spinner shows real progress (currently
+    /// the tarball and ComfyUI download journeys) — kept here rather than
+    /// duplicated per step file.
+    pub async fn assert_intermediate_download_progress_frame(
+        &mut self,
+        context: &str,
+        timeout: Duration,
+    ) {
+        self.wait_for_screen_where(
+            "an intermediate (neither 0% nor 100%) download progress frame",
+            is_intermediate_download_progress_frame,
+            timeout,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("intermediate download progress frame never appeared for {context}: {e}")
+        });
+    }
+
+    /// Like [`wait_for_exit`](Self::wait_for_exit), but panics with `context`
+    /// instead of returning a `Result` — the common case for every PTY
+    /// scenario's "install exits cleanly" step.
+    pub async fn assert_exits_cleanly(&mut self, context: &str, timeout: Duration) {
+        self.wait_for_exit(timeout)
+            .await
+            .unwrap_or_else(|e| panic!("{context} did not exit cleanly: {e}"));
     }
 
     /// Poll until the child exits, asserting a *non-zero* exit code — the fail-
