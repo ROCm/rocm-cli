@@ -765,11 +765,14 @@ mod tests {
 
     #[tokio::test]
     async fn approval_trigger_does_not_refire_on_follow_up() {
-        // `on_approval_result` appends the approved-action result as an Agent
-        // turn (not a new User turn) before raising the one-shot automatic
-        // follow-up. The trigger must key off the *last* turn only, so that
-        // follow-up call sees `[User(trigger), Agent(result)]` and does not
-        // re-surface approval a second time.
+        // Hand-builds the history shape that `app::on_approval_result`
+        // produces in production (it appends the approved-action result as
+        // an Agent turn, not a new User turn) and feeds it straight to
+        // `MockAgentClient::complete` — this does not call
+        // `on_approval_result` itself. It pins the mock's own approval
+        // trigger to key off the *last* turn only, so a follow-up call
+        // seeing `[User(trigger), Agent(result)]` does not re-surface
+        // approval a second time.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<ClientMsg>();
         let agent = MockAgentClient::with_tool_call_and_approval_trigger(
             "all good",
