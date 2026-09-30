@@ -20,6 +20,7 @@ mod e2e {
     pub mod artifact_steps;
     pub mod automations_steps;
     pub mod bench_steps;
+    pub mod bootstrap_steps;
     pub mod chat_steps;
     pub mod comfyui_steps;
     pub mod config_steps;
