@@ -1338,14 +1338,15 @@ jobs:
           path: tests/e2e-cucumber/results/
           # The copy-out step above is deliberately best-effort (it must not
           # report red just because an earlier step already failed the job),
-          # so this is the only place left to catch a copy that failed for its
-          # own reason: default `warn` would upload nothing, and the
-          # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
-          # omits any platform with no report.json rather than flagging it, so
-          # the lane would silently vanish from the report instead of showing
-          # as a failure. Only the WSL lanes need this: every other lane
-          # writes report.json directly in-job, with no extra guest-to-host
-          # copy step that can fail on its own.
+          # so a copy that failed for its own reason leaves results/ empty.
+          # `error` makes that a failed step here, in the lane that owns the
+          # copy, where default `warn` would upload nothing without a word.
+          # The consolidated report job's missing-report check flags the absent
+          # artifact too, and is the only signal on a `continue-on-error` lane:
+          # a failed step there does not turn the lane's check red. Only the
+          # WSL lanes need this guard: every other lane writes report.json
+          # directly in-job, with no guest-to-host copy step that can fail on
+          # its own.
           if-no-files-found: error
 
   # Third AMD GPU target: the rad3 cluster's Radeon AI PRO R9700S (gfx1201, 32GB),
@@ -1755,6 +1756,10 @@ jobs:
     name: E2E consolidated report (self-hosted)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # `actions: read` lets the missing-report check list this run's artifacts.
+    permissions:
+      contents: read
+      actions: read
     needs:
       - changes
       - e2e-gpu
@@ -1797,6 +1802,55 @@ jobs:
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
             --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+
+      # A lane that dies before writing report.json (preflight, build, a crash
+      # before results exist) uploads nothing, and `discover()` can only render
+      # the reports that arrived, so that lane would drop out of the grid with
+      # no row and no FAIL. On a `continue-on-error` lane nothing else is red
+      # either. So check it here: every lane that ran (any `needs` result but
+      # `skipped`) must have uploaded its report artifact. This reads the run's
+      # artifact list rather than e2e-artifacts/, because download-artifact
+      # flattens a single match into the root and loses its name. The list also
+      # holds earlier attempts' artifacts, so a re-run that uploads nothing can
+      # pass on the first attempt's report: this can miss a lane, but never
+      # flags one that did upload. LANE_REPORTS, and this script's behaviour,
+      # are pinned by xtask's workflow contract tests. The annotation quotes the
+      # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
+      # `success` even though the lane failed, so the absent artifact is the
+      # signal, not that value. `!cancelled()`, not `always()`: a run
+      # superseded mid-flight cuts lanes off before upload, which is not a gap.
+      - name: Check every lane that ran uploaded its report
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS: ${{ toJSON(needs) }}
+          LANE_REPORTS: |
+            e2e-gpu=e2e-gpu-report
+            e2e-gpu-strix-ubuntu=e2e-gpu-strix-ubuntu-report
+            e2e-gpu-strix-windows=e2e-gpu-strix-windows-report
+            e2e-wsl=e2e-gpu-strix-wsl-report
+            e2e-gpu-rad3=e2e-gpu-rad3-report
+            e2e-gpu-mi350p=e2e-gpu-mi350p-report
+            e2e-gpu-w7900=e2e-gpu-w7900-report
+        run: |
+          uploaded=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --jq '.artifacts[].name') || {
+            echo "::error::could not list this run's artifacts, so no lane was checked"
+            exit 1
+          }
+          missing=0
+          while IFS='=' read -r job artifact; do
+            [ -n "$job" ] || continue
+            result=$(jq -r --arg job "$job" '.[$job].result // "absent"' <<<"$NEEDS")
+            [ "$result" = skipped ] && continue
+            if ! grep -qxF "$artifact" <<<"$uploaded"; then
+              echo "::error::lane $job ran (needs result: $result) but uploaded no $artifact, so it is missing from the consolidated report"
+              echo "- :x: \`$job\` ran (needs result: $result) but uploaded no \`$artifact\`; it is missing from the grid above" >> "$GITHUB_STEP_SUMMARY"
+              missing=1
+            fi
+          done <<<"$LANE_REPORTS"
+          exit "$missing"
 
       - name: Upload consolidated report
         if: always()

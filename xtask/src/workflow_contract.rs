@@ -882,6 +882,386 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         }
     }
 
+    /// The non-empty lines of the `key: |` block scalar in `block`, trimmed.
+    fn block_scalar_lines(block: &str, key: &str) -> Vec<String> {
+        let marker = format!("{key}: |");
+        let mut lines = block.lines().skip_while(|line| line.trim() != marker);
+        let head = lines
+            .next()
+            .unwrap_or_else(|| panic!("block defines `{marker}`"));
+        let indent = indent_of(head);
+        lines
+            .take_while(|line| line.trim().is_empty() || indent_of(line) > indent)
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    const REPORT_CHECK_STEP: &str = "- name: Check every lane that ran uploaded its report";
+
+    /// A step block, found by its exact `- name:` line, including that line.
+    fn named_step(block: &str, name_line: &str) -> String {
+        let lines: Vec<&str> = block.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.trim() == name_line)
+            .unwrap_or_else(|| panic!("block has a step `{name_line}`"));
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
+            }
+            step.push_str(body);
+            step.push('\n');
+        }
+        step
+    }
+
+    /// The consolidated report job of each self-hosted workflow, with its
+    /// missing-report check step.
+    fn report_check_steps() -> Vec<(&'static str, String, &'static str, String)> {
+        self_hosted_workflows()
+            .into_iter()
+            .map(|(workflow, text)| {
+                let report_job = match workflow {
+                    "e2e-selfhosted.yml" => "e2e-report",
+                    "nightly.yml" => "e2e-report-nightly",
+                    other => panic!("no consolidated report job known for {other}"),
+                };
+                let step = named_step(job_block(&text, report_job), REPORT_CHECK_STEP);
+                (workflow, text, report_job, step)
+            })
+            .collect()
+    }
+
+    /// The report artifact a lane's upload step names (`name: e2e-*-report`).
+    fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
+        let names: Vec<&str> = job_block(text, job)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("name: "))
+            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
+             found {names:?}"
+        );
+        names[0].to_owned()
+    }
+
+    #[test]
+    fn every_lane_that_runs_is_checked_for_its_report_artifact() {
+        // A lane that dies before writing report.json uploads nothing, and the
+        // consolidated grid can only render reports that arrived, so the lane
+        // drops out with no row and no FAIL — and on a `continue-on-error` lane
+        // nothing else is red either. The report job's missing-report check is
+        // what catches that, and it only knows a lane through LANE_REPORTS.
+        //
+        // Derived from the lanes, like its siblings: a new lane fails here until
+        // it is added to the map under the exact artifact name its upload step
+        // uses — a misspelt name would flag the lane missing on every run, and
+        // an absent one would leave it uncovered.
+        let steps = report_check_steps();
+        for (workflow, text, report_job, step) in &steps {
+            let (workflow, report_job) = (*workflow, *report_job);
+            let block = job_block(text, report_job);
+            let lanes = self_hosted_e2e_jobs(text);
+            let expected: Vec<String> = lanes
+                .iter()
+                .map(|(job, _)| format!("{job}={}", uploaded_report_artifact(workflow, text, job)))
+                .collect();
+            // Read from the step itself, so a LANE_REPORTS left elsewhere in the
+            // job after the step is deleted cannot satisfy this.
+            assert_eq!(
+                block_scalar_lines(step, "LANE_REPORTS"),
+                expected,
+                "{workflow} `{report_job}`: LANE_REPORTS must map every self-hosted lane, \
+                 in workflow order, to the artifact its upload step names"
+            );
+            for (job, _) in &lanes {
+                assert!(
+                    block.lines().any(|line| line.trim() == format!("- {job}")),
+                    "{workflow} `{report_job}` must list `{job}` under needs, or the \
+                     missing-report check cannot see whether it ran"
+                );
+            }
+            assert!(
+                block.lines().any(|line| line.trim() == "actions: read"),
+                "{workflow} `{report_job}` needs `actions: read` to list the run's artifacts"
+            );
+            // `!cancelled()` rather than the implicit `success()`: the check has
+            // to run precisely when an earlier step or a lane has failed.
+            let step_lines: Vec<&str> = step.lines().map(str::trim).collect();
+            for required in [
+                "if: ${{ !cancelled() }}",
+                "GH_TOKEN: ${{ github.token }}",
+                "NEEDS: ${{ toJSON(needs) }}",
+            ] {
+                assert!(
+                    step_lines.contains(&required),
+                    "{workflow} `{report_job}`'s missing-report check must carry `{required}`"
+                );
+            }
+        }
+        // The script is copied into both workflows; a fix applied to one twin
+        // must not silently miss the other.
+        let bodies: Vec<String> = steps
+            .iter()
+            .map(|(_, _, _, step)| {
+                dedent(&run_block(step).expect("the check step has a `run: |` block"))
+                    .expect("the check step's script is not empty")
+            })
+            .collect();
+        assert_eq!(
+            bodies[0], bodies[1],
+            "the missing-report check scripts in e2e-selfhosted.yml and nightly.yml have drifted"
+        );
+    }
+
+    /// Run a report job's missing-report check script under `bash -e`, as a
+    /// `run:` step does, with a stub `gh` that lists `uploaded` (or fails when
+    /// `uploaded` is `None`) and a `needs` context of `results`.
+    #[cfg(unix)]
+    fn run_report_check(
+        step: &str,
+        results: &[(&str, &str)],
+        uploaded: Option<&[&str]>,
+    ) -> (i32, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let script = dir.path().join("check.sh");
+        let listing = dir.path().join("artifacts.txt");
+        let summary = dir.path().join("summary.md");
+        let stub = dir.path().join("gh");
+        std::fs::write(
+            &script,
+            dedent(&run_block(step).expect("the check step has a `run: |` block"))
+                .expect("the check step's script is not empty"),
+        )
+        .expect("write script");
+        std::fs::write(&summary, "").expect("write summary");
+        match uploaded {
+            Some(names) => {
+                std::fs::write(&listing, names.join("\n") + "\n").expect("write listing");
+                std::fs::write(&stub, "#!/bin/sh\ncat \"$LISTING\"\n").expect("write gh stub");
+            }
+            None => std::fs::write(&stub, "#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n")
+                .expect("write gh stub"),
+        }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("make the stub executable");
+
+        let needs: serde_json::Map<String, serde_json::Value> = results
+            .iter()
+            .map(|(job, result)| ((*job).to_owned(), serde_json::json!({ "result": result })))
+            .collect();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-e")
+            .arg(&script)
+            .env("PATH", path)
+            .env("LISTING", &listing)
+            .env("NEEDS", serde_json::Value::Object(needs).to_string())
+            // A `|` block scalar ends in a newline, as GitHub passes it, so the
+            // script's read loop sees a trailing empty line it must skip.
+            .env(
+                "LANE_REPORTS",
+                block_scalar_lines(step, "LANE_REPORTS").join("\n") + "\n",
+            )
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env("GITHUB_RUN_ID", "1")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .output()
+            .expect("running the check script");
+        let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+        log.push_str(&String::from_utf8_lossy(&out.stderr));
+        (
+            out.status.code().expect("check exited with a status code"),
+            log,
+            std::fs::read_to_string(&summary).expect("read summary"),
+        )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_report_check_flags_only_lanes_that_ran_without_a_report() {
+        // The contract test above pins the check's inputs; this runs its logic,
+        // so a check that never fails (or always does) cannot pass for one.
+        let has_jq = std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !has_jq {
+            // A skip reads as a pass, so on CI a missing `jq` must fail loudly
+            // rather than leave the check's logic silently untested.
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "`jq` is not on PATH, so the missing-report check's logic cannot be \
+                 exercised; install it on this runner"
+            );
+            eprintln!("skipping: no `jq` on PATH");
+            return;
+        }
+        let (.., step) = report_check_steps()
+            .into_iter()
+            .find(|(workflow, ..)| *workflow == "e2e-selfhosted.yml")
+            .expect("the per-PR workflow has a report check");
+        let lanes: Vec<(String, String)> = block_scalar_lines(&step, "LANE_REPORTS")
+            .iter()
+            .map(|line| {
+                let (job, artifact) = line.split_once('=').expect("`job=artifact`");
+                (job.to_owned(), artifact.to_owned())
+            })
+            .collect();
+        let jobs: Vec<&str> = lanes.iter().map(|(job, _)| job.as_str()).collect();
+        let every_artifact: Vec<&str> = lanes.iter().map(|(_, a)| a.as_str()).collect();
+        let (victim, victim_artifact) = (&lanes[0].0, &lanes[0].1);
+        let all = |result: &'static str| -> Vec<(&str, &str)> {
+            jobs.iter().map(|job| (*job, result)).collect()
+        };
+        let without_victim: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| a != victim_artifact)
+            .collect();
+        let mut with_changes = all("success");
+        with_changes.push(("changes", "success"));
+
+        let (code, log, summary) = run_report_check(&step, &with_changes, Some(&every_artifact));
+        assert_eq!(
+            code, 0,
+            "every lane reported, so nothing is missing:\n{log}"
+        );
+        assert!(
+            summary.is_empty(),
+            "nothing missing, nothing summarised: {summary}"
+        );
+
+        let mut failed = all("success");
+        failed[0].1 = "failure";
+        let (code, log, summary) = run_report_check(&step, &failed, Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a lane that ran and uploaded nothing must fail:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {victim} ran")) && log.contains(victim_artifact),
+            "the annotation must name the lane and its artifact:\n{log}"
+        );
+        assert!(
+            summary.contains(victim.as_str()),
+            "the summary must name the lane: {summary}"
+        );
+
+        // A continue-on-error lane may present as `success`; the missing
+        // artifact alone has to be enough.
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a missing report fails whatever the needs result:\n{log}"
+        );
+
+        let mut skipped = all("success");
+        skipped[0].1 = "skipped";
+        let (code, log, _) = run_report_check(&step, &skipped, Some(&without_victim));
+        assert_eq!(
+            code, 0,
+            "a skipped lane uploads nothing and is not missing:\n{log}"
+        );
+
+        // A single-platform dispatch skips most lanes. Skipping one must move
+        // on to the next lane, not stop checking: skip a middle lane while the
+        // last one is missing.
+        assert!(
+            lanes.len() >= 3,
+            "these cases need a first, middle and last lane"
+        );
+        let (middle_artifact, (last, last_artifact)) = (&lanes[1].1, lanes.last().unwrap());
+        let mut skip_middle = all("success");
+        skip_middle[1].1 = "skipped";
+        let after_skip: Vec<&str> = every_artifact
+            .iter()
+            .copied()
+            .filter(|a| a != middle_artifact && a != last_artifact)
+            .collect();
+        let (code, log, _) = run_report_check(&step, &skip_middle, Some(&after_skip));
+        assert_eq!(
+            code, 1,
+            "lanes after a skipped one must still be checked:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("::error::lane {last} ran")),
+            "the missing lane after the skipped one must be named:\n{log}"
+        );
+
+        // Every missing lane is reported, not just the first one found.
+        let two_missing: Vec<&str> = without_victim
+            .iter()
+            .copied()
+            .filter(|a| a != last_artifact)
+            .collect();
+        let (code, log, summary) = run_report_check(&step, &all("success"), Some(&two_missing));
+        assert_eq!(code, 1, "two lanes missing must fail:\n{log}");
+        for lane in [victim, last] {
+            assert!(
+                log.contains(&format!("::error::lane {lane} ran"))
+                    && summary.contains(lane.as_str()),
+                "every missing lane must be named, including `{lane}`:\n{log}\n{summary}"
+            );
+        }
+
+        // A lane absent from `needs` has no result to say it was skipped, so
+        // it is checked rather than waved through.
+        let (code, log, _) = run_report_check(&step, &all("success")[1..], Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a lane missing from `needs` must not pass unchecked:\n{log}"
+        );
+        assert!(
+            log.contains("needs result: absent"),
+            "the annotation must show the lane had no `needs` entry:\n{log}"
+        );
+
+        // `cancelled` is what a lane cut off by its timeout reports: it is
+        // checked like any lane that ran, and passes only if it still uploaded.
+        let mut timed_out = all("success");
+        timed_out[0].1 = "cancelled";
+        let (code, log, _) = run_report_check(&step, &timed_out, Some(&without_victim));
+        assert_eq!(
+            code, 1,
+            "a timed-out lane that uploaded nothing is missing:\n{log}"
+        );
+        let (code, log, _) = run_report_check(&step, &timed_out, Some(&every_artifact));
+        assert_eq!(
+            code, 0,
+            "a timed-out lane that still uploaded is not missing:\n{log}"
+        );
+
+        let mut near_miss = without_victim.clone();
+        let stale = format!("{victim_artifact}-old");
+        near_miss.push(&stale);
+        let (code, log, _) = run_report_check(&step, &all("success"), Some(&near_miss));
+        assert_eq!(
+            code, 1,
+            "only the exact artifact name satisfies the check:\n{log}"
+        );
+
+        let (code, log, _) = run_report_check(&step, &all("success"), None);
+        assert_eq!(code, 1, "an unlistable run must not pass unchecked:\n{log}");
+        assert!(
+            log.contains("could not list this run's artifacts"),
+            "an API failure must say so rather than fail silently:\n{log}"
+        );
+    }
+
     /// Every `GPU preflight` step block in `text`, in file order.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         let lines: Vec<&str> = text.lines().collect();
