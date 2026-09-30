@@ -296,7 +296,11 @@ fix` takes the id, not the position.
   the tool that wrote the report rather than something read off the machine.
   The distribution is checked against a list of known names rather than
   repeated from the machine. Hardware that is not on AMD's published
-  compatibility matrix produces no report at all, and the CLI says why.
+  compatibility matrix produces no report at all, and the CLI says why. So
+  does a WSL machine, for a different reason: this CLI does not inspect the
+  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+  matrix and says that rather than claiming the architecture could not be
+  read.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
