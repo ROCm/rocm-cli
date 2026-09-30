@@ -401,6 +401,10 @@ impl Examination {
             // the reconciled list rather than the whole bus.
             probe_gpus_kernel_membership(&mut e);
             probe_gpus_rocminfo(&mut e);
+            // After `rocminfo`, because it is the probe most likely to name a
+            // card the PCI scan missed, and before the sysfs fallback, which
+            // plants the same placeholder with a note of its own.
+            note_unnamed_kernel_topology_gpus(&mut e);
             probe_gpus_sysfs_fallback(&mut e);
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
@@ -1155,6 +1159,27 @@ fn extract_lspci_name(line: &str) -> String {
     trimmed.trim().to_owned()
 }
 
+/// The name a GPU carries when the kernel topology is all we have to go on.
+///
+/// A placeholder, not a name: it says "AMD GPU, source known, model unknown".
+/// Both probes that can produce a GPU without a marketing name use it, and
+/// [`gpu_name_is_unknown`] reads it back, so it has to be one string rather
+/// than three copies that could drift apart.
+const KERNEL_TOPOLOGY_GPU_NAME: &str = "AMD GPU (from kernel topology)";
+
+/// Whether this GPU still has no real model name.
+///
+/// [`KERNEL_TOPOLOGY_GPU_NAME`] has to count as unknown here. The membership
+/// pass runs *before* `rocminfo` and stamps that placeholder on every kernel
+/// node the PCI scan could not name; if a later probe treated it as a name
+/// already present, the placeholder would outrank the marketing name `rocminfo`
+/// supplies and the report would be strictly worse than before the membership
+/// pass existed -- on exactly the host the pass was written for, the ordinary
+/// ROCm container with `rocminfo` but no `pciutils`.
+fn gpu_name_is_unknown(name: &str) -> bool {
+    name.is_empty() || name == KERNEL_TOPOLOGY_GPU_NAME
+}
+
 fn probe_gpus_rocminfo(e: &mut Examination) {
     if !which("rocminfo") {
         e.rocminfo_present = false;
@@ -1176,7 +1201,17 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
         return;
     }
     e.rocminfo_status = "ok".to_owned();
+    apply_rocminfo_gpu_agents(e, &out);
+}
 
+/// Fold a `rocminfo` reading into the GPU list, against caller-supplied output.
+///
+/// Split from the process launch the same way [`apply_kernel_gpu_membership`] is
+/// split from the `/sys` read, and for the same reason: the interesting
+/// behaviour here is how an agent is matched onto an existing entry, and a test
+/// that had to run the real `rocminfo` could only assert it on a host with a
+/// GPU. See `a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder`.
+fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
     let mut gfx_targets: Vec<(String, String)> = Vec::new();
     let mut cur_name = String::new();
     let mut cur_marketing = String::new();
@@ -1216,7 +1251,7 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
         if let Some(&gpu_idx) = amd_indices.get(idx) {
             let gpu = &mut e.gpus[gpu_idx];
             gpu.gfx_target = gfx.clone();
-            if !marketing.is_empty() && gpu.name.is_empty() {
+            if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
                 gpu.name = marketing;
             }
             gpu.is_apu = Some(gfx_is_apu_family(&gfx));
@@ -1269,7 +1304,7 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     // `Some(false)` to populate has_apu / has_discrete_amd. Claiming either
     // would be inventing a fact, so both stay false and only has_amd_gpu moves.
     e.gpus.push(Gpu {
-        name: "AMD GPU (from kernel topology)".to_owned(),
+        name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
         gfx_target,
         is_amd: true,
         is_apu: None,
@@ -1300,7 +1335,33 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
 /// card, which must survive untouched.
 #[cfg(any(target_os = "linux", test))]
 fn probe_gpus_kernel_membership(e: &mut Examination) {
+    // The status is dropped: both answers call for the same action here. It is
+    // returned at all so that a test can tell them apart -- see
+    // [`KfdTopology`].
     probe_gpus_kernel_membership_in(e, Path::new("/sys/class/kfd/kfd/topology/nodes"));
+}
+
+/// What the kernel topology had to say, as opposed to what was done about it.
+///
+/// "There is no KFD to read" and "KFD listed no GPU" are different answers that
+/// happen to call for the same action -- leave the PCI enumeration standing --
+/// and that coincidence is precisely why the distinction went untested. With
+/// both collapsed into a no-op, replacing the read's early return with
+/// `unwrap_or_default()`, which turns "cannot read" into "read an empty
+/// topology", left the entire suite green: `apply_kernel_gpu_membership`'s own
+/// `nodes.is_empty()` guard absorbed the difference, so no assertion about the
+/// resulting report could ever have noticed.
+///
+/// Naming the answer separately from the action is what makes it assertable.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KfdTopology {
+    /// No KFD to read: `amdgpu` never loaded, the node directory is absent, or
+    /// this is a container without it. "Cannot say", not "no GPUs".
+    Unreadable,
+    /// KFD answered, describing this many GPU nodes. Zero is a real answer --
+    /// the driver is there and bound nothing -- and is not the same statement.
+    Read(usize),
 }
 
 /// KFD is a Linux interface, so off Linux there is no topology to read.
@@ -1322,11 +1383,12 @@ const fn probe_gpus_kernel_membership(_e: &mut Examination) {}
 /// `the_membership_probe_reconciles_the_topology_it_is_pointed_at`, which fails
 /// if that handoff goes away.
 #[cfg(any(target_os = "linux", test))]
-fn probe_gpus_kernel_membership_in(e: &mut Examination, nodes_dir: &Path) {
+fn probe_gpus_kernel_membership_in(e: &mut Examination, nodes_dir: &Path) -> KfdTopology {
     let Some(nodes) = crate::kfd_gpu_nodes_in(nodes_dir) else {
-        return;
+        return KfdTopology::Unreadable;
     };
     apply_kernel_gpu_membership(e, &nodes);
+    KfdTopology::Read(nodes.len())
 }
 
 /// The reconcile itself, against a caller-supplied topology reading.
@@ -1353,7 +1415,6 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         .into_iter()
         .partition(|gpu| gpu.is_amd);
     let mut claimed = vec![false; from_pci.len()];
-    let mut unnamed = 0usize;
 
     let mut gpus: Vec<Gpu> = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -1367,9 +1428,13 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
             // Kernel-visible but absent from the PCI scan: no `lspci` on PATH,
             // or a node whose address could not be decoded. The device is still
             // usable, so it must be listed -- just without the enriched name.
-            unnamed += 1;
+            //
+            // A placeholder, and deliberately not a note: `rocminfo` has not run
+            // yet and may well supply the real marketing name, so whether this
+            // device is *finally* unnamed is not knowable here. That verdict is
+            // left to `note_unnamed_kernel_topology_gpus`, after naming is done.
             gpus.push(Gpu {
-                name: "AMD GPU (from kernel topology)".to_owned(),
+                name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
                 gfx_target: node.gfx_target.clone(),
                 pci_id: node.pci_id.clone(),
                 is_amd: true,
@@ -1410,15 +1475,35 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
             unexposed.join(", ")
         ));
     }
+    e.gpus = gpus;
+    e.gpus.extend(others);
+}
+
+/// Report which kernel-sourced GPUs ended up with no model name, once nothing
+/// left can supply one.
+///
+/// Separate from [`apply_kernel_gpu_membership`], which is where the count used
+/// to be taken, because that pass runs before `probe_gpus_rocminfo`. Counting
+/// there asserted "their marketing name is unknown" while the probe that most
+/// often knows the name had not yet run -- so the note fired even on hosts whose
+/// report went on to name every card.
+///
+/// Must run after `probe_gpus_rocminfo` and before `probe_gpus_sysfs_fallback`:
+/// the first is what resolves the placeholder, and the second plants the same
+/// placeholder again with a note of its own, which this would otherwise count a
+/// second time.
+fn note_unnamed_kernel_topology_gpus(e: &mut Examination) {
+    let unnamed = e
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.is_amd && gpu.name == KERNEL_TOPOLOGY_GPU_NAME)
+        .count();
     if unnamed > 0 {
         e.notes.push(format!(
             "{unnamed} GPU(s) were taken from the kernel topology because the PCI enumeration \
              did not list them; their marketing name is unknown."
         ));
     }
-
-    e.gpus = gpus;
-    e.gpus.extend(others);
 }
 
 /// Whether two PCI addresses name the same device. An empty address matches
@@ -3084,6 +3169,10 @@ mod tests {
         // lspci is unavailable to confirm it.
         assert_eq!(e.gpus[0].pci_id, "0000:11:00.0");
         assert_eq!(e.gpus[1].gfx_target, "gfx942");
+        // The note is no longer the membership pass's to emit -- `rocminfo` runs
+        // after it and may name these -- so the verdict comes from the pass that
+        // runs once naming is final. Nothing named them here, so it must fire.
+        note_unnamed_kernel_topology_gpus(&mut e);
         assert!(
             e.notes.join("\n").contains("marketing name is unknown"),
             "an unnamed entry must say so: {:?}",
@@ -3301,24 +3390,131 @@ mod tests {
 
     #[test]
     fn the_membership_probe_leaves_the_report_alone_when_the_topology_is_unreadable() {
-        // The early return. No KFD at all -- `amdgpu` never loaded, or this is
-        // not Linux -- is "cannot say", not "no GPUs", so the PCI enumeration
-        // must come back exactly as it went in and no note may be invented.
-        let mut e = Examination {
+        // "Unreadable" and "readable but empty" are different answers -- "cannot
+        // say" versus "the driver bound nothing" -- and each is a no-op for its
+        // own reason. Asserting only that the report is untouched cannot tell
+        // them apart: it passed even with the early return replaced by
+        // `unwrap_or_default()`, which collapses the first into the second,
+        // because `apply_kernel_gpu_membership`'s own empty-guard absorbed it.
+        //
+        // So discriminate on something only the early return can produce: the
+        // reconcile must never be *entered* at all. A planted topology with a
+        // CPU node and no GPU node is the readable-but-empty case, and it is
+        // given an empty PCI list so that entering the reconcile would be
+        // observable -- if that path ran, it would take the `nodes.is_empty()`
+        // guard. The unreadable case is given the eight-card bus, which the
+        // reconcile would rewrite to nothing had it been reached with an empty
+        // node list.
+        let mut unreadable = Examination {
             gpus: mi300x_bus_gpus(),
             ..Examination::default()
         };
-        probe_gpus_kernel_membership_in(
-            &mut e,
+        let verdict = probe_gpus_kernel_membership_in(
+            &mut unreadable,
             &std::env::temp_dir().join("rocm-cli-absent-kfd-topology-nodes"),
         );
-
         assert_eq!(
-            e.gpus,
+            unreadable.gpus,
             mi300x_bus_gpus(),
             "an unreadable topology must leave the PCI enumeration untouched"
         );
-        assert!(e.notes.is_empty(), "notes: {:#?}", e.notes);
+        assert!(
+            unreadable.notes.is_empty(),
+            "notes: {:#?}",
+            unreadable.notes
+        );
+        // The discriminating assertion. Every assertion above is satisfied by
+        // the reconcile's `nodes.is_empty()` guard just as well as by the early
+        // return, which is why they could not fail when the two were collapsed.
+        // This one can only hold if the read itself reported "cannot say".
+        assert_eq!(
+            verdict,
+            KfdTopology::Unreadable,
+            "a missing node directory is \"cannot say\", which is not the same answer as \
+             \"KFD listed no GPU\" -- collapsing them must fail here"
+        );
+
+        // The other case, through the same entry point: a topology the kernel
+        // *does* expose, listing zero GPUs. Also a no-op on the report, but for
+        // its own reason -- the driver bound nothing, which is a fact, where the
+        // case above is the absence of one.
+        let (root, nodes) = plant_kfd_topology("membership-readable-empty", &[]);
+        let mut empty = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        let verdict = probe_gpus_kernel_membership_in(&mut empty, &nodes);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            verdict,
+            KfdTopology::Read(0),
+            "a readable topology with no GPU node must report itself read, not unreadable"
+        );
+        assert_eq!(
+            empty.gpus,
+            mi300x_bus_gpus(),
+            "a readable topology with no GPU node must leave the PCI list standing: the card is \
+             on the bus and the driver did not bind, which is the single most useful thing \
+             `examine` can say there"
+        );
+        assert!(empty.notes.is_empty(), "notes: {:#?}", empty.notes);
+    }
+
+    #[test]
+    fn a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder() {
+        // The ordinary ROCm container: `rocminfo` present, `pciutils` absent --
+        // the shape this whole change was written for. The PCI scan enumerates
+        // nothing, so the membership pass contributes the kernel's node under a
+        // placeholder name, and `rocminfo` runs *after* it.
+        //
+        // The placeholder must therefore not count as a name already present.
+        // When it did, it outranked the marketing name and the user saw
+        // "AMD GPU (from kernel topology)" on a host that previously reported
+        // "AMD Instinct MI300X" -- a regression the change inflicted on its own
+        // target scenario.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:5d:00.0".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            }],
+        );
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "the kernel's node must be listed even with no PCI scan to name it"
+        );
+        assert_eq!(e.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n\
+             Agent 2\n  Name:  gfx942\n  Marketing Name:  AMD Instinct MI300X\n  \
+             Device Type:  GPU\n",
+        );
+        note_unnamed_kernel_topology_gpus(&mut e);
+
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "`rocminfo` must map its agent onto the kernel's entry, not add a second: {:#?}",
+            e.gpus
+        );
+        assert_eq!(
+            e.gpus[0].name, "AMD Instinct MI300X",
+            "the marketing name must survive the placeholder, not lose to it"
+        );
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert_eq!(
+            e.gpus[0].pci_id, "0000:5d:00.0",
+            "the address the kernel supplied must not be lost in the naming"
+        );
+        assert!(
+            !e.notes.join("\n").contains("marketing name is unknown"),
+            "the name is known -- `rocminfo` just supplied it -- so the note must not fire: {:#?}",
+            e.notes
+        );
     }
 
     #[test]
