@@ -12417,10 +12417,14 @@ Class Name:                Display
         // `<root>/<engine>/envs` shape built on it. It deliberately does NOT
         // claim to cover the host-normalisation step, and routing the expected
         // value through the same call the production code makes is why: on a
-        // non-Windows target `normalize_runtime_path_for_host` is the identity
-        // for every input (see `normalize_runtime_path_text_for_platform`), so
-        // dropping normalisation from the override arm cannot fail this on a
-        // Linux lane — nor, with an already-normal temp path, on a Windows one.
+        // non-Windows target `normalize_runtime_path_for_host` returns its
+        // input unchanged (see `normalize_runtime_path_text_for_platform`) for
+        // any path these tests can produce, so dropping normalisation from the
+        // override arm cannot fail this on a Linux lane — nor, with an
+        // already-normal temp path, on a Windows one. Not the identity in the
+        // strict sense: the helper round-trips through `Path::display()`, which
+        // is lossy for a non-UTF-8 path. Temp paths here are UTF-8, so the
+        // distinction does not reach this assertion, but it is not a no-op.
         // Making it fail would need the platform threaded through the seam, and
         // the normaliser itself is already covered on every host by
         // `runtime_path_normalization_accepts_windows_drive_forms` and its

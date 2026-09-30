@@ -108,27 +108,88 @@ mod tests {
     /// Named helpers that serialize env mutation for their whole scope.
     ///
     /// Anything ending `_TEST_LOCK` counts too, and is matched by suffix rather
-    /// than listed — see [`serializes`]. A fixed list of lock NAMES went stale
+    /// than listed — see [`lock_name_column`]. A fixed list of lock NAMES went stale
     /// within days of this guard being written: `main` added
     /// `UPDATE_CHECK_ENV_TEST_LOCK` and the guard then flagged correctly
     /// disciplined code and told its author to rename the lock.
     const NAMED_SERIALIZERS: [&str; 2] = ["ScopedTestEnv", "ScopedEnvVar"];
 
-    /// Whether `text` takes one of the process-wide serializers.
-    ///
-    /// The suffix rule recognises the DISCIPLINE rather than a specific lock, so
-    /// a new `*_TEST_LOCK` is covered the day it is declared. It is a suffix and
-    /// not a substring on purpose: `NOT_A_TEST_LOCK_HELPER` names something else.
+    /// Where `line` takes a serializer, as a column, or `None` if it does not.
     ///
     /// Applied per LINE by the caller, which is what lets it answer "was the
     /// lock taken before this mutation?" rather than merely "somewhere in this
     /// body". Every lock in this tree names itself on the line that acquires it
     /// (`let _guard = SOME_TEST_LOCK` ...), so a per-line match loses nothing.
-    fn serializes(text: &str) -> bool {
-        NAMED_SERIALIZERS.iter().any(|name| text.contains(name))
-            || text
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .any(|word| word.ends_with("_TEST_LOCK"))
+    ///
+    /// A column rather than a bool because that per-line answer is not enough
+    /// on its own: the caller also has to order the acquisition against a
+    /// mutation on the SAME line. Comparing by line number alone read
+    /// `set_var(..); let _g = LOCK.lock();` as serialized, which is the
+    /// retroactive-lock bug the per-line rule was introduced to stop, written
+    /// on one line instead of two.
+    ///
+    /// A `*_TEST_LOCK` has to be ACQUIRED, not merely named: `let _x = &LOCK;`
+    /// mentions one and holds nothing. `rest` carries the remainder of the
+    /// statement for that check, because rustfmt splits the real shape —
+    ///
+    /// ```text
+    /// let _guard = PROCESS_ENV_TEST_LOCK
+    ///     .lock()
+    ///     .unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// ```
+    ///
+    /// — across three lines, so demanding `.lock(` on the naming line would
+    /// reject every correctly disciplined test in `crates/rocm-core`.
+    ///
+    /// `NAMED_SERIALIZERS` are types, not mutexes, so they carry no `.lock(`
+    /// and are matched on the name alone.
+    fn serializer_column(line: &str, rest: &str) -> Option<usize> {
+        if let Some(at) = NAMED_SERIALIZERS.iter().filter_map(|n| line.find(n)).min() {
+            return Some(at);
+        }
+        let at = lock_name_column(line)?;
+        (line[at..].contains(".lock(") || rest.contains(".lock(")).then_some(at)
+    }
+
+    /// The column a `*_TEST_LOCK` static is named at.
+    ///
+    /// The suffix rule recognises the DISCIPLINE rather than a specific lock,
+    /// so a new `*_TEST_LOCK` is covered the day it is declared. It is a suffix
+    /// and not a substring on purpose: `NOT_A_TEST_LOCK_HELPER` names something
+    /// else.
+    fn lock_name_column(line: &str) -> Option<usize> {
+        const SUFFIX: &str = "_TEST_LOCK";
+        let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        line.match_indices(SUFFIX).find_map(|(at, _)| {
+            let ends_word = line[at + SUFFIX.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !identifier(c));
+            let start = line[..at]
+                .rfind(|c: char| !identifier(c))
+                .map_or(0, |i| i + 1);
+            ends_word.then_some(start)
+        })
+    }
+
+    /// The rest of the statement beginning at `lines[index]`.
+    ///
+    /// Empty when that line already ends the statement. Bounded, because a line
+    /// with no `;` after it at all — the last line of a truncated file — would
+    /// otherwise drag the whole remainder of the body in; rustfmt's widest
+    /// split of a lock acquisition is three lines.
+    fn statement_continuation(lines: &[&str], index: usize) -> String {
+        if lines.get(index).is_some_and(|line| line.contains(';')) {
+            return String::new();
+        }
+        let mut out = String::new();
+        for line in lines.iter().skip(index + 1).take(4) {
+            out.push_str(line);
+            if line.contains(';') {
+                break;
+            }
+        }
+        out
     }
 
     /// Replace the CONTENTS of string literals, char literals and comments with
@@ -297,7 +358,7 @@ mod tests {
         // and strips the same span. The single character of difference is the
         // `b` itself, emitted as code rather than as a space. Four things read
         // the stripped text — the brace counter, the names in `MUTATIONS`,
-        // [`serializes`] and [`has_test_attribute`] — and a `b` whose only
+        // [`serializer_column`] and [`has_test_attribute`] — and a `b` whose only
         // neighbour on the right is the stripped literal's run of spaces cannot
         // complete a brace, a `set_var(`, a `_TEST_LOCK`/`ScopedTestEnv`, or a
         // `#[`. Equivalent on every path that reads it, so a test for it would
@@ -368,6 +429,10 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Offense {
         line: usize,
+        /// Column the call starts at, used only to order it against a
+        /// serializer taken on the same line. Never reported: the offender is
+        /// located by `file:line`, and a column would go stale under rustfmt.
+        column: usize,
         call: String,
     }
 
@@ -375,9 +440,11 @@ mod tests {
     struct OpenTest {
         /// The brace depth the body opened at; it closes on the way back down.
         open_depth: usize,
-        /// The first line that took a serializer, if any. A mutation is exempt
-        /// only from that line ONWARD — see [`OpenTest::unserialized_hits`].
-        serialized_at: Option<usize>,
+        /// Where the first serializer was taken, as `(line, column)`, if any. A
+        /// mutation is exempt only from that POINT onward — see
+        /// [`OpenTest::unserialized_hits`]. The column is what keeps a lock
+        /// written after a mutation on the same line from covering it.
+        serialized_at: Option<(usize, usize)>,
         hits: Vec<Offense>,
     }
 
@@ -392,7 +459,10 @@ mod tests {
         fn unserialized_hits(&self) -> impl Iterator<Item = Offense> + '_ {
             self.hits
                 .iter()
-                .filter(move |hit| self.serialized_at.is_none_or(|at| hit.line < at))
+                .filter(move |hit| {
+                    self.serialized_at
+                        .is_none_or(|at| (hit.line, hit.column) < at)
+                })
                 .cloned()
         }
     }
@@ -436,13 +506,30 @@ mod tests {
     /// production code, and test-support types such as `ScopedTestEnv` whose
     /// whole job is to perform the mutation on a test's behalf.
     fn env_mutations_in_unserialized_tests(text: &str) -> Vec<Offense> {
+        scan(text).offenses
+    }
+
+    /// What one pass over a file saw.
+    ///
+    /// `bodies` exists so the whole-tree assertion can tell "no offenders" from
+    /// "nothing was scanned" — see
+    /// `the_whole_tree_scan_actually_enters_test_bodies`.
+    struct Scan {
+        offenses: Vec<Offense>,
+        bodies: usize,
+    }
+
+    fn scan(text: &str) -> Scan {
         let stripped = strip_literals_and_comments(text);
+        let lines: Vec<&str> = stripped.lines().collect();
         let mut offenses = Vec::new();
+        let mut bodies = 0usize;
         let mut depth: usize = 0;
         let mut pending_test_attr = false;
         let mut current: Option<OpenTest> = None;
 
-        for (index, line) in stripped.lines().enumerate() {
+        for index in 0..lines.len() {
+            let line = lines[index];
             let code = line.trim();
 
             if current.is_none() && has_test_attribute(code) {
@@ -459,6 +546,7 @@ mod tests {
             // that one used to slip through in silence.
             if pending_test_attr && opens > 0 {
                 pending_test_attr = false;
+                bodies += 1;
                 current = Some(OpenTest {
                     open_depth: depth,
                     serialized_at: None,
@@ -471,14 +559,20 @@ mod tests {
             }
 
             if let Some(open) = current.as_mut() {
-                // Before the hit, so a lock and a mutation on ONE line counts as
-                // serialized -- the lock is taken first in source order.
-                if open.serialized_at.is_none() && serializes(code) {
-                    open.serialized_at = Some(index + 1);
+                if open.serialized_at.is_none()
+                    && let Some(column) =
+                        serializer_column(code, &statement_continuation(&lines, index))
+                {
+                    open.serialized_at = Some((index + 1, column));
                 }
-                if let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle)) {
+                if let Some((column, found)) = MUTATIONS
+                    .iter()
+                    .filter_map(|needle| code.find(*needle).map(|at| (at, *needle)))
+                    .min()
+                {
                     open.hits.push(Offense {
                         line: index + 1,
+                        column,
                         // Without the `(` the needle carries; the offender is
                         // named by the call, not by the match pattern.
                         call: found.trim_end_matches('(').to_owned(),
@@ -513,7 +607,7 @@ mod tests {
             offenses.extend(open.unserialized_hits());
         }
 
-        offenses
+        Scan { offenses, bodies }
     }
 
     #[test]
@@ -544,6 +638,40 @@ mod tests {
              cannot check for you: two tests replacing one key under two \
              different mutexes both satisfy it and still race. Offenders:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// The whole-tree assertion above is `offenders.is_empty()`, which also
+    /// holds when the scan entered no test bodies at all.
+    ///
+    /// `workspace_rust_sources` pins that files were found; nothing pinned that
+    /// test code inside them was reached. An arming regression — the attribute
+    /// rule narrowing, the brace bookkeeping closing bodies early — would turn
+    /// the guard off and read as a green gate, which is the one failure mode
+    /// this module is written against.
+    ///
+    /// The floor is deliberately far below the real count (3218 at the time of
+    /// writing) and is not a census: it has to survive tests being added and
+    /// removed without anyone remembering this number, while still failing
+    /// loudly if arming collapses.
+    #[test]
+    fn the_whole_tree_scan_actually_enters_test_bodies() {
+        const FLOOR: usize = 500;
+
+        let bodies: usize = workspace_rust_sources()
+            .iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+                scan(&text).bodies
+            })
+            .sum();
+
+        assert!(
+            bodies >= FLOOR,
+            "the scan entered {bodies} test bodies across the tree, under the \
+             {FLOOR} floor -- the guard is not looking at test code any more, \
+             so its green result means nothing"
         );
     }
 
@@ -1162,6 +1290,48 @@ mod tests {
             env_mutations_in_unserialized_tests(&same_line).is_empty(),
             "a lock earlier on the same line precedes the mutation"
         );
+
+        // ...and the same line the other way round is NOT. Ordering by line
+        // number alone accepted this, which is the same retroactive lock the
+        // per-line rule rejects when it is written on the next line down.
+        let same_line_late = unguarded_test(&format!("{call} {lock}"));
+        let hits = env_mutations_in_unserialized_tests(&same_line_late);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the mutation ran before the lock on that line: {hits:?}"
+        );
+    }
+
+    /// A lock has to be ACQUIRED, not merely named. `let _x = &LOCK;` mentions
+    /// one and holds nothing, and matching the name alone handed that the
+    /// exemption.
+    ///
+    /// The acquisition is looked for across the statement rather than the line,
+    /// because rustfmt splits the real shape in this repo over three lines —
+    /// which is why "require `.lock(` on the naming line" is not the fix: it
+    /// would reject every disciplined test in `crates/rocm-core`. Both shapes
+    /// are asserted here so neither can regress into the other.
+    #[test]
+    fn a_lock_that_is_named_but_not_taken_does_not_serialize_anything() {
+        let call = mutation_call("set_var");
+
+        let named_only = unguarded_test(&format!("let _x = &SOME_TEST_LOCK;\n        {call}"));
+        let hits = env_mutations_in_unserialized_tests(&named_only);
+        assert_eq!(hits.len(), 1, "naming a lock is not holding it: {hits:?}");
+
+        for acquisition in [
+            "let _guard = SOME_TEST_LOCK.lock().unwrap();",
+            // rustfmt's split, as every `*_TEST_LOCK` site in `rocm-core` is
+            // actually written.
+            "let _guard = SOME_TEST_LOCK\n            .lock()\n            .unwrap_or_else(std::sync::PoisonError::into_inner);",
+        ] {
+            let source = unguarded_test(&format!("{acquisition}\n        {call}"));
+            assert!(
+                env_mutations_in_unserialized_tests(&source).is_empty(),
+                "this lock is taken, however rustfmt broke the lines up"
+            );
+        }
     }
 
     /// The serialization point is the FIRST lock, not the last one seen.

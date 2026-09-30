@@ -1468,6 +1468,29 @@ mod tests {
         // assertion's point of view, from no decoy at all.
         let without_override = newest_rocm_install_dir_in(std::slice::from_ref(&searched), None);
 
+        // The check above only exercises whichever decoy shape THIS host's
+        // layout recognises, so deleting the other one leaves Linux green and
+        // the regression waits for the Windows lane to surface it. The seam
+        // already takes the layout, so driving it with both discriminates on
+        // every host for the cost of one loop.
+        let by_layout: Vec<(crate::RocmLayout, bool)> = [
+            (crate::RocmLayout::Siblings, "rocm-6.2.0"),
+            (crate::RocmLayout::Children, "6.2"),
+        ]
+        .into_iter()
+        .map(|(layout, decoy)| {
+            let installs = crate::discover_rocm_installs_in_layout(
+                std::slice::from_ref(&searched),
+                None,
+                layout,
+            );
+            (
+                layout,
+                installs.iter().any(|install| install.path.ends_with(decoy)),
+            )
+        })
+        .collect();
+
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
@@ -1475,6 +1498,13 @@ mod tests {
             "the decoy must be reachable through the search roots on this \
              platform, or 'the override outranks them' holds vacuously"
         );
+        for (layout, reached) in by_layout {
+            assert!(
+                reached,
+                "the {layout:?} decoy must be reachable under that layout, or \
+                 the ordering claim is vacuous on the platform that uses it"
+            );
+        }
         assert_eq!(
             found,
             install.to_string_lossy(),
