@@ -1127,6 +1127,31 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
     }
     let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User");
     let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine");
+    report_and_clear_override_windows(opts, &user_val, &machine_val, |prompt| {
+        confirm(prompt, opts.yes)
+    })
+}
+
+/// Does the reporting/clearing work for [`run_unset_override_windows`], with
+/// the User/Machine scope values and the consent prompt taken as parameters
+/// rather than read from `ps_env_scope`/`confirm` directly. That's what makes
+/// the decline path testable without a real Windows host -- same reason
+/// [`pin_device_in_rc_file`] takes its consent as a closure.
+///
+/// A decline must still exit `5`: `skills/rocm-doctor/reference.md` documents
+/// `5` as "user declined", and a caller (human or agent) relies on that to
+/// tell "nothing happened because you said no" apart from "nothing happened
+/// because there was nothing to do". Declining just the User scope can't
+/// short-circuit straight to `return 5`, though -- if the Machine scope is
+/// also set, the guidance for clearing it (which needs an elevated shell)
+/// still has to print unconditionally, so the decline is recorded in a flag
+/// and checked only once both scopes have had their say.
+fn report_and_clear_override_windows(
+    opts: &FixOptions,
+    user_val: &str,
+    machine_val: &str,
+    consent: impl FnOnce(&str) -> bool,
+) -> i32 {
     if user_val.is_empty() && machine_val.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in either the User");
         println!("or Machine env scope. You're done after closing/reopening shells.");
@@ -1139,12 +1164,13 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
     if !machine_val.is_empty() {
         println!("  Machine scope: {machine_val}");
     }
+    let mut declined = false;
     if !user_val.is_empty() {
         println!("\nClear from the User scope (no admin needed):");
         println!("  Will run: setx HSA_OVERRIDE_GFX_VERSION \"\"");
         if opts.dry_run {
             println!("  (dry-run; not executed)");
-        } else if confirm("Clear HSA_OVERRIDE_GFX_VERSION from User scope?", opts.yes) {
+        } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
             let (rc, out, err) = run("setx", &["HSA_OVERRIDE_GFX_VERSION", ""], RUN_TIMEOUT);
             relay_output(&out, &err);
             if rc != 0 {
@@ -1152,6 +1178,8 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
                 return 4;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
+        } else {
+            declined = true;
         }
     }
     if !machine_val.is_empty() {
@@ -1165,7 +1193,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
             "or remove it through System Properties -> Environment Variables -> System variables. This command does NOT elevate itself."
         );
     }
-    0
+    if declined { 5 } else { 0 }
 }
 
 /// fix-6: persist the ROCm/HIP bin directory on PATH (with consent).
@@ -1916,6 +1944,73 @@ mod tests {
             "a file that never carried the override must not be touched either"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Windows arm of fix-2 does mutate (it runs `setx` to clear the User
+    /// scope), so unlike the Linux arm above, a decline has to come back as
+    /// `5`, not `0` -- `skills/rocm-doctor/reference.md` documents `5` as
+    /// "user declined" and an agent tells that apart from "nothing to do"
+    /// this way.
+    #[test]
+    fn windows_decline_on_user_scope_returns_5() {
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| false);
+
+        assert_eq!(code, 5, "a declined User-scope clear must exit 5, not 0");
+    }
+
+    /// Declining the User scope must not swallow the Machine-scope guidance:
+    /// a user with both scopes set still needs the elevated-shell
+    /// instructions printed, so the decline can't `return 5` on the spot --
+    /// it has to fall through and let the Machine-scope block run first.
+    /// This test can't see stdout, but it pins the return code so a future
+    /// change that reintroduces an early `return 5` (skipping that block)
+    /// would have to change this assertion to keep passing.
+    #[test]
+    fn windows_decline_with_machine_scope_also_set_still_returns_5() {
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "11.0.0", |_| {
+                false
+            });
+
+        assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn windows_consent_granted_is_not_treated_as_a_decline() {
+        // `setx` isn't on this host, so a real run would report failure (`4`)
+        // -- the point here is only that the consent gate itself was
+        // reached and answered "yes", not routed as a decline.
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| true);
+
+        assert_ne!(
+            code, 5,
+            "granted consent must never be reported as declined"
+        );
+    }
+
+    #[test]
+    fn windows_dry_run_short_circuits_before_the_consent_gate() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = report_and_clear_override_windows(&opts, "10.3.0", "", |_| {
+            panic!("dry-run must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0, "a dry-run preview is not a decline");
+    }
+
+    #[test]
+    fn windows_nothing_persisted_in_either_scope_returns_0_without_prompting() {
+        let code = report_and_clear_override_windows(&FixOptions::default(), "", "", |_| {
+            panic!("nothing to clear means no consent gate at all")
+        });
+
+        assert_eq!(code, 0);
     }
 
     #[test]
