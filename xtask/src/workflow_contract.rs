@@ -790,8 +790,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// read `on.push.branches`. Only `e2e-selfhosted.yml` carries it — a
     /// release-branch push should get the self-hosted regression matrix ahead
     /// of cutting the `v*` tag `release.yml` builds from. `ci.yml`'s own push
-    /// trigger stays `main`-only: a `release/**` push already went through
-    /// that gate on the PR that landed it.
+    /// trigger stays `main`-only, so it does not run on the release-branch
+    /// commit itself; a direct push or cherry-pick to a release branch is not
+    /// covered by it, and coverage instead comes from whatever pull request
+    /// produced that commit.
     #[test]
     fn self_hosted_workflow_fires_on_release_branch_push() {
         let workflow = read_workflow("e2e-selfhosted.yml");
@@ -809,8 +811,8 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         assert_eq!(
             push_branches(&workflow),
             vec!["main".to_string()],
-            "ci.yml's push trigger must stay main-only; a release/** push already went \
-             through this gate via the PR that landed it, so it must not re-run on push too"
+            "ci.yml's push trigger must stay main-only; it does not run on the \
+             release-branch commit itself, so it must not re-run on push too"
         );
     }
 

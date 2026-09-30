@@ -175,9 +175,12 @@ pre-split layout the GPU jobs do **not** gate on the hosted `build-and-test` job
 binary itself as its first real step (a broken build fails that job fast and
 non-fatally). `ci.yml`'s required `build-and-test` and mock `e2e` remain the
 authoritative pre-merge build gate; `ci.yml`'s own `push` trigger stays
-`main`-only — a `release/**` push already went through that gate on the PR
-that landed it, so it isn't re-run here (`e2e-selfhosted.yml` gates on nothing
-but its own build, per the previous paragraph).
+`main`-only, so it does not run on the release-branch commit itself — a
+direct push or cherry-pick to a release branch is not covered by it. Coverage
+instead comes from whatever pull request produced that commit
+(`e2e-selfhosted.yml` gates on nothing but its own build, per the previous
+paragraph, and the self-hosted lanes build the binary themselves rather than
+compensating for the hosted gate).
 
 They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
