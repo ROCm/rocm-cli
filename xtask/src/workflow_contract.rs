@@ -1676,13 +1676,26 @@ esac
         let mut documented_artifacts = backticked_list_between(
             &docs,
             "The lane artifacts are named canonically (",
-            ") in every workflow",
+            ") in `ci.yml` and",
         );
         // Sorted, not deduplicated: a name listed twice must still fail.
         documented_artifacts.sort();
         assert_eq!(
             documented_artifacts, declared_artifacts,
             "the canonical artifact list must enumerate every uploaded report artifact exactly once"
+        );
+
+        // ponytail: brittle literal-text match, not a YAML matrix parse — it exists only
+        // to keep this hardcoded literal in sync with `consolidated::parse_descriptor`'s
+        // hardcoded "release"/"nightly" suffixes. If nightly.yml's channel matrix ever
+        // changes, update both it and `parse_descriptor` together.
+        let nightly = std::fs::read_to_string(repo_root().join(".github/workflows/nightly.yml"))
+            .expect("read nightly.yml");
+        assert!(
+            nightly.contains("channel: [release, nightly]"),
+            "nightly.yml's channel matrix must declare exactly the channel values \
+             `consolidated::parse_descriptor` strips as artifact-name suffixes; if this \
+             literal ever changes, `parse_descriptor` must change with it"
         );
 
         let platform_input = nested_block(

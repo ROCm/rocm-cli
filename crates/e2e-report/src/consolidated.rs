@@ -30,6 +30,11 @@ struct Descriptor {
     /// one-job-per-platform model these no longer exist, but the flag is retained
     /// as a stable secondary sort key so old artifacts still order predictably.
     known_bugs: bool,
+    /// The channel suffix stripped from the artifact name, if any. Only a
+    /// fallback: [`PlatformReport::effective_channel`] prefers the manifest's
+    /// `versions.channel` and uses this solely for the errored-run case where
+    /// no `platform.json` was ever written.
+    channel_from_name: Option<&'static str>,
 }
 
 /// Parse an artifact/dir name like `e2e-gpu-strix-windows-report`
@@ -42,14 +47,16 @@ fn parse_descriptor(name: &str) -> Descriptor {
     let core = core.strip_suffix("-report").unwrap_or(core);
 
     // The nightly workflow always appends the channel as the final segment
-    // before `-report` (e.g. `e2e-gpu-strix-windows-nightly-report`). The
-    // channel value itself isn't tracked here — the Grid derives channel from
-    // `platform.json` content, not the artifact name — so just strip it to
-    // reach the platform core below.
-    let core = core
-        .strip_suffix("-release")
-        .or_else(|| core.strip_suffix("-nightly"))
-        .unwrap_or(core);
+    // before `-report` (e.g. `e2e-gpu-strix-windows-nightly-report`). Captured
+    // as `channel_from_name` — a fallback for the errored-run case where no
+    // `platform.json` was written, so the manifest has no channel to read.
+    let (core, channel_from_name) = match core.strip_suffix("-release") {
+        Some(rest) => (rest, Some("release")),
+        None => match core.strip_suffix("-nightly") {
+            Some(rest) => (rest, Some("nightly")),
+            None => (core, None),
+        },
+    };
 
     // Legacy `-known-bugs` suffix (retained only as a stable secondary sort key).
     let (core, known_bugs) = match core.strip_suffix("known-bugs") {
@@ -77,17 +84,22 @@ fn parse_descriptor(name: &str) -> Descriptor {
         // be reported as Linux — so render Unknown / Unknown rather than defaulting
         // OS to Linux the way `fallback_descriptor` does for a titlecased platform.
         "unknown" => ("Unknown", "Unknown"),
-        other => return fallback_descriptor(other, known_bugs),
+        other => return fallback_descriptor(other, known_bugs, channel_from_name),
     };
 
     Descriptor {
         platform: platform.to_string(),
         os: os.to_string(),
         known_bugs,
+        channel_from_name,
     }
 }
 
-fn fallback_descriptor(core: &str, known_bugs: bool) -> Descriptor {
+fn fallback_descriptor(
+    core: &str,
+    known_bugs: bool,
+    channel_from_name: Option<&'static str>,
+) -> Descriptor {
     let platform = core
         .split('-')
         .filter(|w| !w.is_empty())
@@ -107,6 +119,7 @@ fn fallback_descriptor(core: &str, known_bugs: bool) -> Descriptor {
         },
         os: "Linux".to_string(),
         known_bugs,
+        channel_from_name,
     }
 }
 
@@ -420,14 +433,19 @@ struct GridColumn {
     details: std::collections::BTreeMap<String, ManifestExpectation>,
 }
 
+/// Append a "(channel)" suffix to `base` when known.
+fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
+    match channel {
+        Some(c) => format!("{base} ({c})"),
+        None => base.to_string(),
+    }
+}
+
 impl GridColumn {
     /// Column heading label: the slug, plus its channel when known — the part of
     /// column identity that doesn't already show up in `versions.summary()`.
     fn label(&self) -> String {
-        match self.versions.channel.as_deref() {
-            Some(channel) => format!("{} ({channel})", self.slug),
-            None => self.slug.clone(),
-        }
+        with_channel_suffix(&self.slug, self.versions.channel.as_deref())
     }
 }
 
@@ -720,12 +738,16 @@ impl PlatformReport {
             .flat_map(|f| &f.elements)
             .any(|el| el.tags.iter().any(|t| t.name == EXPECTED_FAILURE_TAG));
         let desc = parse_descriptor(&artifact);
-        let label = format!("{} {}", desc.platform, desc.os);
         let commands = parse_commands(json_path);
         let tally = reconciled_tally(json_path);
         let versions = parse_platform_manifest(json_path)
             .map(|m| m.versions)
             .unwrap_or_default();
+        // Manifest channel wins when known; the artifact-name channel is only a
+        // fallback for the errored-run case where no `platform.json` was written.
+        let effective_channel = versions.channel.as_deref().or(desc.channel_from_name);
+        let label =
+            with_channel_suffix(&format!("{} {}", desc.platform, desc.os), effective_channel);
         Self {
             desc,
             label,
@@ -737,6 +759,17 @@ impl PlatformReport {
             tally,
             versions,
         }
+    }
+
+    /// The channel that governs this platform's rendering: the manifest's
+    /// `versions.channel` when known, falling back to the channel captured
+    /// from the artifact name for the errored-run case where no
+    /// `platform.json` was ever written.
+    fn effective_channel(&self) -> Option<&str> {
+        self.versions
+            .channel
+            .as_deref()
+            .or(self.desc.channel_from_name)
     }
 
     /// Map each scenario name → whether it passed. Uses the canonical
@@ -940,9 +973,10 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         // Component versions in the Platform/OS cells: ROCm/vLLM/lemonade under the
         // platform, the OS version under the OS. Absent components are omitted (mock
         // has no runtime; a not-yet-probed source is simply skipped).
+        let plat_base = with_channel_suffix(&r.desc.platform, r.effective_channel());
         let plat_cell = match r.versions.platform_stack() {
-            s if s.is_empty() => r.desc.platform.clone(),
-            s => format!("{}<br><sub>{}</sub>", r.desc.platform, s),
+            s if s.is_empty() => plat_base,
+            s => format!("{plat_base}<br><sub>{s}</sub>"),
         };
         let os_cell = match r.versions.os.as_deref() {
             Some(v) if v != r.desc.os => format!("{}<br><sub>{}</sub>", r.desc.os, v),
@@ -1449,7 +1483,10 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     // Platform columns in matrix order (platform+os), de-duplicated across tiers.
     let mut columns: Vec<String> = Vec::new();
     for r in reports {
-        let col = format!("{} {}", r.desc.platform, r.desc.os);
+        let col = with_channel_suffix(
+            &format!("{} {}", r.desc.platform, r.desc.os),
+            r.effective_channel(),
+        );
         if !columns.contains(&col) {
             columns.push(col);
         }
@@ -1458,7 +1495,10 @@ fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     // key → (column → all-passed-so-far). Absent column = not run there.
     let mut cells: BTreeMap<CommandKey, BTreeMap<String, bool>> = BTreeMap::new();
     for r in reports {
-        let col = format!("{} {}", r.desc.platform, r.desc.os);
+        let col = with_channel_suffix(
+            &format!("{} {}", r.desc.platform, r.desc.os),
+            r.effective_channel(),
+        );
         let passed = r.scenario_pass_map();
         for c in &r.commands {
             // Full command as executed; fall back to the stripped signature for
@@ -2171,10 +2211,12 @@ mod tests {
     }
 
     #[test]
-    fn nightly_failure_is_not_masked_by_release_pass() {
-        // The bug this guards: pre-fix, both inputs shared one "mi300x" column,
-        // and the release pass (inserted first) blocked the nightly fail from
-        // ever overwriting it — a real nightly regression rendered invisible.
+    fn nightly_failure_reaches_needs_attention_in_its_own_column() {
+        // Pins that a release pass and a nightly fail on the same slug land in
+        // two separate columns (not one collision that a merge clause has to
+        // arbitrate) and that the nightly failure surfaces in the needs-attention
+        // list. It does NOT exercise the same-column merge-protection clause —
+        // see `a_later_failure_is_not_masked_within_one_column` for that.
         let release = r#"{
             "platform_slug": "mi300x",
             "capability": {"effective_serve_engine": "vllm"},
@@ -2213,6 +2255,46 @@ mod tests {
                 .iter()
                 .any(|(label, id, _, _)| label == "mi300x (nightly)" && *id == "serve-x"),
             "the nightly failure must surface in the needs-attention list",
+        );
+    }
+
+    #[test]
+    fn a_later_failure_is_not_masked_within_one_column() {
+        // Same platform_slug AND same channel: both artifacts land in ONE column,
+        // so this (unlike `nightly_failure_reaches_needs_attention_in_its_own_column`)
+        // actually exercises the `and_modify` merge-protection clause in
+        // `Grid::build` — a later, conflicting result for the same id must not be
+        // silently dropped in favor of an earlier clean one.
+        let release_a = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let release_b = release_a;
+        let passed = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let failed = feature_json(&[(&["id:serve-x"], &["failed"])]);
+        let (_d1, first_path) = write_platform(&passed, release_a);
+        let (_d2, second_path) = write_platform(&failed, release_b);
+        let inputs = vec![
+            ("mi300x-release-a".to_string(), first_path),
+            ("mi300x-release-b".to_string(), second_path),
+        ];
+
+        let grid = Grid::build(&inputs);
+        assert_eq!(
+            grid.columns.len(),
+            1,
+            "same slug and channel must collapse into one column, not two",
+        );
+        let outcome = *grid.columns[0]
+            .outcomes
+            .get("serve-x")
+            .expect("serve-x outcome");
+        assert_eq!(
+            outcome,
+            CellOutcome::UnexpectedFail,
+            "a later failure must not be masked by an earlier pass in the same column: {outcome:?}",
         );
     }
 
@@ -2701,5 +2783,45 @@ mod tests {
         assert_eq!(r.status_text(), "FAIL");
         let (_total, _pass, fail, _skip, _xfail) = r.display_counts();
         assert_eq!(fail, 1);
+    }
+
+    #[test]
+    fn manifest_channel_wins_over_artifact_name_channel() {
+        // The manifest's `versions.channel` is authoritative; an artifact-name
+        // channel, when present, must not override it.
+        let platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"},
+            "expectations": [{"id":"serve-x","feature":"Serving","expected":"pass"}]
+        }"#;
+        let report = feature_json(&[(&["id:serve-x"], &["passed"])]);
+        let (_d, path) = write_platform(&report, platform);
+        // Artifact name (deliberately) disagrees with the manifest, to prove
+        // precedence rather than coincidentally matching.
+        let r = PlatformReport::load("e2e-gpu-nightly-report".into(), &path);
+        assert_eq!(
+            r.effective_channel(),
+            Some("release"),
+            "{:?}",
+            r.effective_channel()
+        );
+        assert!(r.label.contains("(release)"), "{}", r.label);
+        assert!(!r.label.contains("(nightly)"), "{}", r.label);
+    }
+
+    #[test]
+    fn artifact_name_channel_is_a_fallback_when_manifest_is_absent() {
+        // An errored run that never wrote `platform.json` has no manifest channel
+        // to read; the artifact-name channel is the only signal available.
+        let report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let r = PlatformReport::load("e2e-gpu-strix-windows-nightly-report".into(), report.path());
+        assert_eq!(
+            r.effective_channel(),
+            Some("nightly"),
+            "{:?}",
+            r.effective_channel()
+        );
+        assert!(r.label.contains("(nightly)"), "{}", r.label);
     }
 }
