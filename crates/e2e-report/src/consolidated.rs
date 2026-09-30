@@ -41,6 +41,16 @@ fn parse_descriptor(name: &str) -> Descriptor {
     let core = name.strip_prefix("e2e-").unwrap_or(name);
     let core = core.strip_suffix("-report").unwrap_or(core);
 
+    // The nightly workflow always appends the channel as the final segment
+    // before `-report` (e.g. `e2e-gpu-strix-windows-nightly-report`). The
+    // channel value itself isn't tracked here — the Grid derives channel from
+    // `platform.json` content, not the artifact name — so just strip it to
+    // reach the platform core below.
+    let core = core
+        .strip_suffix("-release")
+        .or_else(|| core.strip_suffix("-nightly"))
+        .unwrap_or(core);
+
     // Legacy `-known-bugs` suffix (retained only as a stable secondary sort key).
     let (core, known_bugs) = match core.strip_suffix("known-bugs") {
         Some(rest) => (rest.trim_end_matches('-'), true),
@@ -557,7 +567,11 @@ impl Grid {
                 // A real result supersedes a defensive Missing on merge, and a
                 // problem outcome is never silently displaced by a clean one for
                 // the same id in the same column — a second, conflicting result
-                // must stay visible rather than being masked by the first.
+                // must stay visible rather than being masked by the first. A
+                // second, *differing* problem outcome for the same id/column
+                // (e.g. Failed then Flaky) still keeps whichever arrived first,
+                // since neither `and_modify` branch matches once `o` is already
+                // a problem.
                 columns[col_idx]
                     .outcomes
                     .entry(exp.id.clone())
@@ -1698,6 +1712,40 @@ mod tests {
             // Must not fall through to `fallback_descriptor`, which would render
             // "Gpu Strix Wsl" on Linux — a WSL2 host reported as native Linux.
             ("e2e-gpu-strix-wsl-report", "Strix Halo", "WSL2"),
+        ] {
+            let d = parse_descriptor(name);
+            assert_eq!(
+                (d.platform.as_str(), d.os.as_str()),
+                (platform, os),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_strips_nightly_workflow_channel_suffix() {
+        // Real artifact names from `.github/workflows/nightly.yml`, which always
+        // inserts the channel as the final segment before `-report`. A synthetic
+        // label like "mi300x-release" wouldn't reproduce the bug this guards
+        // against: nightly-channel artifacts falling through to
+        // `fallback_descriptor` and being mislabeled "Linux".
+        for (name, platform, os) in [
+            ("e2e-gpu-release-report", "MI300X", "Linux"),
+            ("e2e-gpu-nightly-report", "MI300X", "Linux"),
+            ("e2e-gpu-rad3-release-report", "R9700", "Linux"),
+            ("e2e-gpu-rad3-nightly-report", "R9700", "Linux"),
+            ("e2e-gpu-mi350p-nightly-report", "MI350P", "Linux"),
+            (
+                "e2e-gpu-strix-ubuntu-nightly-report",
+                "Strix Halo",
+                "Ubuntu",
+            ),
+            (
+                "e2e-gpu-strix-windows-nightly-report",
+                "Strix Halo",
+                "Windows",
+            ),
+            ("e2e-gpu-strix-wsl-nightly-report", "Strix Halo", "WSL2"),
         ] {
             let d = parse_descriptor(name);
             assert_eq!(

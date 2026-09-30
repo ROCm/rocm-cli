@@ -146,16 +146,6 @@ fn label_for_root_report(dir: &Path) -> String {
     }
 }
 
-/// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
-///
-/// Deliberately not filtered to `-report`: that is the shape the caller
-/// asserts, so filtering on it first would make the population and the
-/// assertion the same condition, and an artifact named `e2e-gpu-results`
-/// would be invisible to a test claiming to check every e2e artifact.
-///
-/// Lives outside `mod tests` so `workflow_contract`'s docs guard can derive the
-/// canonical artifact list from the same scan this module's guard asserts on,
-/// rather than keeping a second copy that could drift from it.
 /// Strips the literal `${{ matrix.channel }}` template segment nightly's
 /// per-lane matrix inserts into its artifact names, so a name like
 /// `e2e-gpu-${{ matrix.channel }}-report` compares as its canonical
@@ -167,6 +157,16 @@ pub(crate) fn without_channel_matrix_segment(name: &str) -> String {
     name.replace("-${{ matrix.channel }}-", "-")
 }
 
+/// Every `e2e-`-prefixed artifact name an upload step in `file` publishes.
+///
+/// Deliberately not filtered to `-report`: that is the shape the caller
+/// asserts, so filtering on it first would make the population and the
+/// assertion the same condition, and an artifact named `e2e-gpu-results`
+/// would be invisible to a test claiming to check every e2e artifact.
+///
+/// Lives outside `mod tests` so `workflow_contract`'s docs guard can derive the
+/// canonical artifact list from the same scan this module's guard asserts on,
+/// rather than keeping a second copy that could drift from it.
 #[cfg(test)]
 pub(crate) fn uploaded_e2e_artifacts(path: &Path) -> Vec<String> {
     let text =
@@ -277,10 +277,12 @@ mod tests {
                 .map(|n| without_channel_matrix_segment(&n))
                 .collect();
             names.sort();
-            // nightly's channel matrix uploads two literal names per lane
-            // (release, nightly) that normalize to the same base; collapse
-            // them so the comparison is platform-for-platform, not upload-
-            // count-for-upload-count.
+            // Each lane's `name:` line appears once in the workflow source with
+            // the literal `${{ matrix.channel }}` template (this scan does not
+            // simulate matrix expansion, so there is only one line to see per
+            // lane, not one per expanded channel). `dedup` is defensive, not
+            // load-bearing today: it guards against a future lane that uploads
+            // under two distinct static names for the same platform.
             names.dedup();
             names
         };
