@@ -30,18 +30,14 @@ pub struct AmdSmiCollector {
 }
 
 impl AmdSmiCollector {
-    /// Returns `Some` only if a supported GPU device is readable and
-    /// `amd-smi version` succeeds.
+    /// Uses an explicit `amd-smi` binary path, and takes a precomputed
+    /// GPU-reachability verdict for the pre-flight. Returns `Some` only if a
+    /// supported GPU device is readable (or `gpu_reachable` substitutes for
+    /// that check) and `amd-smi version` succeeds.
     ///
     /// The device pre-flight is mandatory: without an accessible `/dev/kfd` on
     /// bare-metal Linux, `amd-smi` can block in uninterruptible kernel sleep
     /// (D-state) that no signal can escape.
-    pub async fn detect() -> Option<Self> {
-        Self::detect_with_binary("amd-smi", false).await
-    }
-
-    /// Like [`detect`](Self::detect) but uses an explicit `amd-smi` binary path,
-    /// and takes a precomputed GPU-reachability verdict for the pre-flight.
     ///
     /// The managed ROCm SDK ships `amd-smi` inside the runtime wheel's bin
     /// directory rather than on `PATH`, so callers resolve the path or command
@@ -579,7 +575,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a real AMD GPU + amd-smi; run manually on hardware"]
     async fn live_processes_no_panic() {
-        if let Some(c) = AmdSmiCollector::detect().await {
+        if let Some(c) = AmdSmiCollector::detect_with_binary("amd-smi", false).await {
             // Either Ok or Err is acceptable; the contract is "does not panic".
             let _ = c.processes().await;
         }

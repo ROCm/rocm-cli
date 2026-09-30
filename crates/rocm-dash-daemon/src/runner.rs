@@ -240,6 +240,29 @@ fn parse_test_clock_directive(value: &str) -> Option<TestClockDirective> {
     value.parse().ok().map(TestClockDirective::FreeRunning)
 }
 
+/// Which detection call `run_loop`'s background gpu-init task makes, decided
+/// up front from [`RunnerOptions`] so the decision itself is a plain value a
+/// test can assert on without spawning the task or touching a real binary.
+enum AmdSmiDetectPlan {
+    SkipDevicePreflight(OsString),
+    Detect(OsString, bool),
+}
+
+/// `amd_smi_binary: None` means "no override", not "no detection" — it still
+/// runs the real pre-flight against the literal `amd-smi` command name, with
+/// the same threaded `gpu_reachable` verdict as an explicit binary.
+fn amd_smi_detect_plan(
+    binary: Option<OsString>,
+    skip_device_preflight: bool,
+    gpu_reachable: bool,
+) -> AmdSmiDetectPlan {
+    match binary {
+        Some(binary) if skip_device_preflight => AmdSmiDetectPlan::SkipDevicePreflight(binary),
+        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable),
+        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable),
+    }
+}
+
 /// Loop forever: tick host + gpu metrics + bench rows, apply through reducer, broadcast.
 ///
 /// `tick_override` lets tests run faster than `opts.gpu_tick`; production passes
@@ -338,20 +361,21 @@ pub async fn run_loop(
     // `rocm services` already reported it). Run detection off the critical path:
     // the loop starts ticking immediately (surfacing serving instances within
     // one discovery tick) and GPU metrics fill in the moment detection lands.
-    let amd_smi_binary = opts.amd_smi_binary.clone();
-    let amd_smi_skip_device_preflight = opts.amd_smi_skip_device_preflight;
-    let amd_smi_gpu_reachable = opts.amd_smi_gpu_reachable;
+    let detect_plan = amd_smi_detect_plan(
+        opts.amd_smi_binary.clone(),
+        opts.amd_smi_skip_device_preflight,
+        opts.amd_smi_gpu_reachable,
+    );
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
     tokio::spawn(async move {
-        let gpu = match amd_smi_binary {
-            Some(binary) if amd_smi_skip_device_preflight => {
+        let gpu = match detect_plan {
+            AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
                 AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            Some(binary) => {
-                AmdSmiCollector::detect_with_binary(binary, amd_smi_gpu_reachable).await
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+                AmdSmiCollector::detect_with_binary(binary, gpu_reachable).await
             }
-            None => AmdSmiCollector::detect_with_binary("amd-smi", amd_smi_gpu_reachable).await,
         };
         let info = match &gpu {
             Some(g) => Some(g.system_info().await),
@@ -444,7 +468,7 @@ pub async fn run_loop(
             // reachable) the device pre-flight itself may have failed, or it
             // passed but the binary was missing/unresolvable/failed to run —
             // both causes are named since either is possible here.
-            warnings.push(if amd_smi_gpu_reachable {
+            warnings.push(if opts.amd_smi_gpu_reachable {
                 "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
                  detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
                  model may not be supported by the installed amd-smi/ROCm, or not supported on \
@@ -1140,6 +1164,37 @@ fn avg_ms_from_histogram(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// Pins the `None` binary arm specifically: a revert back to hardcoding
+    /// `false` here (rather than threading `gpu_reachable` through, as the
+    /// `Some` arm already does) would not be caught by any integration test,
+    /// since exercising it end to end needs a real or PATH-resolved `amd-smi`
+    /// binary named literally `amd-smi`.
+    #[test]
+    fn detect_plan_threads_gpu_reachable_through_the_none_binary_arm() {
+        match amd_smi_detect_plan(None, false, true) {
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+                assert_eq!(binary, OsString::from("amd-smi"));
+                assert!(gpu_reachable);
+            }
+            AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
+        }
+
+        match amd_smi_detect_plan(None, false, false) {
+            AmdSmiDetectPlan::Detect(_, gpu_reachable) => assert!(!gpu_reachable),
+            AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
+        }
+    }
+
+    #[test]
+    fn detect_plan_skip_preflight_takes_priority_over_an_explicit_binary() {
+        match amd_smi_detect_plan(Some("fake-amd-smi".into()), true, false) {
+            AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
+                assert_eq!(binary, OsString::from("fake-amd-smi"));
+            }
+            AmdSmiDetectPlan::Detect(..) => panic!("expected SkipDevicePreflight"),
+        }
+    }
 
     #[test]
     fn test_clock_advances_by_ticks_and_external_offset() {

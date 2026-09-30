@@ -676,32 +676,37 @@ async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
         .await;
     });
 
-    // The runner ticks forever (a fresh Snapshot every 50ms), so waiting for
-    // the channel to go idle would hang: check a bounded handful of ticks
-    // instead of waiting for silence that never comes.
+    // One outer deadline for the whole wait, not a per-message timeout: see
+    // the comment on the same shape above these siblings.
     let overall = Duration::from_secs(10);
     let mut snapshots_seen = 0;
-    loop {
-        let ev = match timeout(overall, rx.recv()).await {
-            Ok(Ok(ev)) => ev,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => break,
-            Err(_) => break,
-        };
-        if let Event::Snapshot(snap) = ev {
-            assert!(
-                snap.gpus.is_empty(),
-                "amd-smi must never run when neither gpu_reachable nor a readable /dev/kfd hold"
-            );
-            snapshots_seen += 1;
-            if snapshots_seen >= 5 {
-                break;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) => {
+                    assert!(
+                        snap.gpus.is_empty(),
+                        "amd-smi must never run when neither gpu_reachable nor a readable \
+                         /dev/kfd hold"
+                    );
+                    snapshots_seen += 1;
+                    if snapshots_seen >= 5 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    }
+    })
+    .await;
 
     handle.abort();
     let _ = handle.await;
 
-    assert!(snapshots_seen >= 5, "expected at least 5 snapshot ticks");
+    assert!(
+        snapshots_seen >= 5,
+        "expected at least 5 snapshot ticks within 10s"
+    );
 }

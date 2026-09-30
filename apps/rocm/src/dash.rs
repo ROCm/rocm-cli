@@ -920,29 +920,18 @@ mod tests {
     /// `has_usable_amd_gpu()` would flip the `(false, true)` bare-metal case
     /// to `true`, since the fail-open verdict fires on any unprobeable
     /// platform, not just WSL.
+    ///
+    /// This pins the helper's body only. The call site's binding — that
+    /// `runner_options` passes `is_wsl_host()` itself rather than a literal —
+    /// is not pinned by any test: on an ordinary CI host with no usable GPU,
+    /// `has_usable_amd_gpu()` is already `false`, so a mutant literal `true`
+    /// there is indistinguishable from the real call from this crate's tests.
     #[test]
     fn gpu_reachable_for_preflight_only_substitutes_on_wsl() {
         assert!(!gpu_reachable_for_preflight(false, true));
         assert!(!gpu_reachable_for_preflight(false, false));
         assert!(!gpu_reachable_for_preflight(true, false));
         assert!(gpu_reachable_for_preflight(true, true));
-    }
-
-    /// The truth table above pins the helper's body but not the call site's
-    /// binding: this pins that `runner_options` actually passes
-    /// `is_wsl_host()` (not a literal `true`) into the gate.
-    #[test]
-    fn runner_options_gates_gpu_reachable_wiring_off_wsl() {
-        if rocm_core::is_wsl_host() {
-            eprintln!("skipping: this test requires a non-WSL host");
-            return;
-        }
-        let p = paths();
-        let opts = runner_options(&cfg(), &p, false);
-        assert!(
-            !opts.amd_smi_gpu_reachable,
-            "off WSL, amd_smi_gpu_reachable must stay false regardless of is_wsl_host()'s argument binding"
-        );
     }
 
     #[test]
