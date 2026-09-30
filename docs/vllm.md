@@ -4,19 +4,19 @@ Copyright © Advanced Micro Devices, Inc., or its affiliates.
 SPDX-License-Identifier: MIT
 -->
 
-# vLLM Adapter
+# vLLM adapter
 
 `rocm-engine-vllm` is a first-party adapter around an existing vLLM
 installation. It is intended for Linux and WSL ROCm GPU serving.
 
 The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
-`vllm` command visible to rocm-cli.
+`vllm` command visible to ROCm CLI.
 
-For rocm-cli managed TheRock runtimes, prefer building vLLM from source against
+For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
 the existing TheRock PyTorch stack. A prebuilt vLLM ROCm wheel can replace the
 TheRock torch packages or target a different ROCm soname set; that is not a
-valid no-fallback setup for rocm-cli GPU serving.
+valid no-fallback setup for ROCm CLI GPU serving.
 
 ## Torch alignment on engine install
 
@@ -53,7 +53,7 @@ is an escape hatch, not a supported configuration: the resulting combination is
 not validated against the supported matrix, and a runtime that cannot execute a
 kernel will fail at serving time.
 
-### ROCm 10.x wheel discovery
+## ROCm 10.x wheel discovery
 
 For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
 and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,
@@ -80,7 +80,7 @@ Supported discovery paths:
 
 - `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`
 - `ROCM_CLI_VLLM_PYTHON=/path/to/python` where a sibling `vllm` command exists
-- the active rocm-cli managed TheRock runtime, if vLLM has been installed into
+- the active ROCm CLI-managed TheRock runtime, if vLLM has been installed into
   that Python environment
 - `vllm` on `PATH`
 
@@ -102,7 +102,7 @@ python3 scripts/vllm_therock_gpu_test.py \
 ```
 
 The acceptance script is Linux/WSL only. It requires vLLM to be discoverable
-through a rocm-cli managed TheRock runtime manifest, launches with
+through a ROCm CLI-managed TheRock runtime manifest, launches with
 `gpu_required`, checks `/health` and `/v1/completions`, and verifies loaded
 ROCm libraries come from the managed TheRock SDK wheel directories. It rejects
 external vLLM command overrides and does not allow CPU fallback. It defaults
@@ -128,13 +128,13 @@ kernel. With the patch, the live acceptance harness passed on
 `facebook/opt-125m` and verified HIP/BLAS libraries loaded from the managed
 TheRock SDK wheel directories.
 
-Serving through rocm-cli:
+Serving through ROCm CLI:
 
 ```bash
 rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
 ```
 
-### GPU selection
+## GPU selection
 
 Use `--gpu` to choose the AMD GPU vLLM runs on:
 
@@ -146,16 +146,16 @@ rocm serve Qwen/Qwen3.5-4B --engine vllm --managed
 rocm serve Qwen/Qwen3.5-4B --engine vllm --gpu 1 --managed
 ```
 
-rocm-cli pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
+ROCm CLI pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
 multiple GPUs is not supported.
 
-### GPU memory
+## GPU memory
 
 vLLM claims a fixed fraction of each GPU's **total** VRAM — not of the free
 VRAM, and not scaled to the model — for weights plus KV cache. On a large card
 a small model therefore still reserves a large slice.
 
-rocm-cli sets no `--gpu-memory-utilization` of its own, so vLLM's own default
+ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
 applies unless a value comes from somewhere else — either a model's catalog
 recipe or, taking precedence over it, the flag below:
 
@@ -173,16 +173,16 @@ Earlier releases pinned this to `0.80` to leave display/WSL headroom. That pin i
 gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
 `--gpu-memory-utilization 0.8` to restore the previous reservation.
 
-### Tool calling
+## Tool calling
 
 The TUI chat tab attaches tool definitions to every chat request. vLLM rejects
 those with HTTP 400 unless it is launched with `--enable-auto-tool-choice` **and**
 a matching `--tool-call-parser`. vLLM does not auto-detect the parser and it is
-model-specific, so rocm-cli never guesses one:
+model-specific, so ROCm CLI never guesses one:
 
 - **Built-in catalog models** carry the correct parser in their recipe metadata,
   so tool calling works out of the box (e.g. Qwen family → `hermes`,
-  Llama&nbsp;3 → `llama3_json`).
+  Llama 3 → `llama3_json`).
 - **Other models** (arbitrary Hugging Face repos, or a catalog model forced onto
   vLLM without authored metadata) need an explicit parser:
 
@@ -197,7 +197,7 @@ model-specific, so rocm-cli never guesses one:
 Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
 ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 
-References:
+## Related resources
 
-- vLLM ROCm installation: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/
-- AMD ROCm vLLM guidance: https://rocmdocs.amd.com/en/latest/how-to/rocm-for-ai/inference/deploy-your-model.html
+- [vLLM ROCm installation](https://docs.vllm.ai/en/stable/getting_started/installation/gpu/)
+- [AMD ROCm AI ecosystem: vLLM](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/inference/vllm.html)

@@ -10,6 +10,10 @@ subtrees:
   - caption: Getting started
     entries:
       - file: getting-started
+  - caption: Inference engines
+    entries:
+      - file: engines/vllm
+        title: vLLM adapter
   - caption: Commands
     entries:
       - file: commands
