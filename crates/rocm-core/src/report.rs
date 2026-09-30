@@ -767,6 +767,140 @@ mod tests {
         );
     }
 
+    /// A machine described by the things a report may carry, so a population
+    /// can be built out of them.
+    ///
+    /// Every argument is something the report is supposed to distinguish. The
+    /// fields varied *inside* this helper are the ones it is supposed to
+    /// ignore, and they differ on every call, so a report that leaked any of
+    /// them would split a group that must stay whole.
+    fn machine(gfx: &str, distro: (&str, &str), rocm: &str, engine: (&str, &str)) -> Examination {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NTH: AtomicU32 = AtomicU32::new(0);
+        let nth = NTH.fetch_add(1, Ordering::Relaxed);
+
+        Examination {
+            os_family: "linux".to_owned(),
+            distro_id: distro.0.to_owned(),
+            // A patch component that differs per machine. Two hosts on 22.04
+            // and 22.04.3 are one population, and a report that said otherwise
+            // would make every host its own group.
+            distro_version: format!("{}.{nth}", distro.1),
+            os_version: format!("#{nth} SMP PREEMPT_DYNAMIC Thu Jun 18 21:54:43 UTC 2026"),
+            rocm_path: "/opt/rocm".to_owned(),
+            rocm_version: format!("{rocm}.{nth}"),
+            framework: engine.0.to_owned(),
+            framework_version: format!("{}.{nth}", engine.1),
+            cpu_model: format!("cpu-model-{nth}"),
+            user_name: format!("user-{nth}"),
+            has_amd_gpu: true,
+            gpus: vec![Gpu {
+                name: format!("marketing-name-{nth}"),
+                gfx_target: gfx.to_owned(),
+                pci_id: format!("pci-{nth}"),
+                is_apu: Some(false),
+                is_amd: true,
+            }],
+            ..Examination::default()
+        }
+    }
+
+    /// The description a grouper matches on: every published field except the
+    /// ones that describe this build rather than this machine.
+    fn description(report: &Report) -> String {
+        format!(
+            "{}|{}|{}-{}|{}|{}-{}",
+            report.entry,
+            report.architecture,
+            report.distro,
+            report.os_major,
+            report.rocm,
+            report.engine,
+            report.engine_version,
+        )
+    }
+
+    fn describe(machine: &Examination, entry: Option<&str>) -> String {
+        description(&prepare_report(machine, entry, false).expect("a released machine reports"))
+    }
+
+    /// Reports are grouped by exact match on their fields, so the fields have
+    /// to put the same problem in one group and different problems in
+    /// different ones. Nothing else checks this, and neither half is visible
+    /// by reading the field list.
+    ///
+    /// The failure this exists to catch is not a wrong value. It is a field
+    /// set that is too fine, making every machine its own group, or too
+    /// coarse, collapsing distinct problems into one. Both look fine field by
+    /// field and make the whole reporting path worthless.
+    #[test]
+    fn the_published_fields_group_one_problem_together_and_two_problems_apart() {
+        // Same problem, different machines. Every difference here is something
+        // a report must not carry: a kernel build, a patch release, a CPU, a
+        // GPU's marketing name, a PCI address, a user.
+        let same: std::collections::HashSet<String> = (0..8)
+            .map(|_| {
+                describe(
+                    &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+                    Some("fix-6-path"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            same.len(),
+            1,
+            "eight machines with one problem produced {} groups. A field set this fine gives \
+             every host its own group, and no group ever describes a problem: {same:?}",
+            same.len()
+        );
+
+        // Different problems. Each differs from the first in exactly one thing
+        // the report is supposed to separate on.
+        let distinct = [
+            // The case that motivated the distribution field. Same family,
+            // same major: without the distribution these two are one group.
+            describe(
+                &machine("gfx942", ("rhel", "22"), "7.1", ("pytorch", "2.5")),
+                Some("fix-6-path"),
+            ),
+            describe(
+                &machine("gfx1100", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+                Some("fix-6-path"),
+            ),
+            describe(
+                &machine("gfx942", ("ubuntu", "24"), "7.1", ("pytorch", "2.5")),
+                Some("fix-6-path"),
+            ),
+            // A minor release apart. 7.0 and 7.1 are different problems.
+            describe(
+                &machine("gfx942", ("ubuntu", "22"), "7.0", ("pytorch", "2.5")),
+                Some("fix-6-path"),
+            ),
+            describe(
+                &machine("gfx942", ("ubuntu", "22"), "7.1", ("llama-cpp", "0.9")),
+                Some("fix-6-path"),
+            ),
+            describe(
+                &machine("gfx942", ("ubuntu", "22"), "7.1", ("pytorch", "2.5")),
+                None,
+            ),
+        ];
+        let base = same.into_iter().next().expect("one group above");
+        for (nth, other) in distinct.iter().enumerate() {
+            assert_ne!(
+                *other, base,
+                "difference {nth} did not change the description, so two different problems \
+                 land in one group and a team reading it cannot tell them apart"
+            );
+        }
+        let unique: std::collections::HashSet<&String> = distinct.iter().collect();
+        assert_eq!(
+            unique.len(),
+            distinct.len(),
+            "two different problems share a description: {distinct:?}"
+        );
+    }
+
     /// The grouping fields carry a population, not a machine.
     ///
     /// Asserts the published values rather than the absence of the markers.
