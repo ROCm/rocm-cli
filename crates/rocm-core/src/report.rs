@@ -118,7 +118,7 @@ pub const APPROVED_ENGINES: &[&str] = &["pytorch", "llama-cpp"];
 /// Named rather than a bare `None`: Doctor has to explain the refusal, and
 /// "hardware we cannot identify" and "hardware that is not released" call for
 /// different sentences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// A GPU on this machine is not on the ROCm compatibility matrix.
     ///
@@ -129,6 +129,27 @@ pub enum Refusal {
     /// No GPU architecture could be read, so nothing confirms the hardware is
     /// on the compatibility matrix. Refused rather than assumed.
     ArchitectureUnreadable,
+}
+
+impl Refusal {
+    /// The marker a written refusal carries, and the value
+    /// [`ReadOutcome::Refused`] hands back.
+    ///
+    /// Here rather than at the point of printing, so that the writer, the
+    /// reader and the tests all name the same constant. Spelled out arm by arm
+    /// rather than derived, because this vocabulary is part of the schema: a
+    /// renamed variant must not silently rename a marker that reports already
+    /// in the field were written with.
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::UnreleasedHardware => "unreleased-hardware",
+            Self::ArchitectureUnreadable => "architecture-unreadable",
+        }
+    }
+
+    /// Every refusal, so a reader or a test cannot cover fewer than exist.
+    pub const ALL: &'static [Self] = &[Self::UnreleasedHardware, Self::ArchitectureUnreadable];
 }
 
 /// A report, as it would be published.
@@ -183,6 +204,20 @@ pub const UNRECOGNISED: &str = "unrecognised";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadOutcome {
     Understood(Box<Report>),
+    /// The machine declined to describe itself, and named the rule that
+    /// declined.
+    ///
+    /// A refusal is evidence, not a gap. It is the only trace the disclosure
+    /// guard leaves, so counting refusals is how anybody learns whether the
+    /// guard fires on the machines it was meant to fire on. Merged into
+    /// [`ReadOutcome::Unread`] it would instead read as a reader fault, and
+    /// the guard working would be indistinguishable from the reader broken.
+    Refused {
+        /// The marker the writer used, e.g. `"unreleased-hardware"`. The
+        /// schema version gates this vocabulary: a reader that accepted the
+        /// schema has accepted the set of markers that go with it.
+        reason: String,
+    },
     /// The report is written to an agreement this reader does not know.
     ///
     /// Distinct from an empty report on purpose. A counter that read this as
@@ -363,12 +398,26 @@ fn rocm_release(examination: &Examination) -> String {
 /// against [`APPROVED_ENGINES`] to catch a future probe rather than today's.
 /// `framework_version` is parsed out of an installed package, so it is
 /// truncated like every other version here.
+///
+/// `"unknown"` is `Examination`'s struct default for this field
+/// (`examine.rs`), and a completed probe leaves it in place when neither
+/// engine was found, so it maps to [`NONE`] rather than [`UNKNOWN`]: the
+/// ordinary "no engine installed" case is an absence, not a case where this
+/// build looked and could not tell (the vocabulary [`UNKNOWN`] and [`NONE`]
+/// document, which `docs/testing.md`'s report-fields section also states).
+/// This mapping presumes the caller always ran a probe before building a
+/// report -- an `Examination` built some other way, whose `framework` was
+/// simply never touched, would be indistinguishable from that ordinary case
+/// and would also read as absent here.
+///
+/// `"skipped"` is what `examine.rs` records when
+/// [`crate::examine::FrameworkProbe::Skip`] was requested and the probe never
+/// ran at all. Unlike the default, that is not
+/// "looked and found nothing", so it is left to fall through the allowlist
+/// check below rather than special-cased, and comes back [`UNKNOWN`].
 fn engine_and_version(examination: &Examination) -> (String, String) {
     let name = examination.framework.trim().to_ascii_lowercase();
-    // `"skipped"` is what `examine.rs` records when the probe did not run, and
-    // an empty value is what it leaves when the probe ran and found nothing.
-    // Neither is an engine, and neither may carry a version.
-    if name.is_empty() {
+    if name == UNKNOWN {
         return (NONE.to_owned(), NONE.to_owned());
     }
     if !APPROVED_ENGINES.contains(&name.as_str()) {
@@ -437,6 +486,22 @@ fn windows_os_major(ver_banner: &str) -> String {
         })
 }
 
+/// The JSON envelope `rocm diagnose --report --json` prints for a refusal.
+///
+/// Built here rather than at the call site, so the writer and this module's
+/// own reader tests construct the identical shape from the identical
+/// function. A hand-rolled duplicate literal at either end can drift from
+/// what the other actually produces and stay green; calling this cannot.
+#[must_use]
+pub fn refusal_envelope(refusal: Refusal, explanation: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": REPORT_SCHEMA_VERSION,
+        "refused": refusal.marker(),
+        "explanation": explanation,
+        "architecture_matrix": APPROVED_ARCHITECTURES_SOURCE,
+    })
+}
+
 /// Read a report written by some version of this CLI.
 #[must_use]
 pub fn read_report(json: &str) -> ReadOutcome {
@@ -453,6 +518,28 @@ pub fn read_report(json: &str) -> ReadOutcome {
         .unwrap_or(0);
     if schema_seen != REPORT_SCHEMA_VERSION {
         return ReadOutcome::Unread { schema_seen };
+    }
+    // Before the body, because a refusal envelope carries the schema and none
+    // of the report's fields, so deserializing first would fail and report a
+    // deliberate refusal as a reader fault.
+    //
+    // Checked against `Refusal::ALL` rather than accepted verbatim: the schema
+    // version gates this vocabulary, so a marker outside it cannot have been
+    // written by any version of this CLI that speaks this schema. Accepting it
+    // anyway would carry whatever a forged or corrupted envelope put there
+    // through to a reason field a counter treats as trusted vocabulary, which
+    // is the same free-text leak this whole module exists to refuse elsewhere.
+    if let Some(reason) = envelope.get("refused").and_then(serde_json::Value::as_str) {
+        return if Refusal::ALL
+            .iter()
+            .any(|refusal| refusal.marker() == reason)
+        {
+            ReadOutcome::Refused {
+                reason: reason.to_owned(),
+            }
+        } else {
+            ReadOutcome::Unread { schema_seen }
+        };
     }
     serde_json::from_value::<Report>(envelope)
         .map_or(ReadOutcome::Unread { schema_seen }, |report| {
@@ -734,6 +821,145 @@ mod tests {
         );
     }
 
+    /// A missing `/etc/os-release` reads as unreadable, not as an unrecognised
+    /// distribution.
+    ///
+    /// Distinct from [`DISTRO_OTHER`] on purpose: "the file was missing" and
+    /// "the file named something this build does not recognise" are different
+    /// facts, and only the first is this build never getting to decide.
+    #[test]
+    fn a_missing_os_release_reads_as_unknown_not_as_an_unrecognised_distribution() {
+        let mut machine = machine_of_sentinels("gfx1100");
+        machine.distro_id = String::new();
+        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+        assert_eq!(
+            report.distro, UNKNOWN,
+            "an empty ID means the file could not be read, which is different from a file that \
+             named something off the list"
+        );
+    }
+
+    /// A release with no minor still groups, and a release with an unusual
+    /// build separator still yields its release.
+    ///
+    /// Both are `major_minor`'s fallback paths: a bare major survives rather
+    /// than being discarded with a non-numeric minor, and every delimiter the
+    /// function accepts, not only `.`, is exercised at least once.
+    #[test]
+    fn a_release_with_no_minor_or_an_unusual_build_separator_still_groups() {
+        let mut bare_major = machine_of_sentinels("gfx1100");
+        bare_major.rocm_version = "7".to_owned();
+        let report = prepare_report(&bare_major, None, false).expect("a released machine reports");
+        assert_eq!(
+            report.rocm, "7",
+            "a release with no minor is still a population and must not be discarded"
+        );
+
+        let mut dash_delimited = machine_of_sentinels("gfx1100");
+        dash_delimited.rocm_version = "7-1-0".to_owned();
+        let report =
+            prepare_report(&dash_delimited, None, false).expect("a released machine reports");
+        assert_eq!(
+            report.rocm, "7.1",
+            "a dash-delimited build string must yield the same release as a dot-delimited one"
+        );
+    }
+
+    /// A refusal reads as a refusal, not as a report nobody could parse.
+    ///
+    /// Both refusals are checked, because a reader that recognised only one
+    /// would leave the other counted as a reader fault, and the two rules are
+    /// the two halves of the disclosure guard.
+    ///
+    /// The fixture is built by calling [`refusal_envelope`], the same function
+    /// `diagnose --report --json` calls to print one, rather than a second,
+    /// independent `json!` literal. The two cannot drift apart: either both
+    /// change together, through the one function, or neither does.
+    #[test]
+    fn a_refusal_is_read_as_a_refusal_rather_than_as_an_unreadable_report() {
+        for refusal in Refusal::ALL {
+            let marker = refusal.marker();
+            let envelope = refusal_envelope(*refusal, "why no report was prepared").to_string();
+
+            match read_report(&envelope) {
+                ReadOutcome::Refused { reason } => assert_eq!(
+                    reason, marker,
+                    "the refusal was recognised but its rule was lost, so nothing can tell the \
+                     two halves of the guard apart"
+                ),
+                other => panic!(
+                    "a refusal read as {other:?}. Counted that way, the guard firing is \
+                     indistinguishable from the reader failing, and the trial that exists to \
+                     watch the guard cannot see it."
+                ),
+            }
+        }
+    }
+
+    /// A `"refused"` value outside the known markers is not trusted vocabulary.
+    ///
+    /// The schema version gates the marker set, so a marker this reader does
+    /// not recognise cannot have been written by any CLI that speaks this
+    /// schema -- it is forged or corrupted, and reading it as a genuine refusal
+    /// would carry that text through to a reason field a counter treats as
+    /// trusted. Found by mutation: accepting `reason` verbatim, with no check
+    /// against [`Refusal::ALL`], passed every other test in this file.
+    #[test]
+    fn an_unrecognised_refusal_marker_is_not_read_as_a_refusal() {
+        let envelope = serde_json::json!({
+            "schema": REPORT_SCHEMA_VERSION,
+            "refused": "SENTINEL-FORGED-REFUSAL",
+            "explanation": "why no report was prepared",
+        })
+        .to_string();
+
+        assert_eq!(
+            read_report(&envelope),
+            ReadOutcome::Unread {
+                schema_seen: REPORT_SCHEMA_VERSION
+            },
+            "a marker outside the schema-gated vocabulary must not be trusted as a genuine refusal"
+        );
+    }
+
+    /// The refusal markers are wire vocabulary, and are pinned as literals.
+    ///
+    /// The round-trip test above cannot catch a change here: it derives the
+    /// value it expects from the same function it is checking, so swapping the
+    /// two arms keeps it green. Found by mutation. A swap would attribute
+    /// every "hardware not released" refusal to "architecture unreadable" and
+    /// the reverse, which is the precise question the trial exists to answer,
+    /// so these strings are written out rather than computed.
+    #[test]
+    fn the_refusal_markers_are_the_strings_already_written_into_the_field() {
+        assert_eq!(Refusal::UnreleasedHardware.marker(), "unreleased-hardware");
+        assert_eq!(
+            Refusal::ArchitectureUnreadable.marker(),
+            "architecture-unreadable"
+        );
+        assert_eq!(
+            Refusal::ALL.len(),
+            2,
+            "a refusal was added without deciding what it is called on the wire"
+        );
+    }
+
+    /// A report still reads as a report.
+    ///
+    /// The paired half: a reader that answered `Refused` to everything would
+    /// satisfy the test above on its own.
+    #[test]
+    fn recognising_refusals_did_not_stop_reports_being_read() {
+        let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false)
+            .expect("a released machine must produce a report");
+        let serialized = serde_json::to_string(&report).expect("a report must serialize");
+
+        match read_report(&serialized) {
+            ReadOutcome::Understood(read_back) => assert_eq!(*read_back, report),
+            other => panic!("a genuine report read as {other:?}"),
+        }
+    }
+
     /// An engine name this build does not recognise is not published.
     ///
     /// Today every value of `framework` is a literal written by `examine.rs`,
@@ -760,6 +986,55 @@ mod tests {
         assert!(
             !serialized.contains("SENTINEL-UNAPPROVED"),
             "an unrecognised engine name reached a public tracker: {serialized}"
+        );
+    }
+
+    /// A machine with no engine installed reads as absent, not unreadable.
+    ///
+    /// `"unknown"` is `Examination::framework`'s struct default, and a
+    /// completed probe leaves it there when neither engine was found -- the
+    /// ordinary case for most machines. Found by mutation: the prior code
+    /// special-cased an empty string here, a value `examine.rs` never
+    /// actually writes, so every one of these tests passed against a branch
+    /// that could never run, while the case that does run every day fell
+    /// through to [`UNKNOWN`] and mislabelled an absence as unreadable.
+    #[test]
+    fn no_engine_found_by_a_completed_probe_reads_as_none_not_unknown() {
+        let mut machine = machine_of_sentinels("gfx1100");
+        machine.framework = "unknown".to_owned();
+        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+
+        assert_eq!(
+            report.engine, NONE,
+            "the default a completed probe leaves in place means no engine was found, which is \
+             an absence, not a case where this build looked and could not tell"
+        );
+        assert_eq!(
+            report.engine_version, NONE,
+            "a version cannot describe an engine the report says is absent"
+        );
+    }
+
+    /// A skipped probe reads as unreadable, not absent.
+    ///
+    /// `"skipped"` means [`crate::examine::FrameworkProbe::Skip`] was
+    /// requested and the probe never ran at all, which is a different fact
+    /// from the probe running and finding nothing: this build did not look,
+    /// so it cannot say the engine is absent.
+    #[test]
+    fn a_skipped_probe_reads_as_unreadable_not_as_no_engine_installed() {
+        let mut machine = machine_of_sentinels("gfx1100");
+        machine.framework = "skipped".to_owned();
+        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+
+        assert_eq!(
+            report.engine, UNKNOWN,
+            "a probe that never ran cannot report an absence; that would say a machine has no \
+             engine when this build simply never looked"
+        );
+        assert_eq!(
+            report.engine_version, UNKNOWN,
+            "a version cannot describe an engine this build never checked for"
         );
     }
 
@@ -813,28 +1088,46 @@ mod tests {
     /// from the machine, which makes it the one free-text hole in a structure
     /// that is otherwise assembled field by field. A forged or mistaken id must
     /// not ride through to a public tracker.
+    ///
+    /// Also pins `fix_offered`, the field derived from `entry_recognised`: a
+    /// fix cannot be offered for a cause the catalog did not establish, so a
+    /// caller asking for `fix_offered: true` alongside a forged id must be
+    /// overruled. Both calls below pass `true`, so the paired assertion cannot
+    /// be satisfied by an implementation that forces the flag `false`
+    /// unconditionally -- the real-id case has to show the flag surviving.
     #[test]
     fn an_entry_id_the_catalog_does_not_know_is_never_published_verbatim() {
         // Non-vacuity: a real id has to reach the report, or "the forged one
         // does not" is satisfied by discarding every id.
-        let known = prepare_report(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), false)
+        let known = prepare_report(&machine_of_sentinels("gfx1100"), Some("fix-6-path"), true)
             .expect("a released machine must produce a report");
         assert_eq!(
             known.entry, "fix-6-path",
             "premise failed: a real catalog id must reach the report, otherwise the assertion \
              below passes against an implementation that publishes no id at all"
         );
+        assert!(
+            known.fix_offered,
+            "premise failed: fix_offered must survive for a recognised entry, otherwise the \
+             assertion below passes against an implementation that forces the flag false \
+             unconditionally"
+        );
 
         let forged = prepare_report(
             &machine_of_sentinels("gfx1100"),
             Some("SENTINEL-FORGED-ENTRY"),
-            false,
+            true,
         )
         .expect("a released machine must produce a report");
         assert_eq!(
             forged.entry, UNRECOGNISED,
             "an id the catalog does not know is not a finding, and publishing it verbatim would \
              put caller-supplied text on a public tracker"
+        );
+        assert!(
+            !forged.fix_offered,
+            "a fix cannot be offered for a cause the catalog did not establish; this would \
+             publish a fix pointer next to an entry the report itself calls unrecognised"
         );
     }
 

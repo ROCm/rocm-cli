@@ -158,6 +158,11 @@ enum Command {
         /// Nothing leaves the machine: this prints the exact content so it can
         /// be read before any of it is shared. Hardware that is not on AMD's
         /// published compatibility matrix produces no report at all.
+        ///
+        /// Not combinable with `--distro`: a report describes this machine, and
+        /// a WSL distribution reached remotely is not fully examined (see
+        /// `--distro`'s own help), so it cannot back the disclosure guard's
+        /// architecture check.
         #[arg(long, conflicts_with = "distro")]
         report: bool,
     },
@@ -2865,18 +2870,12 @@ fn show_prepared_report(
                 }
             };
             if json {
-                let marker = match refusal {
-                    rocm_core::ReportRefusal::UnreleasedHardware => "unreleased-hardware",
-                    rocm_core::ReportRefusal::ArchitectureUnreadable => "architecture-unreadable",
-                };
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema": rocm_core::REPORT_SCHEMA_VERSION,
-                        "refused": marker,
-                        "explanation": explanation,
-                        "architecture_matrix": rocm_core::APPROVED_ARCHITECTURES_SOURCE,
-                    }))?
+                    serde_json::to_string_pretty(&rocm_core::refusal_envelope(
+                        refusal,
+                        explanation
+                    ))?
                 );
             } else {
                 println!("{explanation}");

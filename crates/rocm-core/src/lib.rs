@@ -59,6 +59,7 @@ pub use proc_lifecycle::{
 pub use report::{
     APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
     Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    refusal_envelope,
 };
 use runtime::env_path_override;
 pub use runtime::{
