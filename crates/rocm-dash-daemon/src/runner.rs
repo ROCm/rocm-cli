@@ -351,7 +351,7 @@ pub async fn run_loop(
             Some(binary) => {
                 AmdSmiCollector::detect_with_binary(binary, amd_smi_gpu_reachable).await
             }
-            None => AmdSmiCollector::detect().await,
+            None => AmdSmiCollector::detect_with_binary("amd-smi", amd_smi_gpu_reachable).await,
         };
         let info = match &gpu {
             Some(g) => Some(g.system_info().await),

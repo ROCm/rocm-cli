@@ -474,11 +474,10 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
     let handle = tokio::spawn(async move {
         let opts = runner::RunnerOptions {
             amd_smi_binary: Some(fake_bin),
-            // Force the fake through the real detection path (as in the test
-            // above) while independently asserting reachability, mirroring how
-            // `apps/rocm` threads `rocm_core::has_usable_amd_gpu()` through
-            // regardless of whether the device pre-flight itself was skipped.
-            amd_smi_skip_device_preflight: true,
+            // Force the fake through the real detection path, mirroring how
+            // `apps/rocm` threads `rocm_core::has_usable_amd_gpu()` through:
+            // `amd_smi_gpu_reachable: true` alone satisfies the real pre-flight.
+            amd_smi_skip_device_preflight: false,
             amd_smi_gpu_reachable: true,
             disable_vllm_metrics: true,
             ..Default::default()
@@ -494,27 +493,31 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
         .await;
     });
 
+    // One outer deadline for the whole wait, not a per-message timeout: the
+    // runner broadcasts a snapshot every 50ms, so a timeout re-armed on each
+    // `rx.recv()` can never elapse while a matching snapshot never arrives,
+    // which would hang this regression guard forever instead of failing red.
     let overall = Duration::from_secs(10);
     let mut found = None;
-    loop {
-        let ev = match timeout(overall, rx.recv()).await {
-            Ok(Ok(ev)) => ev,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => break,
-            Err(_) => break,
-        };
-        if let Event::Snapshot(snap) = ev
-            && !snap.warnings.is_empty()
-        {
-            found = Some(snap.warnings);
-            break;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) if !snap.warnings.is_empty() => {
+                    found = Some(snap.warnings);
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
-    }
+    })
+    .await;
 
     handle.abort();
     let _ = handle.await;
 
-    let warnings = found.expect("a warning-carrying snapshot must arrive");
+    let warnings = found.expect("a warning-carrying snapshot must arrive within 10s");
     assert!(
         warnings
             .iter()
@@ -543,6 +546,18 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight() {
     use std::os::unix::fs::PermissionsExt;
+
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/kfd")
+        .is_ok()
+    {
+        eprintln!(
+            "skipping: this test requires no accessible /dev/kfd, so it exercises the \
+             reachability OR-branch rather than the device-node one"
+        );
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -577,22 +592,25 @@ async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight()
         .await;
     });
 
+    // See the comment on the same shape above: an outer deadline, not a
+    // per-message timeout, so a reverted preflight (never emitting a
+    // non-empty `gpus`) fails red at 10s instead of hanging forever.
     let overall = Duration::from_secs(10);
     let mut found = false;
-    loop {
-        let ev = match timeout(overall, rx.recv()).await {
-            Ok(Ok(ev)) => ev,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(broadcast::error::RecvError::Closed)) => break,
-            Err(_) => break,
-        };
-        if let Event::Snapshot(snap) = ev
-            && !snap.gpus.is_empty()
-        {
-            found = true;
-            break;
+    let _ = timeout(overall, async {
+        loop {
+            match rx.recv().await {
+                Ok(Event::Snapshot(snap)) if !snap.gpus.is_empty() => {
+                    found = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
         }
-    }
+    })
+    .await;
 
     handle.abort();
     let _ = handle.await;
@@ -600,7 +618,7 @@ async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight()
     assert!(
         found,
         "gpu_reachable: true must let the real device pre-flight pass and the fake amd-smi \
-         produce telemetry, even with no accessible /dev/kfd on this host"
+         produce telemetry within 10s, even with no accessible /dev/kfd on this host"
     );
 }
 

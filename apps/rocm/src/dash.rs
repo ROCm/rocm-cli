@@ -928,6 +928,23 @@ mod tests {
         assert!(gpu_reachable_for_preflight(true, true));
     }
 
+    /// The truth table above pins the helper's body but not the call site's
+    /// binding: this pins that `runner_options` actually passes
+    /// `is_wsl_host()` (not a literal `true`) into the gate.
+    #[test]
+    fn runner_options_gates_gpu_reachable_wiring_off_wsl() {
+        if rocm_core::is_wsl_host() {
+            eprintln!("skipping: this test requires a non-WSL host");
+            return;
+        }
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(
+            !opts.amd_smi_gpu_reachable,
+            "off WSL, amd_smi_gpu_reachable must stay false regardless of is_wsl_host()'s argument binding"
+        );
+    }
+
     #[test]
     fn runner_options_derives_default_bench_csv_from_current_paths() {
         let p = paths();
