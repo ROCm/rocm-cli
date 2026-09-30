@@ -8107,6 +8107,14 @@ fn amd_smi_json_with(
 /// the `kill`, so callers that can reach one must decline to spawn it in the
 /// first place — see [`amd_smi_preflight_ok`]. This function at least returns
 /// to its caller in that case rather than joining the child in its wait.
+///
+/// On timeout the calling thread returns without waiting on the child; the
+/// `wait` is handed to a detached reaper thread instead, because
+/// `std::process::Child` has no reaping `Drop` and dropping the handle here
+/// would strand a zombie for the lifetime of this process. That reap is
+/// best-effort: it completes only if the child actually dies, which is the
+/// same condition the `kill` above already depends on. See
+/// `reap_in_background`.
 pub fn run_command_with_timeout(
     mut command: Command,
     timeout: Duration,
@@ -8133,15 +8141,63 @@ pub fn run_command_with_timeout(
             });
         }
         if started.elapsed() >= timeout {
+            // `kill` is allowed to fail — most often because the child exited
+            // between the `try_wait` above and here, in which case it is already
+            // a zombie and the reap below is exactly what is needed. Reap
+            // unconditionally rather than only on a successful kill.
             let _ = child.kill();
-            // Deliberately neither waits on the child nor joins the readers: an
-            // unkillable child would block both, which is the hang this timeout
-            // exists to bound. That costs the partial output the message used to
-            // quote; the threads end by themselves once the child does.
+            // This thread deliberately joins neither the child nor the readers:
+            // an unkillable child would block both, which is the hang this
+            // timeout exists to bound. That costs the partial output the message
+            // used to quote; the reader threads end by themselves once the child
+            // does.
+            reap_in_background(child);
             bail!("process exceeded {}s timeout", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Take ownership of a killed child and `wait` for it on a detached thread.
+///
+/// `std::process::Child` has no reaping `Drop`: dropping the handle after a
+/// `kill` leaves the child a zombie occupying a PID slot for the whole lifetime
+/// of this process. That is affordable for a one-shot CLI and not for a daemon
+/// — `rocmd`'s watcher tick reaches this path on its GPU-telemetry cadence, so
+/// a host where `amd-smi` reliably overruns the probe timeout would accrue
+/// zombies until the PID table ran dry. Reaping on a *detached* thread is what
+/// lets the `wait` happen without the calling thread paying for it.
+///
+/// Guarantees:
+///
+/// - The calling thread returns immediately; it never waits on the child.
+/// - A child that does die — the normal case after `SIGKILL`, and the case
+///   where it had already exited before the `kill` — is reaped, and its PID is
+///   released, within roughly the time the kernel takes to tear it down.
+///
+/// Does not guarantee:
+///
+/// - That the child dies. A process in uninterruptible sleep ignores `SIGKILL`,
+///   so its reaper parks until the kernel lets it go, possibly forever. The
+///   resource leaked in that case is a blocked thread rather than a zombie PID
+///   — no worse than what it replaces, and better than blocking the caller, but
+///   still a leak. The only real mitigation is declining to spawn against a
+///   suspect device: see [`amd_smi_preflight_ok`].
+/// - That a reaper always exists. If the thread cannot be spawned, the child is
+///   dropped and left as a zombie, which is the pre-existing failure mode and
+///   strictly better than propagating an error from a path that is already
+///   reporting one.
+///
+/// Reaper threads do not accumulate under normal operation: one is created per
+/// timeout, and each one exits as soon as its child does. Accumulation needs a
+/// steady supply of children that never die, which is the uninterruptible-sleep
+/// case above.
+fn reap_in_background(mut child: std::process::Child) {
+    let _ = thread::Builder::new()
+        .name("rocm-reap-timed-out-child".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn drain_on_thread<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
@@ -9916,6 +9972,84 @@ mod tests {
             output.stderr.len(),
             BYTES,
             "stderr was truncated or stalled"
+        );
+        Ok(())
+    }
+
+    /// Killing a timed-out child is not the same as reaping it.
+    /// `std::process::Child` has no reaping `Drop`, so dropping the handle
+    /// after the `kill` strands the corpse in state `Z` for the lifetime of
+    /// this process. `rocmd` reaches this path from its watcher tick, so on a
+    /// host where `amd-smi` reliably overruns the probe timeout that is an
+    /// unbounded PID leak rather than a one-off.
+    ///
+    /// The child records its own PID before sleeping well past the timeout, so
+    /// this watches the real process table instead of inferring anything from
+    /// the returned error. Drop `reap_in_background` and the entry sits at `Z`
+    /// until the poll below gives up.
+    ///
+    /// Linux-only: `/proc` is where a zombie is observable. The behaviour is
+    /// not Linux-specific, only the assertion is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_timed_out_child_is_reaped_rather_than_left_a_zombie() -> Result<()> {
+        /// The `stat` state field is the first token after the last `)`, which
+        /// is where parsing has to start because `comm` may itself contain
+        /// parentheses. `None` means the entry is gone, i.e. fully reaped.
+        fn process_state(pid: u32) -> Option<char> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .next()?
+                .chars()
+                .next()
+        }
+
+        let temp_root = std::env::temp_dir().join(format!("rocm-cli-reap-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let pid_file = temp_root.join("child-pid");
+
+        // `$$` is this `sh`, which is our direct child whether or not the shell
+        // execs the `sleep` over itself — either way it is the process we kill
+        // and therefore the one that must be reaped. The sleep outlasts the
+        // timeout by enough that the child cannot exit on its own and make the
+        // assertion pass for the wrong reason.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; sleep 30", pid_file.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let result = run_command_with_timeout(command, Duration::from_millis(300));
+        assert!(
+            result.is_err(),
+            "the child outlives the timeout, so this must have timed out: {result:?}"
+        );
+
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .context("the child never recorded its pid, so nothing was proven")?
+            .trim()
+            .parse()
+            .context("unparseable child pid")?;
+        let _ = fs::remove_dir_all(&temp_root);
+
+        // The reaper races the kernel tearing the child down, so poll rather
+        // than sample once. Without the reap this burns the full budget and
+        // still reports `Z`.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = process_state(pid);
+        while state == Some('Z') && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            state = process_state(pid);
+        }
+
+        assert_ne!(
+            state,
+            Some('Z'),
+            "pid {pid} is still a zombie: the timeout path killed the child but never reaped it"
         );
         Ok(())
     }
