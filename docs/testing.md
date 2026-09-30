@@ -1290,11 +1290,15 @@ On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `fix_offered`. This path has not been exercised against real hardware in CI;
 verifying it needs a lane whose GPU architecture is on the allowlist.
 
-Three of those fields answer with a word rather than a value, and the words
-are not interchangeable. `none` means the thing is absent, `unknown` means this
-build looked and could not tell, and `other` means a distribution was named but
-is not one this build recognises. A host with no ROCm installed reports
-`"rocm": "none"`, while a host whose install exists but whose version could not
-be read reports `"rocm": "unknown"` — worth checking by hand on a machine with
-a partial install, since the two are easy to merge by accident and a counter
-cannot tell them apart afterwards.
+Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
+answer with a word rather than a value, and the words are not interchangeable.
+`none` means the thing is absent, `unknown` means this build looked and could
+not tell, and `other` means a distribution was named but is not one this build
+recognises. A host with no ROCm installed reports `"rocm": "none"`, while a
+host whose install exists but whose version could not be read reports `"rocm":
+"unknown"` — worth checking by hand on a machine with a partial install, since
+the two are easy to merge by accident and a counter cannot tell them apart
+afterwards. `engine`/`engine_version` carry the same distinction: a host a
+probe found no engine on reports `"engine": "none"`, while a host whose engine
+probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
+since a probe that never ran cannot say an engine is absent.

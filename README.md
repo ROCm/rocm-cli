@@ -288,14 +288,17 @@ fix` takes the id, not the position.
   report, and sends nothing — there is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action. The
   content is deliberately narrow (a schema version, the matched entry, whether
-  a fix was offered for it, the GPU architecture, the OS family, distribution
-  and major version, the ROCm release, the inference engine and its release,
-  the CLI version), and it carries no host name, user name, file path, or
-  error text. Every version is cut back to a release, so a build number that
-  would narrow toward one machine never appears, and the distribution is
-  checked against a list of known names rather than repeated from the
-  machine. Hardware that is not on AMD's published compatibility
-  matrix produces no report at all, and the CLI says why.
+  a fix was offered for it, the GPU architecture and which compatibility
+  matrix snapshot it was checked against, the OS family, distribution and
+  major version, the ROCm release, the inference engine and its release, the
+  CLI version), and it carries no host name, user name, file path, or error
+  text. The ROCm release and the inference engine's release are each cut
+  back to a release, so a build number that would narrow toward one machine
+  never appears there; the CLI's own version is the exception, since it names
+  the tool that wrote the report rather than something read off the machine.
+  The distribution is checked against a list of known names rather than
+  repeated from the machine. Hardware that is not on AMD's published
+  compatibility matrix produces no report at all, and the CLI says why.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
