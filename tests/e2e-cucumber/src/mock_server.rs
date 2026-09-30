@@ -676,6 +676,11 @@ impl MockServer {
 /// record shape.
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceRecordOptions {
+    /// Engine name recorded for the service. Defaults to `"vllm"`, the engine
+    /// the mock server stands in for. A scenario that needs the CLI to match
+    /// this record against a *different* engine — e.g. the self-managing
+    /// `lemonade` path — overrides it.
+    pub engine: &'static str,
     pub status: &'static str,
     pub startup_phase: Option<&'static str>,
     pub supervisor_pid: u32,
@@ -685,6 +690,7 @@ pub struct ServiceRecordOptions {
 impl Default for ServiceRecordOptions {
     fn default() -> Self {
         Self {
+            engine: "vllm",
             status: "ready",
             startup_phase: None,
             supervisor_pid: 0,
@@ -722,7 +728,7 @@ pub fn write_service_record_with(
     // `/v1/models` for its readiness probe, which the mock serves.
     let record = json!({
         "service_id": "e2e-mock",
-        "engine": "vllm",
+        "engine": options.engine,
         "model_ref": model,
         "canonical_model_id": model,
         "host": "127.0.0.1",

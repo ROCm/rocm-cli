@@ -30,6 +30,18 @@ fn interactive_summary_timeout() -> Duration {
 /// [`OOM_GUIDANCE_MODEL`] keeps the two OOM scenarios' service records from ever
 /// colliding, and marks this one as the launch (not reuse) case.
 const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
+/// Model id of the live managed service planted by
+/// `@id:serve-unrelated-live-service-still-fails-fast`.
+///
+/// Must not be relatable to [`LEMONADE_SERVE_TARGET`] by the CLI's lenient
+/// service-name matcher (case-insensitive equality, or either name containing
+/// the other once extensions are stripped) — otherwise the pre-gate would open
+/// on a legitimate match and the scenario would stop testing the model keying.
+const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
+/// The GGUF model the Lemonade-pinned serve steps request. Same checkpoint
+/// `serve-lemonade-preparation-recovery` uses, so no new download is implied on
+/// any lane that ever does reach a real install.
+const LEMONADE_SERVE_TARGET: &str = "Qwen3-0.6B-GGUF";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -1131,6 +1143,7 @@ async fn plant_oom_managed_serve(world: &mut E2eWorld) {
             startup_phase: Some("initializing"),
             supervisor_pid: std::process::id(),
             engine_pid: Some(std::process::id()),
+            ..ServiceRecordOptions::default()
         },
     );
     // A real allocator OOM signature (not vLLM's generic EngineCore wrapper,
@@ -1142,6 +1155,53 @@ async fn plant_oom_managed_serve(world: &mut E2eWorld) {
         "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
     )
     .expect("failed to plant the OOM startup log");
+}
+
+/// Plant a live managed **Lemonade** service for a model the serve under test
+/// will not ask for.
+///
+/// Lemonade because it is the engine that manages its own runtime: the reuse
+/// pre-gate's body calls `ensure_self_managed_engine_ready`, which prints
+/// "Preparing lemonade for GPU serving..." and installs. That print is the
+/// user-visible evidence that engine work ran, and it is what
+/// `assert_no_engine_preparation` looks for.
+///
+/// The record names the same engine the serve will pass, so the ENGINE is not
+/// what holds the pre-gate shut — only [`UNRELATED_LIVE_MODEL`] differing from
+/// the served model is. `starting` plus this test process's pid keeps the record
+/// live through the CLI's liveness overlay, exactly as the reuse scenario's
+/// record does.
+#[given("a live managed Lemonade serve for an unrelated model")]
+async fn plant_unrelated_live_lemonade_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        UNRELATED_LIVE_MODEL,
+        65_533,
+        ServiceRecordOptions {
+            engine: "lemonade",
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+        },
+    );
+}
+
+/// Serve a Lemonade model under the GPU-required default while the unrelated
+/// live service planted above exists. No fault-injection env var: the scripted
+/// Lemonade backend failure would waive the very GPU pre-flight this scenario
+/// asserts.
+#[when("the user serves a different model with Lemonade under the GPU-required default")]
+async fn user_serves_other_model_with_unrelated_service_live(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", LEMONADE_SERVE_TARGET, "--engine", "lemonade"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
 }
 
 #[when("the user opens its interactive serve summary")]
@@ -1271,6 +1331,24 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     );
 }
 
+#[then("no engine was prepared for GPU serving")]
+async fn assert_no_engine_preparation(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // `ensure_self_managed_engine_ready` announces itself with exactly this line
+    // (`apps/rocm/src/main.rs`) immediately before it downloads and installs, so
+    // its absence is the observable "no engine work ran". Matched on the
+    // "Preparing " prefix rather than the whole sentence: that is the token the
+    // CLI owns, and it stays true if the rest of the sentence is reworded.
+    //
+    // Nothing here wraps — this is captured pipe output, not a PTY grid — so a
+    // plain `contains` is the right check.
+    assert!(
+        !output.contains("Preparing "),
+        "a live managed service for an unrelated model must not drag engine \
+         preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
 #[then("the CLI explains that temperature cannot be negative")]
 async fn assert_negative_temperature_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1322,8 +1400,11 @@ async fn assert_reused_running_service(world: &mut E2eWorld) {
         .as_ref()
         .expect("no interactive serve summary")
         .screen_text();
+    // Whitespace-insensitive for the same reason as the two assertions below: the
+    // heading is rendered onto an 80-column PTY grid, so a soft wrap falling
+    // between "already" and "running" would break a literal `contains`.
     assert!(
-        screen.contains("already running"),
+        screen_without_whitespace(&screen).contains("alreadyrunning"),
         "expected the summary to reflect the reused live service:\n{screen}"
     );
 }
