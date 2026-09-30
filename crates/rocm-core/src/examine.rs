@@ -395,17 +395,7 @@ impl Examination {
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
-            // Between the two, because it decides *which* AMD GPUs exist: the
-            // PCI scan over-reports in a container and `rocminfo` maps its
-            // agents onto the surviving entries by position, so it has to see
-            // the reconciled list rather than the whole bus.
-            probe_gpus_kernel_membership(&mut e);
-            probe_gpus_rocminfo(&mut e);
-            // After `rocminfo`, because it is the probe most likely to name a
-            // card the PCI scan missed, and before the sysfs fallback, which
-            // plants the same placeholder with a note of its own.
-            note_unnamed_kernel_topology_gpus(&mut e);
-            probe_gpus_sysfs_fallback(&mut e);
+            probe_gpus_after_lspci(&mut e, GpuProbeSources::host());
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -1288,15 +1278,23 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
 /// those are worth keeping whenever they are available.
 ///
 /// Reached only when the KFD topology could not be read or described no GPU,
-/// since [`probe_gpus_kernel_membership`] would otherwise have contributed an
+/// since [`probe_gpus_kernel_membership_in`] would otherwise have contributed an
 /// entry per node already. What is left for this to cover is the host whose
 /// target comes from DRM ip-discovery instead — see
 /// [`crate::detect_linux_sysfs_gfx_target`].
-fn probe_gpus_sysfs_fallback(e: &mut Examination) {
+///
+/// `gfx_target` is supplied by the caller rather than read here so the pass has
+/// a seam like every other one in the sequence: the hosts it covers are ones a
+/// test cannot run on, and it is the only pass whose *output* distinguishes the
+/// sequence's correct order from running
+/// [`note_unnamed_kernel_topology_gpus`] after it. It stays a function rather
+/// than a value so the read is still skipped entirely when an AMD GPU is
+/// already listed.
+fn probe_gpus_sysfs_fallback(e: &mut Examination, gfx_target: fn() -> Option<String>) {
     if e.gpus.iter().any(|gpu| gpu.is_amd) {
         return;
     }
-    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+    let Some(gfx_target) = gfx_target() else {
         return;
     };
     // `is_apu` is left unset rather than guessed: sysfs gives the target, not
@@ -1317,28 +1315,70 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     );
 }
 
-/// Make the reported AMD GPU list the set the *kernel* exposes, named from what
-/// the PCI scan found.
+/// Where the GPU passes that follow the PCI scan read the host from.
 ///
-/// The PCI bus answers a different question from the kernel. Matching the
-/// processing-accelerator class is what finally makes Instinct parts visible to
-/// [`probe_gpus_lspci`], but it also makes every card on the *host* bus visible
-/// to a container that was passed one of them: an MI300X node reports eight
-/// accelerators on the bus while KFD describes only the GPU the container may
-/// use. Enumerating from PCI alone would therefore tell that user they have
-/// eight GPUs, and `rocm serve` would then fail on a device `examine` had just
-/// advertised — worse than the under-detection this replaced, which at least
-/// failed honestly.
+/// They run in one particular order, stated by [`probe_gpus_after_lspci`], and
+/// until this existed that order was a claim only a doc comment made: the
+/// sequence read `/sys` and launched `rocminfo` itself, so no test could drive
+/// it. Moving [`note_unnamed_kernel_topology_gpus`] above `rocminfo`, below the
+/// sysfs fallback, or deleting it outright each left the whole suite green,
+/// even though the first reinstates the premature-note defect the pass was
+/// split out to remove.
 ///
-/// So count from the kernel and name from PCI. Only `is_amd` entries are
-/// touched: KFD describes AMD compute devices and says nothing about an NVIDIA
-/// card, which must survive untouched.
-#[cfg(any(target_os = "linux", test))]
-fn probe_gpus_kernel_membership(e: &mut Examination) {
-    // The status is dropped: both answers call for the same action here. It is
-    // returned at all so that a test can tell them apart -- see
+/// Naming the sources is what makes the sequence drivable against a planted
+/// host, so its shape is pinned by assertion rather than by prose — see
+/// `the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback`.
+/// The passes themselves are the real ones; only where they read is injected.
+struct GpuProbeSources<'a> {
+    /// The KFD topology nodes directory the membership pass reconciles against.
+    kfd_nodes: &'a Path,
+    /// A `rocminfo` reading to fold in, or `None` to run `rocminfo` here.
+    ///
+    /// `None` is what the host uses; `Some` exists because a test cannot make a
+    /// machine with no GPU produce an agent listing, and the placeholder's fate
+    /// turns entirely on whether one arrived.
+    rocminfo: Option<&'a str>,
+    /// How the sysfs fallback learns the gfx target when nothing else named a
+    /// card. See [`probe_gpus_sysfs_fallback`] for why it is a function.
+    sysfs_gfx_target: fn() -> Option<String>,
+}
+
+impl GpuProbeSources<'_> {
+    /// The real host: the kernel's own KFD topology, the `rocminfo` on `PATH`,
+    /// and the sysfs target read.
+    fn host() -> Self {
+        Self {
+            kfd_nodes: Path::new("/sys/class/kfd/kfd/topology/nodes"),
+            rocminfo: None,
+            sysfs_gfx_target: crate::detect_linux_sysfs_gfx_target,
+        }
+    }
+}
+
+/// Every GPU pass after the PCI scan, in the order they have to run in.
+///
+/// The order is the whole point of gathering them here: each pass is correct
+/// only in one position, and three of the four constraints below are invisible
+/// to any test that calls the passes directly in an order it chose itself.
+///
+/// - The membership pass decides *which* AMD GPUs exist, so it runs before
+///   `rocminfo`: the PCI scan over-reports in a container, and `rocminfo` maps
+///   its agents onto the surviving entries by position, so it has to see the
+///   reconciled list rather than the whole bus.
+/// - [`note_unnamed_kernel_topology_gpus`] runs after `rocminfo`, which is the
+///   probe most likely to name a card the PCI scan missed, and before the sysfs
+///   fallback, which plants the same placeholder with a note of its own.
+fn probe_gpus_after_lspci(e: &mut Examination, sources: GpuProbeSources) {
+    // The topology status is dropped: both answers call for the same action
+    // here. It is returned at all so that a test can tell them apart -- see
     // [`KfdTopology`].
-    probe_gpus_kernel_membership_in(e, Path::new("/sys/class/kfd/kfd/topology/nodes"));
+    probe_gpus_kernel_membership_in(e, sources.kfd_nodes);
+    match sources.rocminfo {
+        Some(out) => apply_rocminfo_gpu_agents(e, out),
+        None => probe_gpus_rocminfo(e),
+    }
+    note_unnamed_kernel_topology_gpus(e);
+    probe_gpus_sysfs_fallback(e, sources.sysfs_gfx_target);
 }
 
 /// What the kernel topology had to say, as opposed to what was done about it.
@@ -1365,10 +1405,30 @@ enum KfdTopology {
 }
 
 /// KFD is a Linux interface, so off Linux there is no topology to read.
+///
+/// The gating is not cosmetic: [`probe_gpus_after_lspci`] is reached through a
+/// runtime `os_family == "linux"` test, not a `cfg`, so it and this call still
+/// have to compile on Windows — and Linux clippy cannot see that. The twin
+/// keeps the sequence itself in one place instead of a second, drifting copy.
 #[cfg(not(any(target_os = "linux", test)))]
-const fn probe_gpus_kernel_membership(_e: &mut Examination) {}
+const fn probe_gpus_kernel_membership_in(_e: &mut Examination, _nodes_dir: &Path) {}
 
-/// The probe itself, against a caller-supplied nodes directory.
+/// Make the reported AMD GPU list the set the *kernel* exposes, named from what
+/// the PCI scan found, against a caller-supplied nodes directory.
+///
+/// The PCI bus answers a different question from the kernel. Matching the
+/// processing-accelerator class is what finally makes Instinct parts visible to
+/// [`probe_gpus_lspci`], but it also makes every card on the *host* bus visible
+/// to a container that was passed one of them: an MI300X node reports eight
+/// accelerators on the bus while KFD describes only the GPU the container may
+/// use. Enumerating from PCI alone would therefore tell that user they have
+/// eight GPUs, and `rocm serve` would then fail on a device `examine` had just
+/// advertised — worse than the under-detection this replaced, which at least
+/// failed honestly.
+///
+/// So count from the kernel and name from PCI. Only `is_amd` entries are
+/// touched: KFD describes AMD compute devices and says nothing about an NVIDIA
+/// card, which must survive untouched.
 ///
 /// Split from the `/sys` path exactly as [`crate::kfd_gpu_nodes_in`] is, and for
 /// the same reason one level further out: it leaves the *whole* probe drivable
@@ -1488,10 +1548,12 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
 /// often knows the name had not yet run -- so the note fired even on hosts whose
 /// report went on to name every card.
 ///
-/// Must run after `probe_gpus_rocminfo` and before `probe_gpus_sysfs_fallback`:
+/// Must run after `probe_gpus_rocminfo` and before [`probe_gpus_sysfs_fallback`]:
 /// the first is what resolves the placeholder, and the second plants the same
 /// placeholder again with a note of its own, which this would otherwise count a
-/// second time.
+/// second time. Both bounds are asserted rather than merely asked for — see
+/// `the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback`,
+/// which fails if this call moves to either side of them or goes away.
 fn note_unnamed_kernel_topology_gpus(e: &mut Examination) {
     let unnamed = e
         .gpus
@@ -3072,7 +3134,9 @@ mod tests {
             }],
             ..Examination::default()
         };
-        probe_gpus_sysfs_fallback(&mut e);
+        // A target is deliberately on offer: the point is that the fallback
+        // declines it, not that there was nothing to take.
+        probe_gpus_sysfs_fallback(&mut e, || Some("gfx942".to_owned()));
         assert_eq!(e.gpus.len(), 1, "the fallback must not add a second entry");
         assert_eq!(e.gpus[0].pci_id, "1002:74a1");
         assert!(
@@ -3514,6 +3578,130 @@ mod tests {
             !e.notes.join("\n").contains("marketing name is unknown"),
             "the name is known -- `rocminfo` just supplied it -- so the note must not fire: {:#?}",
             e.notes
+        );
+    }
+
+    /// The notes [`note_unnamed_kernel_topology_gpus`] emits, and only those.
+    ///
+    /// Matched on "their marketing name is unknown" rather than the looser
+    /// "marketing name is unknown", because `probe_gpus_sysfs_fallback` emits a
+    /// note of its own ending "PCI id and marketing name are unknown" — and
+    /// telling the two apart is exactly what catches the note being taken after
+    /// the fallback instead of before it.
+    fn unknown_name_notes(e: &Examination) -> Vec<&String> {
+        e.notes
+            .iter()
+            .filter(|note| note.contains("their marketing name is unknown"))
+            .collect()
+    }
+
+    #[test]
+    fn the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback() {
+        // The test above proves the *passes* compose when a caller runs them in
+        // the right order. It cannot notice the real call site running them in
+        // the wrong one -- it chooses the order itself. So drive
+        // `probe_gpus_after_lspci`, which is the sequence `Examination::probe`
+        // runs, against planted hosts. Each scenario below is failed by exactly
+        // one way of misplacing `note_unnamed_kernel_topology_gpus`:
+        //
+        //   A. above `probe_gpus_rocminfo` -- the premature-note defect this
+        //      pass was split out to remove: a named card gets noted as unnamed.
+        //   B. deleted -- a genuinely unnamed card goes unremarked.
+        //   C. below `probe_gpus_sysfs_fallback` -- the fallback's own
+        //      placeholder is counted on top of the fallback's own note.
+
+        // A. The ordinary ROCm container: KFD exposes the one passed-through
+        //    MI300X, `pciutils` is absent so the PCI scan named nothing, and
+        //    `rocminfo` supplies the marketing name. Naming is finished by the
+        //    time the note is taken, so there is nothing to report.
+        let (root, nodes) = plant_kfd_topology("sequence-named", &[(23808, 90402)]);
+        let mut named = Examination::default();
+        probe_gpus_after_lspci(
+            &mut named,
+            GpuProbeSources {
+                kfd_nodes: &nodes,
+                rocminfo: Some(
+                    "Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n\
+                     Agent 2\n  Name:  gfx942\n  Marketing Name:  AMD Instinct MI300X\n  \
+                     Device Type:  GPU\n",
+                ),
+                sysfs_gfx_target: || Some("gfx942".to_owned()),
+            },
+        );
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            named.gpus.len(),
+            1,
+            "the kernel exposes one card and `rocminfo` names it: {:#?}",
+            named.gpus
+        );
+        assert_eq!(
+            named.gpus[0].name, "AMD Instinct MI300X",
+            "the marketing name must reach the report"
+        );
+        assert_eq!(
+            unknown_name_notes(&named),
+            Vec::<&String>::new(),
+            "the note must be taken after `rocminfo`, which named this card: {:#?}",
+            named.notes
+        );
+
+        // B. The same host with a `rocminfo` that lists no GPU agent. Nothing
+        //    ever named the card, so the note is the only thing that tells the
+        //    user why the report says "AMD GPU (from kernel topology)".
+        let (root, nodes) = plant_kfd_topology("sequence-unnamed", &[(23808, 90402)]);
+        let mut unnamed = Examination::default();
+        probe_gpus_after_lspci(
+            &mut unnamed,
+            GpuProbeSources {
+                kfd_nodes: &nodes,
+                rocminfo: Some("Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n"),
+                sysfs_gfx_target: || Some("gfx942".to_owned()),
+            },
+        );
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(unnamed.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+        assert_eq!(
+            unknown_name_notes(&unnamed).len(),
+            1,
+            "an entry nothing could name must say so exactly once: {:#?}",
+            unnamed.notes
+        );
+
+        // C. No KFD topology to read at all, so the membership pass is a no-op
+        //    and the sysfs fallback is what finds the card -- the DRM
+        //    ip-discovery host it exists for. The fallback plants the same
+        //    placeholder *and* explains it in a note of its own, so the count
+        //    must already have been taken: reporting it again would tell the
+        //    user twice, in two different wordings, about one card.
+        let mut fallback = Examination::default();
+        probe_gpus_after_lspci(
+            &mut fallback,
+            GpuProbeSources {
+                kfd_nodes: &std::env::temp_dir().join("rocm-cli-absent-kfd-for-sequence"),
+                rocminfo: Some("Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n"),
+                sysfs_gfx_target: || Some("gfx1103".to_owned()),
+            },
+        );
+        assert_eq!(
+            fallback.gpus.len(),
+            1,
+            "the fallback must supply the card the topology could not: {:#?}",
+            fallback.gpus
+        );
+        assert_eq!(fallback.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+        assert_eq!(
+            unknown_name_notes(&fallback),
+            Vec::<&String>::new(),
+            "the fallback already explains its own placeholder; the note must be taken \
+             before it, not after: {:#?}",
+            fallback.notes
+        );
+        assert_eq!(
+            fallback.notes.len(),
+            1,
+            "one card, one explanation: {:#?}",
+            fallback.notes
         );
     }
 
