@@ -1,8 +1,5 @@
 root: index
 subtrees:
-  - entries:
-      - file: release-notes
-        title: Release notes
   - caption: Demos
     entries:
       - file: demos
