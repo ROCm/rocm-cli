@@ -1180,9 +1180,11 @@ mod tests {
         assert_eq!(
             (routed_verbatim, fell_back),
             (4, 3),
-            "the table must keep exercising both branches; if a scoring or admissibility \
-             change moved a line across a boundary, re-pick the fixture rather than relaxing \
-             the expectation"
+            "the table must keep exercising both branches; if an admissibility change \
+             moved a line across the quotability boundary, re-pick the fixture rather than \
+             relaxing the expectation. Scoring is not what separates these rows — every row \
+             here is comfortably accepted by the detector, and the three fallbacks are \
+             fallbacks purely because they cannot be rendered as one single-quoted word"
         );
     }
 
