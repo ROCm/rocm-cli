@@ -129,6 +129,20 @@ pub enum Refusal {
     /// No GPU architecture could be read, so nothing confirms the hardware is
     /// on the compatibility matrix. Refused rather than assumed.
     ArchitectureUnreadable,
+    /// Nothing on this machine was asked about the hardware, so there is no
+    /// answer to refuse on.
+    ///
+    /// Separate from [`Refusal::ArchitectureUnreadable`] because the two say
+    /// different things and only one of them is about the machine. "We looked
+    /// and could not read it" is a finding. "We never looked" is a gap in this
+    /// tool. Reporting the second as the first tells a healthy machine it has
+    /// no readable GPU, which is false.
+    ///
+    /// Reached on WSL today: `examine`'s WSL arm returns before any GPU probe
+    /// runs, so the GPU list is empty there whatever the hardware is. The
+    /// deeper fix is to probe on WSL, where the architecture is in fact
+    /// reachable. Until then this says what is true.
+    PlatformNotProbed,
 }
 
 impl Refusal {
@@ -145,11 +159,16 @@ impl Refusal {
         match self {
             Self::UnreleasedHardware => "unreleased-hardware",
             Self::ArchitectureUnreadable => "architecture-unreadable",
+            Self::PlatformNotProbed => "platform-not-probed",
         }
     }
 
     /// Every refusal, so a reader or a test cannot cover fewer than exist.
-    pub const ALL: &'static [Self] = &[Self::UnreleasedHardware, Self::ArchitectureUnreadable];
+    pub const ALL: &'static [Self] = &[
+        Self::UnreleasedHardware,
+        Self::ArchitectureUnreadable,
+        Self::PlatformNotProbed,
+    ];
 }
 
 /// A report, as it would be published.
@@ -254,6 +273,15 @@ pub fn prepare_report(
         .filter(|g| g.is_amd)
         .map(|g| g.gfx_target.trim())
         .collect();
+
+    // Checked before the architecture, because an empty GPU list means two
+    // different things and only this branch can tell them apart. `examine`'s
+    // WSL arm returns before any GPU probe runs, so the list there is empty
+    // whatever the hardware is. Reading that as "could not be read" tells a
+    // healthy machine something false about itself.
+    if examination.is_wsl {
+        return Err(Refusal::PlatformNotProbed);
+    }
 
     // Default-deny, and this is the branch that enforces it. A machine with no
     // readable AMD architecture has nothing confirming its hardware is on the
@@ -372,19 +400,36 @@ fn distro(examination: &Examination) -> String {
 
 /// The installed ROCm release, as major and minor.
 ///
-/// `rocm_path` decides absence and `rocm_version` decides readability, because
-/// `examine.rs` collapses both into an empty string: `rocm_version` is
-/// `install.version.unwrap_or_default()`, so "no install was found" and "an
-/// install was found whose version could not be read" arrive identical. Those
-/// are different facts to anybody counting, in the same way [`ReadOutcome`]
-/// keeps an unreadable report apart from an absent one.
+/// Sourced per platform, for the same reason [`os_major`] is: no single
+/// `Examination` field holds "the installed ROCm" on both. `probe` calls
+/// `probe_rocm_install` only on Linux and WSL, which is what fills
+/// `rocm_path` / `rocm_version`; the Windows branch calls
+/// `probe_hip_sdk_windows` instead and fills `hip_sdk_path` /
+/// `hip_sdk_version`, leaving the other pair empty. Reading only the Linux
+/// pair therefore reported `none` -- "no ROCm installed" -- on a Windows
+/// machine with a fully installed HIP SDK.
 ///
-/// The path itself is only ever read here. It is never published.
+/// Within each platform the path decides absence and the version decides
+/// readability, because `examine.rs` collapses both into an empty string:
+/// "no install was found" and "an install was found whose version could not
+/// be read" arrive identical. Those are different facts to anybody counting,
+/// in the same way [`ReadOutcome`] keeps an unreadable report apart from an
+/// absent one.
+///
+/// Neither path is ever published. They are read here to tell absence from
+/// unreadability, and nothing else.
 fn rocm_release(examination: &Examination) -> String {
-    if examination.rocm_path.trim().is_empty() {
+    let (path, version) = match examination.os_family.as_str() {
+        "windows" => (&examination.hip_sdk_path, &examination.hip_sdk_version),
+        // Linux and WSL, the platforms `probe_rocm_install` runs on. Anything
+        // else reaches neither probe, so both pairs are empty and this
+        // correctly reports an absence.
+        _ => (&examination.rocm_path, &examination.rocm_version),
+    };
+    if path.trim().is_empty() {
         return NONE.to_owned();
     }
-    let release = major_minor(&examination.rocm_version);
+    let release = major_minor(version);
     if release.is_empty() {
         UNKNOWN.to_owned()
     } else {
@@ -666,6 +711,38 @@ mod tests {
             Err(Refusal::ArchitectureUnreadable),
             "nothing confirmed this hardware is on the compatibility matrix, and default-deny \
              is the whole point"
+        );
+    }
+
+    /// A machine nobody asked about is told so, not told its GPU is unreadable.
+    ///
+    /// `examine`'s WSL arm returns before any GPU probe runs, so the GPU list
+    /// is empty there whatever the hardware is. Reading that as "could not be
+    /// read" told a healthy WSL machine something false about itself, in the
+    /// one command whose purpose is to be exact about what it can say.
+    ///
+    /// The fixture carries a perfectly good approved GPU on purpose. A machine
+    /// with no GPU would reach the right answer for the wrong reason, and the
+    /// test would pass against code that still never looked at `is_wsl`.
+    #[test]
+    fn a_wsl_machine_is_told_its_platform_was_not_inspected_not_that_its_gpu_is_unreadable() {
+        let mut wsl = machine_of_sentinels("gfx1100");
+        wsl.is_wsl = true;
+
+        assert_eq!(
+            prepare_report(&wsl, None, false),
+            Err(Refusal::PlatformNotProbed),
+            "a platform this CLI never inspects must say so, rather than report a finding \
+             about hardware nothing looked at"
+        );
+
+        // The premise. Without it the assertion above is satisfied by refusing
+        // the same machine for the old reason, or by refusing everything.
+        let mut bare_metal = wsl;
+        bare_metal.is_wsl = false;
+        assert!(
+            prepare_report(&bare_metal, None, false).is_ok(),
+            "premise failed: the same machine off WSL has an approved GPU and must report"
         );
     }
 
@@ -1071,9 +1148,10 @@ mod tests {
             Refusal::ArchitectureUnreadable.marker(),
             "architecture-unreadable"
         );
+        assert_eq!(Refusal::PlatformNotProbed.marker(), "platform-not-probed");
         assert_eq!(
             Refusal::ALL.len(),
-            2,
+            3,
             "a refusal was added without deciding what it is called on the wire"
         );
     }
@@ -1196,6 +1274,52 @@ mod tests {
             absent.rocm, unreadable.rocm,
             "a counter cannot tell an absent ROCm from an unreadable one"
         );
+    }
+
+    /// A Windows machine's ROCm comes from the fields Windows actually fills.
+    ///
+    /// `probe` calls `probe_rocm_install` on Linux and WSL only; the Windows
+    /// branch calls `probe_hip_sdk_windows`, which fills a different pair and
+    /// leaves `rocm_path` / `rocm_version` empty. Reading only the Linux pair
+    /// reported `none` on a Windows host with a fully installed SDK, which
+    /// reads as "no ROCm here" and is the opposite of true.
+    ///
+    /// The fixture is built the way `probe`'s Windows branch leaves an
+    /// examination -- the Linux pair empty, the HIP pair filled -- so it
+    /// cannot pass against a shape that platform never produces.
+    #[test]
+    fn a_windows_machine_reports_the_hip_sdk_release_rather_than_no_rocm() {
+        let mut windows = machine_of_sentinels("gfx1100");
+        windows.os_family = "windows".to_owned();
+        windows.os_version = "Microsoft Windows [Version 10.0.22631.4460]".to_owned();
+        // What `probe_hip_sdk_windows` fills.
+        windows.hip_sdk_path = "C:/SENTINEL-PATH/hip".to_owned();
+        windows.hip_sdk_version = "6.2.4".to_owned();
+        // What it does not: the Linux probe never runs on this platform.
+        windows.rocm_path = String::new();
+        windows.rocm_version = String::new();
+
+        let report = prepare_report(&windows, None, false).expect("a released machine reports");
+        assert_eq!(
+            report.rocm, "6.2",
+            "a Windows host with an installed SDK must report its release, not an absence"
+        );
+
+        // Absence still reads as absence on this platform, so the fix did not
+        // buy the version by making `none` unreachable.
+        let mut bare = windows.clone();
+        bare.hip_sdk_path = String::new();
+        bare.hip_sdk_version = String::new();
+        let bare = prepare_report(&bare, None, false).expect("a released machine reports");
+        assert_eq!(bare.rocm, NONE);
+
+        // And an install whose version cannot be read is still distinguishable
+        // from one that is not there.
+        let mut unreadable = windows;
+        unreadable.hip_sdk_version = String::new();
+        let unreadable =
+            prepare_report(&unreadable, None, false).expect("a released machine reports");
+        assert_eq!(unreadable.rocm, UNKNOWN);
     }
 
     /// I6, continued — a non-numeric source is refused rather than

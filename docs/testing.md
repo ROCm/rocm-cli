@@ -1278,10 +1278,17 @@ rocm diagnose --report
 rocm diagnose --report --json
 ```
 
-The command refuses rather than prepares a report on two hosts: one with an
-architecture the ROCm compatibility matrix does not list as supported, and
-one whose AMD GPU architecture could not be read at all. Both refusals exit 0
-and are distinguishable from `--json`'s `refused` field.
+The command refuses rather than prepares a report on three hosts, and the
+three reasons are not interchangeable. One holds an architecture the ROCm
+compatibility matrix does not list as supported (`unreleased-hardware`). One
+has an AMD GPU architecture that could not be read (`architecture-unreadable`).
+The third is any WSL host (`platform-not-probed`): `examine` returns before
+any GPU probe runs there, so nothing has looked, and saying the architecture
+could not be read would state a finding about hardware nothing inspected. All
+three exit 0 and are told apart by `--json`'s `refused` field, and the refusal
+envelope also carries `architecture_matrix`, the same compatibility-matrix
+snapshot stamp a genuine report carries, so a refusal is just as traceable to
+a matrix revision as a report is.
 
 On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `crates/rocm-core/src/report.rs`), the command prints the full `Report`:

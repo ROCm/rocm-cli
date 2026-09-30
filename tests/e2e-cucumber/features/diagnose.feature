@@ -423,11 +423,16 @@ Feature: Diagnosing failures and listing fixes
   # can see exactly what would be published, and that asking produces either a
   # report or a stated refusal and never a silent send.
   #
-  # Host-independent on purpose, and the two halves land on different lanes. A
+  # Host-independent on purpose, and the branches land on different lanes. A
   # lane with an AMD GPU on the compatibility matrix exercises the prepared
-  # report; a lane without one exercises the refusal, which is the case the mock
-  # lane actually has. Written so that whichever branch a lane reaches is a real
-  # assertion rather than a skip.
+  # report; a lane without one exercises the unreadable-architecture refusal,
+  # which is the case the mock lane actually has. The WSL lane reaches neither:
+  # `examine` returns before any GPU probe there, so it refuses because the
+  # platform was never inspected, whatever hardware it holds. Saying "a lane
+  # without an allowlisted GPU exercises the refusal" would be wrong for that
+  # lane, and would record the guard as firing correctly when it fired for an
+  # unrelated structural reason. Written so that whichever branch a lane
+  # reaches is a real assertion rather than a skip.
   @id:diagnose-report-is-shown-and-not-sent
   Scenario: diagnose-29 - Asking what a report would say shows it and sends nothing
     When the user asks the CLI what a report would carry

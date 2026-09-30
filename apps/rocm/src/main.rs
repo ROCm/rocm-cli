@@ -3154,6 +3154,14 @@ fn show_prepared_report(
                     "No AMD GPU architecture could be read here, so nothing confirms this \
                      hardware is on the ROCm compatibility matrix. No report was prepared."
                 }
+                rocm_core::ReportRefusal::PlatformNotProbed => {
+                    // Says what happened rather than dressing it as a finding
+                    // about the machine. The earlier wording told a healthy WSL
+                    // user their GPU could not be read, when nothing had looked.
+                    "This CLI does not inspect the GPU on WSL yet, so it cannot confirm whether \
+                     this hardware is on the ROCm compatibility matrix. No report was prepared. \
+                     This is a gap in the tool, not a problem with the machine."
+                }
             };
             if json {
                 println!(
