@@ -310,43 +310,59 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli. An install with no active default runtime never prompts, but once a
-managed runtime is the active default every `install sdk` asks first, because
-the new install takes over as the active default. That gate is not scoped to the
-family or channel you are installing: a `--family` or `--channel` you have never
-installed before takes over the active default just as a same-family upgrade
-does, so it asks too. To approve that non-interactively — in scripts or CI, where
-the prompt would otherwise refuse — pass `--approve-replacing-active-default`,
-which is also what the refusal itself recommends and what ROCm CLI's own
-non-interactive surfaces (chat, MCP, the dashboard) pass. `--yes` grants the same
-approval *and* approves installing required system packages (such as OpenMPI for
-vLLM), which means `sudo`; reach for it only where something can answer a sudo
-password prompt — which an unattended job cannot, unless it has passwordless sudo
-configured. In the default managed install root, the root and its manifest are
-keyed by version, so an upgrade or downgrade keeps the previous install on disk
-and only a same-version reinstall reuses the same root. `--prefix` opts out of
-that: the folder you name is used verbatim for every version, so successive
-installs into one prefix replace each other in place — and if the venv already
-there no longer runs its own Python, it is removed outright and rebuilt. The
-consent gate does not cover that: it asks about changing the active default
-runtime, not about what a named prefix loses. `install driver` installs the AMD
-kernel driver on Linux (DKMS or native package). `update` checks for a newer
-ROCm package; pass `--apply` to install it, or `--dry-run` to preview what
-`--apply` would do without changing anything (`--dry-run` does not require
-`--apply`). `--runtime` and `--activate` require `--apply` or `--dry-run` — pass
-one of those instead of naming a runtime or requesting activation on its own.
-`--json` prints the check result as a single line of JSON instead of text;
-`--timeout-secs` bounds its network calls (`--timeout-secs` requires `--json`;
-both `--json` and `--timeout-secs` conflict with `--apply`, and `--json` also
-conflicts with `--dry-run`). `update --apply` never prompts and needs no
-approval flag: selecting a runtime to update is itself the approval, and it
-leaves the active default alone unless you add `--activate`. `update` does
-accept `--yes`, for consistency with other mutating commands, but it grants
-nothing there — the approval line the update path prints never credits it.
+by rocm-cli.
 
-ROCm 10 and newer ship from a different source layout. It is opt-in, and asking
-for it takes two things together: pin the version with `--version`, and name the
-exact GPU arch — the raw `gfx` code, not a family label:
+#### Approval prompt
+
+If no managed runtime is the active default, `install sdk` doesn't prompt.
+Otherwise it asks first, because the new install becomes the active default.
+The prompt applies to any install, including a `--family` or `--channel` you
+haven't installed before.
+
+To approve without a prompt, for example in scripts or CI, where the prompt
+would otherwise refuse:
+
+- `--approve-replacing-active-default` approves the change of active default
+  only. The refusal message recommends it, and ROCm CLI's own non-interactive
+  surfaces (chat, MCP, and the dashboard) pass it.
+- `--yes` gives the same approval and also approves installing required system
+  packages, such as OpenMPI for vLLM. That requires `sudo`, so use it only where
+  something can answer a sudo password prompt. An unattended job can't, unless
+  it has passwordless sudo configured.
+
+#### Install location
+
+In the default managed install root, the root and its manifest are keyed by
+version. An upgrade or downgrade keeps the previous install on disk. Only a
+same-version reinstall reuses the same root.
+
+`--prefix` changes this. The folder you name is used as-is for every version, so
+successive installs into one prefix replace each other in place. If the venv
+already there no longer runs its own Python, it is removed outright and rebuilt. The
+approval prompt doesn't cover this, because it asks only about changing the
+active default runtime, not about what a named prefix loses.
+
+#### Driver installation
+
+`install driver` installs the AMD kernel driver on Linux, using DKMS or a native
+package.
+
+#### Updates
+
+`update` checks for a newer ROCm package.
+
+| Flag | Effect |
+| --- | --- |
+| `--apply` | Installs the update. Needs no approval flag, because selecting a runtime to update is the approval. Leaves the active default alone unless you add `--activate`. |
+| `--dry-run` | Previews what `--apply` would do without changing anything. Doesn't require `--apply`. |
+| `--runtime`, `--activate` | Require `--apply` or `--dry-run`. |
+| `--json` | Prints the check result as a single line of JSON instead of text. Conflicts with `--apply` and `--dry-run`. |
+| `--timeout-secs` | Bounds the network calls of the check. Requires `--json`. Conflicts with `--apply`. |
+| `--yes` | Accepted for consistency with other mutating commands, but grants nothing on `update`. The approval line the update path prints never credits it. |
+
+ROCm 10 and newer ship from a different source layout. You opt in by passing two
+things together: pin the version with `--version`, and name the exact GPU arch,
+using the raw `gfx` code rather than a family label:
 
 ```
 rocm install sdk --version 10.0.0 --family gfx1200 --dry-run
@@ -362,10 +378,9 @@ torchaudio from their published dependency metadata, then validates that every
 selected framework package carries the same ROCm build identifier before it
 creates or changes a managed runtime.
 
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources it always has, and
-it never quietly retries against the ROCm 10 sources when a lookup comes up
-empty — it tells you what it could not find instead.
+Without a `--version` of 10 or newer, `install sdk` resolves the same release
+and nightly sources as before. It doesn't retry against the ROCm 10 sources when
+a lookup finds nothing; it tells you what it couldn't find instead.
 
 ### Runtime management
 

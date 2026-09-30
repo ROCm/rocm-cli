@@ -17,7 +17,7 @@ adapters for Lemonade and vLLM.
 .. important::
 
    **Tech Preview:** This software is provided as-is, without warranty or
-   guarantee of stability. APIs, commands, and behavior may change without
+   guarantee of stability. APIs, commands, and behavior might change without
    notice. Intended for experimentation and early feedback only.
 
 The ROCm CLI public repository is located at
