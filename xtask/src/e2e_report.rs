@@ -146,12 +146,13 @@ fn label_for_root_report(dir: &Path) -> String {
     }
 }
 
-/// Strips the literal `${{ matrix.channel }}` template segment nightly's
-/// per-lane matrix inserts into its artifact names, so a name like
-/// `e2e-gpu-${{ matrix.channel }}-report` compares as its canonical
-/// `e2e-gpu-report` base. This scan is text-based over the raw workflow
-/// source and does not simulate matrix expansion, so the template text
-/// would otherwise appear verbatim and never match anything.
+/// Strips the literal `${{ matrix.channel }}` template segment a channel
+/// matrix inserts into its artifact names — nightly's six GPU lanes and, per
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
+/// canonical `e2e-gpu-report` base. This scan is text-based over the raw
+/// workflow source and does not simulate matrix expansion, so the template
+/// text would otherwise appear verbatim and never match anything.
 #[cfg(test)]
 pub(crate) fn without_channel_matrix_segment(name: &str) -> String {
     name.replace("-${{ matrix.channel }}-", "-")
@@ -290,6 +291,10 @@ mod tests {
         };
         let nightly = lanes("nightly.yml");
         let per_pr = lanes("e2e-selfhosted.yml");
+        assert!(
+            !per_pr.is_empty(),
+            "per-PR lane scan found nothing to check"
+        );
         assert!(
             per_pr.iter().all(|p| nightly.contains(p)),
             "every per-PR platform must also run nightly: per_pr={per_pr:?} nightly={nightly:?}"
