@@ -916,6 +916,11 @@ mod tests {
     /// The services overlay renders only live instances, so the count of
     /// records that are no longer running has to be adapted by the bin like
     /// `model_recipes` / `runtimes` / `automations` are.
+    ///
+    /// This is also the only test here that pins that the count is read off
+    /// `services_dir()` at all — its sibling
+    /// [`resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed`]
+    /// asserts 0 and so still passes against an empty registry. Keep both.
     #[test]
     fn resolved_args_counts_records_that_are_no_longer_running() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -959,12 +964,20 @@ mod tests {
     ///
     /// Witnessed rather than left implicit because the overlay's note sends the
     /// user to that very command, so the two surfaces can disagree in front of
-    /// them. The pid below is the sentinel the `main.rs` service tests use for
-    /// "no such process", which is what makes the record stale: the CLI would
-    /// find no live pid and rewrite the status. Asserting 0 is asserting that no
-    /// refresh happens on this path — if someone later adds one, this test
-    /// fails and they are pointed at the doc comment explaining the trade-off
-    /// rather than silently flipping a launch-time read into network I/O.
+    /// them. The record below is stale by construction: its status still says
+    /// `running`, and there is no process or listener behind it. That status
+    /// string is the whole of what decides the count — this path never consults
+    /// a pid and never probes the port, and the on-disk view it deserializes
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
+    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// if someone later adds one, this test fails and they are pointed at the
+    /// doc comment explaining the trade-off rather than silently flipping a
+    /// launch-time read into network I/O.
+    ///
+    /// Asserting 0 would also hold if the registry were never read, so this test
+    /// does not on its own show that any record reached the count;
+    /// [`resolved_args_counts_records_that_are_no_longer_running`] is what pins
+    /// that. Keep the two together.
     #[test]
     fn resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -984,11 +997,11 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         std::fs::create_dir_all(p.services_dir()).unwrap();
-        // A crashed server: status still `running`, pids long gone, nothing
-        // listening on the port.
+        // A crashed server as this path can see one: the status string was never
+        // rewritten, so it still says `running`.
         std::fs::write(
             p.services_dir().join("stale.json"),
-            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3,"supervisor_pid":999999999,"engine_pid":999999999}"#,
+            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3}"#,
         )
         .unwrap();
 
