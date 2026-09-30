@@ -728,11 +728,12 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         commands,
         needs_sudo: true,
         // Catalog-aligned, not state-derived: fix.rs's FixRecipe for this fix-id sets
-        // needs_reboot unconditionally, even on this no-blacklist path where the plan
-        // above is just `modprobe amdgpu`. Diagnose conforms to the catalog rather
-        // than the reverse (see assert_needs_reboot_matches_the_catalog below) so
-        // `rocm diagnose` and `rocm fix` never disagree; occasionally over-warning
-        // here is judged cheaper than the drift it replaces.
+        // needs_reboot unconditionally. On this no-blacklist path the plan is just
+        // `modprobe amdgpu` (or that plus a Secure Boot signing note, whose own
+        // remedy can require a reboot) -- diagnose conforms to the catalog rather
+        // than the reverse (see fix.rs's assert_needs_reboot_matches_the_catalog) so
+        // `rocm diagnose` and `rocm fix` never disagree; over-warning is limited to
+        // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
         needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
         auto_applicable: false,
@@ -2990,10 +2991,6 @@ mod tests {
             .find(|d| d.id == "fix-5-amdgpu-load")
             .expect("amdgpu-not-loaded should be diagnosed");
         let fix = hit.fix.as_ref().unwrap();
-        assert!(
-            fix.needs_reboot,
-            "fix-5-amdgpu-load must report needs_reboot, matching the fix.rs catalog"
-        );
         crate::fix::assert_needs_reboot_matches_the_catalog("fix-5-amdgpu-load", fix.needs_reboot);
 
         let text = render_report_text(&report, report.matched.len());

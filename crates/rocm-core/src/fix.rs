@@ -1732,4 +1732,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn needs_reboot_true_fix_ids_match_the_known_set() {
+        // assert_needs_reboot_matches_the_catalog only ever runs for
+        // fix-5-amdgpu-load, so the other 23 fix-ids' hardcoded needs_reboot
+        // literals in diagnose.rs have no guard against drifting from the
+        // catalog. This doesn't reach into diagnose.rs, but it does catch an
+        // accidental catalog edit and pins the expected set by name so a
+        // deliberate catalog change forces a look at diagnose.rs's matching
+        // literals too.
+        let expected: std::collections::BTreeSet<&str> = [
+            "fix-3-rocm-kernel",
+            "fix-5-amdgpu-load",
+            "fix-11-iommu",
+            "fix-12-installer",
+            "fix-14-adrenalin-too-old",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&str> = RECIPES
+            .iter()
+            .filter(|r| r.needs_reboot)
+            .map(|r| r.fix_id)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the catalog's needs_reboot:true set has changed -- update diagnose.rs's \
+             matching literals and this test's expected set together"
+        );
+    }
 }
