@@ -288,9 +288,13 @@ fix` takes the id, not the position.
   report, and sends nothing — there is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action. The
   content is deliberately narrow (a schema version, the matched entry, whether
-  a fix was offered for it, the GPU architecture, the OS family and major
-  version, the CLI version), and it carries no host name, user name, file
-  path, or error text. Hardware that is not on AMD's published compatibility
+  a fix was offered for it, the GPU architecture, the OS family, distribution
+  and major version, the ROCm release, the inference engine and its release,
+  the CLI version), and it carries no host name, user name, file path, or
+  error text. Every version is cut back to a release, so a build number that
+  would narrow toward one machine never appears, and the distribution is
+  checked against a list of known names rather than repeated from the
+  machine. Hardware that is not on AMD's published compatibility
   matrix produces no report at all, and the CLI says why.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the

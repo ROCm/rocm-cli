@@ -1286,6 +1286,15 @@ and are distinguishable from `--json`'s `refused` field.
 On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `crates/rocm-core/src/report.rs`), the command prints the full `Report`:
 `schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
-`os_major`, `cli_version`, and `fix_offered`. This path has not been exercised
-against real hardware in CI; verifying it needs a lane whose GPU architecture
-is on the allowlist.
+`os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
+`fix_offered`. This path has not been exercised against real hardware in CI;
+verifying it needs a lane whose GPU architecture is on the allowlist.
+
+Three of those fields answer with a word rather than a value, and the words
+are not interchangeable. `none` means the thing is absent, `unknown` means this
+build looked and could not tell, and `other` means a distribution was named but
+is not one this build recognises. A host with no ROCm installed reports
+`"rocm": "none"`, while a host whose install exists but whose version could not
+be read reports `"rocm": "unknown"` — worth checking by hand on a machine with
+a partial install, since the two are easy to merge by accident and a counter
+cannot tell them apart afterwards.

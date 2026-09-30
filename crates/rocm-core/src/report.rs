@@ -66,6 +66,53 @@ pub const APPROVED_ARCHITECTURES: &[&str] = &[
     "gfx1200", "gfx1201",
 ];
 
+/// Distribution identifiers that may be published, as `/etc/os-release` spells
+/// them in `ID=`.
+///
+/// This list exists for a different reason than [`APPROVED_ARCHITECTURES`].
+/// No distribution is a secret, and none is withheld here. The hazard is that
+/// `ID=` is free text read from a file on the user's machine: a vendor image,
+/// a derivative, or a private build writes whatever it likes there, and a
+/// report bound for an issue tracker must not carry it. Anything absent
+/// becomes [`DISTRO_OTHER`], which still groups and says nothing.
+///
+/// Generous on purpose. A name that is missing costs grouping accuracy for
+/// real users, while a name that is present costs nothing, so the bar for
+/// adding one is only that it is a distribution rather than a description of
+/// somebody's fleet.
+// `rustfmt::skip` for the same reason as `APPROVED_ARCHITECTURES`: the comments
+// label the group beneath them, and reflowing moves each label onto the group
+// above it.
+#[rustfmt::skip]
+pub const APPROVED_DISTROS: &[&str] = &[
+    // Named by the ROCm compatibility matrix.
+    "ubuntu", "rhel", "sles", "ol", "debian", "rocky", "azurelinux",
+    // Common elsewhere, and grouped rather than flattened into `other`.
+    "almalinux", "centos", "fedora", "opensuse-leap", "opensuse-tumbleweed",
+    "arch", "linuxmint", "pop",
+];
+
+/// What the distribution field says when the identifier is not one this build
+/// recognises. A real value, so that such machines still group together.
+pub const DISTRO_OTHER: &str = "other";
+
+/// What a field says when this build looked and could not tell.
+///
+/// Kept apart from [`NONE`]: "no ROCm is installed" and "ROCm is installed and
+/// its version could not be read" are different facts, and a counter that
+/// merged them would report an install problem as an absence.
+pub const UNKNOWN: &str = "unknown";
+
+/// What a field says when the thing is absent rather than unreadable.
+pub const NONE: &str = "none";
+
+/// Engine names that may be published.
+///
+/// Every value is written by this crate rather than parsed from a machine, so
+/// this guards against a future probe rather than against today's. The
+/// accompanying version is parsed, and is truncated instead.
+pub const APPROVED_ENGINES: &[&str] = &["pytorch", "llama-cpp"];
+
 /// Why no report was produced.
 ///
 /// Named rather than a bare `None`: Doctor has to explain the refusal, and
@@ -108,6 +155,23 @@ pub struct Report {
     /// and this crate never reads that source: see `os_major` in
     /// `report.rs` for the field each platform's value actually comes from.
     pub os_major: String,
+    /// The distribution, as an `/etc/os-release` `ID=` value on the approved
+    /// list, or [`DISTRO_OTHER`]. `"windows"` on Windows, which has no such
+    /// file.
+    ///
+    /// Carried beside `os_family` rather than replacing it. Grouping needs to
+    /// tell Ubuntu 22 from any other distribution numbered 22, which the
+    /// family and the major version cannot do between them.
+    pub distro: String,
+    /// The installed ROCm release as major and minor, e.g. `"7.1"`, or
+    /// [`NONE`] / [`UNKNOWN`].
+    pub rocm: String,
+    /// The inference engine found on this machine, or [`NONE`] / [`UNKNOWN`].
+    pub engine: String,
+    /// That engine's release as major and minor, truncated the same way as
+    /// every other version here because it is parsed from an installed
+    /// package rather than written by this crate.
+    pub engine_version: String,
     pub cli_version: String,
     pub fix_offered: bool,
 }
@@ -180,6 +244,9 @@ pub fn prepare_report(
     // here rather than trusted from the caller, because `prepare_report` is
     // `pub` and re-exported, and nothing else enforces the two fields agree.
     let fix_offered = fix_offered && entry_recognised;
+    // Together, so the pair cannot disagree. A version beside `none` would
+    // describe an engine the report also says is not installed.
+    let (engine, engine_version) = engine_and_version(examination);
 
     Ok(Report {
         schema: REPORT_SCHEMA_VERSION,
@@ -193,6 +260,10 @@ pub fn prepare_report(
         entry,
         os_family: examination.os_family.clone(),
         os_major: os_major(examination),
+        distro: distro(examination),
+        rocm: rocm_release(examination),
+        engine,
+        engine_version,
         cli_version: env!("CARGO_PKG_VERSION").to_owned(),
         fix_offered,
     })
@@ -232,6 +303,107 @@ fn os_major(examination: &Examination) -> String {
         // No other platform is supported by `examine.rs`; nothing here is
         // known to hold a release, so nothing is published.
         _ => String::new(),
+    }
+}
+
+/// The distribution to publish.
+///
+/// Linux reads `ID=` from `/etc/os-release`, which is free text written by
+/// whoever built the image. It is checked against [`APPROVED_DISTROS`] rather
+/// than published, because an unrecognised value is as likely to name a
+/// company as a distribution.
+///
+/// Windows has no such file: `examine.rs::probe_os` populates `distro_id` only
+/// under `runtime_is_linux()`, so the value there is a constant rather than
+/// anything read from the machine.
+fn distro(examination: &Examination) -> String {
+    match examination.os_family.as_str() {
+        "linux" => {
+            let id = examination.distro_id.trim().to_ascii_lowercase();
+            if id.is_empty() {
+                // `/etc/os-release` was missing or unreadable. Distinct from an
+                // unrecognised name: this build did not get to decide.
+                UNKNOWN.to_owned()
+            } else if APPROVED_DISTROS.contains(&id.as_str()) {
+                id
+            } else {
+                DISTRO_OTHER.to_owned()
+            }
+        }
+        "windows" => "windows".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The installed ROCm release, as major and minor.
+///
+/// `rocm_path` decides absence and `rocm_version` decides readability, because
+/// `examine.rs` collapses both into an empty string: `rocm_version` is
+/// `install.version.unwrap_or_default()`, so "no install was found" and "an
+/// install was found whose version could not be read" arrive identical. Those
+/// are different facts to anybody counting, in the same way [`ReadOutcome`]
+/// keeps an unreadable report apart from an absent one.
+///
+/// The path itself is only ever read here. It is never published.
+fn rocm_release(examination: &Examination) -> String {
+    if examination.rocm_path.trim().is_empty() {
+        return NONE.to_owned();
+    }
+    let release = major_minor(&examination.rocm_version);
+    if release.is_empty() {
+        UNKNOWN.to_owned()
+    } else {
+        release
+    }
+}
+
+/// The engine and its release, decided together.
+///
+/// `framework` is written by this crate from a closed set, so it is checked
+/// against [`APPROVED_ENGINES`] to catch a future probe rather than today's.
+/// `framework_version` is parsed out of an installed package, so it is
+/// truncated like every other version here.
+fn engine_and_version(examination: &Examination) -> (String, String) {
+    let name = examination.framework.trim().to_ascii_lowercase();
+    // `"skipped"` is what `examine.rs` records when the probe did not run, and
+    // an empty value is what it leaves when the probe ran and found nothing.
+    // Neither is an engine, and neither may carry a version.
+    if name.is_empty() {
+        return (NONE.to_owned(), NONE.to_owned());
+    }
+    if !APPROVED_ENGINES.contains(&name.as_str()) {
+        return (UNKNOWN.to_owned(), UNKNOWN.to_owned());
+    }
+    let version = major_minor(&examination.framework_version);
+    let version = if version.is_empty() {
+        UNKNOWN.to_owned()
+    } else {
+        version
+    };
+    (name, version)
+}
+
+/// The leading `major.minor` of `version`, keeping only components that are
+/// entirely ASCII digits.
+///
+/// Wider than [`leading_digits`], which keeps the major alone. A ROCm or
+/// engine release without its minor does not group: 7.0 and 7.1 are different
+/// problems, while 22.04 and 22.10 are the same population. Anything past the
+/// minor is a build, which narrows toward one machine, so it is dropped.
+fn major_minor(version: &str) -> String {
+    let mut parts = version.trim().split(['.', '-', '+', '_']);
+    let major = parts.next().unwrap_or_default();
+    if major.is_empty() || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return String::new();
+    }
+    match parts.next() {
+        Some(minor) if !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{major}.{minor}")
+        }
+        // A bare major is still a population. A non-numeric minor is the free
+        // text this function exists to drop, and dropping it must not take the
+        // major with it.
+        _ => major.to_owned(),
     }
 }
 
@@ -315,6 +487,16 @@ mod tests {
             cpu_model: "SENTINEL-CPU".to_owned(),
             distro_id: "SENTINEL-DISTRO".to_owned(),
             rocminfo_status: "SENTINEL-ERROR-TEXT".to_owned(),
+            // Real shapes with a marker in the tail, not pure markers. A pure
+            // marker is rejected outright and proves only that garbage is
+            // dropped; these prove the published head survives while the build
+            // tail -- the part that narrows toward one machine -- does not.
+            // `framework` is a real approved value for the same reason: an
+            // unapproved one short-circuits before the version is ever read,
+            // so the version sweep would pass without that path running.
+            rocm_version: "7.1.0-SENTINEL-ROCM-BUILD".to_owned(),
+            framework: "pytorch".to_owned(),
+            framework_version: "2.5.1+SENTINEL-ENGINE-BUILD".to_owned(),
             has_amd_gpu: true,
             gpus: vec![Gpu {
                 name: "SENTINEL-MARKETING-NAME".to_owned(),
@@ -338,6 +520,8 @@ mod tests {
         "SENTINEL-ERROR-TEXT",
         "SENTINEL-MARKETING-NAME",
         "SENTINEL-PCI",
+        "SENTINEL-ROCM-BUILD",
+        "SENTINEL-ENGINE-BUILD",
     ];
 
     /// An architecture no product will ever have.
@@ -493,6 +677,115 @@ mod tests {
         assert!(
             !serialized.contains("Microsoft Windows"),
             "the ver banner reached a report bound for a public tracker: {serialized}"
+        );
+    }
+
+    /// The grouping fields carry a population, not a machine.
+    ///
+    /// Asserts the published values rather than the absence of the markers.
+    /// The sweep alone would pass if every one of these fields were empty, and
+    /// an empty field is exactly what a grouper cannot use: this states that
+    /// the numeric head survived while the build tail did not.
+    #[test]
+    fn the_grouping_fields_keep_the_release_and_drop_the_build() {
+        let report = prepare_report(&machine_of_sentinels("gfx1100"), None, false)
+            .expect("a released machine must produce a report");
+
+        assert_eq!(
+            report.rocm, "7.1",
+            "the ROCm release has to survive truncation: 7.0 and 7.1 are different problems"
+        );
+        assert_eq!(report.engine, "pytorch");
+        assert_eq!(
+            report.engine_version, "2.5",
+            "the engine release has to survive truncation the same way"
+        );
+        assert_eq!(
+            report.distro, DISTRO_OTHER,
+            "an ID this build does not recognise has to group, not be republished"
+        );
+    }
+
+    /// A distribution name is checked, not trusted.
+    ///
+    /// Paired, because "always answers `other`" satisfies the unrecognised
+    /// half on its own and would throw away every real distribution.
+    #[test]
+    fn a_recognised_distribution_is_named_and_an_unrecognised_one_is_not() {
+        let mut known = machine_of_sentinels("gfx1100");
+        known.distro_id = "Ubuntu".to_owned();
+        let report = prepare_report(&known, None, false).expect("a released machine reports");
+        assert_eq!(
+            report.distro, "ubuntu",
+            "premise failed: a distribution on the list must be named, otherwise the case below \
+             is satisfied by discarding every name"
+        );
+
+        // The shape that matters: a private image whose `ID=` names its owner
+        // rather than a distribution.
+        let mut vendor = machine_of_sentinels("gfx1100");
+        vendor.distro_id = "SENTINEL-CORP-INTERNAL-IMAGE".to_owned();
+        let report = prepare_report(&vendor, None, false).expect("a released machine reports");
+        assert_eq!(report.distro, DISTRO_OTHER);
+        let serialized = serde_json::to_string(&report).expect("a report must serialize");
+        assert!(
+            !serialized.contains("SENTINEL-CORP"),
+            "an ID written by whoever built the image reached a public tracker: {serialized}"
+        );
+    }
+
+    /// An engine name this build does not recognise is not published.
+    ///
+    /// Today every value of `framework` is a literal written by `examine.rs`,
+    /// so this guards a future probe rather than the current one: the moment
+    /// one sets that field from parsed output, an allowlist is the difference
+    /// between a name and whatever the parse produced. Found by mutation --
+    /// removing the check changed nothing, because the shared fixture uses an
+    /// approved engine and so never reached the branch.
+    #[test]
+    fn an_engine_this_build_does_not_recognise_is_not_named_in_the_report() {
+        let mut machine = machine_of_sentinels("gfx1100");
+        machine.framework = "SENTINEL-UNAPPROVED-ENGINE".to_owned();
+        let report = prepare_report(&machine, None, false).expect("a released machine reports");
+
+        assert_eq!(
+            report.engine, UNKNOWN,
+            "an engine name off the list has to be withheld, not republished"
+        );
+        assert_eq!(
+            report.engine_version, UNKNOWN,
+            "a version cannot describe an engine the report declines to name"
+        );
+        let serialized = serde_json::to_string(&report).expect("a report must serialize");
+        assert!(
+            !serialized.contains("SENTINEL-UNAPPROVED"),
+            "an unrecognised engine name reached a public tracker: {serialized}"
+        );
+    }
+
+    /// An absent ROCm and an unreadable one are different facts.
+    ///
+    /// `examine.rs` collapses both into an empty `rocm_version`, so without
+    /// this the report would say "not installed" about a machine whose install
+    /// merely could not be read -- turning an install problem into an absence
+    /// for anybody counting.
+    #[test]
+    fn no_rocm_installed_reads_differently_from_a_rocm_that_could_not_be_read() {
+        let mut absent = machine_of_sentinels("gfx1100");
+        absent.rocm_path = String::new();
+        absent.rocm_version = String::new();
+        let absent = prepare_report(&absent, None, false).expect("a released machine reports");
+
+        let mut unreadable = machine_of_sentinels("gfx1100");
+        unreadable.rocm_version = String::new();
+        let unreadable =
+            prepare_report(&unreadable, None, false).expect("a released machine reports");
+
+        assert_eq!(absent.rocm, NONE);
+        assert_eq!(unreadable.rocm, UNKNOWN);
+        assert_ne!(
+            absent.rocm, unreadable.rocm,
+            "a counter cannot tell an absent ROCm from an unreadable one"
         );
     }
 
