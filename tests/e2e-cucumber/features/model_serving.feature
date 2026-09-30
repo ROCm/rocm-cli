@@ -255,3 +255,45 @@ Feature: Model serving
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
+
+  # KNOWN GAP — the `/dev/kfd` pre-flight on the serve probes (EAI-8457) has no
+  # scenario here, and cannot have one on any lane this suite runs.
+  #
+  # The behaviour: on a Linux host where `/dev/kfd` cannot be opened, `--gpu
+  # auto` no longer launches `amd-smi` at all (`detect_gpu_count`,
+  # `gpu_vram_usage`), so GPU auto-selection degrades to service state alone
+  # where it previously attempted the launch. That is user-observable, so §3 of
+  # AGENTS.md asks for a scenario rather than only the `rocm-core` unit tests
+  # that pin `kfd_readable` and `amd_smi_json`.
+  #
+  # Why no lane can carry it. The premise needs a host that is BOTH GPU-present
+  # by the KFD/DRM sysfs rule AND unable to open `/dev/kfd` — the real shape of
+  # a container started without `--device /dev/kfd`, or a user outside the
+  # render group, where world-readable sysfs still enumerates the device that
+  # `open(2)` then refuses. No lane is that host:
+  #
+  #   - the no-GPU mock lane never reaches either probe. `usable_amd_gpu_indices`
+  #     answers an authoritative empty set there and `serve` fails fast on it
+  #     first — that is serve-13 above, which passes on every PR and is the
+  #     evidence for this claim. Code after that bail is unreachable on the lane.
+  #   - `@requires-gpu` lanes have a readable `/dev/kfd` by construction; every
+  #     other GPU scenario depends on it. The declined branch never fires.
+  #   - `@requires-wsl` exercises the wave-through (the gate is skipped on WSL),
+  #     which is the opposite branch.
+  #
+  # Nor can the harness manufacture the premise: `KFD_DEVICE` is a compile-time
+  # constant in `rocm-core` with no path override, the node is root-owned so the
+  # harness can neither remove it nor make it unreadable, and supplementary
+  # group membership cannot be dropped without privilege. A scenario planting a
+  # stub `amd-smi` under `ROCM_CLI_DATA_DIR` would still take the *allowed*
+  # branch on a GPU lane and never run at all on the mock lane, so it would be
+  # green without exercising anything — the vacuity the rule exists to prevent.
+  #
+  # Covered instead at unit level in `rocm-core`, each confirmed non-vacuous by
+  # reverting the fix: `the_kfd_gate_stops_amd_smi_before_it_is_spawned` asserts
+  # the gate stops the *spawn* (a fake `amd-smi` leaves a marker file that must
+  # not appear), with the same fixture re-run against a readable device to prove
+  # the fake would otherwise have executed.
+  #
+  # Retire this note if a lane ever gains a container with sysfs GPU topology
+  # and no `/dev/kfd` passed through, which would make the premise reachable.

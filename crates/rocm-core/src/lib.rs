@@ -10036,20 +10036,28 @@ mod tests {
             .context("unparseable child pid")?;
         let _ = fs::remove_dir_all(&temp_root);
 
-        // The reaper races the kernel tearing the child down, so poll rather
-        // than sample once. Without the reap this burns the full budget and
-        // still reports `Z`.
+        // Poll until the entry is *gone*, which is the only state that proves
+        // both halves of the contract. `!= Z` would not: a timeout path that
+        // never killed the child leaves it in `S`, which satisfies `!= Z` while
+        // the child sleeps on. Two transients make this a poll rather than a
+        // single sample — the kernel tearing the child down after the `SIGKILL`
+        // (briefly still `R`/`S`) and the detached reaper waiting on the corpse
+        // (`Z`) — so anything short of `None` is retried until the deadline.
+        //
+        // No PID-reuse hazard: the loop stops at the first `None`, and the slot
+        // cannot be recycled before then because a zombie still occupies it.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut state = process_state(pid);
-        while state == Some('Z') && Instant::now() < deadline {
+        while state.is_some() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(25));
             state = process_state(pid);
         }
 
-        assert_ne!(
-            state,
-            Some('Z'),
-            "pid {pid} is still a zombie: the timeout path killed the child but never reaped it"
+        assert_eq!(
+            state, None,
+            "pid {pid} was never reaped: the timeout path must kill the child and wait on it \
+             (state `Z` means it was killed but not reaped; any live state means it was \
+             never killed)"
         );
         Ok(())
     }
