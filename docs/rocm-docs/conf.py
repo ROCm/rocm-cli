@@ -38,6 +38,8 @@ for _logger_name in ("sphinx.rocm_docs.projects", "sphinx.rocm_docs.theme"):
 # -- Project information ---------------------------------------------------
 
 project = "ROCm CLI"
+version = "0.1.0"
+release = version
 author = "Advanced Micro Devices, Inc."
 # pylint: disable=redefined-builtin
 copyright = "Copyright (c) Advanced Micro Devices, Inc. All rights reserved."
@@ -57,7 +59,7 @@ html_theme_options = {
     "repository_url": "https://github.com/ROCm/rocm-cli",
     "repository_branch": "main",
 }
-html_title = "ROCm CLI documentation"
+html_title = f"{project} {version} documentation"
 # myst.header: `:start-after:` on included README sections strips the heading
 # line itself, so the first heading in the chunk renders one level below its
 # expected depth; docutils re-normalizes this in the rendered output, so it's
