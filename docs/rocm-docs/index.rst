@@ -38,6 +38,10 @@ The ROCm CLI public repository is located at
 
       * :doc:`Getting started with ROCm CLI <getting-started>`
 
+   .. grid-item-card:: Inference engines
+
+      * :doc:`vLLM adapter <engines/vllm>`
+
    .. grid-item-card:: Commands
 
       * :doc:`Command reference <commands>`
