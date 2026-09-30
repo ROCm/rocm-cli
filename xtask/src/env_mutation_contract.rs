@@ -92,7 +92,18 @@ mod tests {
     }
 
     /// The mutating calls that need serializing.
-    const MUTATIONS: [&str; 2] = ["env::set_var", "env::remove_var"];
+    ///
+    /// Matched unqualified, because the qualifier is a matter of how the file
+    /// happens to import: `std::env::set_var(..)`, `env::set_var(..)`, a bare
+    /// `set_var(..)` after `use std::env::set_var`, and `e::set_var(..)` after
+    /// `use std::env as e` are all the same call and all hazardous. Keying on
+    /// `env::` caught only the first two.
+    ///
+    /// The trailing `(` is what keeps that widening from over-reporting: it
+    /// pins the match to a call rather than a prefix, so `env::set_variable(..)`
+    /// — an unrelated function whose name merely starts the same way — is not
+    /// an offense. Both directions have fixtures.
+    const MUTATIONS: [&str; 2] = ["set_var(", "remove_var("];
 
     /// Named helpers that serialize env mutation for their whole scope.
     ///
@@ -284,10 +295,13 @@ mod tests {
         // no fixture: removing it only means the caller declines at the `b` and
         // matches one character later at the `r`, which opens the same literal
         // and strips the same span. The single character of difference is the
-        // `b` itself, emitted as code rather than as a space — and the stripped
-        // text is read only for braces and for the names in `MUTATIONS`, so a
-        // stray `b` cannot change a verdict. An equivalent mutant; a test for it
-        // would assert nothing.
+        // `b` itself, emitted as code rather than as a space. Four things read
+        // the stripped text — the brace counter, the names in `MUTATIONS`,
+        // [`serializes`] and [`has_test_attribute`] — and a `b` whose only
+        // neighbour on the right is the stripped literal's run of spaces cannot
+        // complete a brace, a `set_var(`, a `_TEST_LOCK`/`ScopedTestEnv`, or a
+        // `#[`. Equivalent on every path that reads it, so a test for it would
+        // assert nothing.
         if chars.get(j) == Some(&'b') {
             j += 1;
         }
@@ -401,6 +415,15 @@ mod tests {
     /// * Attributes are recognised by path (see [`has_test_attribute`]), so a
     ///   harness whose attribute does not end in `test` — `#[test_case(..)]`,
     ///   `#[rstest]` — would not arm the scan. Neither is used in this tree.
+    /// * For the same reason `#[cfg_attr(unix, test)]` does not arm it either:
+    ///   the path stops at the `(`, so it reads as `cfg_attr`. Recognising it
+    ///   means parsing the argument list and skipping the FIRST argument, which
+    ///   is the condition — `#[cfg_attr(test, derive(Debug))]` also contains a
+    ///   bare `test` and must keep NOT arming the scan, or the rest of the file
+    ///   reads as one test body. That is a second attribute grammar inside a
+    ///   text scanner, for a spelling this tree does not use and whose
+    ///   idiomatic form — `#[cfg(unix)]` above `#[test]` — this scan does
+    ///   catch. Stated rather than implemented, deliberately.
     /// * The scan checks that A lock is held, not that it is THE lock every
     ///   other mutator of the same key takes. Two tests replacing one key under
     ///   two different mutexes both pass and still race each other. Closing
@@ -456,17 +479,21 @@ mod tests {
                 if let Some(found) = MUTATIONS.iter().find(|needle| code.contains(*needle)) {
                     open.hits.push(Offense {
                         line: index + 1,
-                        call: (*found).to_owned(),
+                        // Without the `(` the needle carries; the offender is
+                        // named by the call, not by the match pattern.
+                        call: found.trim_end_matches('(').to_owned(),
                     });
                 }
             }
 
             // Saturating purely so a file this scan misreads cannot panic the
             // build. With literals tokenized away the count is balanced on any
-            // file that compiles, so the saturation is unreachable in practice
-            // — it is a backstop, not part of the logic. (Proven by mutation:
-            // swapping it for a plain `-` leaves the whole suite green, so it
-            // is an equivalent mutant and no fixture is written for it.)
+            // file that compiles, so the saturation is unreachable on this
+            // tree — it is a backstop, not part of the logic. It is still
+            // load-bearing and still observable: a plain `-` panics with
+            // `attempt to subtract with overflow` on a leading `}`, where this
+            // returns no offenses. Pinned by
+            // `an_unbalanced_close_returns_nothing_rather_than_panicking`.
             depth = (depth + opens).saturating_sub(closes);
 
             if let Some(open) = current.as_ref()
@@ -531,6 +558,15 @@ mod tests {
         format!("unsafe {{ std::env::{kind}(\"KEY\", \"value\") }}")
     }
 
+    /// The same call reached without the `std::env::` qualifier.
+    ///
+    /// `use std::env::set_var` leaves `qualifier` empty; `use std::env as e`
+    /// makes it `e::`. Assembled at runtime for the same reason as
+    /// [`mutation_call`].
+    fn imported_mutation_call(qualifier: &str, kind: &str) -> String {
+        format!("unsafe {{ {qualifier}{kind}(\"KEY\", \"value\") }}")
+    }
+
     fn unguarded_test(body: &str) -> String {
         format!(
             "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {body}\n    }}\n}}\n"
@@ -576,6 +612,44 @@ mod tests {
                 "an unguarded std::env::{kind} inside a #[test] must be flagged"
             );
         }
+    }
+
+    /// The qualifier is a matter of how the file imports, not of what the call
+    /// does. Keying the match on `env::` made a test that had written
+    /// `use std::env::set_var` invisible to the scan while doing exactly the
+    /// thing the guard exists to stop.
+    #[test]
+    fn a_mutation_reached_through_an_import_is_flagged() {
+        for qualifier in ["", "e::"] {
+            for kind in ["set_var", "remove_var"] {
+                let source = unguarded_test(&imported_mutation_call(qualifier, kind));
+                let hits = env_mutations_in_unserialized_tests(&source);
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "an unguarded {qualifier}{kind} inside a #[test] must be flagged: {hits:?}"
+                );
+                assert_eq!(
+                    hits[0].call, kind,
+                    "the offender is named by the call, not by the match pattern"
+                );
+            }
+        }
+    }
+
+    /// The other side of widening the match: it is a call, not a prefix.
+    ///
+    /// Before the trailing `(`, any name merely STARTING `env::set_var` was
+    /// reported — a build failure naming a function that never touches the
+    /// environment, which is the same credibility problem as a miss.
+    #[test]
+    fn a_call_merely_starting_like_a_mutation_is_not_flagged() {
+        let source = unguarded_test(&format!("let _ = env::{}able(\"KEY\");", "set_var"));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert!(
+            hits.is_empty(),
+            "set_variable is a different function: {hits:?}"
+        );
     }
 
     /// An async test is a test.
@@ -805,6 +879,23 @@ mod tests {
         assert!(
             stripped.contains("let c = 1;"),
             "code must survive: {stripped:?}"
+        );
+    }
+
+    /// A raw string's closer is the quote AND its hashes, and all of it has to
+    /// be consumed.
+    ///
+    /// Stopping at the quote returns to the code stream sitting on the hashes,
+    /// which then leak out as code. A `#` emitted where the source had a
+    /// literal is how text turns into an attribute: leaked immediately before a
+    /// `[`, it spells the `#[` that [`has_test_attribute`] arms on.
+    #[test]
+    fn a_raw_string_close_consumes_its_hashes() {
+        let source = "let a = r#\"x\"#;\nlet b = r##\"y\"##;\n";
+        let stripped = strip_literals_and_comments(source);
+        assert!(
+            !stripped.contains('#'),
+            "the closing hashes belong to the literal: {stripped:?}"
         );
     }
 
@@ -1070,6 +1161,44 @@ mod tests {
         assert!(
             env_mutations_in_unserialized_tests(&same_line).is_empty(),
             "a lock earlier on the same line precedes the mutation"
+        );
+    }
+
+    /// The serialization point is the FIRST lock, not the last one seen.
+    ///
+    /// Letting a later acquisition overwrite it turns the exemption into a
+    /// false accusation: a test that locks, mutates, then takes a second lock
+    /// gets reported for a mutation that was covered the whole time. A guard
+    /// that cries wolf on disciplined code is how a build check stops being
+    /// believed.
+    #[test]
+    fn a_later_lock_does_not_move_the_serialization_point() {
+        let call = mutation_call("set_var");
+        let lock = "let _guard = SOME_TEST_LOCK.lock().unwrap();";
+
+        let source = unguarded_test(&format!("{lock}\n        {call}\n        {lock}"));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert!(
+            hits.is_empty(),
+            "the first lock already covered this mutation: {hits:?}"
+        );
+    }
+
+    /// The depth counter saturates, and that is observable behaviour rather
+    /// than a formality: on a file this scan misreads, a plain `-` panics with
+    /// `attempt to subtract with overflow` and takes the build down with a
+    /// message about the guard rather than about the offending test. Saturating
+    /// reports nothing instead, which is the right answer for a close with
+    /// nothing open.
+    ///
+    /// This was previously called an equivalent mutant on the grounds that
+    /// swapping the operator left the suite green. It is not: the suite simply
+    /// had no input in this shape.
+    #[test]
+    fn an_unbalanced_close_returns_nothing_rather_than_panicking() {
+        assert!(
+            env_mutations_in_unserialized_tests("}\n}\n").is_empty(),
+            "a close with nothing open is nothing to report"
         );
     }
 
