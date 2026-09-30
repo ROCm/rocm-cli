@@ -308,7 +308,11 @@ it reports. Four of them run with `continue-on-error: false`, so a real
 regression shows red instead of always green; `e2e-gpu-w7900` runs with
 `continue-on-error: true` while that hardware is being proven out, and should
 be flipped to `false` once it has a track record. Their results also surface in
-the self-hosted consolidated report for visibility.
+the self-hosted consolidated report for visibility. A lane that ran but uploaded
+no report (it died before writing its results) fails the consolidated report
+job, naming the lane, rather than silently dropping out of the grid; on a
+`continue-on-error: true` lane that is the only red signal for such a failure.
+The nightly report job applies the same check to every nightly lane.
 
 ### Timeouts on the Strix lanes
 
