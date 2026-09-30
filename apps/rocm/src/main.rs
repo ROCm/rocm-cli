@@ -6040,13 +6040,6 @@ fn serve(args: ServeArgs) -> Result<()> {
     } else {
         rocm_core::usable_amd_gpu_indices()
     };
-    let resolved_selection = resolve_engine_selection(
-        &config,
-        &selected_engine,
-        runtime_id.as_deref(),
-        env_id.as_deref(),
-    );
-    let resolved_selection = validate_engine_selection_runtime(&paths, resolved_selection)?;
     // Reusing an already-running managed service launches nothing and pins no
     // GPU, so it must bypass the GPU-required pre-flight below — the reused
     // service was already vetted at its own launch, and this invocation does no
@@ -6056,41 +6049,66 @@ fn serve(args: ServeArgs) -> Result<()> {
     // Without a runtime we cannot resolve, so we fall through and the pre-flight
     // refuses the no-GPU / no-runtime case with its usual message.
     //
-    // The pre-gate matches on the model, not just the engine: everything inside
-    // this block is real engine work (a `ResolveModel` round-trip, and for a
-    // self-managing engine an `ensure_self_managed_engine_ready` that can print
-    // "Preparing <engine> for GPU serving..." and install), so gating on the
-    // engine alone let a live service for an *unrelated* model — one this
-    // invocation can never reuse — drag that work ahead of the no-usable-GPU
-    // bail on a GPU-less host.
+    // The outermost condition is `any_live_managed_service_for_model`, and it is
+    // first for a reason: it reads the managed-service records and nothing else,
+    // so it is the only thing this block costs on the ordinary launch. Everything
+    // it guards has side effects that must not precede the bail —
+    //
+    //   - the pre-gate matches on the model, not just the engine, because the
+    //     probe body is real engine work (a `ResolveModel` round-trip, and for a
+    //     self-managing engine an `ensure_self_managed_engine_ready` that can
+    //     print "Preparing <engine> for GPU serving..." and install). Gating on
+    //     the engine alone let a live service for an *unrelated* model — one this
+    //     invocation can never reuse — drag that work ahead of the no-usable-GPU
+    //     bail on a GPU-less host.
+    //
+    //   - resolving the engine/runtime selection is not free either.
+    //     `validate_engine_selection_runtime` takes `single_ready_runtime_key`
+    //     whenever neither `--runtime-id` nor `--env-id` is given (the default
+    //     path), and that calls `recover_setup_runtime_registration`, which can
+    //     `fs::create_dir_all` + `fs::write` a runtime registry manifest and can
+    //     fail with an unrelated runtime-manifest error. So it stays *inside*
+    //     this block, behind the record-only check, and is computed below the
+    //     bail on every other path.
+    let mut resolved_selection: Option<EngineSelection> = None;
     let mut resolved_model: Option<ResolveModelResponse> = None;
     let mut reuse_existing = false;
-    let can_resolve_model = !cpu_only
-        && (resolved_selection.runtime_id.is_some()
-            || resolved_selection.env_id.is_some()
-            || engine_manages_own_runtime(&selected_engine));
-    if can_resolve_model
-        && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
+    if !cpu_only && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
     {
-        if engine_manages_own_runtime(&selected_engine) {
-            ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
-        }
-        let probe = engine_request::<_, ResolveModelResponse>(
-            Some(&paths),
-            &selected_engine,
-            EngineMethod::ResolveModel,
-            &ResolveModelRequest {
-                model_ref: engine_model_ref.clone(),
-                runtime_id: resolved_selection.runtime_id.clone(),
-                device_policy: Some(device_policy.clone()),
-                recipe_override: None,
-                engine_recipe: engine_recipe.clone(),
-            },
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(
+                &config,
+                &selected_engine,
+                runtime_id.as_deref(),
+                env_id.as_deref(),
+            ),
         )?;
-        reuse_existing =
-            existing_live_managed_service(&paths, &selected_engine, &probe.canonical_model_id)
-                .is_some();
-        resolved_model = Some(probe);
+        let can_resolve_model = selection.runtime_id.is_some()
+            || selection.env_id.is_some()
+            || engine_manages_own_runtime(&selected_engine);
+        if can_resolve_model {
+            if engine_manages_own_runtime(&selected_engine) {
+                ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
+            }
+            let probe = engine_request::<_, ResolveModelResponse>(
+                Some(&paths),
+                &selected_engine,
+                EngineMethod::ResolveModel,
+                &ResolveModelRequest {
+                    model_ref: engine_model_ref.clone(),
+                    runtime_id: selection.runtime_id.clone(),
+                    device_policy: Some(device_policy.clone()),
+                    recipe_override: None,
+                    engine_recipe: engine_recipe.clone(),
+                },
+            )?;
+            reuse_existing =
+                existing_live_managed_service(&paths, &selected_engine, &probe.canonical_model_id)
+                    .is_some();
+            resolved_model = Some(probe);
+        }
+        resolved_selection = Some(selection);
     }
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
     // before preparing or launching any engine for *this* model (no wasted engine
@@ -6098,12 +6116,13 @@ fn serve(args: ServeArgs) -> Result<()> {
     // engine enforces the same rule as a backstop.
     //
     // The precise contract, since the reuse detection above is the one thing that
-    // can precede this bail: *engine* work — the `ResolveModel` round-trip and any
-    // self-managed engine install — runs first only when a live managed service
-    // already matches this engine and model, i.e. only when this invocation is
-    // about to reuse it and legitimately skip the bail. When no such service
-    // exists (the ordinary launch, and every no-GPU refusal path) that block's
-    // body is skipped.
+    // can precede this bail: everything with a side effect — the runtime-selection
+    // resolution (which can write a runtime registry manifest), the `ResolveModel`
+    // round-trip, and any self-managed engine install — runs first only when a
+    // live managed service already matches this engine and model, i.e. only when
+    // this invocation is about to reuse it and legitimately skip the bail. When no
+    // such service exists (the ordinary launch, and every no-GPU refusal path)
+    // that block's body is skipped and this is the first thing that runs.
     //
     // Its *condition* is not free, though: `any_live_managed_service_for_model`
     // goes through `load_managed_services`, which refreshes every service record —
@@ -6166,6 +6185,28 @@ fn serve(args: ServeArgs) -> Result<()> {
         )?)
     } else {
         None
+    };
+    // Resolve which runtime/env this serve will use, now that the host GPU
+    // pre-condition and `--gpu` have both been checked. This must not move back
+    // above the bail: `validate_engine_selection_runtime` reaches
+    // `recover_setup_runtime_registration` on the default (no `--runtime-id` /
+    // `--env-id`) path, which writes a runtime registry manifest and can fail
+    // with a runtime-manifest error that has nothing to do with the GPU — so a
+    // GPU-less `rocm serve <model>` would mutate disk, or report the wrong
+    // problem, instead of failing fast. The reuse pre-gate above needs the answer
+    // early and already paid for it when a reusable service exists; take that
+    // answer rather than repeating the registry recovery.
+    let resolved_selection = match resolved_selection {
+        Some(selection) => selection,
+        None => validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(
+                &config,
+                &selected_engine,
+                runtime_id.as_deref(),
+                env_id.as_deref(),
+            ),
+        )?,
     };
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
@@ -6572,6 +6613,19 @@ fn simulate_oom_managed_launch(
 /// unrelated failures, and an unrelated invocation that merely reused an
 /// already-live service are never misattributed. The OOM-signature check in
 /// [`serve_summary::oom_memory_note`] narrows it further.
+///
+/// The `already_running` exclusion is deliberately kept even though today's only
+/// producer of `already_running: true` — `spawn_managed_engine_child`'s reuse
+/// short-circuit — also reports `log_path: None`, so the `log_path` guard below
+/// would already catch that one case. The two say different things: `log_path`
+/// is a local "there is no log to read", while `already_running` is the
+/// attribution rule this function exists to enforce, and it must survive any
+/// future reuse path that does carry the reused service's log. The unit test
+/// `append_oom_serve_note_ignores_an_already_running_services_log` discriminates
+/// it directly — it passes a log path that *does* contain an OOM signature
+/// together with `already_running: true` — so dropping the clause turns that
+/// test red. The E2E scenario `@id:serve-oom-memory-guidance` cannot: it goes
+/// through the real reuse path, where `log_path` is `None`.
 ///
 /// When the pre-launch low-VRAM warning already put the shared
 /// `--gpu-memory-utilization` hint in `notes`, the *fragment* is dropped from
