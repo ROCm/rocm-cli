@@ -49,47 +49,86 @@ const VLLM_ROCM_INDEX_PREFIX: &str = "https://wheels.vllm.ai/rocm";
 /// pinned in [`VLLM_ROCM_BUILD_TABLE`].
 pub(crate) struct VllmRocmDiscoverBuild {
     rocm_sdk_version: &'static str,
+    /// PEP 425 interpreter tag this row's wheels are published for. AMD builds
+    /// ROCm 10.x `vllm`, `flash-attn` and `amd-aiter` for exactly one CPython
+    /// version, so a venv on any other interpreter resolves nothing at all.
+    python_tag: &'static str,
+    /// Index publishing this row's rotating-dev-tag vLLM/flash-attn/amd-aiter
+    /// wheels. Per-row because ROCm 10.1 frameworks are staged on a different
+    /// host than 10.0's.
+    vllm_index_url: &'static str,
+    /// Index publishing this row's torch build.
+    torch_index_url: &'static str,
     vllm_version_prefix: &'static str,
     flash_attn_version_prefix: &'static str,
     amd_aiter_version_prefix: &'static str,
-    torch_requirement: &'static str,
+    torch_version_prefix: &'static str,
+    /// Plain PyPI pin: tensorizer publishes no ROCm-specific build, so there is
+    /// nothing to discover.
     tensorizer_requirement: &'static str,
 }
 
-const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[VllmRocmDiscoverBuild {
-    rocm_sdk_version: "10.0.0",
-    vllm_version_prefix: "0.27",
-    flash_attn_version_prefix: "2.8",
-    amd_aiter_version_prefix: "0.1",
-    torch_requirement: "torch==2.12.0+rocm10.0.0",
-    tensorizer_requirement: "tensorizer==2.12.1",
-}];
-/// Index that publishes the rotating-dev-tag vLLM/flash-attn/amd-aiter
-/// wheels for [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
-const VLLM_ROCM_DISCOVER_INDEX_URL: &str = "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/";
-/// Index that publishes the pinned torch build for
-/// [`VLLM_ROCM_DISCOVER_BUILD_TABLE`] rows.
-const VLLM_ROCM_DISCOVER_TORCH_INDEX_URL: &str = "https://stable.repo.amd.com/rocm/whl-next/";
+const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
+    VllmRocmDiscoverBuild {
+        rocm_sdk_version: "10.0.0",
+        python_tag: "cp314",
+        vllm_index_url: "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/",
+        torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
+        vllm_version_prefix: "0.27",
+        flash_attn_version_prefix: "2.8",
+        amd_aiter_version_prefix: "0.1",
+        torch_version_prefix: "2.12",
+        tensorizer_requirement: "tensorizer==2.12.1",
+    },
+    VllmRocmDiscoverBuild {
+        rocm_sdk_version: "10.1.0",
+        python_tag: "cp314",
+        vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
+        torch_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/",
+        vllm_version_prefix: "0.29",
+        flash_attn_version_prefix: "2.8",
+        amd_aiter_version_prefix: "0.1",
+        torch_version_prefix: "2.12",
+        tensorizer_requirement: "tensorizer==2.12.1",
+    },
+];
 /// Looks up the discovery build recipe for a ROCm SDK version, if any.
 ///
-/// Matched on major version only: unlike [`VLLM_ROCM_BUILD_TABLE`], where a
-/// row pins one exact release's wheel filename, a discover row is a live
-/// resolver recipe AMD's index applies uniformly across an entire ROCm major
-/// line. AMD's preview wheels are tagged with the real target release
-/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0`, and
-/// `+rocm7.14.1` as genuinely distinct, coexisting builds), so once ROCm
-/// 10.x's target moves past `10.0.0` the same rotation will happen here; a
-/// row keyed to an exact string would then silently stop matching. `10.0.0`
-/// and `10.1.0` should both discover through the same `"10.0.0"` row. This
-/// intentionally differs from `apps/rocm/src/therock.rs`'s SDK layout
-/// selection, which avoids major-only gating for unrelated reasons (on-disk
-/// layout, not wheel availability).
+/// Matched on `major.minor`, ignoring patch and any dev/pre-release suffix. A
+/// discover row is a live resolver recipe rather than one pinned filename, so
+/// it does span a release line, but only a `major.minor` one: 10.0 and 10.1
+/// publish genuinely different wheels (vLLM `0.27` from
+/// `rocm.frameworks.amd.com` versus `0.29` from the staging host), so a
+/// major-only row would serve one SDK's wheels to the other. Patch is still
+/// ignored, because AMD does rotate the patch and dev tag within a line
+/// (`whl-multi-arch/torch/` carries `+rocm7.13.0`, `+rocm7.14.0` and
+/// `+rocm7.14.1` as coexisting builds) and a row keyed to an exact string
+/// would silently stop matching. An unknown line matches nothing and fails
+/// closed in [`resolve_vllm_install_target`] rather than falling back to a
+/// stale static pin.
 pub(crate) fn vllm_rocm_discover_build(
     rocm_sdk_version: &str,
 ) -> Option<&'static VllmRocmDiscoverBuild> {
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
-        .find(|build| rocm_sdk_major_matches(rocm_sdk_version, build.rocm_sdk_version))
+        .find(|build| rocm_sdk_series_matches(rocm_sdk_version, build.rocm_sdk_version))
+}
+/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
+/// ignoring patch and any dev/pre-release suffix. See
+/// [`vllm_rocm_discover_build`] for why the line, not the exact release, is
+/// what a discover row covers.
+fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
+    fn series(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor.parse().ok()?))
+    }
+    series(recorded).is_some_and(|version| Some(version) == series(table_key))
 }
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
@@ -611,6 +650,7 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
 fn vllm_rocm10_discover_install_args(
     python: &Path,
     reinstall: bool,
+    build: &VllmRocmDiscoverBuild,
     pins: &[String],
 ) -> Vec<String> {
     let mut args = uv_pip_install_base(python);
@@ -621,10 +661,80 @@ fn vllm_rocm10_discover_install_args(
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
     args.push("--extra-index-url".to_owned());
-    args.push(VLLM_ROCM_DISCOVER_INDEX_URL.to_owned());
+    args.push(build.vllm_index_url.to_owned());
     args.push("--extra-index-url".to_owned());
-    args.push(VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned());
+    args.push(build.torch_index_url.to_owned());
     args
+}
+/// Rejects a discovered pin whose `+rocm<version>` local version names a
+/// different ROCm line than the SDK being installed for.
+///
+/// Discovery constrains the *release* (`vllm==0.29.*`) but cannot constrain the
+/// local version, because PEP 440 has no local-version wildcard. Both discovery
+/// indexes serve more than one ROCm line at once (staging carries 10.0 and 10.1
+/// vLLM side by side), so without this a mis-stocked or re-pointed index could
+/// resolve a 10.0 wheel onto a 10.1 SDK and only fail at import time.
+/// `flash-attn` and `amd-aiter` publish no rocm local version at all, so a pin
+/// without one passes.
+fn ensure_rocm_local_version_matches(pin: &str, rocm_sdk_version: &str) -> Result<()> {
+    let Some((_, version)) = pin.split_once("==") else {
+        return Ok(());
+    };
+    let Some(local) = split_local_version(version).1 else {
+        return Ok(());
+    };
+    let Some(local_rocm) = local.strip_prefix("rocm") else {
+        return Ok(());
+    };
+    if rocm_sdk_series_matches(local_rocm, rocm_sdk_version) {
+        return Ok(());
+    }
+    bail!(
+        "discovered `{pin}` for ROCm SDK {rocm_sdk_version}, but its `+{local}` build targets a \
+         different ROCm release; the index for this ROCm line is serving another SDK's wheels"
+    )
+}
+/// The PEP 425 interpreter tag of `python`, e.g. `cp314`.
+fn python_interpreter_tag(python: &Path) -> Result<String> {
+    let output = ProcessCommand::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')",
+        ])
+        .output()
+        .with_context(|| format!("failed to launch {} to read its version", python.display()))?;
+    if !output.status.success() {
+        bail!(
+            "{} could not report its version: {}",
+            python.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+/// Fails before discovery when `python` is not the interpreter this row's
+/// wheels are built for.
+///
+/// Checked up front rather than left to `uv`: every package in the row is
+/// published for one tag only, so a mismatched interpreter surfaces as three
+/// separate "no compatible version found" resolver dumps that name the
+/// requirement but never the interpreter, which is the thing to fix.
+fn ensure_discover_python_tag(python: &Path, build: &VllmRocmDiscoverBuild) -> Result<()> {
+    let tag = python_interpreter_tag(python)?;
+    if tag == build.python_tag {
+        return Ok(());
+    }
+    bail!(
+        "vLLM for ROCm {} is published for {} only, but {} is {}.\n\
+         Re-create this runtime's Python environment on {}, for example by re-running \
+         `rocm install sdk --version {}` so ROCm CLI provisions a matching interpreter.",
+        build.rocm_sdk_version,
+        build.python_tag,
+        python.display(),
+        tag,
+        build.python_tag,
+        build.rocm_sdk_version
+    )
 }
 /// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
 /// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
@@ -637,11 +747,20 @@ fn install_vllm_rocm10_discover(
     reinstall: bool,
     build: &VllmRocmDiscoverBuild,
 ) -> Result<Vec<String>> {
+    ensure_discover_python_tag(python, build)?;
+    let torch = discover_pinned_requirement(
+        uv,
+        paths,
+        python,
+        build.torch_index_url,
+        "torch",
+        build.torch_version_prefix,
+    )?;
     let vllm = discover_pinned_requirement(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "vllm",
         build.vllm_version_prefix,
     )?;
@@ -649,7 +768,7 @@ fn install_vllm_rocm10_discover(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "flash-attn",
         build.flash_attn_version_prefix,
     )?;
@@ -657,20 +776,23 @@ fn install_vllm_rocm10_discover(
         uv,
         paths,
         python,
-        VLLM_ROCM_DISCOVER_INDEX_URL,
+        build.vllm_index_url,
         "amd-aiter",
         build.amd_aiter_version_prefix,
     )?;
 
     let pins = vec![
-        build.torch_requirement.to_owned(),
+        torch,
         vllm,
         flash_attn,
         amd_aiter,
         build.tensorizer_requirement.to_owned(),
     ];
+    for pin in &pins {
+        ensure_rocm_local_version_matches(pin, build.rocm_sdk_version)?;
+    }
 
-    let args = vllm_rocm10_discover_install_args(python, reinstall, &pins);
+    let args = vllm_rocm10_discover_install_args(python, reinstall, build, &pins);
     let output = ProcessCommand::new(uv)
         .args(args)
         .envs(uv_command_env(paths))
@@ -1429,18 +1551,80 @@ mod tests {
             "tensorizer==2.12.1".to_owned(),
         ];
         let python = PathBuf::from("/opt/venv/bin/python");
+        let build = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
 
-        let args = vllm_rocm10_discover_install_args(&python, false, &pins);
+        let args = vllm_rocm10_discover_install_args(&python, false, build, &pins);
         assert!(!args.contains(&"--reinstall".to_owned()));
         for pin in &pins {
             assert!(args.contains(pin), "{args:?} should contain {pin}");
         }
         assert!(args.contains(&"--prerelease".to_owned()));
         assert!(args.contains(&"allow".to_owned()));
-        assert!(args.contains(&VLLM_ROCM_DISCOVER_INDEX_URL.to_owned()));
-        assert!(args.contains(&VLLM_ROCM_DISCOVER_TORCH_INDEX_URL.to_owned()));
+        assert!(args.contains(&build.vllm_index_url.to_owned()));
+        assert!(args.contains(&build.torch_index_url.to_owned()));
 
-        let args = vllm_rocm10_discover_install_args(&python, true, &pins);
+        let args = vllm_rocm10_discover_install_args(&python, true, build, &pins);
         assert!(args.contains(&"--reinstall".to_owned()));
+    }
+    /// The 10.1 row must reach the staging host for both vLLM and torch; 10.0
+    /// must keep using the production frameworks index and `whl-next`. This is
+    /// the offline half of the 10.1 verification: no ROCm 10.1 SDK is published
+    /// yet, so the live install cannot be exercised.
+    #[test]
+    fn discover_rows_select_their_own_indexes() {
+        let ten_zero = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
+        assert_eq!(
+            ten_zero.vllm_index_url,
+            "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/"
+        );
+        assert_eq!(
+            ten_zero.torch_index_url,
+            "https://stable.repo.amd.com/rocm/whl-next/"
+        );
+        assert_eq!(ten_zero.vllm_version_prefix, "0.27");
+
+        // A real probe carries a patch and dev suffix the table key never does.
+        let ten_one = vllm_rocm_discover_build("10.1.0a20260928").expect("10.1 has a discover row");
+        assert_eq!(
+            ten_one.vllm_index_url,
+            "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/"
+        );
+        assert_eq!(
+            ten_one.torch_index_url,
+            "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/"
+        );
+        assert_eq!(ten_one.vllm_version_prefix, "0.29");
+
+        // An unpublished line must not borrow another line's wheels.
+        assert!(vllm_rocm_discover_build("10.2.0").is_none());
+        assert!(vllm_rocm_discover_build("7.2.3").is_none());
+    }
+    /// An unknown 10.x line fails closed rather than silently resolving the
+    /// static table's 7.2.3 pin, which is the whole point of keeping
+    /// [`rocm_sdk_major_matches`] alongside the narrower row lookup.
+    #[test]
+    fn unknown_rocm10_line_still_fails_closed() {
+        let err = install_target(None, Some("10.2.0")).expect_err("10.2.0 has no vLLM build");
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains("7.2.3"),
+            "should not fall back to the static pin: {rendered}"
+        );
+    }
+    #[test]
+    fn rocm_local_version_guard_rejects_another_lines_wheel() {
+        // No local version at all (flash-attn, amd-aiter) is fine.
+        assert!(ensure_rocm_local_version_matches("flash-attn==2.8.3", "10.1.0").is_ok());
+        // Same line, different patch and rc suffix, is fine.
+        assert!(ensure_rocm_local_version_matches("torch==2.12.0+rocm10.1.0rc3", "10.1.0").is_ok());
+        // A 10.0 wheel resolved for a 10.1 SDK is not.
+        let err = ensure_rocm_local_version_matches(
+            "vllm==0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826",
+            "10.1.0",
+        )
+        .expect_err("a 10.0 wheel must not install onto a 10.1 SDK");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("10.1.0"), "{rendered}");
+        assert!(rendered.contains("rocm10.0.0"), "{rendered}");
     }
 }

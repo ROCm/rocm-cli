@@ -132,9 +132,11 @@ Feature: TheRock "next" ROCm 10 install layout
   # `uv pip install --dry-run --reinstall` before installing pinned to what
   # that reported. No fixture can serve a rotating dev-tag filename and stay
   # meaningful, so this is the only place that mechanism runs against the
-  # real index at all. Provisions its own ROCm 10 runtime rather than reusing
-  # therock-next-07's, so that scenario's arch-detection coverage still runs
-  # on hosts that can't start vLLM.
+  # real index at all. Also the only place that proves ROCm CLI provisions the
+  # cp314 interpreter this route's wheels require, rather than the cp312
+  # every earlier SDK version uses. Provisions its own ROCm 10 runtime rather
+  # than reusing therock-next-07's, so that scenario's arch-detection coverage
+  # still runs on hosts that can't start vLLM.
   @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm @nightly
   Scenario: therock-next-09 - Installing vLLM against a live ROCm 10 preview runtime reports the discovery pins
     Given a machine with no CLI-managed runtimes
@@ -142,6 +144,7 @@ Feature: TheRock "next" ROCm 10 install layout
     Then a runtime is registered
     And the runtime is set as active
     And the runtime includes an inference engine
+    And the ROCm 10 runtime provisioned a cp314 Python interpreter
     When the user reinstalls vllm
     Then the install reports the vLLM ROCm 10.x discovery pins
 
