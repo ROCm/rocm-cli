@@ -15,6 +15,16 @@ SPDX-License-Identifier: MIT
 
 ```{include} ../../README.md
 :start-after: "## Configure ROCm and serve a model"
+:end-before: "Running the command when a"
+```
+
+Running the command when a managed runtime is already the active default asks
+first, because the new install takes over as the active default; see
+[ROCm installation](commands.md#rocm-installation) for that gate and the flags
+that approve it without a prompt.
+
+```{include} ../../README.md
+:start-after: "for that gate and the flags that approve it without a prompt."
 :end-before: "You can also serve any compatible Hugging Face model directly"
 ```
 
