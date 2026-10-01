@@ -68,12 +68,14 @@ Expected result:
 - The launcher opens; choosing "Set up this system" there opens the setup
   screen. It does not open automatically before the main TUI, and the user
   does not need to type `/setup`.
-- The setup shows a recommended ROCm folder.
-- The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
-  can see that pip downloads stay inside the chosen ROCm folder.
-- The install-folder row opens an interactive folder picker. Arrow keys and the
-  mouse can choose folders; Enter opens or selects; Esc returns without losing
-  the current setup screen.
+- On the "Install ROCm SDK (pip)" step's Configure screen, the Folder row reads
+  `(default managed folder · Tab to browse)` until a folder is chosen. `Tab`
+  opens the folder picker; arrow keys choose, Enter opens or selects, Esc
+  returns without losing the Configure screen or an already-chosen folder.
+  Leaving the row unset installs to the default managed folder.
+- On that same screen `←`/`→` toggle Release/Nightly, and `Tab` opens the
+  folder picker rather than toggling the channel — the same Tab-to-browse
+  binding the Install and Serve forms use.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
 - Install logs show only in the foreground progress card, with PageUp/PageDown

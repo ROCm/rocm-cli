@@ -311,6 +311,69 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
 }
 
+#[when("the user opens onboarding setup")]
+async fn open_onboarding_setup(world: &mut E2eWorld) {
+    // `n` opens the onboarding wizard from the Observe tab
+    // (`KeyAction::OpenOnboarding`). Same resend-until-it-takes rationale as
+    // `open_observe_view`: nothing before this proves the event loop is
+    // reading input yet. The wizard's panel title is step-independent, so it
+    // is a safe marker regardless of which step renders first.
+    session(world)
+        .send_until("n", "Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open onboarding setup: {e}"));
+}
+
+#[when("the user continues past the onboarding welcome screen")]
+async fn continue_past_onboarding_welcome(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to continue past the welcome screen: {e}"));
+}
+
+#[when("the user chooses to install the ROCm SDK")]
+async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
+    // "Install ROCm SDK (pip)" is the choose-menu's default (first) entry, so
+    // confirming needs no prior navigation keys.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
+}
+
+#[when("the user browses for an install folder")]
+async fn browse_for_install_folder(world: &mut E2eWorld) {
+    session(world)
+        .send("\t")
+        .unwrap_or_else(|e| panic!("failed to open the install-folder browser: {e}"));
+}
+
+#[when("the user chooses the current folder")]
+async fn choose_current_folder(world: &mut E2eWorld) {
+    // "[ use this folder ]" is the browser's first, already-selected entry.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose the current folder: {e}"));
+}
+
+#[when("the user closes onboarding setup")]
+async fn close_onboarding_setup(world: &mut E2eWorld) {
+    // Two `Esc`: the first backs Configure out to Choose, the second closes
+    // the wizard entirely — it owns every key while open (see
+    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
+    // until it is gone.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to leave Configure: {e}"));
+    tui.wait_until_gone("Tab browse folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Configure sub-view did not close: {e}"));
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
+    tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("onboarding wizard did not close: {e}"));
+}
+
 #[when("the user accepts the local endpoint")]
 async fn accept_local_endpoint(world: &mut E2eWorld) {
     let tui = session(world);
@@ -928,6 +991,53 @@ async fn serving_actions_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Serving actions", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("Serving actions did not appear: {e}"));
+}
+
+#[then("the onboarding welcome screen is displayed")]
+async fn onboarding_welcome_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Let's get ROCm set up on this machine.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding welcome screen did not appear: {e}"));
+}
+
+#[then("the onboarding setup choices are displayed")]
+async fn onboarding_choices_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Install ROCm SDK (pip)", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding setup choices did not appear: {e}"));
+}
+
+#[then("the SDK Configure step is displayed")]
+async fn sdk_configure_step_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("default managed folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the SDK Configure step did not appear: {e}"));
+}
+
+#[then("the install-folder browser is displayed")]
+async fn install_folder_browser_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Pick an install folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
+}
+
+#[then("the Configure step shows the chosen folder instead of the placeholder")]
+async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the Folder row shows a chosen path rather than the unset placeholder",
+            |screen| {
+                screen.contains("Folder:")
+                    && !screen.contains("default managed folder · Tab to browse")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
 }
 
 #[then("the managed model is displayed")]
