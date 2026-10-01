@@ -1528,6 +1528,27 @@ because its runtime key and package specs carry the index's spelling.
 `generator_reach_report` prints how often each hard case is generated (run it
 with `-- --nocapture`), and fails if the generator stops reaching them.
 
+Artifact integrity and engine protocol property tests:
+
+```bash
+cargo test -p rocm-core --test digest_gate_properties --test integrity_properties --test model_selector_properties
+cargo test -p rocm-engine-protocol --test protocol_properties
+cargo test -p rocm-engine-lemonade --lib archive_digest
+cargo test -p xtask verify_pinned_keys
+```
+
+These check the code that decides whether a download, a signature or the
+pinned release key is authentic, and the code that decodes engine output. The
+generators aim at near misses — a digest one nibble off or sharing a correct
+prefix, a signature with one byte changed or leading zeros, a loopback spelling
+padded or re-cased, a model id with a variant suffix — because a uniformly
+random input is rejected by any implementation, correct or not. The pinned-key
+tests run the real check over a scratch repository root and walk every
+position of the committed key. `model_selector_properties` also pins, rather
+than asserts away, that readiness accepts a bare family word such as `qwen`
+reported by an engine for other models of that family, in the catalog and
+beyond.
+
 Model recipe engine metadata checks:
 
 ```bash

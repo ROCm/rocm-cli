@@ -817,4 +817,418 @@ mod tests {
             "an unset variable must resolve to None, not to some other variable"
         );
     }
+
+    /// The canonical current release key exactly as committed, so the checks
+    /// below run against the real trust root rather than a fixture.
+    fn canonical_release_key_text() -> String {
+        std::fs::read_to_string(repo_root().join(PINNED_KEYS[0].canonical))
+            .expect("the canonical current release key is committed")
+    }
+
+    /// The canonical PEM's base64 lines, taken from the raw file text by line
+    /// position (everything between the header and footer lines) rather than
+    /// through `pem_body`, so a defect in the normalization under test cannot
+    /// also shape the expected value.
+    fn raw_body_lines(pem: &str) -> Vec<String> {
+        let lines: Vec<&str> = pem.lines().collect();
+        assert_eq!(
+            lines.first(),
+            Some(&PEM_BEGIN),
+            "canonical key starts with its header"
+        );
+        let footer = lines
+            .iter()
+            .position(|line| *line == PEM_END)
+            .expect("canonical key has a footer");
+        lines[1..footer]
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect()
+    }
+
+    fn pem_from_lines(body: &[String]) -> String {
+        format!("{PEM_BEGIN}\n{}\n{PEM_END}\n", body.join("\n"))
+    }
+
+    /// The two installer constants the current release key is pinned in, in the
+    /// shape the real installers embed them.
+    fn install_sh(current: &str, extra: &str) -> String {
+        format!(
+            "#!/bin/sh\n{extra}PINNED_RELEASE_PUBLIC_KEY_CURRENT=\"{current}\"\n\
+             PINNED_RELEASE_PUBLIC_KEY_NEXT=\"\"\n"
+        )
+    }
+
+    fn install_ps1(current: &str, extra: &str) -> String {
+        format!(
+            "{extra}$PinnedReleasePublicKeyCurrent = @\"\n{current}\"@\n\
+             $PinnedReleasePublicKeyNext = \"\"\n"
+        )
+    }
+
+    /// A repository root holding the real canonical current release key and the
+    /// given installer sources, for running [`check_pinned_keys`] — the real
+    /// comparison — end to end. The other canonical keys are absent, so their
+    /// entries are dormant.
+    fn release_layout(canonical: &str, sh: &str, ps1: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("docs/keys")).expect("create docs/keys");
+        std::fs::write(dir.path().join(PINNED_KEYS[0].canonical), canonical)
+            .expect("write canonical key");
+        std::fs::write(dir.path().join("install.sh"), sh).expect("write install.sh");
+        std::fs::write(dir.path().join("install.ps1"), ps1).expect("write install.ps1");
+        dir
+    }
+
+    fn diverges(result: &Result<Vec<String>>) -> bool {
+        result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("have diverged"))
+    }
+
+    /// Rewrite the installer sources of a [`release_layout`] in place, so a loop
+    /// over many cases reuses one directory instead of creating one per case.
+    fn write_sources(root: &Path, sh: &str, ps1: &str) {
+        std::fs::write(root.join("install.sh"), sh).expect("write install.sh");
+        std::fs::write(root.join("install.ps1"), ps1).expect("write install.ps1");
+    }
+
+    const BASE64_ALPHABET: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /// The single-character edits applied at one position of a body line:
+    /// deletion, duplication, substitution by each neighbour in the base64
+    /// alphabet (which swaps `+` and `/`, the two symbols a letters-and-digits
+    /// normalization would drop; `=` padding has none), for a letter the same
+    /// letter in the other case, and a swap with the next character when the
+    /// two differ (which a comparison that ignores character order would miss).
+    fn single_character_edits(line: &str, column: usize) -> Vec<String> {
+        let alphabet: Vec<char> = BASE64_ALPHABET.chars().collect();
+        let chars: Vec<char> = line.chars().collect();
+        let original = chars[column];
+        // `=` padding has no alphabet neighbours; deletion and duplication
+        // still apply to it. (The committed key carries no padding today, so
+        // this only matters after a rotation to one that does.)
+        let mut replacements = alphabet
+            .iter()
+            .position(|&c| c == original)
+            .map(|index| {
+                vec![
+                    alphabet[(index + 1) % alphabet.len()],
+                    alphabet[(index + alphabet.len() - 1) % alphabet.len()],
+                ]
+            })
+            .unwrap_or_default();
+        if original.is_ascii_alphabetic() {
+            replacements.push(if original.is_ascii_uppercase() {
+                original.to_ascii_lowercase()
+            } else {
+                original.to_ascii_uppercase()
+            });
+        }
+
+        let mut edits: Vec<String> = replacements
+            .into_iter()
+            .map(|replacement| {
+                let mut edited = chars.clone();
+                edited[column] = replacement;
+                edited.into_iter().collect()
+            })
+            .collect();
+        let mut deleted = chars.clone();
+        deleted.remove(column);
+        edits.push(deleted.into_iter().collect());
+        let mut duplicated = chars.clone();
+        duplicated.insert(column, original);
+        edits.push(duplicated.into_iter().collect());
+        if chars.get(column + 1).is_some_and(|&next| next != original) {
+            let mut swapped = chars;
+            swapped.swap(column, column + 1);
+            edits.push(swapped.into_iter().collect());
+        }
+        edits
+    }
+
+    /// Every single-character drift of the pinned current release key — at
+    /// every position of the real published key, in either installer — is
+    /// reported as divergence by the real check.
+    ///
+    /// This is the guarantee the whole check exists for: installers must pin
+    /// exactly the key CI signs releases with, so a one-character slip during a
+    /// rotation cannot pass. A random key body is caught by any comparison at
+    /// all; what separates a correct one from a prefix, truncating or
+    /// over-normalizing comparison is a body that matches everywhere but one
+    /// place. So rather than sampling, this walks every position and applies
+    /// each edit [`single_character_edits`] produces there. Look-alike swaps
+    /// beyond those (`l`/`I`, `O`/`0`) are not enumerated.
+    #[test]
+    fn every_single_character_drift_of_the_pinned_key_is_detected() {
+        let canonical = canonical_release_key_text();
+        let body = raw_body_lines(&canonical);
+
+        // Positive control: the untampered layout passes, so every failure below
+        // is the drift being detected, not the layout being broken.
+        let root = release_layout(
+            &canonical,
+            &install_sh(&canonical, ""),
+            &install_ps1(&canonical, ""),
+        );
+        let messages = check_pinned_keys(root.path(), None).expect("the intact layout passes");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("release-current: pinned in")),
+            "the intact layout must actually compare the current key, got {messages:?}"
+        );
+
+        let mut expected_checks = 0_usize;
+        let mut checked = 0_usize;
+        for (line, text) in body.iter().enumerate() {
+            for (column, original) in text.chars().enumerate() {
+                let edits = single_character_edits(text, column);
+                let swaps = usize::from(
+                    text.chars()
+                        .nth(column + 1)
+                        .is_some_and(|next| next != original),
+                );
+                expected_checks += 2
+                    * (swaps
+                        + match original {
+                            '=' => 2,
+                            letter if letter.is_ascii_alphabetic() => 5,
+                            _ => 4,
+                        });
+                for edit in edits {
+                    let mut tampered_body = body.clone();
+                    tampered_body[line] = edit;
+                    let tampered = pem_from_lines(&tampered_body);
+                    for (sh, ps1, which) in [
+                        (
+                            install_sh(&tampered, ""),
+                            install_ps1(&canonical, ""),
+                            "install.sh",
+                        ),
+                        (
+                            install_sh(&canonical, ""),
+                            install_ps1(&tampered, ""),
+                            "install.ps1",
+                        ),
+                    ] {
+                        write_sources(root.path(), &sh, &ps1);
+                        let result = check_pinned_keys(root.path(), None);
+                        assert!(
+                            diverges(&result),
+                            "{which}: a key differing at line {line}, column {column} was not \
+                             reported as divergence: {result:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        let body_chars: usize = body.iter().map(|line| line.chars().count()).sum();
+        assert!(
+            body_chars > 300,
+            "the walk covered only {body_chars} body characters"
+        );
+        assert_eq!(checked, expected_checks, "every position gets every edit");
+    }
+
+    /// A published canonical key whose pinned constant is empty, or missing
+    /// from the source altogether, is divergence — not a match and not a
+    /// dormant skip. Each case leaves exactly one entry wrong, so the error
+    /// must name that entry.
+    #[test]
+    fn an_empty_or_missing_constant_against_a_published_key_diverges() {
+        let canonical = canonical_release_key_text();
+        let root = release_layout(
+            &canonical,
+            &install_sh(&canonical, ""),
+            &install_ps1(&canonical, ""),
+        );
+        let next_canonical = root.path().join(PINNED_KEYS[1].canonical);
+
+        let cases = [
+            (
+                "current empty in install.sh",
+                install_sh("", ""),
+                install_ps1(&canonical, ""),
+                false,
+                "release-current",
+            ),
+            (
+                "current empty in install.ps1",
+                install_sh(&canonical, ""),
+                install_ps1("", ""),
+                false,
+                "release-current",
+            ),
+            (
+                "current constant missing from install.sh",
+                "#!/bin/sh\nPINNED_RELEASE_PUBLIC_KEY_NEXT=\"\"\n".to_owned(),
+                install_ps1(&canonical, ""),
+                false,
+                "release-current",
+            ),
+            // The rotation case: the next key's PEM is published (the same key
+            // stands in for it) while the installers still carry `NEXT=""`.
+            (
+                "next published but empty in the installers",
+                install_sh(&canonical, ""),
+                install_ps1(&canonical, ""),
+                true,
+                "release-next",
+            ),
+        ];
+        for (label, sh, ps1, publish_next, entry) in cases {
+            if publish_next {
+                std::fs::write(&next_canonical, &canonical).expect("write canonical next key");
+            } else {
+                let _ = std::fs::remove_file(&next_canonical);
+            }
+            write_sources(root.path(), &sh, &ps1);
+            let result = check_pinned_keys(root.path(), None);
+            assert!(
+                diverges(&result),
+                "{label}: expected divergence, got {result:?}"
+            );
+            let message = result.expect_err("diverged").to_string();
+            assert!(
+                message.starts_with(&format!("{entry}:")),
+                "{label}: the divergence must be reported for {entry}, got {message}"
+            );
+        }
+    }
+
+    /// An empty canonical file is a key not yet published (dormant), while a
+    /// pinned source file that does not exist is an error naming the file —
+    /// neither may read as a match.
+    #[test]
+    fn a_blank_canonical_key_is_dormant_and_a_missing_source_is_an_error() {
+        let canonical = canonical_release_key_text();
+        let root = release_layout(
+            "  \n",
+            &install_sh(&canonical, ""),
+            &install_ps1(&canonical, ""),
+        );
+        let messages =
+            check_pinned_keys(root.path(), None).expect("a blank canonical key is dormant");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "release-current: no canonical key yet — skipped (dormant)"),
+            "a blank canonical key must be reported dormant, got {messages:?}"
+        );
+
+        std::fs::write(root.path().join(PINNED_KEYS[0].canonical), &canonical)
+            .expect("write canonical key");
+        std::fs::remove_file(root.path().join("install.ps1")).expect("remove install.ps1");
+        let error = check_pinned_keys(root.path(), None)
+            .expect_err("a missing pinned source must be an error");
+        assert_eq!(
+            error.to_string(),
+            "release-current: source file is missing: install.ps1"
+        );
+    }
+
+    /// A correct copy of the canonical key elsewhere in the same file — in a
+    /// comment, in another constant, in a stale copy, before or after the
+    /// constant — never makes a wrong `CURRENT` constant pass.
+    ///
+    /// The decoys are placed *before* the constant as well as after it, because
+    /// a check that reads the first key in the file would only be caught by a
+    /// decoy that comes first.
+    #[test]
+    fn a_correct_key_elsewhere_in_the_file_never_rescues_a_wrong_constant() {
+        let canonical = canonical_release_key_text();
+        let mut body = raw_body_lines(&canonical);
+        // Flip the case of the first letter on the second body line, a
+        // one-character drift that stays inside the base64 alphabet.
+        let flipped: String = {
+            let mut chars: Vec<char> = body[1].chars().collect();
+            let at = chars
+                .iter()
+                .position(char::is_ascii_alphabetic)
+                .expect("a letter to flip");
+            chars[at] = if chars[at].is_ascii_uppercase() {
+                chars[at].to_ascii_lowercase()
+            } else {
+                chars[at].to_ascii_uppercase()
+            };
+            chars.into_iter().collect()
+        };
+        body[1] = flipped;
+        let wrong = pem_from_lines(&body);
+        assert_fixture_differs(&wrong, &canonical);
+
+        let sh_decoys = [
+            format!("# previous key:\n# {}\n", canonical.replace('\n', "\n# ")),
+            format!("PREVIOUS_RELEASE_PUBLIC_KEY=\"{canonical}\"\n"),
+            format!("STALE_COPY=\"{canonical}\"\n"),
+        ];
+        let ps1_decoys = [
+            format!("# previous key:\n# {}\n", canonical.replace('\n', "\n# ")),
+            format!("$PreviousReleasePublicKey = @\"\n{canonical}\"@\n"),
+            format!("$StaleCopy = \"{canonical}\"\n"),
+        ];
+
+        for decoy in &sh_decoys {
+            for sh in [
+                install_sh(&wrong, decoy),
+                format!("{}{decoy}", install_sh(&wrong, "")),
+            ] {
+                let root = release_layout(&canonical, &sh, &install_ps1(&canonical, ""));
+                let result = check_pinned_keys(root.path(), None);
+                assert!(
+                    diverges(&result),
+                    "install.sh: a wrong CURRENT passed because the canonical key appears \
+                     elsewhere ({decoy:?}): {result:?}"
+                );
+            }
+        }
+        for decoy in &ps1_decoys {
+            for ps1 in [
+                install_ps1(&wrong, decoy),
+                format!("{}{decoy}", install_ps1(&wrong, "")),
+            ] {
+                let root = release_layout(&canonical, &install_sh(&canonical, ""), &ps1);
+                let result = check_pinned_keys(root.path(), None);
+                assert!(
+                    diverges(&result),
+                    "install.ps1: a wrong CURRENT passed because the canonical key appears \
+                     elsewhere ({decoy:?}): {result:?}"
+                );
+            }
+        }
+    }
+
+    fn assert_fixture_differs(left: &str, right: &str) {
+        assert_ne!(left, right, "the fixture must actually differ");
+    }
+
+    /// Characterization: the comparison reduces each key to its base64
+    /// alphabet, so characters *outside* that alphabet inserted into an
+    /// embedded key's body — whitespace or punctuation — are normalized away
+    /// and do not register as divergence.
+    ///
+    /// Whether such a body is harmless rests on the consumers' PEM readers
+    /// (OpenSSL in the installers, `pem-rfc7468` in the binary) rejecting or
+    /// ignoring it at load time; this check does not decide that. Pinned so the
+    /// normalization's reach is visible rather than implicit.
+    #[test]
+    fn non_base64_noise_in_an_embedded_key_is_normalized_away() {
+        let canonical = canonical_release_key_text();
+        for noise in [" ", "!", "."] {
+            let noisy = canonical.replacen("\nMII", &format!("\n{noise}MII"), 1);
+            assert_fixture_differs(&noisy, &canonical);
+            let root = release_layout(
+                &canonical,
+                &install_sh(&noisy, ""),
+                &install_ps1(&noisy, ""),
+            );
+            check_pinned_keys(root.path(), None).unwrap_or_else(|error| {
+                panic!("{noise:?} inside the body is expected to be normalized away: {error:#}")
+            });
+        }
+    }
 }
