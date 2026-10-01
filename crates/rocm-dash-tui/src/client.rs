@@ -179,9 +179,11 @@ async fn connect_and_run(connect: &str, tx: UnboundedSender<ClientMsg>) -> anyho
 }
 
 #[cfg(windows)]
+// Mirrors the signature of the `cfg(unix)` arm, which callers `.await`;
+// dropping `async` here would not compile on Windows.
+#[allow(clippy::unused_async)]
 async fn connect_and_run(connect: &str, _tx: UnboundedSender<ClientMsg>) -> anyhow::Result<()> {
     Err(anyhow!(
-        "rocm-dash TUI requires Unix domain sockets; not supported on Windows yet (connect={})",
-        connect
+        "rocm-dash TUI requires Unix domain sockets; not supported on Windows yet (connect={connect})"
     ))
 }

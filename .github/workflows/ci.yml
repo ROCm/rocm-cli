@@ -577,6 +577,23 @@ jobs:
         with:
           cache-on-failure: true
 
+      # The `clippy` job runs on Linux only, so it compiles the `cfg(unix)` side
+      # of every platform conditional and never sees the `cfg(windows)` side.
+      # Windows-gated code was therefore outside the warnings-as-errors gate
+      # entirely — not merely under-linted — so a lint could land there and no
+      # check in the set could fail. This mirrors the two invocations the Linux
+      # `clippy` job runs; the second is separate because the `e2e` target sets
+      # `test = false`, so `--all-targets` does not build it.
+      #
+      # Runs before the build so a lint failure costs seconds rather than the
+      # full build/test/package cycle, matching why this job `needs: clippy`.
+      - name: Clippy (Windows targets)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: |
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+          cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
