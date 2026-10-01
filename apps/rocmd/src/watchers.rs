@@ -1450,6 +1450,7 @@ pub(crate) fn restart_managed_service(
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
     record.supervisor_pid = std::process::id();
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(std::process::id());
     record.write()?;
 
     let mut child = detached_rocmd_command(&rocmd_binary)
@@ -1461,6 +1462,8 @@ pub(crate) fn restart_managed_service(
         .context("failed to spawn recovery supervisor")?;
 
     record.supervisor_pid = child.id();
+    // Refresh the identity token in lockstep with the PID it belongs to.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child.id());
     record.write()?;
 
     thread::sleep(Duration::from_millis(200));
