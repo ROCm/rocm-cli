@@ -465,14 +465,57 @@ impl RuntimeLine {
 ///
 /// Runtime keys are slugified (`runtime_key`/`wheel_runtime_key` in
 /// `apps/rocm/src/therock.rs` both dash-join their fields), so a dotted
-/// `--version` like `7.11.0` shows up as `7-11-0` inside the key; a
-/// `--build-date` is already dash-separated and matches as given. A substring
-/// check is all `decide` can do here — it only sees the rendered key, not the
-/// format/family/composition that built it — but the key always carries the
-/// version or build-date verbatim, so a false match would need another pin to
-/// contain this one as a literal substring, which two real pins never do.
+/// `--version` like `7.11.0` shows up as `7-11-0` inside the key. A
+/// `--build-date` instead recovers as an eight-digit `YYYYMMDD` run (e.g.
+/// `20260605`) via `runtime_version_build_date`, with no dashes at all, so it
+/// needs its own digits-only comparison rather than the dash-normalized one —
+/// and the caller may have spelled it `MMDDYYYY` (`normalize_requested_build_date`
+/// accepts that too), which digit-stripping alone can't reorder.
+///
+/// Stripping punctuation from an arbitrary `--version` can also yield a short
+/// digit run that isn't a build date at all (`7.13.0` -> `7130`), and that run
+/// can collide with a fragment of some *other* runtime's hex fingerprint
+/// suffix. So the digits-only comparison only ever fires for an exact 8-digit
+/// run (the one shape a recovered build date has) and only matches a run in
+/// the key that isn't itself a piece of a longer digit sequence.
 fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
-    runtime_key.contains(pin) || runtime_key.contains(&pin.replace('.', "-"))
+    if runtime_key.contains(pin) || runtime_key.contains(&pin.replace('.', "-")) {
+        return true;
+    }
+    let digits_only: String = pin.chars().filter(char::is_ascii_digit).collect();
+    if digits_only.len() != 8 {
+        return false;
+    }
+    // Runtime keys only ever carry the YYYYMMDD order; reorder an MMDDYYYY
+    // pin before comparing (same digit-position heuristic as
+    // `normalize_requested_build_date` in `apps/rocm/src/therock.rs`).
+    let yyyymmdd = if digits_only.starts_with("20") {
+        digits_only
+    } else if digits_only[4..].starts_with("20") {
+        format!(
+            "{}{}{}",
+            &digits_only[4..8],
+            &digits_only[0..2],
+            &digits_only[2..4]
+        )
+    } else {
+        return false;
+    };
+    key_contains_delimited_digit_run(runtime_key, &yyyymmdd)
+}
+
+/// Whether `key` contains `run` (a fixed-length digit string) as a maximal
+/// digit run — i.e. not immediately preceded or followed by another digit,
+/// so it can't be a sub-span of some longer, unrelated digit sequence (such
+/// as a fingerprint suffix that happens to contain the same digits).
+fn key_contains_delimited_digit_run(key: &str, run: &str) -> bool {
+    let bytes = key.as_bytes();
+    key.match_indices(run).any(|(start, _)| {
+        let before_is_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+        let end = start + run.len();
+        let after_is_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        !before_is_digit && !after_is_digit
+    })
 }
 
 /// Bring the shared pre-warm tree at `prewarm_dir` to the runtime state the
@@ -1354,6 +1397,41 @@ runtime release-wheel-gfx94x-dcgpu-7-11-0 format=wheel channel=release status=up
             decide(text, "release", Some("7.11.0")),
             "two distinct pins against the same tree must resolve to distinct runtime keys"
         );
+    }
+
+    #[test]
+    fn build_date_pin_matches_the_digits_only_key() {
+        // A build date reaches the runtime key as an 8-digit run with no
+        // dashes (runtime_version_build_date's scan format), while the flag
+        // is documented and passed as YYYY-MM-DD — the two must still match.
+        let text = "update\n  \
+runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release status=up_to_date\n";
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("2026-06-05")) else {
+            panic!("a runtime already matching the dashed build-date pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0a20260605")
+        );
+    }
+
+    #[test]
+    fn version_pin_digits_do_not_match_an_unrelated_fingerprint_fragment() {
+        // digits_only("7.13.0") is "7130", which appears verbatim inside this
+        // other runtime's 16-hex fingerprint suffix. It must not match: this
+        // key belongs to version 7.9.0, not 7.13.0.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-aa7130bbccddeeff",
+            "7.13.0"
+        ));
+    }
+
+    #[test]
+    fn build_date_pin_matches_regardless_of_mmddyyyy_or_yyyymmdd_spelling() {
+        let key = "nightly-wheel-multi-arch-7-13-0a20260605-0123456789abcdef";
+        assert!(key_matches_pin(key, "2026-06-05"));
+        assert!(key_matches_pin(key, "06-05-2026"));
     }
 
     #[test]
