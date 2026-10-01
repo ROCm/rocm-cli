@@ -103,16 +103,33 @@ mod tests {
     /// pins the match to a call rather than a prefix, so `env::set_variable(..)`
     /// — an unrelated function whose name merely starts the same way — is not
     /// an offense. Both directions have fixtures.
-    const MUTATIONS: [&str; 2] = ["set_var(", "remove_var("];
+    /// `RestoredEnvVar::set(` is here because the guard matches TEXT, and a
+    /// mutation spelled as a method on a restoring wrapper contains neither
+    /// direct call. The two tests that use it are the sanctioned exception this
+    /// change documents, and before this entry existed they sat outside the
+    /// guard entirely — deleting their lock acquisition left the scan green,
+    /// which is the opposite of what their comments told the next contributor.
+    /// Listing the helper keeps the escape hatch narrow: it is still the lock
+    /// that is required, the wrapper just stops hiding the requirement.
+    const MUTATIONS: [&str; 3] = ["set_var(", "remove_var(", "RestoredEnvVar::set("];
 
     /// Named helpers that serialize env mutation for their whole scope.
+    ///
+    /// Membership is "holds a lock for its whole scope", not "wraps an env
+    /// mutation". `ScopedEnvVar` (`apps/rocm/src/main.rs`) was listed here and
+    /// only ever saved and restored — its one caller,
+    /// `with_scoped_builtin_engine_env`, takes `BUILTIN_ENGINE_ENV_LOCK`
+    /// itself. The type is visible to the largest test module in the tree, in
+    /// the same file, so any test that merely named it was granted the full
+    /// exemption while holding nothing: the exact failure this guard exists to
+    /// prevent, written into the guard.
     ///
     /// Anything ending `_TEST_LOCK` counts too, and is matched by suffix rather
     /// than listed — see [`lock_name_column`]. A fixed list of lock NAMES went stale
     /// within days of this guard being written: `main` added
     /// `UPDATE_CHECK_ENV_TEST_LOCK` and the guard then flagged correctly
     /// disciplined code and told its author to rename the lock.
-    const NAMED_SERIALIZERS: [&str; 2] = ["ScopedTestEnv", "ScopedEnvVar"];
+    const NAMED_SERIALIZERS: [&str; 1] = ["ScopedTestEnv"];
 
     /// Where `line` takes a serializer, as a column, or `None` if it does not.
     ///
@@ -143,6 +160,13 @@ mod tests {
     ///
     /// `NAMED_SERIALIZERS` are types, not mutexes, so they carry no `.lock(`
     /// and are matched on the name alone.
+    ///
+    /// The `.min()` over that list is equivalent to taking its first element
+    /// while the list holds one entry, so no fixture can distinguish them —
+    /// stated rather than tested. It earns its keep the moment a second name is
+    /// added, which is why it is written positionally now; the equivalent
+    /// choice over [`MUTATIONS`], which does hold several, is pinned by
+    /// [`the_reported_mutation_is_the_leftmost_one_on_the_line`].
     fn serializer_column(line: &str, rest: &str) -> Option<usize> {
         if let Some(at) = NAMED_SERIALIZERS.iter().filter_map(|n| line.find(n)).min() {
             return Some(at);
@@ -695,6 +719,15 @@ mod tests {
         format!("unsafe {{ {qualifier}{kind}(\"KEY\", \"value\") }}")
     }
 
+    /// A mutation spelled as a method on a restoring wrapper.
+    ///
+    /// Assembled rather than written out for the same reason as
+    /// [`mutation_call`]: a fixture containing the literal text would make this
+    /// file match its own scan.
+    fn delegated_mutation_call(path: &str) -> String {
+        format!("let _restore = crate::test_env::{path}(\"KEY\", &value);")
+    }
+
     fn unguarded_test(body: &str) -> String {
         format!(
             "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {body}\n    }}\n}}\n"
@@ -727,9 +760,10 @@ mod tests {
     #[test]
     fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
         let kinds = ["set_var", "remove_var"];
+        let delegated = ["RestoredEnvVar::set"];
         assert_eq!(
             MUTATIONS.len(),
-            kinds.len(),
+            kinds.len() + delegated.len(),
             "a call was added to MUTATIONS without a case here"
         );
         for kind in kinds {
@@ -740,6 +774,41 @@ mod tests {
                 "an unguarded std::env::{kind} inside a #[test] must be flagged"
             );
         }
+        for path in delegated {
+            let source = unguarded_test(&delegated_mutation_call(path));
+            assert_eq!(
+                env_mutations_in_unserialized_tests(&source).len(),
+                1,
+                "an unguarded {path} inside a #[test] must be flagged"
+            );
+        }
+    }
+
+    /// A restoring wrapper does not exempt the test that drives it.
+    ///
+    /// The wrapper restores; it does not serialize. Taking the key's lock first
+    /// is still required, and because the call text carries neither direct
+    /// mutation the guard only enforces that while the helper is named in
+    /// [`MUTATIONS`]. Both directions are pinned: unguarded is an offense,
+    /// guarded is not.
+    #[test]
+    fn a_mutation_delegated_to_a_restoring_wrapper_still_needs_the_lock() {
+        let call = delegated_mutation_call("RestoredEnvVar::set");
+
+        let hits = env_mutations_in_unserialized_tests(&unguarded_test(&call));
+        assert_eq!(hits.len(), 1, "the wrapper does not serialize: {hits:?}");
+        assert_eq!(
+            hits[0].call, "RestoredEnvVar::set",
+            "the offender is named by the call"
+        );
+
+        let guarded = unguarded_test(&format!(
+            "let _guard = SOME_TEST_LOCK.lock().unwrap();\n        {call}"
+        ));
+        assert!(
+            env_mutations_in_unserialized_tests(&guarded).is_empty(),
+            "the lock above is what makes this shape acceptable"
+        );
     }
 
     /// The qualifier is a matter of how the file imports, not of what the call
@@ -881,7 +950,6 @@ mod tests {
 
         for marker in [
             "let _env = ScopedTestEnv::new();",
-            "let _env = ScopedEnvVar::new(\"K\");",
             "let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();",
             // The suffix rule: a lock this guard has never heard of.
             "let _guard = SOME_BRAND_NEW_TEST_LOCK.lock().unwrap();",
@@ -1351,6 +1419,130 @@ mod tests {
         assert!(
             hits.is_empty(),
             "the first lock already covered this mutation: {hits:?}"
+        );
+    }
+
+    /// A statement that ends on its own line pulls in no continuation.
+    ///
+    /// [`statement_continuation`] returns early on a line already carrying its
+    /// `;`. Without that early return it would read the lines BELOW as part of
+    /// the statement, so a line that merely NAMES a lock would borrow the
+    /// `.lock(` from an unrelated acquisition further down and hand out the
+    /// exemption retroactively — the mutation here sits between the two.
+    ///
+    /// The loop's `break` on the terminator is pinned separately, by
+    /// [`a_statement_ending_inside_the_window_stops_the_walk_there`]: the early
+    /// return means a line carrying its own `;` never reaches the loop at all.
+    #[test]
+    fn a_self_terminating_line_does_not_borrow_a_later_acquisition() {
+        let call = mutation_call("set_var");
+        let source = unguarded_test(&format!(
+            "let _x = &SOME_TEST_LOCK;\n        {call}\n        \
+             let _real = OTHER_TEST_LOCK.lock().unwrap();"
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the naming line ended its own statement; the lock below it covers nothing \
+             above it: {hits:?}"
+        );
+    }
+
+    /// The continuation window is bounded, and the bound is load-bearing in
+    /// both directions.
+    ///
+    /// Too narrow and rustfmt's real three-line split of a lock acquisition
+    /// stops being recognised, which rejects every disciplined test in
+    /// `rocm-core` — that direction is pinned by
+    /// [`a_lock_that_is_named_but_not_taken_does_not_serialize_anything`]. Too
+    /// wide and the walk keeps running past the end of the statement into
+    /// whatever follows, so an acquisition that is nowhere near the naming line
+    /// still exempts it. This fixture splits one wider than the window.
+    #[test]
+    fn an_acquisition_split_wider_than_the_window_is_not_credited() {
+        let call = mutation_call("set_var");
+        let padding = "\n            // filler\n".repeat(5);
+        let source = unguarded_test(&format!(
+            "let _guard = SOME_TEST_LOCK{padding}            .lock()\n            .unwrap();\n        {call}"
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the acquisition is further from its name than the window reaches: {hits:?}"
+        );
+    }
+
+    /// A statement that ends partway through the window stops the walk there.
+    ///
+    /// The naming line carries no `;`, so it does reach the loop — and the loop
+    /// must stop at the line that terminates the statement. Without the
+    /// `break` it keeps reading to the window's edge and picks up an unrelated
+    /// acquisition below the mutation, exempting a mutation that ran first.
+    ///
+    /// The `.clone()` continuation is what makes this distinct from
+    /// [`a_self_terminating_line_does_not_borrow_a_later_acquisition`], which
+    /// never enters the loop.
+    #[test]
+    fn a_statement_ending_inside_the_window_stops_the_walk_there() {
+        let call = mutation_call("set_var");
+        let source = unguarded_test(&format!(
+            "let _x = &SOME_TEST_LOCK\n            .clone();\n        {call}\n        \
+             let _real = OTHER_TEST_LOCK.lock().unwrap();"
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the statement ended at `.clone();`; nothing below it belongs to it: {hits:?}"
+        );
+    }
+
+    /// The offense is the LEFTMOST mutation on the line, not the first one that
+    /// happens to be listed in [`MUTATIONS`].
+    ///
+    /// The reported column is what orders the mutation against a lock taken on
+    /// the same line, so picking by list order instead of position is a silent
+    /// false negative: here the mutation that ran BEFORE the lock is the one
+    /// later in the list, and taking the list's first reports a column to the
+    /// right of the acquisition, which reads as serialized.
+    #[test]
+    fn the_reported_mutation_is_the_leftmost_one_on_the_line() {
+        let source = unguarded_test(&format!(
+            "{} let _g = SOME_TEST_LOCK.lock().unwrap(); {}",
+            mutation_call("remove_var"),
+            mutation_call("set_var")
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "the mutation left of the lock is unserialized: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].call, "remove_var",
+            "the leftmost call is the one that ran before the lock"
+        );
+    }
+
+    /// `_TEST_LOCK` has to END the identifier.
+    ///
+    /// Dropping the word-boundary check hands the exemption to anything merely
+    /// CARRYING the suffix — `SOME_TEST_LOCK_HELPER` is a different item, and a
+    /// test naming one holds no lock at all. A false negative, and a silent
+    /// one: the guard reports nothing and the race stays.
+    #[test]
+    fn an_identifier_merely_carrying_the_lock_suffix_is_not_a_lock() {
+        let call = mutation_call("set_var");
+        let source = unguarded_test(&format!(
+            "let _h = SOME_TEST_LOCK_HELPER.lock().unwrap();\n        {call}"
+        ));
+        let hits = env_mutations_in_unserialized_tests(&source);
+        assert_eq!(
+            hits.len(),
+            1,
+            "`SOME_TEST_LOCK_HELPER` is not a `*_TEST_LOCK`: {hits:?}"
         );
     }
 

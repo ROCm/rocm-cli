@@ -22,8 +22,12 @@ use std::path::Path;
 ///
 /// This RESTORES; it does not SERIALIZE. Two tests holding one of these for the
 /// same key still race each other, so the caller must still take the key's
-/// `*_TEST_LOCK` first — and because this type is deliberately not named like
-/// one, the env-mutation contract guard in `xtask` keeps asking it to.
+/// `*_TEST_LOCK` first.
+///
+/// The env-mutation contract guard in `xtask` enforces that, but only because
+/// `RestoredEnvVar::set(` is named in its `MUTATIONS` list. The guard matches
+/// call TEXT, so wrapping a mutation in a method hides it by default — a
+/// restoring helper added later is outside the guard until it is listed too.
 pub(crate) struct RestoredEnvVar {
     key: &'static str,
     previous: Option<OsString>,

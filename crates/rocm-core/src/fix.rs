@@ -1535,7 +1535,9 @@ mod tests {
 
         // Restored on drop rather than on the next line, so a panic inside the
         // resolver cannot leave this key pointing at the directory removed
-        // below. The lock above is what serializes it; see `RestoredEnvVar`.
+        // below. `RestoredEnvVar` only restores; the lock above is what
+        // serializes, and the contract guard requires it here because
+        // `RestoredEnvVar::set(` is in its mutation list.
         let restore = crate::test_env::RestoredEnvVar::set("ROCM_PATH", &install);
         let found = newest_rocm_install_dir();
         drop(restore);

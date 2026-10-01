@@ -12459,8 +12459,9 @@ Class Name:                Display
 
         // Restored on drop rather than on the next line, so a panic inside
         // `engine_envs_dir` cannot leave this key pointing at the directory
-        // removed below. The lock above is what serializes it; see
-        // `RestoredEnvVar`.
+        // removed below. `RestoredEnvVar` only restores; the lock above is what
+        // serializes, and the contract guard requires it here because
+        // `RestoredEnvVar::set(` is in its mutation list.
         let restore =
             crate::test_env::RestoredEnvVar::set("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
         let resolved = paths.engine_envs_dir("vllm");
