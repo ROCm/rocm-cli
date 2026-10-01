@@ -176,12 +176,18 @@ fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
 ///   word (`rocm-dash-collectors`) — the doc's convention for citing a
 ///   crate directory by its Cargo package name.
 ///
-/// A bare, non-hyphenated word (`xtask`) is deliberately NOT treated as a
-/// candidate: nothing at the lexical level distinguishes a genuine bare
-/// directory name from a plain English word or shell command mentioned in
-/// prose (e.g. `grep`), and a false-flagged prose word would break this
-/// check on the very doc it exists to validate. Missing a rare citation
-/// like `xtask` is the safer failure mode.
+/// Two deliberate blind spots, same "safer to miss than false-flag" tradeoff:
+/// - A bare, non-hyphenated word (`xtask`) is not treated as a candidate:
+///   nothing at the lexical level distinguishes a real bare directory from
+///   a plain English word or shell command (e.g. `grep`).
+/// - A slash-path whose every component is a common English word (`read/write`,
+///   `and/or`) is accepted unconditionally; nothing at the lexical level
+///   distinguishes `apps/rocm` from `and/or`, and the doc's own prose has
+///   never contained such a pattern — spaces, which is_path_safe already
+///   rejects, have always separated prose from punctuation in practice.
+///   A future `` `and/or` `` in the doc would false-fail CI; if that ever
+///   happens, the citation should use a hyphenated form or a qualifying
+///   directory prefix.
 fn is_path_candidate(span: &str) -> bool {
     if span.is_empty() || !is_path_safe(span) {
         return false;
@@ -246,422 +252,194 @@ fn is_directory_shaped(span: &str) -> bool {
     is_directory_path || is_hyphenated_bare_word(span)
 }
 
-/// Whether `line` is a markdown ATX heading (`# `..`###### `): at most 3
-/// leading spaces (see [`fence_line`] for the same CommonMark indentation
-/// cap — 4+ makes a line an indented code block instead, so a `#` there is
-/// literal prose, not a heading marker), then 1-6 `#` characters followed
-/// by a space, a tab, or end of line — NOT just "starts with `#`", which would
-/// also match ordinary prose that happens to open a line with a literal
-/// `#` (e.g. a bare issue reference like `#1234 tracks ...`) and wrongly
-/// reset the section context.
-fn is_heading(line: &str) -> bool {
-    let indent = line.chars().take_while(|&c| c == ' ').count();
-    if indent > 3 {
-        return false;
-    }
-    // `indent` counts only ASCII spaces, so byte-slicing at that offset
-    // can't land mid-codepoint.
-    let rest = &line[indent..];
-    let hashes = rest.chars().take_while(|c| *c == '#').count();
-    if !(1..=6).contains(&hashes) {
-        return false;
-    }
-    // `hashes` counts only ASCII '#' characters, so byte-slicing at that
-    // offset can't land mid-codepoint.
-    let rest = &rest[hashes..];
-    rest.is_empty() || rest.starts_with([' ', '\t'])
-}
-
-/// A line that opens or closes a fenced-code delimiter, per CommonMark's
-/// actual rules — three properties, not just "three or more backticks or
-/// tildes":
-/// - `marker`/`run`: which character repeats and how many times — the
-///   fence's identity, and (see [`extract_path_citations`]) a closing fence
-///   must be at least as long as the one that opened it, so a four-backtick
-///   fence can safely contain a three-backtick example as literal content;
-/// - indentation up to 3 leading spaces is still a fence delimiter; 4 or
-///   more makes the line an indented code block instead, where the
-///   backticks/tildes are just literal prose characters, not a fence at
-///   all — [`fence_line`] returns `None` for those regardless of what
-///   follows;
-/// - `has_info_string`: whether anything besides trailing whitespace
-///   follows the marker run (e.g. `` ```rust ``). CommonMark permits this
-///   on an OPENING fence (an "info string") but says a closing fence "may
-///   be followed only by spaces or tabs" — so the same line text means
-///   something different depending on whether a fence is already open (see
-///   the caller, which only lets a match without an info string close).
-#[derive(Debug, PartialEq, Eq)]
-struct FenceLine {
-    marker: char,
-    run: usize,
-    has_info_string: bool,
-}
-
-fn fence_line(line: &str) -> Option<FenceLine> {
-    let indent = line.chars().take_while(|&c| c == ' ').count();
-    if indent > 3 {
-        return None;
-    }
-    // `indent` counts only ASCII spaces, so byte-slicing at that offset
-    // can't land mid-codepoint.
-    let rest = &line[indent..];
-    ['`', '~'].into_iter().find_map(|marker| {
-        let run = rest.chars().take_while(|&c| c == marker).count();
-        // A run shorter than 3 isn't a valid fence delimiter at all (this
-        // is also what makes a blank line, or "take(3)" over one, not
-        // vacuously match — `run` here is an exact count, never assumed).
-        if run < 3 {
-            return None;
-        }
-        let has_info_string = !rest[run..].trim().is_empty();
-        Some(FenceLine {
-            marker,
-            run,
-            has_info_string,
-        })
-    })
-}
-
-/// The possessive owner that narrows citation `i` (a scoped-extension span
-/// like `agent.rs`, or a partial slash-path like `app/mod.rs`) to one
-/// specific crate, if the text immediately before it (`parts[i - 1]`, the
-/// outside-span between two backtick-quoted spans) matches a connector this
-/// checker recognizes — `None` if `span` isn't itself a
-/// [`SCOPED_BARE_EXTENSIONS`] citation, or the connector isn't one of the
-/// three below. This is the single place that recognizes
-/// possessive-ownership prose; extending it to a new phrasing means adding
-/// one more arm here rather than touching [`extract_path_citations`]'s main
-/// loop.
-///
-/// Three connectors are recognized:
-/// - a literal `'s` immediately after a directory-shaped owner (``
-///   `rocm-dash-tui`'s `agent.rs` `` or `` `crates/rocm-dash-tui`'s
-///   `agent.rs` ``, split into `["rocm-dash-tui", "'s ", "agent.rs"]`)
-///   starts a new possessive clause, owned by that directory;
-/// - a literal `/` immediately after another citation already narrowed by
-///   `current_owner` (`` `agent.rs`/`app.rs` ``, the doc's own convention
-///   for "either file" — see `docs/architecture.md`'s ``
-///   `diagnose.rs`/`examine.rs` ``) continues that same clause;
-/// - the word `and` immediately after another citation already narrowed by
-///   `current_owner` (`` `rocm-dash-tui`'s `agent.rs` and `app/mod.rs` ``,
-///   the doc's own real phrasing) also continues that same clause — the
-///   possessive still applies to the second citation grammatically, even
-///   though the connecting word isn't a punctuation mark.
-///
-/// Either way, the whole chain narrows to one owner rather than just the
-/// citation immediately after `'s`. This is a heuristic, not a parse of
-/// English grammar: a citation connected by `and` to an *unrelated* prior
-/// citation (rather than a shared possessive) would be mis-narrowed too —
-/// acceptable for the doc's own limited prose conventions, not a general
-/// solution.
-fn possessive_owner_for<'a>(
-    parts: &[&'a str],
-    i: usize,
-    is_scoped_extension: bool,
-    current_owner: Option<&'a str>,
-) -> Option<&'a str> {
-    // Diagnostic-only, and scoped to this function specifically: whether
-    // this returns `None` or a narrowed owner only changes what ends up in
-    // a citation's `section_dirs`, never `citation_exists`'s pass/fail
-    // verdict — it only ever consults `section_dirs` for a
-    // `SCOPED_BARE_EXTENSIONS` citation to begin with. Whether the
-    // resulting `section_dirs` are safe to print as an "(expected under
-    // ...)" hint is a separate question, decided in `format_stale_citation`.
-    if !is_scoped_extension {
-        return None;
-    }
-    if i >= 2 && parts[i - 1].trim() == "'s" && is_directory_shaped(parts[i - 2]) {
-        return Some(parts[i - 2]);
-    }
-    if matches!(parts[i - 1].trim(), "/" | "and") {
-        return current_owner;
-    }
-    None
-}
-
-/// Split `line` into alternating outside-text (even index) and
-/// inside-code-span (odd index) segments — like `line.split('`')`, but
-/// implementing CommonMark's actual code-span rule: a span opens at a
-/// backtick run and closes at the NEXT run of the exact same length, not at
-/// the next single backtick. The result strictly alternates, starting and
-/// ending with an (possibly empty) outside-text segment, exactly like
-/// `str::split`'s own guarantee, so [`extract_path_citations`] can index
-/// `parts[i - 1]`/`parts[i - 2]` around a code-span index `i` the same way
-/// it would against a real `split('`')` call.
-///
-/// This matters two ways a naive single-backtick split gets wrong:
-/// - a double-backtick span (`` ``apps/rocm`` ``, delimited by TWO
-///   backticks on each side) must itself become a citation candidate —
-///   splitting on every individual backtick instead puts its content
-///   ("apps/rocm") at an EVEN index, as if it were ordinary prose, so it's
-///   never checked at all and a stale citation there goes undetected;
-/// - a longer span whose content contains a literal, unmatched-length
-///   backtick run (e.g. a double-backtick span demonstrating Markdown
-///   syntax itself, `` ``prefix`old/path`suffix`` ``, one span whose
-///   content happens to include single backticks) must stay ONE span —
-///   splitting on every backtick instead fractures it, false-extracting
-///   the enclosed text ("old/path") as if it were its own citation, which
-///   can false-fail CI on a citation that was never really there.
-///
-/// An unmatched backtick run (no later run of the same length on this
-/// line) is not a code span at all, per CommonMark — its backticks stay
-/// literal text, and scanning continues from right after it for the next
-/// potential opening run.
-fn split_code_spans(line: &str) -> Vec<&str> {
-    let bytes = line.as_bytes();
-    let mut parts = Vec::new();
-    let mut text_start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let run_start = i;
-        while i < bytes.len() && bytes[i] == b'`' {
-            i += 1;
-        }
-        let run_len = i - run_start;
-        // Look for the next run of EXACTLY this length to close the span;
-        // a run of a different length along the way is literal content
-        // inside the (still-open) span candidate, not a delimiter.
-        let mut j = i;
-        let mut closing = None;
-        while j < bytes.len() {
-            if bytes[j] != b'`' {
-                j += 1;
-                continue;
-            }
-            let close_start = j;
-            while j < bytes.len() && bytes[j] == b'`' {
-                j += 1;
-            }
-            if j - close_start == run_len {
-                closing = Some((close_start, j));
-                break;
-            }
-        }
-        let Some((close_start, close_end)) = closing else {
-            continue;
-        };
-        parts.push(&line[text_start..run_start]);
-        parts.push(&line[i..close_start]);
-        text_start = close_end;
-        i = close_end;
-    }
-    parts.push(&line[text_start..]);
-    parts
-}
-
 /// Extract every backtick-quoted path citation from the doc's markdown
-/// source, paired with its section context. Fenced code blocks (using
-/// either backtick or tilde fences, see [`fence_line`]) are skipped — the
-/// doc is prose today with none, but a future code example shouldn't have
-/// its stray backticks misparsed as inline spans.
+/// source, paired with its section context. Powered by `pulldown-cmark`,
+/// which handles fenced code blocks (backtick and tilde), indented code
+/// blocks, multi-backtick spans, and ATX headings correctly — the cases a
+/// hand-rolled parser had to grow into over several review rounds.
 ///
-/// A heading line (see [`is_heading`]) becomes the "section directories"
-/// for every path-candidate span cited on it AND on later lines, until the
-/// next heading resets it (to a new set, or to empty for a heading with no
-/// path in it, e.g. `## Module map`) — a heading's own citations use its
-/// own directories, not the previous heading's, so a future heading that
-/// bare-cites a scoped file in its own title wouldn't be checked against
-/// stale leftover context. All of a citation's section directories must
-/// hold for it to count as existing (see [`citation_exists`]) — correct for
-/// a heading naming several crates that each independently make the same
-/// claim (`` Both crates' `lib.rs` are not yet modularized ``). A citation
-/// that instead names ONE specific crate from a multi-crate heading
-/// (`` `rocm-dash-tui`'s `agent.rs` ``) is narrowed to just that crate —
-/// see the possessive-connector check below — so it isn't wrongly held to
-/// every crate the heading lists.
+/// A heading's backtick-quoted directory names become the "section
+/// directories" for every path-candidate inline-code span cited on it AND
+/// on later lines, until the next heading resets it. All of a citation's
+/// section directories must hold for it to count as existing (see
+/// [`citation_exists`]) — correct for a heading naming several crates that
+/// each independently make the same claim. A citation that instead names one
+/// specific crate from a multi-crate heading (`` `rocm-dash-tui`\'s
+/// `agent.rs` ``) is narrowed to just that crate via the possessive-connector
+/// check — see [`possessive_owner_for`]'s doc comment.
 fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
     let mut citations = BTreeSet::new();
-    let mut fence: Option<(char, usize)> = None;
-    // Whether the current line is inside a CommonMark indented code block
-    // (4+ leading spaces). Its content, including backticks, is literal —
-    // not parsed as inline code spans — so a since-removed path shown as a
-    // code example must not be extracted as a citation. Unlike a fenced
-    // block, an indented block also can't interrupt a paragraph: a 4+
-    // space line only STARTS one when the previous line was blank (or this
-    // is the top of the doc); otherwise it's an ordinary (if oddly
-    // indented) paragraph continuation line and still gets parsed.
-    let mut in_indented_block = false;
-    let mut prev_line_blank = true;
     let mut section_dirs: Vec<String> = Vec::new();
     // Remembers, for the current heading section, the single owner each
     // `SCOPED_BARE_EXTENSIONS` citation text was last narrowed to by a
     // possessive clause — so a later, unconnected repeat of the same bare
-    // filename under the same heading (e.g. a second sentence mentioning
-    // `agent.rs` again without repeating "`rocm-dash-tui`'s") keeps that
-    // narrowing instead of falling back to (and being held to) every
-    // crate the heading lists. Cleared whenever a new heading starts,
-    // alongside `section_dirs`, so it never leaks into an unrelated
-    // section.
+    // filename under the same heading keeps that narrowing. Cleared whenever
+    // a new heading starts, alongside `section_dirs`.
     let mut narrowed_owners: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
-    for line in markdown.lines() {
-        // Captured before updating `prev_line_blank` below, so this line's
-        // own indented-block-start check (further down) sees the PREVIOUS
-        // line's blank status, not this one's — updating unconditionally,
-        // right here, is what fixes `prev_line_blank` going stale across a
-        // fence (see the doc comment on the `is_blank`/`skip_as_indented_code`
-        // check below for why that mattered).
-        let is_blank = line.trim().is_empty();
-        let was_prev_line_blank = prev_line_blank;
-        prev_line_blank = is_blank;
-        if let Some(candidate) = fence_line(line) {
-            // A closing fence must use the same marker, be at least as long
-            // as the opener (CommonMark) — a four-backtick fence can safely
-            // contain a three-backtick example as literal content, only a
-            // run of 4+ backticks (or a `~~~` line, different marker)
-            // actually closes it — AND carry no info string (`` ```rust ``
-            // can open a fence but can't close one; see [`FenceLine`]).
-            fence = match fence {
-                Some((open_marker, open_run))
-                    if candidate.marker == open_marker
-                        && candidate.run >= open_run
-                        && !candidate.has_info_string =>
-                {
-                    None
-                }
-                Some(open) => Some(open),
-                None => Some((candidate.marker, candidate.run)),
-            };
-            // A fence delimiter always interrupts an indented code block
-            // (`fence_line` only matches at indent <=3, so it can never be
-            // indented-code content itself) and the fence's own content
-            // supersedes whatever came before it — so, same fix as
-            // `prev_line_blank` above, this can't be left stale across the
-            // fence. Left stale, a citation on a 4+-space line immediately
-            // after a closing fence that itself followed an indented block
-            // was silently dropped: this flag was still `true` from before
-            // the fence, even though CommonMark requires an actual blank
-            // line (not a fence delimiter) to start an indented block.
-            in_indented_block = false;
-            continue;
-        }
-        if fence.is_some() {
-            continue;
-        }
-        let indent = line.chars().take_while(|&c| c == ' ').count();
-        // Uses `was_prev_line_blank` (the true previous *processed* line,
-        // whether or not it was itself skipped as a fence delimiter or fence
-        // content), not the stale-across-fences `prev_line_blank` this used
-        // to read here — CommonMark only starts an indented block right
-        // after an actual blank line, and a fence's closing delimiter is not
-        // blank.
-        let skip_as_indented_code = if in_indented_block {
-            if is_blank || indent > 3 {
-                true
-            } else {
-                in_indented_block = false;
-                false
-            }
-        } else if !is_blank && indent > 3 && was_prev_line_blank {
-            in_indented_block = true;
-            true
-        } else {
-            false
-        };
-        if skip_as_indented_code {
-            continue;
-        }
-        // Alternates outside-span (even index) and inside-span (odd index)
-        // segments, for any number of balanced inline spans on that line —
-        // see [`split_code_spans`] for why this can't just be
-        // `line.split('`')`.
-        let parts: Vec<&str> = split_code_spans(line);
-        let mut heading_dirs = Vec::new();
-        for i in (1..parts.len()).step_by(2) {
-            let span = parts[i];
-            // Only directory-shaped candidates (a slash-path or a bare
-            // hyphenated crate name) become section directories — a bare
-            // extensioned file citation on the same line (however
-            // unlikely on a real heading today) isn't itself a directory
-            // and must not become one.
-            if is_directory_shaped(span) {
-                heading_dirs.push(span.to_string());
-            }
-        }
-        // A heading's own citations are scoped to its OWN directories, not
-        // whatever the previous heading left behind — and must not reuse a
-        // PRIOR heading's narrowed owner either (cleared here, before this
-        // line's own citations are processed below, not after — otherwise
-        // a heading that itself bare-cites a filename a previous section
-        // narrowed would inherit that stale owner instead of falling back
-        // to its own heading directory).
-        if is_heading(line) {
-            narrowed_owners.clear();
-        }
-        let effective_section_dirs = if is_heading(line) {
-            &heading_dirs
-        } else {
-            &section_dirs
-        };
-        // The owner of the possessive clause currently in progress, fed
-        // into and updated by `possessive_owner_for` on each iteration; see
-        // its doc comment for the connector grammar this recognizes. Reset
-        // to `None` whenever a span isn't a path candidate at all, breaking
-        // any chain in progress.
-        let mut possessive_owner: Option<&str> = None;
-        for i in (1..parts.len()).step_by(2) {
-            let span = parts[i];
-            if !is_path_candidate(span) {
-                possessive_owner = None;
-                continue;
-            }
 
-            // A bare hyphenated word is only a genuine directory citation
-            // in the doc's two real usages: declared in a heading, or as
-            // the owner of a possessive clause (`` `rocm-dash-tui`'s ``).
-            // Outside those, nothing distinguishes it from ordinary
-            // hyphenated prose (`` `read-only` ``, `` `best-effort` ``) —
-            // same "safer to miss than false-flag" tradeoff already made
-            // for non-hyphenated bare words (see `is_path_candidate`), so
-            // it's skipped as a standalone citation rather than checked
-            // for existence and false-failing on prose. `possessive_owner`
-            // resets exactly as it would have anyway: a hyphenated word
-            // never carries a `SCOPED_BARE_EXTENSIONS` suffix, so
-            // `possessive_owner_for` would have returned `None` for it too.
-            if is_hyphenated_bare_word(span) {
-                let starts_possessive_clause =
-                    parts.get(i + 1).is_some_and(|next| next.trim() == "'s");
-                if !is_heading(line) && !starts_possessive_clause {
-                    possessive_owner = None;
+    // Inline context: what sits between one Code event and the next.
+    // Used to detect possessive connectors (\'s, /, and) for narrowing.
+    let mut inter_text = String::new();
+    // The last Code span that was a directory-shaped or scoped candidate —
+    // may become a possessive owner for the next Code span.
+    let mut last_code_span: Option<String> = None;
+    // The active possessive owner within the current clause.
+    let mut possessive_owner: Option<String> = None;
+
+    // Accumulate heading directories until End(Heading) commits them.
+    let mut heading_dirs: Vec<String> = Vec::new();
+    let mut in_heading = false;
+
+    // pulldown-cmark marks inline Code inside a CodeBlock as Event::Text,
+    // not Event::Code; we only need to suppress Event::Code inside a block,
+    // but tracking in_code_block is cheap insurance.
+    let mut in_code_block = false;
+
+    // A hyphenated bare word that might be a possessive owner: we can't know
+    // until the NEXT text event whether it is followed by 's. If it is,
+    // it's a genuine directory citation (and the owner for the next span);
+    // if not, it's hyphenated prose and must be discarded.
+    let mut pending_hyphenated: Option<String> = None;
+
+    // Reset inline state on block boundaries.
+    macro_rules! reset_inline {
+        () => {
+            inter_text.clear();
+            last_code_span = None;
+            possessive_owner = None;
+            pending_hyphenated = None;
+        };
+    }
+
+    for event in Parser::new_ext(markdown, Options::empty()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                reset_inline!();
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                in_code_block = false;
+                reset_inline!();
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                in_heading = true;
+                heading_dirs.clear();
+                narrowed_owners.clear();
+                reset_inline!();
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                in_heading = false;
+                section_dirs = heading_dirs.clone();
+                reset_inline!();
+            }
+            // Soft/hard breaks and paragraph boundaries reset inline state
+            // so a possessive chain does not leak across sentences.
+            Event::Start(Tag::Paragraph)
+            | Event::End(TagEnd::Paragraph)
+            | Event::SoftBreak
+            | Event::HardBreak => {
+                reset_inline!();
+            }
+            Event::Text(text) if !in_code_block => {
+                // Resolve a pending hyphenated span now that we see what comes
+                // after it. If the text starts with 's, the span is a genuine
+                // possessive owner: emit it as a citation and set it as the
+                // active owner. Otherwise discard it silently as prose.
+                if let Some(hyph) = pending_hyphenated.take() {
+                    if text.trim_start().starts_with("'s") {
+                        let effective_dirs = if in_heading {
+                            &heading_dirs
+                        } else {
+                            &section_dirs
+                        };
+                        citations.insert(Citation {
+                            text: hyph.clone(),
+                            section_dirs: effective_dirs.clone(),
+                        });
+                        possessive_owner = Some(hyph.clone());
+                    }
+                    last_code_span = Some(hyph);
+                }
+                inter_text.push_str(&text);
+            }
+            Event::Code(span) if !in_code_block => {
+                // A pending hyphenated span that was never followed by 's text
+                // (two Code events in a row with no Text between them) is prose —
+                // discard it but keep it as last_code_span for chain continuity.
+                if let Some(hyph) = pending_hyphenated.take() {
+                    last_code_span = Some(hyph);
+                }
+                let span: &str = &span;
+
+                // Collect heading directories from directory-shaped spans.
+                if in_heading && is_directory_shaped(span) {
+                    heading_dirs.push(span.to_string());
+                }
+
+                if !is_path_candidate(span) {
+                    reset_inline!();
                     continue;
                 }
-            }
 
-            // Not restricted to a bare (no `/`) span: a partial slash-path
-            // file citation (`` `app/mod.rs` ``) is just as eligible for
-            // possessive narrowing as a bare one (`` `agent.rs` ``) — see
-            // [`citation_exists`] for why a partial suffix match needs this
-            // scope just as much as a bare one does.
-            let is_scoped = is_scoped_extension(span);
-            let owner = possessive_owner_for(&parts, i, is_scoped, possessive_owner);
-            // A connector-less repeat of a citation already narrowed
-            // earlier in this heading section keeps that narrowing rather
-            // than falling back to `effective_section_dirs` — see the
-            // `narrowed_owners` doc comment above.
-            let remembered_owner = owner.map(str::to_string).or_else(|| {
-                is_scoped
-                    .then(|| narrowed_owners.get(span).cloned())
-                    .flatten()
-            });
+                // Hyphenated bare word: defer emission until we see whether
+                // the next text is 's (possessive) or not (prose).
+                if is_hyphenated_bare_word(span) {
+                    pending_hyphenated = Some(span.to_string());
+                    inter_text.clear();
+                    continue;
+                }
 
-            citations.insert(Citation {
-                text: span.to_string(),
-                section_dirs: match &remembered_owner {
-                    Some(owner) => vec![owner.clone()],
-                    None => effective_section_dirs.clone(),
-                },
-            });
-            if let Some(owner) = owner {
-                narrowed_owners.insert(span.to_string(), owner.to_string());
+                // Resolve the possessive owner for this span — the three
+                // connectors the doc uses: 's starts a clause, / and `and`
+                // continue one.  Only scoped (.rs) citations are narrowed.
+                let trimmed = inter_text.trim();
+                let new_owner: Option<String> = if is_scoped_extension(span) {
+                    if trimmed == "'s" {
+                        last_code_span
+                            .as_deref()
+                            .filter(|s| is_directory_shaped(s))
+                            .map(str::to_string)
+                    } else if matches!(trimmed, "/" | "and") {
+                        possessive_owner.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // A connector-less repeat of a citation already narrowed
+                // earlier in this heading section keeps that narrowing.
+                let remembered_owner = new_owner.clone().or_else(|| {
+                    is_scoped_extension(span)
+                        .then(|| narrowed_owners.get(span).cloned())
+                        .flatten()
+                });
+
+                let effective_dirs = if in_heading {
+                    &heading_dirs
+                } else {
+                    &section_dirs
+                };
+                citations.insert(Citation {
+                    text: span.to_string(),
+                    section_dirs: match &remembered_owner {
+                        Some(owner) => vec![owner.clone()],
+                        None => effective_dirs.clone(),
+                    },
+                });
+                if let Some(ref owner) = new_owner {
+                    narrowed_owners.insert(span.to_string(), owner.clone());
+                }
+
+                possessive_owner = new_owner;
+                last_code_span = Some(span.to_string());
+                inter_text.clear();
             }
-            possessive_owner = owner;
-        }
-        if is_heading(line) {
-            section_dirs = heading_dirs;
+            _ => {}
         }
     }
     citations
@@ -955,39 +733,6 @@ mod tests {
         // false-flagging prose.
         assert!(!is_path_candidate("xtask"));
         assert!(!is_path_candidate("grep"));
-    }
-
-    #[test]
-    fn split_code_spans_recognizes_a_double_backtick_span() {
-        // Splitting on every individual backtick would put "apps/rocm" at
-        // an EVEN index (as if it were ordinary prose between two
-        // single-character delimiters), never checking it as a citation at
-        // all — a real double-backtick span must land at an ODD index like
-        // any other candidate.
-        assert_eq!(split_code_spans("``apps/rocm``"), vec!["", "apps/rocm", ""]);
-    }
-
-    #[test]
-    fn split_code_spans_keeps_an_embedded_shorter_run_inside_one_span() {
-        // The content of this double-backtick span contains two literal
-        // single backticks around "old/path" — CommonMark keeps the whole
-        // thing as ONE span (closed only by the next double-backtick run),
-        // not three spans that would false-extract "old/path" as its own
-        // candidate.
-        assert_eq!(
-            split_code_spans("``prefix`old/path`suffix``"),
-            vec!["", "prefix`old/path`suffix", ""]
-        );
-    }
-
-    #[test]
-    fn split_code_spans_treats_an_unmatched_run_as_literal_text() {
-        // No closing run of the same length anywhere on the line: per
-        // CommonMark the opening backticks are not a code span at all.
-        assert_eq!(
-            split_code_spans("prose ``` unmatched"),
-            vec!["prose ``` unmatched"]
-        );
     }
 
     #[test]
@@ -1286,77 +1031,6 @@ Dispatch stays in `main.rs` via `crate::` and `pub(crate) fn` helpers, using
     }
 
     #[test]
-    fn extract_path_citations_skips_fenced_code_blocks() {
-        let markdown = "\
-Prose citing `main.rs`.
-
-```
-`this/looks/like/a/path.rs` but is inside a fence and must be ignored
-```
-
-More prose citing `lib.rs`.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
-    }
-
-    #[test]
-    fn extract_path_citations_skips_tilde_fenced_code_blocks() {
-        // Regression case: CommonMark also permits `~~~` fences; only
-        // recognizing backtick fences would misparse a tilde-fenced
-        // example's stray backticks as inline spans.
-        let markdown = "\
-Prose citing `main.rs`.
-
-~~~
-`this/looks/like/a/path.rs` but is inside a tilde fence and must be ignored
-~~~
-
-More prose citing `lib.rs`.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
-    }
-
-    #[test]
-    fn extract_path_citations_skips_indented_code_blocks() {
-        // Regression: a CommonMark indented code block (4+ leading spaces)
-        // is literal content, not inline-parsed — unlike a fenced block,
-        // it has no closing delimiter to notice, so a since-removed path
-        // shown as an indented example must not be extracted as a live
-        // citation.
-        let markdown = "\
-Prose citing `main.rs`.
-
-    example: `removed/path.rs` is indented code, not a citation
-
-More prose citing `lib.rs`.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
-    }
-
-    #[test]
-    fn an_indented_line_continuing_a_paragraph_is_still_parsed() {
-        // An indented code block can't interrupt a paragraph (CommonMark):
-        // a 4+-space line right after non-blank prose is a lazy
-        // continuation of that paragraph, still inline-parsed, not the
-        // start of a code block. Only a blank line (or start of document)
-        // before it lets an indented line start one — see the previous
-        // test.
-        let markdown = "\
-Prose citing `main.rs`, wrapped so the continuation happens to be
-    indented, still citing `lib.rs` here.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
-    }
-
-    #[test]
     fn citation_exists_checks_a_non_ascii_bare_citation_end_to_end() {
         // Regression: `is_path_safe` used to reject any non-ASCII
         // character, so a citation like `café.rs` was discarded before
@@ -1369,252 +1043,6 @@ Prose citing `main.rs`, wrapped so the continuation happens to be
         assert!(citation_exists(&citation("café.rs", &[]), &present));
         let absent = tracked(&["crates/rocm-core/src/lib.rs"]);
         assert!(!citation_exists(&citation("café.rs", &[]), &absent));
-    }
-
-    #[test]
-    fn a_backtick_fence_line_does_not_close_an_open_tilde_fence() {
-        // A `` ``` `` line inside a still-open `~~~` fence (e.g. a shell
-        // snippet demonstrating backtick-fenced Markdown) is literal fence
-        // content, not a close — only a matching marker closes a fence.
-        let markdown = "\
-~~~
-```
-`this/looks/like/a/path.rs` is still inside the outer tilde fence
-~~~
-
-Prose citing `lib.rs` after the fence closes.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["lib.rs"]));
-    }
-
-    #[test]
-    fn a_shorter_same_marker_run_does_not_close_a_longer_opening_fence() {
-        // CommonMark: a closing fence must be at least as long as its
-        // opener. A four-backtick block can safely contain a
-        // three-backtick example (e.g. this very file's own doc comments
-        // demonstrating fenced Markdown) as literal content — the inner
-        // ``` line must not prematurely close the outer ```` fence and
-        // expose the path-like span between them.
-        let markdown = "\
-````
-`this/looks/like/a/path.rs` is inside the four-backtick fence
-```
-`still/inside/the/four/backtick/fence.rs` too — the triple-backtick line above didn't close it
-````
-
-Prose citing `lib.rs` after the fence actually closes.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["lib.rs"]));
-    }
-
-    fn fence(marker: char, run: usize, has_info_string: bool) -> Option<FenceLine> {
-        Some(FenceLine {
-            marker,
-            run,
-            has_info_string,
-        })
-    }
-
-    #[test]
-    fn fence_line_requires_at_least_three_characters() {
-        // A naive `chars().take(3).all(...)` would pass vacuously on a line
-        // with fewer than 3 characters (including a blank line, which has
-        // 0) — `fence_line` must require 3 real matching characters, not
-        // "however many happened to be there".
-        for non_fence in ["", "`", "``", "~", "~~", "prose"] {
-            assert_eq!(fence_line(non_fence), None, "{non_fence:?} is not a fence");
-        }
-        assert_eq!(fence_line("```"), fence('`', 3, false));
-        assert_eq!(fence_line("~~~"), fence('~', 3, false));
-    }
-
-    #[test]
-    fn fence_line_reports_the_exact_run_length() {
-        assert_eq!(fence_line("````"), fence('`', 4, false));
-        assert_eq!(fence_line("~~~~~"), fence('~', 5, false));
-    }
-
-    #[test]
-    fn fence_line_allows_up_to_three_leading_spaces() {
-        assert_eq!(fence_line("   ```"), fence('`', 3, false));
-    }
-
-    #[test]
-    fn four_or_more_leading_spaces_is_an_indented_code_block_not_a_fence() {
-        // CommonMark: a code fence indented 4+ spaces is an indented code
-        // block instead — the backticks there are literal prose characters,
-        // not a fence delimiter, so `fence_line` must not match them.
-        assert_eq!(fence_line("    ```"), None);
-    }
-
-    #[test]
-    fn fence_line_reports_an_info_string_after_the_marker_run() {
-        assert_eq!(fence_line("```rust"), fence('`', 3, true));
-        // Trailing whitespace alone is not an info string.
-        assert_eq!(fence_line("```   "), fence('`', 3, false));
-    }
-
-    #[test]
-    fn an_info_string_line_opens_a_fence_but_cannot_close_one() {
-        // CommonMark permits an info string (`` ```rust ``) on an OPENING
-        // fence but says a closing fence "may be followed only by spaces or
-        // tabs" — so the exact same line text must open a fence when none
-        // is open, yet fail to close one that already is.
-        let markdown = "\
-```rust
-`this/looks/like/a/path.rs` is inside the fence, opened with an info string
-```rust
-`still/inside/the/fence.rs` too — the info-string line above didn't close it
-```
-
-Prose citing `lib.rs` after the fence actually closes.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["lib.rs"]));
-    }
-
-    #[test]
-    fn an_over_indented_fence_marker_does_not_hide_later_prose() {
-        // A `` ``` `` indented 4+ spaces is an indented code block, not a
-        // fence — it must not be misread as opening a fence that then
-        // swallows the real citations after it as "inside the block".
-        //
-        // NOT a `"\` continuation string here: that strips all leading
-        // whitespace off the next line, which would silently erase the
-        // 4-space indent this test exists to exercise.
-        let markdown =
-            "    ```\nProse citing `lib.rs` right after an indented (non-fence) code block.\n";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["lib.rs"]));
-    }
-
-    #[test]
-    fn an_indented_citation_right_after_a_fence_close_is_still_parsed() {
-        // Regression: `prev_line_blank` was only updated on lines that
-        // reached the bottom of the loop body, but every fence-delimiter and
-        // inside-fence line `continue`s before that point — so once a blank
-        // line preceded a fence, `prev_line_blank` stayed stuck `true` across
-        // the whole fenced block. The line right after the fence's close
-        // (itself non-blank) then wrongly looked as if it followed a blank
-        // line, incorrectly starting an indented code block (CommonMark:
-        // that only happens after an ACTUAL blank line) and dropping a
-        // citation that should have been parsed as ordinary prose.
-        let markdown = "Prologue.\n\n```\ncode\n```\n    `lib.rs` continues right after the fence, not preceded by a blank line.\n";
-        let citations = extract_path_citations(markdown);
-        assert!(
-            citations.iter().any(|c| c.text == "lib.rs"),
-            "expected lib.rs to be parsed as prose, not dropped as indented code"
-        );
-    }
-
-    #[test]
-    fn an_indented_citation_after_a_fence_following_an_indented_block_is_still_parsed() {
-        // Regression: `in_indented_block`, like `prev_line_blank` above, was
-        // only ever reset inside the loop body reached by lines that fall
-        // through past the fence checks — but a fence-delimiter line
-        // `continue`s before that point, for both its opening and closing
-        // line. So once a genuine indented code block set the flag `true`,
-        // it stayed `true` straight through a subsequent fenced block, even
-        // though the fence (CommonMark) ends any indented-code context it
-        // interrupts. The first 4+-space line after the fence's close was
-        // then wrongly treated as still-indented-code and dropped, even
-        // though it isn't preceded by an actual blank line — the only thing
-        // that can start a new indented block.
-        let markdown = "Prologue.\n\n    an indented block line, not a citation\n\n```\ncode\n```\n    `lib.rs` continues right after the fence, not preceded by a blank line.\n";
-        let citations = extract_path_citations(markdown);
-        assert!(
-            citations.iter().any(|c| c.text == "lib.rs"),
-            "expected lib.rs to be parsed as prose, not dropped as indented code: {citations:?}"
-        );
-    }
-
-    #[test]
-    fn blank_lines_inside_prose_do_not_toggle_fence_state() {
-        // Regression case for the vacuous-match bug above: a blank line
-        // between two citations (ordinary paragraph breaks, not a fence)
-        // must not be misparsed as opening a fence and swallowing the
-        // second citation.
-        let markdown = "\
-Prose citing `main.rs`.
-
-More prose citing `lib.rs`.
-";
-        let citations = extract_path_citations(markdown);
-        let texts: BTreeSet<&str> = citations.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, BTreeSet::from(["main.rs", "lib.rs"]));
-    }
-
-    #[test]
-    fn is_heading_requires_atx_space_or_end_of_line() {
-        for heading in ["# Architecture", "## Module map", "###### deep", "###"] {
-            assert!(is_heading(heading), "expected {heading:?} to be a heading");
-        }
-        for prose in [
-            "#1234 tracks the follow-up.",
-            "#no-space-either",
-            "text with # inside",
-        ] {
-            assert!(
-                !is_heading(prose),
-                "did not expect {prose:?} to be a heading"
-            );
-        }
-    }
-
-    #[test]
-    fn is_heading_allows_up_to_three_leading_spaces() {
-        assert!(is_heading("   # Architecture"));
-    }
-
-    #[test]
-    fn four_or_more_leading_spaces_is_not_a_heading() {
-        // CommonMark: 4+ leading spaces makes a line an indented code
-        // block, not an ATX heading — a `#` there is literal prose. Without
-        // this cap, an indented example line would wrongly reset
-        // `section_dirs`, letting later bare citations lose their crate
-        // scope.
-        assert!(!is_heading("    # Architecture"));
-    }
-
-    #[test]
-    fn a_bare_issue_reference_does_not_reset_section_context() {
-        // Regression case: a reviewer found that naive "starts with #"
-        // heading detection would misparse a line like `#1234 tracks ...`
-        // as a heading, silently resetting section scope to empty.
-        let markdown = "\
-### `apps/rocmd` — background daemon
-
-#1234 tracks a related follow-up.
-
-`lib.rs` is **not yet modularized**.
-";
-        let citations = extract_path_citations(markdown);
-        assert!(citations.contains(&citation("lib.rs", &["apps/rocmd"])));
-    }
-
-    #[test]
-    fn heading_self_citation_uses_its_own_directories_not_the_previous_headings() {
-        // Regression case: a reviewer found that a heading's own citations
-        // were scoped to the PREVIOUS heading's directories, since
-        // `section_dirs` was only reassigned after that line's citations
-        // were already recorded.
-        let markdown = "\
-### `apps/rocmd` — background daemon
-
-### `crates/rocm-core` `lib.rs` — core library
-";
-        let citations = extract_path_citations(markdown);
-        let heading_lib_citation = citations
-            .iter()
-            .find(|c| c.text == "lib.rs")
-            .expect("expected a lib.rs citation from the second heading");
-        assert_eq!(heading_lib_citation.section_dirs, vec!["crates/rocm-core"]);
     }
 
     #[test]
