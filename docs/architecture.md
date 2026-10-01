@@ -25,7 +25,7 @@ Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surfac
 
 ### `apps/rocm` — main CLI binary
 
-Subsystem modules already following full domain extraction (each owns its own types): `therock.rs`, `comfyui.rs`, `providers.rs`, `chat_host_facts.rs`, `dash.rs`, `dash_seam.rs`, `provider_keys.rs`, `serve_summary.rs`, `storage.rs`. Mechanically relocated dispatch-adjacent handlers (no owned types, shared config stays at the crate root): `automations.rs`, `uninstall.rs`, `endpoint_keys.rs`, `logging.rs`. `bootstrap.rs` is a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in `main.rs`. Shared CLI-output components: `cli_progress.rs` (`Spinner`, `AnimatedSpinner`), `cli_report.rs` (`ActionReport`).
+Subsystem modules already following full domain extraction (each owns its own types): `therock.rs`, `comfyui.rs`, `providers.rs`, `chat_host_facts.rs`, `dash.rs`, `dash_seam.rs`, `provider_keys.rs`, `runtime_services.rs`, `serve_summary.rs`, `storage.rs`. Mechanically relocated dispatch-adjacent handlers (no owned types, shared config stays at the crate root): `automations.rs`, `uninstall.rs`, `endpoint_keys.rs`, `logging.rs`. `bootstrap.rs` is a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in `main.rs`. Shared CLI-output components: `cli_progress.rs` (`Spinner`, `AnimatedSpinner`), `cli_report.rs` (`ActionReport`).
 
 `main.rs` itself is **not yet modularized** — see EAI-7768, split planned across several PRs, one cluster at a time.
 
