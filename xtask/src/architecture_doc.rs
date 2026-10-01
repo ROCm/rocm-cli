@@ -266,7 +266,9 @@ fn is_directory_shaped(span: &str) -> bool {
 /// each independently make the same claim. A citation that instead names one
 /// specific crate from a multi-crate heading (`` `rocm-dash-tui`\'s
 /// `agent.rs` ``) is narrowed to just that crate via the possessive-connector
-/// check — see [`possessive_owner_for`]'s doc comment.
+/// check: `'s` starts a possessive clause, `/` and `and` continue one.
+/// Only `.rs` citations are narrowed this way; the logic lives inline in
+/// the `Event::Code` arm below.
 fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
