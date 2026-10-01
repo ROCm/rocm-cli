@@ -47,6 +47,11 @@ pub use types::{
     ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PlannedAction,
     ReplayState, ResolvedArgs, UpdateStatus, format_mmss,
 };
+// `NO_CHAT_BACKEND_MSG` has no current caller through this `crate::app::`
+// path (call sites use `super::types::` directly), but it was reachable here
+// pre-split and the re-export list claims parity with `crate::app::*`.
+#[allow(unused_imports)]
+pub(crate) use types::NO_CHAT_BACKEND_MSG;
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
 /// How many snapshots to keep for sparklines.
@@ -606,7 +611,7 @@ impl AppState {
     /// while the user is inside one of those. It does NOT by itself protect a
     /// running job console: the shared console maps `q` / running-`Esc` to
     /// "close overlay", which would null the manager mid-job. That case is
-    /// handled upstream in `event_loop` by [`focused_close_key_blocked`], which
+    /// handled upstream in `event_loop` by `focused_close_key_blocked`, which
     /// swallows those keys while the job is non-terminal — so by the time this
     /// gate is checked, a focused overlay only ever closed at its root (form
     /// screen or a terminal job). Always `false` for the normal
