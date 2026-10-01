@@ -6202,8 +6202,9 @@ impl RocmCliConfig {
     /// on the binary crate that contains it, so this path keeps its own.
     ///
     /// Closing the gap means moving the helper down into `rocm-core`.
-    /// `windows-sys` is already a Windows-target dependency here and
-    /// `Win32_Storage_FileSystem` is the only missing feature, but the move is
+    /// `windows-sys` is already a Windows-target dependency here and now
+    /// carries `Win32_Storage_FileSystem` (the test gate below needs it), so
+    /// nothing is missing on the dependency side — but the move is
     /// the whole staging/publishing family in `therock.rs` — around ten
     /// functions, its `#[cfg]` arms and its existing call sites — not one
     /// function, and `apps/rocmd` carries a second, already-drifted copy that
@@ -12906,9 +12907,10 @@ last_installed_runtime_id = "therock-release"
         // behind, holds just as well for an implementation with no temp file at
         // all — it cannot tell the two apart.
         //
-        // `saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place`
-        // below is the Windows counterpart, reading the same identity through
-        // `file_index` so this guarantee is not asserted on Unix alone.
+        // The `#[cfg(windows)]` function of the same name below is the Windows
+        // counterpart, reading the same identity through
+        // `GetFileInformationByHandle`, so this guarantee is not asserted on
+        // Unix alone.
         let (root, paths) = temp_app_paths("config-save-replaces");
         let mut config = RocmCliConfig {
             default_engine: Some("vllm".to_owned()),
@@ -12933,48 +12935,80 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
+    /// The volume serial number paired with the 64-bit file index: this
+    /// platform's file identity, the way an inode is on Unix.
+    ///
+    /// Read through `GetFileInformationByHandle` rather than
+    /// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
+    /// `file_index` accessors are still unstable behind the `windows_by_handle`
+    /// feature gate and so cannot be called on the pinned stable toolchain —
+    /// using them failed the Windows lane with `error[E0658]` while every other
+    /// lane stayed green, because nothing else in the workspace builds this
+    /// `#[cfg(windows)]` arm.
+    #[cfg(windows)]
+    #[allow(unsafe_code)] // Win32 FFI
+    fn windows_file_identity(path: &Path) -> Result<(u32, u64)> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        // All-POD `repr(C)` record, fully overwritten by the call below on
+        // success and never read on failure.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+            bail!(
+                "failed to read the file identity of {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+
     #[cfg(windows)]
     #[test]
     fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
-        use std::os::windows::fs::MetadataExt;
-
-        // The Windows counterpart of the Unix test above. `file_index` together
-        // with `volume_serial_number` is this platform's file identity, the way
-        // an inode is on Unix: a `fs::write` over the live path refills the SAME
-        // file and keeps the pair, while a publish-by-rename puts a DIFFERENT
-        // file behind the name. Without this, the only test that can tell the
-        // two implementations apart was `#[cfg(unix)]`, and a Windows-only
-        // regression to a plain `fs::write` would pass every gate.
+        // The Windows counterpart of the Unix test above. The file index
+        // together with the volume serial number is this platform's file
+        // identity, the way an inode is on Unix: a `fs::write` over the live
+        // path refills the SAME file and keeps the pair, while a
+        // publish-by-rename puts a DIFFERENT file behind the name. Without
+        // this, the only test that can tell the two implementations apart was
+        // `#[cfg(unix)]`, and a Windows-only regression to a plain `fs::write`
+        // would pass every gate.
         //
-        // The identity is read through `fs::metadata`, which opens the file, so
-        // both values are `Some` in practice; the `None` arm is the documented
-        // case where Windows declines to report one rather than a failure to
-        // replace, so it does not assert.
+        // Unlike the `MetadataExt` accessors this replaces, the identity here is
+        // not optional: `GetFileInformationByHandle` either fills both fields or
+        // fails, and a failure is a test error rather than a silently skipped
+        // assertion. The previous shape could not have distinguished "Windows
+        // declined to report an identity" from "the test asserted nothing".
         let (root, paths) = temp_app_paths("config-save-replaces");
         let mut config = RocmCliConfig {
             default_engine: Some("vllm".to_owned()),
             ..RocmCliConfig::default()
         };
         config.save(&paths)?;
-        let before = fs::metadata(paths.config_path())?;
-        let before_identity = (before.volume_serial_number(), before.file_index());
+        let before = windows_file_identity(&paths.config_path())?;
 
         config.default_engine = Some("lemonade".to_owned());
         config.save(&paths)?;
-        let after = fs::metadata(paths.config_path())?;
-        let after_identity = (after.volume_serial_number(), after.file_index());
+        let after = windows_file_identity(&paths.config_path())?;
 
         let loaded = RocmCliConfig::load(&paths)?;
         let _ = fs::remove_dir_all(&root);
 
-        if before_identity.1.is_some() && after_identity.1.is_some() {
-            assert_ne!(
-                before_identity, after_identity,
-                "an overwrite that keeps the same file identity rewrote the \
-                 live config in place, so an interrupted save can leave it \
-                 truncated"
-            );
-        }
+        assert_ne!(
+            before, after,
+            "an overwrite that keeps the same file identity rewrote the live \
+             config in place, so an interrupted save can leave it truncated"
+        );
         assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
     }
