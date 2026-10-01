@@ -4,14 +4,16 @@
 
 #![allow(clippy::items_after_test_module)]
 
+mod cli;
 mod common;
 mod persistence;
 #[cfg(test)]
 mod test_support;
 mod webhook;
 
+pub use cli::{run_bin_cli, run_from_args};
+
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
 use rocm_core::AutomationEventRecord;
 use rocm_core::{
@@ -48,334 +50,14 @@ const GPU_THERMAL_MEMORY_PRESSURE_C: f64 = 95.0;
 const GPU_MEMORY_VRAM_PRESSURE_PERCENT: f64 = 95.0;
 const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 
-#[derive(Parser, Debug)]
-#[command(name = "rocmd", about = "rocm-cli local supervisor", version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    Run {
-        #[arg(long, help = "Enable the persistent watcher loop.")]
-        automations_enabled: bool,
-        #[arg(
-            long,
-            help = "Listen on 127.0.0.1:<PORT> for local JSON POST /automation-events; never binds publicly."
-        )]
-        local_webhook_port: Option<u16>,
-    },
-    Supervise {
-        service_id: String,
-        #[arg(long)]
-        engine: String,
-        #[arg(long)]
-        model_ref: String,
-        #[arg(long)]
-        canonical_model_id: String,
-        #[arg(long, conflicts_with = "env_id")]
-        runtime_id: Option<String>,
-        #[arg(long, conflicts_with = "runtime_id")]
-        env_id: Option<String>,
-        #[arg(long, default_value = DEFAULT_LOCAL_HOST)]
-        host: String,
-        #[arg(long)]
-        port: u16,
-        #[arg(long, default_value = "gpu_required")]
-        device_policy: String,
-        #[arg(long)]
-        gpu: Option<String>,
-        #[arg(long)]
-        engine_recipe_json: Option<String>,
-    },
-    Status,
-    BridgeSnapshot {
-        #[arg(long)]
-        pretty: bool,
-    },
-    SandboxRun {
-        #[arg(value_enum)]
-        tool: SandboxToolArg,
-        #[arg(long)]
-        service_id: Option<String>,
-        #[arg(long)]
-        artifact_ref: Option<String>,
-        #[arg(
-            long,
-            help = "Allow prefetch_artifact to perform an approved network download for direct HTTP(S) artifacts with size and sha256 metadata."
-        )]
-        allow_artifact_download: bool,
-        #[arg(
-            long,
-            help = "Maximum bytes allowed for an approved artifact download."
-        )]
-        artifact_max_bytes: Option<u64>,
-        #[arg(
-            long,
-            help = "Allow authenticated Hugging Face artifact downloads using ROCM_CLI_HUGGINGFACE_TOKEN, HF_TOKEN, or HUGGING_FACE_HUB_TOKEN. Tokens are sent only to HTTPS Hugging Face URLs."
-        )]
-        allow_huggingface_download: bool,
-        #[arg(long)]
-        message: Option<String>,
-        #[arg(
-            long,
-            help = "Run only the restricted internal tool API when bubblewrap isolation is unavailable; required on Windows."
-        )]
-        allow_native_fallback: bool,
-    },
-    #[command(hide = true)]
-    SandboxTool {
-        #[arg(value_enum)]
-        tool: SandboxToolArg,
-        #[arg(long)]
-        service_id: Option<String>,
-        #[arg(long)]
-        artifact_ref: Option<String>,
-        #[arg(long)]
-        allow_artifact_download: bool,
-        #[arg(long)]
-        artifact_max_bytes: Option<u64>,
-        #[arg(long)]
-        allow_huggingface_download: bool,
-        #[arg(long)]
-        message: Option<String>,
-    },
-    McpServer,
-    #[command(hide = true)]
-    McpToolsJson,
-    #[command(hide = true)]
-    McpCall {
-        name: String,
-        #[arg(long, default_value = "{}")]
-        arguments_json: String,
-        #[arg(
-            long,
-            help = "Allow this hidden direct MCP helper to run a mutating ROCm tool call."
-        )]
-        allow_mutation: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-#[value(rename_all = "snake_case")]
-enum SandboxToolArg {
-    CheckUpdates,
-    DriverPlan,
-    ExamineSnapshot,
-    ListServers,
-    RestartServer,
-    StopServer,
-    PrefetchArtifact,
-    NotifyUser,
-}
-
-impl SandboxToolArg {
-    const fn as_cli_value(self) -> &'static str {
-        match self {
-            Self::CheckUpdates => "check_updates",
-            Self::DriverPlan => "driver_plan",
-            Self::ExamineSnapshot => "examine_snapshot",
-            Self::ListServers => "list_servers",
-            Self::RestartServer => "restart_server",
-            Self::StopServer => "stop_server",
-            Self::PrefetchArtifact => "prefetch_artifact",
-            Self::NotifyUser => "notify_user",
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    const fn writes_data(self) -> bool {
-        matches!(
-            self,
-            Self::RestartServer | Self::StopServer | Self::NotifyUser
-        )
-    }
-
-    #[cfg(target_os = "linux")]
-    const fn writes_cache(self) -> bool {
-        matches!(self, Self::CheckUpdates | Self::PrefetchArtifact)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct SandboxToolPolicy {
-    allow_artifact_download: bool,
-    artifact_max_bytes: Option<u64>,
-    allow_huggingface_download: bool,
-    huggingface_token: Option<String>,
-}
-
-impl SandboxToolPolicy {
-    fn from_cli(
-        allow_artifact_download: bool,
-        artifact_max_bytes: Option<u64>,
-        allow_huggingface_download: bool,
-    ) -> Self {
-        Self {
-            allow_artifact_download,
-            artifact_max_bytes,
-            allow_huggingface_download,
-            huggingface_token: allow_huggingface_download
-                .then(resolve_huggingface_token)
-                .flatten(),
-        }
-    }
-}
-
-fn resolve_huggingface_token() -> Option<String> {
-    [
-        "ROCM_CLI_HUGGINGFACE_TOKEN",
-        "HF_TOKEN",
-        "HUGGING_FACE_HUB_TOKEN",
-    ]
-    .iter()
-    .find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-    })
-}
-
-#[tokio::main]
-pub async fn run_bin_cli() -> Result<()> {
-    let cli = Cli::parse();
-    run_cli(cli).await
-}
-
-pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
-    let cli = Cli::try_parse_from(args)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to create rocmd runtime")?;
-    runtime.block_on(run_cli(cli))
-}
-
-async fn run_cli(cli: Cli) -> Result<()> {
-    let paths = AppPaths::discover()?;
-
-    match cli.command.unwrap_or(Command::Status) {
-        Command::Run {
-            automations_enabled,
-            local_webhook_port,
-        } => run_daemon(&paths, automations_enabled, local_webhook_port).await?,
-        Command::Supervise {
-            service_id,
-            engine,
-            model_ref,
-            canonical_model_id,
-            runtime_id,
-            env_id,
-            host,
-            port,
-            device_policy,
-            gpu,
-            engine_recipe_json,
-        } => supervise_service(
-            &paths,
-            service_id,
-            engine,
-            model_ref,
-            canonical_model_id,
-            runtime_id,
-            env_id,
-            host,
-            port,
-            device_policy,
-            gpu,
-            engine_recipe_json,
-        )?,
-        Command::Status => {
-            print_status(&paths)?;
-        }
-        Command::BridgeSnapshot { pretty } => {
-            common::print_bridge_snapshot(&paths, pretty)?;
-        }
-        Command::SandboxRun {
-            tool,
-            service_id,
-            artifact_ref,
-            allow_artifact_download,
-            artifact_max_bytes,
-            allow_huggingface_download,
-            message,
-            allow_native_fallback,
-        } => {
-            let policy = SandboxToolPolicy::from_cli(
-                allow_artifact_download,
-                artifact_max_bytes,
-                allow_huggingface_download,
-            );
-            let value = run_sandbox_runner(
-                &paths,
-                tool,
-                service_id,
-                artifact_ref,
-                message,
-                allow_native_fallback,
-                policy,
-            )?;
-            print_json(&value)?;
-        }
-        Command::SandboxTool {
-            tool,
-            service_id,
-            artifact_ref,
-            allow_artifact_download,
-            artifact_max_bytes,
-            allow_huggingface_download,
-            message,
-        } => {
-            let policy = SandboxToolPolicy::from_cli(
-                allow_artifact_download,
-                artifact_max_bytes,
-                allow_huggingface_download,
-            );
-            let value = run_sandbox_tool(&paths, tool, service_id, artifact_ref, message, policy)?;
-            print_json(&value)?;
-        }
-        Command::McpServer => {
-            run_mcp_server(&paths)?;
-        }
-        Command::McpToolsJson => {
-            print_json(&json!({ "tools": rocm_mcp_tools() }))?;
-        }
-        Command::McpCall {
-            name,
-            arguments_json,
-            allow_mutation,
-        } => {
-            let arguments = serde_json::from_str::<Value>(&arguments_json).with_context(|| {
-                format!("failed to parse --arguments-json for MCP tool `{name}`")
-            })?;
-            if !arguments.is_object() {
-                bail!("--arguments-json for MCP tool `{name}` must be a JSON object");
-            }
-            ensure_direct_mcp_call_allowed(&name, allow_mutation)?;
-            let result = handle_mcp_tool_call(
-                &paths,
-                &json!({
-                    "name": name,
-                    "arguments": arguments,
-                }),
-            )?;
-            print_json(&result)?;
-        }
-    }
-
-    Ok(())
-}
-
 fn run_sandbox_runner(
     paths: &AppPaths,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     service_id: Option<String>,
     artifact_ref: Option<String>,
     message: Option<String>,
     allow_native_fallback: bool,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) -> Result<Value> {
     #[cfg(target_os = "linux")]
     {
@@ -403,11 +85,11 @@ fn run_sandbox_runner(
 #[cfg(target_os = "linux")]
 fn run_bubblewrap_sandbox(
     paths: &AppPaths,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     service_id: Option<String>,
     artifact_ref: Option<String>,
     message: Option<String>,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) -> Result<Value> {
     paths.ensure()?;
 
@@ -431,7 +113,7 @@ fn run_bubblewrap_sandbox(
         .arg("/tmp")
         .arg("--tmpfs")
         .arg("/run");
-    if !(matches!(tool, SandboxToolArg::PrefetchArtifact) && policy.allow_artifact_download) {
+    if !(matches!(tool, cli::SandboxToolArg::PrefetchArtifact) && policy.allow_artifact_download) {
         command.arg("--unshare-net");
     }
 
@@ -480,11 +162,11 @@ fn bind_app_path_for_sandbox(
 
 fn run_native_restricted_sandbox(
     paths: &AppPaths,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     service_id: Option<String>,
     artifact_ref: Option<String>,
     message: Option<String>,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) -> Result<Value> {
     let value = run_sandbox_tool(
         paths,
@@ -506,18 +188,18 @@ fn run_native_restricted_sandbox(
 
 fn run_sandbox_tool(
     paths: &AppPaths,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     service_id: Option<String>,
     artifact_ref: Option<String>,
     message: Option<String>,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) -> Result<Value> {
     match tool {
-        SandboxToolArg::CheckUpdates => {
+        cli::SandboxToolArg::CheckUpdates => {
             let output = run_rocm_capture_for_paths(paths, &["update"], Duration::from_mins(1))?;
             Ok(sandbox_check_updates_value(output))
         }
-        SandboxToolArg::DriverPlan => {
+        cli::SandboxToolArg::DriverPlan => {
             let output = run_rocm_capture_for_paths(
                 paths,
                 &["install", "driver", "--dkms", "--dry-run"],
@@ -525,7 +207,7 @@ fn run_sandbox_tool(
             )?;
             Ok(sandbox_driver_plan_value(output))
         }
-        SandboxToolArg::ExamineSnapshot => {
+        cli::SandboxToolArg::ExamineSnapshot => {
             let examine = ExamineSummary::gather()?;
             Ok(json!({
                 "tool": tool.as_cli_value(),
@@ -534,7 +216,7 @@ fn run_sandbox_tool(
                 "examine": examine,
             }))
         }
-        SandboxToolArg::ListServers => {
+        cli::SandboxToolArg::ListServers => {
             let services = persistence::load_managed_services(paths)?;
             Ok(json!({
                 "tool": tool.as_cli_value(),
@@ -544,7 +226,7 @@ fn run_sandbox_tool(
                 "services": services,
             }))
         }
-        SandboxToolArg::RestartServer => {
+        cli::SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires `--service-id`")?;
             let mut record = persistence::load_managed_services(paths)?
                 .into_iter()
@@ -558,7 +240,7 @@ fn run_sandbox_tool(
                 "service": record,
             }))
         }
-        SandboxToolArg::StopServer => {
+        cli::SandboxToolArg::StopServer => {
             let service_id = service_id.context("stop_server requires `--service-id`")?;
             let stopped = stop_managed_service(paths, &service_id)?;
             Ok(json!({
@@ -568,7 +250,7 @@ fn run_sandbox_tool(
                 "result": stopped,
             }))
         }
-        SandboxToolArg::PrefetchArtifact => {
+        cli::SandboxToolArg::PrefetchArtifact => {
             let artifact_ref =
                 artifact_ref.context("prefetch_artifact requires `--artifact-ref`")?;
             let resolved = resolve_model_recipe_artifact(&artifact_ref)?.with_context(|| {
@@ -583,7 +265,7 @@ fn run_sandbox_tool(
                 policy,
             )
         }
-        SandboxToolArg::NotifyUser => {
+        cli::SandboxToolArg::NotifyUser => {
             let message = message.unwrap_or_else(|| "sandbox notification".to_owned());
             record_notification_audit(paths, "sandbox:notify_user", "notify_user", None, &message)?;
             Ok(json!({
@@ -625,12 +307,12 @@ fn prefetch_artifact_value_with_policy(
     artifact_ref: &str,
     model: &str,
     artifact: ModelRecipeArtifactRecord,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) -> Result<Value> {
     let cache = model_artifact_cache_status(paths, model, &artifact);
     if !policy.allow_artifact_download {
         return Ok(json!({
-            "tool": SandboxToolArg::PrefetchArtifact.as_cli_value(),
+            "tool": cli::SandboxToolArg::PrefetchArtifact.as_cli_value(),
             "artifact_ref": artifact_ref,
             "model": model,
             "artifact": artifact,
@@ -644,7 +326,7 @@ fn prefetch_artifact_value_with_policy(
 
     if cache.marker_path.is_file() {
         return Ok(json!({
-            "tool": SandboxToolArg::PrefetchArtifact.as_cli_value(),
+            "tool": cli::SandboxToolArg::PrefetchArtifact.as_cli_value(),
             "artifact_ref": artifact_ref,
             "model": model,
             "artifact": artifact,
@@ -826,7 +508,7 @@ fn prefetch_artifact_value_with_policy(
     )?;
     let cache = model_artifact_cache_status(paths, model, &artifact);
     Ok(json!({
-        "tool": SandboxToolArg::PrefetchArtifact.as_cli_value(),
+        "tool": cli::SandboxToolArg::PrefetchArtifact.as_cli_value(),
         "artifact_ref": artifact_ref,
         "model": model,
         "artifact": artifact,
@@ -967,7 +649,7 @@ fn prefetch_blocked_value(
     reason: &str,
 ) -> Value {
     json!({
-        "tool": SandboxToolArg::PrefetchArtifact.as_cli_value(),
+        "tool": cli::SandboxToolArg::PrefetchArtifact.as_cli_value(),
         "artifact_ref": artifact_ref,
         "model": model,
         "artifact": artifact,
@@ -1150,7 +832,7 @@ fn sandbox_check_updates_value(output: common::CommandCapture) -> Value {
         output.exit_status == 0 && update_output_reports_update_available(&output.stdout);
     let message = common::update_check_message(status);
     json!({
-        "tool": SandboxToolArg::CheckUpdates.as_cli_value(),
+        "tool": cli::SandboxToolArg::CheckUpdates.as_cli_value(),
         "status": status,
         "update_available": update_available,
         "mutating": false,
@@ -1196,7 +878,7 @@ fn sandbox_driver_plan_value(output: common::CommandCapture) -> Value {
         "error"
     };
     json!({
-        "tool": SandboxToolArg::DriverPlan.as_cli_value(),
+        "tool": cli::SandboxToolArg::DriverPlan.as_cli_value(),
         "status": status,
         "mutating": false,
         "message": "ran read-only `rocm install driver --dkms --dry-run`; no driver commands were executed",
@@ -1207,7 +889,7 @@ fn sandbox_driver_plan_value(output: common::CommandCapture) -> Value {
     })
 }
 
-fn sandbox_report(tool: SandboxToolArg, isolation: &str, output: Value) -> Value {
+fn sandbox_report(tool: cli::SandboxToolArg, isolation: &str, output: Value) -> Value {
     json!({
         "protocol": "rocmd-sandbox-run-v0",
         "tool": tool.as_cli_value(),
@@ -1220,7 +902,7 @@ fn sandbox_report(tool: SandboxToolArg, isolation: &str, output: Value) -> Value
 
 fn record_sandbox_audit(
     paths: &AppPaths,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     isolation: &str,
     ok: bool,
     service_id: Option<&str>,
@@ -1248,11 +930,11 @@ fn record_sandbox_audit(
 fn append_sandbox_tool_command_args(
     command: &mut ProcessCommand,
     rocmd_binary: &std::path::Path,
-    tool: SandboxToolArg,
+    tool: cli::SandboxToolArg,
     service_id: Option<&str>,
     artifact_ref: Option<&str>,
     message: Option<&str>,
-    policy: SandboxToolPolicy,
+    policy: cli::SandboxToolPolicy,
 ) {
     command
         .arg("--")
@@ -3432,11 +3114,11 @@ fn handle_therock_update_event(
     handle_therock_update_event_with_runner(paths, mode, state, event, |paths| {
         run_sandbox_tool(
             paths,
-            SandboxToolArg::CheckUpdates,
+            cli::SandboxToolArg::CheckUpdates,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
     })
 }
@@ -3557,7 +3239,7 @@ fn restricted_check_updates_result(value: &Value) -> Result<RestrictedCheckUpdat
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted update check did not report a tool name")?;
-    if tool != SandboxToolArg::CheckUpdates.as_cli_value() {
+    if tool != cli::SandboxToolArg::CheckUpdates.as_cli_value() {
         bail!("restricted update check returned `{tool}`, expected `check_updates`");
     }
     let status = value
@@ -4158,11 +3840,11 @@ fn handle_driver_upgrade_event(
     handle_driver_upgrade_event_with_runner(paths, mode, state, event, |paths| {
         run_sandbox_tool(
             paths,
-            SandboxToolArg::DriverPlan,
+            cli::SandboxToolArg::DriverPlan,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
     })
 }
@@ -4276,7 +3958,7 @@ fn restricted_driver_plan_result(value: &Value) -> Result<RestrictedDriverPlanRe
         .get("tool")
         .and_then(Value::as_str)
         .context("restricted driver plan did not report a tool name")?;
-    if tool != SandboxToolArg::DriverPlan.as_cli_value() {
+    if tool != cli::SandboxToolArg::DriverPlan.as_cli_value() {
         bail!("restricted driver plan returned `{tool}`, expected `driver_plan`");
     }
     let status = value
@@ -4779,7 +4461,6 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 mod tests {
     use super::*;
     use crate::test_support::{temp_app_paths, unique_test_root, workspace_test_artifact_dir};
-    use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
 
@@ -5450,32 +5131,6 @@ mod tests {
     }
 
     #[test]
-    fn direct_mcp_call_parses_allow_mutation_flag() {
-        let cli = Cli::try_parse_from([
-            "rocmd",
-            "mcp-call",
-            "install_sdk",
-            "--arguments-json",
-            "{}",
-            "--allow-mutation",
-        ])
-        .expect("hidden direct MCP helper args should parse");
-
-        match cli.command {
-            Some(Command::McpCall {
-                name,
-                arguments_json,
-                allow_mutation,
-            }) => {
-                assert_eq!(name, "install_sdk");
-                assert_eq!(arguments_json, "{}");
-                assert!(allow_mutation);
-            }
-            _ => panic!("expected mcp-call command"),
-        }
-    }
-
-    #[test]
     fn direct_mcp_call_guard_blocks_mutation_without_explicit_ack() {
         ensure_direct_mcp_call_allowed("examine", false)
             .expect("read-only direct MCP helper calls should not need mutation approval");
@@ -5655,33 +5310,6 @@ mod tests {
     }
 
     #[test]
-    fn supervise_defaults_to_gpu_required_without_cpu_fallback() {
-        let cli = Cli::try_parse_from([
-            "rocmd",
-            "supervise",
-            "svc",
-            "--engine",
-            "vllm",
-            "--model-ref",
-            "qwen",
-            "--canonical-model-id",
-            "Qwen/Qwen3.5",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "11435",
-        ])
-        .expect("supervise args should parse");
-
-        match cli.command {
-            Some(Command::Supervise { device_policy, .. }) => {
-                assert_eq!(device_policy, "gpu_required");
-            }
-            _ => panic!("expected supervise command"),
-        }
-    }
-
-    #[test]
     fn install_sdk_rejects_system_prefix_without_ack() {
         let arguments = serde_json::Map::from_iter([(
             "prefix".to_owned(),
@@ -5838,33 +5466,6 @@ mod tests {
             watcher_policy_action("therock-update", WatcherMode::Contained),
             WatcherPolicyAction::RunContained
         );
-    }
-
-    #[test]
-    fn local_webhook_help_mentions_loopback_only_binding() {
-        let mut command = Cli::command();
-        let help = command
-            .find_subcommand_mut("run")
-            .expect("run subcommand should exist")
-            .render_long_help()
-            .to_string();
-        assert!(help.contains("--local-webhook-port"));
-        assert!(help.contains("127.0.0.1:<PORT>"));
-        assert!(help.contains("never binds publicly"));
-    }
-
-    #[test]
-    fn local_webhook_port_rejects_out_of_range_values() {
-        let error = Cli::try_parse_from([
-            "rocmd",
-            "run",
-            "--automations-enabled",
-            "--local-webhook-port",
-            "70000",
-        ])
-        .unwrap_err();
-
-        assert!(error.to_string().contains("70000"));
     }
 
     #[tokio::test]
@@ -7469,17 +7070,17 @@ mod tests {
     #[test]
     fn sandbox_tool_cli_values_cover_restricted_plan_api() {
         let names = [
-            SandboxToolArg::CheckUpdates,
-            SandboxToolArg::ExamineSnapshot,
-            SandboxToolArg::ListServers,
-            SandboxToolArg::RestartServer,
-            SandboxToolArg::StopServer,
-            SandboxToolArg::PrefetchArtifact,
-            SandboxToolArg::NotifyUser,
-            SandboxToolArg::DriverPlan,
+            cli::SandboxToolArg::CheckUpdates,
+            cli::SandboxToolArg::ExamineSnapshot,
+            cli::SandboxToolArg::ListServers,
+            cli::SandboxToolArg::RestartServer,
+            cli::SandboxToolArg::StopServer,
+            cli::SandboxToolArg::PrefetchArtifact,
+            cli::SandboxToolArg::NotifyUser,
+            cli::SandboxToolArg::DriverPlan,
         ]
         .into_iter()
-        .map(SandboxToolArg::as_cli_value)
+        .map(cli::SandboxToolArg::as_cli_value)
         .collect::<Vec<_>>();
 
         for expected in [
@@ -7501,11 +7102,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-examine-snapshot");
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::ExamineSnapshot,
+            cli::SandboxToolArg::ExamineSnapshot,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         fs::remove_dir_all(root).ok();
 
@@ -7544,11 +7145,11 @@ mod tests {
 
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::ListServers,
+            cli::SandboxToolArg::ListServers,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         fs::remove_dir_all(root).ok();
 
@@ -7567,11 +7168,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-list-servers-empty");
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::ListServers,
+            cli::SandboxToolArg::ListServers,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         fs::remove_dir_all(root).ok();
 
@@ -7595,11 +7196,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-restart-requires-service");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::RestartServer,
+            cli::SandboxToolArg::RestartServer,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -7615,11 +7216,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-restart-missing-service");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::RestartServer,
+            cli::SandboxToolArg::RestartServer,
             Some("missing-service".to_owned()),
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -7637,11 +7238,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-stop-requires-service");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::StopServer,
+            cli::SandboxToolArg::StopServer,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -7657,11 +7258,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-stop-missing-service");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::StopServer,
+            cli::SandboxToolArg::StopServer,
             Some("missing-service".to_owned()),
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -7699,11 +7300,11 @@ mod tests {
 
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::StopServer,
+            cli::SandboxToolArg::StopServer,
             Some("svc-current".to_owned()),
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         let reloaded = load_service_record(&paths, "svc-current")?;
         fs::remove_dir_all(root).ok();
@@ -7842,11 +7443,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-notify-user");
         let value = run_sandbox_tool(
             &paths,
-            SandboxToolArg::NotifyUser,
+            cli::SandboxToolArg::NotifyUser,
             None,
             None,
             Some("ROCm setup is ready.".to_owned()),
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         let audit_text = fs::read_to_string(paths.audit_events_path())?;
         fs::remove_dir_all(root).ok();
@@ -7876,11 +7477,11 @@ mod tests {
 
         let value = run_native_restricted_sandbox(
             &paths,
-            SandboxToolArg::NotifyUser,
+            cli::SandboxToolArg::NotifyUser,
             None,
             None,
             Some("hello".to_owned()),
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )?;
         let audit_text = fs::read_to_string(paths.audit_events_path())?;
         fs::remove_dir_all(root).ok();
@@ -7901,11 +7502,11 @@ mod tests {
         append_sandbox_tool_command_args(
             &mut command,
             Path::new("/tmp/rocmd"),
-            SandboxToolArg::NotifyUser,
+            cli::SandboxToolArg::NotifyUser,
             None,
             None,
             Some("hello"),
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         );
         let args = command
             .get_args()
@@ -7932,11 +7533,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-prefetch-requires-ref");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::PrefetchArtifact,
+            cli::SandboxToolArg::PrefetchArtifact,
             None,
             None,
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -7967,7 +7568,7 @@ mod tests {
                 engines: vec!["vllm".to_owned()],
                 source_policy: None,
             },
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .expect("policy value should render");
         fs::remove_dir_all(root).ok();
@@ -7995,11 +7596,11 @@ mod tests {
         let (root, paths) = temp_app_paths("sandbox-prefetch-unknown-ref");
         let error = run_sandbox_tool(
             &paths,
-            SandboxToolArg::PrefetchArtifact,
+            cli::SandboxToolArg::PrefetchArtifact,
             None,
             Some("Qwen/Missing#hf-main".to_owned()),
             None,
-            SandboxToolPolicy::default(),
+            cli::SandboxToolPolicy::default(),
         )
         .unwrap_err();
         fs::remove_dir_all(root).ok();
@@ -8031,10 +7632,10 @@ mod tests {
             "qwen#direct-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8070,10 +7671,10 @@ mod tests {
             "qwen#direct-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8114,10 +7715,10 @@ mod tests {
             "qwen#torrent-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8158,10 +7759,10 @@ mod tests {
             "qwen#hf-main",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8202,7 +7803,7 @@ mod tests {
             "qwen#hf-main",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
                 allow_huggingface_download: true,
@@ -8251,10 +7852,10 @@ mod tests {
             "qwen#manual-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8299,10 +7900,10 @@ mod tests {
             "qwen#hf-main",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
@@ -8343,7 +7944,7 @@ mod tests {
             "qwen#hf-main",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
                 allow_huggingface_download: true,
@@ -8392,7 +7993,7 @@ mod tests {
             "qwen#hf-main",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
                 allow_huggingface_download: true,
@@ -8444,10 +8045,10 @@ mod tests {
             "qwen#direct-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         let bytes_path = value
@@ -8507,10 +8108,10 @@ mod tests {
             "qwen#direct-bin",
             "Qwen/Test-1B",
             artifact,
-            SandboxToolPolicy {
+            cli::SandboxToolPolicy {
                 allow_artifact_download: true,
                 artifact_max_bytes: Some(1024),
-                ..SandboxToolPolicy::default()
+                ..cli::SandboxToolPolicy::default()
             },
         )?;
         fs::remove_dir_all(root).ok();
