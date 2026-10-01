@@ -861,7 +861,17 @@ fn format_stale_citation(citation: &Citation) -> String {
     // `extract_path_citations`). Hinting a section for one of those would
     // name a location the check never actually required.
     let is_scoped = is_scoped_extension(&citation.text);
-    if citation.section_dirs.is_empty() || !is_scoped {
+    // For a slash-qualified citation, `citation_exists` only ever reaches
+    // `section_dirs` after a tree-wide whole-path match already failed — the
+    // one location that match accepts is the literal cited path itself, not
+    // "under every one of this heading's directories". That conjunction is
+    // frequently unsatisfiable for a multi-segment path (the suffix already
+    // names its own crate, which can't also be "under" a sibling crate's
+    // directory), so hinting it here would send a contributor chasing a
+    // location the file could never occupy. Suppress the hint for this shape;
+    // the bare citation text (its own path) already says where it's expected.
+    let is_slash = citation.text.contains('/');
+    if citation.section_dirs.is_empty() || !is_scoped || is_slash {
         format!("  `{}`", citation.text)
     } else if citation.section_dirs.len() > 1 {
         // `citation_exists` requires the file under *every* listed
@@ -2001,6 +2011,39 @@ See `apps/rocmd/src/main.rs` for the entry point.
         let message = stale_message(&[&both_engines]);
         assert!(
             message.contains("`lib.rs` (expected under all of `engines/lemonade`, `engines/vllm`)")
+        );
+    }
+
+    #[test]
+    fn stale_message_does_not_offer_an_unsatisfiable_multi_directory_hint_for_a_slash_citation() {
+        // Regression case: a reviewer found that a slash-qualified citation
+        // scoped to more than one directory (e.g.
+        // `crates/rocm-dash-tui/src/ui/approval.rs` under the four-crate
+        // `rocm-dash-*` heading) was hinted as "(expected under all of
+        // `crates/rocm-dash-core`, `rocm-dash-collectors`, ...)" — a location
+        // the file could never occupy, since the cited path already names
+        // its own crate directory and can't simultaneously be "under" a
+        // sibling's. `citation_exists` only falls back to `section_dirs` for
+        // this shape after a tree-wide whole-path match has already failed,
+        // so the literal cited path is the only place it was ever checked.
+        let scoped_slash_citation = citation(
+            "crates/rocm-dash-tui/src/ui/approval.rs",
+            &[
+                "crates/rocm-dash-core",
+                "rocm-dash-collectors",
+                "rocm-dash-daemon",
+                "rocm-dash-tui",
+            ],
+        );
+        let message = stale_message(&[&scoped_slash_citation]);
+        assert!(
+            message.contains("  `crates/rocm-dash-tui/src/ui/approval.rs`\n")
+                || message.ends_with("`crates/rocm-dash-tui/src/ui/approval.rs`"),
+            "expected a bare, hint-free line, got: {message}"
+        );
+        assert!(
+            !message.contains("expected under"),
+            "a slash citation's hint names a location the whole-path check never accepted: {message}"
         );
     }
 
