@@ -1491,9 +1491,9 @@ mod tests {
         assert!(vllm_rocm_discover_build("10.0.0").is_some());
         // AMD tags preview wheels with the real target release (verified via
         // whl-multi-arch/torch/'s coexisting +rocm7.13.0/7.14.0/7.14.1
-        // builds), so ROCm 10.x's tag will move past 10.0.0 the same way;
-        // the discovery recipe must keep firing across the whole major line,
-        // not just the exact version it happened to be added for.
+        // builds), so a pre-release suffix on a known major.minor must still
+        // match its row (here the dedicated 10.1.0 one), not just an exact
+        // version string.
         assert!(vllm_rocm_discover_build("10.1.0a20260822").is_some());
         assert!(vllm_rocm_discover_build("999.0.0").is_none());
     }

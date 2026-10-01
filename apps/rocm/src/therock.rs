@@ -1733,6 +1733,22 @@ fn install_wheel_runtime(
         device_target: device_target_override,
         layout: layout_override,
     } = source_override;
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted after `resolve_pip_runtime` returns — too late for the
+    // channel/arch check below, which needs an exact arch before it can run at
+    // all. Recover it into the family override up front, same as `resolve_pip_runtime`
+    // does internally.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
+    // Fail fast on a request `resolve_pip_runtime` could only ever reject (wrong
+    // channel, or a grouped family with no exact arch) before paying for Python
+    // provisioning below, which can mean a real download for a layout this host
+    // or channel can never actually use.
+    select_source_layout(
+        channel,
+        &resolve_family(paths, recovered_family_override.as_deref())?,
+        version_selector,
+    )?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
     // selects wheels using that interpreter's own tags, so the requirement is
     // read from the *request* rather than from the resolved version.
@@ -1766,12 +1782,6 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    // `device_target_override` (an update apply's exact recorded arch) is only
-    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
-    // for the next layout, which needs an exact arch before it can query
-    // package metadata at all. Recover it into the family override up front.
-    let recovered_family_override = family_override
-        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
@@ -5778,6 +5788,11 @@ fn ensure_managed_python(
     let uv = ensure_uv_binary(paths)?;
 
     // Check the manifest first — if the recorded executable is still usable, skip the install.
+    // ponytail: this manifest holds one version at a time, so alternating between a
+    // canonical (3.12) and a `Next` (3.14) install re-runs `uv python install` on every
+    // switch instead of keeping both cached — `uv` itself still short-circuits the
+    // re-download, so this costs a subprocess round trip, not a real reinstall. Upgrade
+    // to a version-keyed manifest if that alternation turns out to be a common pattern.
     if let Ok(Some(manifest)) = load_managed_python_manifest(paths)
         && manifest.version == version
         && manifest.executable.is_file()
