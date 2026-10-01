@@ -1750,10 +1750,23 @@ fn install_wheel_runtime(
         version_selector,
     )?;
     // The interpreter has to be picked before `resolve_pip_runtime`, which
-    // selects wheels using that interpreter's own tags, so the requirement is
-    // read from the *request* rather than from the resolved version.
-    let python_requirement =
-        python_requirement(requested_source_layout(layout_override, version_selector));
+    // selects wheels using that interpreter's own tags. `requested_source_layout`
+    // only answers from the *request*: an explicit stable ROCm 10+ pin already
+    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
+    // nightly build-date/prerelease pin always reports `Canonical`, even once
+    // the canonical/nightly feed's own "latest" has rotated past that major on
+    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
+    // peeks the channel's own `rocm` listing to catch that case.
+    let python_requirement = match requested_source_layout(layout_override, version_selector) {
+        SourceLayout::Next => python_requirement(SourceLayout::Next),
+        SourceLayout::Canonical => {
+            if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
+                python_requirement(SourceLayout::Next)
+            } else {
+                python_requirement(SourceLayout::Canonical)
+            }
+        }
+    };
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
         managed_python_version(python_requirement)
@@ -4860,19 +4873,29 @@ fn ensure_uv_venv(
 ) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
-        if run_command(
+        let reusable = run_command(
             &env_python,
             &["--version"],
             "verify existing managed TheRock runtime Python",
         )
         .is_ok()
-        {
+            && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
+                wheel_compatibility_for_python(python_launcher)
+                    .is_ok_and(|required| existing.python_tag == required.python_tag)
+            });
+        if reusable {
             return Ok(());
         }
-        progress_line("Existing Python environment is incomplete; recreating it.");
+        // Same `install_root` can be reused across reinstalls (it's keyed on
+        // resolved version/build date, not on the interpreter), so an existing
+        // venv left over from a lower-tag requirement must not be mistaken for
+        // a compatible one just because it still runs.
+        progress_line(
+            "Existing Python environment does not match the required interpreter; recreating it.",
+        );
         fs::remove_dir_all(install_root).with_context(|| {
             format!(
-                "failed to remove incomplete Python environment at {}",
+                "failed to remove incompatible Python environment at {}",
                 install_root.display()
             )
         })?;
@@ -5741,9 +5764,11 @@ struct PythonRequirement {
 /// Keyed on the layout rather than on a resolved ROCm version because the
 /// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
 /// wheels using the interpreter's own tags, so the resolved version is not
-/// available yet. The layout is an honest stand-in, because
-/// [`next_layout_requested`] means an explicit stable pin at ROCm >=
-/// [`THEROCK_NEXT_MIN_MAJOR`] is the only way to reach `Next` at all.
+/// available yet. The layout is an honest stand-in only when it was decided
+/// from an explicit stable pin (`next_layout_requested`); a fresh install with
+/// no pin, or a nightly build-date/prerelease pin, needs
+/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
+/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
 const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
     match layout {
         SourceLayout::Next => PythonRequirement {
@@ -5769,6 +5794,51 @@ fn requested_source_layout(
         None if version_selector.is_some_and(next_layout_requested) => SourceLayout::Next,
         None => SourceLayout::Canonical,
     }
+}
+
+/// Whether a `Canonical`-layout install (auto-select, or a nightly
+/// build-date/prerelease pin) will actually resolve a ROCm build at major >=
+/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
+///
+/// `requested_source_layout` only answers from the shape of the request: an
+/// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`
+/// and gets `cp314` that way, but the canonical/nightly feed can resolve a
+/// ROCm >= `THEROCK_NEXT_MIN_MAJOR` build (stable or prerelease) on its own,
+/// with no `Next` routing involved — and the `cp314` requirement is a property
+/// of the build itself, not of which index served it. Fetching the channel's
+/// own interpreter-agnostic `rocm` listing ahead of interpreter selection is
+/// the only way to know; `resolve_pip_runtime` re-fetches the same URL for the
+/// real resolution afterwards and shares this call's cache entry, so this
+/// costs no extra network round trip.
+fn canonical_auto_select_needs_next_python(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Result<bool> {
+    let source = resolve_source(channel, SourceLayout::Canonical);
+    let rocm_versions = load_simple_index_versions(paths, &source.wheel_index, "rocm", None, None)?;
+    Ok(highest_candidate_needs_next_python(
+        &rocm_versions,
+        channel,
+        version_selector,
+    ))
+}
+
+/// Pure decision core of [`canonical_auto_select_needs_next_python`], split out
+/// so it can be tested without a network fetch.
+fn highest_candidate_needs_next_python(
+    rocm_versions: &[String],
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> bool {
+    let mut candidates = channel_rocm_candidates(rocm_versions, channel);
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates
+        .last()
+        .and_then(|version| parse_version(version))
+        .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR)
 }
 
 fn managed_python_version(requirement: PythonRequirement) -> String {
@@ -7575,6 +7645,25 @@ mod tests {
     }
 
     #[test]
+    fn auto_select_landing_on_next_major_needs_next_python() {
+        // Same feed as `nightly_accepts_future_prerelease_major_without_cli_changes`:
+        // auto-select reaches ROCm 10.1.0a20260822, which needs cp314, not cp312,
+        // even though it's a prerelease served from the ordinary canonical/nightly
+        // index rather than `Next`'s separately hosted one.
+        assert!(highest_candidate_needs_next_python(
+            &["10.1.0a20260822".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
+
+        assert!(!highest_candidate_needs_next_python(
+            &["7.14.0".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
+    }
+
+    #[test]
     fn tarball_selection_never_crosses_channels() {
         let platform = platform_tarball_token();
         let files = vec![
@@ -9106,6 +9195,96 @@ echo Python 3.12.10
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_reporting(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
+        );
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_uv_creating_venv(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  /bin/mkdir -p "$4/bin"
+  /bin/cat > "$4/bin/python" <<PY
+#!/bin/sh
+if [ "\$1" = "-c" ]; then
+  echo {tag}
+  exit 0
+fi
+echo {version}
+PY
+  /bin/chmod +x "$4/bin/python"
+  exit 0
+fi
+exit 1
+"#
+        );
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_recreates_on_interpreter_tag_mismatch() {
+        // `install_root` is keyed on resolved version/build date, not on the
+        // interpreter, so a reinstall that now requires cp314 must not reuse a
+        // stale cp312 venv left over from before this tag check existed.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-ensure-uv-venv-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let install_root = root.join("install");
+        let stale_bin = install_root.join("bin");
+        fs::create_dir_all(&stale_bin).unwrap();
+        write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
+
+        let python_launcher =
+            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
+        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
+
+        ensure_uv_venv(&paths, &uv, &python_launcher, &install_root).unwrap();
+
+        let env_python = venv_python_path(&install_root);
+        let compat = wheel_compatibility_for_python(&env_python).unwrap();
+        assert_eq!(
+            compat.python_tag, "cp314",
+            "stale cp312 venv must be recreated, not silently reused"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
