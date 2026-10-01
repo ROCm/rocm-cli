@@ -1936,6 +1936,16 @@ mod tests {
             html.contains("Mi300x (nightly)"),
             "HTML matrix must carry the nightly channel suffix"
         );
+
+        // The sort key's channel element only matters if it actually drives
+        // order: nightly's lexical head start ("n" < "r") must place it before
+        // release in the rendered matrix, or this element of the tuple is dead.
+        let nightly_pos = html.find("Mi300x (nightly)").expect("nightly cell present");
+        let release_pos = html.find("Mi300x (release)").expect("release cell present");
+        assert!(
+            nightly_pos < release_pos,
+            "HTML matrix must order nightly before release for the same platform"
+        );
     }
 
     #[test]
