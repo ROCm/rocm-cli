@@ -54,6 +54,12 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
+The license-headers pre-push hook (`hawkeye`) isn't managed by prek and, unlike the manifest hooks above, fails hard rather than skipping when its binary is missing:
+
+```bash
+cargo install hawkeye --locked   # required for the license-headers pre-push hook
+```
+
 ### Workspace layout
 
 | Path | Description |
