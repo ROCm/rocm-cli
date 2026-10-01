@@ -1092,6 +1092,10 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     None
 }
@@ -1564,12 +1568,12 @@ struct WindowsDisplayAdapter {
 
 impl WindowsExamineInventory {
     #[cfg(windows)]
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
     #[cfg(windows)]
-    fn merge_missing_from(&mut self, mut other: WindowsExamineInventory) {
+    fn merge_missing_from(&mut self, mut other: Self) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
         }
@@ -2676,8 +2680,7 @@ fn append_windows_probe_diagnostics(
         result
             .program
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| program.to_owned()),
+            .map_or_else(|| program.to_owned(), |path| path.display().to_string()),
         args.join(" ")
     );
     if let Some(error) = result.error.as_deref() {

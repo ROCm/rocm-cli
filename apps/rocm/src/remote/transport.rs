@@ -150,6 +150,10 @@ fn control_socket_path() -> Option<String> {
 /// warnings at best. Returning `None` keeps the argument builder honest instead
 /// of emitting options the platform ignores.
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn control_socket_path() -> Option<String> {
     None
 }

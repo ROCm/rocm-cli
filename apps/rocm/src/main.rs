@@ -1293,6 +1293,10 @@ fn reset_sigpipe() {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
 
 /// Run `f` with SIGPIPE temporarily ignored, restoring the previous
@@ -3965,6 +3969,10 @@ impl PrivilegeEscalation {
     ///
     /// Only ever called on the production path; every plan builder takes the
     /// escalation as a parameter so both branches are testable on any host.
+    // `running_as_root()` is a non-const syscall on unix and a trivial
+    // constant off it, so Clippy sees this as const-able only on Windows.
+    // Making it `const` would stop the unix build compiling.
+    #[allow(clippy::missing_const_for_fn)]
     fn detect() -> Self {
         if rocm_core::openmpi::running_as_root() {
             Self::AlreadyRoot
