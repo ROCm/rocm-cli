@@ -136,12 +136,23 @@ pub fn record_startup(dir: &Path) {
 /// that is not reaching anyone. `writeln!` rather than `eprintln!` so a failing
 /// stderr yields a missing line rather than a second panic on the way out.
 pub fn record_fatal_panic(dir: &Path, message: &str) {
+    record_fatal_panic_to(dir, message, &mut std::io::stderr());
+}
+
+/// [`record_fatal_panic`] with its second destination injected, so the text written
+/// there can be asserted on.
+///
+/// Split out purely for that: with `std::io::stderr()` hard-coded, deleting the
+/// write left every test in this module green, which is the one destination the
+/// lane this exists for actually reads. The pointer to the log is the part a reader
+/// needs and the part most likely to rot, so it is what the test pins.
+fn record_fatal_panic_to(dir: &Path, message: &str, out: &mut dyn std::io::Write) {
     let mut lines = vec![format!("message: {message}")];
     lines.extend(describe_std_streams());
     append(dir, "fatal panic (escaped the cucumber run)", &lines);
 
     let _ = writeln!(
-        std::io::stderr(),
+        out,
         "E2E suite aborted by a panic inside the cucumber run: {message}\n\
          (cucumber silences the panic hook while running, so this would otherwise \
          print nothing; see {LOG_NAME} in the results artifact)"
@@ -295,6 +306,35 @@ mod tests {
         assert!(
             log.contains("message: failed to write into terminal: injected"),
             "the escaping panic's message must reach the log:\n{log}"
+        );
+    }
+
+    /// The second destination is the one the lane actually reads.
+    ///
+    /// stderr is what reaches the job log, and the suite lane this boundary exists
+    /// for publishes no artifact at all — so the log is unreachable there and this
+    /// line is the whole diagnostic. Left unasserted, deleting the write kept every
+    /// other test in this module green, which would quietly restore exactly the
+    /// silence the change removes.
+    ///
+    /// Pins the pointer to the log as well as the message: a reader who gets this
+    /// line still needs to be told where the fuller record is, and that is the half
+    /// most likely to rot.
+    #[test]
+    fn the_panic_is_announced_on_the_second_destination_too() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let mut out = Vec::new();
+
+        record_fatal_panic_to(dir.path(), "failed to write into terminal: boom", &mut out);
+
+        let written = String::from_utf8(out).expect("the announcement must be UTF-8");
+        assert!(
+            written.contains("failed to write into terminal: boom"),
+            "the panic message must reach the second destination, got: {written}"
+        );
+        assert!(
+            written.contains(LOG_NAME),
+            "the announcement must point at the fuller record, got: {written}"
         );
     }
 
