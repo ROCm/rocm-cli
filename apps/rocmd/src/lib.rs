@@ -3162,13 +3162,6 @@ fn supervise_service(
     }
 }
 
-fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
-    match value {
-        Some(value) => vec![flag.to_owned(), value.to_owned()],
-        None => Vec::new(),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn engine_serve_http_args(
     engine: &str,
@@ -3198,9 +3191,12 @@ fn engine_serve_http_args(
     if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(gpu_indices) {
         args.extend(["--gpu".to_owned(), csv]);
     }
-    args.extend(optional_arg("--runtime-id", runtime_id));
-    args.extend(optional_arg("--env-id", env_id));
-    args.extend(optional_arg("--engine-recipe-json", engine_recipe_json));
+    args.extend(common::optional_arg("--runtime-id", runtime_id));
+    args.extend(common::optional_arg("--env-id", env_id));
+    args.extend(common::optional_arg(
+        "--engine-recipe-json",
+        engine_recipe_json,
+    ));
     args.extend(["--state-path".to_owned(), state_path.display().to_string()]);
     args
 }
@@ -4878,12 +4874,15 @@ fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
             .unwrap_or("gpu_required")
             .to_owned(),
     ];
-    args.extend(optional_arg("--runtime-id", record.runtime_id.as_deref()));
-    args.extend(optional_arg("--env-id", record.env_id.as_deref()));
+    args.extend(common::optional_arg(
+        "--runtime-id",
+        record.runtime_id.as_deref(),
+    ));
+    args.extend(common::optional_arg("--env-id", record.env_id.as_deref()));
     if let Some(csv) = rocm_engine_protocol::gpu_indices_to_csv(&record.gpu_indices) {
         args.extend(["--gpu".to_owned(), csv]);
     }
-    args.extend(optional_arg(
+    args.extend(common::optional_arg(
         "--engine-recipe-json",
         record.engine_recipe_json.as_deref(),
     ));
