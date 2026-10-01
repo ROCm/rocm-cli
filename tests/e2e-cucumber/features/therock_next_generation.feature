@@ -137,7 +137,24 @@ Feature: TheRock "next" ROCm 10 install layout
   # every earlier SDK version uses. Provisions its own ROCm 10 runtime rather
   # than reusing therock-next-07's, so that scenario's arch-detection coverage
   # still runs on hosts that can't start vLLM.
-  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm @nightly
+  #
+  # Not `@nightly`: `install_vllm_rocm10_discover` always runs its 403-tolerant
+  # `--config-file` install and forced torch realignment regardless of which
+  # row (10.0.x production, 10.1.x staging) the live preview index currently
+  # serves as newest, so this is the live per-PR regression guard for both
+  # fixes (ROCMAI-439) as well as the discovery mechanism itself — accepted as
+  # a real fresh-SDK-install cost on every vLLM-capable self-hosted GPU lane.
+  #
+  # The serve+inference tail matters because `serve-vllm-inference`
+  # (model_serving.feature) does not cover this route: its runtime comes from
+  # a plain unpinned `rocm install sdk`, never the ROCm 10 preview source. A
+  # discovered wheel that installs cleanly but can't actually load or answer a
+  # request (bad torch realignment, cp314 ABI mismatch, a `uv.toml` fallback
+  # pulling an incompatible transitive dep) would pass every assertion above
+  # this line and still be unservable, so this scenario reuses the same
+  # serve/chat steps every other engine-canary scenario does rather than
+  # stopping at "install reported the right pins".
+  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm
   Scenario: therock-next-09 - Installing vLLM against a live ROCm 10 preview runtime reports the discovery pins
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override
@@ -147,6 +164,10 @@ Feature: TheRock "next" ROCm 10 install layout
     And the ROCm 10 runtime provisioned a cp314 Python interpreter
     When the user reinstalls vllm
     Then the install reports the vLLM ROCm 10.x discovery pins
+    And a model is being served on GPU
+    When the user sends a chat completion request
+    Then the response contains a model reply
+    And the response identifies the correct model
 
   # The opt-in half of therock-next-02. Both polarities run here, on the mock
   # lane, because this is the only place the flag's effect on the real install
