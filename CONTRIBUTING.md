@@ -57,7 +57,7 @@ cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_
 The license-headers hook (`hawkeye`) runs on both commit and push for matching files. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard rather than skipping when the binary is missing:
 
 ```bash
-cargo install hawkeye --locked   # required for the license-headers hook
+cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
 ```
 
 ### Workspace layout
