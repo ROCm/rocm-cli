@@ -704,6 +704,25 @@ pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&st
     );
 }
 
+/// Assert that the `needs_reboot` a [`crate::diagnose::Fix`] carries matches
+/// the catalog recipe's.
+///
+/// Same hand-maintained-copies problem as [`assert_plan_matches_the_catalog_copy`],
+/// for a single flag instead of the command block: `FixRecipe` and `Fix` set
+/// `needs_reboot` independently, so a silent divergence means `rocm diagnose`
+/// and `rocm fix <id>` tell a user different things about the same fix-id
+/// (this is what happened with `fix-5-amdgpu-load` before it was closed here).
+#[cfg(test)]
+pub(crate) fn assert_needs_reboot_matches_the_catalog(fix_id: &str, needs_reboot: bool) {
+    let recipe = find_recipe(fix_id)
+        .unwrap_or_else(|| panic!("{fix_id}: no catalog recipe to compare against"));
+    assert_eq!(
+        recipe.needs_reboot, needs_reboot,
+        "{fix_id}: diagnose's needs_reboot has drifted from the catalog recipe \
+         `rocm fix` reports; a user may see either surface for the same fix-id"
+    );
+}
+
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
@@ -768,11 +787,12 @@ pub fn list_recipes() -> String {
 /// values render as the same text from either command. This only
 /// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
 /// diagnose's `Fix` still supply those independently, so a fix-id's rendered
-/// flags can still differ if the two disagree on a value (known example:
-/// `fix-5-amdgpu-load`'s `needs_reboot`). Also out of scope: the bare
-/// `rocm fix` catalog listing (`list_recipes`) describes the same
-/// `auto_applicable` property with a separate, untouched AUTO/PRINT-ONLY
-/// vocabulary.
+/// flags can still differ if the two disagree on a value; `assert_needs_reboot_matches_the_catalog`
+/// and `assert_plan_matches_the_catalog_copy` are targeted regression tests
+/// that pin specific fix-ids against that drift, not a blanket guarantee for
+/// every fix-id. Also out of scope: the bare `rocm fix` catalog listing
+/// (`list_recipes`) describes the same `auto_applicable` property with a
+/// separate, untouched AUTO/PRINT-ONLY vocabulary.
 // These mirror the `FixRecipe`/`Fix` struct fields, where
 // `clippy::struct_excessive_bools` is already allowed workspace-wide; that
 // allow doesn't reach this free function's parameters, so
@@ -1711,5 +1731,35 @@ mod tests {
                 "sudo={needs_sudo} reboot={needs_reboot} relogin={needs_relogin} auto={auto_applicable}"
             );
         }
+    }
+
+    #[test]
+    fn needs_reboot_true_fix_ids_match_the_known_set() {
+        // assert_needs_reboot_matches_the_catalog only ever runs for
+        // fix-5-amdgpu-load, so the other 23 fix-ids' hardcoded needs_reboot
+        // literals in diagnose.rs have no guard against drifting from the
+        // catalog. This doesn't reach into diagnose.rs, but it does catch an
+        // accidental catalog edit and pins the expected set by name so a
+        // deliberate catalog change forces a look at diagnose.rs's matching
+        // literals too.
+        let expected: std::collections::BTreeSet<&str> = [
+            "fix-3-rocm-kernel",
+            "fix-5-amdgpu-load",
+            "fix-11-iommu",
+            "fix-12-installer",
+            "fix-14-adrenalin-too-old",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&str> = RECIPES
+            .iter()
+            .filter(|r| r.needs_reboot)
+            .map(|r| r.fix_id)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the catalog's needs_reboot:true set has changed -- update diagnose.rs's \
+             matching literals and this test's expected set together"
+        );
     }
 }
