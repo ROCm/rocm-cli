@@ -112,9 +112,18 @@ const DASH_TEST_CLOCK_FILE: &str = "test-clock-offset";
 ///
 /// Because this runs in every build, not just under the harness, a stray copy
 /// of the file in a real data dir would otherwise move the dashboard onto a
-/// logical clock with nothing to show for it. Finding the file is therefore
-/// logged at WARN naming the path, so skewed timestamps are explained by the
-/// log rather than having to be guessed at. The warning goes to `tracing`, not
+/// logical clock with nothing to show for it. The clock is not display-only:
+/// its value is the cycle timestamp for counter and direct observation, the
+/// histogram average, the tracker snapshot and the snapshot's own timestamp, so
+/// it is the denominator of generation throughput, the window for latency
+/// averages and the basis of the Fresh/Held/expired verdict — and it is what
+/// gets written into persisted session records. Finding the file is therefore
+/// logged at WARN naming the path, so a user whose throughput numbers look
+/// wrong is pointed at the cause rather than having to guess. The warning says
+/// *restart* as well as remove, because the resolved path is captured once for
+/// the life of the run loop and a read that fails — including the file having
+/// been deleted — leaves the directive frozen at its last value, pinning the
+/// logical clock rather than restoring wall time. The warning goes to `tracing`, not
 /// stdout/stderr: the only caller is [`maybe_spawn_embedded_daemon`] on the
 /// `rocm dash` path, where the TUI owns the terminal (see `logging.rs`) and a
 /// stray write would corrupt the display.
@@ -125,9 +134,12 @@ fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
     }
     tracing::warn!(
         test_clock_file = %path.display(),
-        "dashboard telemetry clock is in TEST mode, not wall time: displayed \
-         timestamps come from a logical clock read from this file. Only the E2E \
-         harness creates it; delete it to restore wall-clock timestamps."
+        "dashboard telemetry clock is in TEST mode, not wall time: a logical \
+         clock read from this file drives displayed timestamps, the timestamps \
+         written into persisted session records, and every figure derived from \
+         them — generation throughput, latency averages and metric freshness. \
+         Only the E2E harness creates it; remove it and restart the dashboard to \
+         return to wall time (deleting it mid-run pins the logical clock instead)."
     );
     Some(path)
 }
@@ -1139,8 +1151,10 @@ mod tests {
 
     /// The clock seam is state-based, so it is live in every build, not only
     /// under the harness. A stray file in a real data dir therefore moves the
-    /// dashboard off wall time; finding one must say so, naming the file, or a
-    /// user has no way to explain the skewed timestamps they are shown.
+    /// dashboard off wall time — not just in the timestamps on screen but in
+    /// throughput, latency averages, freshness and the session records written
+    /// to disk. Finding one must say so, naming the file, or a user has no way
+    /// to explain the numbers they are shown.
     #[test]
     fn dash_test_clock_offset_path_warns_when_the_file_is_present() {
         let root = scratch_dir("dash-clock-warn");
