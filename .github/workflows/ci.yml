@@ -1193,18 +1193,17 @@ jobs:
     timeout-minutes: 20
     # Deliberately NOT gated by the `changes` path filter: `cargo xtask
     # check-architecture-doc` fails, naming every one, if a path citation in
-    # docs/architecture.md isn't found where it's cited — scoped to its
-    # nearest heading's directories for a subsystem-specific `.rs` citation,
-    # at the repository root for a bare `.md`/`.toml` citation, or anywhere
-    # in the tracked tree for a bare directory name or an otherwise-unscoped
-    # citation — and the citations aren't limited to any fixed set
-    # of paths — the doc can cite any tracked file. A path-filter allowlist
-    # here would need to list every file the doc could ever cite and be kept
-    # current as citations are added, which is
-    # exactly the kind of drift this check exists to catch; a rename/removal
-    # of a currently-cited file wouldn't itself touch docs/architecture.md, so
-    # gating on that path (as a prior version of this job did) could skip the
-    # check on the very PR that goes stale. Run unconditionally instead.
+    # docs/architecture.md isn't found where it's cited (see
+    # `citation_exists`'s doc comment in xtask/src/architecture_doc.rs for
+    # exactly where each citation shape is checked), and the citations
+    # aren't limited to any fixed set of paths — the doc can cite any
+    # tracked file. A path-filter allowlist here would need to list every
+    # file the doc could ever cite and be kept current as citations are
+    # added, which is exactly the kind of drift this check exists to catch;
+    # a rename/removal of a currently-cited file wouldn't itself touch
+    # docs/architecture.md, so gating on that path (as a prior version of
+    # this job did) could skip the check on the very PR that goes stale.
+    # Run unconditionally instead.
     #
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'

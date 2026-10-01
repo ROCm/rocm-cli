@@ -10,10 +10,12 @@
 //! exist. A renamed or removed file then rots silently in the doc until a
 //! reader notices. This check makes the doc self-policing instead: it
 //! extracts every backtick-quoted path citation and fails, naming every one
-//! not found where it's cited (scoped to its nearest heading's directories
-//! for a subsystem-specific `.rs` citation, at the repository root for a
-//! bare `.md`/`.toml` citation, or anywhere in the tracked tree for a bare
-//! directory name or an otherwise-unscoped citation).
+//! not found where it's cited. Exactly where a given citation is checked
+//! depends on its shape (a slash path, a bare filename, a bare directory
+//! name) — see [`citation_exists`]'s doc comment for the one, canonical
+//! statement of that rule; nowhere else in this module, `main.rs`,
+//! `ci.yml`, `CONTRIBUTING.md`, or `docs/architecture.md` restates it, so
+//! there is exactly one place for it to drift out of sync with the code.
 //!
 //! Same shape as [`crate::crate_edges`]: a reusable [`run`] plus
 //! `#[cfg(test)]` unit tests on the pure extraction/lookup helpers, and one
@@ -26,10 +28,13 @@
 //! `` `pub(crate) fn` ``, `` `comfyui::render_status(...)` ``,
 //! `` `too_many_lines = "allow"` ``, and bare type names like
 //! `` `ActionReport` ``. [`is_path_candidate`] filters those out; see its
-//! doc comment for the exact rule and its known blind spot (a bare,
+//! doc comment for the exact rule and its known blind spots: a bare,
 //! non-hyphenated word like `` `xtask` `` is indistinguishable from a plain
-//! English word like `` `grep` `` and is deliberately never treated as a
-//! citation, so it goes unchecked rather than risk false-flagging prose).
+//! English word like `` `grep` ``, and a bare filename whose extension
+//! isn't in [`BARE_FILE_EXTENSIONS`] (e.g. `` `report.json` ``) isn't
+//! recognized as a citation shape at all — both are deliberately never
+//! checked, so they go unchecked rather than risk false-flagging prose or
+//! an arbitrary extension.
 //!
 //! ## Scoping bare filename citations to their section
 //!
@@ -161,10 +166,12 @@ fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// - it contains a `/` — an explicit relative path
 ///   (`apps/rocm/src/therock.rs`) or a bare directory citation
 ///   (`apps/rocm`);
-/// - it has no `/` but ends in a [`BARE_FILE_EXTENSIONS`] extension — the
-///   doc cites many files by bare name (`main.rs`, `lib.rs`,
-///   `bootstrap.rs`), trusting surrounding prose for which subsystem
-///   directory they live in rather than repeating the full path;
+/// - it has no `/` but ends in a [`BARE_FILE_EXTENSIONS`] extension, with
+///   at least one character before it (the extension alone, e.g. `` `.rs` ``,
+///   is not itself a filename) — the doc cites many files by bare name
+///   (`main.rs`, `lib.rs`, `bootstrap.rs`), trusting surrounding prose for
+///   which subsystem directory they live in rather than repeating the full
+///   path;
 /// - it has no `/` and no extension, but is an all-lowercase hyphenated
 ///   word (`rocm-dash-collectors`) — the doc's convention for citing a
 ///   crate directory by its Cargo package name.
@@ -243,7 +250,7 @@ fn is_directory_shaped(span: &str) -> bool {
 /// leading spaces (see [`fence_line`] for the same CommonMark indentation
 /// cap — 4+ makes a line an indented code block instead, so a `#` there is
 /// literal prose, not a heading marker), then 1-6 `#` characters followed
-/// by a space or end of line — NOT just "starts with `#`", which would
+/// by a space, a tab, or end of line — NOT just "starts with `#`", which would
 /// also match ordinary prose that happens to open a line with a literal
 /// `#` (e.g. a bare issue reference like `#1234 tracks ...`) and wrongly
 /// reset the section context.
@@ -755,10 +762,8 @@ fn citation_exists(citation: &Citation, tracked: &[PathBuf]) -> bool {
 }
 
 /// Fetch the doc's current path citations and fail, naming every one not
-/// found where it's cited (scoped to its nearest heading's directories for a
-/// subsystem-specific `.rs` citation, at the repository root for a bare
-/// `.md`/`.toml` citation, or anywhere in the tracked tree for a bare
-/// directory name or an otherwise-unscoped citation).
+/// found where it's cited — see [`citation_exists`]'s doc comment for
+/// exactly where each citation shape is checked.
 ///
 /// This one-line delegation to [`check_doc_at`] has only its `Ok` direction
 /// exercised end-to-end, by `run_passes_against_the_real_doc`: silently

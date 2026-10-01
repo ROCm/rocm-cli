@@ -102,11 +102,11 @@ enum Command {
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
     /// Fail, naming every one, if a path cited (in backticks) in
-    /// `docs/architecture.md` isn't found where it's cited — scoped to its
-    /// nearest heading's directories for a subsystem-specific `.rs`
-    /// citation, at the repository root for a bare `.md`/`.toml` citation,
-    /// or anywhere in the tracked tree for a bare directory name or an
-    /// otherwise-unscoped citation.
+    /// `docs/architecture.md` isn't found where it's cited. Exactly where a
+    /// citation is checked depends on its shape (a slash path, a bare
+    /// filename, a bare directory name) — the failure message names the
+    /// expected location per citation; see `citation_exists`'s doc comment
+    /// in `xtask/src/architecture_doc.rs` for the full rule.
     CheckArchitectureDoc,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
