@@ -180,3 +180,12 @@ flaky = true
 when = { is_wsl = true, therock_family = "gfx*" }
 bug = "EAI-7998"
 reason = "`examine --json` reports has_amd_gpu:false on a WSL2 host whose own summary names a gfx target."
+
+# Same root as the row above (EAI-7998): on WSL the GPU probes are routed out,
+# so `examine --json` carries no per-GPU records at all while the summary names
+# a target. examine-16 reads `gpus[]`, so it fails there for the same reason
+# examine-08 does. Retire both rows together when the WSL form lists its GPU.
+[["examine-json-names-target-per-gpu"]]
+when = { is_wsl = true, therock_family = "gfx*" }
+bug = "EAI-7998"
+reason = "`examine --json` lists no per-GPU records on a WSL2 host whose own summary names a gfx target."
