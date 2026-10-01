@@ -343,7 +343,7 @@ pub(crate) async fn run_daemon(
     )?;
     state.write(paths)?;
 
-    crate::evaluate_watchers(paths, &config, &mut state)?;
+    crate::watchers::evaluate_watchers(paths, &config, &mut state)?;
     state.last_tick_unix_ms = unix_time_millis();
     state.write(paths)?;
 
@@ -357,15 +357,15 @@ pub(crate) async fn run_daemon(
         tokio::select! {
             _ = ticker.tick() => {
                 let config = RocmCliConfig::load(paths)?;
-                crate::reconcile_watcher_snapshots(&config, &mut state);
-                crate::evaluate_watchers(paths, &config, &mut state)?;
+                crate::watchers::reconcile_watcher_snapshots(&config, &mut state);
+                crate::watchers::evaluate_watchers(paths, &config, &mut state)?;
                 state.last_tick_unix_ms = unix_time_millis();
                 state.write(paths)?;
             }
             event = crate::webhook::receive_local_webhook_event(&mut local_webhook_receiver) => {
                 if let Some(event) = event {
                     let config = RocmCliConfig::load(paths)?;
-                    crate::reconcile_watcher_snapshots(&config, &mut state);
+                    crate::watchers::reconcile_watcher_snapshots(&config, &mut state);
                     crate::persistence::record_event(
                         paths,
                         &mut state,
@@ -380,7 +380,7 @@ pub(crate) async fn run_daemon(
                         event.service_id.clone(),
                     )?;
                     if let Err(error) =
-                        crate::evaluate_watchers_for_events(paths, &config, &mut state, &[event])
+                        crate::watchers::evaluate_watchers_for_events(paths, &config, &mut state, &[event])
                     {
                         crate::persistence::record_event(
                             paths,
@@ -1313,7 +1313,7 @@ mod tests {
         assert!(!key_path.exists());
 
         let result = stop_managed_service(&paths, service_id);
-        let reloaded = crate::load_service_record(&paths, service_id);
+        let reloaded = crate::watchers::load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();
 
         let value = result?;
