@@ -288,7 +288,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 artifact_max_bytes,
                 allow_huggingface_download,
             );
-            let value = crate::run_sandbox_runner(
+            let value = crate::sandbox::run_sandbox_runner(
                 &paths,
                 tool,
                 service_id,
@@ -313,8 +313,14 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 artifact_max_bytes,
                 allow_huggingface_download,
             );
-            let value =
-                crate::run_sandbox_tool(&paths, tool, service_id, artifact_ref, message, policy)?;
+            let value = crate::sandbox::run_sandbox_tool(
+                &paths,
+                tool,
+                service_id,
+                artifact_ref,
+                message,
+                policy,
+            )?;
             crate::print_json(&value)?;
         }
         Command::McpServer => {
