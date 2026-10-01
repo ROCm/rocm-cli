@@ -18312,12 +18312,17 @@ fn restart_internal_managed_service(
     // restart supersedes it. Leaving it set would let the next liveness refresh
     // delete the key of the service we are bringing back up.
     //
-    // A failed restart now persists the cleared marker too: the bail paths below
-    // retire the record, and retiring writes it. So the key outlives a restart
-    // that never got an engine up, rather than being reclaimed by the next
-    // refresh. That is the safe direction — the record is left `"failed"`, which
-    // is not live, so nothing reuses the service while the key waits for a
-    // retry — but it is a change from when every bail left the marker set.
+    // A restart that fails at or after the spawn persists the cleared marker too,
+    // because those bails retire the record and retiring writes it. So the key
+    // outlives a restart that got an engine up and lost it, rather than being
+    // reclaimed by the next refresh. That is the safe direction — the record is
+    // left `"failed"`, which is not live, so nothing reuses the service while the
+    // key waits for a retry.
+    //
+    // An earlier bail — any of the `?`s between here and the spawn — leaves the
+    // record unwritten, so the marker stays set on disk and the next refresh
+    // reclaims the key. That is correct too: nothing was restarted, so the stop
+    // stands.
     record.stop_requested_unix_ms = None;
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
