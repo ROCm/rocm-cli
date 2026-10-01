@@ -84,7 +84,7 @@ repos:
         groups: [local-tools] # local-only; CI uses the `commit-signatures` job
 
   # License headers: mirrors the fast/hawkeye CI check.
-  # Requires: cargo install hawkeye
+  # Requires: hawkeye, pinned version documented in CONTRIBUTING.md
   - repo: local
     hooks:
       - id: license-headers
@@ -93,7 +93,7 @@ repos:
         language: system
         types_or: [rust, python, shell]
         pass_filenames: false
-        groups: [local-tools] # runs in the dedicated `license-headers` CI job (hawkeye action)
+        groups: [local-tools] # runs in the dedicated `license-headers` CI job (pinned prebuilt binary, no Action)
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
