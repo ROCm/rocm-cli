@@ -33986,6 +33986,64 @@ ID_LIKE="suse opensuse"
         assert!(err.to_string().contains("protected system location"));
     }
 
+    /// The gate above is the last thing between a registry entry and
+    /// `fs::remove_dir_all`, and the path it is handed is text somebody else
+    /// wrote. One folder has many spellings, so the refusal has to survive all
+    /// of them — a trailing separator, a doubled one, a `.`, or a `..` that
+    /// walks back out of the user's home directory. Each of these names `/etc`.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_runtime_install_root_rejects_every_spelling_of_a_protected_path() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let home = home.display().to_string();
+        let spellings = [
+            "/etc/".to_owned(),
+            "//etc".to_owned(),
+            "/./etc".to_owned(),
+            "/etc/.".to_owned(),
+            format!("{home}/../../etc"),
+        ];
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|text| ensure_runtime_install_root_is_safe_to_remove(Path::new(text)).is_ok())
+            .collect();
+
+        assert!(
+            accepted.is_empty(),
+            "accepted as safe to recursively delete: {accepted:?}"
+        );
+    }
+
+    /// The same question — "is this a system location?" — also keeps the local
+    /// assistant from installing into one, and there the folder arrives as
+    /// free-form JSON from a model rather than from a file the user wrote. A
+    /// trailing separator is exactly the sort of thing generated text carries,
+    /// so the refusal has to survive every spelling here too.
+    #[test]
+    #[cfg(unix)]
+    fn the_assistant_cannot_name_a_system_install_folder_by_respelling_it() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let home = home.display().to_string();
+        let spellings = [
+            "/usr/".to_owned(),
+            "/opt/".to_owned(),
+            "//usr".to_owned(),
+            "/./opt".to_owned(),
+            format!("{home}/../../usr"),
+        ];
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|text| !chat_install_prefix_is_system(Path::new(text)))
+            .collect();
+
+        assert!(
+            accepted.is_empty(),
+            "accepted as a user install folder: {accepted:?}"
+        );
+    }
+
     #[test]
     fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
         let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
