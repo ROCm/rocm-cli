@@ -31,7 +31,7 @@ Subsystem modules already following full domain extraction (each owns its own ty
 
 ### `apps/rocmd` — background daemon
 
-`lib.rs` modularization is in progress (ROCMAI-83, Phase 5 of EAI-7768's sequencing). Extracted so far: `persistence.rs` (`record_event`/`load_managed_services`, the automation-event/audit-log and managed-service-registry I/O shared across the daemon's sandbox, MCP, service-lifecycle, and watcher code). Still pending: a shared-helpers module for code used across ≥2 of those remaining clusters (GPU/amd-smi snapshotting, the bridge-snapshot diagnostic, small arg/healthcheck utilities), plus the CLI, sandbox, MCP, service-lifecycle, webhook, and watcher clusters themselves — each landing as its own PR.
+`lib.rs` modularization is in progress (ROCMAI-83, Phase 5 of EAI-7768's sequencing). Extracted so far: `persistence.rs` (`record_event`/`load_managed_services`, the automation-event/audit-log and managed-service-registry I/O shared across the daemon's sandbox, MCP, service-lifecycle, and watcher code) and `common.rs` (helpers shared across ≥2 of those remaining clusters: GPU/amd-smi snapshotting, the bridge-snapshot diagnostic, `CommandCapture`/command-timeout plumbing, and small arg/healthcheck/endpoint-key utilities). Still pending: the CLI, sandbox, MCP, service-lifecycle, webhook, and watcher clusters themselves — each landing as its own PR.
 
 ### `crates/rocm-core` — core library
 
