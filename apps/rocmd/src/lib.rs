@@ -35,7 +35,7 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
@@ -2743,39 +2743,47 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
         .into_iter()
         .find(|record| record.service_id == service_id)
         .with_context(|| format!("managed service `{service_id}` not found"))?;
-    let mut signaled_pids = Vec::new();
-    let mut skipped_pids = Vec::new();
-    let mut root_pids = Vec::new();
-    if let Some(engine_pid) = record.engine_pid
-        && engine_pid != 0
-    {
-        if engine_pid == std::process::id() {
-            skipped_pids.push(engine_pid);
-        } else {
-            root_pids.push(engine_pid);
-        }
-    }
-    if record.supervisor_pid != 0
-        && record.supervisor_pid != std::process::id()
-        && Some(record.supervisor_pid) != record.engine_pid
-    {
-        root_pids.push(record.supervisor_pid);
-    }
-    let mut pids_to_signal = descendant_pids_for_roots(&root_pids)?;
-    pids_to_signal.extend(root_pids);
-    let mut seen_pids = HashSet::new();
-    for pid in pids_to_signal {
-        if !seen_pids.insert(pid) {
-            continue;
-        }
-        if terminate_process(pid)? {
-            signaled_pids.push(pid);
-        } else {
-            skipped_pids.push(pid);
-        }
-    }
-    let force_signaled_pids = force_terminate_remaining_processes(&signaled_pids)?;
+    let stops = terminate_recorded_service_pids(&record);
+    let pids_where = |keep: fn(&RecordedPidStop) -> bool| -> Vec<u32> {
+        stops
+            .iter()
+            .filter(|stop| keep(stop))
+            .map(|s| s.pid)
+            .collect()
+    };
+    let signaled_pids = pids_where(|stop| stop.signaled);
+    let force_signaled_pids = pids_where(|stop| stop.forced);
+    // Everything that was deliberately not signalled: the stopping process
+    // itself, a PID that was already gone, and — the case this list used not to
+    // be able to express — a PID that is live but provably belongs to somebody
+    // else now. `pid_outcomes` says which.
+    let skipped_pids = pids_where(|stop| !stop.signaled);
+    let all_stopped = stops.iter().all(|stop| stop.stopped);
+    let pid_outcomes = stops
+        .iter()
+        .map(|stop| {
+            json!({
+                "pid": stop.pid,
+                "role": stop.role,
+                "outcome": stop.outcome,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The status records that a stop was carried out, as it always has. Whether
+    // every process is confirmed gone is a separate question, answered by
+    // `stopped` in the result rather than by overloading the status string.
     record.status = "stopped".to_owned();
+    // Recorded PIDs go stale the instant their processes exit, and a stale PID
+    // is exactly what the identity check exists to catch — so do not leave one
+    // behind for the next stop to find. Cleared only once every recorded process
+    // is confirmed gone: an unconfirmed survivor is still the service's, and a
+    // later stop has to be able to reach it.
+    if all_stopped {
+        record.supervisor_pid = 0;
+        record.supervisor_start_ticks = None;
+        record.engine_pid = None;
+        record.engine_start_ticks = None;
+    }
     record.write()?;
     // Best-effort and idempotent: a missing key file is not an error, so this
     // is safe to call unconditionally on every stop (including loopback
@@ -2790,201 +2798,169 @@ fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
         "signaled_pids": signaled_pids,
         "force_signaled_pids": force_signaled_pids,
         "skipped_pids": skipped_pids,
+        "pid_outcomes": pid_outcomes,
+        "stopped": all_stopped,
     }))
 }
 
-#[cfg(unix)]
-fn descendant_pids_for_roots(root_pids: &[u32]) -> Result<Vec<u32>> {
-    if root_pids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let output = ProcessCommand::new("ps")
-        .args(["-eo", "pid=,ppid="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to list process tree with ps")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        bail!(
-            "failed to list process tree: {}",
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-    let output = String::from_utf8_lossy(&output.stdout);
-    Ok(descendant_pids_from_ps_output(&output, root_pids))
+/// How long a stop waits for a recorded process tree to exit on its own before
+/// escalating to a forced kill. Matches `rocm services stop`, which terminates
+/// the same records.
+const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// What a stop did about one PID recorded in a service manifest.
+struct RecordedPidStop {
+    pid: u32,
+    /// Which recorded PID this is: `supervisor` or `engine`.
+    role: &'static str,
+    /// Stable label for what happened, from
+    /// [`rocm_core::TerminationOutcome::as_str`], plus `self` for the stopping
+    /// process's own PID.
+    outcome: &'static str,
+    signaled: bool,
+    forced: bool,
+    /// Whether the recorded process is confirmed to be no longer running.
+    stopped: bool,
 }
 
-#[cfg(not(unix))]
-fn descendant_pids_for_roots(_root_pids: &[u32]) -> Result<Vec<u32>> {
-    Ok(Vec::new())
-}
-
-#[cfg(any(unix, test))]
-fn descendant_pids_from_ps_output(output: &str, root_pids: &[u32]) -> Vec<u32> {
-    fn append_descendants(
-        parent: u32,
-        processes: &[(u32, u32)],
-        seen: &mut HashSet<u32>,
-        output: &mut Vec<u32>,
-    ) {
-        for (pid, ppid) in processes {
-            if *ppid != parent || *pid == parent || !seen.insert(*pid) {
-                continue;
-            }
-            append_descendants(*pid, processes, seen, output);
-            output.push(*pid);
-        }
-    }
-
-    let processes = output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let pid = parts.next()?.parse::<u32>().ok()?;
-            let ppid = parts.next()?.parse::<u32>().ok()?;
-            Some((pid, ppid))
-        })
-        .collect::<Vec<_>>();
-    let mut seen = root_pids.iter().copied().collect::<HashSet<_>>();
-    let mut descendants = Vec::new();
-    for root in root_pids {
-        append_descendants(*root, &processes, &mut seen, &mut descendants);
-    }
-    descendants
-}
-
-fn terminate_process(pid: u32) -> Result<bool> {
-    if pid == std::process::id() {
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        let output = ProcessCommand::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch kill for pid {pid}"))?;
-        if output.status.success() {
-            Ok(true)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if stderr.contains("No such process") || stdout.contains("No such process") {
-                return Ok(false);
-            }
-            bail!(
-                "failed to signal pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            )
-        }
-    }
-    #[cfg(windows)]
-    {
-        let output = ProcessCommand::new("taskkill")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .arg("/T")
-            .arg("/F")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch taskkill for pid {pid}"))?;
-        if output.status.success() {
-            Ok(true)
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if stderr.contains("not found") || stdout.contains("not found") {
-                return Ok(false);
-            }
-            bail!(
-                "failed to stop pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            )
-        }
-    }
-}
-
-#[cfg(unix)]
-fn force_terminate_remaining_processes(pids: &[u32]) -> Result<Vec<u32>> {
-    if pids.is_empty() {
-        return Ok(Vec::new());
-    }
-    thread::sleep(Duration::from_millis(750));
-    let mut force_signaled = Vec::new();
-    for pid in pids {
-        if *pid == std::process::id() || !process_is_running(*pid)? {
+/// Terminate the processes a service manifest records, verifying identity first.
+///
+/// PIDs are recycled, so a persisted PID is not by itself evidence that the
+/// recorded process is still the one holding it. Each PID is therefore paired
+/// with **its own** start-time token — `supervisor_start_ticks` with
+/// `supervisor_pid`, `engine_start_ticks` with `engine_pid` — and routed through
+/// [`rocm_core::terminate_verified`], which signals nothing when the recorded
+/// identity is refuted. `rocm services stop` reads the same records through the
+/// same primitive, so neither command can decide differently about one.
+///
+/// Descendants are reached from the *verified* root rather than expanded out of
+/// a live process listing keyed on a PID nobody checked — which, given a stale
+/// root, enumerated a stranger's children and signalled those too. Where the
+/// kernel start-time is readable, `terminate_verified` additionally binds each
+/// child to its own identity before any forced kill; see
+/// [`terminate_recorded_pid`] for what Windows can and cannot do here.
+///
+/// The stopping process's own PID is reported but never signalled, and does not
+/// count towards "the recorded service is gone": `rocmd` records itself as the
+/// supervisor of the services it launches, and it is the launcher, not the
+/// service.
+fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> Vec<RecordedPidStop> {
+    // Build the (pid, role, own-token) work list, de-duplicating on PID and
+    // preferring an entry that carries a verifiable start-time. The two PIDs can
+    // coincide — a launcher that is also the server — and a token must never be
+    // read across from the PID it does not belong to.
+    let mut entries: Vec<(u32, &'static str, Option<u64>)> = Vec::new();
+    for (pid, role, ticks) in [
+        (
+            Some(record.supervisor_pid),
+            "supervisor",
+            record.supervisor_start_ticks,
+        ),
+        (record.engine_pid, "engine", record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0) else {
             continue;
-        }
-        let output = ProcessCommand::new("kill")
-            .arg("-KILL")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("failed to launch kill -KILL for pid {pid}"))?;
-        if output.status.success() {
-            force_signaled.push(*pid);
+        };
+        if let Some(existing) = entries.iter_mut().find(|(seen, _, _)| *seen == pid) {
+            if existing.2.is_none() {
+                existing.2 = ticks;
+            }
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "failed to force stop pid {pid}: {}",
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    format!("exit status {}", output.status)
-                }
-            );
+            entries.push((pid, role, ticks));
         }
     }
-    Ok(force_signaled)
+
+    entries
+        .into_iter()
+        .map(|(pid, role, ticks)| {
+            if pid == std::process::id() {
+                return RecordedPidStop {
+                    pid,
+                    role,
+                    outcome: "self",
+                    signaled: false,
+                    forced: false,
+                    stopped: true,
+                };
+            }
+            let outcome = terminate_recorded_pid(&rocm_core::ProcessIdentity::new(pid, ticks));
+            RecordedPidStop {
+                pid,
+                role,
+                outcome: outcome.as_str(),
+                // TimedOut belongs with the signalled: the signal went out, the
+                // exit was just never observed. `stopped` carries that truth.
+                signaled: matches!(
+                    outcome,
+                    rocm_core::TerminationOutcome::Graceful
+                        | rocm_core::TerminationOutcome::Forced
+                        | rocm_core::TerminationOutcome::TimedOut
+                ),
+                // "The stop escalated to a forced kill", not "the forced kill
+                // worked": a forced stop only reaches `TimedOut` by way of that
+                // escalation, and `stopped` is what says whether the process
+                // actually went away.
+                forced: matches!(
+                    outcome,
+                    rocm_core::TerminationOutcome::Forced | rocm_core::TerminationOutcome::TimedOut
+                ),
+                stopped: outcome.stopped(),
+            }
+        })
+        .collect()
 }
 
-#[cfg(not(unix))]
-fn force_terminate_remaining_processes(_pids: &[u32]) -> Result<Vec<u32>> {
-    Ok(Vec::new())
-}
-
-#[cfg(unix)]
-fn process_is_running(pid: u32) -> Result<bool> {
-    let output = ProcessCommand::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("failed to launch kill -0 for pid {pid}"))?;
-    Ok(output.status.success())
+/// Terminate one recorded process after verifying its identity.
+///
+/// The stop is forced: its contract is definitive, so the command must not
+/// report success while an engine worker still holds the GPU. Only a process
+/// whose recorded identity is confirmed is ever reached by it.
+fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome {
+    // Windows needs the descendants taken separately. `rocm_core` has no way to
+    // walk a process tree there — `process_tree_pids` returns just the root — and
+    // the engine runs one level below the recorded PID, because `rocmd` launches
+    // it through an `__engine-serve-http` process. A root-only kill would leave
+    // the engine running and still holding the device.
+    //
+    // This is the same reach the stop has always had on Windows, and it costs no
+    // safety: `process_start_ticks` has no `/proc` to read there, so a Windows
+    // identity can never be refuted in the first place. It is still gated on the
+    // same verdict `terminate_verified` reaches, so a refuted root's subtree
+    // stays untouched wherever identity *is* verifiable.
+    #[cfg(windows)]
+    if matches!(
+        rocm_core::identity_state(identity),
+        rocm_core::IdentityState::Matches
+    ) {
+        // Taken while the root is still alive: `taskkill /T` resolves children
+        // through the live parent, so it cannot reach them once the root is gone.
+        let _ = ProcessCommand::new("taskkill")
+            .args(["/PID", &identity.pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // `terminate_verified` still owns the bounded wait and the verdict, but
+        // a root the tree kill already took now reads back as `AlreadyGone` —
+        // which would deny a stop this command did perform.
+        let outcome = rocm_core::terminate_verified(
+            identity,
+            rocm_core::KillScope::Tree,
+            MANAGED_STOP_GRACE,
+            true,
+        );
+        return if matches!(outcome, rocm_core::TerminationOutcome::AlreadyGone) {
+            rocm_core::TerminationOutcome::Forced
+        } else {
+            outcome
+        };
+    }
+    rocm_core::terminate_verified(
+        identity,
+        rocm_core::KillScope::Tree,
+        MANAGED_STOP_GRACE,
+        true,
+    )
 }
 
 async fn run_daemon(
@@ -3259,6 +3235,10 @@ fn supervise_service(
         env_id.clone(),
         Some(device_policy.clone()),
     );
+    // Pair the recorded supervisor PID with the kernel's start-time for it.
+    // Without that token a later stop has no way to tell this process from an
+    // unrelated one that inherited the PID, and falls back to signalling blind.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(std::process::id());
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
     // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts
@@ -3345,6 +3325,9 @@ fn supervise_service(
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
 
     record.engine_pid = Some(child.id());
+    // Captured while the child is known alive, so a later stop verifies this
+    // exact process instead of whatever has since inherited its PID.
+    record.engine_start_ticks = rocm_core::process_start_ticks(child.id());
     record.status = "running".to_owned();
     record.write()?;
 
@@ -5045,6 +5028,7 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
     record.supervisor_pid = std::process::id();
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(std::process::id());
     record.write()?;
 
     let mut child = detached_rocmd_command(&rocmd_binary)
@@ -5056,6 +5040,8 @@ fn restart_managed_service(_paths: &AppPaths, record: &mut ManagedServiceRecord)
         .context("failed to spawn recovery supervisor")?;
 
     record.supervisor_pid = child.id();
+    // Refresh the identity token in lockstep with the PID it belongs to.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child.id());
     record.write()?;
 
     thread::sleep(Duration::from_millis(200));
@@ -8876,6 +8862,11 @@ mod tests {
     /// A PID whose recorded start-time no longer matches the kernel's belongs to
     /// a different process: the recorded service already exited and its PID was
     /// recycled. The stop must refuse it rather than signal a stranger.
+    ///
+    /// Linux-only: a refutable identity needs a readable start-time, and
+    /// `rocm_core::process_start_ticks` reads it from `/proc`. On Windows it is
+    /// always `None`, so no identity can be refuted there and the state this
+    /// asserts on cannot be constructed.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_managed_service_refuses_a_pid_whose_recorded_identity_no_longer_matches() -> Result<()>
@@ -8952,6 +8943,9 @@ mod tests {
     /// The blast radius of a refuted PID is not limited to the PID itself: the
     /// stop used to expand each recorded PID into its *current* descendants, so
     /// a recycled PID dragged that process's whole subtree into the kill set.
+    ///
+    /// Linux-only for the same reason as the test above: the refuted identity it
+    /// starts from cannot exist on a platform without `/proc` start-times.
     #[cfg(target_os = "linux")]
     #[test]
     fn stop_managed_service_leaves_the_subtree_of_a_refuted_pid_running() -> Result<()> {
@@ -9128,27 +9122,6 @@ mod tests {
             "a confirmed stop must clear the engine PID"
         );
         Ok(())
-    }
-
-    #[test]
-    fn stop_server_process_tree_discovers_descendants_before_parents() {
-        let output = "\
-10 1
-11 10
-12 11
-13 10
-20 1
-21 20
-";
-
-        assert_eq!(
-            descendant_pids_from_ps_output(output, &[10]),
-            vec![12, 11, 13]
-        );
-        assert_eq!(
-            descendant_pids_from_ps_output(output, &[10, 20]),
-            vec![12, 11, 13, 21]
-        );
     }
 
     #[test]
