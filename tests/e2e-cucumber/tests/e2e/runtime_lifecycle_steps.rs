@@ -131,13 +131,6 @@ fn plant_live_service_on_runtime(world: &E2eWorld, recorded_runtime_key: &'stati
     );
 }
 
-/// The runtime key recorded in the isolated active-runtime marker
-/// (`<data>/runtimes/active.json`) — what the next serve would actually use.
-///
-/// Parsed as JSON rather than substring-matched on the file: once a second
-/// runtime has been activated the marker also carries `previous_runtime_key`,
-/// so a `contains` check would be satisfied by either key and could not tell a
-/// refused switch from a completed one.
 /// The runtime key recorded in the isolated `config.json`.
 ///
 /// The marker sibling above cannot be used by the scenario that breaks the
@@ -162,6 +155,13 @@ fn config_active_runtime_key(world: &E2eWorld) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The runtime key recorded in the isolated active-runtime marker
+/// (`<data>/runtimes/active.json`) — what the next serve would actually use.
+///
+/// Parsed as JSON rather than substring-matched on the file: once a second
+/// runtime has been activated the marker also carries `previous_runtime_key`,
+/// so a `contains` check would be satisfied by either key and could not tell a
+/// refused switch from a completed one.
 fn active_runtime_key(world: &E2eWorld) -> String {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let marker = root

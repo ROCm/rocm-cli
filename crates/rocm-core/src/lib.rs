@@ -12905,6 +12905,10 @@ last_installed_runtime_id = "therock-release"
         // The sibling test above, which only checks that no temp file is left
         // behind, holds just as well for an implementation with no temp file at
         // all — it cannot tell the two apart.
+        //
+        // `saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place`
+        // below is the Windows counterpart, reading the same identity through
+        // `file_index` so this guarantee is not asserted on Unix alone.
         let (root, paths) = temp_app_paths("config-save-replaces");
         let mut config = RocmCliConfig {
             default_engine: Some("vllm".to_owned()),
@@ -12925,6 +12929,52 @@ last_installed_runtime_id = "therock-release"
             "an overwrite that keeps the same inode rewrote the live config in \
              place, so an interrupted save can leave it truncated"
         );
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+
+        // The Windows counterpart of the Unix test above. `file_index` together
+        // with `volume_serial_number` is this platform's file identity, the way
+        // an inode is on Unix: a `fs::write` over the live path refills the SAME
+        // file and keeps the pair, while a publish-by-rename puts a DIFFERENT
+        // file behind the name. Without this, the only test that can tell the
+        // two implementations apart was `#[cfg(unix)]`, and a Windows-only
+        // regression to a plain `fs::write` would pass every gate.
+        //
+        // The identity is read through `fs::metadata`, which opens the file, so
+        // both values are `Some` in practice; the `None` arm is the documented
+        // case where Windows declines to report one rather than a failure to
+        // replace, so it does not assert.
+        let (root, paths) = temp_app_paths("config-save-replaces");
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        let before = fs::metadata(paths.config_path())?;
+        let before_identity = (before.volume_serial_number(), before.file_index());
+
+        config.default_engine = Some("lemonade".to_owned());
+        config.save(&paths)?;
+        let after = fs::metadata(paths.config_path())?;
+        let after_identity = (after.volume_serial_number(), after.file_index());
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        if before_identity.1.is_some() && after_identity.1.is_some() {
+            assert_ne!(
+                before_identity, after_identity,
+                "an overwrite that keeps the same file identity rewrote the \
+                 live config in place, so an interrupted save can leave it \
+                 truncated"
+            );
+        }
         assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
     }

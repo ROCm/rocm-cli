@@ -239,11 +239,27 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
-Switching runtimes does not move a server that is already running. With one up,
-check what an activation says about it. `<other_runtime_key>` below means the
-runtime the server is **not** recorded on — run `rocm runtimes list` and take
-any key that is not the active one; section 2 installed a second runtime so
-there is one:
+The rest of this section needs a **vLLM** server running on the currently active
+runtime, on Linux or WSL. Nothing earlier in this document leaves one up:
+section 3 serves Lemonade and then stops it on both of its branches, and the
+block just above stops whatever was left. Start one now and leave it running:
+
+```bash
+rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
+rocm services
+```
+
+`rocm services` must list it as running before you go on; note its service id.
+Re-running section 3's Lemonade command instead does not work here: Lemonade
+brings its own runtime and is deliberately never counted by the reconciler, so
+every step below would report `services_on_previous_runtime: 0`, print no
+`note:` line to read the next command from, and verify nothing.
+
+Switching runtimes does not move a server that is already running. Check what an
+activation says about the server you just started. `<other_runtime_key>` below
+means the runtime the server is **not** recorded on — run `rocm runtimes list`
+and take any key that is not the active one; section 2 installed a second
+runtime so there is one:
 
 ```powershell
 rocm services
@@ -289,8 +305,9 @@ Expected result:
   move them.
 - A Lemonade server is never counted, because that engine brings its own
   runtime: with only Lemonade serving, the count stays
-  `services_on_previous_runtime: 0`. Use a vLLM server on Linux or WSL to see a
-  non-zero count. A server started with `--env-id` is counted just like any
+  `services_on_previous_runtime: 0`. That is why the steps above start a vLLM
+  server — it is what makes the count non-zero. A server started with `--env-id`
+  is counted just like any
   other: the `env_id` recorded in the service record is not a pin and does not
   exempt it from `services_on_previous_runtime`.
 - A running server whose record names no runtime is counted apart, under
