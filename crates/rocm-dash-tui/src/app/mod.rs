@@ -30,7 +30,7 @@ mod slash;
 mod summary;
 mod types;
 
-pub use actions::KeyAction;
+pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use event_loop::{
     HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
     restore_terminal, shutdown_claimed_on,

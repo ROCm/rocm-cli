@@ -369,9 +369,9 @@ pub(crate) struct SlashToolRequest {
 /// Plain data mirrored from the bin's `freeform_plan_next_action_with_context`
 /// so the reducer can decide whether to hand a complete mutating action to the
 /// approval modal. A placeholder action (`has_placeholders`) stays plan-only.
-/// `pub` (not `pub(crate)`) because it is a payload of the `pub` [`ClientMsg`]
-/// enum (mirrors [`crate::tool_exec::ApprovalIntent`]); the reducer entrypoints
-/// that consume it stay crate-private.
+/// `pub` (not `pub(crate)`) because it is a payload of the `pub`
+/// [`crate::client::ClientMsg`] enum (mirrors [`crate::tool_exec::ApprovalIntent`]);
+/// the reducer entrypoints that consume it stay crate-private.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedAction {
     /// The rocm CLI argv to run (e.g. `["install","sdk","--prefix","/x"]`).
