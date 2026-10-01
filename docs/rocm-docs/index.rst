@@ -37,5 +37,5 @@ The ROCm CLI public repository is located at
 
    .. grid-item-card:: Use ROCm CLI
 
-      * :doc:`vLLM adapter <engines/vllm>`
       * :doc:`Command reference <commands>`
+      * :doc:`vLLM adapter <engines/vllm>`
