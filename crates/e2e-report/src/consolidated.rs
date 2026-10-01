@@ -1903,15 +1903,39 @@ mod tests {
 
     #[test]
     fn generate_consolidated_writes_html() {
-        let a = write_report(&feature_json(&[(&[], &["passed"])]));
+        // Same platform_slug, two channels: the HTML matrix (matrix_table) must
+        // carry the channel suffix too, not just its markdown twin.
+        let release_platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"}
+        }"#;
+        let nightly_platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "nightly"}
+        }"#;
+        let report = feature_json(&[(&[], &["passed"])]);
+        let (_d1, release_path) = write_platform(&report, release_platform);
+        let (_d2, nightly_path) = write_platform(&report, nightly_platform);
         let out = tempfile::NamedTempFile::new().expect("temp");
-        let inputs = vec![("e2e-report".to_string(), a.path().to_path_buf())];
+        let inputs = vec![
+            ("mi300x-release".to_string(), release_path),
+            ("mi300x-nightly".to_string(), nightly_path),
+        ];
         generate_consolidated(&inputs, out.path(), &RunMeta::default()).expect("generate");
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(html.contains("Consolidated E2E Report"));
-        assert!(html.contains("Mock"));
         assert!(html.contains("Platforms"));
         assert!(html.contains("Legend"));
+        assert!(
+            html.contains("Mi300x (release)"),
+            "HTML matrix must carry the release channel suffix"
+        );
+        assert!(
+            html.contains("Mi300x (nightly)"),
+            "HTML matrix must carry the nightly channel suffix"
+        );
     }
 
     #[test]
@@ -2807,6 +2831,33 @@ mod tests {
         assert_eq!(
             row_cells[nightly_i], "❌",
             "nightly failure must not be masked by release's pass:\n{row}"
+        );
+
+        // Platform/OS summary table: same two channels must get separate rows
+        // there too, not just in the coverage sub-table above.
+        assert!(
+            md.contains("| Mi300x (release) | Linux |"),
+            "summary row must carry the release channel suffix:\n{md}"
+        );
+        assert!(
+            md.contains("| Mi300x (nightly) | Linux |"),
+            "summary row must carry the nightly channel suffix:\n{md}"
+        );
+
+        // The 4-element sort tuple only matters if it actually drives order
+        // regardless of input order: feed nightly before release and confirm
+        // the summary rows land in the same relative order either way.
+        let reversed_inputs = vec![inputs[1].clone(), inputs[0].clone()];
+        let md_reversed = consolidated_summary_markdown(&reversed_inputs);
+        let rows: Vec<&str> = md.lines().filter(|l| l.starts_with("| Mi300x (")).collect();
+        let rows_reversed: Vec<&str> = md_reversed
+            .lines()
+            .filter(|l| l.starts_with("| Mi300x ("))
+            .collect();
+        assert_eq!(
+            rows, rows_reversed,
+            "platform row order must be deterministic regardless of input order, \
+             which only holds once channel is in the sort key"
         );
     }
 
