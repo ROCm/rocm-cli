@@ -4,6 +4,8 @@
 
 #![allow(clippy::items_after_test_module)]
 
+mod persistence;
+
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -12,16 +14,18 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
+use rocm_core::AutomationEventRecord;
+#[cfg(test)]
 use rocm_core::engine_plugin_dirs;
 use rocm_core::{
-    AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
-    AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
-    ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
-    load_recent_automation_events, model_artifact_cache_status, resolve_amd_smi_binary,
-    resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AuditEventRecord, AutomationProposalRecord, AutomationRuntimeState,
+    AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
+    DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord, ModelRecipeArtifactRecord,
+    RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot, append_audit_event,
+    append_automation_proposal, builtin_watcher, builtin_watchers, daemon_binary_path,
+    default_engine_for_platform, format_host_port, load_recent_automation_events,
+    model_artifact_cache_status, resolve_amd_smi_binary, resolve_model_recipe_artifact,
+    unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -411,7 +415,7 @@ fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
         automation_runtime: AutomationRuntimeState::load(paths)?,
         recent_automation_events: load_recent_automation_events(paths, 32)?,
         engines: bridge_engine_inventory(),
-        services: load_managed_services(paths)?,
+        services: persistence::load_managed_services(paths)?,
     })
 }
 
@@ -582,7 +586,7 @@ fn run_sandbox_tool(
             }))
         }
         SandboxToolArg::ListServers => {
-            let services = load_managed_services(paths)?;
+            let services = persistence::load_managed_services(paths)?;
             Ok(json!({
                 "tool": tool.as_cli_value(),
                 "status": "listed",
@@ -593,7 +597,7 @@ fn run_sandbox_tool(
         }
         SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires `--service-id`")?;
-            let mut record = load_managed_services(paths)?
+            let mut record = persistence::load_managed_services(paths)?
                 .into_iter()
                 .find(|record| record.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -2134,7 +2138,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             ))
         }
         "services" => {
-            let services = load_managed_services(paths)?;
+            let services = persistence::load_managed_services(paths)?;
             Ok(tool_success(
                 format!("Found {} managed services.", services.len()),
                 json!({ "services": services }),
@@ -2150,7 +2154,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 .and_then(Value::as_u64)
                 .unwrap_or(80)
                 .clamp(1, 500) as usize;
-            let record = load_managed_services(paths)?
+            let record = persistence::load_managed_services(paths)?
                 .into_iter()
                 .find(|service| service.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -2739,7 +2743,7 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 }
 
 fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
-    let mut record = load_managed_services(paths)?
+    let mut record = persistence::load_managed_services(paths)?
         .into_iter()
         .find(|record| record.service_id == service_id)
         .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -3052,7 +3056,7 @@ async fn run_daemon(
 
     paths.ensure()?;
     state.write(paths)?;
-    record_event(
+    persistence::record_event(
         paths,
         &mut state,
         "rocmd",
@@ -3086,7 +3090,7 @@ async fn run_daemon(
                 if let Some(event) = event {
                     let config = RocmCliConfig::load(paths)?;
                     reconcile_watcher_snapshots(&config, &mut state);
-                    record_event(
+                    persistence::record_event(
                         paths,
                         &mut state,
                         "rocmd",
@@ -3102,7 +3106,7 @@ async fn run_daemon(
                     if let Err(error) =
                         evaluate_watchers_for_events(paths, &config, &mut state, &[event])
                     {
-                        record_event(
+                        persistence::record_event(
                             paths,
                             &mut state,
                             "rocmd",
@@ -3119,7 +3123,7 @@ async fn run_daemon(
                 } else {
                     local_webhook_receiver = None;
                     state.local_webhook_endpoint = None;
-                    record_event(
+                    persistence::record_event(
                         paths,
                         &mut state,
                         "rocmd",
@@ -3140,7 +3144,7 @@ async fn run_daemon(
     state.running = false;
     state.last_tick_unix_ms = unix_time_millis();
     state.local_webhook_endpoint = None;
-    record_event(
+    persistence::record_event(
         paths,
         &mut state,
         "rocmd",
@@ -3206,7 +3210,7 @@ fn print_status(paths: &AppPaths) -> Result<()> {
     );
     println!("  audit events: {}", paths.audit_events_path().display());
 
-    let records = load_managed_services(paths)?;
+    let records = persistence::load_managed_services(paths)?;
     if records.is_empty() {
         println!("  services: none");
         return Ok(());
@@ -3274,7 +3278,7 @@ fn supervise_service(
     // key-file fallback is false precisely when a service has been stopped, and
     // the weakened record would then be written back at the bottom of this
     // function. That is the outcome the comment above says must not happen.
-    let previously_required = load_managed_services(paths)
+    let previously_required = persistence::load_managed_services(paths)
         .context(
             "could not read the service registry to check whether this service requires an \
              endpoint API key; refusing to recover it rather than assume it does not",
@@ -3888,7 +3892,7 @@ where
     };
     match policy {
         WatcherPolicyAction::Observe | WatcherPolicyAction::QueueProposal => {
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "therock-update",
@@ -3911,7 +3915,7 @@ where
         WatcherPolicyAction::RunContained => match update_runner(paths) {
             Ok(output) => match restricted_check_updates_result(&output) {
                 Ok(result) => {
-                    record_event(
+                    persistence::record_event(
                         paths,
                         state,
                         "therock-update",
@@ -3933,7 +3937,7 @@ where
                     }
                 }
                 Err(error) => {
-                    record_event(
+                    persistence::record_event(
                         paths,
                         state,
                         "therock-update",
@@ -3947,7 +3951,7 @@ where
                 }
             },
             Err(error) => {
-                record_event(
+                persistence::record_event(
                     paths,
                     state,
                     "therock-update",
@@ -4007,7 +4011,7 @@ fn record_update_available_notification(
     } else {
         "A ROCm runtime update is available. Preview it before applying. No updates were applied."
     };
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "therock-update",
@@ -4100,7 +4104,7 @@ fn handle_gpu_metrics_event(
         other => other,
     };
 
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "gpu-metrics",
@@ -4337,7 +4341,7 @@ fn handle_gpu_thermal_protect_event(
     let reason = event.reason.as_deref().unwrap_or("gpu_pressure_threshold");
 
     if matches!(mode, WatcherMode::Observe) {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4351,7 +4355,7 @@ fn handle_gpu_thermal_protect_event(
     }
 
     let Some(record) = resolve_gpu_pressure_service_target(paths, event)? else {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4365,7 +4369,7 @@ fn handle_gpu_thermal_protect_event(
     };
 
     if pending_stop_proposal_exists(paths, &record.service_id)? {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4389,7 +4393,7 @@ fn handle_gpu_thermal_protect_event(
         "{summary}; {mode_note}; selected managed server {} ({})",
         record.service_id, record.endpoint_url
     );
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "gpu-thermal-protect",
@@ -4439,7 +4443,7 @@ fn resolve_gpu_pressure_service_target(
         return Ok(active_pressure_target(record));
     }
 
-    let active = load_managed_services(paths)?
+    let active = persistence::load_managed_services(paths)?
         .into_iter()
         .filter_map(active_pressure_target)
         .collect::<Vec<_>>();
@@ -4489,7 +4493,7 @@ where
     F: FnMut(&str) -> Result<bool>,
 {
     let Some(artifact_ref) = payload_string(&event.payload, "artifact_ref") else {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "cache-warm",
@@ -4502,7 +4506,7 @@ where
     match artifact_exists(&artifact_ref) {
         Ok(true) => {}
         Ok(false) => {
-            return record_event(
+            return persistence::record_event(
                 paths,
                 state,
                 "cache-warm",
@@ -4515,7 +4519,7 @@ where
             );
         }
         Err(error) => {
-            return record_event(
+            return persistence::record_event(
                 paths,
                 state,
                 "cache-warm",
@@ -4529,7 +4533,7 @@ where
         }
     }
     match mode {
-        WatcherMode::Observe => record_event(
+        WatcherMode::Observe => persistence::record_event(
             paths,
             state,
             "cache-warm",
@@ -4551,7 +4555,7 @@ where
                     "cache warm requested for {artifact_ref}; queueing a reviewed prefetch proposal"
                 )
             };
-            record_event(paths, state, "cache-warm", "info", action, &message, None)?;
+            persistence::record_event(paths, state, "cache-warm", "info", action, &message, None)?;
             queue_proposal_with_arguments(
                 paths,
                 "cache-warm",
@@ -4596,7 +4600,7 @@ where
     F: FnOnce(&AppPaths) -> Result<Value>,
 {
     if payload_string(&event.payload, "component").as_deref() != Some("driver") {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "driver-upgrade",
@@ -4608,7 +4612,7 @@ where
     }
 
     match mode {
-        WatcherMode::Observe => record_event(
+        WatcherMode::Observe => persistence::record_event(
             paths,
             state,
             "driver-upgrade",
@@ -4621,7 +4625,7 @@ where
             let action = "prepare_driver_plan";
             let message =
                 "local driver update signal received; queueing a reviewed read-only driver plan";
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "driver-upgrade",
@@ -4641,7 +4645,7 @@ where
         }
         WatcherMode::Contained => match driver_plan_runner(paths) {
             Ok(output) => match restricted_driver_plan_result(&output) {
-                Ok(result) => record_event(
+                Ok(result) => persistence::record_event(
                     paths,
                     state,
                     "driver-upgrade",
@@ -4657,7 +4661,7 @@ where
                     ),
                     None,
                 ),
-                Err(error) => record_event(
+                Err(error) => persistence::record_event(
                     paths,
                     state,
                     "driver-upgrade",
@@ -4669,7 +4673,7 @@ where
                     None,
                 ),
             },
-            Err(error) => record_event(
+            Err(error) => persistence::record_event(
                 paths,
                 state,
                 "driver-upgrade",
@@ -4763,7 +4767,7 @@ fn handle_server_recover_event(
         .context("server-recover event is missing service_id")?;
     let mut record = load_service_record(paths, service_id)?;
     if !service_record_matches_recovery_event(paths, &record, event) {
-        record_event(
+        persistence::record_event(
             paths,
             state,
             "server-recover",
@@ -4810,7 +4814,7 @@ fn handle_server_recover_event_with_record(
     let recovery_reason_display = display_recovery_reason(recovery_reason);
 
     match watcher_policy_action("server-recover", mode) {
-        WatcherPolicyAction::Observe => record_event(
+        WatcherPolicyAction::Observe => persistence::record_event(
             paths,
             state,
             "server-recover",
@@ -4827,7 +4831,7 @@ fn handle_server_recover_event_with_record(
                 "managed service {} needs recovery ({recovery_reason_display}); queueing restart proposal",
                 record.service_id,
             );
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "server-recover",
@@ -4863,7 +4867,7 @@ fn handle_server_recover_event_with_record(
                     .is_some(),
                 record.requires_api_key,
             ) {
-                return record_event(
+                return persistence::record_event(
                     paths,
                     state,
                     "server-recover",
@@ -4878,7 +4882,7 @@ fn handle_server_recover_event_with_record(
                 );
             }
             restart_managed_service(paths, &mut *record)?;
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "server-recover",
@@ -4950,7 +4954,7 @@ const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPo
 
 fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRecord, String)>> {
     let now = unix_time_millis();
-    for record in load_managed_services(paths)? {
+    for record in persistence::load_managed_services(paths)? {
         if record.mode != "managed" {
             continue;
         }
@@ -5107,49 +5111,6 @@ fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
     args
 }
 
-fn record_event(
-    paths: &AppPaths,
-    state: &mut AutomationRuntimeState,
-    watcher_id: &str,
-    level: &str,
-    action: &str,
-    message: &str,
-    service_id: Option<String>,
-) -> Result<()> {
-    let now = unix_time_millis();
-    if let Some(snapshot) = state.watcher_mut(watcher_id) {
-        snapshot.last_event = Some(message.to_owned());
-        snapshot.last_event_unix_ms = Some(now);
-    }
-    let event = AutomationEventRecord {
-        at_unix_ms: now,
-        watcher_id: watcher_id.to_owned(),
-        level: level.to_owned(),
-        action: action.to_owned(),
-        message: message.to_owned(),
-        service_id,
-    };
-    append_automation_event(paths, &event)?;
-
-    let audit_watcher_id = (watcher_id != "rocmd").then(|| watcher_id.to_owned());
-    append_audit_event(
-        paths,
-        &AuditEventRecord {
-            at_unix_ms: now,
-            source: "rocmd".to_owned(),
-            category: "automation".to_owned(),
-            actor: audit_watcher_id
-                .as_deref()
-                .map_or_else(|| "rocmd".to_owned(), |id| format!("watcher:{id}")),
-            level: level.to_owned(),
-            action: action.to_owned(),
-            message: message.to_owned(),
-            watcher_id: audit_watcher_id,
-            service_id: event.service_id,
-        },
-    )
-}
-
 fn queue_proposal(
     paths: &AppPaths,
     watcher_id: &str,
@@ -5219,32 +5180,6 @@ fn proposal_arguments_for_action(action: &str, service_id: Option<&str>) -> Valu
         "prepare_driver_plan" => json!({}),
         _ => Value::Null,
     }
-}
-
-fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
-    let services_dir = paths.services_dir();
-    if !services_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut records = Vec::new();
-    for entry in fs::read_dir(&services_dir)
-        .with_context(|| format!("failed to read {}", services_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if let Ok(record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
-            records.push(record);
-        }
-    }
-
-    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
-    Ok(records)
 }
 
 #[cfg(unix)]
@@ -5478,7 +5413,7 @@ mod tests {
         // And the refusal must not have weakened what is on disk. The guard runs
         // before `record.write()` precisely so a refused attempt leaves the
         // recorded requirement armed for the next attempt.
-        let stored = load_managed_services(&paths).unwrap();
+        let stored = persistence::load_managed_services(&paths).unwrap();
         let stored = stored
             .iter()
             .find(|candidate| candidate.service_id == "svc-needs-key")
@@ -8003,52 +7938,6 @@ mod tests {
         fs::remove_dir_all(root).ok();
         assert_eq!(found.0.service_id, "svc-starting");
         assert_eq!(found.1, "manifest_status_starting_stale");
-        Ok(())
-    }
-
-    #[test]
-    fn record_event_mirrors_watcher_actions_to_audit_log() -> Result<()> {
-        let (root, paths) = temp_app_paths("record-event-audit");
-        let mut state = AutomationRuntimeState {
-            running: true,
-            automations_enabled: true,
-            daemon_pid: 1,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 1,
-            local_webhook_endpoint: None,
-            active_watchers: vec![WatcherRuntimeSnapshot {
-                id: "server-recover".to_owned(),
-                enabled: true,
-                mode: WatcherMode::Contained,
-                summary: "recover failed managed services".to_owned(),
-                last_event: None,
-                last_event_unix_ms: None,
-            }],
-        };
-
-        record_event(
-            &paths,
-            &mut state,
-            "server-recover",
-            "info",
-            "restart_managed_service",
-            "restarted failed managed service svc-1",
-            Some("svc-1".to_owned()),
-        )?;
-
-        let automation_text = fs::read_to_string(paths.automation_events_path())?;
-        let automation_event =
-            serde_json::from_str::<AutomationEventRecord>(automation_text.trim())?;
-        let audit_text = fs::read_to_string(paths.audit_events_path())?;
-        let audit_event = serde_json::from_str::<AuditEventRecord>(audit_text.trim())?;
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(automation_event.watcher_id, "server-recover");
-        assert_eq!(automation_event.action, "restart_managed_service");
-        assert_eq!(audit_event.category, "automation");
-        assert_eq!(audit_event.actor, "watcher:server-recover");
-        assert_eq!(audit_event.watcher_id.as_deref(), Some("server-recover"));
-        assert_eq!(audit_event.service_id.as_deref(), Some("svc-1"));
         Ok(())
     }
 
