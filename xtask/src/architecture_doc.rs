@@ -519,6 +519,17 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 Some(open) => Some(open),
                 None => Some((candidate.marker, candidate.run)),
             };
+            // A fence delimiter always interrupts an indented code block
+            // (`fence_line` only matches at indent <=3, so it can never be
+            // indented-code content itself) and the fence's own content
+            // supersedes whatever came before it — so, same fix as
+            // `prev_line_blank` above, this can't be left stale across the
+            // fence. Left stale, a citation on a 4+-space line immediately
+            // after a closing fence that itself followed an indented block
+            // was silently dropped: this flag was still `true` from before
+            // the fence, even though CommonMark requires an actual blank
+            // line (not a fence delimiter) to start an indented block.
+            in_indented_block = false;
             continue;
         }
         if fence.is_some() {
@@ -1484,6 +1495,27 @@ Prose citing `lib.rs` after the fence actually closes.
         assert!(
             citations.iter().any(|c| c.text == "lib.rs"),
             "expected lib.rs to be parsed as prose, not dropped as indented code"
+        );
+    }
+
+    #[test]
+    fn an_indented_citation_after_a_fence_following_an_indented_block_is_still_parsed() {
+        // Regression: `in_indented_block`, like `prev_line_blank` above, was
+        // only ever reset inside the loop body reached by lines that fall
+        // through past the fence checks — but a fence-delimiter line
+        // `continue`s before that point, for both its opening and closing
+        // line. So once a genuine indented code block set the flag `true`,
+        // it stayed `true` straight through a subsequent fenced block, even
+        // though the fence (CommonMark) ends any indented-code context it
+        // interrupts. The first 4+-space line after the fence's close was
+        // then wrongly treated as still-indented-code and dropped, even
+        // though it isn't preceded by an actual blank line — the only thing
+        // that can start a new indented block.
+        let markdown = "Prologue.\n\n    an indented block line, not a citation\n\n```\ncode\n```\n    `lib.rs` continues right after the fence, not preceded by a blank line.\n";
+        let citations = extract_path_citations(markdown);
+        assert!(
+            citations.iter().any(|c| c.text == "lib.rs"),
+            "expected lib.rs to be parsed as prose, not dropped as indented code: {citations:?}"
         );
     }
 
