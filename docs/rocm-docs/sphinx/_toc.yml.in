@@ -10,9 +10,10 @@ subtrees:
         title: See ROCm CLI in action
   - caption: Use ROCm CLI
     entries:
+      - file: commands
+        title: Command reference
       - file: engines/vllm
         title: vLLM adapter
-      - file: commands
   - caption: About
     entries:
       - file: about/contributing
