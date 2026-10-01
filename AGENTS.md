@@ -101,6 +101,31 @@ definitions when no existing scenario already covers it:
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
+**A message about the CLI's own behavior is asserted together with the behavior.** When a
+change adds or edits a line the CLI prints about what it just did, what it will do next,
+or what the user must do to recover, the covering test asserts the message *and* the
+resulting state in the same test. Three shapes need this:
+
+- claims of an outcome ("this becomes the active default runtime", "nothing was saved")
+- remediation advice naming a command — the named command must exist, accept those flags,
+  and actually clear the condition that printed it
+- promises that something will *not* happen ("no driver commands will be executed",
+  "never stops servers automatically"), which no happy-path test exercises
+
+A test that only pins the wording certifies the string, not the truth of it, and a pin
+over a false claim holds the claim in place. Where the text genuinely has to be pinned on
+its own, the assertion carries a comment naming the test that proves the behavior — see
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+which pins the onboarding line and points at
+`startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
+itself.
+
+The message and the code it describes are usually in different functions and often
+different files, so nothing links them by construction. Where the printed line can be
+derived from the same value the branch is taken on — as `preapproved_install_line` in
+`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
+computed from the decision cannot disagree with it.
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
