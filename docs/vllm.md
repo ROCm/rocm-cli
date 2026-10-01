@@ -80,14 +80,24 @@ ignored within a row, since AMD rotates those constantly.
 
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
-reports it would install, then reinstalls pinned to that exact version
-(tensorizer is the one package that stays a plain literal pin, since it has no
-ROCm-specific build to discover). Every resolved pin that carries a
+reports it would install, then reinstalls pinned to that exact version.
+tensorizer is not discovered or pinned this way: it has no ROCm-specific
+build, and vllm's own wheel metadata already declares an exact tensorizer
+dependency, so it is left to vllm's own dependency resolution rather than
+risk a conflicting pin of its own. Every resolved pin that carries a
 `+rocmX.Y` local version is checked against the SDK's own major.minor before
 installing, so an index that happens to serve more than one ROCm line at once
 cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
-fails rather than falling back to an unpinned or CPU install. Every other
+fails rather than falling back to an unpinned or CPU install. The final install
+of vllm/flash-attn/amd-aiter also resolves vllm's own plain-PyPI transitive
+dependencies (e.g. `lm-format-enforcer`), which AMD's index doesn't host; a
+generated `uv.toml` sets `ignore-error-codes = [403]` for that index so `uv`
+falls through to PyPI for those instead of treating the index's 403 as fatal.
+That same full-dependency resolve can also pull in an unconstrained `torch`
+from PyPI, undoing the exact ROCm pin just installed; the install re-pins
+torch back to it immediately afterwards.
+Every other
 ROCm SDK version, including 7.2.3, keeps using the static pin table; an SDK
 version with no matching row there falls back to the table's default pin,
 *unless* its major release matches a discovery-table entry, in which case
