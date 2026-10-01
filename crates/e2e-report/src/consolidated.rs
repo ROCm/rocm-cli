@@ -860,11 +860,18 @@ pub fn generate_consolidated(
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
     reports.sort_by(|a, b| {
-        (&a.desc.platform, &a.desc.os, a.desc.known_bugs).cmp(&(
-            &b.desc.platform,
-            &b.desc.os,
-            b.desc.known_bugs,
-        ))
+        (
+            &a.desc.platform,
+            &a.desc.os,
+            a.desc.known_bugs,
+            a.effective_channel(),
+        )
+            .cmp(&(
+                &b.desc.platform,
+                &b.desc.os,
+                b.desc.known_bugs,
+                b.effective_channel(),
+            ))
     });
 
     let now = now_utc();
@@ -940,11 +947,18 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
 
     let mut reports = reports;
     reports.sort_by(|a, b| {
-        (&a.desc.platform, &a.desc.os, a.desc.known_bugs).cmp(&(
-            &b.desc.platform,
-            &b.desc.os,
-            b.desc.known_bugs,
-        ))
+        (
+            &a.desc.platform,
+            &a.desc.os,
+            a.desc.known_bugs,
+            a.effective_channel(),
+        )
+            .cmp(&(
+                &b.desc.platform,
+                &b.desc.os,
+                b.desc.known_bugs,
+                b.effective_channel(),
+            ))
     });
 
     let mut out = String::from("## E2E consolidated report\n\n");
@@ -1621,7 +1635,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
             @for r in reports {
                 @let (total, pass, fail, skip, xf) = r.display_counts();
                 tr {
-                    td { (r.desc.platform) }
+                    td { (with_channel_suffix(&r.desc.platform, r.effective_channel())) }
                     td { (r.desc.os) }
                     td.num { (total) }
                     td.num { (pass) }
@@ -2715,6 +2729,84 @@ mod tests {
         assert!(
             md.contains("Uncovered commands ("),
             "uncovered fold missing:\n{md}"
+        );
+    }
+
+    #[test]
+    fn command_coverage_distinguishes_channels_on_same_platform() {
+        // Same platform_slug, release passing and nightly failing the same
+        // command: the coverage table must carry both channels as separate
+        // columns, not collapse them into one where the failure masks the pass.
+        let release_platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "release"}
+        }"#;
+        let nightly_platform = r#"{
+            "platform_slug": "mi300x",
+            "capability": {"effective_serve_engine": "vllm"},
+            "versions": {"channel": "nightly"}
+        }"#;
+        let commands = concat!(
+            r#"{"scenario":"s0","subcommand":"rocm serve Qwen/Qwen2.5-1.5B-Instruct --engine","model":"Qwen/Qwen2.5-1.5B-Instruct","engine":"vllm","rc":0}"#,
+            "\n",
+        );
+
+        let release_dir = tempfile::tempdir().expect("tempdir");
+        let release_report = release_dir.path().join("report.json");
+        std::fs::write(&release_report, feature_json(&[(&[], &["passed"])])).expect("write report");
+        std::fs::write(release_dir.path().join("platform.json"), release_platform)
+            .expect("write platform");
+        std::fs::write(release_dir.path().join("commands.jsonl"), commands)
+            .expect("write commands");
+
+        let nightly_dir = tempfile::tempdir().expect("tempdir");
+        let nightly_report = nightly_dir.path().join("report.json");
+        std::fs::write(&nightly_report, feature_json(&[(&[], &["failed"])])).expect("write report");
+        std::fs::write(nightly_dir.path().join("platform.json"), nightly_platform)
+            .expect("write platform");
+        std::fs::write(nightly_dir.path().join("commands.jsonl"), commands)
+            .expect("write commands");
+
+        let inputs = vec![
+            ("mi300x-release".to_string(), release_report),
+            ("mi300x-nightly".to_string(), nightly_report),
+        ];
+        let md = consolidated_summary_markdown(&inputs);
+
+        // Assert structure before glyphs: a column-collapse regression must
+        // fail loudly here rather than passing by reading the wrong cell.
+        let header = md
+            .lines()
+            .find(|l| l.contains("| Command | Engine |"))
+            .expect("coverage header row present");
+        let header_cells: Vec<&str> = header.split('|').map(str::trim).collect();
+        assert!(
+            header_cells.contains(&"Mi300x Linux (release)")
+                && header_cells.contains(&"Mi300x Linux (nightly)"),
+            "coverage header must carry both channels distinctly:\n{header}"
+        );
+
+        let row = md
+            .lines()
+            .find(|l| l.contains("rocm serve"))
+            .expect("serve command row present");
+        let row_cells: Vec<&str> = row.split('|').map(str::trim).collect();
+        let release_i = header_cells
+            .iter()
+            .position(|c| *c == "Mi300x Linux (release)")
+            .unwrap();
+        let nightly_i = header_cells
+            .iter()
+            .position(|c| *c == "Mi300x Linux (nightly)")
+            .unwrap();
+        assert_eq!(
+            row_cells[release_i], "✅",
+            "release column must show a pass:\n{row}"
+        );
+        assert_eq!(
+            row_cells[nightly_i], "❌",
+            "nightly failure must not be masked by release's pass:\n{row}"
         );
     }
 

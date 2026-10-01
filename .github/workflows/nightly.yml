@@ -471,8 +471,10 @@ jobs:
 
       # Channel-suffixed so the release and nightly matrix legs don't collide
       # within this run (actions/upload-artifact rejects duplicate names).
-      # Column identity in the e2e-report crate comes from platform.json's own
-      # content, not this label, so the suffix has no effect on grid rendering.
+      # The manifest's channel field (platform.json's versions.channel) is
+      # authoritative for column identity; this suffix is only the fallback
+      # the report reads when no manifest channel exists, so it must stay in
+      # sync with the values the descriptor parser strips.
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
