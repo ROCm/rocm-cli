@@ -12,6 +12,7 @@
 
 mod affected;
 mod architecture_doc;
+mod coverage;
 mod crate_edges;
 mod demos;
 mod e2e;
@@ -108,6 +109,19 @@ enum Command {
     /// expected location per citation; see `citation_exists`'s doc comment
     /// in `xtask/src/architecture_doc.rs` for the full rule.
     CheckArchitectureDoc,
+    /// Verify every workspace crate's line coverage against the per-crate
+    /// floors committed in `coverage-floors.toml`.
+    ///
+    /// Fails naming each crate that dropped below its floor, each crate with no
+    /// floor at all (so a new workspace member cannot land outside the gate),
+    /// and each floor whose crate no longer reports coverage. Requires
+    /// `cargo-llvm-cov`.
+    Coverage {
+        /// Rewrite `coverage-floors.toml` from the current measurement instead
+        /// of checking against it. Use after adding tests to ratchet a floor up.
+        #[arg(long)]
+        bless: bool,
+    },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -256,6 +270,7 @@ fn run() -> Result<()> {
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckArchitectureDoc => architecture_doc::run()?,
+        Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,

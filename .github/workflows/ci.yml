@@ -111,6 +111,10 @@ jobs:
               - 'rust-toolchain*'
               # clippy runs `cargo xtask manifest --check` against this file.
               - 'MANIFEST.md'
+              # The committed per-crate coverage floors. Listed so that lowering
+              # a floor re-runs the gate that floor controls, instead of being
+              # the one edit the coverage job never sees.
+              - 'coverage-floors.toml'
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
@@ -1054,9 +1058,17 @@ jobs:
         run: cargo xtask tpn --check
 
   coverage:
+    # The name is stale — this gate covers every workspace crate, not just the
+    # rocm-dash ones — but it is a required status check on `main`, and GitHub
+    # matches required checks by job name. Renaming it here without updating
+    # branch protection in the same moment would leave every subsequent pull
+    # request waiting on a check that can no longer report. Rename and update
+    # protection together, as their own change.
     name: Coverage (rocm-dash crates, ratcheted)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Raised from 20: the gate now instruments the whole workspace rather than
+    # four crates, so the build it waits on is several times larger.
+    timeout-minutes: 45
     needs: changes
     # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
     if: github.event_name != 'workflow_dispatch'
@@ -1090,19 +1102,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-cov-
 
-      # Ratcheted, fail-on-regression floor scoped to the transplanted rocm-dash
-      # crates (the clean anchor) — deliberately NOT the whole workspace, so the
-      # gate does not over-claim coverage of the large untyped rocm-cli core
-      # Baseline measured 2026-06-11: 73.7% lines across the four
-      # crates. Floor set just below measured; ratchet upward as the larger TUI
-      # tab files (bench/overview/modal) gain tests.
-      - name: Coverage gate (rocm-dash crates, >= 70% lines)
+      # Per-crate floors over every workspace crate, pinned in
+      # `coverage-floors.toml` and enforced by the xtask. The crate list lives
+      # in the xtask rather than here so a new workspace member cannot land
+      # outside the gate by nobody remembering to edit this file — the check
+      # fails on a crate with no floor.
+      #
+      # See `xtask/src/coverage.rs` for why the floors are per crate, and what
+      # this metric does and does not measure.
+      - name: Coverage floors (every crate)
         if: needs.changes.outputs.rust == 'true'
-        run: |
-          cargo llvm-cov --no-cfg-coverage \
-            -p rocm-dash-core -p rocm-dash-collectors \
-            -p rocm-dash-daemon -p rocm-dash-tui \
-            --fail-under-lines 70
+        run: cargo xtask coverage
 
   powershell-lint:
     # Runs the prek `powershell-script-analyzer` hook's logic (cargo xtask
