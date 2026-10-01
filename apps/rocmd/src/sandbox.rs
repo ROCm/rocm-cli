@@ -5,7 +5,8 @@
 use crate::cli::{SandboxToolArg, SandboxToolPolicy};
 use crate::common::{self, CommandCapture};
 use crate::persistence::load_managed_services;
-use crate::{ARTIFACT_PREFETCH_TIMEOUT, restart_managed_service, stop_managed_service};
+use crate::service::stop_managed_service;
+use crate::{ARTIFACT_PREFETCH_TIMEOUT, restart_managed_service};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,

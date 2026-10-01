@@ -240,7 +240,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Run {
             automations_enabled,
             local_webhook_port,
-        } => crate::run_daemon(&paths, automations_enabled, local_webhook_port).await?,
+        } => crate::service::run_daemon(&paths, automations_enabled, local_webhook_port).await?,
         Command::Supervise {
             service_id,
             engine,
@@ -253,7 +253,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             device_policy,
             gpu,
             engine_recipe_json,
-        } => crate::supervise_service(
+        } => crate::service::supervise_service(
             &paths,
             service_id,
             engine,
@@ -268,7 +268,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             engine_recipe_json,
         )?,
         Command::Status => {
-            crate::print_status(&paths)?;
+            crate::service::print_status(&paths)?;
         }
         Command::BridgeSnapshot { pretty } => {
             print_bridge_snapshot(&paths, pretty)?;

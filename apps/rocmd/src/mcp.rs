@@ -741,7 +741,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .get("service_id")
                 .and_then(Value::as_str)
                 .context("stop_server requires `service_id`")?;
-            let stopped = crate::stop_managed_service(paths, service_id)?;
+            let stopped = crate::service::stop_managed_service(paths, service_id)?;
             Ok(tool_success(
                 format!("Stopped managed service `{service_id}`."),
                 stopped,
