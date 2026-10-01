@@ -8848,11 +8848,9 @@ mod tests {
 
     /// A tag mismatch and a broken venv are different failures with different
     /// fixes, so the gate must not report one as the other.
+    #[cfg(unix)]
     #[test]
     fn python_gate_rejects_the_wrong_tag_without_blaming_the_venv() -> Result<()> {
-        if runtime_is_windows() {
-            return Ok(());
-        }
         let (root, _paths) = test_paths("python-gate-tag-mismatch");
         let bin_dir = root.join("bin");
         fs::create_dir_all(&bin_dir)?;
