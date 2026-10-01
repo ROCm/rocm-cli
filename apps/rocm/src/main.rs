@@ -18143,7 +18143,7 @@ fn run_internal_sandbox_tool(
         }
         SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires --service-id")?;
-            let service = restart_internal_managed_service(paths, &service_id)?;
+            let service = restart_internal_managed_service(paths, &service_id, None)?;
             serde_json::json!({
                 "tool": tool.as_cli_value(),
                 "status": "restarted",
@@ -18312,11 +18312,40 @@ fn unload_lemonade_service_model(record: &ManagedServiceRecord) -> Result<()> {
     }
 }
 
+/// Re-apply a caller's runtime pin to a record that was just loaded for a
+/// restart, in the same shape `pin_service_record_to_runtime` writes it: the
+/// exact runtime key, and no env pin.
+///
+/// Split out from [`restart_internal_managed_service`] so the pin can be
+/// asserted without launching an engine — see
+/// `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`.
+fn apply_restart_runtime_pin(record: &mut ManagedServiceRecord, runtime_pin: Option<&str>) {
+    if let Some(runtime_key) = runtime_pin {
+        record.runtime_id = Some(runtime_key.to_owned());
+        record.env_id = None;
+    }
+}
+
+/// Stop a managed service and bring it back up.
+///
+/// `runtime_pin` is for callers whose whole reason for restarting is to MOVE the
+/// service — `runtime_services::restart_service_onto_runtime`. Passing the key
+/// here is not a convenience over writing the record first: `load_managed_service`
+/// below refreshes the record from the engine state file written by the process
+/// being replaced, which re-adopts THAT process's `runtime_id` and `env_id`. For
+/// a plain restart that is correct, since the record should describe what is
+/// actually running. For a move it silently undoes the re-pin — the previous
+/// `env_id` comes back, and `builtin_engine_serve_http_args` omits `--runtime-id`
+/// whenever `env_id` is set, so the child would resolve a runtime for itself and
+/// come back up on the one it was already using while the record claimed the new
+/// key. `None` leaves the refreshed record exactly as it was.
 fn restart_internal_managed_service(
     paths: &AppPaths,
     service_id: &str,
+    runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
     let mut record = load_managed_service(paths, service_id)?;
+    apply_restart_runtime_pin(&mut record, runtime_pin);
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
     // deletes the key file (correct on a real stop), but a restart must bring the
     // service back on the same public host with the same auth. Capture it first and
@@ -30031,7 +30060,7 @@ install therock";
         record.write()?;
 
         // No key file: the situation after a stop, which drops it.
-        let error = restart_internal_managed_service(&paths, "vllm-public-2000")
+        let error = restart_internal_managed_service(&paths, "vllm-public-2000", None)
             .expect_err("a keyless public service must not be restarted");
         let rendered = format!("{error:#}");
         assert!(
@@ -30119,7 +30148,7 @@ install therock";
         record.status = "running".to_owned();
         record.write().unwrap();
 
-        let error = restart_internal_managed_service(&paths, service_id).unwrap_err();
+        let error = restart_internal_managed_service(&paths, service_id, None).unwrap_err();
         assert!(
             error.to_string().contains("without authentication"),
             "{error:#}"
@@ -34162,6 +34191,128 @@ ID_LIKE="suse opensuse"
         );
         assert_eq!(restored.runtime_id.as_deref(), Some(OLD_RUNTIME_KEY));
         assert_eq!(restored.env_id.as_deref(), Some("custom-env"));
+        Ok(())
+    }
+
+    /// Rebuild the child's argv the way `restart_internal_managed_service`
+    /// does: from the record as that function holds it, after its own load and
+    /// after `apply_restart_runtime_pin`. Every field is read off the record for
+    /// that reason — a helper that took the runtime key as a parameter would
+    /// assert nothing about which record state the restart actually sees.
+    fn restart_child_argv_for_record(record: &ManagedServiceRecord) -> Result<Vec<String>> {
+        let policy = parse_device_policy(record.device_policy.as_deref())?;
+        let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
+        builtin_engine_serve_http_args(
+            &record.engine,
+            &record.service_id,
+            &record.canonical_model_id,
+            &record.host,
+            record.port,
+            &policy,
+            &record.gpu_indices,
+            record.runtime_id.as_deref(),
+            record.env_id.as_deref(),
+            recipe.as_ref(),
+            &record.engine_state_path,
+            Some(&record.log_path),
+        )
+    }
+
+    /// The value following `flag` in an argv, or `None` when the flag is absent.
+    fn argv_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    /// The runtime pin a `--restart-services` restart moves a server with, at
+    /// the only place it is observable without launching an engine: the argv the
+    /// restarted child is given.
+    ///
+    /// The sibling test above asserts the record's fields; that is not the same
+    /// claim. `builtin_engine_serve_http_args` omits `--runtime-id` whenever
+    /// `env_id` is set, so what the record says and what the child is told can
+    /// differ — and it is the child's argv that decides which runtime comes back
+    /// up.
+    ///
+    /// The setup is what makes this non-vacuous, and it is the case the MI300X
+    /// lane failed on rather than an invented one. The service being moved is
+    /// still running when the restart loads its record, so its engine state file
+    /// still describes it, and `refresh_from_engine_state` re-adopts that
+    /// process's `runtime_id` and `env_id` over the pin
+    /// `pin_service_record_to_runtime` had just written. `without_pin` below is
+    /// that load: the disk says the new runtime, the loaded record says the old
+    /// one, and the argv carries no `--runtime-id` at all because the revived
+    /// `env_id` suppresses it. Deleting the body of `apply_restart_runtime_pin`
+    /// makes `with_pin` identical to it, and the last two assertions fail.
+    ///
+    /// What it does not reach: that `restart_internal_managed_service` calls
+    /// `apply_restart_runtime_pin` at all, or that the child launched with this
+    /// argv loads that runtime. The first needs a spawn, the second a GPU —
+    /// `runtime-lifecycle-10` is where both are observed.
+    #[test]
+    fn pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv() -> Result<()> {
+        let (root, paths) = test_paths("service-runtime-pin-argv");
+        paths.ensure()?;
+        let planted = plant_service_record_on_runtime(
+            &paths,
+            "svc-argv",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            Some("custom-env"),
+        )?;
+        // The outgoing process's own state, in the shape vLLM writes it: the
+        // family form it resolved, and an `env_id` it records on every launch
+        // whether or not the user asked for one.
+        fs::write(
+            &planted.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "starting",
+                "runtime_id": "therock-release:gfx120X-all",
+                "env_id": "custom-env",
+            }))?,
+        )?;
+
+        runtime_services::pin_service_record_to_runtime(&paths, "svc-argv", NEW_RUNTIME_KEY)?;
+        // Read before the load below, which may itself write the refreshed
+        // record back over the pin.
+        let on_disk = fs::read_to_string(paths.service_manifest_path("svc-argv"))?;
+        let mut loaded_for_restart = load_managed_service(&paths, "svc-argv")?;
+        let without_pin = restart_child_argv_for_record(&loaded_for_restart)?;
+        apply_restart_runtime_pin(&mut loaded_for_restart, Some(NEW_RUNTIME_KEY));
+        let with_pin = restart_child_argv_for_record(&loaded_for_restart)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            on_disk.contains(NEW_RUNTIME_KEY),
+            "the pin reached the record on disk, so what follows is the refresh \
+             undoing it rather than the write never happening: {on_disk}"
+        );
+        assert_eq!(
+            argv_flag_value(&without_pin, "--runtime-id"),
+            None,
+            "the record loaded for the restart has had the outgoing process's \
+             `env_id` restored over the pin, and that alone drops the runtime \
+             pin from the child's argv: {without_pin:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&without_pin, "--env-id"),
+            Some("custom-env"),
+            "which is the engine's own env coming back, not the user's: {without_pin:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&with_pin, "--runtime-id"),
+            Some(NEW_RUNTIME_KEY),
+            "re-applying the pin after the refresh is what makes the restarted \
+             child load the runtime that was just activated: {with_pin:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&with_pin, "--env-id"),
+            None,
+            "clearing `env_id` is half the pin, not tidying: leaving it set \
+             would suppress the `--runtime-id` asserted above: {with_pin:?}"
+        );
         Ok(())
     }
 
@@ -38377,6 +38528,39 @@ ID_LIKE="suse opensuse"
                 recorded: "therock-release:gfx120X-all".to_owned()
             },
             "an ambiguous family id is reported rather than assumed correct"
+        );
+
+        // The family-resolution arm itself, which the ambiguous case above does
+        // not reach: one install carrying the family id resolves to it, and a
+        // server already on the runtime being activated must not be reported as
+        // left behind — `--restart-services` would otherwise stop and respawn it
+        // for nothing.
+        let one_install_of_the_family = vec![test_runtime_manifest_for_update(
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "gfx120X-all",
+            "7.13.0",
+        )];
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(
+                &record,
+                &one_install_of_the_family,
+                NEW_RUNTIME_KEY
+            ),
+            runtime_services::ServiceRuntimeState::Matches,
+            "an unambiguous family id resolves to the install that carries it"
+        );
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(
+                &record,
+                &one_install_of_the_family,
+                OLD_RUNTIME_KEY
+            ),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: "therock-release:gfx120X-all".to_owned()
+            },
+            "resolving is not excusing: the same family id is stale against a \
+             runtime it does not resolve to"
         );
 
         record.runtime_id = None;

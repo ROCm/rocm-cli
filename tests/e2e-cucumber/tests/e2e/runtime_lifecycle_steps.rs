@@ -792,18 +792,30 @@ async fn rollback_after_reactivation_reaches_first(world: &mut E2eWorld) {
 #[then("re-activating that runtime reports the service already on it")]
 async fn reactivating_reports_the_service_already_on_the_runtime(world: &mut E2eWorld) {
     // The endpoint check above proves a server is serving; it cannot prove WHICH
-    // runtime that server loaded, and the failure this path exists to prevent is
-    // silent — `restart_service_onto_runtime` re-pins before restarting because
-    // `restart_internal_managed_service` rebuilds argv from the record on disk,
-    // so transposing the two brings the engine back up on the runtime it was
-    // already using and still reports success.
+    // runtime that server loaded. This step reads that back: the reconciler
+    // refreshes every record from the engine state before classifying it, so a
+    // server the activation left behind is named here rather than merely
+    // implied.
     //
-    // Re-running the activation is what distinguishes them: the reconciler reads
-    // every record through `load_managed_services`, whose
-    // `refresh_from_engine_state` adopts the runtime the ENGINE actually
-    // launched with, overwriting the pin. So a respawn onto the old runtime
-    // surfaces here as a service left behind, while a correct one is `Matches`
-    // and reported nowhere.
+    // What this step does NOT prove is the pin-before-restart order inside
+    // `restart_service_onto_runtime`. A child launched without `--runtime-id`
+    // resolves a runtime itself and reports the manifest's family id, and
+    // `classify_service_runtime_state` resolves an unambiguous family id back to
+    // the install carrying it — so on a tree with one install of the family the
+    // transposed order also reports zero here. That order is asserted by the
+    // unit test
+    // `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`
+    // in `apps/rocm/src/main.rs`, which compares the child's argv under both.
+    //
+    // What re-running the activation does catch: the reconciler reads every
+    // record through `load_managed_services`, whose `refresh_from_engine_state`
+    // adopts the runtime the ENGINE actually launched with, overwriting the pin.
+    // A respawn that came back on a runtime which does not resolve to the one
+    // just activated is named here as left behind, and one that came back
+    // recording no runtime at all is named under
+    // `services_with_unrecorded_runtime` — neither of which the report's
+    // `services_restarted: 1` line, written before the record is re-read, can
+    // tell apart from a clean move.
     //
     // Not vacuous through a dead service: a service that is not live is skipped
     // by the reconciler and would also produce a zero count — but the preceding
@@ -814,9 +826,9 @@ async fn reactivating_reports_the_service_already_on_the_runtime(world: &mut E2e
     let out = ok_output(world);
     assert!(
         out.contains("services_on_previous_runtime: 0"),
-        "the restarted server must be on the runtime that was just activated; a \
-         non-zero count here is the respawn having come back on the runtime it \
-         was already using:\n{}",
+        "the restarted server must read back as being on the runtime that was \
+         just activated; a non-zero count here is the respawn having come back \
+         on a runtime that does not resolve to it:\n{}",
         combined(world)
     );
     assert!(

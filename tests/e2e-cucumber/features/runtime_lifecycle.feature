@@ -97,14 +97,19 @@ Feature: Runtime lifecycle state machine
   # rc=0, and the report names it under `services_restarted` rather than
   # `services_on_previous_runtime`.
   #
-  # The closing step is what makes this a test of the RESTART rather than of the
-  # report. `restart_service_onto_runtime` re-pins the record before restarting,
-  # because the restart rebuilds argv from the record on disk; transposing the
-  # two brings the engine back up on the runtime it was already using and still
-  # reports success, because the entry moves to `services_restarted` either way
-  # and the endpoint answers either way. Re-activating reads the record back
-  # through `refresh_from_engine_state`, which adopts the runtime the engine
-  # really launched with — so the wrong runtime surfaces there and nowhere else.
+  # The closing step reads the record back through `refresh_from_engine_state`,
+  # which adopts the runtime the engine really launched with, and asserts the
+  # activation finds nothing left behind. What it does NOT do is police the
+  # pin-before-restart order inside `restart_service_onto_runtime`: an engine
+  # that resolved a runtime for itself reports the manifest's family id, and
+  # `classify_service_runtime_state` resolves an unambiguous family id back to
+  # the install that carries it — so with a single install of the family, which
+  # is what this tree normally has, the transposed order reports `Matches` too.
+  # That ordering is pinned instead by the unit test
+  # `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`,
+  # which asserts the child's argv under both orders and needs no GPU. This
+  # scenario's job is the user-visible half: rc=0, the report's counts, and a
+  # server that answers afterwards.
   #
   # Why @requires-gpu: `restart_internal_managed_service` stops the engine process
   # and waits up to 45 s on a real HTTP readiness probe before returning, so no

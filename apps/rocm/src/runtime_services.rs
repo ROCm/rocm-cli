@@ -357,13 +357,33 @@ pub(crate) fn service_still_serving(
 
 /// Rewrite the service record onto `runtime_key`, THEN restart it.
 ///
-/// The order is load-bearing. `restart_internal_managed_service` rebuilds the
-/// child's argv from the record on disk and passes `record.runtime_id`
-/// verbatim, so restarting first would bring the service back up on the runtime
-/// it was already using and report success — the very bug this path exists to
-/// fix. The restart itself goes through the unchanged managed-serve path, so
-/// device policy (including gpu_required) is validated exactly as it is for a
-/// fresh `rocm serve`.
+/// Two things carry the new runtime, and both are needed.
+///
+/// The **write** comes first because the report and a restart that fails before
+/// anything is stopped are both read from the record on disk, and because it is
+/// what captures the pin to restore. The restart itself goes through the
+/// unchanged managed-serve path, so device policy (including gpu_required) is
+/// validated exactly as it is for a fresh `rocm serve`.
+///
+/// The **argument** is what reaches the child, because the write does not.
+/// `restart_internal_managed_service` loads the record through
+/// `load_managed_service`, whose `refresh_from_engine_state` re-adopts the
+/// `runtime_id` and `env_id` written by the process being replaced — it is still
+/// running at that point, and its state file still describes it. The pin written
+/// a line earlier is therefore overwritten in memory before the argv is built,
+/// and the restored `env_id` alone is enough to drop `--runtime-id`, which
+/// brings the service back up on the runtime it was already using while the
+/// record claims the new key — the very bug this path exists to fix. The MI300X
+/// lane caught exactly this: a restart the report counted as successful came
+/// back on the engine's own resolution, and re-activating named the service as
+/// still on the previous runtime.
+///
+/// Asserted, not merely argued, by
+/// `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`
+/// in `main.rs`, which builds the child's argv from a record loaded over a live
+/// engine state file, with and without the pin. The e2e scenario
+/// `runtime-lifecycle-10` covers the user-visible success path but cannot
+/// separate the two orders on its own — see the note on its closing step.
 ///
 /// The record's `env_id` is cleared in the same write, and that is equally
 /// load-bearing: `builtin_engine_serve_http_args` leaves `--runtime-id` out of
@@ -386,7 +406,12 @@ pub(crate) fn restart_service_onto_runtime(
     runtime_key: &str,
 ) -> Result<()> {
     let previous_pin = pin_service_record_to_runtime(paths, service_id, runtime_key)?;
-    match restart_internal_managed_service(paths, service_id) {
+    // The key is handed to the restart as well as written to the record. The
+    // write is what the report and a failed restart's restore are read from; the
+    // argument is what survives the refresh the restart's own load performs
+    // against the outgoing process's engine state. Dropping either one brings
+    // the service back on the runtime it was already using.
+    match restart_internal_managed_service(paths, service_id, Some(runtime_key)) {
         Ok(_) => Ok(()),
         // A restore that fails is reported with the restart failure rather than
         // swallowed: silently keeping the new key would leave the record
