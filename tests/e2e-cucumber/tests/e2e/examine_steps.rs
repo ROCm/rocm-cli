@@ -908,3 +908,108 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
          ({major}.{minor}.{revision} = {expected})\n{output}"
     );
 }
+
+/// The `gfx_target_version` of every GPU the KFD topology describes, read
+/// straight from sysfs.
+///
+/// `None` when the topology is unreadable, which is the normal case off Linux.
+/// CPU nodes report a `gfx_target_version` of `0` and are skipped, so the length
+/// is the kernel's own GPU count and the values say whether those GPUs are all
+/// the same part.
+fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
+        .ok()?
+        .flatten()
+    {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let version = properties.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "gfx_target_version" {
+                return None;
+            }
+            parts.next()?.parse::<u32>().ok()
+        });
+        if let Some(value) = version.filter(|value| *value != 0) {
+            versions.push(value);
+        }
+    }
+    Some(versions)
+}
+
+/// Whether `lspci` is on PATH, which is what supplies the PCI addresses this
+/// step asserts. Without it the CLI's topology fallback is the right answer and
+/// there is nothing here to check.
+fn host_has_lspci() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
+}
+
+#[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
+async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
+    let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
+        return;
+    };
+    if !host_has_lspci() {
+        return;
+    }
+    let expected = versions.len();
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .expect("`examine --json` did not report a gpus array");
+    let amd: Vec<&serde_json::Value> = gpus
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+
+    assert_eq!(
+        amd.len(),
+        expected,
+        "the kernel describes {expected} GPU node(s) but the report lists {} AMD GPU(s): {gpus:#?}",
+        amd.len()
+    );
+    for gpu in &amd {
+        let pci_id = gpu
+            .get("pci_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !pci_id.is_empty(),
+            "an AMD GPU was reported without a PCI address, so it came from the \
+             topology fallback rather than the PCI enumeration: {gpu:#?}"
+        );
+    }
+
+    // The other half of the enumeration: each listed card must also carry the
+    // target the kernel attributes to it. `lspci` cannot supply one -- it reads
+    // a marketing name, and on an Instinct host `pci.ids` often spells that
+    // "Device 74a1" -- so on a box without `rocminfo` the per-node target from
+    // the topology is the only thing that can fill `gfx_target`, and that fill
+    // is what makes the field non-empty here.
+    //
+    // Gated on the topology being uniform, on the same premise-failure footing
+    // as the guards above: where nodes disagree, which target belongs to which
+    // card is a question this step cannot answer from a node count alone, so it
+    // says nothing rather than something it has not established. The other
+    // premise -- node count equal to the number of AMD entries -- is already
+    // guaranteed by the assertion above, which fails first if it does not hold.
+    if versions.iter().any(|version| *version != versions[0]) {
+        return;
+    }
+    for gpu in &amd {
+        let gfx_target = gpu
+            .get("gfx_target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !gfx_target.is_empty(),
+            "the kernel describes {expected} GPU node(s) all of one target, but an AMD GPU was \
+             reported with no gfx_target, so the topology's target never reached the report: \
+             {gpu:#?}"
+        );
+    }
+}
