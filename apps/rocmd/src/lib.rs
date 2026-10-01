@@ -2526,6 +2526,14 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
         // itself reopen onboarding). Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
         Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
+        // `remote targets` reads the local tailnet, `doctor` fetches another
+        // machine's state and scores it here, `status` probes sessions that
+        // already exist. None of them change anything on either machine.
+        // `serve`, `attach` and `stop` start, publish or tear down, so they stay
+        // off the list and go through the approval UI like any other mutation.
+        Some("remote") => second
+            .as_deref()
+            .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")),
         _ => false,
     };
     if read_only {
@@ -3253,6 +3261,32 @@ fn supervise_service(
     );
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
+    // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts
+    // this false, so rebuilding a record here without restoring it would not
+    // just skip the check now — it would write the weakened record back and
+    // disarm every later `rocm services restart` as well.
+    //
+    // Propagated, not defaulted. This read arms the guard below, so it is not
+    // best-effort the way an identical-looking call feeding a printed warning
+    // would be. `load_managed_services` already *skips* unparseable records, so
+    // an `Err` here is a real I/O failure — and a missing directory is `Ok`
+    // anyway. Swallowing it would say "no service ever required a key", the
+    // key-file fallback is false precisely when a service has been stopped, and
+    // the weakened record would then be written back at the bottom of this
+    // function. That is the outcome the comment above says must not happen.
+    let previously_required = load_managed_services(paths)
+        .context(
+            "could not read the service registry to check whether this service requires an \
+             endpoint API key; refusing to recover it rather than assume it does not",
+        )?
+        .iter()
+        .any(|existing| existing.service_id == record.service_id && existing.requires_api_key);
+    // Only what the registry recorded. The `|| key-file-is-present` clause that
+    // used to be here re-derived the flag the same way `spawn_managed_engine_child`
+    // did, and was wrong for the same reason: a public bind always has a key file
+    // whether or not auth was ever demanded, so recovery re-armed this on services
+    // that never asked for it and refused them with the wrong remediation.
+    record.requires_api_key = previously_required;
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
@@ -3262,6 +3296,7 @@ fn supervise_service(
         rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
             .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
             .is_some(),
+        record.requires_api_key,
     )?;
     record.write()?;
 
@@ -3300,7 +3335,11 @@ fn supervise_service(
     // no auth, so fail closed instead — an unreachable service is recoverable,
     // an anonymous public one is not.
     let endpoint_key_applied = apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    ensure_public_service_has_endpoint_key(&record.host, endpoint_key_applied)?;
+    ensure_public_service_has_endpoint_key(
+        &record.host,
+        endpoint_key_applied,
+        record.requires_api_key,
+    )?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -4822,6 +4861,7 @@ fn handle_server_recover_event_with_record(
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
                     .is_some(),
+                record.requires_api_key,
             ) {
                 return record_event(
                     paths,
@@ -5225,6 +5265,261 @@ mod tests {
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    #[test]
+    fn recovery_refuses_a_service_that_lost_a_key_it_was_launched_with() {
+        // The daemon keeps its own copy of this guard, and it only knew about
+        // public binds. A loopback service that something republishes — a
+        // tailnet publish outlives this daemon, let alone the process — would
+        // be recovered without authentication, and the rebuilt record would
+        // then disarm `rocm services restart` too.
+        for host in ["127.0.0.1", "localhost", "::1"] {
+            let error = super::ensure_public_service_has_endpoint_key(host, false, true)
+                .expect_err("a service launched with a key must not be recovered without one");
+            assert!(
+                format!("{error:#}").contains("without authentication"),
+                "{error:#}"
+            );
+        }
+        // With the key still present, recovery proceeds.
+        super::ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
+        // And a service that never had one is untouched.
+        super::ensure_public_service_has_endpoint_key("127.0.0.1", false, false).unwrap();
+    }
+
+    #[test]
+    fn remote_read_only_verbs_are_allowed_and_mutating_ones_are_not() {
+        let allow = |args: &[&str]| {
+            let owned = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+            super::ensure_rocm_command_is_read_only(&owned)
+        };
+
+        // These read: the local tailnet, another machine's state, sessions that
+        // already exist. Rejecting them made the whole family unusable here even
+        // though none of them change anything.
+        for args in [
+            &["remote", "targets"][..],
+            &["remote", "targets", "--tag", "gpu"][..],
+            &["remote", "doctor", "gpu-box"][..],
+            &["remote", "status"][..],
+        ] {
+            allow(args).unwrap_or_else(|error| panic!("{args:?} should be read-only: {error:#}"));
+        }
+
+        // These start, publish or tear down, so they go through approval.
+        for args in [
+            &["remote", "serve", "gpu-box", "a-model"][..],
+            &["remote", "attach", "sess"][..],
+            &["remote", "stop", "sess"][..],
+            &["remote"][..],
+        ] {
+            assert!(allow(args).is_err(), "{args:?} must not be read-only");
+        }
+    }
+
+    /// Drive `supervise_service` far enough to reach the key guard, and return
+    /// what it did.
+    ///
+    /// The guard sits before the manifest write and well before any spawn, so a
+    /// refusal returns without starting a process — which is what makes the real
+    /// call site testable at all. The arguments below are the shape a recovery
+    /// re-exec passes: a loopback bind, no GPU, no recipe.
+    ///
+    /// This exists because testing `ensure_public_service_has_endpoint_key`
+    /// directly with literal arguments cannot catch the defect that actually
+    /// happened twice in this crate's history — the guard being *wired up* with
+    /// the wrong value at its call site.
+    ///
+    /// Bounded, and the bound is the assertion. A guard that fails to refuse
+    /// does not return an error — it falls through to the engine spawn and
+    /// supervises a child that never exits, so an unbounded call would hang the
+    /// suite instead of failing it. Both callers below are regression tests for
+    /// a fail-*open*, which is exactly the shape that turns into a hang.
+    fn supervise_at_the_guard(paths: &AppPaths, service_id: &str) -> Result<()> {
+        let paths = paths.clone();
+        let service_id = service_id.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = supervise_service(
+                &paths,
+                service_id,
+                "llamacpp".to_owned(),
+                "a-model".to_owned(),
+                "a-model".to_owned(),
+                None,
+                None,
+                "127.0.0.1".to_owned(),
+                11434,
+                "gpu_required".to_owned(),
+                None,
+                None,
+            );
+            let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "supervise_service did not return within 30s: the key guard let the call \
+                     through and it reached the engine spawn, which is the fail-open this test \
+                     exists to catch"
+                )
+            })
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Write a service record into the registry the way a live service would
+    /// have left it behind.
+    fn seed_registry(paths: &AppPaths, service_id: &str, requires_api_key: bool) {
+        fs::create_dir_all(paths.services_dir()).unwrap();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id.to_owned(),
+            "llamacpp".to_owned(),
+            "a-model".to_owned(),
+            "a-model".to_owned(),
+            "127.0.0.1".to_owned(),
+            11434,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.requires_api_key = requires_api_key;
+        record.write().unwrap();
+    }
+
+    /// Drive `supervise_service` and report whether the key guard let it past.
+    ///
+    /// Decided on what the call *returns*, not on any file. The obvious
+    /// observable — the manifest appearing — is useless here, because
+    /// `seed_registry` has already written one, so polling for it passes
+    /// whatever the guard does. That mistake was made first and caught by
+    /// mutating the code the test claims to protect.
+    ///
+    /// A call the guard admits does not return: it carries on to the engine
+    /// spawn. So the guard's refusal is the only thing that comes back quickly,
+    /// and it is identified by its message rather than by the mere fact of an
+    /// error — a later, unrelated failure must not read as a refusal.
+    fn guard_admits(paths: &AppPaths, service_id: &str) -> bool {
+        let owned_paths = paths.clone();
+        let owned_id = service_id.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = supervise_service(
+                &owned_paths,
+                owned_id,
+                "llamacpp".to_owned(),
+                "a-model".to_owned(),
+                "a-model".to_owned(),
+                None,
+                None,
+                "127.0.0.1".to_owned(),
+                11434,
+                "gpu_required".to_owned(),
+                None,
+                None,
+            );
+            let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            // The key guard refused, by its own words.
+            Ok(Err(rendered)) if rendered.contains("without authentication") => false,
+            // Anything else means it got past the guard: it either finished, or
+            // failed later for a reason that is not this guard, or is still
+            // running because it reached the spawn.
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn a_service_that_never_required_a_key_is_not_refused_for_lacking_one() {
+        // The other direction of the guard, and the one no test covered.
+        // Hardcoding `record.requires_api_key = true` at the restore site passes
+        // every other test in this crate, because they all seed a service that
+        // *does* require a key. This is the case that catches it.
+        //
+        // Two records are seeded, not one: with a single record the
+        // `existing.service_id == record.service_id` half of the lookup does
+        // nothing, so dropping that comparison would go unnoticed and one
+        // service's requirement would leak onto another's.
+        let (root, paths) = temp_app_paths("supervise-no-key-needed");
+        seed_registry(&paths, "svc-needs-key", true);
+        seed_registry(&paths, "svc-plain", false);
+
+        assert!(
+            guard_admits(&paths, "svc-plain"),
+            "a loopback service that never asked for a key must not be refused for lacking one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn supervising_a_service_that_required_a_key_refuses_when_the_key_is_gone() {
+        // The real call site, not the guard in isolation. `supervise_service`
+        // rebuilds the record with `ManagedServiceRecord::new`, which starts
+        // `requires_api_key` false, and restores it from the registry. Passing
+        // the wrong value here — a literal, or the freshly-built field before it
+        // is restored — is exactly the miswiring that shipped twice in this
+        // crate and that a literal-argument unit test cannot see.
+        let (root, paths) = temp_app_paths("supervise-requires-key");
+        seed_registry(&paths, "svc-needs-key", true);
+
+        let error = supervise_at_the_guard(&paths, "svc-needs-key")
+            .expect_err("a service that required a key must not be recovered without one");
+        assert!(
+            format!("{error:#}").contains("without authentication"),
+            "{error:#}"
+        );
+
+        // And the refusal must not have weakened what is on disk. The guard runs
+        // before `record.write()` precisely so a refused attempt leaves the
+        // recorded requirement armed for the next attempt.
+        let stored = load_managed_services(&paths).unwrap();
+        let stored = stored
+            .iter()
+            .find(|candidate| candidate.service_id == "svc-needs-key")
+            .expect("the seeded record must survive a refused recovery");
+        assert!(
+            stored.requires_api_key,
+            "a refused recovery must not disarm the requirement"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_read_refuses_recovery_rather_than_assuming_no_key() {
+        // `load_managed_services` already skips records it cannot parse, so an
+        // `Err` from it is a real I/O failure — and a missing directory is `Ok`.
+        // Defaulting it away therefore says "no service ever required a key",
+        // which is fail-open on an auth gate and, worse, gets written back.
+        //
+        // The failure is provoked portably: a directory named like a record
+        // makes the `fs::read` inside the loop fail rather than the read_dir.
+        let (root, paths) = temp_app_paths("supervise-unreadable-registry");
+        fs::create_dir_all(paths.services_dir().join("not-a-record.json")).unwrap();
+
+        let error = supervise_at_the_guard(&paths, "svc-unknown")
+            .expect_err("an unreadable registry must refuse, not assume no key was required");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("could not read the service registry"),
+            "{rendered}"
+        );
+
+        // Nothing was written: a registry we could not read is not a registry we
+        // may add a weakened record to.
+        assert!(
+            !paths.service_manifest_path("svc-unknown").exists(),
+            "a refused recovery must not persist a record"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// Regression: a failed write must not leave a `.tmp-*` scratch file
     /// behind. The name is unique per attempt, so before this an orphan
@@ -7592,15 +7887,15 @@ mod tests {
         // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
         // the key gone the child would listen on that public host anonymously,
         // so the spawn must be refused instead.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
+        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
         assert!(
             error.to_string().contains("without authentication"),
             "{error:#}"
         );
 
-        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
+        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
         for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false)
+            ensure_public_service_has_endpoint_key(host, false, false)
                 .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
         }
     }
@@ -9562,7 +9857,24 @@ fn apply_endpoint_key_env(
 /// Mirrors the guard of the same name in `rocm`; the shared
 /// [`rocm_engine_protocol::is_public_bind_host`] keeps the two classifications
 /// identical for a given `ManagedServiceRecord::host`.
-fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
+fn ensure_public_service_has_endpoint_key(
+    host: &str,
+    key_present: bool,
+    requires_api_key: bool,
+) -> Result<()> {
+    // The bind address is not the whole story. A service bound to loopback is
+    // only private until something republishes the port, and a tailnet publish
+    // outlives both the process and this daemon. The requirement is recorded on
+    // the service precisely so recovery can honour it without re-deriving it
+    // from an address that no longer answers the question.
+    if requires_api_key && !key_present {
+        bail!(
+            "refusing to recover a service that was launched with an endpoint API key but no \
+             longer has one: it would come back up without authentication, and something \
+             outside this machine may still be publishing its port. Relaunch it with \
+             `rocm serve --require-api-key` to issue a new key."
+        );
+    }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
         bail!(
             "refusing to respawn a service bound to the public host `{host}` without an endpoint \

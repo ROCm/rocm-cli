@@ -24,12 +24,14 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("artifact_prefetch.feature", "artifact-prefetch"),
     ("automations.feature", "automations"),
     ("bench.feature", "bench"),
+    ("bootstrap.feature", "bootstrap"),
     ("chat.feature", "chat"),
     ("comfyui.feature", "comfyui"),
     ("config.feature", "config"),
     ("dash.feature", "dash"),
     ("dependency_guard.feature", "deps-guard"),
     ("diagnose.feature", "diagnose"),
+    ("download_progress_pty.feature", "download-progress"),
     ("driver_install.feature", "driver-install"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
@@ -37,6 +39,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
+    ("remote.feature", "remote"),
     // Not `runtime`: `runtime_setup.feature` owns that key, and two files
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),

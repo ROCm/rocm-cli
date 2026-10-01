@@ -175,6 +175,29 @@ Feature: GPU detection and system inspection
     When the user inspects the system both for reading and for scripting
     Then the framework report names the runtime's interpreter
 
+  # EAI-8950. The text form repairs a lost registry entry from the install tree
+  # before rendering (`recover_setup_runtime_registration`), so it names the
+  # folder; `--json` skips that call because it writes, and used to answer
+  # `active_runtime_root: null` with no folder anywhere in the document. The
+  # folder is reachable from config without the registry and without writing,
+  # which is what these fields carry.
+  #
+  # The order of the two runs is load-bearing: the `Given` plants an install
+  # tree the text form CAN repair from, so running it first would hand `--json`
+  # an `active_runtime_root` it is supposed to have no way to resolve. The
+  # machine-readable form goes FIRST, while the registry is still empty; the
+  # text form follows so the two answers can be held against each other.
+  #
+  # No GPU needed: config and install tree are planted, and the isolated
+  # registry is empty by design (see `E2eWorld::default`) — which is precisely
+  # the missing-entry state under test.
+  @id:examine-json-names-the-setup-runtime-folder
+  Scenario: examine-16 - The scripting form names the setup runtime folder unaided
+    Given setup names a runtime folder the registry has forgotten
+    When the user inspects the system for scripting before reading
+    Then the machine-readable form names the setup runtime folder
+    And it does not pass that folder off as the active runtime's
+
   # The help's own worked examples are the first thing a new user copies, so a
   # model named there has to be one this CLI can actually serve. The check
   # accepts either form the README documents — a name the model listing knows,
@@ -185,7 +208,7 @@ Feature: GPU detection and system inspection
   # real catalog alias), so this ships as a guard rather than an expected
   # failure.
   @id:examine-help-serve-example-names-a-resolvable-model
-  Scenario: examine-16 - Every model the help offers as an example is one the CLI can resolve
+  Scenario: examine-17 - Every model the help offers as an example is one the CLI can resolve
     When the user reads the serve examples the help offers
     Then every model named there is one the CLI can resolve
 
@@ -197,6 +220,6 @@ Feature: GPU detection and system inspection
   # Since fixed on main (the same EAI-8011 change now describes bare `rocm` as
   # the launcher), so this ships as a guard rather than an expected failure.
   @id:examine-help-describes-the-default-command
-  Scenario: examine-17 - The help tells the two ways of opening a screen apart
+  Scenario: examine-18 - The help tells the two ways of opening a screen apart
     When the user asks for help
     Then running the CLI with no subcommand is not described as the dashboard command

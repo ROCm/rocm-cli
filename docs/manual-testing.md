@@ -68,12 +68,14 @@ Expected result:
 - The launcher opens; choosing "Set up this system" there opens the setup
   screen. It does not open automatically before the main TUI, and the user
   does not need to type `/setup`.
-- The setup shows a recommended ROCm folder.
-- The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
-  can see that pip downloads stay inside the chosen ROCm folder.
-- The install-folder row opens an interactive folder picker. Arrow keys and the
-  mouse can choose folders; Enter opens or selects; Esc returns without losing
-  the current setup screen.
+- On the "Install ROCm SDK (pip)" step's Configure screen, the Folder row reads
+  `(default managed folder · Tab to browse)` until a folder is chosen. `Tab`
+  opens the folder picker; arrow keys choose, Enter opens or selects, Esc
+  returns without losing the Configure screen or an already-chosen folder.
+  Leaving the row unset installs to the default managed folder.
+- On that same screen `←`/`→` toggle Release/Nightly, and `Tab` opens the
+  folder picker rather than toggling the channel — the same Tab-to-browse
+  binding the Install and Serve forms use.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
 - Install logs show only in the foreground progress card, with PageUp/PageDown
@@ -157,16 +159,18 @@ Expected result:
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
-  `libraries,devel`), alongside pinned `torchaudio` from the TheRock index. On a host
-  with no detectable AMD GPU the preview reports `device_target: undetermined`
-  and a real install refuses rather than pulling every published device payload.
+  `libraries`, and `devel` only when `--devel` is passed), alongside pinned
+  `torchaudio` from the TheRock index. On a host with no detectable AMD GPU the
+  preview reports `device_target: undetermined` and a real install refuses
+  rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
   all four packages in one pip transaction.
 - The install does not ask for an external Python venv.
-- Runtime validation uses TheRock's runtime/devel package roots and
+- Runtime validation uses TheRock's runtime package roots and
   `rocm_sdk.find_libraries`; `rocm-sdk path --root` is expected after the
-  pinned `rocm[libraries,devel,device-…]` install succeeds.
+  pinned `rocm[libraries,device-…]` install succeeds. The compiler toolchain is
+  not required for validation to pass; `--devel` adds `devel` to those extras.
 - `rocm examine` reports the active runtime as ready.
 
 Developer-only deterministic override:
@@ -176,7 +180,8 @@ python scripts\therock_sdk_install_test.py --dry-run --family gfx120X-all
 ```
 
 Use `--family` only when a test needs a fixed package family. Do not use it for
-normal user setup.
+normal user setup. The script checks the default install; add `--devel` to check
+the opt-in compiler toolchain path instead.
 
 ## 3. Lemonade GPU Verification
 
