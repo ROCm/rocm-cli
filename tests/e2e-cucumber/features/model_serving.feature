@@ -255,3 +255,16 @@ Feature: Model serving
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
+
+  # A managed serve that fails leaves its record on disk, and the default
+  # `rocm services list` hides it because it is not live. The header then read
+  # "none ready", the list was empty, and nothing on screen said a record
+  # existed or how to read its log - so a user whose serve failed saw the same
+  # screen as a user who had never served at all. The default view now counts
+  # what it hides and names the two commands that reach it. No GPU and no real
+  # serve: the record is planted, so this runs on every lane.
+  @id:serve-past-attempts-surfaced
+  Scenario: serve-22 - A failed local server is counted in the default list
+    Given a local server attempt has failed
+    When the user lists running services
+    Then the list reports the attempt and how to look at it

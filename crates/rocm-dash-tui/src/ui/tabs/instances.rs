@@ -1091,6 +1091,7 @@ mod tests {
 
     fn mk_state(instances: HashMap<String, Instance>, sel: usize) -> AppState {
         AppState {
+            services_past_attempts: 0,
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,
