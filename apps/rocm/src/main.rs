@@ -30024,7 +30024,7 @@ install therock";
 
         // The claim itself (onboarding only opens via an explicit `n` on the
         // Observe tab, never automatically) is proven by
-        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `crates/rocm-dash-tui/src/app/event_loop.rs`'s
         // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
         // test and the `onboarding.rs` module doc — this assertion only
         // guards the string, not the behavior.
