@@ -25,7 +25,11 @@ const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::{
+        ForcedTerminationOutcome, assert_unconfirmed_stop_kept_the_service, seed_keyed_service,
+        temp_app_paths,
+    };
+    use crate::watchers::load_service_record;
     use anyhow::Result;
     use rocm_core::ManagedServiceRecord;
     use serde_json::Value;
@@ -77,6 +81,44 @@ mod tests {
                     .iter()
                     .any(|pid| pid.as_u64() == Some(u64::from(current_pid))))
         );
+        Ok(())
+    }
+
+    /// The sandbox tool used to report `status: stopped` unconditionally.
+    #[test]
+    fn sandbox_tool_stop_server_reports_an_unconfirmed_stop() -> Result<()> {
+        let (root, paths) = temp_app_paths("sandbox-stop-unconfirmed");
+        paths.ensure()?;
+        let service_id = "svc-sandbox-stop-unconfirmed";
+        let key_path = seed_keyed_service(&paths, service_id, 11448)?;
+
+        let result = {
+            let _forced = ForcedTerminationOutcome::set(rocm_core::TerminationOutcome::Unverified);
+            crate::sandbox::run_sandbox_tool(
+                &paths,
+                crate::cli::SandboxToolArg::StopServer,
+                Some(service_id.to_owned()),
+                None,
+                None,
+                crate::cli::SandboxToolPolicy::default(),
+            )
+        };
+        let key_kept = key_path.exists();
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(
+            value.get("status").and_then(Value::as_str),
+            Some("stop_unconfirmed"),
+            "{value}"
+        );
+        assert_eq!(
+            value.pointer("/result/stopped").and_then(Value::as_bool),
+            Some(false),
+            "{value}"
+        );
+        assert_unconfirmed_stop_kept_the_service(&reloaded?, key_kept);
         Ok(())
     }
 }

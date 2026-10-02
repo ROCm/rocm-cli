@@ -104,6 +104,13 @@ pub(crate) fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result
     }))
 }
 
+/// Whether a [`stop_managed_service`] report confirms that every recorded
+/// process is gone. A report without the verdict counts as unconfirmed, so a
+/// caller can never mistake a missing field for a completed stop.
+pub(crate) fn stop_report_confirmed(report: &Value) -> bool {
+    report.get("stopped").and_then(Value::as_bool) == Some(true)
+}
+
 /// How long a stop waits for a recorded process tree to exit on its own before
 /// escalating to a forced kill. Matches `rocm services stop`, which terminates
 /// the same records.
@@ -217,6 +224,10 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> Vec<Recorde
 /// report success while an engine worker still holds the GPU. Only a process
 /// whose recorded identity is confirmed is ever reached by it.
 fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome {
+    #[cfg(test)]
+    if let Some(outcome) = crate::test_support::forced_termination_outcome() {
+        return outcome;
+    }
     // Windows needs the descendants taken separately. `rocm_core` has no way to
     // walk a process tree there — `process_tree_pids` returns just the root — and
     // the engine runs one level below the recorded PID, because `rocmd` launches
