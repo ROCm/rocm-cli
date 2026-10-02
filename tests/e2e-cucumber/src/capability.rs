@@ -954,6 +954,19 @@ Local model engines
             ("gfx950:sramecc+:xnack-", "mi350p"),
             ("gfx942", "mi300x"),
             ("gfx94X-dcgpu", "mi300x"),
+            // The consumer/workstation RDNA parts slug as themselves, and the
+            // rad3 (R9700) and W7900 lanes both depend on that: their report
+            // artifacts are keyed off the bare family in
+            // `xtask::e2e_report::label_for_root_report`.
+            //
+            // Pinned because the fallthrough is the absence of a rule, which no
+            // other assertion here would notice losing. `rocm_core`'s
+            // similarly-named `normalize_therock_family` DOES fold these into
+            // `gfx110X-all`/`gfx120X-all` for wheel selection; aligning the two
+            // would send both lanes' artifacts to `e2e-unknown-report` with
+            // every test still green.
+            ("gfx1100", "gfx1100"),
+            ("gfx1201", "gfx1201"),
         ] {
             assert_eq!(
                 derive_platform_slug(true, Some(gfx_target), "linux", false),
