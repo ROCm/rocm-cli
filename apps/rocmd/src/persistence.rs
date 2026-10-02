@@ -81,37 +81,8 @@ pub(crate) fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_app_paths;
     use rocm_core::{WatcherMode, WatcherRuntimeSnapshot};
-    use std::path::PathBuf;
-
-    fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = unique_test_root(&format!(
-            "rocmd-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
-    }
-
-    fn unique_test_root(label: &str) -> PathBuf {
-        let root = workspace_test_artifact_dir().join(label);
-        fs::create_dir_all(&root).expect("create workspace-local test root");
-        root
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("rocmd")
-    }
 
     #[test]
     fn record_event_mirrors_watcher_actions_to_audit_log() -> Result<()> {

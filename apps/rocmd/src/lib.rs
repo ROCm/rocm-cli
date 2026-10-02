@@ -5,6 +5,8 @@
 #![allow(clippy::items_after_test_module)]
 
 mod persistence;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
@@ -5197,6 +5199,7 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{temp_app_paths, unique_test_root, workspace_test_artifact_dir};
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
@@ -9488,39 +9491,10 @@ mod tests {
         Ok(format!("http://{addr}/artifact.bin"))
     }
 
-    fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = unique_test_root(&format!(
-            "rocmd-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
-    }
-
-    fn unique_test_root(label: &str) -> PathBuf {
-        let root = workspace_test_artifact_dir().join(label);
-        fs::create_dir_all(&root).expect("create workspace-local test root");
-        root
-    }
-
     fn unique_test_path(label: &str) -> PathBuf {
         let root = workspace_test_artifact_dir();
         fs::create_dir_all(&root).expect("create workspace-local test dir");
         root.join(label)
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("rocmd")
     }
 
     fn test_watcher_snapshot(
