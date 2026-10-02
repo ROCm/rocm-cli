@@ -15,7 +15,8 @@
 //! implementation detail, so a failure names a user-visible defect.
 
 use super::{
-    Examination, GFX_TARGET_PACKAGING, Gpu, apply_rocminfo_gpu_agents, classify_amd_marketing_name,
+    Examination, GFX_TARGET_PACKAGING, Gpu, apply_hipinfo_gcn_arch_names, apply_lspci_gpus,
+    apply_rocminfo_gpu_agents, apply_windows_display_rows, classify_amd_marketing_name,
     extract_lspci_name, gfx_is_apu_family, is_lspci_gpu_line, summarise_gpu_categories,
 };
 use proptest::prelude::*;
@@ -144,9 +145,10 @@ const AMD_MARKETING_NAMES: &[(&str, &str, bool)] = &[
 ///
 /// Not every one of these is produced by a lookup table — gfx902, gfx909 and
 /// gfx1037 reach the CLI only through
-/// [`crate::gfx_target_from_gc_version`], which synthesises a target from the
-/// GC version DRM ip-discovery reports. That is exactly why they are here: the
-/// cross-table drift guard cannot see them, so ground truth has to.
+/// [`crate::gfx_target_from_gc_version`], which synthesises a target from a GC
+/// version (KFD's packed `gfx_target_version`, or DRM ip-discovery). That is
+/// exactly why they are here: the cross-table drift guard cannot see them, so
+/// ground truth has to.
 const GFX_TARGETS: &[(&str, bool)] = &[
     ("gfx900", false),
     ("gfx906", false),
@@ -338,6 +340,50 @@ fn apu_lspci_devices() -> Vec<(&'static str, &'static str, &'static str, bool)> 
     apus
 }
 
+/// What the real PCI scan makes of one corpus device.
+///
+/// Every test that needs a PCI-sourced GPU goes through this rather than
+/// assembling one from the classifiers, because a test that re-implements the
+/// probe's logic pins the re-implementation: when the probe stops reading the
+/// device id, a hand-built row keeps passing.
+fn pci_scanned(device: &str, device_id: &str, addr: &str) -> Gpu {
+    let line = format!(
+        "{addr} VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] {device} [1002:{device_id}] (rev c1)"
+    );
+    let mut e = Examination::default();
+    apply_lspci_gpus(&mut e, &line);
+    assert_eq!(e.gpus.len(), 1, "{line:?} must enumerate as one GPU");
+    e.gpus.remove(0)
+}
+
+/// A `Win32_VideoController` row as `WIN_GPU_SCRIPT` prints it: name, driver
+/// version, PNP device id.
+fn windows_row(name: &str, device_id: &str) -> String {
+    format!("{name}\t32.0.1\tPCI\\VEN_1002&DEV_{device_id}&SUBSYS_00001002&REV_C1")
+}
+
+/// What the real Windows display probe makes of one row.
+fn windows_scanned(name: &str, device_id: &str) -> Gpu {
+    let row = windows_row(name, device_id);
+    let mut e = Examination::default();
+    apply_windows_display_rows(&mut e, &row);
+    assert_eq!(e.gpus.len(), 1, "{row:?} must enumerate as one GPU");
+    e.gpus.remove(0)
+}
+
+/// Every PCI device id the crate's device-id table maps, with its target.
+///
+/// The table is a `match`, not an iterable, so its whole input domain is swept.
+fn every_mapped_pci_device_id() -> Vec<(String, &'static str)> {
+    let ids: Vec<_> = (0..=0xffff_u32)
+        .map(|id| format!("{id:04x}"))
+        .filter_map(|id| crate::gfx_target_from_amd_pci_device_id(&id).map(|t| (id, t)))
+        .collect();
+    assert!(!ids.is_empty(), "the device-id table maps no id at all");
+    ids
+}
+
 /// A `rocminfo` agent listing for the given targets, in the agent block shape
 /// the current parser can digest (no ISA sub-entries).
 fn rocminfo_output(agents: &[(&str, &str)]) -> String {
@@ -447,23 +493,17 @@ proptest! {
         marketing in proptest::sample::select(&["", "AMD Radeon Graphics"][..]),
     ) {
         // A coherent host: the gfx target is the one this very device reports.
-        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {}", device.0);
-        let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
+        let gpu = pci_scanned(device.0, device.1, &addr);
         prop_assert!(
-            is_apu_guess,
+            gpu.is_apu == Some(true),
             "the PCI scan must already know {} is an APU before this property \
-             can say anything about preserving that verdict",
+             can say anything about preserving that verdict: {:?}",
             device.0,
+            gpu,
         );
 
         let mut e = Examination {
-            gpus: vec![Gpu {
-                name,
-                gfx_target: gfx_guess,
-                pci_id: addr,
-                is_apu: Some(true),
-                is_amd: true,
-            }],
+            gpus: vec![gpu],
             ..Examination::default()
         };
         apply_rocminfo_gpu_agents(&mut e, &rocminfo_output(&[(device.2, marketing)]));
@@ -517,76 +557,44 @@ proptest! {
         );
     }
 
-    /// The Windows display probe and `examine`'s own Windows GPU enumeration
-    /// read the same row and must not disagree about the gfx target.
+    /// `examine` and the install-side display probe must read the same
+    /// adapter the same way.
+    ///
+    /// They share a decoder, so this is not two tables cross-checking each
+    /// other: it guards the *wiring*. The install side hands the decoder
+    /// `name<TAB>pnp`, `examine` hands it `name<TAB>driver<TAB>pnp`, and a
+    /// decoder that read the PNP id by column position rather than by content
+    /// would quietly resolve one and not the other.
     #[test]
-    fn windows_probes_agree_on_gfx_target(
+    fn examine_and_the_install_probe_read_a_windows_row_alike(
         entry in proptest::sample::select(AMD_MARKETING_NAMES),
-        subsys in 0u32..0x1_0000,
-    ) {
-        // Only coherent rows: the PNP id must name the same part the marketing
-        // name does, or the two probes are being asked about different GPUs.
-        let Some(device_id) = entry_device_id(entry.0) else {
-            return Ok(());
-        };
-        // A Win32_VideoController row as `probe_gpus_windows` reads it: name,
-        // driver version, PNP device id.
-        let pnp = format!("PCI\\VEN_1002&DEV_{device_id}&SUBSYS_{subsys:04x}1002&REV_C1");
-        let row = format!("{}\t32.0.1\t{pnp}", entry.0);
-        let install_target = crate::parse_windows_display_gfx_target(&row);
-        let examine_target = classify_amd_marketing_name(entry.0).0;
-        if let Some(install_target) = install_target
-            && !examine_target.is_empty()
-        {
-            prop_assert_eq!(
-                &examine_target,
-                &install_target,
-                "the Windows display probe and examine disagree about {}",
-                entry.0,
-            );
-        }
-    }
-
-    /// `probe_gpus_windows` has the PNP device id in hand on every row, and the
-    /// crate already decodes it. When that decode names an APU target, the
-    /// report must not come back `is_apu=false` just because the marketing
-    /// name was not in `examine`'s own smaller table.
-    #[test]
-    fn the_windows_row_is_not_called_discrete_when_its_pnp_id_names_an_apu(
-        entry in proptest::sample::select(AMD_MARKETING_NAMES),
-        subsys in 0u32..0x1_0000,
     ) {
         let Some(device_id) = entry_device_id(entry.0) else {
             return Ok(());
         };
-        let pnp = format!("PCI\\VEN_1002&DEV_{device_id}&SUBSYS_{subsys:04x}1002&REV_C1");
-        let row = format!("{}\t32.0.1\t{pnp}", entry.0);
-        let Some(install_target) = crate::parse_windows_display_gfx_target(&row) else {
-            return Ok(());
-        };
-        prop_assume!(gfx_is_apu_family(&install_target));
-        let (_target, is_apu) = classify_amd_marketing_name(entry.0);
-        prop_assert!(
-            is_apu,
-            "{} has PNP id {} which this crate decodes to the APU target {}, \
-             yet examine reports is_apu=false",
+        let install_text = format!(
+            "{}\tPCI\\VEN_1002&DEV_{device_id}&SUBSYS_00001002&REV_C1",
+            entry.0
+        );
+        let install_target = crate::parse_windows_display_gfx_target(&install_text);
+        let examine_target = windows_scanned(entry.0, device_id).gfx_target;
+        prop_assert_eq!(
+            install_target.unwrap_or_default(),
+            examine_target,
+            "the install probe and examine disagree about {}",
             entry.0,
-            pnp,
-            install_target,
         );
     }
-
 }
 
 /// Corpus entries whose `lspci` text names no model at all.
 ///
 /// `lspci` prints the `pci.ids` device string, and when that database has no
-/// entry for an id it prints the bare word `Device`. A name-keyed lookup can
-/// never classify such a row: the identifying information is in the
-/// `[1002:xxxx]` id on the same line, which the PCI scan currently discards.
-/// They are excluded from the name-classification sweeps below rather than
-/// dropped from the corpus, because the parsing and totality properties still
-/// have to survive them.
+/// entry for an id it prints the bare word `Device`. The PCI scan then has only
+/// the `[1002:xxxx]` id to go on, and these are ids the crate's device-id table
+/// does not map yet (Strix Halo's, here), so nothing can classify them. They
+/// are excluded from the APU sweeps below rather than dropped from the corpus,
+/// because the parsing and totality properties still have to survive them.
 const LSPCI_DEVICES_WITHOUT_A_PCI_IDS_NAME: &[&str] = &["Device"];
 
 /// The PCI device id for a marketing name, when the corpus pins one.
@@ -631,10 +639,10 @@ fn every_known_apu_is_classified_as_an_apu() {
         if !is_apu || LSPCI_DEVICES_WITHOUT_A_PCI_IDS_NAME.contains(device) {
             continue;
         }
-        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {device}");
-        if !classify_amd_marketing_name(&name).1 {
+        let gpu = pci_scanned(device, id, "0000:04:00.0");
+        if gpu.is_apu != Some(true) {
             misses.push(format!(
-                "  lspci device {device:?} [1002:{id}]: examine says is_apu=false"
+                "  lspci device {device:?} [1002:{id}]: the PCI scan says {gpu:?}"
             ));
         }
     }
@@ -651,8 +659,7 @@ fn every_known_apu_is_classified_as_an_apu() {
 fn no_part_is_labelled_with_the_wrong_gfx_target() {
     let mut wrong: Vec<String> = Vec::new();
     for (device, id, gfx, _is_apu) in AMD_LSPCI_DEVICES {
-        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {device}");
-        let guess = classify_amd_marketing_name(&name).0;
+        let guess = pci_scanned(device, id, "0000:04:00.0").gfx_target;
         if !guess.is_empty() && guess != *gfx {
             wrong.push(format!(
                 "  lspci {device:?} [1002:{id}] is {gfx}, but examine reports {guess}"
@@ -690,18 +697,18 @@ fn no_part_is_labelled_with_the_wrong_gfx_target() {
 #[test]
 fn the_apu_verdict_holds_on_both_sides_of_the_rocminfo_isa_name_defect() {
     let build = |with_isa: bool| {
-        let name = "Advanced Micro Devices, Inc. [AMD/ATI] Raphael".to_owned();
-        let (gfx_target, is_apu) = classify_amd_marketing_name(&name);
-        assert_eq!(gfx_target, "gfx1036", "the PCI scan alone names the part");
-        assert!(is_apu, "the PCI scan alone knows Raphael is an APU");
+        let gpu = pci_scanned("Raphael", "164e", "0000:14:00.0");
+        assert_eq!(
+            gpu.gfx_target, "gfx1036",
+            "the PCI scan alone names the part"
+        );
+        assert_eq!(
+            gpu.is_apu,
+            Some(true),
+            "the PCI scan alone knows Raphael is an APU"
+        );
         let mut e = Examination {
-            gpus: vec![Gpu {
-                name,
-                gfx_target,
-                pci_id: "0000:14:00.0".to_owned(),
-                is_apu: Some(is_apu),
-                is_amd: true,
-            }],
+            gpus: vec![gpu],
             ..Examination::default()
         };
         apply_rocminfo_gpu_agents(
@@ -746,17 +753,9 @@ fn the_apu_verdict_holds_on_both_sides_of_the_rocminfo_isa_name_defect() {
 ///   discrete GPU, so the PCI scan's verdict has to survive untouched.
 #[test]
 fn folding_in_rocminfo_only_ever_adds_knowledge() {
-    let host = |lspci_name: &str, agent_target: &str, with_isa: bool| {
-        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {lspci_name}");
-        let (gfx_target, is_apu) = classify_amd_marketing_name(&name);
+    let host = |lspci_name: &str, device_id: &str, agent_target: &str, with_isa: bool| {
         let mut e = Examination {
-            gpus: vec![Gpu {
-                name,
-                gfx_target,
-                pci_id: "0000:66:00.0".to_owned(),
-                is_apu: Some(is_apu),
-                is_amd: true,
-            }],
+            gpus: vec![pci_scanned(lspci_name, device_id, "0000:66:00.0")],
             ..Examination::default()
         };
         apply_rocminfo_gpu_agents(
@@ -768,12 +767,12 @@ fn folding_in_rocminfo_only_ever_adds_knowledge() {
     };
 
     // A nameless Strix Halo: nothing is known before the fold.
-    let before = host("Device", "gfx1151", true);
+    let before = host("Device", "1586", "gfx1151", true);
     assert_eq!(before.gpus[0].gfx_target, "", "{:?}", before.gpus);
     assert!(!before.has_apu, "{:?}", before.gpus);
     // Once the agent is readable the fold supplies both the target and the
     // packaging that follows from it.
-    let after = host("Device", "gfx1151", false);
+    let after = host("Device", "1586", "gfx1151", false);
     assert_eq!(after.gpus[0].gfx_target, "gfx1151", "{:?}", after.gpus);
     assert!(
         after.has_apu,
@@ -785,7 +784,7 @@ fn folding_in_rocminfo_only_ever_adds_knowledge() {
     // A Rembrandt laptop whose agent names a target this crate has no packaging
     // entry for. The target is still worth recording; the verdict is not the
     // fold's to revise.
-    let unknown = host("Rembrandt [Radeon 680M]", "gfx1154", false);
+    let unknown = host("Rembrandt [Radeon 680M]", "1681", "gfx1154", false);
     assert_eq!(unknown.gpus[0].gfx_target, "gfx1154", "{:?}", unknown.gpus);
     assert!(
         unknown.has_apu,
@@ -913,23 +912,12 @@ fn the_igpu_dgpu_collision_check_still_fires_on_a_raphael_plus_rx7900_host() {
                 [AMD/ATI] Raphael [1002:164e] (rev c1)";
     let dgpu = "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
                 [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M] [1002:744c]";
-    let mut gpus = Vec::new();
-    for (line, pci) in [(dgpu, "0000:03:00.0"), (igpu, "0000:14:00.0")] {
-        let name = extract_lspci_name(line);
-        let (gfx_target, is_apu) = classify_amd_marketing_name(&name);
-        gpus.push(Gpu {
-            name,
-            gfx_target,
-            pci_id: pci.to_owned(),
-            is_apu: Some(is_apu),
-            is_amd: true,
-        });
-    }
     let mut e = Examination {
         os_family: "linux".to_owned(),
-        gpus,
         ..Examination::default()
     };
+    apply_lspci_gpus(&mut e, &format!("{dgpu}\n{igpu}\n"));
+    assert_eq!(e.gpus.len(), 2, "{:?}", e.gpus);
     // rocminfo in KFD node order, matching the PCI order the scan produced.
     apply_rocminfo_gpu_agents(
         &mut e,
@@ -972,19 +960,12 @@ fn no_known_apu_has_its_verdict_downgraded_by_rocminfo() {
         if !is_apu {
             continue;
         }
-        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {device}");
-        let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
-        if !is_apu_guess {
+        let gpu = pci_scanned(device, id, "0000:04:00.0");
+        if gpu.is_apu != Some(true) {
             continue;
         }
         let mut e = Examination {
-            gpus: vec![Gpu {
-                name: name.clone(),
-                gfx_target: gfx_guess,
-                pci_id: "0000:04:00.0".to_owned(),
-                is_apu: Some(true),
-                is_amd: true,
-            }],
+            gpus: vec![gpu],
             ..Examination::default()
         };
         apply_rocminfo_gpu_agents(&mut e, &rocminfo_output(&[(gfx, "AMD Radeon Graphics")]));
@@ -1032,25 +1013,20 @@ fn a_rembrandt_laptop_is_not_reported_as_a_discrete_gpu() {
     )
     .expect("plant the GPU node properties");
 
-    let line = "0000:04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
-                [AMD/ATI] Rembrandt [Radeon 680M] [1002:1681] (rev c8)";
-    let name = extract_lspci_name(line);
-    let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
-    assert!(
-        is_apu_guess,
-        "the PCI scan alone already knows Rembrandt is an APU"
+    // The whole Linux sequence from the PCI scan on: `apply_lspci_gpus` is the
+    // scan itself, minus only the process launch.
+    let mut e = Examination::default();
+    apply_lspci_gpus(
+        &mut e,
+        "0000:04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. \
+         [AMD/ATI] Rembrandt [Radeon 680M] [1002:1681] (rev c8)",
     );
-
-    let mut e = Examination {
-        gpus: vec![Gpu {
-            name,
-            gfx_target: gfx_guess,
-            pci_id: "0000:04:00.0".to_owned(),
-            is_apu: Some(is_apu_guess),
-            is_amd: true,
-        }],
-        ..Examination::default()
-    };
+    assert_eq!(
+        e.gpus.first().and_then(|gpu| gpu.is_apu),
+        Some(true),
+        "the PCI scan alone already knows Rembrandt is an APU: {:?}",
+        e.gpus
+    );
     super::probe_gpus_after_lspci(
         &mut e,
         super::GpuProbeSources {
@@ -1073,6 +1049,194 @@ fn a_rembrandt_laptop_is_not_reported_as_a_discrete_gpu() {
         !e.has_discrete_amd,
         "an iGPU-only laptop must not report has_discrete_amd, got {:?}",
         e.gpus
+    );
+}
+
+/// The Linux PCI scan classifies a row by its device id when the name carries
+/// nothing.
+///
+/// `lspci` prints the bare word `Device` for an id `pci.ids` does not know, so
+/// on these rows only the `[1002:xxxx]` tag can identify the part. Every id the
+/// device-id table maps is swept, so a scan that falls back to reading the name
+/// alone fails here for all of them at once.
+#[test]
+fn an_lspci_row_is_classified_by_its_device_id_when_its_name_says_nothing() {
+    let mut wrong: Vec<String> = Vec::new();
+    for (id, target) in every_mapped_pci_device_id() {
+        let gpu = pci_scanned("Device", &id, "0000:66:00.0");
+        if gpu.gfx_target != target || gpu.is_apu != Some(gfx_is_apu_family(target)) {
+            wrong.push(format!("  [1002:{id}] is {target}, scanned as {gpu:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "lspci rows the device id identifies but the scan did not:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The Windows display probe classifies a row by its PNP id when the name
+/// carries nothing.
+///
+/// "AMD Radeon(TM) Graphics" is not a placeholder: it is what Renoir, Rembrandt
+/// and Raphael iGPUs actually report as their adapter name on Windows, so for
+/// the commonest APUs the PNP id is the only thing on the row that names the
+/// part.
+#[test]
+fn a_windows_row_is_classified_by_its_pnp_id_when_its_name_says_nothing() {
+    assert_eq!(
+        classify_amd_marketing_name("AMD Radeon(TM) Graphics").0,
+        "",
+        "the premise: the generic name alone must resolve nothing"
+    );
+    let mut wrong: Vec<String> = Vec::new();
+    for (id, target) in every_mapped_pci_device_id() {
+        let gpu = windows_scanned("AMD Radeon(TM) Graphics", &id);
+        if gpu.gfx_target != target || gpu.is_apu != Some(gfx_is_apu_family(target)) {
+            wrong.push(format!("  DEV_{id} is {target}, scanned as {gpu:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "Windows rows the PNP id identifies but the probe did not:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// `hipInfo` revises the display probe's verdict when it reports a target whose
+/// packaging is known, and only then.
+///
+/// The first half is a host that exists: a Renoir laptop's adapter is named
+/// "AMD Radeon(TM) Graphics" and its device id is one the table does not map,
+/// so the display probe gives it no target and the PCI-row default, and only
+/// `hipInfo`'s `gcnArchName` can say what it is.
+///
+/// The second half pins the fold's contract on a state the Windows display
+/// probe cannot currently produce — a GPU already called an APU, with no
+/// target. The display probe only reaches `Some(true)` by resolving a target,
+/// so through the real pipeline the "leave an unknown target's verdict alone"
+/// rule changes no output today. It is asserted anyway because it is the rule
+/// every other fold in this module follows, and the first new source of a
+/// target-less verdict would otherwise inherit the downgrade silently.
+#[test]
+fn a_hipinfo_target_revises_a_verdict_only_when_its_packaging_is_known() {
+    let mut e = Examination::default();
+    apply_windows_display_rows(&mut e, &windows_row("AMD Radeon(TM) Graphics", "1636"));
+    assert_eq!(e.gpus[0].gfx_target, "", "{:?}", e.gpus);
+    apply_hipinfo_gcn_arch_names(&mut e, "device# 0\n  gcnArchName: gfx90c:xnack-\n");
+    assert_eq!(e.gpus[0].gfx_target, "gfx90c", "{:?}", e.gpus);
+    assert_eq!(
+        e.gpus[0].is_apu,
+        Some(true),
+        "a known integrated target must revise the display probe's default: {:?}",
+        e.gpus
+    );
+
+    let mut e = Examination {
+        gpus: vec![Gpu {
+            name: "AMD Radeon(TM) Graphics".to_owned(),
+            is_amd: true,
+            is_apu: Some(true),
+            ..Gpu::default()
+        }],
+        ..Examination::default()
+    };
+    apply_hipinfo_gcn_arch_names(&mut e, "  gcnArchName: gfx1154\n");
+    assert_eq!(e.gpus[0].gfx_target, "gfx1154", "{:?}", e.gpus);
+    assert_eq!(
+        e.gpus[0].is_apu,
+        Some(true),
+        "an unrecognised target is not evidence of a discrete GPU: {:?}",
+        e.gpus
+    );
+}
+
+/// An AMD PCI row nothing can identify is reported as discrete, deliberately,
+/// and both sides of that trade are pinned here — see `pci_row_is_apu`.
+///
+/// What the default buys: a Ryzen 7000 desktop with an RX 5700 XT. Navi 10 is
+/// in neither SKU table, so its row resolves no target; reported as "cannot
+/// say", it would clear `has_discrete_amd` and the iGPU+dGPU collision check
+/// would never fire on the host it is written for.
+///
+/// What it costs: a Mendocino laptop, whose iGPU likewise resolves nothing, is
+/// reported with `has_discrete_amd` set. The collision check still needs
+/// `has_apu`, which that host does not have, so no diagnosis fires — the cost
+/// is a wrong field in `rocm examine --json`, which is asserted too rather
+/// than left implicit.
+#[test]
+fn an_unidentifiable_pci_row_is_reported_as_discrete_and_this_is_what_that_costs() {
+    let raphael = "0000:14:00.0 VGA compatible controller [0300]: Advanced Micro Devices, \
+                   Inc. [AMD/ATI] Raphael [1002:164e] (rev c1)";
+    let navi10 = "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, \
+                  Inc. [AMD/ATI] Navi 10 [Radeon RX 5600 OEM/5600 XT / 5700/5700 XT] \
+                  [1002:731f] (rev c1)";
+    let mendocino = "0000:04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, \
+                     Inc. [AMD/ATI] Mendocino [1002:1506] (rev c1)";
+    let host = |lines: &[&str]| {
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            ..Examination::default()
+        };
+        apply_lspci_gpus(&mut e, &lines.join("\n"));
+        summarise_gpu_categories(&mut e);
+        let fires = crate::diagnose::diagnose(&e, "my training run segfaults")
+            .matched
+            .iter()
+            .any(|d| d.id == "fix-9-igpu-dgpu" && d.score > 0);
+        (e, fires)
+    };
+
+    let (hybrid, fires) = host(&[navi10, raphael]);
+    assert_eq!(
+        hybrid.gpus[0].gfx_target, "",
+        "the premise: Navi 10 is unresolved"
+    );
+    assert!(
+        hybrid.has_apu && hybrid.has_discrete_amd && fires,
+        "an unresolved discrete card beside a known iGPU must still raise the \
+         collision diagnosis: {:?}",
+        hybrid.gpus
+    );
+
+    let (laptop, fires) = host(&[mendocino]);
+    assert_eq!(
+        laptop.gpus[0].gfx_target, "",
+        "the premise: Mendocino is unresolved"
+    );
+    assert!(
+        laptop.has_discrete_amd && !laptop.has_apu,
+        "the known cost: an unresolved iGPU reads as discrete: {:?}",
+        laptop.gpus
+    );
+    assert!(
+        !fires,
+        "and the cost stops there — no iGPU+dGPU diagnosis on a one-GPU laptop"
+    );
+}
+
+/// No discrete part in the corpus is ever classified as an APU.
+///
+/// The APU sweeps above only look for misses; this is the other direction,
+/// and it is what keeps a codename pattern in the marketing table from being
+/// broader than the part it names.
+#[test]
+fn no_discrete_part_is_classified_as_an_apu() {
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, gfx, is_apu) in AMD_MARKETING_NAMES {
+        if !is_apu && classify_amd_marketing_name(name).1 {
+            wrong.push(format!("  marketing name {name:?} ({gfx})"));
+        }
+    }
+    for (device, id, gfx, is_apu) in AMD_LSPCI_DEVICES {
+        if !is_apu && pci_scanned(device, id, "0000:03:00.0").is_apu == Some(true) {
+            wrong.push(format!("  lspci {device:?} [1002:{id}] ({gfx})"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "discrete parts classified as APUs:\n{}",
+        wrong.join("\n")
     );
 }
 
