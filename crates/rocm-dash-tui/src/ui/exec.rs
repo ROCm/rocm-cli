@@ -22,16 +22,20 @@ pub fn exe_label(cmd: &str) -> &str {
     cmd.rsplit(['/', '\\']).next().unwrap_or(cmd)
 }
 
-/// Quote `value` for display if it's empty or contains whitespace or a
-/// shell-meaningful character, so a command preview can't misrepresent where
-/// one argument ends and the next begins. Mirrors the display-only quoting
-/// already used for the same purpose in `apps/rocm` (e.g.
-/// `therock.rs::quote_display_arg`).
-fn quote_display_arg(value: &str) -> String {
+/// Quote `value` for display so a command preview can't misrepresent where
+/// one argument ends and the next begins.
+///
+/// Triggers on empty input, whitespace, a literal `"`, or a shell-meaningful
+/// character — an unescaped, unquoted `"` reads as the start of a
+/// neighboring quoted argument just as easily as a bare space does. Mirrors
+/// the display-only quoting already used for the same purpose in
+/// `apps/rocm` (e.g. `therock.rs::quote_display_arg`), with the `"` trigger
+/// added.
+pub fn quote_display_arg(value: &str) -> String {
     if value.is_empty()
-        || value
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')' | '&' | ';' | '|'))
+        || value.chars().any(|ch| {
+            ch.is_whitespace() || matches!(ch, '"' | '[' | ']' | '(' | ')' | '&' | ';' | '|')
+        })
     {
         format!("\"{}\"", value.replace('"', "\\\""))
     } else {
@@ -81,6 +85,16 @@ mod tests {
     fn display_args_escapes_embedded_quotes() {
         let args = vec!["say \"hi\"".to_string()];
         assert_eq!(display_args(&args), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn display_args_quotes_embedded_quote_without_whitespace() {
+        let args = vec!["say\"hi".to_string(), "there buddy".to_string()];
+        assert_eq!(
+            display_args(&args),
+            "\"say\\\"hi\" \"there buddy\"",
+            "a bare embedded quote must be quoted even with no whitespace in the value"
+        );
     }
 
     #[test]
