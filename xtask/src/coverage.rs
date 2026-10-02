@@ -216,18 +216,43 @@ fn floor_to_hundredths(percent: f64) -> f64 {
     (percent * 100.0).floor() / 100.0
 }
 
+/// Gated workspace members that contributed no file at all to the coverage
+/// report.
+///
+/// [`aggregate`] can only total what the report contains, so a member none of
+/// whose sources were compiled into an instrumented test binary would otherwise
+/// be invisible: no measurement means no "needs a floor" failure, and `--bless`
+/// would silently leave it out of the file. Naming it here keeps the "every
+/// gated crate is checked" invariant true for the crates the measurement cannot
+/// see, not only for the ones it can. The way out is either tests or an
+/// [`EXCLUDED`] entry with its reason, never a floor: there is no number to pin.
+fn unreported(gated: &BTreeSet<String>, measured: &BTreeMap<String, Measured>) -> Vec<String> {
+    gated
+        .iter()
+        .filter(|name| !measured.contains_key(*name))
+        .map(|name| {
+            format!(
+                "{name}: workspace member absent from the coverage report (no test binary compiled \
+                 its sources) — add tests, or list it in EXCLUDED in xtask/src/coverage.rs with the reason"
+            )
+        })
+        .collect()
+}
+
 /// Compare measured coverage against committed floors.
 ///
 /// Returns the human-readable failures, empty when everything holds. The check
 /// is bidirectional, matching `crate_edges`: a crate with no floor fails just
 /// as loudly as a crate below its floor, so adding a workspace member cannot
 /// quietly land outside the gate, and a floor left behind by a deleted crate
-/// cannot sit in the file pretending to guard something.
+/// cannot sit in the file pretending to guard something. A gated member the
+/// report does not mention at all fails too (see [`unreported`]).
 fn check_floors(
+    gated: &BTreeSet<String>,
     measured: &BTreeMap<String, Measured>,
     floors: &BTreeMap<String, f64>,
 ) -> Vec<String> {
-    let mut failures = Vec::new();
+    let mut failures = unreported(gated, measured);
 
     let measured_names: BTreeSet<&str> = measured.keys().map(String::as_str).collect();
     let floor_names: BTreeSet<&str> = floors.keys().map(String::as_str).collect();
@@ -237,9 +262,12 @@ fn check_floors(
             "{name}: no floor in {FLOORS_FILE} — every gated crate needs one; run `cargo xtask coverage --bless`"
         ));
     }
-    for name in floor_names.difference(&measured_names) {
+    // A floored member that is still gated but missing from the report is
+    // already named by `unreported`; only a floor for a crate that is no longer
+    // a gated member is stale.
+    for name in floor_names.iter().filter(|name| !gated.contains(**name)) {
         failures.push(format!(
-            "{name}: has a floor in {FLOORS_FILE} but reported no coverage — remove the entry if the crate is gone"
+            "{name}: has a floor in {FLOORS_FILE} but is not a gated workspace member — remove the entry if the crate is gone"
         ));
     }
 
@@ -329,6 +357,8 @@ pub fn run(bless: bool) -> Result<()> {
         .filter(|(name, _)| !EXCLUDED.contains(&name.as_str()))
         .collect();
 
+    let gated_names: BTreeSet<String> = gated.keys().cloned().collect();
+
     let report = measure(&root)?;
     let measured = aggregate(&report, &gated);
     if measured.is_empty() {
@@ -338,6 +368,16 @@ pub fn run(bless: bool) -> Result<()> {
     let floors_path = root.join(FLOORS_FILE);
 
     if bless {
+        // Blessing cannot write a floor for a crate it has no number for, and
+        // quietly omitting it would hand the next check an unfloored member.
+        let missing = unreported(&gated_names, &measured);
+        if !missing.is_empty() {
+            bail!(
+                "cannot bless {FLOORS_FILE} ({} problem(s)):\n{}",
+                missing.len(),
+                missing.join("\n")
+            );
+        }
         fs::write(&floors_path, render_floors(&measured))
             .with_context(|| format!("failed to write {}", floors_path.display()))?;
         println!(
@@ -357,7 +397,7 @@ pub fn run(bless: bool) -> Result<()> {
     let floors: FloorsFile = toml::from_str(&raw)
         .with_context(|| format!("failed to parse {}", floors_path.display()))?;
 
-    let failures = check_floors(&measured, &floors.floors);
+    let failures = check_floors(&gated_names, &measured, &floors.floors);
     if !failures.is_empty() {
         bail!(
             "coverage floors not met ({} problem(s)):\n{}\n\n\
@@ -396,15 +436,101 @@ mod tests {
             .collect()
     }
 
+    /// `check_floors` for the common case where every gated member appears in
+    /// the report, so the gated set is exactly the measured crates.
+    fn check(measured: &BTreeMap<String, Measured>, floors: &BTreeMap<String, f64>) -> Vec<String> {
+        let gated: BTreeSet<String> = measured.keys().cloned().collect();
+        check_floors(&gated, measured, floors)
+    }
+
+    /// A report whose only file belongs to `/ws/crates/present`, so any other
+    /// gated member contributes nothing to it.
+    fn report_covering_only_present() -> (BTreeMap<String, PathBuf>, LlvmCovReport) {
+        let dirs: BTreeMap<String, PathBuf> = [
+            ("present".to_string(), PathBuf::from("/ws/crates/present")),
+            ("silent".to_string(), PathBuf::from("/ws/crates/silent")),
+        ]
+        .into_iter()
+        .collect();
+        let report = LlvmCovReport {
+            data: vec![LlvmCovData {
+                files: vec![LlvmCovFile {
+                    filename: "/ws/crates/present/src/lib.rs".to_string(),
+                    summary: LlvmCovFileSummary {
+                        lines: LlvmCovLines {
+                            count: 10,
+                            covered: 9,
+                        },
+                    },
+                }],
+            }],
+        };
+        (dirs, report)
+    }
+
+    #[test]
+    fn a_gated_member_absent_from_the_report_fails_even_without_a_floor() {
+        // The case the zero-line handling in `aggregate` cannot reach: the
+        // member has no file in the report at all, so it never becomes a
+        // measured crate, and a floor check driven only by measured crates
+        // would pass with "silent" never mentioned.
+        let (dirs, report) = report_covering_only_present();
+        let gated: BTreeSet<String> = dirs.keys().cloned().collect();
+        let totals = aggregate(&report, &dirs);
+        assert!(!totals.contains_key("silent"), "precondition: {totals:?}");
+
+        let failures = check_floors(&gated, &totals, &floors(&[("present", 90.0)]));
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("silent: workspace member absent from the coverage report"),
+            "{failures:?}"
+        );
+        // The remediation it names is real: listing the crate in EXCLUDED is
+        // what removes it from `gated` in `run`, and then the check is clean.
+        let without_silent: BTreeSet<String> =
+            gated.into_iter().filter(|n| n != "silent").collect();
+        assert!(check_floors(&without_silent, &totals, &floors(&[("present", 90.0)])).is_empty());
+    }
+
+    #[test]
+    fn a_floored_member_absent_from_the_report_is_not_called_stale() {
+        // A floor for a crate that still exists must not advise deleting the
+        // floor: the crate lost its coverage, it did not leave the workspace.
+        let (dirs, report) = report_covering_only_present();
+        let gated: BTreeSet<String> = dirs.keys().cloned().collect();
+        let totals = aggregate(&report, &dirs);
+
+        let failures = check_floors(
+            &gated,
+            &totals,
+            &floors(&[("present", 90.0), ("silent", 80.0)]),
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with("silent: workspace member absent"),
+            "{failures:?}"
+        );
+        assert!(!failures[0].contains("remove the entry"), "{failures:?}");
+    }
+
+    #[test]
+    fn blessing_refuses_a_gated_member_it_has_no_number_for() {
+        let (dirs, report) = report_covering_only_present();
+        let gated: BTreeSet<String> = dirs.keys().cloned().collect();
+        let missing = unreported(&gated, &aggregate(&report, &dirs));
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].starts_with("silent:"), "{missing:?}");
+    }
+
     #[test]
     fn a_crate_at_its_floor_passes() {
-        let failures = check_floors(&measured(&[("rocm", 77.0)]), &floors(&[("rocm", 77.0)]));
+        let failures = check(&measured(&[("rocm", 77.0)]), &floors(&[("rocm", 77.0)]));
         assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
     fn a_crate_below_its_floor_beyond_tolerance_fails_and_names_itself() {
-        let failures = check_floors(&measured(&[("rocm", 76.5)]), &floors(&[("rocm", 77.0)]));
+        let failures = check(&measured(&[("rocm", 76.5)]), &floors(&[("rocm", 77.0)]));
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(
             failures[0].starts_with("rocm: 76.50% lines, below its floor"),
@@ -415,7 +541,7 @@ mod tests {
     #[test]
     fn a_drop_within_tolerance_passes() {
         // 0.1pp under the floor, inside the 0.2pp tolerance.
-        let failures = check_floors(&measured(&[("rocm", 76.9)]), &floors(&[("rocm", 77.0)]));
+        let failures = check(&measured(&[("rocm", 76.9)]), &floors(&[("rocm", 77.0)]));
         assert!(failures.is_empty(), "{failures:?}");
     }
 
@@ -423,14 +549,14 @@ mod tests {
     fn a_drop_just_past_tolerance_fails() {
         // 0.25pp under the floor, outside the 0.2pp tolerance. Pins the boundary
         // so widening the tolerance cannot pass unnoticed.
-        let failures = check_floors(&measured(&[("rocm", 76.75)]), &floors(&[("rocm", 77.0)]));
+        let failures = check(&measured(&[("rocm", 76.75)]), &floors(&[("rocm", 77.0)]));
         assert_eq!(failures.len(), 1, "{failures:?}");
     }
 
     #[test]
     fn a_measured_crate_with_no_floor_fails() {
         // The case that lets a new workspace member land outside the gate.
-        let failures = check_floors(
+        let failures = check(
             &measured(&[("rocm", 77.0), ("newcomer", 12.0)]),
             &floors(&[("rocm", 77.0)]),
         );
@@ -440,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_floor_with_no_measured_crate_fails() {
-        let failures = check_floors(
+        let failures = check(
             &measured(&[("rocm", 77.0)]),
             &floors(&[("rocm", 77.0), ("departed", 50.0)]),
         );
@@ -453,7 +579,7 @@ mod tests {
 
     #[test]
     fn every_failing_crate_is_reported_not_just_the_first() {
-        let failures = check_floors(
+        let failures = check(
             &measured(&[("rocm", 10.0), ("rocm-core", 20.0)]),
             &floors(&[("rocm", 77.0), ("rocm-core", 81.0)]),
         );
@@ -525,11 +651,11 @@ mod tests {
             "zero-line crate must still be measured"
         );
         // Present but unfloored => reported, not silently skipped.
-        let failures = check_floors(&totals, &floors(&[]));
+        let failures = check(&totals, &floors(&[]));
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("empty: no floor"), "{failures:?}");
         // With a floor, it passes rather than dividing by zero.
-        assert!(check_floors(&totals, &floors(&[("empty", 100.0)])).is_empty());
+        assert!(check(&totals, &floors(&[("empty", 100.0)])).is_empty());
     }
 
     #[test]
@@ -538,7 +664,7 @@ mod tests {
         let m = measured(&[("rocm", 77.999), ("rocm-core", 81.004)]);
         let rendered = render_floors(&m);
         let parsed: FloorsFile = toml::from_str(&rendered).expect("rendered floors must parse");
-        assert!(check_floors(&m, &parsed.floors).is_empty());
+        assert!(check(&m, &parsed.floors).is_empty());
     }
 
     #[test]

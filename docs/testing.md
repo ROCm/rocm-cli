@@ -152,7 +152,10 @@ commit why coverage legitimately dropped (a crate shrank, tests moved elsewhere)
 than re-blessing to make a red check go away.
 
 Adding a workspace crate fails the check until that crate has a floor, so a new crate
-cannot land outside the gate.
+cannot land outside the gate. A crate that no test binary compiles at all never shows up
+in the coverage report; both the check and `--bless` fail on it by name, and the way out
+is tests or an entry in `EXCLUDED` in `xtask/src/coverage.rs` with the reason — there is
+no measurement to bless a floor from.
 
 These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules as
 covered source. That inflates the numbers and damps the gate — see the module comment in
