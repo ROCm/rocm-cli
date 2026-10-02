@@ -164,7 +164,7 @@ Feature: TheRock "next" ROCm 10 install layout
     And the ROCm 10 runtime provisioned a cp314 Python interpreter
     When the user reinstalls vllm
     Then the install reports the vLLM ROCm 10.x discovery pins
-    And a model is being served on GPU
+    Given a model is being served on GPU
     When the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
