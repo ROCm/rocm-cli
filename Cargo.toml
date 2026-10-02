@@ -33,6 +33,7 @@ publish = false
 [workspace.dependencies]
 anyhow = "1.0"
 async-stream = "0.3"
+pulldown-cmark = { version = "0.12", default-features = false }
 axum = "0.8"
 clap = { version = "4.6", features = ["derive", "string", "suggestions"] }
 clap_complete = "4.6"
