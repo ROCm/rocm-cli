@@ -871,6 +871,10 @@ const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
 /// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
 /// Returns the task handle + socket to clean up on exit, or `None` when an
 /// existing daemon was found (we connect to it instead).
+// One function with `#[cfg]` blocks inside, not a cfg-split pair: the unix
+// body awaits, the Windows body does not. Callers `.await` this either way,
+// so dropping `async` off unix would not compile.
+#[allow(clippy::unused_async)]
 async fn maybe_spawn_embedded_daemon(
     connect: &str,
     config: &RocmCliConfig,

@@ -2830,6 +2830,10 @@ fn descendant_pids_for_roots(root_pids: &[u32]) -> Result<Vec<u32>> {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn descendant_pids_for_roots(_root_pids: &[u32]) -> Result<Vec<u32>> {
     Ok(Vec::new())
 }
@@ -2976,6 +2980,10 @@ fn force_terminate_remaining_processes(pids: &[u32]) -> Result<Vec<u32>> {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn force_terminate_remaining_processes(_pids: &[u32]) -> Result<Vec<u32>> {
     Ok(Vec::new())
 }

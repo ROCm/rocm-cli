@@ -205,6 +205,9 @@ async fn run_unix(path: PathBuf, opts: RunnerOptions) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
+// Mirrors the signature of the `cfg(unix)` arm, which callers `.await`;
+// dropping `async` here would not compile on Windows.
+#[allow(clippy::unused_async)]
 async fn run_unix(_path: PathBuf, _opts: RunnerOptions) -> anyhow::Result<()> {
     Err(anyhow!(
         "rocm-dash daemon requires Unix domain sockets; not supported on Windows yet"

@@ -1227,7 +1227,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stdout_handle,
+            &raw mut stdout_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1243,7 +1243,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stderr_handle,
+            &raw mut stderr_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1293,7 +1293,7 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     unsafe {
         WaitForSingleObject(handle, INFINITE);
         let mut exit_code = 0;
-        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+        if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             CloseHandle(handle);
             bail!(
                 "failed to read process {pid} exit code: {}",
@@ -1476,7 +1476,7 @@ pub fn process_is_running(pid: u32) -> bool {
         return false;
     }
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 };
+    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
     unsafe {
         CloseHandle(handle);
     }
@@ -1572,6 +1572,10 @@ pub fn detach_command_session(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub fn detach_command_session(_command: &mut Command) {}
 
 #[cfg(windows)]
@@ -1615,12 +1619,12 @@ fn spawn_windows_no_inherit(
             command_line.as_mut_ptr(),
             null(),
             null(),
-            if std_handles.is_some() { 1 } else { 0 },
+            i32::from(std_handles.is_some()),
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &startup_info,
-            &mut process_info,
+            &raw const startup_info,
+            &raw mut process_info,
         )
     };
     if created == 0 {
@@ -2088,12 +2092,12 @@ struct WindowsDisplayAdapter {
 
 impl WindowsExamineInventory {
     #[cfg(windows)]
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
     }
 
     #[cfg(windows)]
-    fn merge_missing_from(&mut self, mut other: WindowsExamineInventory) {
+    fn merge_missing_from(&mut self, mut other: Self) {
         if self.cpu_model.is_none() {
             self.cpu_model = other.cpu_model.take();
         }
@@ -3507,8 +3511,7 @@ fn append_windows_probe_diagnostics(
         result
             .program
             .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| program.to_owned()),
+            .map_or_else(|| program.to_owned(), |path| path.display().to_string()),
         args.join(" ")
     );
     if let Some(error) = result.error.as_deref() {
@@ -5345,6 +5348,10 @@ fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn probe_usable_amd_gpu_indices() -> Option<Vec<u32>> {
     None
 }

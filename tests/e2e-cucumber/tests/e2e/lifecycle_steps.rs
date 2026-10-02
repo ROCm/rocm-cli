@@ -263,8 +263,7 @@ fn which_ok(name: &str) -> bool {
         .arg("-Command")
         .arg("exit 0")
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Capture the current Windows user PATH (registry `HKCU\Environment\Path`).
