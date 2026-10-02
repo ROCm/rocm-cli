@@ -832,7 +832,7 @@ async fn lemonade_preparation_cannot_complete(world: &mut E2eWorld) {
 }
 
 #[when("the user serves a model with Lemonade")]
-async fn user_serves_with_failing_lemonade_preparation(world: &mut E2eWorld) {
+async fn user_serves_with_lemonade(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
         world,
         &[
@@ -1480,10 +1480,39 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         "expected the launch to report the engine's immediate exit:\n{output}"
     );
     // The child is detached, so its own log is the only account of why it died —
-    // the user has to be told where it is.
+    // the user has to be told where it is. The path is read off the record the
+    // launch left behind, not matched as a `.log` suffix that any incidental
+    // mention of a log would satisfy; and it is the path `rocm` itself recorded,
+    // so a Windows 8.3 short form cannot make the comparison disagree with itself.
+    //
+    // The two platforms reach this through different branches of the message.
+    // On Unix the parent redirects the child's stdio into the log, so the dead
+    // child's output is there and the message carries a tail. On Windows the
+    // detached spawn does not redirect, and the scripted child never receives
+    // `--log`, so the log stays empty and only the no-tail branch runs. Naming
+    // the path is the claim both branches share, and it is the one pinned here.
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services");
+    let log_paths: Vec<String> = std::fs::read_dir(&services)
+        .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(|record| record["engine"] == "lemonade")
+        .filter_map(|record| record["log_path"].as_str().map(str::to_owned))
+        .collect();
     assert!(
-        output.contains(".log"),
-        "expected the failure to name the engine's service log:\n{output}"
+        !log_paths.is_empty(),
+        "the failed launch left no lemonade service record in {}",
+        services.display()
+    );
+    assert!(
+        log_paths.iter().any(|path| output.contains(path.as_str())),
+        "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
     );
 }
 
