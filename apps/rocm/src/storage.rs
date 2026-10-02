@@ -934,6 +934,11 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 }
 
                 // Per-key delegation keeps config/marker cleanup in one place.
+                // It rests on `select_runtime_manifest` resolving a key back to
+                // the very manifest the policy decided about — keys that differ
+                // only in letter case are distinct installs here, so a lookup
+                // that folded them together would delete a different runtime
+                // than the one the user just confirmed.
                 let result = crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
                     .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
                 // `uninstall_runtime` re-evaluates ownership itself and can
@@ -1704,6 +1709,123 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm runtimes adopt --runtime-key` stores the key the user typed
+    /// verbatim, so an adopted runtime can carry a key that differs from an
+    /// installed one only in case. The registry is one file per key, and
+    /// `ABC.json` and `abc.json` are two files, so nothing rejects the pair.
+    ///
+    /// Prune resolves the key it selected twice: `build_prune_plan` finds the
+    /// manifest with `==`, and the removal it delegates to resolves the same
+    /// string through `select_runtime_manifest`. While that second lookup
+    /// preferred the newest case-insensitive match, an adopted record — stamped
+    /// with the moment it was adopted, so always the newest — won it, and prune
+    /// de-registered the adopted runtime while leaving the install the user
+    /// confirmed in place, reclaiming nothing.
+    ///
+    /// Two case twins are only two registry files on a case-sensitive
+    /// filesystem, so the situation cannot arise — and cannot be staged — on
+    /// Windows, where the second fixture would overwrite the first.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a case-sensitive filesystem to hold two registry entries differing only in case"
+    )]
+    #[test]
+    fn prune_removes_the_install_it_named_and_not_a_case_twin_of_it() -> Result<()> {
+        let (root, paths) = test_paths("case-twin");
+        let old = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-9-0", "gfx110X-all", "7.9.0", 5),
+            2048,
+        )?;
+        let middle = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-10-0", "gfx110X-all", "7.10.0", 10),
+            2048,
+        )?;
+        let newer = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-11-0", "gfx110X-all", "7.11.0", 20),
+            2048,
+        )?;
+        // `rocm runtimes adopt --runtime-key RELEASE-WHEEL-GFX110X-7-9-0`.
+        // Adoption always sets read_only and imported_from, and stamps
+        // installed_at with the moment it ran, so it is the newest record.
+        let mut adopted = manifest("RELEASE-WHEEL-GFX110X-7-9-0", "gfx110X-all", "7.9.0", 99);
+        adopted.read_only = true;
+        adopted.imported_from = Some(PathBuf::from("/opt/rocm"));
+        let adopted = install_fixture(&paths, adopted, 2048)?;
+        // The runtime in use is a third one, so neither twin is force-kept by
+        // the active pointer. (A pointer at either twin holds *both*, because
+        // the holds compare case-insensitively — that is what hides this.)
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some("release-wheel-gfx110x-7-11-0".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = build_prune_plan(&paths, &config, 1)?;
+        let planned: Vec<&str> = plan
+            .remove
+            .iter()
+            .map(|entry| entry.runtime_key.as_str())
+            .collect();
+        assert_eq!(
+            planned,
+            vec!["release-wheel-gfx110x-7-9-0"],
+            "the plan the user confirms names the lowercase install: {:?}",
+            plan.skipped
+        );
+
+        // The removal loop in `storage()`, including its last-second re-check.
+        for entry in &plan.remove {
+            let manifests = therock::load_runtime_manifests(&paths)?;
+            let marker = read_active_runtime_marker(&paths);
+            let inputs = RetentionInputs::from_config(&config, marker.as_ref());
+            let default_key = resolved_default_runtime_key(&manifests, &inputs);
+            if let Some(manifest) = manifests
+                .iter()
+                .find(|manifest| manifest.runtime_key == entry.runtime_key)
+                && unconditional_hold(manifest, &inputs, default_key.as_deref()).is_some()
+            {
+                continue;
+            }
+            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+        }
+
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        assert!(
+            !old.install_root.exists(),
+            "the install the plan named must be the one that is gone"
+        );
+        assert!(newer.install_root.is_dir());
+        assert!(middle.install_root.is_dir());
+        assert!(
+            adopted.install_root.is_dir(),
+            "the adopted runtime's folder must survive"
+        );
+        assert!(
+            !registry.join("release-wheel-gfx110x-7-9-0.json").is_file(),
+            "the named install is de-registered too, not just emptied"
+        );
+        assert!(
+            registry.join("RELEASE-WHEEL-GFX110X-7-9-0.json").is_file(),
+            "the adopted runtime must still be registered"
+        );
+        // Belt as well as braces: even if the policy ever did select the
+        // adopted twin, the ownership guard would still refuse its folder.
+        assert_eq!(
+            should_remove_runtime_install_root(&adopted)?,
+            InstallRootDecision::ReadOnly,
+            "an adopted install's folder stays off-limits to deletion"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some("release-wheel-gfx110x-7-11-0"),
+            "removing an old install must not deactivate the runtime in use"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
     /// `--yes` is required when there is nobody to answer the prompt. This is
     /// the gate standing between a scripted invocation and a multi-gigabyte
     /// deletion, so it is worth a test of its own.
