@@ -25,6 +25,33 @@ const ENGINE: &str = "vllm";
 /// A record whose manifest a user already deleted by hand, leaving its engine
 /// state file stranded — the state this feature has to be able to clean up.
 const ORPHAN_ID: &str = "vllm-e2e-hand-deleted";
+/// A service whose `rocm serve` has written its 0600 endpoint key but not yet
+/// its record — the launch-in-progress shape the leftover sweep must not
+/// mistake for something to delete.
+const STARTING_ID: &str = "vllm-e2e-still-starting";
+/// The value in that service's key file, asserted back so a truncating write is
+/// caught as well as a deletion.
+const STARTING_KEY: &str = "live-endpoint-key";
+/// How long the staged launch keeps the lock once the prune is under way.
+///
+/// The clock starts in the *When* step, immediately before the `rocm` process is
+/// spawned — not in the Given. An earlier revision started it in the Given and
+/// slept a fixed two seconds, which made the whole hold a budget that the step
+/// transition had to fit inside. It did on a developer box and did not on a
+/// loaded CI runner: the lock was released before `rocm` was spawned, the prune
+/// sailed through in 4ms, and the assertion below reported "it did not block on
+/// the lock" for a build where it would have. Tying the hold to the spawn
+/// removes the runner's scheduling from the measurement entirely.
+const LAUNCH_PUBLISH_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Slack allowed on the prune's elapsed time before it is called shorter than
+/// the hold.
+///
+/// The releasing thread is started just before the spawn rather than exactly at
+/// it, so the prune's own timer can begin a hair after the hold's. That gap is
+/// microseconds, and it is orders of magnitude smaller than the difference the
+/// bound in [`prune_did_not_return_before_the_hold`] is there to notice: a prune
+/// that never takes the lock returns in well under a second.
+const LAUNCH_WAIT_SLACK: std::time::Duration = std::time::Duration::from_millis(100);
 
 fn data_dir(world: &E2eWorld) -> PathBuf {
     world
@@ -177,15 +204,8 @@ async fn record_still_running(world: &mut E2eWorld) {
 #[given("a local server record whose server died long ago and was never listed since")]
 async fn record_died_long_ago(world: &mut E2eWorld) {
     plant_record(world, "ready");
-    let month_ago = std::time::SystemTime::now() - std::time::Duration::from_hours(24 * 30);
     for path in record_files(world) {
-        let handle = std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap_or_else(|error| panic!("failed to open {} : {error}", path.display()));
-        handle
-            .set_modified(month_ago)
-            .unwrap_or_else(|error| panic!("failed to backdate {} : {error}", path.display()));
+        backdate(&path, std::time::Duration::from_hours(24 * 30));
     }
 }
 
@@ -219,6 +239,101 @@ async fn orphaned_engine_state(world: &mut E2eWorld) {
         serde_json::json!({ "status": "failed" }).to_string(),
     )
     .expect("failed to write orphaned engine state");
+}
+
+/// A managed launch caught between its two writes, staged exactly as `rocm
+/// serve` stages it: the 0600 endpoint key is on disk, the record is not, and
+/// the managed-launch lock is held across the whole of that interval.
+///
+/// The lock is taken with the production [`rocm_core::FileLock`] on the real
+/// `launch.lock` path, from a thread in *this* process, so the `rocm services
+/// prune` the next step spawns contends with it across a process boundary —
+/// which is the property the fix actually rests on and the one no in-process
+/// test can show. The thread then does what `serve` does next, writing the
+/// record, *before* it releases, so a prune that waits for the lock can only
+/// ever see the published state.
+///
+/// The sleep is what keeps the scenario from passing vacuously, not what makes
+/// it pass: it has to outlast `rocm`'s own startup so the prune is genuinely
+/// queued on the lock rather than arriving after the record is already there.
+/// That is a fixed duration against a variable startup, and the way it fails is
+/// one-sided in the unhelpful direction — a slow or loaded runner does not flake
+/// the scenario, it lets the prune arrive after the record is published, where
+/// the key survives for a reason that has nothing to do with the lock. Nothing
+/// in the scenario detects that case, and `prune_did_not_return_before_the_hold`
+/// is not a cure for it: the prune's elapsed time brackets the whole child
+/// process, so a startup longer than the hold satisfies that bound without the
+/// prune ever having queued on the lock. What the scenario rests on is
+/// [`starting_key_present`], and that is evidence about the lock only while
+/// startup is shorter than the hold. Overshooting the sleep is therefore the
+/// safe direction: it widens the startup margin the hold covers.
+#[given("a managed launch holding the launch lock between its key write and its record write")]
+async fn launch_between_its_two_writes(world: &mut E2eWorld) {
+    let services = services_dir(world);
+    std::fs::create_dir_all(&services).expect("failed to create services dir");
+    let key = services.join(format!("{STARTING_ID}.endpoint-key"));
+    let manifest = services.join(format!("{STARTING_ID}.json"));
+    // Write 1 of 2.
+    std::fs::write(&key, STARTING_KEY).expect("failed to write endpoint key");
+    assert!(
+        !manifest.exists(),
+        "premise: the record must not be written yet"
+    );
+
+    // `supervisor_pid` 0 for the same reason `plant_record` uses it: a record
+    // naming a real live PID makes the World's teardown `services stop` kill
+    // this test process. With no PID to check, `starting` is left alone, which
+    // is also the true state of a record `serve` has only just written.
+    let record = serde_json::json!({
+        "service_id": STARTING_ID,
+        "engine": ENGINE,
+        "model_ref": "qwen",
+        "canonical_model_id": "Qwen/Qwen3.5",
+        "host": "127.0.0.1",
+        "port": 9,
+        "endpoint_url": "http://127.0.0.1:9/v1",
+        "mode": "managed",
+        "status": "starting",
+        "supervisor_pid": 0,
+        "engine_pid": null,
+        "manifest_path": manifest,
+        "log_path": services.join(format!("{STARTING_ID}.log")),
+        // Deliberately never created: `spawn_managed_engine_child` writes the
+        // record before it makes the engine state directory, so this is the
+        // shape a just-published record really has.
+        "engine_state_path": engine_state_dir(world).join(format!("{STARTING_ID}.json")),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    let lock_path = services.join("launch.lock");
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let staged = std::thread::spawn(move || {
+        let lock =
+            rocm_core::FileLock::acquire(&lock_path).expect("failed to take the launch lock");
+        held_tx.send(()).expect("signal that the lock is held");
+        // Hold until the prune is actually running. Sleeping a fixed span here
+        // instead would put the harness's step transition inside the hold, and
+        // a transition slower than the span releases the lock before `rocm` is
+        // ever spawned. The generous timeout is a stuck-test guard, not the
+        // hold: the When step signals within milliseconds of the spawn, and a
+        // scenario that never reaches it drops the sender, which disconnects this
+        // receive at once rather than leaving it to time out.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_mins(2));
+        // Write 2 of 2, still under the lock.
+        std::fs::write(
+            &manifest,
+            serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+        )
+        .expect("failed to publish the launch's record");
+        drop(lock);
+    });
+    // Do not return until the lock is genuinely held, so the prune that follows
+    // cannot win the race by scheduling luck.
+    held_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the launch lock was taken");
+    world.launch_release = Some(release_tx);
+    world.launch_stage = Some(staged);
 }
 
 // ── When ───────────────────────────────────────────────────────────
@@ -263,9 +378,28 @@ async fn run_prune_default_age(world: &mut E2eWorld) {
 /// `--any-age`, spelled the way the summary tells the user to spell it, not the
 /// `--older-than-hours 0` equivalent: the point is that the advertised flag
 /// reaches the same code path.
+///
+/// Timed for `service-cleanup-07`, where a prune that came back before the
+/// staged launch let go of the managed-launch lock cannot have waited for that
+/// lock. The converse does not hold — see
+/// [`prune_did_not_return_before_the_hold`].
 #[when("the user prunes every record whatever its age")]
 async fn run_prune_any_age(world: &mut E2eWorld) {
+    // If a launch is staged, start its hold now rather than when it was staged,
+    // so the span the prune has to block for begins at the spawn and cannot be
+    // eaten by however long the harness took to get from that step to this one.
+    // The sender lives on this scenario's own World, so a concurrently running
+    // scenario sharing this step's text cannot consume it (see
+    // `E2eWorld::launch_release`).
+    if let Some(release) = world.launch_release.take() {
+        std::thread::spawn(move || {
+            std::thread::sleep(LAUNCH_PUBLISH_DELAY);
+            let _ = release.send(());
+        });
+    }
+    let started = std::time::Instant::now();
     let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "prune", "--any-age", "--yes"]);
+    world.cli_elapsed = Some(started.elapsed());
     record(world, stdout, stderr, rc);
 }
 
@@ -385,6 +519,70 @@ async fn preview_lists_both(world: &mut E2eWorld) {
     );
 }
 
+/// A sanity bound on how long the prune ran — not evidence that it blocked.
+///
+/// [`crate::run_rocm`] spawns a prebuilt binary and the timer brackets the whole
+/// `Command::output()`, so process startup is inside the measurement. A prune
+/// that ran longer than [`LAUNCH_PUBLISH_DELAY`] may have been queued on the
+/// lock for the hold, or may merely have been slow to start on a loaded runner
+/// and then found a lock that was already free; this assertion cannot separate
+/// those. What it does catch is the other end: a prune that comes back before
+/// the lock was ever released cannot have waited for it. That is what removing
+/// the `FileLock::acquire` from `prune_managed_service_records` produces on any
+/// runner whose `rocm` startup is shorter than the hold. The scenario's
+/// discriminating assertion is [`starting_key_present`]; see the note there for
+/// the limit it carries.
+#[then("the prune did not return before the staged hold elapsed")]
+async fn prune_did_not_return_before_the_hold(world: &mut E2eWorld) {
+    let elapsed = world
+        .cli_elapsed
+        .expect("the prune step must record how long it took");
+    assert!(
+        elapsed + LAUNCH_WAIT_SLACK >= LAUNCH_PUBLISH_DELAY,
+        "prune returned after {elapsed:?}, less than the {LAUNCH_PUBLISH_DELAY:?} the staged \
+         launch held the launch lock — it came back while the lock was still held, so it cannot \
+         have waited for it, and whatever else this scenario asserts was not decided by the \
+         fix:\n{}",
+        combined_output(world)
+    );
+}
+
+/// The scenario's discriminating assertion: the 0600 key of a launch that has
+/// not published its record yet must survive the sweep.
+///
+/// It discriminates only while `rocm`'s startup is shorter than the staged hold.
+/// Inside that window the prune reads the directory while the key is the only
+/// file that service owns, which is exactly what the leftover sweep deletes, so
+/// a prune that did not take the lock deletes it. Outside it — a runner slow
+/// enough that the record was published before the prune looked — the key is not
+/// a leftover any more and survives whatever the prune does. The scenario has no
+/// way to tell which of the two it just observed.
+#[then("the endpoint key file of the starting server is still there")]
+async fn starting_key_present(world: &mut E2eWorld) {
+    assert_succeeded(world);
+    let services = services_dir(world);
+    let key = services.join(format!("{STARTING_ID}.endpoint-key"));
+    assert!(
+        key.exists(),
+        "prune swept the key of a launch that was holding the launch lock, so it \
+         read the services directory before the record was published:\n{}",
+        combined_output(world)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key).expect("failed to read the endpoint key back"),
+        STARTING_KEY,
+        "the key the starting server is about to need must survive intact"
+    );
+    // The launch's own second write. It lands roughly LAUNCH_PUBLISH_DELAY after
+    // the When step began whatever the prune does, so this says the staged thread
+    // got that far — it is a premise check, not evidence about ordering.
+    assert!(
+        services.join(format!("{STARTING_ID}.json")).exists(),
+        "premise: the staged launch must have published its record:\n{}",
+        combined_output(world)
+    );
+}
+
 #[then("the leftover engine state file is gone")]
 async fn orphan_gone(world: &mut E2eWorld) {
     let orphan = engine_state_dir(world).join(format!("{ORPHAN_ID}.json"));
@@ -468,6 +666,17 @@ fn record(world: &mut E2eWorld, stdout: String, stderr: String, rc: i32) {
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
+}
+
+/// Stamp `path`'s modification time `ago` into the past, so a scenario can put a
+/// fixture on either side of an age gate without sleeping.
+fn backdate(path: &std::path::Path, ago: std::time::Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("failed to open {} : {error}", path.display()))
+        .set_modified(std::time::SystemTime::now() - ago)
+        .unwrap_or_else(|error| panic!("failed to backdate {} : {error}", path.display()));
 }
 
 fn combined_output(world: &E2eWorld) -> String {
