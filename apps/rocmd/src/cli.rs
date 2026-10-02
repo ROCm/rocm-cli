@@ -278,7 +278,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 allow_native_fallback,
                 policy,
             )?;
-            crate::print_json(&value)?;
+            crate::mcp::print_json(&value)?;
         }
         Command::SandboxTool {
             tool,
@@ -302,13 +302,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 message,
                 policy,
             )?;
-            crate::print_json(&value)?;
+            crate::mcp::print_json(&value)?;
         }
         Command::McpServer => {
-            crate::run_mcp_server(&paths)?;
+            crate::mcp::run_mcp_server(&paths)?;
         }
         Command::McpToolsJson => {
-            crate::print_json(&json!({ "tools": crate::rocm_mcp_tools() }))?;
+            crate::mcp::print_json(&json!({ "tools": crate::mcp::rocm_mcp_tools() }))?;
         }
         Command::McpCall {
             name,
@@ -321,15 +321,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
             if !arguments.is_object() {
                 bail!("--arguments-json for MCP tool `{name}` must be a JSON object");
             }
-            crate::ensure_direct_mcp_call_allowed(&name, allow_mutation)?;
-            let result = crate::handle_mcp_tool_call(
+            crate::mcp::ensure_direct_mcp_call_allowed(&name, allow_mutation)?;
+            let result = crate::mcp::handle_mcp_tool_call(
                 &paths,
                 &json!({
                     "name": name,
                     "arguments": arguments,
                 }),
             )?;
-            crate::print_json(&result)?;
+            crate::mcp::print_json(&result)?;
         }
     }
 
