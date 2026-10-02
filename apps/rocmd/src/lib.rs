@@ -6233,6 +6233,28 @@ mod tests {
         );
     }
 
+    /// The test above only ever hands `system_prefix_requires_ack` an
+    /// already-canonical path, so it cannot catch the bug this crate's fix
+    /// addresses: a `..`-respelled prefix that escapes `$HOME` used to compare
+    /// equal to a path still inside it (`Path::ancestors()` treats `..` as an
+    /// ordinary component), so acknowledgement was never required. Drive the
+    /// same check with a prefix built by walking `..` out of the real home
+    /// directory, which is exactly the shape the original bug let through.
+    #[test]
+    #[cfg(unix)]
+    fn install_sdk_rejects_system_prefix_reached_by_escaping_home() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let escaped_prefix = format!("{}/../../usr", home.display());
+
+        let arguments =
+            serde_json::Map::from_iter([("prefix".to_owned(), Value::String(escaped_prefix))]);
+        let error = build_install_sdk_args(&arguments, false).unwrap_err();
+        assert!(
+            error.to_string().contains("allow_system_prefix=true"),
+            "{error:#}"
+        );
+    }
+
     /// The `install_sdk` MCP tool spawns `rocm` with null stdin, so a real
     /// install over an active default managed runtime would hit the approval
     /// gate's non-interactive refusal and bail asking for a flag no MCP caller

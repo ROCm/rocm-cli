@@ -1476,6 +1476,41 @@ mod tests {
         );
     }
 
+    /// `windows_containment_sees_through_spelling_and_case` above exercises the
+    /// Windows path-resolution rules from a Linux host, but only through the
+    /// platform-parameterised helpers. The public gate itself,
+    /// [`runtime_install_root_is_protected`], still decides which protected-root
+    /// list to consult by reading [`runtime_is_windows()`] — a compile-time
+    /// answer — so its Windows arm is reachable only when this binary is
+    /// actually running on Windows. Not `#[cfg(unix)]`-gated, so it compiles
+    /// and runs on every lane: it follows the same `cfg!(windows)`-at-runtime
+    /// shape `ensure_runtime_install_root_rejects_protected_system_path` (in
+    /// `apps/rocm`) already uses to pick host-appropriate fixtures, so a lane
+    /// that is not Windows still exercises the gate end-to-end against the
+    /// Unix answer it already owns.
+    #[test]
+    fn the_public_gate_refuses_every_spelling_of_a_protected_root_on_its_own_host() {
+        let spellings: Vec<PathBuf> = if cfg!(windows) {
+            vec![
+                PathBuf::from("C:/Windows/"),            // trailing separator
+                PathBuf::from("c:/windows"),             // mixed case
+                PathBuf::from("C:/Windows//System32"),   // doubled separator
+                PathBuf::from("C:/Program Files//"),     // doubled separator
+                PathBuf::from("C:/PROGRAM FILES (X86)"), // mixed case
+            ]
+        } else {
+            vec![PathBuf::from("/etc/"), PathBuf::from("//etc")]
+        };
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|path| !runtime_install_root_is_protected(path))
+            .map(|path| path.display().to_string())
+            .collect();
+
+        assert!(accepted.is_empty(), "accepted as removable: {accepted:?}");
+    }
+
     // ── Properties: the recursive-delete guard ─────────────────────
     //
     // `runtime_install_root_is_protected` is the single source of truth for
@@ -1517,7 +1552,20 @@ mod tests {
         /// It says nothing about symlinks. The guard is not symlink-safe (see
         /// `lexically_resolved_runtime_path_text`); this reference only pins
         /// that every *spelling* of one folder resolves alike.
+        ///
+        /// Absolute input only: every generator seed in this module
+        /// (`PROTECTED_ROOTS`, `prefix()`, `home_text()`) is already rooted at
+        /// `/`, so a relative path never reaches this oracle today. That is a
+        /// property of the generators, not of this function's logic, so it is
+        /// asserted rather than merely assumed — a generator change that starts
+        /// seeding relative text would otherwise desync the oracle from
+        /// `runtime_install_root_is_protected` (which does handle relative
+        /// paths) without a single property failing to say so.
         fn lexically_resolved(path: &str) -> String {
+            assert!(
+                path.starts_with('/'),
+                "lexically_resolved is a POSIX-absolute-path oracle; got relative input {path:?}"
+            );
             let mut parts: Vec<&str> = Vec::new();
             for part in path.split('/') {
                 match part {
