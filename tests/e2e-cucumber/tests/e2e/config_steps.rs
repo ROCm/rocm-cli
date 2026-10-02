@@ -211,6 +211,78 @@ async fn confirm_key_not_echoed(world: &mut E2eWorld) {
     );
 }
 
+// ── Unreadable settings file ──────────────────────────────────────
+
+/// A `config.json` cut off part-way through recording `setup.therock_venv`,
+/// the field that tells the CLI where a custom-folder install keeps its
+/// runtimes. Black-box: plain bytes, as an interrupted write or a bad hand
+/// edit leaves them. A constant, so the Then step can compare byte for byte.
+const CUT_SHORT_SETTINGS: &str = "{\n  \"active_runtime_key\": \"therock-release-gfx1151-7.13.0\",\n  \"setup\": {\n    \"therock_venv\": \"/opt/custom-ro";
+
+fn settings_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has an isolated root")
+        .path()
+        .join("config")
+        .join("config.json")
+}
+
+#[given("the CLI's settings file was cut short while it recorded a custom ROCm folder")]
+async fn settings_cut_short(world: &mut E2eWorld) {
+    let path = settings_path(world);
+    std::fs::create_dir_all(path.parent().expect("settings file has a parent"))
+        .expect("failed to create config dir");
+    std::fs::write(&path, CUT_SHORT_SETTINGS).expect("failed to plant settings file");
+}
+
+#[when("the user checks the CLI version without naming a data folder")]
+async fn version_without_data_dir(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_without_data_dir_override(world, &["version"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user checks the CLI version naming the data folder explicitly")]
+async fn version_with_data_dir(world: &mut E2eWorld) {
+    // The isolated environment sets ROCM_CLI_DATA_DIR, which is the recovery
+    // the refusal names.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["version"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[then("the CLI refuses, saying the settings file cannot be read and how to recover")]
+async fn refuses_unreadable_settings(world: &mut E2eWorld) {
+    assert_failed(world);
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    for needle in [
+        "cannot tell where rocm-cli keeps its data",
+        "config.json",
+        "cannot be read",
+        "ROCM_CLI_DATA_DIR",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "expected stderr to contain {needle:?}, got:\n{}",
+            combined_output(world)
+        );
+    }
+}
+
+#[then("the settings file is left exactly as it was")]
+async fn settings_unchanged(world: &mut E2eWorld) {
+    let after = std::fs::read_to_string(settings_path(world)).expect("settings file is gone");
+    assert_eq!(
+        after, CUT_SHORT_SETTINGS,
+        "the CLI rewrote the settings file"
+    );
+}
+
+#[then("the CLI reports its version")]
+async fn reports_version(world: &mut E2eWorld) {
+    assert_ok_contains(world, "rocm-cli ");
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn record(world: &mut E2eWorld, stdout: String, stderr: String, rc: i32) {

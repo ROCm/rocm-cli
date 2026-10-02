@@ -1722,6 +1722,14 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Resolve the config, data and cache dirs from the environment and
+    /// `config.json`.
+    ///
+    /// Errors when no data dir is given through `ROCM_CLI_DATA_DIR` and
+    /// `config.json` exists but cannot be read: the managed root it records
+    /// decides the data dir, so guessing the default would point every command
+    /// at the wrong runtimes. Callers that only want paths for best-effort work
+    /// (logging, diagnosis) already treat an error here as "no paths".
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
@@ -1739,24 +1747,27 @@ impl AppPaths {
                 .context("unable to determine cache directory for rocm-cli")?,
         }
         .normalize_for_host();
-        Ok(Self::discover_from_paths(
+        Self::discover_from_paths(
             paths,
             data_dir_override.is_some(),
             cache_dir_override.is_some(),
-        ))
+        )
     }
 
+    /// Fails when `ROCM_CLI_DATA_DIR` is unset and `config.json` exists but
+    /// cannot be read, because the data dir it records is then unknown; see
+    /// `configured_managed_root_from_config`.
     fn discover_from_paths(
         mut paths: Self,
         data_dir_overridden: bool,
         cache_dir_overridden: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         if !data_dir_overridden
-            && let Some(managed_root) = configured_managed_root_from_config(&paths)
+            && let Some(managed_root) = configured_managed_root_from_config(&paths)?
         {
             paths = paths.with_managed_root(managed_root, cache_dir_overridden);
         }
-        paths.normalize_for_host()
+        Ok(paths.normalize_for_host())
     }
 
     fn normalize_for_host(mut self) -> Self {
@@ -1966,16 +1977,57 @@ impl AppPaths {
     }
 }
 
-fn configured_managed_root_from_config(paths: &AppPaths) -> Option<PathBuf> {
-    let bytes = fs::read(paths.config_path()).ok()?;
-    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-    value
-        .get("setup")?
-        .get("therock_venv")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+/// The managed root recorded in `config.json` (`setup.therock_venv`), if any.
+///
+/// Agrees with [`RocmCliConfig::load`] that a missing file means "nothing
+/// configured" and an unreadable one is an error. Treating an unreadable file
+/// as "nothing configured" would quietly move the data dir — the runtime
+/// registry, the active-runtime marker, service records — back to the default,
+/// so a `--prefix` install's runtimes would vanish and new ones would land in
+/// the wrong place.
+///
+/// Only what this one field needs is checked: a file that is valid JSON but
+/// that `load` rejects for some other field still yields its recorded root.
+/// That keeps the data dir right, and leaves the complaint about the other
+/// field to `load`, which names it.
+fn configured_managed_root_from_config(paths: &AppPaths) -> Result<Option<PathBuf>> {
+    let path = paths.config_path();
+    let unreadable = |detail: String| {
+        anyhow::anyhow!(
+            "cannot tell where rocm-cli keeps its data: {} cannot be read ({detail}). Repair \
+             that file, or move it aside to start from default settings, or set \
+             ROCM_CLI_DATA_DIR to choose the data directory explicitly",
+            path.display()
+        )
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error.to_string())),
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error| unreadable(format!("not valid JSON: {error}")))?;
+    let Some(top) = value.as_object() else {
+        return Err(unreadable(format!("expected a JSON object, found {value}")));
+    };
+    let setup = match top.get("setup") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(setup)) => setup,
+        Some(other) => {
+            return Err(unreadable(format!(
+                "setup should be an object, found {other}"
+            )));
+        }
+    };
+    match setup.get("therock_venv") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.trim())
+            .filter(|text| !text.is_empty())
+            .map(PathBuf::from)),
+        Some(other) => Err(unreadable(format!(
+            "setup.therock_venv should be a path, found {other}"
+        ))),
+    }
 }
 
 pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
@@ -12694,18 +12746,83 @@ Class Name:                Display
             }))?,
         )?;
 
-        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false);
+        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false)?;
         assert_eq!(discovered.config_dir, paths.config_dir);
         assert_eq!(discovered.data_dir, managed_root);
         assert_eq!(discovered.cache_dir, managed_root.join("cache"));
 
-        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false);
+        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false)?;
         assert_eq!(data_overridden.data_dir, paths.data_dir);
         assert_eq!(data_overridden.cache_dir, paths.cache_dir);
 
-        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true);
+        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true)?;
         assert_eq!(cache_overridden.data_dir, managed_root);
         assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// An unreadable `config.json` stops discovery with a message naming the
+    /// file and the ways out, and discovery leaves the file alone. Each way
+    /// out the message names is then shown to clear the condition.
+    #[test]
+    fn app_paths_refuse_to_guess_the_data_dir_from_an_unreadable_config() -> Result<()> {
+        let (root, paths) = temp_app_paths("configured-managed-root-unreadable");
+        let managed_root = root.join("managed");
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(managed_root.clone());
+        config.save(&paths)?;
+        let saved = fs::read(paths.config_path())?;
+
+        for (label, damaged) in [
+            ("truncated", saved[..saved.len() / 2].to_vec()),
+            ("not an object", b"[]".to_vec()),
+            ("setup retyped", br#"{"setup": "x"}"#.to_vec()),
+            (
+                "therock_venv retyped",
+                br#"{"setup": {"therock_venv": 7}}"#.to_vec(),
+            ),
+        ] {
+            fs::write(paths.config_path(), &damaged)?;
+            let error = AppPaths::discover_from_paths(paths.clone(), false, false)
+                .expect_err("discovery must not guess the data dir");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("cannot tell where rocm-cli keeps its data")
+                    && message.contains("config.json")
+                    && message.contains("ROCM_CLI_DATA_DIR"),
+                "{label}: unexpected error: {message}"
+            );
+            assert_eq!(
+                fs::read(paths.config_path())?,
+                damaged,
+                "{label}: discovery changed config.json"
+            );
+
+            // Way out: choose the data dir explicitly.
+            let overridden = AppPaths::discover_from_paths(paths.clone(), true, false)?;
+            assert_eq!(overridden.data_dir, paths.data_dir, "{label}");
+        }
+
+        // Way out: repair the file.
+        fs::write(paths.config_path(), &saved)?;
+        let repaired = AppPaths::discover_from_paths(paths.clone(), false, false)?;
+        assert_eq!(repaired.data_dir, managed_root);
+
+        // Way out: move it aside. A missing config is "nothing configured".
+        fs::rename(paths.config_path(), root.join("config.json.bak"))?;
+        let moved_aside = AppPaths::discover_from_paths(paths.clone(), false, false)?;
+        assert_eq!(moved_aside.data_dir, paths.data_dir);
+
+        // A file that is valid JSON but that `load` rejects for another field
+        // still names the right data dir; `load` reports that field itself.
+        let mut value = serde_json::from_slice::<serde_json::Value>(&saved)?;
+        value["dashboard"]["tui"]["chat_top_p"] = serde_json::json!(1.5);
+        fs::write(paths.config_path(), serde_json::to_vec(&value)?)?;
+        assert!(RocmCliConfig::load(&paths).is_err());
+        let other_field_bad = AppPaths::discover_from_paths(paths, false, false)?;
+        assert_eq!(other_field_bad.data_dir, managed_root);
 
         fs::remove_dir_all(root).ok();
         Ok(())

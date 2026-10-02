@@ -67,3 +67,17 @@ Feature: Configuration mutations
     When the user saves a provider API key
     Then the CLI reports it could not save the key securely
     And the key value never appears in the output
+
+  # A settings file the CLI cannot read must not be mistaken for "no settings".
+  # It records where the user's runtimes live; guessing the default folder
+  # instead makes them disappear from every answer, and later writes land in
+  # the wrong place. The CLI stops, says which file and how to recover, and
+  # leaves the file alone so nothing more is lost.
+  @id:config-unreadable-settings-not-guessed
+  Scenario: config-09 - A settings file the CLI cannot read stops it instead of hiding the user's runtimes
+    Given the CLI's settings file was cut short while it recorded a custom ROCm folder
+    When the user checks the CLI version without naming a data folder
+    Then the CLI refuses, saying the settings file cannot be read and how to recover
+    And the settings file is left exactly as it was
+    When the user checks the CLI version naming the data folder explicitly
+    Then the CLI reports its version
