@@ -94,8 +94,13 @@ mod tests {
         let root = repo_root();
 
         let ci = root.join(".github/workflows/ci.yml");
+        // Normalized the same way as workflow_contract.rs's `read_workflow`:
+        // `job_block`'s marker search is `\n`-literal, and a Windows checkout
+        // with `core.autocrlf` can hand back `\r\n` even though the repo
+        // standardises on LF (see .gitattributes).
         let ci_text = std::fs::read_to_string(&ci)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", ci.display()));
+            .unwrap_or_else(|e| panic!("reading {}: {e}", ci.display()))
+            .replace("\r\n", "\n");
         let job = job_block(&ci_text, "license-headers");
         let installed = job_env_value(job, "HAWKEYE_VERSION");
         // ci.yml's env var is `v`-prefixed (`v7.0.0`); CONTRIBUTING.md's prose
