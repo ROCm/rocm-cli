@@ -263,6 +263,19 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
+  # A managed serve that fails leaves its record on disk, and the default
+  # `rocm services list` hides it because it is not live. The header then read
+  # "none ready", the list was empty, and nothing on screen said a record
+  # existed or how to read its log - so a user whose serve failed saw the same
+  # screen as a user who had never served at all. The default view now counts
+  # what it hides and names the two commands that reach it. No GPU and no real
+  # serve: the record is planted, so this runs on every lane.
+  @id:serve-past-attempts-surfaced
+  Scenario: serve-22 - A failed local server is counted in the default list
+    Given a local server attempt has failed
+    When the user lists running services
+    Then the list reports the attempt and how to look at it
+
   # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
   # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
   # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
@@ -276,7 +289,7 @@ Feature: Model serving
   # runtime is active — hence the same `a managed runtime is active` precondition
   # every other real-serve scenario on this lane opens with.
   @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
-  Scenario: serve-22 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+  Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
     Given a managed runtime is active
     And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU
@@ -300,7 +313,7 @@ Feature: Model serving
   # pre-flight and reaches the reuse short-circuit even here. It therefore gates
   # every PR and allocates no GPU memory.
   @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
-  Scenario: serve-23 - Reusing an already-running serve never blames it for another process's OOM
+  Scenario: serve-24 - Reusing an already-running serve never blames it for another process's OOM
     Given a live managed vLLM serve has an OOM startup log
     When the user opens its interactive serve summary
     Then the summary reflects the reused already-running service
@@ -318,7 +331,7 @@ Feature: Model serving
   # where xtask builds the binary with the feature. @requires-no-gpu because the
   # fabricated launch stands in for the GPU the mock lane does not have.
   @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-24 - A launch that runs out of GPU memory names the memory knobs
+  Scenario: serve-25 - A launch that runs out of GPU memory names the memory knobs
     Given a managed vLLM launch will run out of GPU memory
     When the user opens the interactive serve summary for that launch
     Then the deployment summary blames this launch for GPU memory
@@ -340,7 +353,7 @@ Feature: Model serving
   # no service planted at all, and scenario 23 plants the SAME model, so neither
   # discriminates the model keying — this one does.
   @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
-  Scenario: serve-25 - A live service for another model does not soften the no-GPU refusal
+  Scenario: serve-26 - A live service for another model does not soften the no-GPU refusal
     Given a live managed Lemonade serve for an unrelated model
     When the user serves a different model with Lemonade under the GPU-required default
     Then serving is refused before any engine starts

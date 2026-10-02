@@ -14,12 +14,14 @@ use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
+use e2e_cucumber::paced_download::PacedDownloadServer;
 use tempfile::TempDir;
 
 mod e2e {
     pub mod artifact_steps;
     pub mod automations_steps;
     pub mod bench_steps;
+    pub mod bootstrap_steps;
     pub mod chat_steps;
     pub mod comfyui_steps;
     pub mod config_steps;
@@ -36,6 +38,8 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod serving_steps;
+    pub mod skill_steps;
+    pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;
     pub mod update_steps;
@@ -49,6 +53,10 @@ pub struct E2eWorld {
     /// Loopback file server used by artifact-prefetch scenarios. Kept on the
     /// World so it remains alive while the real `rocmd` subprocess downloads.
     pub artifact_server: Option<LoopbackServer>,
+    /// Paced download server used by the download-progress-spinner PTY
+    /// scenario. Kept on the World so it remains alive while the real `rocm`
+    /// subprocess downloads.
+    pub paced_download_server: Option<PacedDownloadServer>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -107,6 +115,14 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
+    /// skill scenarios. That document is the EXPECTED-value fixture for the
+    /// skill↔CLI contract checks — see `e2e::skill_steps`.
+    pub skill_reference: Option<String>,
+    /// The symptom text a rocm-doctor scenario hands to `rocm diagnose`. Its own
+    /// field rather than borrowing `model_name`, which means a served model and
+    /// has nothing to do with a user's error report.
+    pub skill_symptom: Option<String>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -221,6 +237,7 @@ impl Default for E2eWorld {
         Self {
             mock: None,
             artifact_server: None,
+            paced_download_server: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
@@ -240,6 +257,8 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            skill_reference: None,
+            skill_symptom: None,
         }
     }
 }
@@ -543,6 +562,7 @@ impl Drop for E2eWorld {
             mock.stop();
         }
         self.artifact_server.take();
+        self.paced_download_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
         // engine process (vLLM / llama-server) that outlives this harness — the
         // TempDir drop below removes the on-disk record but never kills those

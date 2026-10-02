@@ -101,6 +101,31 @@ definitions when no existing scenario already covers it:
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
+**A message about the CLI's own behavior is asserted together with the behavior.** When a
+change adds or edits a line the CLI prints about what it just did, what it will do next,
+or what the user must do to recover, the covering test asserts the message *and* the
+resulting state in the same test. Three shapes need this:
+
+- claims of an outcome ("this becomes the active default runtime", "nothing was saved")
+- remediation advice naming a command — the named command must exist, accept those flags,
+  and actually clear the condition that printed it
+- promises that something will *not* happen ("no driver commands will be executed",
+  "never stops servers automatically"), which no happy-path test exercises
+
+A test that only pins the wording certifies the string, not the truth of it, and a pin
+over a false claim holds the claim in place. Where the text genuinely has to be pinned on
+its own, the assertion carries a comment naming the test that proves the behavior — see
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+which pins the onboarding line and points at
+`startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
+itself.
+
+The message and the code it describes are usually in different functions and often
+different files, so nothing links them by construction. Where the printed line can be
+derived from the same value the branch is taken on — as `preapproved_install_line` in
+`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
+computed from the decision cannot disagree with it.
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
@@ -191,6 +216,7 @@ When changing assistant-adjacent behavior, keep consistency with:
 
 - `docs/llm-tool-use.md`
 - `skills/rocm-cli-assistant/SKILL.md`
+- `skills/rocm-doctor/SKILL.md` and `skills/rocm-doctor/reference.md`
 
 Required consistency points:
 
@@ -198,6 +224,62 @@ Required consistency points:
 - mutating actions require approval flow
 - avoid invented shell/package-manager commands in assistant behavior paths
 - preserve built-in assistant constraints and no-CPU-fallback policy
+
+### `skills/rocm-doctor/` — published from here, and a test fixture
+
+`skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
+(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+on two counts, and both change how you edit it:
+
+- **This repo is its source of truth.** The skill is a thin driver over the
+  `rocm` binary, so it is versioned with the binary and lives here.
+  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
+  incubation for this skill: it carries no automated federation for
+  `rocm-doctor` yet — `.github/federation.json` there only declares
+  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
+  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
+  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
+  whenever it changes materially. So edit it here, and never edit the
+  `amd/skills` copy directly — the next hand-sync overwrites it.
+- **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
+  parses its closed-catalog table and compares it to what `rocm fix` reports.
+  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
+  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
+  means changing the CLI **first**, then the two docs. That feature is what
+  catches you if you forget.
+
+The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
+frontmatter for the skill loader, and skills published this way carry no
+license headers of their own. The licence is stated in `skill-card.md`
+instead.
+
+Two checks gate it, and they cover different things:
+
+- **`skill-evals` (skillscope, advisory today)** — the frontmatter an agent
+  runtime parses, the `evals/evals.json` coverage bar (at least 3 prompts that
+  should trigger the skill and 2 near misses that should not), the
+  `skill-card.md` sections, and every internal markdown link. It is not yet a
+  required status check in branch protection: an admin must add its exact
+  context, `Skill checks (skillscope)` (the job's `name:`, not the
+  `skill-evals` job id), before a red run actually blocks a merge. Reproduce
+  it locally with
+  `uv tool install git+https://github.com/amd/skillscope@v0.1.0`, then
+  `skillscope structural --skills-dir 'skills/rocm-doctor' --skill-files
+  skill-card.md --skill-sections Description,Owner,License`. Add `--external`
+  to check the outbound URLs too; CI does not, because a rate-limited host is
+  not a broken link.
+- **`rocm_doctor_skill.feature` (e2e, blocking)** — whether the prose still
+  describes the binary, as above.
+
+Neither grades whether the skill actually *fires*. That is skillscope's
+`routing` and `behavioral`, which need an authenticated `claude` CLI and an
+`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
+so those can be switched on without further work.
+
+`skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
+verbatim into the chat system prompt with `include_str!`, so the YAML
+frontmatter a published skill needs would end up inside that prompt.
 
 ## 8) Verification Matrix For This Repo
 

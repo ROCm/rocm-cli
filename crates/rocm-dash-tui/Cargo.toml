@@ -37,7 +37,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 # Skill manifests are TOML (the external-team contribution contract).
-toml = "0.8"
+toml = "1.1"
 async-trait = "0.1"
 # Header types for the custom auth header some gateways require (e.g. APIM's
 # `Ocp-Apim-Subscription-Key`). `http` is the types-only crate Rig already uses.

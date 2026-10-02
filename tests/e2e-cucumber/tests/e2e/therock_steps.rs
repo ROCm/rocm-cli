@@ -23,12 +23,17 @@
 
 use std::fmt::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use cucumber::{given, then, when};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
+use e2e_cucumber::paced_download::{
+    PacedDownloadServer, build_gzip_tarball, deterministic_payload,
+};
 
 use crate::E2eWorld;
+use crate::e2e::tui_driver::TuiSession;
 
 /// The exact GFX arch the next layout needs. Not a group label: the aggregate
 /// source publishes one `rocm-sdk-device-<arch>` payload per arch, and
@@ -52,6 +57,14 @@ const NEXT_REAL_TARBALL: &str = "therock-dist-linux-gfx120X-all-10.0.0.tar.gz";
 /// The non-release sibling the live catalog publishes beside the real archive.
 const NEXT_TESTS_TARBALL: &str = "therock-dist-linux-gfx120X-all-tests-10.0.0.tar.gz";
 const CURRENT_TARBALL: &str = "therock-dist-linux-gfx120X-all-7.10.0.tar.gz";
+
+/// How many leading bytes of `"Downloading {CURRENT_TARBALL}"` to check for in
+/// [`assert_spinner_lines_cleared`] below. Comfortably under the ~48-column
+/// label budget `assemble_status_line` leaves on an 80-column terminal even at
+/// the widest realistic progress suffix (see that assertion's comment) — the
+/// full string would never fully render while the line is live, so a prefix
+/// this short is what actually needs to disappear on clear.
+const DOWNLOADING_PREFIX_LEN: usize = 30;
 
 /// The `current/` fixture's served base, i.e. what the canonical release
 /// overrides are pointed at.
@@ -311,6 +324,205 @@ async fn tarball_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_TARBALL_BASE", next.into()));
+}
+
+/// Size and pacing for the paced tarball fixture below: large enough (versus
+/// the chunk size) that several chunk boundaries — and therefore several
+/// observable progress frames — land before the transfer completes, and slow
+/// enough per chunk that the PTY's poll cadence reliably samples an
+/// intermediate, sub-100% frame rather than racing straight to completion.
+///
+/// The payload is tens of MB, not a few hundred KB, so that `tar -xf`
+/// (spawned synchronously once the download completes — see
+/// `extract_tarball`) takes long enough, via its own subprocess-spawn and
+/// real disk I/O over a ~20MB archive, for the "Extracting …" spinner frame
+/// to still be on screen the next time the PTY's poll checks it — the poll
+/// cadence only governs how often the already-rendered screen is sampled, not
+/// how fast extraction itself runs. The chunk size scales with the payload,
+/// so the number of paced chunks — and therefore the download's observed
+/// wall time — stays the same as before.
+const PACED_TARBALL_PAYLOAD_BYTES: usize = 20_000_000;
+const PACED_TARBALL_CHUNK_BYTES: usize = 1_600_000;
+const PACED_TARBALL_CHUNK_DELAY: Duration = Duration::from_millis(150);
+/// Wait budget for the PTY-driven download scenario below, mirroring
+/// `engines_steps.rs`'s file-local `SCREEN_TIMEOUT` convention.
+const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[given("a paced canonical release tarball fixture")]
+async fn paced_tarball_fixture(world: &mut E2eWorld) {
+    let served = root(world).join("therock-paced-tarball-fixture");
+    write_fixture(
+        &served.join("tarball").join("current").join("index.html"),
+        &tarball_index_html(&[(CURRENT_TARBALL, 1_787_000_000.0)]),
+    );
+
+    // Build a real gzip tarball so `extract_tarball` (auto-detecting `-xf`) has
+    // a genuine archive to unpack once the paced download completes. The
+    // payload bytes come from a seeded CSPRNG (`StdRng`) rather than a simple
+    // multiplicative-hash sequence: the latter looked scrambled but gzip still
+    // crushed it down to under 2 KB (well under one paced chunk), collapsing
+    // the whole "transfer" into a single unpaced chunk and defeating the
+    // pacing entirely. `StdRng` output is high-entropy enough that gzip
+    // cannot shrink it, keeping the wire transfer close to
+    // `PACED_TARBALL_PAYLOAD_BYTES`.
+    let build_dir = root(world).join("therock-paced-tarball-build");
+    let payload_dir = build_dir.join("payload");
+    std::fs::create_dir_all(&payload_dir).expect("failed to create tarball payload directory");
+    let payload = deterministic_payload(PACED_TARBALL_PAYLOAD_BYTES);
+    std::fs::write(payload_dir.join("payload.bin"), &payload)
+        .expect("failed to write tarball payload");
+    let contents = build_gzip_tarball(&build_dir, CURRENT_TARBALL, "payload").await;
+
+    world.paced_download_server = Some(PacedDownloadServer::start(
+        &served,
+        &format!("tarball/current/{CURRENT_TARBALL}"),
+        contents,
+        PACED_TARBALL_CHUNK_BYTES,
+        PACED_TARBALL_CHUNK_DELAY,
+    ));
+    allow_base_overrides(world);
+    let base = world
+        .paced_download_server
+        .as_ref()
+        .expect("paced download server was just started")
+        .base_url();
+    world.command_env.push((
+        "ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE",
+        format!("{base}/tarball/current/").into(),
+    ));
+}
+
+#[when("the user installs the tarball SDK for family gfx120X-all under a real terminal")]
+async fn install_tarball_sdk_under_pty(world: &mut E2eWorld) {
+    // No `--version`: tarball installs only accept an explicit version pin for
+    // a stable ROCm 10+ selector (see `resolve_tarball_artifact_with_timeout`'s
+    // rejection message), so an unpinned request is what reaches the canonical
+    // release catalog here — which the given-step populated with exactly one
+    // candidate, `CURRENT_TARBALL`.
+    //
+    // This scenario is testing the download spinner, not the post-install
+    // torch-runtime-dependency setup — but a real SDK install completing
+    // successfully triggers `ensure_libatomic_for_torch`/`ensure_libnuma_for_torch`,
+    // which install a missing PyTorch runtime library through the real system
+    // package manager whenever the test host happens to lack it. That is slow,
+    // network-dependent, and mutates host state, none of which this scenario
+    // should depend on, so disable it here.
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_TORCH_RUNTIME_DEP_CHECKS", "1".into()));
+    let session = TuiSession::spawn(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "tarball",
+            "--family",
+            GROUP_FAMILY,
+            "--yes",
+        ],
+    )
+    .unwrap_or_else(|e| panic!("failed to spawn `rocm install sdk` under a pty: {e}"));
+    world.tui = Some(session);
+    // A successful install's summary is ~20 lines; on the default 24-row
+    // screen (no scrollback) it would scroll the download/extraction spinner
+    // rows off the top before `assert_spinner_lines_cleared` ever reads them,
+    // turning that assertion into a tautology regardless of whether
+    // `Spinner::clear` actually ran. Grow rows only — not `use_detail_size`,
+    // which also widens the terminal and would stop the label from
+    // truncating, defeating the whole point of this scenario.
+    //
+    // Issued immediately after spawn with no synchronization point: this
+    // assumes the child process's fork/exec and first spinner repaint take
+    // longer than this resize call, so the grow always lands before more
+    // than 24 lines could have been written. True at real process-startup
+    // timings; there's no signal to wait on that would prove it instead.
+    world
+        .tui
+        .as_mut()
+        .expect("tui session was just set")
+        .grow_rows(60)
+        .unwrap_or_else(|e| panic!("failed to grow the pty's row count: {e}"));
+}
+
+#[then("the terminal shows an intermediate download progress frame")]
+async fn assert_intermediate_download_progress_frame(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .assert_intermediate_download_progress_frame("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the terminal shows the archive being extracted")]
+async fn assert_extraction_frame_is_shown(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .wait_for_screen(&format!("Extracting {CURRENT_TARBALL}"), PTY_SCREEN_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("extraction spinner frame never appeared: {e}"));
+}
+
+#[then("the tarball install exits cleanly")]
+async fn assert_tarball_install_exits_cleanly(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_mut()
+        .expect("no pty session for the tarball install");
+    session
+        .assert_exits_cleanly("the tarball install", PTY_SCREEN_TIMEOUT)
+        .await;
+}
+
+#[then("the final terminal screen shows neither spinner line")]
+async fn assert_spinner_lines_cleared(world: &mut E2eWorld) {
+    let session = world
+        .tui
+        .as_ref()
+        .expect("no pty session for the tarball install");
+    let screen = session.screen_text();
+    // A live progress suffix (kept intact by `assemble_status_line`) can
+    // truncate this label to a fraction of its length on an 80-column
+    // terminal, so the download line never actually contains the full
+    // "Downloading {CURRENT_TARBALL}" string while it's showing — checking
+    // for that full string here would pass trivially whether or not the line
+    // was cleared. Truncation always keeps the label's head intact and cuts
+    // its tail, so a short prefix is present whenever the line is live and
+    // gone once `Spinner::clear` erases it.
+    //
+    // Note this download-line check by itself can't distinguish a real
+    // `Drop`-time clear from the extraction spinner's first repaint simply
+    // overwriting the same row with `Clear(CurrentLine)` — it would pass
+    // either way, since extraction always starts once the download spinner
+    // stops. The extraction assertion just below, and the ComfyUI scenario's
+    // equivalent check (a spinner with nothing after it to overwrite its
+    // row), are what actually prove `Spinner::clear` runs on `Drop`.
+    let downloading = format!("Downloading {CURRENT_TARBALL}");
+    let downloading_prefix = downloading
+        .get(..DOWNLOADING_PREFIX_LEN)
+        .unwrap_or_else(|| {
+            panic!(
+                "DOWNLOADING_PREFIX_LEN ({DOWNLOADING_PREFIX_LEN}) is not a char boundary in \
+             {downloading:?} — pick a length that lands on one, otherwise this assertion \
+             would silently degrade to checking the untruncated label, which a live \
+             truncated line never shows"
+            )
+        });
+    assert!(
+        !screen.contains(downloading_prefix),
+        "download spinner line was not cleared on completion:\n{screen}"
+    );
+    assert!(
+        !screen.contains(&format!("Extracting {CURRENT_TARBALL}")),
+        "extract spinner line was not cleared on completion:\n{screen}"
+    );
 }
 
 fn preview(world: &mut E2eWorld, args: &[&str]) -> i32 {

@@ -110,15 +110,17 @@ impl DiagnoseReport {
     }
 }
 
-/// Upstream tracker for a framework key.
+/// Upstream tracker for a routing target.
+///
+/// Only the targets [`route_when_no_match`] can actually produce are listed.
+/// Arms for lemonade / ollama / lm-studio / amdgpu-install were unreachable —
+/// the host probe never reports those frameworks — so they described a
+/// capability the CLI does not have. Routing an app that merely appears in the
+/// symptom text is the caller's job, not the probe's.
 fn upstream_tracker(target: &str) -> &'static str {
     match target {
         "pytorch" => "https://github.com/pytorch/pytorch/issues  (tag with rocm label)",
         "llama-cpp" => "https://github.com/ggml-org/llama.cpp/issues",
-        "lemonade" => "https://github.com/lemonade-sdk/lemonade/issues",
-        "ollama" => "https://github.com/ollama/ollama/issues",
-        "lm-studio" => "https://lmstudio.ai/docs/app  (use in-app support; no public repo)",
-        "amdgpu-install" => "https://repo.radeon.com  (raise via your AMD support contact)",
         _ => "https://github.com/ROCm/ROCm/issues",
     }
 }
@@ -578,9 +580,11 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
     let fix = Fix {
         summary: "Reinstall the framework from a wheel index that includes this GPU's gfx target. Use HSA_OVERRIDE_GFX_VERSION ONLY as a temporary workaround when no native wheel exists.".to_owned(),
         commands: vec![
-            "# Recommended: PyTorch ROCm nightly that ships the gfx115x kernels.".to_owned(),
+            "# Recommended: a PyTorch ROCm nightly, which often carries kernels a".to_owned(),
+            "# release has not shipped yet. Pick the nightly for the ROCm major you".to_owned(),
+            "# have, not an older one.".to_owned(),
             "pip uninstall -y torch torchvision torchaudio".to_owned(),
-            "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm6.4".to_owned(),
+            "pip install --pre torch torchvision torchaudio \\\n  --index-url https://download.pytorch.org/whl/nightly/rocm7.14".to_owned(),
             "# llama.cpp: rebuild with AMDGPU_TARGETS set to this GPU's gfx.".to_owned(),
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx_target>".to_owned(),
         ],
@@ -848,7 +852,14 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Remove amdgpu from any modprobe blacklist and load it.".to_owned(),
         commands,
         needs_sudo: true,
-        needs_reboot: !blacklisted.is_empty(),
+        // Catalog-aligned, not state-derived: fix.rs's FixRecipe for this fix-id sets
+        // needs_reboot unconditionally. On this no-blacklist path the plan is just
+        // `modprobe amdgpu` (or that plus a Secure Boot signing note, whose own
+        // remedy can require a reboot) -- diagnose conforms to the catalog rather
+        // than the reverse (see fix.rs's assert_needs_reboot_matches_the_catalog) so
+        // `rocm diagnose` and `rocm fix` never disagree; over-warning is limited to
+        // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
+        needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
         auto_applicable: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5".to_owned(),
@@ -1058,9 +1069,10 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
             summary: "Reinstall the framework from the wheel index that matches the system ROCm major (or upgrade the system ROCm to match the wheel).".to_owned(),
             commands: vec![
                 "pip uninstall -y torch torchvision torchaudio".to_owned(),
-                "# Pick the index that matches your system ROCm major. Examples:".to_owned(),
-                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4".to_owned(),
-                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3".to_owned(),
+                "# Install the index for the ROCm major `rocm examine` reports:".to_owned(),
+                "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14".to_owned(),
+                "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:".to_owned(),
+                "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0".to_owned(),
                 "# Then re-check:".to_owned(),
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
@@ -1132,13 +1144,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
-    // Marked auto_applicable below, but `rocm fix fix-9-igpu-dgpu` still needs
-    // --device-index to actually make the change: without it, both the Linux
-    // and Windows runners only print the query that finds the index and
-    // change nothing (see README's --device-index caveat).
-    let note = format!(
-        "{note} Without --device-index, `rocm fix` only prints this query and makes no change, despite being marked AUTO."
-    );
+    // Both branches below are marked auto_applicable, but `rocm fix
+    // fix-9-igpu-dgpu` still needs --device-index to actually make the change:
+    // without it, the Linux and the Windows runner alike only print the query
+    // that finds the index and change nothing (see README's --device-index
+    // caveat). Each branch states that once, in its second note.
+    // `render_report_text` prints every note on its own line, so saying it
+    // again here -- appended to the detected-targets note -- would show up as a
+    // second bullet repeating the first.
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -1152,7 +1165,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             fix_id: "fix-9-igpu-dgpu".to_owned(),
             auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
-            notes: vec![note],
+            notes: vec![
+                note,
+                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
+                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
+                 --device-index N. Without it, `rocm fix` just prints the query that \
+                 identifies which index is the discrete GPU."
+                    .to_owned(),
+            ],
             ..Fix::default()
         }
     } else {
@@ -1167,11 +1187,21 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
             // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
-            // true, runner: run_hip_visible_devices) -- `rocm fix` can already
-            // carry this out on Linux, so the report must not claim otherwise.
+            // true, runner: run_hip_visible_devices) -- `rocm fix
+            // fix-9-igpu-dgpu --device-index N` really does carry this out on
+            // Linux, so the report must not claim otherwise. An agent branches
+            // on this flag to decide whether to offer to run the fix or only
+            // print it, so a wrong value here costs more than a stale sentence.
             auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![note],
+            notes: vec![
+                note,
+                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
+                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
+                 --device-index N. Without it, `rocm fix` just prints the query that \
+                 identifies which index is the discrete GPU."
+                    .to_owned(),
+            ],
             ..Fix::default()
         }
     };
@@ -2388,13 +2418,21 @@ fn catalog_covers(e: &Examination) -> bool {
         .any(|(_, applicable)| applicable.contains(&family))
 }
 
+/// Where to send a user when nothing in the catalog matched.
+///
+/// Keyed off the *host-detected* framework, which `Examination::probe` only
+/// ever sets to `pytorch`, `llama-cpp`, `unknown` or `skipped` — so those two
+/// named arms plus the ROCm-core default are the whole reachable set.
+///
+/// Adding a framework to `examine.rs`'s probe means adding its arm here, its
+/// tracker in [`upstream_tracker`], and its name to the hand-maintained list in
+/// `routing_targets_cover_every_framework_the_probe_reports`. That test reads
+/// its own list rather than deriving one from `examine.rs`, so it cannot notice
+/// a new framework on its own — all three edits are manual.
 fn route_when_no_match(e: &Examination) -> Route {
     let target = match e.framework.as_str() {
         "pytorch" => "pytorch",
         "llama-cpp" => "llama-cpp",
-        "lemonade" => "lemonade",
-        "ollama" => "ollama",
-        "lm-studio" => "lm-studio",
         _ => "rocm-core",
     };
     Route {
@@ -2577,6 +2615,58 @@ mod tests {
             rocm_version: "6.4.1".to_owned(),
             ..linux_base()
         }
+    }
+
+    use crate::fix::{OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS, torch_rocm_indexes_named_in};
+
+    /// A remedy has to be able to resolve the mismatch that produced it.
+    ///
+    /// `check_8` fires when the framework's HIP major differs from the system
+    /// ROCm major, and tells the user to pick the wheel index matching their
+    /// system. If every index it names is older than any ROCm this CLI installs,
+    /// there is nothing to pick: following the instruction installs a torch for
+    /// a major the machine does not have, and this same check fires again on the
+    /// result. A remedy that re-creates its own precondition is worse than none,
+    /// because the user has spent a reinstall to arrive back where they started.
+    #[test]
+    fn the_wheel_mismatch_remedy_can_resolve_the_mismatch_it_reports() {
+        let machine = Examination {
+            framework: "pytorch".to_owned(),
+            framework_rocm_version: "hip=6.4.43482".to_owned(),
+            framework_source: "path".to_owned(),
+            rocm_version: "7.14.60850".to_owned(),
+            ..linux_base()
+        };
+
+        let hit = check_8_wheel_rocm_mismatch(&machine, "");
+        // Non-vacuity: without the finding there is no remedy to judge, and the
+        // assertions below would pass against a check that never fires.
+        let fix = hit
+            .fix
+            .as_ref()
+            .expect("a HIP 6 torch against a ROCm 7 system is the mismatch this check exists for");
+
+        let named = torch_rocm_indexes_named_in(fix.commands.iter().map(String::as_str));
+        assert!(
+            !named.is_empty(),
+            "the remedy names no wheel index at all, so \"pick the one that matches\" points at \
+             nothing: {:?}",
+            fix.commands
+        );
+        // Every index, not merely one of them. "At least one is current" would
+        // pass with a stale line sitting beside a good one, and the user picking
+        // between them has no way to tell which is which -- that is the same
+        // position this defect put them in to begin with.
+        let stale: Vec<_> = named
+            .iter()
+            .filter(|(major, _)| *major < OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "this remedy offers an index older than ROCm {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, \
+             which this CLI installs. A user who picks that line installs a torch for a major \
+             they do not have, and this same check fires again on the result: {stale:?}"
+        );
     }
 
     #[test]
@@ -3114,6 +3204,192 @@ mod tests {
         assert_eq!(top.score, 100);
     }
 
+    /// The gate the rocm-doctor skill tells an agent to read, and the reason it
+    /// is not "is `matched` empty?".
+    ///
+    /// This cannot be asserted from the e2e suite: `diagnose` scores several
+    /// checkers from host state alone, with no symptom keyword involved, so on a
+    /// runner that happens to have (say) `amdgpu` blacklisted the catalog
+    /// explains the host no matter what symptom is passed. Constructing the
+    /// `Examination` is the only way to hold the premise still.
+    #[test]
+    fn sub_threshold_causes_leave_has_match_false_and_route_upstream() {
+        // Missing both groups scores 45 -- worth listing, not enough to
+        // establish. `matched` is NOT empty here, which is the whole point: an
+        // agent gating on emptiness would propose this fix for a host where
+        // nothing was established, and never route the user anywhere.
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "the office printer keeps jamming on page three");
+
+        assert!(
+            !report.matched.is_empty(),
+            "this test is pointless unless something sub-threshold was listed"
+        );
+        assert!(
+            report
+                .matched
+                .iter()
+                .all(|d| d.score < report.min_score_for_match),
+            "expected every cause below {}, got {:?}",
+            report.min_score_for_match,
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !report.has_match,
+            "nothing cleared the threshold, so has_match must be false -- \
+             skills/rocm-doctor/ tells an agent to route upstream on exactly this"
+        );
+        assert!(
+            report.route_when_no_match.url.starts_with("http"),
+            "the skill's rule is to hand over this tracker when nothing was \
+             established, so it must name somewhere to go: {:?}",
+            report.route_when_no_match
+        );
+    }
+
+    /// The other half: the flag has to discriminate, or asserting it is free.
+    #[test]
+    fn an_established_cause_sets_has_match() {
+        let mut e = linux_base();
+        e.in_render_group = Some(false);
+        e.in_video_group = Some(false);
+        let report = diagnose(&e, "cannot open /dev/kfd: permission denied");
+        assert!(
+            report.has_match,
+            "a symptom that matches the catalog must set has_match: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Routing must stay defined for every framework the probe can report, and
+    /// must not claim targets it can never reach.
+    ///
+    /// The catalog docs previously advertised lemonade / ollama / lm-studio
+    /// routing that no probe could ever trigger; this pins the reachable set so
+    /// a re-added arm has to come with a probe that reaches it.
+    ///
+    /// The list below is **hand-maintained**: its first four entries mirror what
+    /// `Examination::probe` sets in `examine.rs`, and the rest are names the
+    /// probe never returns, kept so a re-added arm for one of them shows up.
+    /// Neither half is derived from that code, so adding a fifth framework to
+    /// the probe will not fail this test — see the note on
+    /// [`route_when_no_match`] for the three places to edit.
+    #[test]
+    fn routing_targets_cover_every_framework_the_probe_reports() {
+        let mut targets = Vec::new();
+        // The first four are what `rocm examine` can actually report. The last
+        // three never come back from the probe, and are here precisely for
+        // that reason: `route_when_no_match` once carried arms for them, and
+        // removing those arms is what this test pins. Without these values in
+        // the loop, restoring `"lemonade" => "lemonade"` changes nothing the
+        // assertion below observes, and the CLI could go back to advertising
+        // routing the probe can never reach with every test still green. With
+        // them, an unreachable arm grows the target set and fails loudly.
+        for framework in [
+            "skipped",
+            "pytorch",
+            "llama-cpp",
+            "unknown",
+            "lemonade",
+            "ollama",
+            "lm-studio",
+        ] {
+            let e = Examination {
+                framework: framework.to_owned(),
+                ..Examination::default()
+            };
+            let route = route_when_no_match(&e);
+            assert!(
+                route.url.starts_with("http"),
+                "{framework}: routed to a non-URL {:?}",
+                route.url
+            );
+            targets.push(route.target);
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(
+            targets,
+            vec!["llama-cpp", "pytorch", "rocm-core"],
+            "the reachable routing targets changed; update the docs in \
+             skills/rocm-doctor/reference.md (and the amd/skills copy) to match"
+        );
+    }
+
+    /// Every diagnosis must agree with the fix catalog about whether the CLI
+    /// can apply the fix itself.
+    ///
+    /// An agent following the rocm-doctor skill branches on `auto_applicable`
+    /// from `diagnose --json` to decide whether to offer to run `rocm fix` or
+    /// merely print the plan, while `fix::apply` dispatches on `RECIPES`. The
+    /// two are written in different files and nothing but this test holds them
+    /// together, so a drift makes the CLI contradict itself: it would advertise
+    /// a fix as one it can run and then refuse, or the reverse.
+    ///
+    /// Both OS families are exercised because the checkers build their `Fix`
+    /// per-OS and only one branch is taken per run, so a Linux-only test would
+    /// leave the Windows branch free to drift unobserved.
+    #[test]
+    fn every_diagnosis_agrees_with_the_fix_catalog_on_auto_applicability() {
+        for os in ["linux", "windows"] {
+            let mut e = Examination {
+                os_family: os.to_owned(),
+                ..Examination::default()
+            };
+            // Trip several checkers at once so this covers more of the catalog
+            // than a single fix.
+            e.in_render_group = Some(false);
+            e.in_video_group = Some(false);
+            e.has_apu = true;
+            e.has_discrete_amd = true;
+            e.gpus = vec![
+                Gpu {
+                    gfx_target: "gfx1103".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ];
+
+            let report = diagnose(&e, "torch crashes with a segfault");
+            assert!(
+                !report.matched.is_empty(),
+                "{os}: expected at least one diagnosis to compare against the catalog"
+            );
+            for d in &report.matched {
+                let fix = d
+                    .fix
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
+                let catalog = crate::fix::auto_applicable_for(&fix.fix_id).unwrap_or_else(|| {
+                    panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
+                });
+                assert_eq!(
+                    fix.auto_applicable, catalog,
+                    "{os}/{}: diagnose reports auto_applicable={}, but the fix catalog \
+                     (what `rocm fix` actually does) says {catalog}",
+                    fix.fix_id, fix.auto_applicable
+                );
+            }
+        }
+    }
+
     #[test]
     fn path_missing_names_the_versioned_rocm_root() {
         // A box whose only ROCm is a versioned root used to report an empty
@@ -3200,9 +3476,82 @@ mod tests {
             "note must not repeat the old wrong gfx-number heuristic: {note}"
         );
         assert!(
-            note.contains("Without --device-index") && note.contains("despite being marked AUTO"),
+            note.contains("--device-index"),
             "note must warn that fix-9 is a no-op without --device-index: {note}"
         );
+    }
+
+    /// The `note:` lines `render_report_text` prints for one diagnosis, in
+    /// order, with the `   note: ` prefix stripped.
+    fn rendered_notes(report: &DiagnoseReport, id: &str) -> Vec<String> {
+        let text = render_report_text(report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == format!("id: {id}"))
+            .unwrap_or_else(|| panic!("{id} should appear in the rendered report:\n{text}"));
+        lines[id_line..]
+            .iter()
+            .take_while(|l| !l.trim_start().starts_with("apply with:"))
+            .filter_map(|l| l.trim_start().strip_prefix("note: "))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// An APU + discrete pairing, on the OS family given, that fires fix-9.
+    fn igpu_dgpu_host(os_family: &str) -> Examination {
+        Examination {
+            os_family: os_family.to_owned(),
+            has_apu: true,
+            has_discrete_amd: true,
+            gpus: vec![
+                Gpu {
+                    gfx_target: "gfx1103".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        }
+    }
+
+    #[test]
+    fn fix_9_states_the_device_index_caveat_exactly_once() {
+        // `render_report_text` prints every note on its own line, so two notes
+        // that both say "--device-index is required for the auto-apply to do
+        // anything" reach the user as two bullets saying the same thing. The
+        // caveat is worth stating -- once. Checked on the rendered lines rather
+        // than on `Fix::notes`, because the duplicate is only a defect at the
+        // point where it is printed, and checked on both OS branches, which
+        // build their `Fix` separately and have drifted apart before.
+        for os_family in ["linux", "windows"] {
+            let report = diagnose(&igpu_dgpu_host(os_family), "torch crashes with a segfault");
+            let notes = rendered_notes(&report, "fix-9-igpu-dgpu");
+            let caveats: Vec<&String> = notes
+                .iter()
+                .filter(|n| n.contains("--device-index"))
+                .collect();
+            assert_eq!(
+                caveats.len(),
+                1,
+                "{os_family}: the --device-index caveat must be stated once, not {}; notes: {notes:#?}",
+                caveats.len()
+            );
+            let mut seen = std::collections::BTreeSet::new();
+            for note in &notes {
+                assert!(
+                    seen.insert(note.clone()),
+                    "{os_family}: fix-9 prints the same note twice: {note}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3303,6 +3652,56 @@ mod tests {
             "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
             "rendered flags: line for fix-11-iommu: {flags_line}"
         );
+    }
+
+    fn assert_fix_5_needs_reboot(e: &Examination) {
+        let report = diagnose(e, "");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-5-amdgpu-load")
+            .expect("amdgpu-not-loaded should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        crate::fix::assert_needs_reboot_matches_the_catalog("fix-5-amdgpu-load", fix.needs_reboot);
+
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-5-amdgpu-load")
+            .expect("fix-5-amdgpu-load should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-5-amdgpu-load should have a flags: line");
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
+            "rendered flags: line for fix-5-amdgpu-load: {flags_line}"
+        );
+    }
+
+    #[test]
+    fn fix_5_amdgpu_load_needs_reboot_matches_catalog_when_blacklisted() {
+        let mut e = linux_base();
+        e.amdgpu_loaded = Some(false);
+        e.amdgpu_blacklisted_in = vec!["/etc/modprobe.d/blacklist.conf".to_owned()];
+        assert_fix_5_needs_reboot(&e);
+    }
+
+    #[test]
+    fn fix_5_amdgpu_load_needs_reboot_matches_catalog_when_not_blacklisted() {
+        // `check_5_amdgpu_blacklisted` used to compute `needs_reboot` as
+        // `!blacklisted.is_empty()`, so this case (module simply not loaded,
+        // no blacklist entry involved) used to report `false` here while the
+        // `fix-5-amdgpu-load` FixRecipe catalog said `true` unconditionally --
+        // the drift issue #418 fixed. Pin the now-unconditional `true` so a
+        // regression back to the conditional fails here rather than only
+        // being visible by eyeballing `rocm diagnose` vs `rocm fix` output.
+        let mut e = linux_base();
+        e.amdgpu_loaded = Some(false);
+        assert!(e.amdgpu_blacklisted_in.is_empty());
+        assert_fix_5_needs_reboot(&e);
     }
 
     #[test]
