@@ -227,6 +227,7 @@ form works depends on the engine your GPU selects.
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
+| `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
@@ -260,7 +261,7 @@ the JSON report, not the human-readable one.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
 
@@ -281,6 +282,25 @@ fix` takes the id, not the position.
   skips checks that need to read the distribution's own environment
   (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
   `rocm diagnose` inside the distribution for those.
+- `--report` shows exactly what this machine would contribute to a problem
+  report, and sends nothing — there is no transport yet, and there will be no
+  automatic one: a report leaves a machine only by its owner's own action. The
+  content is deliberately narrow (a schema version, the matched entry, whether
+  a fix was offered for it, the GPU architecture and which compatibility
+  matrix snapshot it was checked against, the OS family, distribution and
+  major version, the ROCm release, the inference engine and its release, the
+  CLI version), and it carries no host name, user name, file path, or error
+  text. The ROCm release and the inference engine's release are each cut
+  back to a release, so a build number that would narrow toward one machine
+  never appears there; the CLI's own version is the exception, since it names
+  the tool that wrote the report rather than something read off the machine.
+  The distribution is checked against a list of known names rather than
+  repeated from the machine. Hardware that is not on AMD's published
+  compatibility matrix produces no report at all, and the CLI says why. So
+  does a WSL machine, for a different reason: this CLI does not inspect the
+  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+  matrix and says that rather than claiming the architecture could not be
+  read.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id

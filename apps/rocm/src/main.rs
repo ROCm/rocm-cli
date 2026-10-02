@@ -153,6 +153,18 @@ enum Command {
         /// name only when more than one is installed.
         #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
         distro: Option<String>,
+        /// Show the report this machine would contribute, and send nothing.
+        ///
+        /// Nothing leaves the machine: this prints the exact content so it can
+        /// be read before any of it is shared. Hardware that is not on AMD's
+        /// published compatibility matrix produces no report at all.
+        ///
+        /// Not combinable with `--distro`: a report describes this machine, and
+        /// a WSL distribution reached remotely is not fully examined (see
+        /// `--distro`'s own help), so it cannot back the disclosure guard's
+        /// architecture check.
+        #[arg(long, conflicts_with = "distro")]
+        report: bool,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -2077,7 +2089,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             top,
             json,
             distro,
-        }) => diagnose(symptom, top, json, distro),
+            report,
+        }) => diagnose(symptom, top, json, distro, report),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2748,7 +2761,13 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
+fn diagnose(
+    symptom: Option<String>,
+    top: usize,
+    json: bool,
+    distro: Option<String>,
+    report_requested: bool,
+) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
@@ -2781,6 +2800,9 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    if report_requested {
+        return show_prepared_report(&examination, &report, json);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2799,6 +2821,87 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         }
     }
     Ok(())
+}
+
+/// The catalog entry a report should name, and whether a fix was offered for it.
+///
+/// Reads `has_match` rather than taking the head of `matched`. Several checkers
+/// open with a nonzero score for a situation that is merely *potentially*
+/// relevant, so `matched` is rarely empty even on a healthy machine — taking its
+/// head regardless would publish a sub-threshold signal as though it were an
+/// established cause, and the counts built on those reports would be wrong in a
+/// way nothing downstream could detect.
+fn established_entry(report: &rocm_core::DiagnoseReport) -> (Option<&str>, bool) {
+    if !report.has_match {
+        return (None, false);
+    }
+    report.matched.first().map_or((None, false), |top| {
+        (Some(top.id.as_str()), top.fix.is_some())
+    })
+}
+
+/// Print the report this machine would contribute, and send nothing.
+fn show_prepared_report(
+    examination: &rocm_core::Examination,
+    report: &rocm_core::DiagnoseReport,
+    json: bool,
+) -> Result<()> {
+    let (entry, fix_offered) = established_entry(report);
+    // Exit 0 either way. A refusal is this command working, not failing: it
+    // decided correctly and said why, and a nonzero code would send a caller
+    // looking for a fault. Anything scripting this reads the outcome from
+    // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
+    // already asks callers to do.
+    match rocm_core::prepare_report(examination, entry, fix_offered) {
+        Ok(prepared) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+            } else {
+                println!("This is the whole of what a report would carry:");
+                println!();
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+                println!();
+                println!("Nothing has been sent. Sending is not implemented yet.");
+            }
+            Ok(())
+        }
+        Err(refusal) => {
+            let explanation = match refusal {
+                rocm_core::ReportRefusal::UnreleasedHardware => {
+                    // "Doctor" is what the epic calls this capability; the CLI
+                    // has no such command, so a user reading this has nothing
+                    // to run and nothing to look up.
+                    "This machine holds hardware that is not on AMD's published ROCm \
+                     compatibility matrix, so no report was prepared. A report describes only \
+                     hardware the compatibility matrix lists as supported."
+                }
+                rocm_core::ReportRefusal::ArchitectureUnreadable => {
+                    "No AMD GPU architecture could be read here, so nothing confirms this \
+                     hardware is on the ROCm compatibility matrix. No report was prepared."
+                }
+                rocm_core::ReportRefusal::PlatformNotProbed => {
+                    // Says what happened rather than dressing it as a finding
+                    // about the machine. The earlier wording told a healthy WSL
+                    // user their GPU could not be read, when nothing had looked.
+                    "This CLI does not inspect the GPU on WSL yet, so it cannot confirm whether \
+                     this hardware is on the ROCm compatibility matrix. No report was prepared. \
+                     This is a gap in the tool, not a problem with the machine."
+                }
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rocm_core::refusal_envelope(
+                        refusal,
+                        explanation
+                    ))?
+                );
+            } else {
+                println!("{explanation}");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
@@ -22208,6 +22311,65 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// A diagnosis report holding exactly one finding.
+    ///
+    /// `has_match` is passed independently of the score on purpose: the point
+    /// under test is that the two are read together, so a fixture that derived
+    /// one from the other could not express the case being guarded against.
+    fn report_of(
+        has_match: bool,
+        id: &str,
+        score: i32,
+        fix: Option<rocm_core::Fix>,
+    ) -> rocm_core::DiagnoseReport {
+        rocm_core::DiagnoseReport {
+            has_match,
+            matched: vec![rocm_core::Diagnosis {
+                id: id.to_owned(),
+                title: "under test".to_owned(),
+                score,
+                evidence: Vec::new(),
+                fix,
+            }],
+            min_score_for_match: 50,
+            high_confidence_threshold: 80,
+            route_when_no_match: rocm_core::diagnose::Route {
+                target: String::new(),
+                url: String::new(),
+            },
+            out_of_scope: None,
+        }
+    }
+
+    /// The entry a report names is one the diagnosis established, not merely
+    /// the strongest signal it saw.
+    ///
+    /// This is a wiring test, not a logic one. `established_entry` is correct in
+    /// itself; what it could get wrong is being handed `matched.first()`
+    /// unconditionally. Several checkers open with a nonzero score for a
+    /// situation that is only potentially relevant, so a healthy machine
+    /// produces a `matched` list full of sub-threshold entries — and a report
+    /// naming one of those would look like an established cause to every
+    /// counter downstream, with nothing able to tell the difference afterwards.
+    #[test]
+    fn a_report_names_an_established_cause_and_not_the_loudest_weak_signal() {
+        let weak_only = report_of(false, "fix-10-container", 25, None);
+        assert_eq!(
+            established_entry(&weak_only),
+            (None, false),
+            "nothing cleared the bar, so the report has no entry to name"
+        );
+
+        // Non-vacuity: an established cause must come through, or the assertion
+        // above is satisfied by never naming anything.
+        let established = report_of(true, "fix-6-path", 90, Some(rocm_core::Fix::default()));
+        assert_eq!(
+            established_entry(&established),
+            (Some("fix-6-path"), true),
+            "an established cause with a fix is exactly what a report is for"
+        );
+    }
     use std::process::ExitCode;
 
     /// `Ok(())` must map to a clean exit so `rocm`'s successful commands don't

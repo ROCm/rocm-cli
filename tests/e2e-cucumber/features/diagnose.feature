@@ -289,3 +289,33 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
     And the preview states that the CLI can run it automatically
+
+  # Nothing here sends a report -- transport does not exist yet -- so what these
+  # two prove is the part that has to be right before it does: that the machine
+  # can see exactly what would be published, and that asking produces either a
+  # report or a stated refusal and never a silent send.
+  #
+  # Host-independent on purpose, and the branches land on different lanes. A
+  # lane with an AMD GPU on the compatibility matrix exercises the prepared
+  # report; a lane without one exercises the unreadable-architecture refusal,
+  # which is the case the mock lane actually has. The WSL lane reaches neither:
+  # `examine` returns before any GPU probe there, so it refuses because the
+  # platform was never inspected, whatever hardware it holds. Saying "a lane
+  # without an allowlisted GPU exercises the refusal" would be wrong for that
+  # lane, and would record the guard as firing correctly when it fired for an
+  # unrelated structural reason. Written so that whichever branch a lane
+  # reaches is a real assertion rather than a skip.
+  @id:diagnose-report-is-shown-and-not-sent
+  Scenario: diagnose-21 - Asking what a report would say shows it and sends nothing
+    When the user asks the CLI what a report would carry
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+
+  # The rule this guards is that a report is assembled field by field, never by
+  # copying a larger structure. The unit tests sweep for planted markers; this
+  # asserts the same property against whatever this real machine happens to be,
+  # which is the case a fixture cannot reproduce.
+  @id:diagnose-report-carries-no-identifying-detail
+  Scenario: diagnose-22 - What a report would carry never identifies the machine
+    When the user asks the CLI what a report would carry in machine-readable form
+    Then the answer names no user, no host, and no file path

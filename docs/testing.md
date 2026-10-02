@@ -1225,3 +1225,44 @@ The install is covered by unit tests over the generated plan (`cargo test -p
 rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
+
+## Doctor Report Preflight
+
+Preview the content a problem report would carry, without sending anything:
+
+```bash
+rocm diagnose --report
+rocm diagnose --report --json
+```
+
+The command refuses rather than prepares a report on three hosts, and the
+three reasons are not interchangeable. One holds an architecture the ROCm
+compatibility matrix does not list as supported (`unreleased-hardware`). One
+has an AMD GPU architecture that could not be read (`architecture-unreadable`).
+The third is any WSL host (`platform-not-probed`): `examine` returns before
+any GPU probe runs there, so nothing has looked, and saying the architecture
+could not be read would state a finding about hardware nothing inspected. All
+three exit 0 and are told apart by `--json`'s `refused` field, and the refusal
+envelope also carries `architecture_matrix`, the same compatibility-matrix
+snapshot stamp a genuine report carries, so a refusal is just as traceable to
+a matrix revision as a report is.
+
+On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
+`crates/rocm-core/src/report.rs`), the command prints the full `Report`:
+`schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
+`os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
+`fix_offered`. This path has not been exercised against real hardware in CI;
+verifying it needs a lane whose GPU architecture is on the allowlist.
+
+Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
+answer with a word rather than a value, and the words are not interchangeable.
+`none` means the thing is absent, `unknown` means this build looked and could
+not tell, and `other` means a distribution was named but is not one this build
+recognises. A host with no ROCm installed reports `"rocm": "none"`, while a
+host whose install exists but whose version could not be read reports `"rocm":
+"unknown"` — worth checking by hand on a machine with a partial install, since
+the two are easy to merge by accident and a counter cannot tell them apart
+afterwards. `engine`/`engine_version` carry the same distinction: a host a
+probe found no engine on reports `"engine": "none"`, while a host whose engine
+probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
+since a probe that never ran cannot say an engine is absent.
