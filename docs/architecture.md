@@ -35,7 +35,7 @@ Subsystem modules already following full domain extraction (each owns its own ty
 
 ### `crates/rocm-core` — core library
 
-Already-extracted subsystem modules include `diagnose.rs`, `examine.rs`, and several siblings following the same pattern. `lib.rs` itself is **not yet modularized** — see EAI-7768, planned last in the modularization effort: highest fan-in (every app and engine crate depends on it), but lowest novelty since the existing sibling modules already prove the pattern works.
+Already-extracted subsystem modules include `diagnose.rs`, `examine.rs`, `model_readiness.rs` (the `rocm diagnose --model`/`rocm model --verbose` fit assessment: curated-recipe lookup against a host's measured GPU/RAM, shared between the two commands so they cannot disagree about whether a model fits), and several siblings following the same pattern. `lib.rs` itself is **not yet modularized** — see EAI-7768, planned last in the modularization effort: highest fan-in (every app and engine crate depends on it), but lowest novelty since the existing sibling modules already prove the pattern works.
 
 ### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
 
