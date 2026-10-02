@@ -1607,6 +1607,8 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::test_support::identity_probe_record;
     use crate::test_support::temp_app_paths;
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
 
@@ -3143,5 +3145,40 @@ mod tests {
             watcher_policy_action("therock-update", WatcherMode::Contained),
             WatcherPolicyAction::RunContained
         );
+    }
+
+    /// The same guarantee for the daemon's recovery path, which records a PID of
+    /// its own. See `supervise_service_persists_the_supervisor_identity_token`
+    /// for why an unrecorded token is the defect rather than a cosmetic gap.
+    ///
+    /// The restart re-execs `rocmd supervise`, which here is the test binary:
+    /// it rejects those arguments and exits at once, so the restart reports
+    /// failure — after it has written the record this test reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_managed_service_persists_the_supervisor_identity_token() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-records-identity");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-identity";
+        let mut record = identity_probe_record(&paths, service_id, 11444);
+        record.status = "failed".to_owned();
+        record.write()?;
+        assert_eq!(
+            load_service_record(&paths, service_id)?.supervisor_start_ticks,
+            None,
+            "precondition: the seeded record carries no token"
+        );
+
+        let _ = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            persisted?.supervisor_start_ticks.is_some(),
+            "restart_managed_service must persist the supervisor's start-time token beside its PID"
+        );
+        Ok(())
     }
 }
