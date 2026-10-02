@@ -12,6 +12,7 @@
 
 mod affected;
 mod architecture_doc;
+mod catalog;
 mod crate_edges;
 mod demos;
 mod e2e;
@@ -109,6 +110,13 @@ enum Command {
     /// expected location per citation; see `citation_exists`'s doc comment
     /// in `xtask/src/architecture_doc.rs` for the full rule.
     CheckArchitectureDoc,
+    /// Regenerate the published Doctor catalog manifest from the compiled catalog.
+    Catalog {
+        /// Verify the published manifest is current without writing; exit
+        /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -257,6 +265,7 @@ fn run() -> Result<()> {
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::CheckArchitectureDoc => architecture_doc::run()?,
+        Command::Catalog { check } => catalog::run(check)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,

@@ -1,0 +1,373 @@
+{
+  "contract_version": 1,
+  "entries": [
+    {
+      "id": "fix-1-arch",
+      "title": "GPU gfx target not in framework arch list",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "windows",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
+    },
+    {
+      "id": "fix-2-unset-override",
+      "title": "Unset HSA_OVERRIDE_GFX_VERSION",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "windows",
+          "class": "auto"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-3-rocm-kernel",
+      "title": "ROCm/distro/kernel triple unsupported",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": true,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
+    },
+    {
+      "id": "fix-4-render-group",
+      "title": "Add user to render/video groups",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "auto"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": true
+    },
+    {
+      "id": "fix-5-amdgpu-load",
+      "title": "Load amdgpu (and clear any blacklist)",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": true,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-6-path",
+      "title": "Add the ROCm/HIP bin directory to PATH",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "auto"
+        },
+        {
+          "os": "windows",
+          "class": "auto"
+        },
+        {
+          "os": "wsl",
+          "class": "auto"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-7-stale-repos",
+      "title": "Quarantine duplicate AMD repos",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-8-wheel-rocm",
+      "title": "Reinstall the framework against the system ROCm/HIP major",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "windows",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html"
+    },
+    {
+      "id": "fix-9-igpu-dgpu",
+      "title": "Hide the iGPU with HIP_VISIBLE_DEVICES",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "needs-argument",
+          "needs": "--device-index"
+        },
+        {
+          "os": "windows",
+          "class": "needs-argument",
+          "needs": "--device-index"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-10-container",
+      "title": "Re-launch the container with AMD devices passed through",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-11-iommu",
+      "title": "Add iommu=pt to the kernel command line",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": true,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-12-installer",
+      "title": "Reset amdgpu-install state and reinstall",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": true,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-13-hip-sdk-missing",
+      "title": "Install the AMD HIP SDK for Windows",
+      "platforms": [
+        {
+          "os": "windows",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html"
+    },
+    {
+      "id": "fix-14-adrenalin-too-old",
+      "title": "Update the Adrenalin / kernel-mode driver",
+      "platforms": [
+        {
+          "os": "windows",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": true,
+      "needs_relogin": false,
+      "doc_url": "https://rocm.docs.amd.com/projects/install-on-windows/en/latest/install/install.html"
+    },
+    {
+      "id": "fix-15-msvc-redist",
+      "title": "Install the MSVC 2015-2022 runtime redistributable",
+      "platforms": [
+        {
+          "os": "windows",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false,
+      "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    },
+    {
+      "id": "fix-17-torch-dlpack",
+      "title": "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-1-gpu-not-exposed",
+      "title": "Expose the GPU to the WSL distro (/dev/dxg)",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-2-dxcore-missing",
+      "title": "Restore the WSL DXCore libraries",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-3-rocdxg-missing",
+      "title": "Install ROCDXG in the WSL distro",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-4-rocdxg-not-linked",
+      "title": "Refresh the linker cache so ROCDXG is loadable",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-5-distro-too-old",
+      "title": "Move to a distro release the WSL path supports",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-6-host-driver-too-old",
+      "title": "Update the AMD driver on the Windows host",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-wsl-7-wsl1",
+      "title": "Convert the distro from WSL 1 to WSL 2",
+      "platforms": [
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
+      "id": "fix-19-shm-too-small",
+      "title": "Raise the shared memory allowance",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": true,
+      "needs_reboot": false,
+      "needs_relogin": false
+    }
+  ],
+  "exit_codes": {
+    "declined": 5,
+    "failed": 4,
+    "internal": 1,
+    "not_applicable": 3,
+    "ok": 0,
+    "unknown_id": 2
+  }
+}
