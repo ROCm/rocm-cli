@@ -36,6 +36,7 @@ const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
 const MERGE_QUEUE_TAG: &str = "merge-queue";
+const GPU_SMOKE_TAG: &str = "gpu-smoke";
 
 // `@serial` deliberately has no entry here, and `from_tags` below silently
 // ignores it like any other unrecognized tag: it isn't an expectation-
@@ -210,6 +211,10 @@ pub struct ScenarioDecl {
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
     /// the full serve matrix before a change lands.
     pub merge_queue: bool,
+    /// `@gpu-smoke`: one of the cheap per-engine real-GPU canaries that still
+    /// run on a pull request and in the merge queue, where a GPU lane runs no
+    /// other real-GPU scenario (`E2E_GPU_SMOKE_ONLY`, see [`restrict_to_smoke`]).
+    pub gpu_smoke: bool,
 }
 
 impl ScenarioDecl {
@@ -231,6 +236,7 @@ impl ScenarioDecl {
         let mut nightly = false;
         let mut lifecycle = false;
         let mut merge_queue = false;
+        let mut gpu_smoke = false;
         for tag in tags {
             let tag = tag
                 .as_ref()
@@ -269,6 +275,8 @@ impl ScenarioDecl {
                 lifecycle = true;
             } else if tag == MERGE_QUEUE_TAG {
                 merge_queue = true;
+            } else if tag == GPU_SMOKE_TAG {
+                gpu_smoke = true;
             }
         }
         Self {
@@ -287,6 +295,7 @@ impl ScenarioDecl {
             nightly,
             lifecycle,
             merge_queue,
+            gpu_smoke,
         }
     }
 
@@ -667,6 +676,34 @@ pub fn resolve(
 
     // (3) default.
     Expectation::ExpectPass
+}
+
+/// Narrow a GPU lane's real-GPU scenarios to the smoke test (`E2E_GPU_SMOKE_ONLY`).
+///
+/// On a pull request and in the merge queue a GPU lane runs, of the scenarios
+/// that need a real GPU, only the `@gpu-smoke` canaries and the `@merge-queue`
+/// serves; every other one resolves to `Skip` with the reason recorded, so the
+/// report shows it as not applicable on that lane. Scenarios that need no GPU
+/// are untouched — the Windows and WSL lanes are where they meet those
+/// platforms — and so is an expectation that already resolved to `Skip`, whose
+/// own reason is the more precise one.
+#[must_use]
+pub fn restrict_to_smoke(
+    decl: &ScenarioDecl,
+    expectation: Expectation,
+    smoke_only: bool,
+) -> Expectation {
+    let outside_smoke = decl.requires_gpu && !decl.gpu_smoke && !decl.merge_queue;
+    if smoke_only && outside_smoke && !matches!(expectation, Expectation::Skip { .. }) {
+        Expectation::Skip {
+            reason: "this GPU lane runs only the @gpu-smoke real-GPU canaries on a pull \
+                     request (E2E_GPU_SMOKE_ONLY); the full GPU suite runs nightly and on \
+                     pushes"
+                .to_owned(),
+        }
+    } else {
+        expectation
+    }
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -1978,5 +2015,50 @@ flaky = true
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_smoke_only_lane_narrows_only_the_real_gpu_scenarios() {
+        let xfail = || Expectation::ExpectXfail {
+            bug: "B-1".to_owned(),
+            reason: "known".to_owned(),
+            flaky: false,
+        };
+        let canary = decl(&["id:serve-vllm", "requires-real-gpu", "gpu-smoke"]);
+        let queue_serve = decl(&["id:serve-default", "requires-real-gpu", "merge-queue"]);
+        let heavy = decl(&["id:runtime-install", "requires-real-gpu"]);
+        let no_gpu = decl(&["id:examine-version"]);
+
+        // The canaries and the queue serves keep their resolution, xfail included.
+        assert_eq!(restrict_to_smoke(&canary, xfail(), true), xfail());
+        assert_eq!(
+            restrict_to_smoke(&queue_serve, Expectation::ExpectPass, true),
+            Expectation::ExpectPass
+        );
+        // Every other real-GPU scenario is skipped, and says why.
+        for expectation in [Expectation::ExpectPass, xfail()] {
+            match restrict_to_smoke(&heavy, expectation, true) {
+                Expectation::Skip { reason } => {
+                    assert!(reason.contains("E2E_GPU_SMOKE_ONLY"), "{reason}");
+                }
+                other => panic!("expected skip, got {other:?}"),
+            }
+        }
+        // A scenario that needs no GPU still runs: the Windows and WSL lanes are
+        // where it meets those platforms.
+        assert_eq!(
+            restrict_to_smoke(&no_gpu, Expectation::ExpectPass, true),
+            Expectation::ExpectPass
+        );
+        // A skip that already happened keeps its own, more precise reason.
+        let skip = Expectation::Skip {
+            reason: "requires os 'linux'".to_owned(),
+        };
+        assert_eq!(restrict_to_smoke(&heavy, skip.clone(), true), skip);
+        // Off a smoke-only lane nothing changes.
+        assert_eq!(
+            restrict_to_smoke(&heavy, Expectation::ExpectPass, false),
+            Expectation::ExpectPass
+        );
     }
 }

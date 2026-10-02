@@ -816,24 +816,77 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// On a pull request and in the merge queue every self-hosted GPU lane
+    /// narrows its real-GPU scenarios to the `@gpu-smoke` canaries, while the
+    /// heavy `@merge-queue` serves stay opted in for the merge queue alone.
+    /// Pushes, dispatches and nightly set neither, so they run the full suite.
     #[test]
-    fn self_hosted_wsl_enables_merge_queue_scenarios_only_for_merge_group() {
+    fn self_hosted_gpu_lanes_run_only_the_gpu_smoke_test_on_prs_and_in_the_merge_queue() {
+        const SMOKE_ONLY: &str = "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}";
+        const QUEUE_ONLY: &str = "${{ github.event_name == 'merge_group' && '1' || '' }}";
         let sh = read_workflow("e2e-selfhosted.yml");
-        let wsl = job_block(&sh, "e2e-wsl");
-        let env = job_mapping(wsl, "env");
-        assert_eq!(
-            env.get("E2E_MERGE_QUEUE").map(String::as_str),
-            Some("${{ github.event_name == 'merge_group' && '1' || '' }}"),
-            "e2e-wsl's job-level env must opt into @merge-queue scenarios for merge_group only"
-        );
+        for lane in [
+            "e2e-gpu",
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-rad3",
+            "e2e-gpu-mi350p",
+        ] {
+            let env = job_mapping(job_block(&sh, lane), "env");
+            assert_eq!(
+                env.get("E2E_GPU_SMOKE_ONLY").map(String::as_str),
+                Some(SMOKE_ONLY),
+                "{lane} must narrow its real-GPU scenarios to the smoke test on pull \
+                 requests and in the merge queue, and nowhere else"
+            );
+            assert_eq!(
+                env.get("E2E_MERGE_QUEUE").map(String::as_str),
+                Some(QUEUE_ONLY),
+                "{lane} must opt into the @merge-queue serves for merge_group only"
+            );
+        }
 
         let nightly = read_workflow("nightly.yml");
         let nightly_wsl = job_block(&nightly, "e2e-wsl-nightly");
         let nightly_env = job_mapping(nightly_wsl, "env");
-        assert!(
-            !nightly_env.contains_key("E2E_MERGE_QUEUE"),
-            "the nightly WSL job cannot receive merge_group events and must not opt into @merge-queue scenarios"
-        );
+        for key in ["E2E_MERGE_QUEUE", "E2E_GPU_SMOKE_ONLY"] {
+            assert!(
+                !nightly_env.contains_key(key),
+                "the nightly WSL job runs the full suite and must not set {key}"
+            );
+        }
+    }
+
+    /// The WSL lane runs the suite inside the distro, which sees only the
+    /// variables WSLENV names. One left out there is silently unset: dropping
+    /// `E2E_GPU_SMOKE_ONLY` would run the full GPU suite on every pull request,
+    /// dropping `E2E_HARDWARE` would skip every real-GPU scenario, and neither
+    /// would ever turn the lane red.
+    #[test]
+    fn wsl_lanes_forward_every_e2e_variable_into_the_distro() {
+        for (workflow, job) in [
+            ("e2e-selfhosted.yml", "e2e-wsl"),
+            ("nightly.yml", "e2e-wsl-nightly"),
+        ] {
+            let text = read_workflow(workflow);
+            let block = job_block(&text, job);
+            let forwarded: Vec<&str> = block
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("$env:WSLENV = '"))
+                .and_then(|rest| rest.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{workflow} job {job} sets no WSLENV"))
+                .split(':')
+                .collect();
+            for key in job_mapping(block, "env").keys() {
+                if key.starts_with("E2E_") {
+                    assert!(
+                        forwarded.contains(&key.as_str()),
+                        "{workflow} job {job} sets {key} but does not forward it through WSLENV"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

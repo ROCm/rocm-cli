@@ -32,11 +32,11 @@ Feature: Model serving
   # vLLM serve + inference (safetensors model). Engine coverage: vLLM. This is the
   # deliberate vLLM half of a per-engine pair with `serve-lemonade-inference`
   # below, so it stays pinned to vLLM (the slug names the engine). It is also the
-  # vLLM per-PR canary: one real vLLM serve runs on every PR so a broken serve is
-  # caught before merge, while the heavier `@merge-queue` serves
+  # vLLM per-PR canary (`@gpu-smoke`): one real vLLM serve runs on every PR so a
+  # broken serve is caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
   # and `serve-readiness-contract`) run only in the merge queue.
-  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm
+  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm @gpu-smoke
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
@@ -59,9 +59,9 @@ Feature: Model serving
     And the response identifies the correct model
 
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
-  # lemonade per-PR canary: one real lemonade serve runs on every PR (the
-  # counterpart to the vLLM canary above).
-  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade
+  # lemonade per-PR canary (`@gpu-smoke`): one real lemonade serve runs on every
+  # PR (the counterpart to the vLLM canary above).
+  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade @gpu-smoke
   Scenario: serve-07 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
     And a GGUF model is being served on lemonade
@@ -77,7 +77,7 @@ Feature: Model serving
   # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
   # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
   # fast per-PR canary rather than needing the @nightly large-checkpoint path.
-  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade
+  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade @gpu-smoke
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
     And a canonical Hugging Face GGUF checkpoint is being served on lemonade

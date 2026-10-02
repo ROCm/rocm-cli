@@ -182,11 +182,20 @@ The cucumber suite runs in one of two hardware modes, chosen by
   usable AMD GPU.
 
 Any other value aborts the run, so a misspelt `real` cannot silently skip the
-real-GPU scenarios. To run them locally on a GPU host:
+real-GPU scenarios.
+
+To run the real-GPU scenarios locally on a GPU host:
 
 ```bash
 E2E_HARDWARE=real cargo xtask e2e
 ```
+
+On a pull request and in the merge queue the GPU lanes narrow their real-GPU
+scenarios to the cheap per-engine `@gpu-smoke` canaries (and, in the queue, the
+`@merge-queue` serves) with `E2E_GPU_SMOKE_ONLY=1`. Everything that needs no
+GPU still runs on them, every GPU scenario that only needs the CLI to see a GPU
+runs on a simulated machine on the hosted lane, and the full real-GPU suite
+runs nightly and on pushes to `main` and `release/**`.
 
 A scenario describes its machine with a Given step — `a machine with an AMD
 Instinct GPU`, `a machine with eight AMD Instinct GPUs`, `a bare-metal Linux
