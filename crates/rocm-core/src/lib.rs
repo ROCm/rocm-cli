@@ -4381,13 +4381,14 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
         "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
         value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
-        // Renoir / Cezanne / Lucienne / Barcelo. Vega-architecture *integrated*
+        // Renoir / Cezanne / Lucienne / Barcelo: Vega-architecture *integrated*
         // graphics, so the `gfx90` catch-all below would file it under
         // `gfx90X-dcgpu` — a datacenter family, which also makes vLLM the
-        // preferred serving engine. No published family covers gfx90c, and
-        // "none" sends the user to pick one instead of silently installing a
-        // runtime built for other silicon.
-        value if value.starts_with("gfx90c") => None,
+        // preferred serving engine. It gets a single-target family of its own,
+        // like gfx900/gfx906/gfx908/gfx90a beside it. Whether a channel
+        // publishes a gfx90c payload is the index's answer, not this table's:
+        // when it does not, the install says so by name.
+        value if value.starts_with("gfx90c") => Some("gfx90c".to_owned()),
         value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
         value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
@@ -4424,6 +4425,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx906",
         "gfx908",
         "gfx90a",
+        "gfx90c",
         "gfx94X-dcgpu",
         "gfx950-dcgpu",
         "gfx101X-dgpu",
@@ -10049,18 +10051,30 @@ mod tests {
         );
     }
 
-    /// A Renoir-class iGPU has no published family, and must not be filed under
-    /// a datacenter one.
+    /// A Renoir-class iGPU is its own family, not a datacenter one.
     ///
     /// gfx90c is Vega-architecture *integrated* graphics, so the `gfx90`
     /// catch-all would answer `gfx90X-dcgpu` — which is not just a wrong label:
     /// `preferred_serve_engine_for_therock_family` reads `-dcgpu` and picks
-    /// vLLM. Its neighbours are genuinely discrete and must keep their
-    /// families.
+    /// vLLM. Answering `None` instead is no better: every `--family` value is
+    /// then rejected for this host, so the "re-run with an explicit
+    /// `--family`" advice the install prints cannot be followed. Its neighbours
+    /// are genuinely discrete and keep their families.
     #[test]
-    fn normalize_therock_family_refuses_to_file_an_igpu_under_a_datacenter_family() {
-        assert_eq!(normalize_therock_family("gfx90c"), None);
-        assert_eq!(normalize_therock_family("gfx90c:xnack-"), None);
+    fn a_renoir_class_igpu_is_its_own_family_and_not_a_datacenter_one() {
+        assert_eq!(
+            normalize_therock_family("gfx90c"),
+            Some("gfx90c".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx90c:xnack-"),
+            Some("gfx90c".to_owned())
+        );
+        assert!(known_therock_families().contains(&"gfx90c"));
+        assert_eq!(
+            preferred_serve_engine_for_therock_family(Some("gfx90c")),
+            None
+        );
         assert_eq!(
             normalize_therock_family("gfx90a"),
             Some("gfx90a".to_owned())

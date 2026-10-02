@@ -7632,6 +7632,35 @@ mod tests {
         );
     }
 
+    /// A Renoir-class iGPU can be installed for when its payload is published.
+    ///
+    /// The family comes from `normalize_therock_family` rather than being
+    /// written out, because that is what `resolve_family` hands this check:
+    /// a family that never matches the detected target turns every `--family`
+    /// the user tries into "belongs to no recognized package family".
+    #[test]
+    fn a_published_renoir_class_target_resolves_to_its_own_payload() {
+        let family = normalize_therock_family("gfx90c")
+            .expect("gfx90c must belong to some family, or no --family can install for it");
+        let mut published = published_device_targets();
+        published.push("gfx90c".to_owned());
+
+        assert_eq!(
+            AggregateDeviceTarget::resolve(Some("gfx90c"), &family, &published),
+            AggregateDeviceTarget::Exact("gfx90c".to_owned())
+        );
+        // And where the channel publishes none, the refusal names the payload
+        // it looked for instead of blaming the family.
+        let unpublished =
+            AggregateDeviceTarget::resolve(Some("gfx90c"), &family, &published_device_targets());
+        assert!(
+            unpublished
+                .reason()
+                .is_some_and(|reason| reason.contains("no `device-gfx90c` payload")),
+            "{unpublished:?}"
+        );
+    }
+
     #[test]
     fn a_detected_target_from_another_family_is_undetermined() {
         let target = AggregateDeviceTarget::resolve(
