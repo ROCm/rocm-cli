@@ -31,6 +31,7 @@ pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod hardware_root;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
@@ -51,6 +52,7 @@ pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use hardware_root::host_path;
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
@@ -2411,8 +2413,10 @@ fn detect_distro_name() -> Option<String> {
     }
 
     if runtime_is_linux() {
-        return parse_os_release_pretty_name(&fs::read_to_string("/etc/os-release").ok()?)
-            .or_else(|| Some("Linux".to_owned()));
+        return parse_os_release_pretty_name(
+            &fs::read_to_string(host_path("/etc/os-release")).ok()?,
+        )
+        .or_else(|| Some("Linux".to_owned()));
     }
 
     None
@@ -2452,19 +2456,21 @@ fn detect_cpu_model() -> Option<String> {
     }
 
     if runtime_is_linux()
-        && let Some(model) = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| {
-            text.lines().find_map(|line| {
-                let value = line
-                    .strip_prefix("model name")
-                    .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-                    .or_else(|| {
-                        line.strip_prefix("Hardware")
-                            .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
-                    })?;
-                let value = normalize_cpu_model(value);
-                (!value.is_empty()).then_some(value)
+        && let Some(model) = fs::read_to_string(host_path("/proc/cpuinfo"))
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    let value = line
+                        .strip_prefix("model name")
+                        .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
+                        .or_else(|| {
+                            line.strip_prefix("Hardware")
+                                .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
+                        })?;
+                    let value = normalize_cpu_model(value);
+                    (!value.is_empty()).then_some(value)
+                })
             })
-        })
     {
         return Some(model);
     }
@@ -2496,13 +2502,15 @@ pub fn detect_system_ram_gib() -> Option<f64> {
     }
 
     if runtime_is_linux()
-        && let Some(kib) = fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
-            text.lines().find_map(|line| {
-                let value = line.strip_prefix("MemTotal:")?.trim();
-                let number = value.split_whitespace().next()?.parse::<f64>().ok()?;
-                Some(number)
+        && let Some(kib) = fs::read_to_string(host_path("/proc/meminfo"))
+            .ok()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    let value = line.strip_prefix("MemTotal:")?.trim();
+                    let number = value.split_whitespace().next()?.parse::<f64>().ok()?;
+                    Some(number)
+                })
             })
-        })
     {
         return Some(kib / 1024.0 / 1024.0);
     }
@@ -2553,8 +2561,8 @@ fn normalize_cpu_model(value: &str) -> String {
 pub fn is_wsl_host() -> bool {
     runtime_is_linux()
         && wsl_signals_indicate_wsl(
-            Path::new("/dev/dxg").exists(),
-            &fs::read_to_string("/proc/version").unwrap_or_default(),
+            host_path("/dev/dxg").exists(),
+            &fs::read_to_string(host_path("/proc/version")).unwrap_or_default(),
         )
 }
 
@@ -2593,7 +2601,8 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 /// rather than as an empty answer.
 fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
-        if let Some(text) = capture_optional_command(program, &["-p"]) {
+        let program = host_path(program);
+        if let Some(text) = capture_optional_command(&program.to_string_lossy(), &["-p"]) {
             return Some(text);
         }
     }
@@ -2613,12 +2622,14 @@ pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
 /// uses, and keep the conventional root as a fallback for the case where
 /// discovery finds nothing.
 fn rocm_relative_file_exists(relative: &str) -> bool {
-    if Path::new("/opt/rocm").join(relative).exists() {
+    if host_path("/opt/rocm").join(relative).exists() {
         return true;
     }
+    // Discovery reports real install paths; reading them through `host_path`
+    // keeps a simulated host's answer from being decided by the real machine.
     discover_rocm_installs()
         .iter()
-        .any(|install| install.path.join(relative).exists())
+        .any(|install| host_path(&install.path).join(relative).exists())
 }
 
 /// The predicate itself, separated from reading the machine so the union can be
@@ -2648,10 +2659,10 @@ fn detect_wsl_summary() -> Option<WslSummary> {
         return None;
     }
 
-    let dxg_device = Path::new("/dev/dxg").exists();
+    let dxg_device = host_path("/dev/dxg").exists();
     let is_wsl = true;
 
-    let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
+    let dxcore = host_path("/usr/lib/wsl/lib/libdxcore.so").exists();
     let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
     let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
     let ldconfig_text = ldconfig_cache();
@@ -2725,7 +2736,7 @@ fn detect_driver_summary() -> DriverSummary {
     }
 
     if runtime_is_linux() {
-        let module_detected = Path::new("/sys/module/amdgpu").exists();
+        let module_detected = host_path("/sys/module/amdgpu").exists();
         return DriverSummary {
             policy: "linux_official_amd_dkms_wrapper".to_owned(),
             status: if module_detected {
@@ -2733,7 +2744,7 @@ fn detect_driver_summary() -> DriverSummary {
             } else {
                 "not_detected".to_owned()
             },
-            detail: if Path::new("/dev/kfd").exists() {
+            detail: if host_path("/dev/kfd").exists() {
                 Some("/dev/kfd is present".to_owned())
             } else if module_detected {
                 Some("amdgpu module metadata is present".to_owned())
@@ -2757,7 +2768,7 @@ fn detect_driver_summary() -> DriverSummary {
 /// for the in-tree kernel module -- it doesn't populate
 /// `/sys/module/amdgpu/version` at all.
 fn detect_linux_amdgpu_driver_version() -> Option<String> {
-    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+    if let Ok(text) = fs::read_to_string(host_path("/sys/module/amdgpu/version")) {
         let version = text.trim();
         if !version.is_empty() {
             return Some(version.to_owned());
@@ -4803,7 +4814,7 @@ fn detect_linux_primary_gpu_name() -> Option<String> {
         return None;
     }
 
-    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    let entries = fs::read_dir(host_path("/sys/class/drm")).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -5161,7 +5172,7 @@ pub(crate) const fn detect_linux_sysfs_gfx_target() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_kfd_gfx_target() -> Option<String> {
-    detect_kfd_gfx_target_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+    detect_kfd_gfx_target_in(&host_path("/sys/class/kfd/kfd/topology/nodes"))
 }
 
 /// One GPU as the kernel's KFD topology describes it.
@@ -5381,7 +5392,7 @@ fn combine_amd_gpu_counts(kfd: Option<usize>, drm: Option<usize>) -> Option<usiz
 /// DRM class dir can't be read; `Some(0)` when it is readable with no AMD card.
 #[cfg(target_os = "linux")]
 fn linux_drm_amdgpu_card_count() -> Option<usize> {
-    let entries = fs::read_dir(Path::new("/sys/class/drm")).ok()?;
+    let entries = fs::read_dir(host_path("/sys/class/drm")).ok()?;
     let count = entries
         .flatten()
         .filter(|entry| {
@@ -5403,7 +5414,7 @@ fn linux_drm_amdgpu_card_count() -> Option<usize> {
 /// availability is unknown and must not be treated as zero.
 #[cfg(target_os = "linux")]
 fn linux_kfd_gpu_node_count() -> Option<usize> {
-    linux_kfd_gpu_node_count_in(Path::new("/sys/class/kfd/kfd/topology/nodes"))
+    linux_kfd_gpu_node_count_in(&host_path("/sys/class/kfd/kfd/topology/nodes"))
 }
 
 /// The KFD GPU-node count, against a caller-supplied nodes directory.
@@ -5421,7 +5432,7 @@ fn linux_kfd_gpu_node_count_in(nodes_dir: &Path) -> Option<usize> {
                 .filter(|entry| kfd_node_is_gpu(&entry.path()))
                 .count(),
         ),
-        Err(_) if Path::new("/dev/kfd").exists() => None,
+        Err(_) if host_path("/dev/kfd").exists() => None,
         Err(_) => Some(0),
     }
 }
@@ -5623,7 +5634,7 @@ fn parse_linux_kfd_gfx_target(value: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
-    let drm_dir = Path::new("/sys/class/drm");
+    let drm_dir = host_path("/sys/class/drm");
     let entries = fs::read_dir(drm_dir).ok()?;
     for entry in entries.flatten() {
         let card_path = entry.path();

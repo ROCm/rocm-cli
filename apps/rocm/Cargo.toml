@@ -11,7 +11,11 @@ publish.workspace = true
 workspace = true
 
 [features]
-e2e-test-hooks = ["rocm-engine-lemonade/e2e-test-hooks"]
+e2e-test-hooks = [
+    "rocm-core/e2e-test-hooks",
+    "rocm-engine-lemonade/e2e-test-hooks",
+    "rocm-engine-vllm/e2e-test-hooks",
+]
 
 [dependencies]
 anyhow.workspace = true
