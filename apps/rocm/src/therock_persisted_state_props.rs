@@ -111,7 +111,8 @@ fn user_settings() -> BoxedStrategy<UserSettings> {
 /// scratch.
 #[derive(Debug, Clone)]
 enum Corruption {
-    /// Interrupted write: `RocmCliConfig::save` is a plain `fs::write`.
+    /// Interrupted write, as a plain `fs::write` in `RocmCliConfig::save` used to
+    /// leave behind (it is atomic now), or a truncating hand edit.
     TruncateAt(usize),
     /// What a non-finite tick serializes to (see the rocm-core property test).
     NullTick,
