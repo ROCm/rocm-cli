@@ -11601,6 +11601,30 @@ fn runtime_keys_text(manifests: &[&therock::InstalledRuntimeManifest]) -> String
         .join(", ")
 }
 
+/// Resolves a user-typed selector to the one installed runtime it names.
+///
+/// Matching a `runtime_key` regardless of letter case is a deliberate
+/// convenience, but it only names one runtime while no two installed keys
+/// differ just in case — and they can. Generated keys are slugified to lower
+/// case, while `runtimes adopt --runtime-key` takes the key the user typed and
+/// `runtimes import` takes it from the supplied manifest; neither slugifies,
+/// so the key is stored verbatim. The registry keeps one file per key, so
+/// `ABC.json` and `abc.json` are two entries on a case-sensitive filesystem
+/// and nothing rejects the pair.
+///
+/// So an exact key match is taken first and wins outright: it is the one
+/// reading of the selector that cannot be mistaken. The case-insensitive
+/// fallback applies only when it lands on a single record; two case twins are
+/// reported as the ambiguity they are, the same way a `runtime_id` naming
+/// several installs already is.
+///
+/// Callers rely on that being a function of the key alone, because several of
+/// them resolve the same key more than once and must land on the same record
+/// every time: `storage remove-old-installs` decides about a manifest and then
+/// names it to the deleter by key, and the uninstall revalidation re-derives
+/// its plan from disk after the confirmation prompt. Resolving by "newest
+/// case-insensitive match" made that decide about one install and act on
+/// another.
 fn select_runtime_manifest<'a>(
     manifests: &'a [therock::InstalledRuntimeManifest],
     selector: &str,
@@ -11612,28 +11636,35 @@ fn select_runtime_manifest<'a>(
 
     if let Some(manifest) = manifests
         .iter()
-        .find(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .find(|manifest| manifest.runtime_key == selector)
     {
         return Ok(manifest);
     }
 
-    let matches = manifests
+    let key_matches = manifests
+        .iter()
+        .filter(|manifest| manifest.runtime_key.eq_ignore_ascii_case(selector))
+        .collect::<Vec<_>>();
+    match key_matches.as_slice() {
+        [manifest] => return Ok(manifest),
+        [] => {}
+        _ => bail!(
+            "runtime selector `{selector}` matches several installed runtime keys that differ only in letter case; name one of them exactly: {}",
+            runtime_keys_text(&key_matches)
+        ),
+    }
+
+    let id_matches = manifests
         .iter()
         .filter(|manifest| manifest.runtime_id.eq_ignore_ascii_case(selector))
         .collect::<Vec<_>>();
-    match matches.as_slice() {
+    match id_matches.as_slice() {
         [manifest] => Ok(manifest),
         [] => bail!("installed runtime not found: {selector}"),
-        _ => {
-            let keys = matches
-                .iter()
-                .map(|manifest| manifest.runtime_key.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            bail!(
-                "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {keys}"
-            );
-        }
+        _ => bail!(
+            "runtime selector `{selector}` matches multiple installed runtimes; activate one by runtime_key: {}",
+            runtime_keys_text(&id_matches)
+        ),
     }
 }
 
@@ -33475,6 +33506,71 @@ ID_LIKE="suse opensuse"
         assert!(error.contains("matches multiple installed runtimes"));
         assert!(error.contains("release-pip-gfx120x-all-7-12-0"));
         assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Matching a key regardless of case is a convenience for a user who typed
+    /// the wrong one; it must not quietly pick between two installs whose keys
+    /// differ only in case. `runtimes adopt --runtime-key` stores the key
+    /// verbatim while generated keys are lower-cased, so such a pair is
+    /// reachable, and a caller that resolves the same key twice — prune decides
+    /// about a manifest and then names it to the deleter by key — has to get
+    /// the same install both times.
+    ///
+    /// No registry is involved here: the manifests are handed straight to the
+    /// resolver, so this holds on every platform even though only a
+    /// case-sensitive filesystem can store such a pair.
+    #[test]
+    fn runtime_selector_prefers_the_exact_key_over_a_case_twin() -> Result<()> {
+        let (root, paths) = test_paths("runtime-case-twin");
+        let base = write_test_pip_runtime(
+            &paths,
+            "release-pip-gfx120x-all-7-13-0",
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        // Newest first, as `load_runtime_manifests` hands them over. The
+        // adopted twin is stamped with the moment it was adopted, so it leads.
+        let manifests = vec![
+            therock::InstalledRuntimeManifest {
+                runtime_key: "RELEASE-PIP-GFX120X-ALL-7-13-0".to_owned(),
+                installed_at_unix_ms: 99,
+                read_only: true,
+                ..base.clone()
+            },
+            base.clone(),
+        ];
+
+        let exact = select_runtime_manifest(&manifests, &base.runtime_key)?;
+        assert_eq!(
+            exact.runtime_key, base.runtime_key,
+            "the key as stored resolves to its own record, not to the newer twin"
+        );
+        let twin = select_runtime_manifest(&manifests, "RELEASE-PIP-GFX120X-ALL-7-13-0")?;
+        assert_eq!(twin.runtime_key, "RELEASE-PIP-GFX120X-ALL-7-13-0");
+
+        // Neither key matches exactly, so the selector genuinely names both.
+        // Reported as the ambiguity it is, like a runtime_id naming several.
+        let error = select_runtime_manifest(&manifests, "Release-Pip-Gfx120X-All-7-13-0")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("differ only in letter case"),
+            "an ambiguous selector must be refused, not silently resolved: {error}"
+        );
+        assert!(error.contains("release-pip-gfx120x-all-7-13-0"));
+        assert!(error.contains("RELEASE-PIP-GFX120X-ALL-7-13-0"));
+
+        // The convenience itself is untouched: with one candidate, any casing
+        // still resolves.
+        let only = vec![base.clone()];
+        assert_eq!(
+            select_runtime_manifest(&only, "Release-Pip-Gfx120X-All-7-13-0")?.runtime_key,
+            base.runtime_key
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
