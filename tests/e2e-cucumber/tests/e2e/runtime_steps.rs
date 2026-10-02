@@ -107,8 +107,37 @@ async fn assert_planned_folder_avoids_the_link(world: &mut E2eWorld) {
     );
 }
 
+/// On a simulated machine there is nothing to install a real SDK for, so the
+/// runtime is planted: a registry record the CLI accepts as ready, whose `vllm`
+/// is the `fake-vllm` stand-in. `rocm serve` then takes the real managed-runtime
+/// path — selection, the engine's runtime lookup, the launch and the readiness
+/// wait — and only the process at the end of it is simulated.
+fn plant_simulated_runtime(world: &mut E2eWorld) {
+    const KEY: &str = "simulated-therock-7.13.0";
+    let data = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data");
+    let install_root = super::comfyui_steps::plant_ready_runtime(&data, KEY);
+    // The engine accepts a managed runtime when `vllm` sits beside its python.
+    let vllm = install_root.join("bin").join("vllm");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(crate::crate_binary("fake-vllm"), &vllm)
+        .unwrap_or_else(|e| panic!("failed to install the vLLM stand-in: {e}"));
+    #[cfg(not(unix))]
+    std::fs::copy(crate::crate_binary("fake-vllm"), &vllm)
+        .unwrap_or_else(|e| panic!("failed to install the vLLM stand-in: {e}"));
+    crate::run_rocm_ok(world, &["runtimes", "activate", KEY]);
+}
+
 #[given("a managed runtime is active")]
 async fn setup_active_runtime(world: &mut E2eWorld) {
+    if world.simulated_host.is_some() {
+        plant_simulated_runtime(world);
+        return;
+    }
     // On a no-GPU host this is a no-op: a managed TheRock SDK runtime can only be
     // installed where there's a GPU family to select wheels for (see
     // `runtime-install-active`, @requires-gpu). The only scenarios that reach this

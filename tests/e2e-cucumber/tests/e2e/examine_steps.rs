@@ -17,7 +17,7 @@ pub(crate) fn field_value<'a>(output: &'a str, field: &str) -> Option<&'a str> {
     })
 }
 
-#[given("a machine with an AMD GPU")]
+#[given("this machine has an AMD GPU")]
 async fn setup_gpu_machine(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
     assert!(
@@ -29,15 +29,6 @@ async fn setup_gpu_machine(world: &mut E2eWorld) {
 #[given("a machine with a ROCm install that was not set up by the CLI")]
 async fn setup_unmanaged_rocm(world: &mut E2eWorld) {
     world.plant_unmanaged_rocm();
-}
-
-#[given("the CLI is running in WSL")]
-async fn setup_wsl_host(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["examine"]);
-    assert!(
-        field_value(&stdout, "wsl").is_some_and(|value| value.eq_ignore_ascii_case("true")),
-        "CLI did not detect WSL:\n{stdout}"
-    );
 }
 
 #[when("the user asks for the version through every CLI surface")]
@@ -832,18 +823,21 @@ async fn assert_still_states_a_verdict(world: &mut E2eWorld) {
     assert_states_a_verdict(world).await;
 }
 
+/// Where the KFD topology lives on the machine this scenario runs against: the
+/// real sysfs, or the simulated host's copy of it.
+fn kfd_nodes_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world.host_path("/sys/class/kfd/kfd/topology/nodes")
+}
+
 /// The `gfx_target_version` of the lowest-numbered KFD GPU node, read straight
 /// from sysfs.
 ///
 /// `None` when the topology is unreadable or names no GPU node, which is the
 /// normal case off Linux and on hosts whose GPU is visible only through DRM.
 /// CPU nodes report `0` and are skipped.
-fn lowest_kfd_gpu_node_gfx_target_version() -> Option<u32> {
+fn lowest_kfd_gpu_node_gfx_target_version(nodes: &std::path::Path) -> Option<u32> {
     let mut lowest: Option<(u64, u32)> = None;
-    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
-        .ok()?
-        .flatten()
-    {
+    for entry in std::fs::read_dir(nodes).ok()?.flatten() {
         let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
             continue;
         };
@@ -893,7 +887,20 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
     let reported = field_value(output, "detected_gfx_target")
         .expect("no detected_gfx_target in examine output");
 
-    let Some(packed) = lowest_kfd_gpu_node_gfx_target_version() else {
+    // On a simulated machine the answer is known exactly, so nothing below may
+    // quietly decline to check it.
+    if let Some(expected) = world
+        .simulated_host
+        .as_ref()
+        .and_then(|simulated| simulated.host.gfx_target())
+    {
+        assert_eq!(
+            reported, expected,
+            "examine named a target other than the simulated GPU's:\n{output}"
+        );
+    }
+
+    let Some(packed) = lowest_kfd_gpu_node_gfx_target_version(&kfd_nodes_dir(world)) else {
         return;
     };
     let (major, minor, revision) = (packed / 10_000, (packed / 100) % 100, packed % 100);
@@ -916,12 +923,9 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
 /// CPU nodes report a `gfx_target_version` of `0` and are skipped, so the length
 /// is the kernel's own GPU count and the values say whether those GPUs are all
 /// the same part.
-fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
+fn kfd_gpu_node_versions(nodes: &std::path::Path) -> Option<Vec<u32>> {
     let mut versions = Vec::new();
-    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
-        .ok()?
-        .flatten()
-    {
+    for entry in std::fs::read_dir(nodes).ok()?.flatten() {
         let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
             continue;
         };
@@ -941,18 +945,24 @@ fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
 
 /// Whether `lspci` is on PATH, which is what supplies the PCI addresses this
 /// step asserts. Without it the CLI's topology fallback is the right answer and
-/// there is nothing here to check.
-fn host_has_lspci() -> bool {
+/// there is nothing here to check. A simulated host always has one: its
+/// stand-in lists the simulated GPUs.
+fn host_has_lspci(world: &E2eWorld) -> bool {
+    if world.simulated_host.is_some() {
+        return true;
+    }
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
 }
 
 #[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
 async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
-    let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
+    let Some(versions) =
+        kfd_gpu_node_versions(&kfd_nodes_dir(world)).filter(|versions| !versions.is_empty())
+    else {
         return;
     };
-    if !host_has_lspci() {
+    if !host_has_lspci(world) {
         return;
     }
     let expected = versions.len();

@@ -322,7 +322,7 @@ Feature: Interactive dashboard
   # alone: the premise under test is the WSL detection path specifically.
   # Currently skipped on every CI lane — no WSL lane carries a real GPU yet
   # (tracked separately in #223) — but still runs locally on WSL hardware.
-  @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-gpu
+  @id:dash-reports-wsl-gpu-telemetry @requires-wsl @requires-real-gpu
   Scenario: dash-24 - Dashboard displays GPU telemetry through WSL
     When the user opens the dashboard
     Then the dashboard reports live GPU telemetry

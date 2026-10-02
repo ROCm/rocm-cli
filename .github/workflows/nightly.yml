@@ -368,6 +368,8 @@ jobs:
     env:
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       # Serve-readiness floor; a `@serve-timeout` tag lengthens it for the large
       # model (its cold ~54 GiB load exceeds this default).
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -498,6 +500,8 @@ jobs:
         channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -593,6 +597,8 @@ jobs:
         channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       E2E_SERVE_TIMEOUT_SECS: "300"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -702,6 +708,8 @@ jobs:
       TMPDIR: /home/ubuntu/actions-runner/tmp
       PIP_CACHE_DIR: /home/ubuntu/actions-runner/pip-cache
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
@@ -899,6 +907,8 @@ jobs:
         channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_TUI_TIMEOUT_SECS: "90"
     steps:
@@ -1122,6 +1132,8 @@ jobs:
       # ubuntu/WSL composite action's own env.
       WSL_UTF8: "1"
       E2E_INCLUDE_NIGHTLY: "1"
+      # Real GPU lane: run `@requires-real-gpu` scenarios too.
+      E2E_HARDWARE: real
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A freshly-provisioned pool host installing WSL2, a distro, and native
       # build deps from scratch this run can leave a TUI frame that renders
@@ -1462,7 +1474,7 @@ jobs:
         shell: powershell
         run: |
           # See .github/scripts/Invoke-WslBash.ps1.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:ROCM_CLI_RELEASE_REF'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_HARDWARE:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli

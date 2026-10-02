@@ -15,6 +15,7 @@ use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::paced_download::PacedDownloadServer;
+use e2e_cucumber::simulated_host::SimulatedHost;
 use tempfile::TempDir;
 
 mod e2e {
@@ -38,6 +39,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod serving_steps;
+    pub mod simulated_host_steps;
     pub mod skill_steps;
     pub mod storage_steps;
     pub mod therock_steps;
@@ -112,6 +114,14 @@ pub struct E2eWorld {
     /// holds its path; `isolate_cmd` then exports it as `ROCM_PATH` so `rocm
     /// examine` detects unmanaged ROCm on any platform (see `plant_unmanaged_rocm`).
     pub legacy_rocm_path: Option<PathBuf>,
+    /// The machine this scenario describes, when it planted one (see
+    /// `plant_simulated_host`): its root directory, exported to every `rocm`
+    /// invocation as `ROCM_CLI_TEST_HOST_ROOT`, and the directory of tool
+    /// stand-ins put at the front of `PATH`. `None` means the real host.
+    pub simulated_host: Option<SimulatedHostRoot>,
+    /// How a simulated machine differs from the real one this scenario runs
+    /// on, for the real-hardware check that keeps the fixtures honest.
+    pub layout_drift: Option<Vec<String>>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
     /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
@@ -148,6 +158,65 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+}
+
+/// A simulated machine planted for one scenario; see
+/// [`E2eWorld::plant_simulated_host`].
+#[derive(Debug)]
+pub struct SimulatedHostRoot {
+    /// What was planted, so steps can state expectations about it.
+    pub host: SimulatedHost,
+    /// The directory standing in for `/`.
+    pub root: PathBuf,
+    /// Every command's `PATH`: the tool stand-ins, then the real `PATH` with
+    /// the hardware tools filtered out.
+    pub path: Vec<PathBuf>,
+}
+
+/// Inherited variables that would let the runner's own GPU setup reach a
+/// simulated machine: device visibility masks and target overrides that a GPU
+/// runner may export, and the ROCm install the runner points at — the GPU
+/// half of what `rocm examine` reports from the environment. A step that needs
+/// one sets it explicitly for its own command, as the mask scenarios do.
+///
+/// `LD_LIBRARY_PATH` stays: the commands the CLI runs may need it to start at
+/// all. `examine` scans it for HIP libraries, which no simulated scenario
+/// asserts on.
+const HOST_GPU_ENV: &[&str] = &[
+    "HIP_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES",
+    "CUDA_VISIBLE_DEVICES",
+    "GPU_DEVICE_ORDINAL",
+    "HSA_OVERRIDE_GFX_VERSION",
+    "HSA_ENABLE_DXG_DETECTION",
+    "HIP_PLATFORM",
+    "PYTORCH_ROCM_ARCH",
+    "HCC_AMDGPU_TARGET",
+    "AMDGPU_TARGETS",
+    "HIP_PATH",
+    "ROCM_PATH",
+    "ROCM_HOME",
+];
+
+/// A stand-in that is a `[[bin]]` of this crate (`fake-host-tool`,
+/// `fake-vllm`), which cargo has already built next to the test binary.
+pub fn crate_binary(name: &str) -> PathBuf {
+    let mut dir = std::env::current_exe().expect("test binary path");
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    let candidate = dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    });
+    assert!(
+        candidate.exists(),
+        "the {name} stand-in was not built at {}; it is a [[bin]] of this crate",
+        candidate.display()
+    );
+    candidate
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -279,6 +348,8 @@ impl Default for E2eWorld {
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,
+            simulated_host: None,
+            layout_drift: None,
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),
@@ -349,6 +420,24 @@ impl E2eWorld {
         if let Some(path) = &self.legacy_rocm_path {
             env.push(("ROCM_PATH", path.clone().into_os_string()));
         }
+        // A scenario that planted a simulated machine points the hardware probes
+        // at it, runs with the simulated machine's PATH so the real host's
+        // `lspci`/`rocminfo`/`powershell.exe` cannot answer for it, and gets a
+        // HOME of its own so nothing installed under the runner's (an `amd-smi`
+        // in `~/.rocm/bin`, say) is found either.
+        if let Some(host) = &self.simulated_host {
+            env.push((
+                e2e_cucumber::simulated_host::TEST_HOST_ROOT_ENV,
+                host.root.clone().into_os_string(),
+            ));
+            env.push((
+                "PATH",
+                std::env::join_paths(&host.path).expect("PATH entries contain no separator"),
+            ));
+            let home = host.root.join("home");
+            std::fs::create_dir_all(&home).expect("failed to create the simulated HOME");
+            env.push(("HOME", home.into_os_string()));
+        }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
         // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
@@ -382,8 +471,22 @@ impl E2eWorld {
     }
 
     pub fn isolate_cmd(&self, cmd: &mut std::process::Command) {
+        for key in self.isolate_env_removals() {
+            cmd.env_remove(key);
+        }
         for (key, value) in self.isolate_env() {
             cmd.env(key, value);
+        }
+    }
+
+    /// Inherited variables a command must NOT see: on a simulated machine, the
+    /// runner's own GPU scoping (see [`HOST_GPU_ENV`]). A planted legacy ROCm
+    /// install is re-added by `isolate_env`, which is applied after this.
+    pub const fn isolate_env_removals(&self) -> &'static [&'static str] {
+        if self.simulated_host.is_some() {
+            HOST_GPU_ENV
+        } else {
+            &[]
         }
     }
 
@@ -536,6 +639,35 @@ impl E2eWorld {
         std::fs::write(rocm.join(".info").join("version"), "6.0.0\n")
             .expect("failed to write legacy rocm marker");
         self.legacy_rocm_path = Some(rocm);
+    }
+
+    /// Make every later `rocm` invocation in this scenario see `host` instead of
+    /// the machine the suite is running on (see `e2e_cucumber::simulated_host`).
+    pub fn plant_simulated_host(&mut self, host: SimulatedHost) {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("no isolated root")
+            .path()
+            .join("simulated-host");
+        let path = host
+            .plant(
+                &root,
+                &crate_binary("fake-host-tool"),
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )
+            .unwrap_or_else(|e| panic!("failed to plant the simulated host: {e}"));
+        self.simulated_host = Some(SimulatedHostRoot { host, root, path });
+    }
+
+    /// Where `path` (an absolute host path such as `/sys/class/kfd`) is read on
+    /// the machine this scenario runs against: under the simulated root when the
+    /// scenario planted one, else the real path.
+    pub fn host_path(&self, path: &str) -> PathBuf {
+        match &self.simulated_host {
+            Some(host) => host.root.join(path.trim_start_matches('/')),
+            None => PathBuf::from(path),
+        }
     }
 
     /// Register the running mock server with the CLI by writing a managed-service
@@ -1208,9 +1340,22 @@ async fn main() {
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
+    // `@requires-real-gpu` scenarios run only where a lane on real hardware opts
+    // in; everywhere else GPU behaviour is exercised against a simulated host.
+    // An unrecognised value aborts the run instead of silently skipping them.
+    let hardware = e2e_cucumber::expectation::HardwareMode::parse(
+        std::env::var(e2e_cucumber::expectation::HardwareMode::ENV)
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
     eprintln!(
-        "Host capability: platform={} os={} gpu={} effective_engine={}",
-        cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
+        "Host capability: platform={} os={} gpu={} effective_engine={} hardware={}",
+        cap.platform_slug,
+        cap.os_family,
+        cap.has_amd_gpu,
+        cap.effective_serve_engine,
+        hardware.as_str(),
     );
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
@@ -1316,6 +1461,7 @@ async fn main() {
                         lifecycle: include_lifecycle,
                         docker: include_docker,
                         merge_queue: include_merge_queue,
+                        hardware,
                     },
                 );
                 let run = (!only_lifecycle || decl.lifecycle)

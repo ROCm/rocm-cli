@@ -36,7 +36,7 @@ Feature: Model serving
   # caught before merge, while the heavier `@merge-queue` serves
   # (`serve-default-engine-working-endpoint`, `serve-default-engine-inference`,
   # and `serve-readiness-contract`) run only in the merge queue.
-  @id:serve-vllm-inference @requires-gpu @requires-engine:vllm
+  @id:serve-vllm-inference @requires-real-gpu @requires-engine:vllm
   Scenario: serve-05 - A served model responds to inference requests on vLLM
     Given a managed runtime is active
     And a model is being served on GPU
@@ -50,7 +50,7 @@ Feature: Model serving
   # unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL checkpoint through Lemonade. These slow
   # loads stay off the ordinary per-PR path, and the longer readiness timeout also
   # gives the first inference request enough time to complete.
-  @id:serve-large-model-inference @requires-gpu @serve-timeout:2400 @nightly
+  @id:serve-large-model-inference @requires-real-gpu @serve-timeout:2400 @nightly
   Scenario: serve-06 - A large platform-specific model serves and responds to inference
     Given a managed runtime is active
     And a large model is being served on GPU
@@ -61,7 +61,7 @@ Feature: Model serving
   # Lemonade serve + inference (GGUF model). Engine coverage: Lemonade. The
   # lemonade per-PR canary: one real lemonade serve runs on every PR (the
   # counterpart to the vLLM canary above).
-  @id:serve-lemonade-inference @requires-gpu @requires-engine:lemonade
+  @id:serve-lemonade-inference @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-07 - A model served on lemonade responds to inference requests
     Given a managed runtime is active
     And a GGUF model is being served on lemonade
@@ -77,7 +77,7 @@ Feature: Model serving
   # unrelated EAI-7423 xfail. Reuses the same small Qwen3-0.6B-GGUF checkpoint as
   # `serve-lemonade-inference` (cache-shared, no extra download) so this stays a
   # fast per-PR canary rather than needing the @nightly large-checkpoint path.
-  @id:serve-hf-checkpoint-inference @requires-gpu @requires-engine:lemonade
+  @id:serve-hf-checkpoint-inference @requires-real-gpu @requires-engine:lemonade
   Scenario: serve-08 - A canonical Hugging Face checkpoint serves and responds to inference
     Given a managed runtime is active
     And a canonical Hugging Face GGUF checkpoint is being served on lemonade
@@ -88,7 +88,7 @@ Feature: Model serving
   # Default-engine serve (no --engine): the effective engine is the platform
   # default from the capability probe, so this covers whichever engine the host
   # would actually pick.
-  @id:serve-default-engine-working-endpoint @requires-gpu @merge-queue
+  @id:serve-default-engine-working-endpoint @requires-real-gpu @merge-queue
   Scenario: serve-09 - Serving a model without specifying an engine produces a working endpoint
     Given a managed runtime is active
     When the user serves a model without specifying an engine
@@ -96,21 +96,22 @@ Feature: Model serving
     And the model is reachable
 
   # The inference half of serve-09.
-  @id:serve-default-engine-inference @requires-gpu @merge-queue
+  @id:serve-default-engine-inference @requires-real-gpu @merge-queue
   Scenario: serve-10 - A default-engine served model responds to inference requests
     Given a managed runtime is active
     When the user serves a model without specifying an engine
     Then the model responds to inference requests
 
   # Default engine on Instinct: a vLLM-capable model served without --engine on
-  # an Instinct data-center GPU (gfx*-dcgpu) defaults to vLLM. Checks only the
-  # selection PLAN, not endpoint readiness. The assertion is vLLM-specific, so it
-  # only applies where vLLM is the effective engine — `@requires-engine:vllm`
-  # skips it on lemonade-default hosts (Strix Halo), where asserting a vLLM
-  # default would be a guaranteed false failure.
-  @id:serve-vllm-default-on-instinct @requires-gpu @requires-engine:vllm
+  # an Instinct data-center GPU (gfx*-dcgpu) defaults to vLLM, and the managed
+  # launch goes through. Both the Instinct machine and the runtime's vLLM are
+  # simulated: the CLI's own selection, runtime lookup, launch and readiness
+  # wait are real, and the vLLM at the end of them answers like one without a
+  # model on a device. So this holds on every Linux lane, not only on Instinct.
+  @id:serve-vllm-default-on-instinct @requires-engine:vllm @requires-os:linux
   Scenario: serve-11 - vLLM is the default serving engine on Instinct
-    Given a managed runtime is active
+    Given a machine with an AMD Instinct GPU
+    And a managed runtime is active
     When the user serves a vLLM-capable model without specifying an engine
     Then vLLM is selected as the default engine
 
@@ -119,7 +120,7 @@ Feature: Model serving
   # `a model is being served on GPU`), so this holds the contract on every GPU
   # platform. Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
-  @id:serve-readiness-contract @requires-gpu @merge-queue
+  @id:serve-readiness-contract @requires-real-gpu @merge-queue
   Scenario: serve-12 - A service reported ready can immediately serve inference
     Given a managed runtime is active
     And a model is being served on GPU
@@ -128,10 +129,11 @@ Feature: Model serving
 
   # GPU-required enforcement (EAI-7400). Under the GPU-required default, a host
   # with no usable AMD GPU must refuse to serve — before any engine is prepared or
-  # launched — with an actionable message, never a CPU or device-0 fallback. Runs
-  # on the no-GPU mock host, so it gates every PR (@requires-no-gpu, no GPU needed).
-  @id:serve-no-gpu-fails-fast @requires-no-gpu
+  # launched — with an actionable message, never a CPU or device-0 fallback. The
+  # GPU-less machine is simulated, so this holds on GPU lanes too.
+  @id:serve-no-gpu-fails-fast @requires-os:linux
   Scenario: serve-13 - Serving is refused on a host with no AMD GPU
+    Given a Linux machine with no AMD GPU
     When the user serves a model under the GPU-required default
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
@@ -147,21 +149,23 @@ Feature: Model serving
     And the CLI explains that temperature cannot be negative
 
   # The masked-device path: on a real GPU host where every device is hidden, the
-  # GPU-required serve must treat it as "no GPU" and refuse, not fall back. Runs on
-  # GPU hardware (Strix Halo / Instinct).
-  @id:serve-masked-devices-fail @requires-gpu @requires-os:linux
+  # GPU-required serve must treat it as "no GPU" and refuse, not fall back. The
+  # GPU host is simulated; the refusal happens before any engine would touch it.
+  @id:serve-masked-devices-fail @requires-os:linux
   Scenario: serve-15 - Serving is refused when every GPU is masked from view
+    Given a machine with an AMD Instinct GPU
     When the user serves a model with every GPU masked from view
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
   # Honest device selection: a `--gpu` index that does not exist on the host is
   # rejected outright, never silently remapped to another device (no device-0
-  # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
-  # refuses ("no usable AMD GPU") before the index is ever validated, so the
-  # index-specific rejection can only be observed where a real device is present.
-  @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
+  # fallback). Needs a GPU: on a no-GPU host the GPU-required pre-flight refuses
+  # ("no usable AMD GPU") before the index is ever validated. A simulated one is
+  # enough, since the refusal comes before any engine would use it.
+  @id:serve-absent-gpu-index-rejected @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
+    Given a machine with an AMD Instinct GPU
     When the user serves a model pinned to a GPU index that does not exist
     Then serving is refused before any engine starts
     And the user is told that GPU index is unavailable
@@ -200,9 +204,10 @@ Feature: Model serving
   # to [0] and ordinal 1 is refused against it. (Contrast serve-20, whose mask
   # names a device a single-GPU host does not have — see the note there.) Either
   # way an honest refusal rather than a remap, which is what this asserts. Runs on
-  # GPU hardware.
-  @id:serve-masked-gpu-index-rejected @requires-gpu @requires-os:linux
+  # a simulated two-GPU machine, the multi-GPU shape it was written for.
+  @id:serve-masked-gpu-index-rejected @requires-os:linux
   Scenario: serve-19 - Serving pinned to a GPU hidden by the visibility mask is refused
+    Given a machine with two AMD Instinct GPUs
     When the user serves a model pinned to a GPU hidden by the visibility mask
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -219,7 +224,7 @@ Feature: Model serving
   # multi-GPU hardware and is covered by the `usable_amd_gpu_indices_from` unit
   # tests.
   #
-  # KNOWN GAP — why this needs `@requires-multi-gpu` rather than just a GPU:
+  # KNOWN GAP — why this needs a second GPU rather than just one:
   # a mask token `>= present` is not a device the host has, so
   # `usable_amd_gpu_indices_from` cannot resolve the visible set and reports
   # "unknown" (`None`) rather than an authoritative answer. On a SINGLE-GPU host
@@ -235,8 +240,11 @@ Feature: Model serving
   # from serving) and EAI-7194 does not change it. Sibling scenario serve-19 uses
   # a `HIP_VISIBLE_DEVICES` mask naming a device that DOES exist, so its visible
   # set resolves on one GPU too and it stays ungated.
-  @id:serve-rocr-reindexed-gpu-index-rejected @requires-gpu @requires-multi-gpu @requires-os:linux
+  #
+  # The second device is simulated, so this no longer waits for a multi-GPU lane.
+  @id:serve-rocr-reindexed-gpu-index-rejected @requires-os:linux
   Scenario: serve-20 - Serving pinned past the ROCR-reindexed visible set is refused
+    Given a machine with two AMD Instinct GPUs
     When the user serves a model pinned past the ROCR-reindexed visible set
     Then serving is refused before any engine starts
     And the user is told the pinned GPU is unavailable
@@ -248,10 +256,12 @@ Feature: Model serving
   # serve must therefore refuse, exactly as serve-15 does for a HIP-only empty
   # mask. Before the fix the probe preferred the HIP mask and discarded the ROCR
   # one entirely, resolved the visible set to [0], and let the serve proceed onto a
-  # device the runtime had already hidden. Runs on GPU hardware: on a no-GPU host
-  # the same refusal fires for having no device at all and would prove nothing.
-  @id:serve-rocr-empty-mask-beats-hip-mask @requires-gpu @requires-os:linux
+  # device the runtime had already hidden. Needs a GPU: on a no-GPU host the
+  # same refusal fires for having no device at all and would prove nothing. The
+  # simulated one is enough.
+  @id:serve-rocr-empty-mask-beats-hip-mask @requires-os:linux
   Scenario: serve-21 - Serving is refused when ROCR hides every GPU a HIP mask names
+    Given a machine with an AMD Instinct GPU
     When the user serves a model with ROCR hiding every GPU a HIP mask names
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
