@@ -55,3 +55,22 @@ Feature: Update report
     Given a machine with no managed runtimes
     When the user checks for updates as JSON with --dry-run
     Then the CLI refuses because --dry-run and --json cannot be combined
+
+  # Which runtime `rocm update` offers to install is decided by comparing the
+  # installed version against the catalog's. That comparison used to fall back
+  # to a plain text compare whenever either side was not exactly
+  # MAJOR.MINOR.PATCH, so a two-component catalogue version inverted the verdict
+  # in BOTH directions: a runtime a release ahead of the catalog was offered the
+  # older build as an "update" (a silent downgrade on `--apply`), and a runtime
+  # a release behind was called ahead of the catalog and never offered the newer
+  # one. Both runtimes are checked in a single report so one run pins both
+  # directions. Nightly channel on purpose: the release channel drops versions
+  # it cannot parse before they ever reach the comparison, which hid this.
+  # Tarball format keeps it metadata-only over a loopback catalog — no Python,
+  # no GPU, no network. Mock lane, every PR.
+  @id:update-report-compares-versions-numerically-not-as-text
+  Scenario: update-07 - The update report compares catalog versions numerically, not as text
+    Given a nightly tarball catalog older than one registered runtime and newer than another
+    When the user checks for updates against that catalog
+    Then the report offers no update for the runtime that is ahead of the catalog
+    And the report offers an update for the runtime that is behind the catalog
