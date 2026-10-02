@@ -10,7 +10,8 @@
 //! module) avoids re-diverging these helpers as `lib.rs` continues to be
 //! split into focused modules (see `docs/architecture.md`).
 
-use rocm_core::{AppPaths, unix_time_millis};
+use anyhow::Result;
+use rocm_core::{AppPaths, ManagedServiceRecord, unix_time_millis};
 use std::fs;
 use std::path::PathBuf;
 
@@ -65,4 +66,88 @@ pub(crate) fn identity_probe_record(
         None,
         Some("gpu_required".to_owned()),
     )
+}
+
+thread_local! {
+    static FORCED_TERMINATION_OUTCOME: std::cell::Cell<Option<rocm_core::TerminationOutcome>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The outcome `terminate_recorded_pid` reports in place of a real
+/// termination, when a test on this thread has forced one.
+pub(crate) fn forced_termination_outcome() -> Option<rocm_core::TerminationOutcome> {
+    FORCED_TERMINATION_OUTCOME.with(std::cell::Cell::get)
+}
+
+/// Makes every recorded-PID termination on the current thread report a fixed
+/// outcome, without signalling anything, until dropped.
+///
+/// An unconfirmed stop needs a process that survives `SIGKILL`, or a live
+/// one whose start-time cannot be read; a test can create neither on demand.
+/// Everything downstream of the termination — the verdict, the manifest
+/// write, the key cleanup and the report — still runs for real.
+pub(crate) struct ForcedTerminationOutcome;
+
+impl ForcedTerminationOutcome {
+    pub(crate) fn set(outcome: rocm_core::TerminationOutcome) -> Self {
+        FORCED_TERMINATION_OUTCOME.with(|cell| cell.set(Some(outcome)));
+        Self
+    }
+}
+
+impl Drop for ForcedTerminationOutcome {
+    fn drop(&mut self) {
+        FORCED_TERMINATION_OUTCOME.with(|cell| cell.set(None));
+    }
+}
+
+/// The recorded PID for the unconfirmed-stop tests. Never signalled: those
+/// tests force the termination outcome, so the value only has to be neither
+/// zero nor the test process itself.
+pub(crate) const UNCONFIRMED_STOP_PID: u32 = 999_999_999;
+
+/// Seed a ready, publicly bound service that has an endpoint key on disk.
+pub(crate) fn seed_keyed_service(paths: &AppPaths, service_id: &str, port: u16) -> Result<PathBuf> {
+    let mut record = ManagedServiceRecord::new(
+        paths,
+        service_id,
+        "vllm",
+        "qwen",
+        "Qwen/Qwen3.5",
+        "0.0.0.0",
+        port,
+        "managed",
+        UNCONFIRMED_STOP_PID,
+        None,
+        None,
+        None,
+    );
+    record.status = "ready".to_owned();
+    record.write()?;
+    let key_path = rocm_engine_protocol::endpoint_key_file_path(paths, service_id);
+    fs::create_dir_all(paths.services_dir())?;
+    fs::write(&key_path, "secret-key")?;
+    Ok(key_path)
+}
+
+/// The state an unconfirmed stop must leave behind: not marked stopped, the
+/// PID kept so a later stop can still reach it, the deferred-cleanup marker
+/// set, and the endpoint key still on disk.
+pub(crate) fn assert_unconfirmed_stop_kept_the_service(
+    reloaded: &ManagedServiceRecord,
+    key_kept: bool,
+) {
+    assert_eq!(
+        reloaded.status, "ready",
+        "an unconfirmed stop must not mark the service stopped"
+    );
+    assert_eq!(
+        reloaded.supervisor_pid, UNCONFIRMED_STOP_PID,
+        "an unconfirmed stop must keep the PID a later stop needs"
+    );
+    assert!(
+        reloaded.stop_requested_unix_ms.is_some(),
+        "an unconfirmed stop must hand key cleanup to the liveness refresh"
+    );
+    assert!(key_kept, "an unconfirmed stop must keep the endpoint key");
 }

@@ -6,7 +6,7 @@ use crate::ARTIFACT_PREFETCH_TIMEOUT;
 use crate::cli::{SandboxToolArg, SandboxToolPolicy};
 use crate::common::{self, CommandCapture};
 use crate::persistence::load_managed_services;
-use crate::service::stop_managed_service;
+use crate::service::{stop_managed_service, stop_report_confirmed};
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
@@ -221,9 +221,16 @@ pub(crate) fn run_sandbox_tool(
         SandboxToolArg::StopServer => {
             let service_id = service_id.context("stop_server requires `--service-id`")?;
             let stopped = stop_managed_service(paths, &service_id)?;
+            // Taken from the same verdict that decided what the stop wrote to
+            // the manifest, so the reported status cannot disagree with it.
+            let status = if stop_report_confirmed(&stopped) {
+                "stopped"
+            } else {
+                "stop_unconfirmed"
+            };
             Ok(json!({
                 "tool": tool.as_cli_value(),
-                "status": "stopped",
+                "status": status,
                 "mutating": true,
                 "result": stopped,
             }))

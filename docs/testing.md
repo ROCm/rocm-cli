@@ -797,6 +797,9 @@ cargo test -p rocmd sandbox_tool_restart_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_requires_service_id_for_stop
 cargo test -p rocmd sandbox_tool_stop_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_stop_server_updates_manifest_and_skips_current_pid
+cargo test -p rocmd sandbox_tool_stop_server_reports_an_unconfirmed_stop
+cargo test -p rocmd mcp_stop_server_reports_an_unconfirmed_stop_as_an_error
+cargo test -p rocmd mcp_stop_server_reports_a_confirmed_stop_as_success
 cargo test -p rocmd sandbox_tool_notify_user_is_read_only
 cargo test -p rocmd sandbox_runner_native_fallback_records_audit
 ```
@@ -808,7 +811,10 @@ read-only extension. Read-only tools must report `mutating: false`;
 `notify_user` must record a local notification audit event; server restart/stop
 must require an explicit service id; sandbox-run native fallback or Linux
 bubblewrap isolation must still execute only this internal tool API and record
-a sandbox audit event.
+a sandbox audit event. `stop_server` — the sandbox tool and the MCP tool alike —
+reports a stop only once every recorded process is confirmed gone: otherwise
+the sandbox tool reports `status: stop_unconfirmed`, the MCP tool answers with
+`isError: true`, and the manifest keeps its PIDs and endpoint key.
 
 Manual restricted-tool smoke:
 
