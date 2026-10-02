@@ -22,6 +22,33 @@ pub fn exe_label(cmd: &str) -> &str {
     cmd.rsplit(['/', '\\']).next().unwrap_or(cmd)
 }
 
+/// Quote `value` for display if it's empty or contains whitespace or a
+/// shell-meaningful character, so a command preview can't misrepresent where
+/// one argument ends and the next begins. Mirrors the display-only quoting
+/// already used for the same purpose in `apps/rocm` (e.g.
+/// `therock.rs::quote_display_arg`).
+fn quote_display_arg(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')' | '&' | ';' | '|'))
+    {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Join `args` into a single display string, quoting any argument that needs
+/// it so an approval preview or job-console title unambiguously shows where
+/// each argument begins and ends.
+pub fn display_args(args: &[String]) -> String {
+    args.iter()
+        .map(|a| quote_display_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,5 +63,35 @@ mod tests {
     #[test]
     fn resolve_exe_is_never_empty() {
         assert!(!resolve_exe().is_empty());
+    }
+
+    #[test]
+    fn display_args_passes_through_plain_values() {
+        let args = vec!["--channel".to_string(), "release".to_string()];
+        assert_eq!(display_args(&args), "--channel release");
+    }
+
+    #[test]
+    fn display_args_quotes_values_with_spaces() {
+        let args = vec!["--prefix".to_string(), "/mnt/my folder".to_string()];
+        assert_eq!(display_args(&args), "--prefix \"/mnt/my folder\"");
+    }
+
+    #[test]
+    fn display_args_escapes_embedded_quotes() {
+        let args = vec!["say \"hi\"".to_string()];
+        assert_eq!(display_args(&args), "\"say \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn display_args_quotes_empty_value() {
+        let args = vec!["--tag".to_string(), String::new()];
+        assert_eq!(display_args(&args), "--tag \"\"");
+    }
+
+    #[test]
+    fn display_args_quotes_shell_metacharacters() {
+        let args = vec!["a&b".to_string(), "c;d".to_string(), "e|f".to_string()];
+        assert_eq!(display_args(&args), "\"a&b\" \"c;d\" \"e|f\"");
     }
 }
