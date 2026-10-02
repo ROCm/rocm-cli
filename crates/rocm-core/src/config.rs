@@ -10,7 +10,7 @@
 //! rocm-dash dashboard sub-config (daemon + TUI), including its one-shot
 //! legacy-TOML migration.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -657,6 +657,26 @@ impl RocmCliConfig {
 
         // Dashboard-specific knobs map into the new sub-config.
         let d = &parsed.daemon;
+        // rocm-dash's own reader (`rocm_dash_core::config`) rejects a tick that
+        // is not a valid `Duration` — NaN, infinite, negative, or too large —
+        // so it already treats this file as unreadable. Migrating it anyway
+        // would also write a non-finite value as JSON `null`, which `load`
+        // rejects. Refuse on the same rule, leaving the TOML untouched.
+        for (key, value) in [
+            ("gpu_tick", d.gpu_tick),
+            ("discovery_tick", d.discovery_tick),
+            ("instance_tick", d.instance_tick),
+        ] {
+            if let Some(secs) = value
+                && let Err(error) = Duration::try_from_secs_f64(secs)
+            {
+                bail!(
+                    "legacy config {} sets daemon.{key} = {secs}, which is not a valid tick \
+                     ({error}); set it to a finite, non-negative number of seconds to migrate the file",
+                    legacy.display()
+                );
+            }
+        }
         if let Some(v) = &d.listen {
             config.dashboard.daemon.listen = v.clone();
         }
@@ -1108,6 +1128,54 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(again, None);
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A tick that is not a valid duration is refused, naming the key, and the
+    /// refusal writes nothing: no `config.json` appears and the TOML is
+    /// unchanged, so the startup notice "skipped legacy dashboard config
+    /// migration" is true and fixing the value lets the next run migrate.
+    #[test]
+    fn migrate_legacy_dashboard_toml_refuses_an_invalid_tick_and_writes_nothing() -> Result<()> {
+        for (value, rendered) in [
+            ("nan", "NaN"),
+            ("inf", "inf"),
+            ("-inf", "-inf"),
+            ("-1.0", "-1"),
+        ] {
+            let (root, paths) = temp_app_paths("migrate-dash-bad-tick");
+            fs::create_dir_all(&root)?;
+            let legacy = root.join("legacy-config.toml");
+            let text = format!(
+                "default_engine = \"vllm\"\n[daemon]\ndiscovery_tick = {value}\n[tui]\ntheme = \"nord\"\n"
+            );
+            fs::write(&legacy, &text)?;
+
+            let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+                .expect_err("an invalid tick must not migrate");
+            let config_written = paths.config_path().exists();
+            let legacy_after = fs::read_to_string(&legacy)?;
+            let _ = fs::remove_dir_all(&root);
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("daemon.discovery_tick = {rendered}")),
+                "{value}: unexpected error: {message}"
+            );
+            assert!(!config_written, "{value}: config.json was written");
+            assert_eq!(legacy_after, text, "{value}: the legacy TOML was modified");
+        }
+
+        // Zero is a valid duration for rocm-dash too, so it still migrates.
+        let (root, paths) = temp_app_paths("migrate-dash-zero-tick");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(&legacy, "[daemon]\ngpu_tick = 0\n")?;
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let loaded = RocmCliConfig::load(&paths);
+        let _ = fs::remove_dir_all(&root);
+        assert!(migrated.is_some());
+        assert!(loaded.is_ok());
         Ok(())
     }
 

@@ -360,7 +360,6 @@ fn legacy_toml_migration_round_trips_finite_values() {
 }
 
 #[test]
-#[ignore = "CONFIRMED BUG: legacy `gpu_tick = nan|inf` migrates into an unreadable config.json"]
 fn legacy_toml_migration_always_produces_a_loadable_config() {
     legacy_migration_property(&tick(), "legacy migration (any)");
 }
