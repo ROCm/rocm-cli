@@ -6311,16 +6311,29 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Write the config so that [`Self::load`] can always read it back.
+    ///
+    /// Two ways a save used to leave a file `load` rejects, both closed here:
+    ///
+    /// - an interrupted write (a full disk mid-install is the usual one) left
+    ///   a truncated file, because a plain `fs::write` truncates first. The
+    ///   write is now atomic: a reader sees the old file or the new one.
+    /// - a value that serializes but does not deserialize, such as a
+    ///   non-finite `f64` (JSON has no NaN, so it is written as `null`). The
+    ///   bytes are parsed back before anything is written, and the save fails
+    ///   with the existing file left as it was.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        let bytes =
+            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
+        serde_json::from_slice::<Self>(&bytes).with_context(|| {
+            format!(
+                "refusing to write {}: the new contents would not load back",
+                path.display()
+            )
+        })?;
+        atomic_write::write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn engine_config(&self, engine: &str) -> Option<&EngineUserConfig> {
@@ -12529,6 +12542,87 @@ Class Name:                Display
         let tool = loaded.tools.get("python").expect("python tool should load");
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
+        Ok(())
+    }
+
+    /// `save` must replace `config.json`, not rewrite it in place: an in-place
+    /// write truncates first, so a full disk part-way through leaves a file
+    /// `load` rejects. A hard link taken before the save still names the old
+    /// file's contents only if the save published a new file over the path.
+    ///
+    /// Unix-only because it observes replacement through a hard link; the
+    /// Windows publish step (`ReplaceFileW`) is covered by the atomic writer's
+    /// own tests in `apps/rocm/src/therock.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn config_save_replaces_the_file_instead_of_rewriting_it_in_place() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-replaces");
+        let previous = RocmCliConfig {
+            active_runtime_key: Some("previous-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        previous.save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+        let witness = root.join("config-before-save.json");
+        fs::hard_link(paths.config_path(), &witness)?;
+
+        let next = RocmCliConfig {
+            active_runtime_key: Some("next-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        next.save(&paths)?;
+
+        let witnessed = fs::read(&witness)?;
+        let loaded = RocmCliConfig::load(&paths)?;
+        let leftovers: Vec<_> = fs::read_dir(&paths.config_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "config.json")
+            .collect();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            witnessed, before,
+            "save rewrote the existing config.json in place"
+        );
+        assert_eq!(loaded.active_runtime_key.as_deref(), Some("next-runtime"));
+        assert!(
+            leftovers.is_empty(),
+            "save left files behind: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    /// A value that serializes but cannot be read back (a non-finite tick is
+    /// written as JSON `null`) must fail the save and leave the existing file
+    /// exactly as it was, rather than replace a good config with one `load`
+    /// rejects.
+    #[test]
+    fn config_save_refuses_contents_load_would_reject_and_keeps_the_old_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-refuses");
+        let good = RocmCliConfig {
+            active_runtime_key: Some("kept-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        good.save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+
+        let mut bad = good;
+        bad.dashboard.daemon.gpu_tick_secs = f64::NAN;
+        let error = bad
+            .save(&paths)
+            .expect_err("a config load would reject must not be saved");
+        let after = fs::read(paths.config_path())?;
+        let reloaded = RocmCliConfig::load(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("refusing to write") && rendered.contains("config.json"),
+            "unexpected error: {rendered}"
+        );
+        assert_eq!(after, before, "the existing config.json was changed");
+        assert_eq!(reloaded.active_runtime_key.as_deref(), Some("kept-runtime"));
         Ok(())
     }
 

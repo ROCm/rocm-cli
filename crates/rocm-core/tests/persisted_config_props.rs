@@ -234,7 +234,6 @@ fn config_round_trips_through_save_and_load_for_finite_values() {
 /// serializes as JSON `null`, which the `f64` field then rejects, so the saved
 /// config cannot be read back at all.
 #[test]
-#[ignore = "CONFIRMED BUG: non-finite dashboard tick saves as null and bricks config.json"]
 fn config_save_never_writes_a_file_load_rejects() {
     let (root, paths) = fresh_paths("roundtrip-any");
     let non_finite = AtomicUsize::new(0);
