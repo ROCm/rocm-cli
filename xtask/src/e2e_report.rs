@@ -185,14 +185,31 @@ mod tests {
     /// `parse_descriptor` maps it to Unknown/Unknown precisely so it escapes the
     /// Linux default. No workflow can name it, so a workflow that did would be
     /// claiming an identity it has no business asserting.
+    ///
+    /// The `-n-1`/`-n-2` entries are the non-`current` legs of the self-hosted
+    /// `sdk_version` matrix (ROCMAI-430): each GPU job uploads those legs under a
+    /// distinct name so they don't collide with the `current` leg, whose name is
+    /// left exactly as it was before the matrix existed.
     const CANONICAL_REPORT_ARTIFACTS: &[&str] = &[
         "e2e-report",
         "e2e-gpu-report",
+        "e2e-gpu-n-1-report",
+        "e2e-gpu-n-2-report",
         "e2e-gpu-rad3-report",
+        "e2e-gpu-rad3-n-1-report",
+        "e2e-gpu-rad3-n-2-report",
         "e2e-gpu-mi350p-report",
+        "e2e-gpu-mi350p-n-1-report",
+        "e2e-gpu-mi350p-n-2-report",
         "e2e-gpu-strix-ubuntu-report",
+        "e2e-gpu-strix-ubuntu-n-1-report",
+        "e2e-gpu-strix-ubuntu-n-2-report",
         "e2e-gpu-strix-windows-report",
+        "e2e-gpu-strix-windows-n-1-report",
+        "e2e-gpu-strix-windows-n-2-report",
         "e2e-gpu-strix-wsl-report",
+        "e2e-gpu-strix-wsl-n-1-report",
+        "e2e-gpu-strix-wsl-n-2-report",
     ];
 
     /// Every workflow in `.github/workflows`, so a new one cannot upload under a
@@ -251,6 +268,11 @@ mod tests {
         // The nightly workflow exists to run *more* scenarios on the *same*
         // platforms. If the two ever diverge, the nightly grid is comparing
         // different hardware than the PR grid without saying so.
+        //
+        // Nightly doesn't run the sdk_version matrix (ROCMAI-430) — it has its
+        // own breadth-over-versions tradeoff — so strip the `-n-1`/`-n-2` legs
+        // before comparing; the `current` leg's name is unaffected by the matrix
+        // and must still match nightly's.
         let lanes = |file: &str| {
             let mut names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -260,7 +282,15 @@ mod tests {
                     .join(file),
             );
             names.retain(|n| !n.starts_with("e2e-consolidated-report"));
+            for suffix in ["-n-1-report", "-n-2-report"] {
+                for name in &mut names {
+                    if let Some(rest) = name.strip_suffix(suffix) {
+                        *name = format!("{rest}-report");
+                    }
+                }
+            }
             names.sort();
+            names.dedup();
             names
         };
         assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));

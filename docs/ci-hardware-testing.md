@@ -146,12 +146,19 @@ covers the mock platform;
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
-The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
-`e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
-`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
-because the report derives each platform's name and OS from the artifact name.
-An unrecognised name renders as a guessed platform on Linux, which would report
-a Windows lane as Linux; `xtask`'s
+The lane artifacts are named canonically (`e2e-gpu-mi350p-n-1-report`,
+`e2e-gpu-mi350p-n-2-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-n-1-report`,
+`e2e-gpu-n-2-report`, `e2e-gpu-rad3-n-1-report`, `e2e-gpu-rad3-n-2-report`,
+`e2e-gpu-rad3-report`, `e2e-gpu-report`, `e2e-gpu-strix-ubuntu-n-1-report`,
+`e2e-gpu-strix-ubuntu-n-2-report`, `e2e-gpu-strix-ubuntu-report`,
+`e2e-gpu-strix-windows-n-1-report`, `e2e-gpu-strix-windows-n-2-report`,
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-n-1-report`,
+`e2e-gpu-strix-wsl-n-2-report`, `e2e-gpu-strix-wsl-report`, `e2e-report`) in every workflow,
+because the report derives each platform's name and OS from the artifact
+name. The `-n-1`/`-n-2` suffixes are the sdk-version-matrix legs (below,
+under "Triggers"); a `current`-leg artifact keeps its pre-matrix name
+unchanged. An unrecognised name renders as a guessed platform on Linux, which
+would report a Windows lane as Linux; `xtask`'s
 `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
 
 ## Triggers
@@ -162,7 +169,21 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 branch, so pushing to a release branch runs the full self-hosted matrix ahead
 of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
-branch. `serve` is narrower than `heavy`: it matches only
+branch.
+
+On a release-branch push, every GPU job additionally expands into a
+`strategy.matrix.sdk_version` of `[current, n-1, n-2]` — three legs, each
+pinning `cargo xtask e2e-prewarm --release-label <leg>` to a different
+TheRock SDK version (`current` tracks the channel's latest; `n-1`/`n-2` pin
+the prior two released versions from `xtask/src/rocm_releases.rs`, a static
+table seeded from the official
+[release list](https://rocm.docs.amd.com/en/latest/release/versions.html)).
+Off a release-branch push the matrix resolves to `[current]` only, so an
+ordinary PR run is unaffected. Each leg uploads its own artifact (the
+`-n-1`/`-n-2` suffix above); the pre-warm's runtime-key design lets all three
+versions share one pre-warmed runtime tree rather than needing separate ones.
+
+`serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the
 serve code path in `apps/rocm`/`apps/rocmd`, `rocm-core`, the e2e-cucumber crate,
 plus broad-dependency safety nets), **not** a blanket `**/*.rs`. So a Rust change
