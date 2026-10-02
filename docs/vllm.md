@@ -32,6 +32,10 @@ Installing an engine into a managed TheRock runtime can change the torch in that
 runtime. Two installers write torch into the same environment — the SDK install
 writes TheRock's build, and the engine install then writes the build from its own
 index — so `rocm engines install` settles which one stays and prints the result
+Installing an engine into a managed TheRock runtime can change the torch in that
+runtime. Two installers write torch into the same environment: the SDK install
+writes TheRock's build, and the engine install then writes the build from its own
+index. So `rocm engines install` settles which one stays and prints the result
 as a `torch_alignment:` line.
 
 A torch that already executes a GPU kernel against the installed SDK is kept
@@ -49,14 +53,15 @@ skip the replacement:
 ROCM_CLI_DISABLE_TORCH_ALIGNMENT=1 rocm engines install vllm --yes
 ```
 
-Any value works, including an empty one — the variable being set is the signal.
+Any value works, including an empty one: the variable being set is the signal.
 The install then reports `torch_alignment: disabled`, naming both the build it
 would have installed and the one it kept. The device check still runs, so an
 opt-out that leaves the runtime unable to serve says so rather than failing later
 during serving.
 
 Use it when you are deliberately running a torch the alignment would replace — a
-locally built wheel, a version under test, a stack pinned for a reproduction. It
+Use it when you are deliberately running a torch the alignment would replace (a
+locally built wheel, a version under test, or a stack pinned for a reproduction). It
 is an escape hatch, not a supported configuration: the resulting combination is
 not validated against the supported matrix, and a runtime that cannot execute a
 kernel will fail at serving time.
@@ -167,12 +172,12 @@ multiple GPUs is not supported.
 
 ## GPU memory
 
-vLLM claims a fixed fraction of each GPU's **total** VRAM — not of the free
-VRAM, and not scaled to the model — for weights plus KV cache. On a large card
+vLLM claims a fixed fraction of each GPU's **total** VRAM (not of the free
+VRAM, and not scaled to the model) for weights plus KV cache. On a large card
 a small model therefore still reserves a large slice.
 
 ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
-applies unless a value comes from somewhere else — either a model's catalog
+applies unless a value comes from somewhere else: either a model's catalog
 recipe or, taking precedence over it, the flag below:
 
 ```bash
@@ -182,6 +187,7 @@ rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
 The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
 for a display, another workload, or a second server; raise it to give a large
 model more KV cache. Applies to vLLM only — it is ignored, with a note in the
+model more KV cache. Applies to vLLM only; it is ignored, with a note in the
 serve output, for other engines. An out-of-range or unparsable value fails the
 command rather than falling back silently.
 
@@ -197,7 +203,7 @@ a matching `--tool-call-parser`. vLLM does not auto-detect the parser and it is
 model-specific, so ROCm CLI never guesses one:
 
 - **Built-in catalog models** carry the correct parser in their recipe metadata,
-  so tool calling works out of the box (e.g. Qwen family → `hermes`,
+  so tool calling works out of the box (for example, Qwen family → `hermes`,
   Llama 3 → `llama3_json`).
 - **Other models** (arbitrary Hugging Face repos, or a catalog model forced onto
   vLLM without authored metadata) need an explicit parser:

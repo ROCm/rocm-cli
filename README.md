@@ -375,7 +375,7 @@ package.
 
 `update` checks for a newer ROCm package.
 
-| Flag | Effect |
+| Flag | Description |
 | --- | --- |
 | `--apply` | Installs the update. Never prompts and needs no approval flag, because selecting a runtime to update is the approval. Leaves the active default alone unless you add `--activate`. |
 | `--dry-run` | Previews what `--apply` would do without changing anything. Doesn't require `--apply`. |
