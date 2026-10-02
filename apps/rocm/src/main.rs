@@ -3380,7 +3380,7 @@ fn passive_driver_checks() -> Vec<DriverPassiveCheck> {
 fn passive_path_check(path: &str, detail: &str) -> DriverPassiveCheck {
     DriverPassiveCheck {
         name: path.to_owned(),
-        status: if Path::new(path).exists() {
+        status: if rocm_core::host_path(path).exists() {
             "present"
         } else {
             "missing"
@@ -3391,7 +3391,7 @@ fn passive_path_check(path: &str, detail: &str) -> DriverPassiveCheck {
 }
 
 fn passive_render_node_check() -> DriverPassiveCheck {
-    let present = fs::read_dir("/dev/dri")
+    let present = fs::read_dir(rocm_core::host_path("/dev/dri"))
         .ok()
         .into_iter()
         .flat_map(|entries| entries.filter_map(std::result::Result::ok))
@@ -4720,7 +4720,8 @@ fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
 }
 
 fn read_os_release() -> Result<String> {
-    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
+    fs::read_to_string(rocm_core::host_path("/etc/os-release"))
+        .context("failed to read /etc/os-release")
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {

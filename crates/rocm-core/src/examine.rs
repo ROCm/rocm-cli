@@ -395,7 +395,8 @@ impl Examination {
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
-            probe_gpus_after_lspci(&mut e, GpuProbeSources::host());
+            let kfd_nodes = crate::host_path("/sys/class/kfd/kfd/topology/nodes");
+            probe_gpus_after_lspci(&mut e, GpuProbeSources::host(&kfd_nodes));
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -559,6 +560,12 @@ fn read_text(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// [`read_text`] for an absolute host path, read where [`crate::host_path`]
+/// says the host is.
+fn read_host_text(path: &str) -> String {
+    std::fs::read_to_string(crate::host_path(path)).unwrap_or_default()
+}
+
 /// Whether `program` resolves on `PATH` (best-effort, no execution).
 pub(crate) fn which(program: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
@@ -607,8 +614,8 @@ fn probe_os(e: &mut Examination) {
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
-        e.kernel_cmdline = read_text("/proc/cmdline").trim().to_owned();
-        let osr = read_text("/etc/os-release");
+        e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
+        let osr = read_host_text("/etc/os-release");
         for line in osr.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -652,7 +659,7 @@ fn probe_wsl(e: &mut Examination) {
         },
         dxg_device: summary.as_ref().is_some_and(|s| s.dxg_device),
         dxcore: summary.as_ref().is_some_and(|s| s.dxcore),
-        wsl_lib_dir: Path::new("/usr/lib/wsl/lib").is_dir(),
+        wsl_lib_dir: crate::host_path("/usr/lib/wsl/lib").is_dir(),
         librocdxg: summary.as_ref().is_some_and(|s| s.librocdxg),
         rocdxg_dids: summary.as_ref().is_some_and(|s| s.rocdxg_dids),
         // `None` when ldconfig itself could not be run, which the summary's
@@ -929,7 +936,7 @@ fn parse_iommu_param(cmdline: &str) -> Option<String> {
 }
 
 fn probe_cpu_linux(e: &mut Examination) {
-    let txt = read_text("/proc/cpuinfo");
+    let txt = read_host_text("/proc/cpuinfo");
     for line in txt.lines() {
         if (e.cpu_vendor == "unknown")
             && line.starts_with("vendor_id")
@@ -1343,12 +1350,13 @@ struct GpuProbeSources<'a> {
     sysfs_gfx_target: fn() -> Option<String>,
 }
 
-impl GpuProbeSources<'_> {
-    /// The real host: the kernel's own KFD topology, the `rocminfo` on `PATH`,
-    /// and the sysfs target read.
-    fn host() -> Self {
+impl<'a> GpuProbeSources<'a> {
+    /// The real host: the kernel's own KFD topology (read at `kfd_nodes`, which
+    /// is [`crate::host_path`]'s answer for it), the `rocminfo` on `PATH`, and
+    /// the sysfs target read.
+    fn host(kfd_nodes: &'a Path) -> Self {
         Self {
-            kfd_nodes: Path::new("/sys/class/kfd/kfd/topology/nodes"),
+            kfd_nodes,
             rocminfo: None,
             sysfs_gfx_target: crate::detect_linux_sysfs_gfx_target,
         }
@@ -1590,7 +1598,7 @@ fn probe_modules(e: &mut Examination) {
     let module_text = if rc == 0 {
         Some(out.lines().skip(1).collect::<Vec<_>>().join("\n"))
     } else {
-        let txt = read_text("/proc/modules");
+        let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
     };
     if let Some(text) = module_text {
@@ -1603,7 +1611,7 @@ fn probe_modules(e: &mut Examination) {
     }
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1613,8 +1621,9 @@ fn probe_modules(e: &mut Examination) {
             }
             let body = read_text(&path.to_string_lossy());
             if body.lines().any(line_blacklists_amdgpu) {
+                // The logical path, not where the probe read it.
                 e.amdgpu_blacklisted_in
-                    .push(path.to_string_lossy().into_owned());
+                    .push(format!("{dir}/{}", entry.file_name().to_string_lossy()));
             }
         }
     }
@@ -1635,13 +1644,13 @@ fn line_blacklists_amdgpu(line: &str) -> bool {
 
 fn probe_devices(e: &mut Examination) {
     e.kfd = Some(stat_device("/dev/kfd", &e.user_name, &e.user_groups));
-    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+    if let Ok(entries) = std::fs::read_dir(crate::host_path("/dev/dri")) {
         let mut render: Vec<String> = entries
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 name.starts_with("renderD")
-                    .then(|| entry.path().to_string_lossy().into_owned())
+                    .then(|| format!("/dev/dri/{name}"))
             })
             .collect();
         render.sort();
@@ -1652,16 +1661,19 @@ fn probe_devices(e: &mut Examination) {
     }
 }
 
+/// Stat the device node at the logical host path `path` (`/dev/kfd`), reading
+/// it where [`crate::host_path`] puts it but reporting the logical path.
 fn stat_device(path: &str, user_name: &str, user_groups: &[String]) -> Device {
+    let host = crate::host_path(path);
     let mut device = Device {
         path: path.to_owned(),
-        exists: Path::new(path).exists(),
+        exists: host.exists(),
         ..Device::default()
     };
     if !device.exists {
         return device;
     }
-    let (rc, out, _) = run("stat", &["-c", "%A|%U|%G", path], SHORT);
+    let (rc, out, _) = run("stat", &["-c", "%A|%U|%G", &host.to_string_lossy()], SHORT);
     if rc == 0 {
         let fields: Vec<&str> = out.trim().split('|').collect();
         if fields.len() == 3 {
