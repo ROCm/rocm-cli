@@ -46,6 +46,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 
+[dev-dependencies]
+# Property-based tests for version ordering / runtime selection. Same spec as
+# rocm-core's: `std` only, so no `fork`/`timeout` machinery (rusty-fork,
+# wait-timeout) enters the lockfile for a suite that does not need it.
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

@@ -2,6 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Property-based tests for version ordering and update-source selection.
+/// A child module so it can reach this module's private comparators directly.
+#[cfg(test)]
+#[path = "therock_version_proptests.rs"]
+mod version_proptests;
+
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,

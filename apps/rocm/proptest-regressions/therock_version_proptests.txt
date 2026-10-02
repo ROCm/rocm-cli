@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dbb0af08e234f51218b13076a7eac12c4a2373f5a4cd5034edd20268c135861c # shrinks to left = "7.9", right = "7.10.0"
+cc 18f8eba266a7177c3413421885b61d6f03ae489978849965390830a936787965 # shrinks to a = "7.0.0.post1", b = "7.0.0a1", c = "7.0.0"
+cc 1390057f20e0d39e188e1f7951e8f944daccef0b513348f2d6402865e5109649 # shrinks to versions = ["7.0.0", "7.0.0.post1", "7.0.0a1"], order = [0, 2, 3, 4, 1]
+cc d2d350800a9efc8ed25e9ff41cf708e52a69233d625ae7adb20b4af0070c4032 # shrinks to manifests = [InstalledRuntimeManifest { runtime_key: "therock-release-wheel-gfx110X-all-runtime-7.0.0", runtime_id: "therock-release:gfx110X-all", channel: "release", format: "wheel", family: "gfx110X-all", family_source: "test", version: "7.0.0", install_root: "runtime-root", selected_artifact_url: "https://example.invalid/rocm", source_layout_generation: None, index_url: None, tarball_file_name: None, python_launcher: None, python_executable: None, pip_cache_dir: None, rocm_sdk: None, sdk_torch: None, wheel_composition: None, read_only: false, imported_from: None, devel: false, installed_at_unix_ms: 2000 }, InstalledRuntimeManifest { runtime_key: "therock-release-wheel-gfx110X-all-devel-7.0.0", runtime_id: "therock-release:gfx110X-all", channel: "release", format: "wheel", family: "gfx110X-all", family_source: "test", version: "7.0.0", install_root: "runtime-root", selected_artifact_url: "https://example.invalid/rocm", source_layout_generation: None, index_url: None, tarball_file_name: None, python_launcher: None, python_executable: None, pip_cache_dir: None, rocm_sdk: None, sdk_torch: None, wheel_composition: None, read_only: false, imported_from: None, devel: true, installed_at_unix_ms: 2000 }], order = [1, 0, 2, 3]
