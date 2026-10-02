@@ -176,24 +176,22 @@ fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
 ///   word (`rocm-dash-collectors`) — the doc's convention for citing a
 ///   crate directory by its Cargo package name.
 ///
-/// Two deliberate blind spots, same "safer to miss than false-flag" tradeoff:
-/// - A bare, non-hyphenated word (`xtask`) is not treated as a candidate:
-///   nothing at the lexical level distinguishes a real bare directory from
-///   a plain English word or shell command (e.g. `grep`).
-/// - A slash-path whose every component is a common English word (`read/write`,
-///   `and/or`) is accepted unconditionally; nothing at the lexical level
-///   distinguishes `apps/rocm` from `and/or`, and the doc's own prose has
-///   never contained such a pattern — spaces, which is_path_safe already
-///   rejects, have always separated prose from punctuation in practice.
-///   A future `` `and/or` `` in the doc would false-fail CI; if that ever
-///   happens, the citation should use a hyphenated form or a qualifying
-///   directory prefix.
+/// One deliberate blind spot remains, same "safer to miss than false-flag"
+/// tradeoff: a bare, non-hyphenated word (`xtask`) is not treated as a
+/// candidate — nothing at the lexical level distinguishes a real bare
+/// directory from a plain English word or shell command (e.g. `grep`).
+///
+/// A slash-path whose every component is a known [`PROSE_SLASH_WORDS`] entry
+/// (`read/write`, `and/or`, `GPU/CPU`) is rejected rather than accepted
+/// unconditionally — see that constant's doc comment for why this guard is
+/// narrow (a curated list, not a dictionary check) rather than a complete
+/// fix.
 fn is_path_candidate(span: &str) -> bool {
     if span.is_empty() || !is_path_safe(span) {
         return false;
     }
     if span.contains('/') {
-        return true;
+        return !is_prose_slash_phrase(span);
     }
     if BARE_FILE_EXTENSIONS
         .iter()
@@ -202,6 +200,30 @@ fn is_path_candidate(span: &str) -> bool {
         return true;
     }
     is_hyphenated_bare_word(span)
+}
+
+/// Bare words known to appear as `/`-joined shorthand pairs in ordinary
+/// prose (`` `and/or` ``, `` `read/write` ``, `` `GPU/CPU` ``) rather than as
+/// real path segments. Matched case-insensitively so `GPU`/`CPU` are caught
+/// by the same list as `and`/`or`.
+///
+/// Not exhaustive, by design — the same bounded, curated-list tradeoff
+/// [`BARE_FILE_EXTENSIONS`] already makes for extensions rather than
+/// guessing. A slash-joined prose pair not in this list (or a path where
+/// only *one* side happens to be an ordinary word, e.g. `apps/rocm`) still
+/// passes [`is_path_candidate`] unchanged — this closes the three concrete
+/// patterns #440 reported, not every possible false positive.
+const PROSE_SLASH_WORDS: [&str; 6] = ["and", "or", "read", "write", "gpu", "cpu"];
+
+/// Whether every `/`-separated segment of `span` is a [`PROSE_SLASH_WORDS`]
+/// entry — i.e. the whole span reads as a prose shorthand pair rather than a
+/// path, so even a real path with one ordinary-word segment (`apps/rocm`)
+/// is unaffected: only a span where *every* segment matches is rejected.
+fn is_prose_slash_phrase(span: &str) -> bool {
+    span.split('/').all(|segment| {
+        let lower = segment.to_ascii_lowercase();
+        PROSE_SLASH_WORDS.contains(&lower.as_str())
+    })
 }
 
 /// Whether every character in `span` is safe to appear in a path, as
@@ -236,20 +258,131 @@ fn is_hyphenated_bare_word(span: &str) -> bool {
 /// [`is_path_safe`]) — otherwise a stray bit of prose punctuation next to a
 /// `/` (`` `foo/bar!`'s `main.rs` ``) would be accepted as a directory,
 /// producing an unmatchable `section_dirs` entry that fails an accurate
-/// citation — and its last component must have no extension (a `.`),
+/// citation — its last component must have no extension (a `.`),
 /// otherwise a full file path (`` `crates/rocm-core/src/diagnose.rs` ``,
 /// or one ending in an extension outside [`BARE_FILE_EXTENSIONS`] like
 /// `` `.github/workflows/ci.yml` ``) would be accepted as if it were the
 /// directory containing it, which is equally unmatchable — checked
 /// generally rather than against just [`BARE_FILE_EXTENSIONS`], since a
 /// full path can end in any extension, not only the ones the doc cites
-/// bare. [`is_hyphenated_bare_word`] already excludes extensions and
-/// guarantees path-safety on its own, so only the slash branch needs the
-/// extra checks.
+/// bare — and it must not be a [`PROSE_SLASH_WORDS`] pair, same as
+/// [`is_path_candidate`]'s slash branch: a heading literally citing
+/// `` `read/write` `` must not be collected as a directory any more than it
+/// would be accepted as a citation elsewhere. [`is_hyphenated_bare_word`]
+/// already excludes extensions and guarantees path-safety on its own, so
+/// only the slash branch needs the extra checks.
 fn is_directory_shaped(span: &str) -> bool {
     let last_segment = span.rsplit('/').next().unwrap_or(span);
-    let is_directory_path = span.contains('/') && is_path_safe(span) && !last_segment.contains('.');
+    let is_directory_path = span.contains('/')
+        && is_path_safe(span)
+        && !last_segment.contains('.')
+        && !is_prose_slash_phrase(span);
     is_directory_path || is_hyphenated_bare_word(span)
+}
+
+/// Whether a possessive clause continues through to the next citation,
+/// given `sentence_boundary_seen` — whether a sentence-ending `.` has
+/// occurred anywhere since the clause's owner was last confirmed — for the
+/// continuation step (the initial `'s` owner-establishing step is a
+/// separate, exact-match check and unaffected by this).
+///
+/// A real split's prose connects its files with free English — "was split
+/// into", "a mechanical relocation, since ..." — not just `/`/`and`/`,`,
+/// and interleaves explanatory asides (type names, identifiers) between
+/// them. Requiring a literal connector token directly before every citation
+/// (the original, stricter design) rejects exactly this ordinary writing: a
+/// doc edit this mundane should not need unusual phrasing just to keep CI
+/// green. So the clause continues through *any* text, with one
+/// unconditional exception: a sentence-ending `.` always ends it. That's
+/// the safety net against the masking risk the module doc warns about —
+/// without it, a later sentence naming an unrelated file from a *different*
+/// crate in the same heading, with no new possessive clause of its own,
+/// would silently inherit an earlier owner instead of falling back to the
+/// heading's full (and correctly checked) crate list. A single sentence is
+/// a safe enough unit to trust: shifting to a different crate's file
+/// without starting a new clause or sentence would be confusing prose on
+/// its own merits, not just a gap in this checker.
+///
+/// Known limitation: an owner can still leak to an unrelated file *within*
+/// one sentence, because only a backtick-quoted `` `'s` `` starts a new
+/// clause — `` `rocm-dash-tui`'s `agent.rs` talks to the daemon's
+/// `server.rs` `` narrows `server.rs` to `rocm-dash-tui` too, even though
+/// its own `'s` is ordinary (un-backticked) prose, not a new possessive
+/// citation. This is natural wording, not a contrived edge case, so it is a
+/// real gap rather than "confusing prose on its own merits" — accepted for
+/// now as the same bounded tradeoff the module doc already makes elsewhere.
+///
+/// `sentence_boundary_seen` is threaded through [`extract_path_citations`]'s
+/// loop rather than recomputed from the `inter_text` buffer at the call
+/// site, because that buffer isn't a reliable record of "every sentence
+/// since the owner was confirmed": a non-candidate aside span (a type name
+/// like `` `AgentClient` ``) or a pending hyphenated span clears it so it
+/// can't be misread as a connector, which used to silently discard an
+/// already-seen sentence-ending period along with it. The flag survives
+/// those clears and is only reset where a clause's owner is actually
+/// (re)confirmed, so a period is never lost just because an aside happened
+/// to follow it.
+const fn continues_possessive_clause(sentence_boundary_seen: bool) -> bool {
+    !sentence_boundary_seen
+}
+
+/// Abbreviations whose trailing period isn't a sentence boundary, matched
+/// against the token of alphanumerics-and-periods containing the candidate
+/// period — case-insensitively, and with that token's own trailing periods
+/// stripped first, so `` e.g. ``'s embedded period doesn't need separate
+/// handling from its trailing one (`` e.g. `` trims to `e.g`, matching the
+/// `"e.g"` entry below). Surrounding punctuation (a leading `(`, say) isn't
+/// part of the token, only alphanumerics/periods are — otherwise a leading
+/// character swept in by a plain whitespace boundary (`` (e.g. ``) would
+/// never match. Not exhaustive, same bounded, curated-list tradeoff as
+/// [`PROSE_SLASH_WORDS`]: an abbreviation not in this list still incorrectly
+/// ends a clause early — a doc edit hitting that gap should spell the
+/// abbreviation out, or this list extended deliberately.
+const SENTENCE_BOUNDARY_ABBREVIATIONS: [&str; 3] = ["e.g", "i.e", "etc"];
+
+/// Whether `text` contains a period that ends a sentence *anywhere* within
+/// it — not just at its end, despite scanning one word at a time; the name
+/// says "contains", not "ends with", because callers scan one accumulated
+/// chunk of prose for any sentence boundary, not just a trailing one (see
+/// [`continues_possessive_clause`] for why that distinction matters here).
+///
+/// A period counts as sentence-ending only when followed by whitespace or
+/// nothing (the end of `text`) — one directly glued to the next character
+/// on both sides never does, which already excludes a version number like
+/// `v1.0` or a filename like `agent.rs` *unless* it sits at the very end of
+/// `text` (a file name right before a sentence-ending period, as in this
+/// module's own doc comments, correctly still counts). The remaining case a
+/// trailing-whitespace check alone can't tell apart from a real sentence end
+/// is an abbreviation like `` e.g. ``/`` i.e. ``/`` etc. `` — checked
+/// against [`SENTENCE_BOUNDARY_ABBREVIATIONS`].
+fn contains_a_sentence_boundary(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        if b != b'.'
+            || !bytes
+                .get(i + 1)
+                .is_none_or(|&next| next.is_ascii_whitespace())
+        {
+            return false;
+        }
+        // Walk back over the token this period ends — alphanumerics and
+        // embedded periods only (`e.g.`'s own internal `.`), so surrounding
+        // punctuation like a leading `(` isn't swept into the comparison
+        // below and doesn't need stripping on top of the trailing trim.
+        let mut word_start = i;
+        while word_start > 0 {
+            let prev = bytes[word_start - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'.' {
+                word_start -= 1;
+            } else {
+                break;
+            }
+        }
+        let word = &text[word_start..=i];
+        !SENTENCE_BOUNDARY_ABBREVIATIONS
+            .iter()
+            .any(|abbr| word.trim_end_matches('.').eq_ignore_ascii_case(abbr))
+    })
 }
 
 /// Extract every backtick-quoted path citation from the doc's markdown
@@ -266,9 +399,9 @@ fn is_directory_shaped(span: &str) -> bool {
 /// each independently make the same claim. A citation that instead names one
 /// specific crate from a multi-crate heading (`` `rocm-dash-tui`\'s
 /// `agent.rs` ``) is narrowed to just that crate via the possessive-connector
-/// check: `'s` starts a possessive clause, `/` and `and` continue one.
-/// Only `.rs` citations are narrowed this way; the logic lives inline in
-/// the `Event::Code` arm below.
+/// check: `'s` starts a possessive clause; [`continues_possessive_clause`]
+/// decides what continues one. Only `.rs` citations are narrowed this way;
+/// the logic lives inline in the `Event::Code` arm below.
 fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -282,14 +415,22 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     let mut narrowed_owners: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
 
-    // Inline context: what sits between one Code event and the next.
-    // Used to detect possessive connectors (\'s, /, and) for narrowing.
+    // Inline context: what sits between one Code event and the next. Only
+    // checked for an exact `'s` (the clause's owner-establishing step); any
+    // other content continues the clause via [`continues_possessive_clause`]
+    // regardless of what it is.
     let mut inter_text = String::new();
     // The last Code span that was a directory-shaped or scoped candidate —
     // may become a possessive owner for the next Code span.
     let mut last_code_span: Option<String> = None;
     // The active possessive owner within the current clause.
     let mut possessive_owner: Option<String> = None;
+    // Whether a sentence-ending `.` has occurred since `possessive_owner`
+    // was last (re)confirmed — tracked separately from `inter_text` because
+    // that buffer gets cleared by asides and pending hyphenated spans
+    // (see [`continues_possessive_clause`]), which must not also erase the
+    // memory of an already-seen sentence boundary.
+    let mut sentence_boundary_seen = false;
 
     // Accumulate heading directories until End(Heading) commits them.
     let mut heading_dirs: Vec<String> = Vec::new();
@@ -313,6 +454,7 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
             last_code_span = None;
             possessive_owner = None;
             pending_hyphenated = None;
+            sentence_boundary_seen = false;
         };
     }
 
@@ -362,8 +504,12 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                             section_dirs: effective_dirs.clone(),
                         });
                         possessive_owner = Some(hyph.clone());
+                        sentence_boundary_seen = false;
                     }
                     last_code_span = Some(hyph);
+                }
+                if contains_a_sentence_boundary(&text) {
+                    sentence_boundary_seen = true;
                 }
                 inter_text.push_str(&text);
             }
@@ -382,21 +528,40 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 }
 
                 if !is_path_candidate(span) {
-                    reset_inline!();
+                    // Unlike a block/heading/paragraph boundary, a stray
+                    // non-path span (a type name, an identifier) inside a
+                    // possessive clause's explanatory aside is transparent to
+                    // the chain, not a hard break: the active owner and
+                    // `sentence_boundary_seen` survive — see
+                    // `continues_possessive_clause`'s doc comment for why
+                    // this is still safe (and why `sentence_boundary_seen`
+                    // specifically must NOT be cleared here). But the
+                    // preceding prose AND `last_code_span` are both cleared:
+                    // the aside's own span (a type name, an identifier) must
+                    // not be mistaken for the possessive's owner by the next
+                    // citation's exact-`'s` check — `'s` takes its owner from
+                    // the span immediately before it, and that span is this
+                    // aside, not whatever code span preceded it.
+                    inter_text.clear();
+                    last_code_span = None;
                     continue;
                 }
 
                 // Hyphenated bare word: defer emission until we see whether
-                // the next text is 's (possessive) or not (prose).
+                // the next text is 's (possessive) or not (prose). Same
+                // transparency as the aside branch above:
+                // `sentence_boundary_seen` must survive this clear too.
                 if is_hyphenated_bare_word(span) {
                     pending_hyphenated = Some(span.to_string());
                     inter_text.clear();
                     continue;
                 }
 
-                // Resolve the possessive owner for this span — the three
-                // connectors the doc uses: 's starts a clause, / and `and`
-                // continue one.  Only scoped (.rs) citations are narrowed.
+                // Resolve the possessive owner for this span — the clause
+                // starts with 's, and continues through any text until a
+                // sentence boundary ends it (see
+                // `continues_possessive_clause`). Only scoped (.rs)
+                // citations are narrowed.
                 let trimmed = inter_text.trim();
                 let new_owner: Option<String> = if is_scoped_extension(span) {
                     if trimmed == "'s" {
@@ -404,7 +569,7 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                             .as_deref()
                             .filter(|s| is_directory_shaped(s))
                             .map(str::to_string)
-                    } else if matches!(trimmed, "/" | "and") {
+                    } else if continues_possessive_clause(sentence_boundary_seen) {
                         possessive_owner.clone()
                     } else {
                         None
@@ -440,6 +605,7 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 possessive_owner = new_owner;
                 last_code_span = Some(span.to_string());
                 inter_text.clear();
+                sentence_boundary_seen = false;
             }
             _ => {}
         }
@@ -727,6 +893,50 @@ mod tests {
     }
 
     #[test]
+    fn slash_joined_prose_pairs_are_not_candidates() {
+        // #440 regression: `is_path_candidate` used to accept any
+        // slash-containing span unconditionally, so a future doc edit using
+        // one of these common shorthand pairs would false-fail CI (none
+        // exist in the tracked tree, so none would resolve to a real path).
+        for span in ["read/write", "and/or", "GPU/CPU"] {
+            assert!(
+                !is_path_candidate(span),
+                "did not expect {span} to be a candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_path_with_only_one_prose_side_is_still_a_candidate() {
+        // The guard only rejects a span where *every* segment is a known
+        // prose word — a real path like `docs/and` has one
+        // `PROSE_SLASH_WORDS` segment (`and`) but its other segment
+        // (`docs`) is not, so it must still be checked. (`apps/rocm`
+        // doesn't actually exercise this: neither `apps` nor `rocm` is a
+        // `PROSE_SLASH_WORDS` entry, so the check can't tell `all` from
+        // `any` on that input — it passes either way.)
+        assert!(is_path_candidate("docs/and"));
+    }
+
+    #[test]
+    fn slash_joined_prose_pairs_are_not_directory_shaped() {
+        // Regression: `is_directory_shaped` wasn't updated alongside
+        // `is_path_candidate`'s #440 fix, so a heading backtick-citing a
+        // prose slash-phrase would still be collected into `heading_dirs`
+        // even though the same span is rejected as a citation elsewhere —
+        // an undocumented inconsistency between the two checks.
+        for span in ["read/write", "and/or", "GPU/CPU"] {
+            assert!(
+                !is_directory_shaped(span),
+                "did not expect {span} to be directory-shaped"
+            );
+        }
+        // A real path with only one ordinary-word segment must stay
+        // directory-shaped, same carve-out as `is_path_candidate`.
+        assert!(is_directory_shaped("apps/rocm"));
+    }
+
+    #[test]
     fn bare_non_hyphenated_word_is_not_a_candidate() {
         // The documented blind spot: `xtask` is a real directory cited bare
         // in the doc, but is lexically identical in shape to a plain word
@@ -735,6 +945,17 @@ mod tests {
         // false-flagging prose.
         assert!(!is_path_candidate("xtask"));
         assert!(!is_path_candidate("grep"));
+    }
+
+    #[test]
+    fn contains_a_sentence_boundary_detects_a_period_at_the_very_end_of_text() {
+        // The doc comment explicitly claims this case ("a file name right
+        // before a sentence-ending period ... correctly still counts"), but
+        // nothing exercised it directly: every other sentence-boundary test
+        // runs through `extract_path_citations`, where a trailing period is
+        // always followed by more markdown text, never the end of the
+        // scanned chunk itself.
+        assert!(contains_a_sentence_boundary("done."));
     }
 
     #[test]
@@ -1213,6 +1434,233 @@ Every listed crate's `mod.rs` is a placeholder example, not real doc prose.
         assert_eq!(
             agent_citation.section_dirs,
             vec!["crates/rocm-dash-tui".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_keeps_an_owner_through_an_unrelated_aside() {
+        // Regression: the real doc's `rocm-dash-tui` paragraph interleaves
+        // type names (`AgentClient`, `rig`) between the files a possessive
+        // clause names — each one a non-path Code span that used to fully
+        // reset the chain (`reset_inline!()`), losing the owner for every
+        // citation after the first. The aside must be transparent instead.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs` (the `AgentClient` seam) and `agent/snapshot.rs` (no `rig` dependency).
+";
+        let citations = extract_path_citations(markdown);
+        for text in ["agent/mod.rs", "agent/snapshot.rs"] {
+            let citation = citations
+                .iter()
+                .find(|c| c.text == text)
+                .unwrap_or_else(|| panic!("expected a {text} citation"));
+            assert_eq!(
+                citation.section_dirs,
+                vec!["rocm-dash-tui".to_string()],
+                "{text} should stay narrowed to rocm-dash-tui through the aside"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_path_citations_narrows_a_natural_comma_and_list() {
+        // Regression: a contributor listing split files the way ordinary
+        // English lists things ("X, Y, Z, and W") rather than joining them
+        // with literal slashes must not lose narrowing on the middle items —
+        // only the last pair uses the word `and`; the rest are plain commas.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs`, `agent/snapshot.rs`, `agent/tools.rs`, and `agent/clients.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        for text in [
+            "agent/mod.rs",
+            "agent/snapshot.rs",
+            "agent/tools.rs",
+            "agent/clients.rs",
+        ] {
+            let citation = citations
+                .iter()
+                .find(|c| c.text == text)
+                .unwrap_or_else(|| panic!("expected a {text} citation"));
+            assert_eq!(
+                citation.section_dirs,
+                vec!["rocm-dash-tui".to_string()],
+                "{text} should be narrowed to rocm-dash-tui via the comma list"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_leak_an_owner_across_a_sentence_boundary() {
+        // The relaxations above must not regress into the rejected "sticky
+        // for the rest of the heading" design: a new sentence naming a file
+        // that belongs to a *different* crate the heading also lists, with
+        // no possessive clause of its own, must NOT inherit the previous
+        // sentence's owner — it should fall back to the heading's full
+        // (and correctly checked) crate list instead.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs` and `agent/snapshot.rs`. Elsewhere, `metrics.rs` tracks collector throughput.
+";
+        let citations = extract_path_citations(markdown);
+        let metrics_citation = citations
+            .iter()
+            .find(|c| c.text == "metrics.rs")
+            .expect("expected a metrics.rs citation");
+        assert_eq!(
+            metrics_citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-collectors".to_string(),
+                "rocm-dash-daemon".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "metrics.rs must not inherit rocm-dash-tui from the earlier sentence"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_leak_an_owner_past_a_sentence_boundary_hidden_by_an_aside() {
+        // Regression: `inter_text.clear()` in the non-candidate aside branch
+        // used to discard a sentence-ending `.` before `continues_possessive_
+        // clause` ever saw it, so a period immediately followed by an aside
+        // Code span (a type name) went unnoticed — the clause wrongly kept
+        // "continuing" past the sentence boundary into the next citation.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` is done. `AgentClient` tracks `metrics.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let metrics_citation = citations
+            .iter()
+            .find(|c| c.text == "metrics.rs")
+            .expect("expected a metrics.rs citation");
+        assert_eq!(
+            metrics_citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-collectors".to_string(),
+                "rocm-dash-daemon".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "metrics.rs must not inherit rocm-dash-tui through the aside, \
+             since a sentence already ended before it"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_takes_the_owner_from_the_span_right_before_s_not_a_stale_one() {
+        // Regression: the aside branch used to clear only `inter_text`,
+        // leaving `last_code_span` pointing at whatever directory-shaped
+        // span preceded the aside. When `'s` directly follows a non-path
+        // aside (a type name), the checker's own rule — `'s` takes its
+        // owner from the span right before it — means the possessive
+        // belongs to the aside itself (not a path), so there is no valid
+        // owner; it must fall back to the heading's full crate list, not
+        // silently narrow to that stale, unrelated directory.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui` wraps `AgentClient`'s `lib.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "lib.rs")
+            .expect("expected a lib.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "lib.rs must not narrow to rocm-dash-tui — the possessive belongs \
+             to AgentClient, not the stale last code span"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_narrow_through_a_slash_qualified_owner_hidden_by_an_aside() {
+        // Second reproduction of the same regression, with a slash-qualified
+        // directory one `and` away from the aside instead of a bare
+        // hyphenated name — the stale `last_code_span` must not survive
+        // either shape of owner.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-tui` — dashboard/telemetry
+
+`crates/rocm-dash-core` and `Foo`'s `x.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "x.rs")
+            .expect("expected an x.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "x.rs must not narrow to crates/rocm-dash-core — the possessive \
+             belongs to Foo, not the stale last code span"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_narrows_a_hyphenated_owner_that_starts_after_an_earlier_sentence() {
+        // Regression: resolving a pending hyphenated span into a confirmed
+        // possessive owner has its own `sentence_boundary_seen = false`
+        // reset, separate from `reset_inline!()` — it must fire every time
+        // an owner is (re)confirmed, including when that owner's clause
+        // starts right after an earlier sentence in the same paragraph.
+        // Without it, the earlier sentence's boundary would still be
+        // asserted against the brand new clause, failing its very first
+        // continuation check and falling back to the heading's full list.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-tui` — dashboard/telemetry
+
+Intro. `rocm-dash-tui`'s old thing was split into `agent/mod.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "agent/mod.rs")
+            .expect("expected an agent/mod.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec!["rocm-dash-tui".to_string()],
+            "agent/mod.rs should narrow to rocm-dash-tui even though an \
+             earlier sentence in the same paragraph already ended"
+        );
+    }
+
+    #[test]
+    fn an_abbreviation_does_not_end_a_possessive_clause() {
+        // Regression: `e.g.`/`i.e.`/`etc.` each end in a period followed by
+        // whitespace, matching the plain "sentence boundary" pattern even
+        // though they don't end a sentence — and the real doc already uses
+        // `e.g.` nearby (the module's own intro paragraph). Without the
+        // abbreviation guard, this would wrongly fall back `agent/mod.rs`
+        // to the heading's full crate list instead of narrowing it.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split (e.g. via mechanical relocation) into `agent/mod.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "agent/mod.rs")
+            .expect("expected an agent/mod.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec!["rocm-dash-tui".to_string()],
+            "agent/mod.rs should stay narrowed to rocm-dash-tui through the e.g. abbreviation"
         );
     }
 
