@@ -731,6 +731,129 @@ fn the_apu_verdict_holds_on_both_sides_of_the_rocminfo_isa_name_defect() {
     }
 }
 
+/// Reading `rocminfo` may only ever improve the report, never worsen it.
+///
+/// The two parser shapes of
+/// [`the_apu_verdict_holds_on_both_sides_of_the_rocminfo_isa_name_defect`] agree
+/// about Raphael because the PCI name already resolves it, so that test alone
+/// cannot show the fold doing anything. These two hosts separate the cases:
+///
+/// - a Strix Halo whose `lspci` entry has no `pci.ids` name, so the PCI scan
+///   contributes nothing and only the agent can supply the target: the fold
+///   must *add* the APU verdict once the agent is readable;
+/// - an iGPU whose agent reports a target this crate has never heard of: the
+///   fold knows the target but not its packaging, which is not evidence of a
+///   discrete GPU, so the PCI scan's verdict has to survive untouched.
+#[test]
+fn folding_in_rocminfo_only_ever_adds_knowledge() {
+    let host = |lspci_name: &str, agent_target: &str, with_isa: bool| {
+        let name = format!("Advanced Micro Devices, Inc. [AMD/ATI] {lspci_name}");
+        let (gfx_target, is_apu) = classify_amd_marketing_name(&name);
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name,
+                gfx_target,
+                pci_id: "0000:66:00.0".to_owned(),
+                is_apu: Some(is_apu),
+                is_amd: true,
+            }],
+            ..Examination::default()
+        };
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            &rocminfo_output_shaped(&[(agent_target, "AMD Radeon Graphics")], with_isa),
+        );
+        summarise_gpu_categories(&mut e);
+        e
+    };
+
+    // A nameless Strix Halo: nothing is known before the fold.
+    let before = host("Device", "gfx1151", true);
+    assert_eq!(before.gpus[0].gfx_target, "", "{:?}", before.gpus);
+    assert!(!before.has_apu, "{:?}", before.gpus);
+    // Once the agent is readable the fold supplies both the target and the
+    // packaging that follows from it.
+    let after = host("Device", "gfx1151", false);
+    assert_eq!(after.gpus[0].gfx_target, "gfx1151", "{:?}", after.gpus);
+    assert!(
+        after.has_apu,
+        "a readable gfx1151 agent must establish the APU verdict the PCI scan \
+         could not reach: {:?}",
+        after.gpus
+    );
+
+    // A Rembrandt laptop whose agent names a target this crate has no packaging
+    // entry for. The target is still worth recording; the verdict is not the
+    // fold's to revise.
+    let unknown = host("Rembrandt [Radeon 680M]", "gfx1154", false);
+    assert_eq!(unknown.gpus[0].gfx_target, "gfx1154", "{:?}", unknown.gpus);
+    assert!(
+        unknown.has_apu,
+        "an unrecognised target is not evidence of a discrete GPU, so the PCI \
+         scan's APU verdict must survive: {:?}",
+        unknown.gpus
+    );
+    assert!(
+        !unknown.has_discrete_amd,
+        "and it must certainly not be promoted to a discrete GPU: {:?}",
+        unknown.gpus
+    );
+}
+
+/// The same rule where there is no PCI row at all: an ordinary ROCm container,
+/// which ships `rocminfo` but not `pciutils`.
+///
+/// Every agent then lands in the branch that *creates* a GPU entry, so there is
+/// no earlier verdict to preserve — but there is still evidence, and still a
+/// difference between "not an APU" and "cannot say". Defaulting the latter to
+/// `Some(false)` reports a discrete AMD GPU on a laptop that has none, which is
+/// what gates the iGPU+dGPU diagnosis on, and it throws away the agent's own
+/// marketing name while doing it. [`super::probe_gpus_sysfs_fallback`] reaches
+/// the same conclusion for the same reason and leaves `is_apu` unset.
+#[test]
+fn an_agent_with_no_pci_row_is_classified_from_what_evidence_there_is() {
+    let container = |agent_target: &str, marketing: &str| {
+        let mut e = Examination::default();
+        apply_rocminfo_gpu_agents(&mut e, &rocminfo_output(&[(agent_target, marketing)]));
+        summarise_gpu_categories(&mut e);
+        e
+    };
+
+    // The target is enough on its own.
+    let known = container("gfx1036", "AMD Radeon Graphics");
+    assert_eq!(known.gpus[0].is_apu, Some(true), "{:?}", known.gpus);
+    assert!(!known.has_discrete_amd, "{:?}", known.gpus);
+
+    // An unlisted target, but the agent names the part: the name answers.
+    let named = container("gfx1154", "AMD Radeon(TM) 780M Graphics");
+    assert_eq!(named.gpus[0].is_apu, Some(true), "{:?}", named.gpus);
+    assert!(
+        !named.has_discrete_amd,
+        "an iGPU-only laptop must not report a discrete AMD GPU just because \
+         its target is new: {:?}",
+        named.gpus
+    );
+
+    // Neither answers. Saying "discrete" here would be inventing a fact.
+    let silent = container("gfx1154", "");
+    assert_eq!(silent.gpus[0].is_apu, None, "{:?}", silent.gpus);
+    assert!(
+        !silent.has_apu && !silent.has_discrete_amd,
+        "{:?}",
+        silent.gpus
+    );
+    assert!(
+        silent.has_amd_gpu,
+        "the GPU is still present and still AMD: {:?}",
+        silent.gpus
+    );
+
+    // A discrete card still reports as one.
+    let discrete = container("gfx1100", "AMD Radeon RX 7900 XTX");
+    assert_eq!(discrete.gpus[0].is_apu, Some(false), "{:?}", discrete.gpus);
+    assert!(discrete.has_discrete_amd, "{:?}", discrete.gpus);
+}
+
 /// Every gfx target the crate's two lookup tables can hand back must have a
 /// packaging entry.
 ///

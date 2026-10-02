@@ -1327,9 +1327,37 @@ fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
             if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
                 gpu.name = marketing;
             }
-            gpu.is_apu = Some(gfx_is_apu_family(&gfx));
+            // The target names the silicon, so where this crate knows how that
+            // target is packaged it outranks the PCI marketing string, which is
+            // a guess over vendor-chosen text. A target it does *not* know is
+            // not evidence of a discrete GPU, so it leaves the PCI scan's
+            // verdict standing rather than replacing it with a default `false`:
+            // reading `rocminfo` must not make the answer worse than not
+            // reading it. Before this, folding in `rocminfo` turned every
+            // APU whose target was unlisted — which was every pre-RDNA3 APU —
+            // into a discrete GPU, clearing `has_apu` and silently suppressing
+            // the iGPU+dGPU collision diagnosis on the one host shape it is
+            // written for.
+            if let Some(packaging) = gfx_target_packaging(&gfx) {
+                gpu.is_apu = Some(packaging == GfxPackaging::Integrated);
+            }
         } else {
-            let is_apu = Some(gfx_is_apu_family(&gfx));
+            // An agent with no PCI row to pair with: the ordinary ROCm
+            // container, where `rocminfo` is present and `pciutils` is not.
+            // Same precedence as above, applied to the evidence that exists
+            // here — the target when its packaging is known, else the agent's
+            // own marketing name when that resolves a part. When neither
+            // answers, `is_apu` stays unset rather than defaulting to `false`:
+            // `summarise_gpu_categories` reads `Some(false)` as "this is a
+            // discrete GPU", so guessing it would report a discrete card on an
+            // iGPU-only laptop. That is the same reasoning, and the same
+            // answer, as [`probe_gpus_sysfs_fallback`].
+            let is_apu = gfx_target_packaging(&gfx)
+                .map(|packaging| packaging == GfxPackaging::Integrated)
+                .or_else(|| {
+                    let (named_target, named_is_apu) = classify_amd_marketing_name(&marketing);
+                    (!named_target.is_empty()).then_some(named_is_apu)
+                });
             e.gpus.push(Gpu {
                 name: if marketing.is_empty() {
                     "AMD GPU".to_owned()
@@ -2438,7 +2466,12 @@ fn probe_hip_sdk_windows(e: &mut Examination) {
                         .find(|g| g.is_amd && g.gfx_target.is_empty())
                 {
                     gpu.gfx_target = gfx;
-                    gpu.is_apu = Some(gfx_is_apu_family(&gpu.gfx_target));
+                    // Same rule as `apply_rocminfo_gpu_agents`: a target whose
+                    // packaging this crate knows outranks the display name, an
+                    // unknown one leaves that verdict alone.
+                    if let Some(packaging) = gfx_target_packaging(&gpu.gfx_target) {
+                        gpu.is_apu = Some(packaging == GfxPackaging::Integrated);
+                    }
                 }
             }
         } else {
