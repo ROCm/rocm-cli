@@ -1399,7 +1399,7 @@ fn runtime_freshness(
     required_composition: Option<&WheelRuntimeComposition>,
     target_runtime_key: &str,
 ) -> RuntimeFreshness {
-    let Some(relation) = actionable_version_relation(&manifest.version, latest_version) else {
+    let Some(relation) = version_relation(&manifest.version, latest_version) else {
         return RuntimeFreshness::AheadOfIndex;
     };
     match relation {
@@ -1417,30 +1417,38 @@ fn runtime_freshness(
     }
 }
 
-/// How `installed` relates to `latest`, but only when the answer is one the
-/// caller may act on.
+/// How two versions relate *as versions*, for the callers asking "is this a
+/// different build?" rather than "where does this sort?".
 ///
-/// [`compare_version_strings`] is a *total* order over strings, which is what
-/// sorting needs: it gives every string a position, including one it cannot
-/// read. Deciding whether to replace an installed runtime needs more than a
-/// position — it needs both sides to be identifiable as versions. An
-/// unreadable string sorts below everything readable, and for the "newest
-/// candidate" pickers that is the safe end; here the unreadable string is the
-/// *installed* version, so the same rule would read as "older than the index"
-/// and offer an install that could be a downgrade. A runtime adopted from an
-/// existing environment carries whatever its probe reported, so this is
-/// reachable without any index being odd.
+/// Those are not the same question, and [`compare_version_strings`] only
+/// answers the second. It is a total order over *strings*, which is what
+/// sorting needs, and it gets there two ways this caller must not inherit:
 ///
-/// Identical strings are equal whatever they spell, which keeps the
+/// * Its last tiebreak is the raw string, so two spellings of one version sort
+///   apart. `7.0.0-rc1` and `7.0.0rc1` are the same version — that is why the
+///   parser accepts both — but they are different strings. Treating that as a
+///   difference offers an update that re-downloads the runtime already
+///   installed. PyPI normalises versions, so an index can serve one spelling
+///   while an older manifest recorded the other.
+/// * A string it cannot read sorts below everything readable. That is the safe
+///   end for the "newest candidate" pickers, which take a maximum, and the
+///   wrong end here, where the unreadable string is the *installed* version and
+///   "lowest" reads as "older than the index" — an offer that could be a
+///   downgrade. A runtime adopted from an existing environment carries whatever
+///   its probe reported, so this is reachable without any index being odd.
+///
+/// So: compare the parsed keys, which are equal exactly when the two strings
+/// denote one version, and return `None` when either side cannot be identified
+/// at all. Byte-identical strings short-circuit, which keeps the
 /// repair/up-to-date path working for a runtime whose version this tool cannot
 /// parse but which plainly matches what the index offers.
-fn actionable_version_relation(installed: &str, latest: &str) -> Option<Ordering> {
-    if installed == latest {
+fn version_relation(left: &str, right: &str) -> Option<Ordering> {
+    if left == right {
         return Some(Ordering::Equal);
     }
-    parse_version_for_ordering(installed)?;
-    parse_version_for_ordering(latest)?;
-    Some(compare_version_strings(installed, latest))
+    let left_key = parse_version_for_ordering(left)?;
+    let right_key = parse_version_for_ordering(right)?;
+    Some(left_key.cmp(&right_key))
 }
 
 fn runtime_freshness_with_manifests(
@@ -2577,7 +2585,13 @@ fn active_default_relation_text(
     resolved_version: &str,
 ) -> String {
     if active.family == family && active.channel == channel.as_str() {
-        let relation = match compare_version_strings(resolved_version, &active.version) {
+        // "reinstall" is a claim about versions, not strings: `7.0.0-rc1` and
+        // `7.0.0rc1` are one version and must not read as an upgrade. When
+        // neither can be identified there is no better word available here, so
+        // the total order still decides rather than inventing a fourth one.
+        let relation = match version_relation(resolved_version, &active.version)
+            .unwrap_or_else(|| compare_version_strings(resolved_version, &active.version))
+        {
             Ordering::Greater => "upgrade",
             Ordering::Less => "downgrade",
             Ordering::Equal => "reinstall",
@@ -2665,10 +2679,15 @@ fn repo_version_without_wheels(
     resolved_version: &str,
 ) -> Option<String> {
     let newest = newest_repo?;
-    match compare_version_strings(newest, resolved_version) {
-        Ordering::Greater => Some(newest.to_owned()),
-        _ => None,
-    }
+    // "Is there a genuinely newer version?", not "which string sorts higher?".
+    // Two spellings of one version would otherwise produce a warning naming the
+    // same version on both sides of "installing X instead", and a pair this
+    // tool cannot identify would produce one it cannot justify.
+    matches!(
+        version_relation(newest, resolved_version),
+        Some(Ordering::Greater)
+    )
+    .then(|| newest.to_owned())
 }
 
 /// Where an already-granted approval for displacing the active default came
@@ -6285,12 +6304,15 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
 /// unreadable, rather than beating a real release by being lexicographically
 /// longer. It would cut the *other* way for [`runtime_freshness`], where the
 /// unreadable string is the installed version and "lowest" would read as "older
-/// than the index" — an offer that could be a downgrade. That caller therefore
-/// does not use this order to decide; see [`actionable_version_relation`].
+/// than the index" — an offer that could be a downgrade.
 ///
-/// Versions that are numerically equal but textually different (`7.9` and
-/// `7.9.0`, `7.9.0` and `7.9.0+local`) are separated by the string, so no two
-/// distinct strings compare `Equal` and `sort_by` is deterministic.
+/// Versions that are equal but textually different (`7.9` and `7.9.0`,
+/// `7.0.0-rc1` and `7.0.0rc1`, `7.9.0` and `7.9.0+local`) are separated by the
+/// raw string, so no two distinct strings compare `Equal` and `sort_by` is
+/// deterministic. That tiebreak is right for sorting and wrong for deciding
+/// whether a build is new: a caller asking "is there a newer runtime?" must use
+/// [`version_relation`], which compares the parsed keys, so that a spelling
+/// difference is not mistaken for an update.
 ///
 /// This replaces an implementation that compared numerically only when *both*
 /// sides matched [`parse_version`]'s grammar and fell back to a byte-wise
@@ -6340,6 +6362,13 @@ fn compare_version_strings(left: &str, right: &str) -> Ordering {
 ///   disagreement about one string, which is the defect this shared parser
 ///   exists to remove; leaving it unreadable keeps them consistent and costs
 ///   only a defined position.
+///
+///   What makes the two sides agree is that [`parse_host_version`] strips a
+///   `-` suffix only when it is *numeric*. A host `7.2.4-98` is reduced to
+///   `7.2.4` before it reaches here, so this function never sees that shape
+///   from the host; and `7.0.0-rc1` is left intact, so both sides read it as a
+///   release candidate. Widening either side of that rule re-opens the
+///   disagreement.
 ///
 /// Local version metadata is dropped rather than ordered, so `7.9.0+local` and
 /// `7.9.0` produce the same key and [`compare_version_strings`] separates them
