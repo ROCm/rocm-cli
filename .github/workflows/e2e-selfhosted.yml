@@ -1073,6 +1073,12 @@ jobs:
       # Every command is best-effort — this is a hazard to reduce, not a
       # precondition to enforce, and a lane that cannot settle its clock should
       # still run and fail with a real diagnosis.
+      #
+      # nightly.yml's `e2e-wsl-nightly` carries a copy of this step, kept in sync
+      # by hand until the lanes are deduplicated (#294);
+      # `both_wsl_lanes_settle_the_clock_before_running_the_suite` in
+      # xtask/src/workflow_contract.rs fails if either copy goes missing, moves
+      # after the suite, or drifts from the other.
       - name: Settle the clock before anything times a scenario
         shell: powershell
         run: |
