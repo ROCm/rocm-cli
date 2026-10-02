@@ -202,7 +202,7 @@ fn mount_owns_path(path: &Path, mount_point: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-const fn mount_owns_path(_path: &Path, _mount_point: &Path) -> bool {
+fn mount_owns_path(_path: &Path, _mount_point: &Path) -> bool {
     true
 }
 
