@@ -848,7 +848,14 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Remove amdgpu from any modprobe blacklist and load it.".to_owned(),
         commands,
         needs_sudo: true,
-        needs_reboot: !blacklisted.is_empty(),
+        // Catalog-aligned, not state-derived: fix.rs's FixRecipe for this fix-id sets
+        // needs_reboot unconditionally. On this no-blacklist path the plan is just
+        // `modprobe amdgpu` (or that plus a Secure Boot signing note, whose own
+        // remedy can require a reboot) -- diagnose conforms to the catalog rather
+        // than the reverse (see fix.rs's assert_needs_reboot_matches_the_catalog) so
+        // `rocm diagnose` and `rocm fix` never disagree; over-warning is limited to
+        // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
+        needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
         auto_applicable: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5".to_owned(),
@@ -3303,6 +3310,56 @@ mod tests {
             "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
             "rendered flags: line for fix-11-iommu: {flags_line}"
         );
+    }
+
+    fn assert_fix_5_needs_reboot(e: &Examination) {
+        let report = diagnose(e, "");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-5-amdgpu-load")
+            .expect("amdgpu-not-loaded should be diagnosed");
+        let fix = hit.fix.as_ref().unwrap();
+        crate::fix::assert_needs_reboot_matches_the_catalog("fix-5-amdgpu-load", fix.needs_reboot);
+
+        let text = render_report_text(&report, report.matched.len());
+        let lines: Vec<&str> = text.lines().collect();
+        let id_line = lines
+            .iter()
+            .position(|l| l.trim_start() == "id: fix-5-amdgpu-load")
+            .expect("fix-5-amdgpu-load should appear in the rendered report");
+        let flags_line = lines[id_line..]
+            .iter()
+            .find(|l| l.trim_start().starts_with("flags:"))
+            .expect("fix-5-amdgpu-load should have a flags: line");
+        assert_eq!(
+            flags_line.trim_start(),
+            "flags: requires sudo, requires reboot, manual only (`rocm fix` will NOT run it automatically)",
+            "rendered flags: line for fix-5-amdgpu-load: {flags_line}"
+        );
+    }
+
+    #[test]
+    fn fix_5_amdgpu_load_needs_reboot_matches_catalog_when_blacklisted() {
+        let mut e = linux_base();
+        e.amdgpu_loaded = Some(false);
+        e.amdgpu_blacklisted_in = vec!["/etc/modprobe.d/blacklist.conf".to_owned()];
+        assert_fix_5_needs_reboot(&e);
+    }
+
+    #[test]
+    fn fix_5_amdgpu_load_needs_reboot_matches_catalog_when_not_blacklisted() {
+        // `check_5_amdgpu_blacklisted` used to compute `needs_reboot` as
+        // `!blacklisted.is_empty()`, so this case (module simply not loaded,
+        // no blacklist entry involved) used to report `false` here while the
+        // `fix-5-amdgpu-load` FixRecipe catalog said `true` unconditionally --
+        // the drift issue #418 fixed. Pin the now-unconditional `true` so a
+        // regression back to the conditional fails here rather than only
+        // being visible by eyeballing `rocm diagnose` vs `rocm fix` output.
+        let mut e = linux_base();
+        e.amdgpu_loaded = Some(false);
+        assert!(e.amdgpu_blacklisted_in.is_empty());
+        assert_fix_5_needs_reboot(&e);
     }
 
     #[test]

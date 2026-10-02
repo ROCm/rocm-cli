@@ -263,6 +263,19 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
 
+  # A managed serve that fails leaves its record on disk, and the default
+  # `rocm services list` hides it because it is not live. The header then read
+  # "none ready", the list was empty, and nothing on screen said a record
+  # existed or how to read its log - so a user whose serve failed saw the same
+  # screen as a user who had never served at all. The default view now counts
+  # what it hides and names the two commands that reach it. No GPU and no real
+  # serve: the record is planted, so this runs on every lane.
+  @id:serve-past-attempts-surfaced
+  Scenario: serve-22 - A failed local server is counted in the default list
+    Given a local server attempt has failed
+    When the user lists running services
+    Then the list reports the attempt and how to look at it
+
   # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
   # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
   # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
@@ -276,7 +289,7 @@ Feature: Model serving
   # runtime is active — hence the same `a managed runtime is active` precondition
   # every other real-serve scenario on this lane opens with.
   @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
-  Scenario: serve-22 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+  Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
     Given a managed runtime is active
     And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU

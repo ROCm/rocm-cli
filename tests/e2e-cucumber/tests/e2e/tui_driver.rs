@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
+use e2e_cucumber::paced_download::is_intermediate_download_progress_frame;
 use e2e_cucumber::panic_capture::panic_message;
 use e2e_cucumber::reader_failure::{ReaderFailure, ReaderFailureObservation};
 use e2e_cucumber::send_until::{RetryTiming, TerminalState, send_until as retry_send_until};
@@ -375,6 +376,22 @@ impl TuiSession {
         self.reader_failure.take_message()
     }
 
+    /// Like [`Self::use_detail_size`], but keeps the standard 80-column width
+    /// and only grows the row count.
+    ///
+    /// For a journey whose later output (e.g. a multi-line install summary)
+    /// would otherwise scroll an earlier row off the visible 24-row screen
+    /// before an assertion can read it — with no scrollback (`vt100::Parser`
+    /// is constructed with 0 lines of it), a scrolled-off row reads as absent
+    /// whether or not it was ever actually cleared, silently turning a
+    /// negative assertion (e.g. "this spinner line is gone") into a
+    /// tautology. Widening to `DETAIL_COLS` would also change how much of a
+    /// long label fits before truncation, which is exactly what some of
+    /// these journeys are testing — so only rows grow here.
+    pub fn grow_rows(&mut self, rows: u16) -> Result<(), String> {
+        self.resize_to(rows, COLS)
+    }
+
     /// Resize both the real PTY and the emulated screen to `rows`x`cols`. The
     /// application receives the normal terminal resize event; assertions
     /// continue to inspect exactly what a user would see at the new geometry.
@@ -543,34 +560,21 @@ impl TuiSession {
     /// [`wait_for_screen`](Self::wait_for_screen). Use this after a keystroke
     /// that should dismiss an overlay whose absence is the only signal of
     /// success (there is no positive marker for "menu didn't open").
+    ///
+    /// Only meaningful once the marker has been seen on screen: an absence is
+    /// trivially true of a marker that never appeared, so the caller must have
+    /// asserted its presence first. A child that exits first is a failure
+    /// rather than a success - the final frame a dead process leaves behind
+    /// would satisfy any absence, which is why
+    /// [`wait_for_screen_where`](Self::wait_for_screen_where) — the loop this
+    /// spells a common case of — checks the child before the screen.
     pub async fn wait_until_gone(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if !self.screen_text().contains(marker) {
-                return Ok(());
-            }
-            if let Some(panic_message) = self.take_reader_panic() {
-                return Err(format!(
-                    "pty reader thread panicked while waiting for {marker:?} to disappear: {panic_message}\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.finished = true;
-                self.record_once(i32::try_from(status.exit_code()).unwrap_or(-1));
-                return Err(format!(
-                    "process exited ({status:?}) before {marker:?} disappeared.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out after {timeout:?} waiting for {marker:?} to disappear.\n{}",
-                    self.framed_screen()
-                ));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
+        self.wait_for_screen_where(
+            &format!("{marker:?} leaves the screen"),
+            |screen| !screen.contains(marker),
+            timeout,
+        )
+        .await
     }
 
     /// Poll the current screen until `is_ready` accepts it, with the same
@@ -579,9 +583,31 @@ impl TuiSession {
     /// rather than as a timeout against the frozen last screen.
     ///
     /// The general form of `wait_for_screen`, for evidence a frame is current
-    /// that is not "it contains this string" — a cleared table cell, or a
-    /// marker the frame stopped showing. `describe` names the condition being
-    /// waited on and is quoted in every diagnostic.
+    /// that is not "it contains this string" — a table cell that changed or
+    /// cleared, or a marker the frame stopped showing. `describe` names the
+    /// condition being waited on and is quoted in every diagnostic.
+    ///
+    /// Unlike `wait_for_screen`, the liveness checks run *before* the predicate,
+    /// and deliberately so. The order is only observable on a poll where one of
+    /// them fires — the child has exited, or the reader thread has panicked —
+    /// and there that check returns before the predicate is ever consulted, so
+    /// the only outcome the ordering can change is a would-be success into a
+    /// named "process exited" or reader-panic error, never the reverse. That
+    /// direction is the safe one whatever shape the predicate has,
+    /// and it is the necessary one for the conditions this form mostly
+    /// expresses — an absence, or a cleared cell, is satisfied by accident by
+    /// the near-empty frame a dead process leaves behind, so a predicate checked
+    /// first would report a crash as success.
+    ///
+    /// The cost falls on predicates that require something to be *present*
+    /// (a cell that must still be rendered, only with a different value): if
+    /// such a condition first holds in the frame the child left behind, this
+    /// reports the exit instead. The positive form can afford the opposite
+    /// order — and drains the final frame after `try_wait`, via
+    /// [`drain_final_frame`](Self::drain_final_frame) — because a marker
+    /// that appeared as the child exited did genuinely appear. Here that
+    /// recovery is given up on purpose: a diagnosed exit is worth more than a
+    /// condition that only ever held in a dying process's last frame.
     pub async fn wait_for_screen_where(
         &mut self,
         describe: &str,
@@ -590,9 +616,6 @@ impl TuiSession {
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if is_ready(&self.screen_text()) {
-                return Ok(());
-            }
             if let Some(panic_message) = self.take_reader_panic() {
                 return Err(format!(
                     "pty reader thread panicked while waiting until {describe}: {panic_message}\n{}",
@@ -606,6 +629,9 @@ impl TuiSession {
                     "process exited ({status:?}) before {describe}.\n{}",
                     self.framed_screen()
                 ));
+            }
+            if is_ready(&self.screen_text()) {
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
@@ -694,6 +720,36 @@ impl TuiSession {
                 self.framed_screen()
             )),
         }
+    }
+
+    /// Waits for an intermediate (neither 0% nor 100%) download progress
+    /// frame, panicking with `context` on timeout. Shared by every PTY
+    /// scenario asserting a download spinner shows real progress (currently
+    /// the tarball and ComfyUI download journeys) — kept here rather than
+    /// duplicated per step file.
+    pub async fn assert_intermediate_download_progress_frame(
+        &mut self,
+        context: &str,
+        timeout: Duration,
+    ) {
+        self.wait_for_screen_where(
+            "an intermediate (neither 0% nor 100%) download progress frame",
+            is_intermediate_download_progress_frame,
+            timeout,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("intermediate download progress frame never appeared for {context}: {e}")
+        });
+    }
+
+    /// Like [`wait_for_exit`](Self::wait_for_exit), but panics with `context`
+    /// instead of returning a `Result` — the common case for every PTY
+    /// scenario's "install exits cleanly" step.
+    pub async fn assert_exits_cleanly(&mut self, context: &str, timeout: Duration) {
+        self.wait_for_exit(timeout)
+            .await
+            .unwrap_or_else(|e| panic!("{context} did not exit cleanly: {e}"));
     }
 
     /// Poll until the child exits, asserting a *non-zero* exit code — the fail-

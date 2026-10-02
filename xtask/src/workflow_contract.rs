@@ -99,7 +99,9 @@ mod tests {
 
     /// Split a flattened YAML sequence into its items. Handles the flow form
     /// (`[a, b]`) and the block form, which [`flattened_values`] joins into
-    /// `- a - b`, so the two spellings compare equal.
+    /// `- a - b`, so the two spellings compare equal. Surrounding quotes are
+    /// stripped from each item too, so `release/**` and `"release/**"` — both
+    /// valid, semantically identical YAML — also compare equal.
     fn flattened_list_items(value: &str) -> Vec<String> {
         let value = value.trim();
         let items: Vec<String> =
@@ -116,7 +118,22 @@ mod tests {
             } else {
                 vec![value.to_owned()]
             };
-        items.into_iter().filter(|item| !item.is_empty()).collect()
+        items
+            .into_iter()
+            .map(|item| strip_quotes(&item))
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// Strip one layer of matching `"..."` or `'...'` quoting, if present.
+    fn strip_quotes(item: &str) -> String {
+        let mut chars = item.chars();
+        match (chars.next(), chars.next_back()) {
+            (Some('"'), Some('"')) | (Some('\''), Some('\'')) if item.len() >= 2 => {
+                chars.as_str().to_owned()
+            }
+            _ => item.to_owned(),
+        }
     }
 
     /// Extract the top-level `concurrency.group` value, joining folded (`>-`)
@@ -753,6 +770,50 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "e2e-selfhosted.yml must define the self-hosted job `{job}` (EAI-7548)"
             );
         }
+    }
+
+    /// The full `on.push.branches` list from a workflow's top-level `push:`
+    /// trigger, as a flattened item vector (e.g. `["main", "release/**"]`).
+    fn push_branches(text: &str) -> Vec<String> {
+        let push_block = nested_block(text, "  push:");
+        let branches = flattened_values(&push_block, "branches");
+        assert_eq!(
+            branches.len(),
+            1,
+            "expected exactly one branches: list under this workflow's push trigger"
+        );
+        flattened_list_items(&branches[0])
+    }
+
+    /// Reverting or mistyping the `release/**` push branch (EAI-8761) would
+    /// leave every other assertion in this suite green, since none of them
+    /// read `on.push.branches`. Only `e2e-selfhosted.yml` carries it — a
+    /// release-branch push should get the self-hosted regression matrix ahead
+    /// of cutting the `v*` tag `release.yml` builds from. `ci.yml`'s own push
+    /// trigger stays `main`-only, so it does not run on the release-branch
+    /// commit itself; a direct push or cherry-pick to a release branch is not
+    /// covered by it, and coverage instead comes from whatever pull request
+    /// produced that commit.
+    #[test]
+    fn self_hosted_workflow_fires_on_release_branch_push() {
+        let workflow = read_workflow("e2e-selfhosted.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string(), "release/**".to_string()],
+            "e2e-selfhosted.yml must run its push-triggered jobs on `main` and any \
+             `release/**` branch, ahead of cutting the `v*` tag release.yml builds from (EAI-8761)"
+        );
+    }
+
+    #[test]
+    fn ci_workflow_push_trigger_stays_main_only() {
+        let workflow = read_workflow("ci.yml");
+        assert_eq!(
+            push_branches(&workflow),
+            vec!["main".to_string()],
+            "ci.yml's push trigger must stay main-only; it does not run on the \
+             release-branch commit itself, so it must not re-run on push too"
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod architecture_doc;
 mod crate_edges;
 mod demos;
 mod e2e;
@@ -100,6 +101,13 @@ enum Command {
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
+    /// Fail, naming every one, if a path cited (in backticks) in
+    /// `docs/architecture.md` isn't found where it's cited. Exactly where a
+    /// citation is checked depends on its shape (a slash path, a bare
+    /// filename, a bare directory name) — the failure message names the
+    /// expected location per citation; see `citation_exists`'s doc comment
+    /// in `xtask/src/architecture_doc.rs` for the full rule.
+    CheckArchitectureDoc,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -247,6 +255,7 @@ fn run() -> Result<()> {
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
+        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,
