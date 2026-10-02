@@ -66,10 +66,38 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
-        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
-        amd_smi_skip_kfd_preflight: false,
+        amd_smi_skip_device_preflight: false,
+        // Runs once per dashboard launch here, not per refresh tick, so the
+        // extra subprocess spawn is negligible.
+        amd_smi_gpu_reachable: gpu_reachable_for_preflight(
+            rocm_core::is_wsl_host(),
+            rocm_core::has_usable_amd_gpu(),
+        ),
+        test_clock_offset_path: dash_test_clock_offset_path(),
     }
+}
+
+/// The verdict may only substitute for the device open on WSL: `has_usable_amd_gpu()`
+/// is deliberately fail-open on an unprobeable platform (so it never blocks a
+/// launch), which is the wrong polarity for this pre-flight's hang guard — an
+/// unknown verdict must NOT skip the real `/dev/kfd` open. Restricting the
+/// substitution to WSL (where there is no device node the dash crates can
+/// probe directly, only the shared ROCDXG-plumbing probe this same function
+/// backs) keeps bare-metal behaviour byte-identical to a plain `/dev/kfd` check.
+const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) -> bool {
+    is_wsl_host && has_usable_gpu
+}
+
+#[cfg(feature = "e2e-test-hooks")]
+fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH").map(Into::into)
+}
+
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
@@ -219,7 +247,58 @@ pub fn resolved_args(
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
+        // Records for local servers that are no longer running. The overlay
+        // renders only the live instances the daemon surfaces, so nothing there
+        // would otherwise admit that a failed server was ever recorded.
+        services_past_attempts: services_past_attempts(paths),
     }
+}
+
+/// Managed-service records that are no longer running, read from the same
+/// registry `rocm services` reads. A status-only file read: no readiness
+/// probes, no daemon.
+///
+/// **Known divergence — this can read lower than `rocm services list --all`,
+/// which is the command the overlay's own note points at.** The CLI path goes
+/// through `main.rs::load_managed_services`, which per record calls
+/// `refresh_from_engine_state` and then
+/// `refresh_managed_service_runtime_liveness`, demoting a crashed server's
+/// stale `running` record to `stopped` and writing it back. `stopped` is not a
+/// scrapeable status, so the CLI counts it; the raw status here is still
+/// `running`, so this does not. The two agree again as soon as any
+/// `rocm services` invocation rewrites the record.
+///
+/// Not refreshed here, for two reasons, in this order:
+///
+/// 1. It would not actually make the surfaces agree. This is a one-shot
+///    snapshot taken in `resolved_args` before the TUI starts (see
+///    `ResolvedArgs::services_past_attempts` — "a snapshot, not a live feed"),
+///    and nothing recomputes it for the life of the session. A server that
+///    crashes a minute into the dashboard diverges again regardless of how
+///    accurate this read was at launch. Closing the gap properly needs a live
+///    feed, not a better snapshot.
+/// 2. The CLI's verdict is not reachable without network I/O.
+///    `refresh_managed_service_runtime_liveness` decides liveness from
+///    `managed_service_endpoint_readiness`, which probes the endpoint — a model
+///    listing bounded by `SERVICE_LIVENESS_CHECK_TIMEOUT`, and for a record
+///    that lists but has not latched a verification, a real inference request
+///    bounded by `INFERENCE_PROBE_TIMEOUT` (8s). Those are per record and would
+///    be paid serially on the plain synchronous thread that `resolved_args`
+///    runs on, delaying the dashboard's first paint by seconds on exactly the
+///    hosts that serve models. It also *writes* records, which launching a
+///    read-only view should not do.
+///
+/// A cheaper approximation exists — adopt the engine state file and check the
+/// recorded pids with `process_is_running`, both local — but it is deliberately
+/// not taken: it trades this undercount for an *overcount* whenever a record's
+/// pids are dead while its endpoint still answers, and duplicates the CLI's
+/// liveness classification in a second place that could drift from it. Reading
+/// low is the safer failure: the note under this count invites the user to run
+/// `rocm services list --all`, which then shows them the true figure.
+fn services_past_attempts(paths: &AppPaths) -> usize {
+    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
+    let records = load_service_records(&paths.services_dir());
+    discover_managed_services(&records).past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -254,7 +333,7 @@ fn demo_session_path(paths: &AppPaths) -> Result<PathBuf> {
 
 /// Create `dir` restricted to the owner (`0o700`) on Unix. `DirBuilder::mode`
 /// applies at creation so there is no umask window; a pre-existing directory is
-/// tightened best-effort afterward (matching `server.rs`/`agent.rs`).
+/// tightened best-effort afterward (matching `server.rs`/`agent/clients.rs`).
 #[cfg(unix)]
 fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -300,8 +379,58 @@ fn prune_stale_demo_sessions(dir: &Path, keep: &Path) {
     }
 }
 
+/// Validate a user-supplied `--replay` path before the dashboard takes over the
+/// terminal. Fails fast with a clear error (and, via the returned `Err`, a
+/// non-zero exit) when the file is missing, is a directory, or is not readable —
+/// rather than entering the alt-screen and only then surfacing a disconnect
+/// inside the TUI. Pure filesystem check → unit-testable without a terminal.
+///
+/// Only a *directory* is rejected on shape, not "not a regular file": the replay
+/// reader is `std::fs::read_to_string`, which happily reads FIFOs, `/dev/stdin`,
+/// and process-substitution paths (`--replay <(zcat rec.ndjson.gz)`), all of
+/// which `metadata().is_file()` would reject. A missing-vs-unreadable distinction
+/// is made by matching the `metadata` error kind, so a permission-denied parent
+/// is not mislabelled "not found".
+fn validate_replay_path(path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow::anyhow!("replay file not found: {}", path.display())
+        }
+        _ => anyhow::anyhow!("cannot read replay file: {}: {err}", path.display()),
+    })?;
+    if meta.is_dir() {
+        anyhow::bail!(
+            "replay path is a directory, not a recording: {}",
+            path.display()
+        );
+    }
+    // Confirm a *regular* file actually opens for reading — a successful `stat`
+    // only needs a traversable parent, not a readable file — so a mode-0
+    // recording fails here instead of after the alt-screen has taken over. Only
+    // regular files are pre-opened: opening a FIFO / `/dev/stdin` / process
+    // substitution would block on, or consume, the one-shot stream the replay
+    // reader (`read_to_string`) is about to read, so those are left to the reader.
+    if meta.is_file() {
+        std::fs::File::open(path)
+            .with_context(|| format!("replay file is not readable: {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Entry point for `rocm dash`. Builds a tokio runtime and runs the dashboard.
 pub fn run(replay: Option<PathBuf>, demo: bool, chat_mock: bool) -> Result<()> {
+    // Validate a user-supplied `--replay` path up front — before building the
+    // runtime or entering the alt-screen — so a missing/unreadable file fails
+    // fast with a clear error and non-zero exit instead of silently taking over
+    // the terminal and surfacing a disconnect inside the TUI. `--demo` writes
+    // its own session below, so it is exempt: `--demo` overwrites `replay` with
+    // that generated path, so a caller-supplied one is never read in demo mode
+    // and must not be rejected. `conflicts_with` rules the pair out on the CLI,
+    // but this is a `pub fn` whose two flags arrive independently, so the guard
+    // is a real precondition at this boundary rather than dead code.
+    if !demo && let Some(path) = replay.as_deref() {
+        validate_replay_path(path)?;
+    }
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths)?;
     // `--demo` writes a synthetic session and replays it, so the dashboard shows
@@ -366,6 +495,40 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
     let paths = AppPaths::discover()?;
     let config = RocmCliConfig::load(&paths).unwrap_or_default();
     let theme = config.dashboard.tui.theme;
+
+    // Bare `rocm` is a persistent hub: it outlives each session's Tokio runtime
+    // and returns to a synchronous, raw-mode launcher menu between flows. Each
+    // session builds and drops its own runtime, and Tokio never unregisters the
+    // libc signal handler it installs — so once a session's runtime is dropped
+    // nothing drains the signal pipe and a per-session watcher goes deaf. The
+    // menu would then hold the terminal in raw mode while SIGTERM/SIGINT are
+    // caught-and-discarded: an unkillable, worse form of the very bug this
+    // fixes. Keep ONE runtime alive for the whole hub and spawn a single
+    // process-lifetime watcher on it, so every window — the menu and each
+    // session alike — has a live reactor to restore the terminal and exit
+    // `128 + signo`. The watcher is registered before the first menu paint, so
+    // even the very first launcher screen is covered.
+    let signal_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .context("building the launcher signal runtime")?;
+    // Register + spawn inside the runtime context; the returned watcher handle is
+    // dropped on purpose (dropping a `JoinHandle` detaches the task, it does not
+    // abort it), so the hub keeps `signal_rt`'s worker draining the signal pipe
+    // for the whole loop below and the watcher lives for the process.
+    //
+    // This watcher deliberately COEXISTS with the one `app::run` installs when a
+    // flow escalates into a full dashboard session. Tokio's signal registry is
+    // process-global, so a single `kill` wakes both. That is safe because the
+    // watcher body arbitrates on a process-global latch: only the first one
+    // through restores the terminal and exits, so the two never race
+    // unsynchronised stdout writes or concurrent `process::exit` calls. See
+    // `spawn_termination_watcher`.
+    let _watcher = signal_rt
+        .block_on(async { rocm_dash_tui::app::spawn_termination_watcher() })
+        .map_err(|e| anyhow::anyhow!("installing launcher termination-signal handlers: {e}"))?;
+
     loop {
         // Re-read the managed-service registry on each pass so the front door
         // reflects models started (or stopped) during a prior flow. This is a
@@ -601,6 +764,21 @@ pub fn run_bench(a: BenchLoadArgs) -> Result<()> {
                 report.failed, report.attempted, row.cell
             );
         }
+        // `engine` is a rollup key, so rows this file already holds for the cell
+        // without one — written before the column was populated, or by a run
+        // whose /metrics was unreachable — do not group with the rows written
+        // now. N trials become two smaller groups and the Bench panel has no
+        // `engine` column to explain it, so the run has to say so itself. The
+        // sweep raises this at most once, so it prints once per run.
+        if let Some(notice) = &report.engine_split {
+            eprintln!(
+                "warning: {} already has rows for {} with a blank engine column; `engine` is a rollup key, so those trials group separately from this run's engine=vllm rows",
+                notice.path, notice.cell
+            );
+            eprintln!(
+                "hint: rotate or move that file if you are comparing trials across the change"
+            );
+        }
     }
     println!(
         "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark."
@@ -752,6 +930,108 @@ mod tests {
         }
     }
 
+    /// The services overlay renders only live instances, so the count of
+    /// records that are no longer running has to be adapted by the bin like
+    /// `model_recipes` / `runtimes` / `automations` are.
+    ///
+    /// This is also the only test here that pins that the count is read off
+    /// `services_dir()` at all — its sibling
+    /// [`resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed`]
+    /// asserts 0 and so still passes against an empty registry. Keep both.
+    #[test]
+    fn resolved_args_counts_records_that_are_no_longer_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(args.services_past_attempts, 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pins the divergence documented on [`services_past_attempts`]: this count
+    /// is a raw status read, so a crashed server whose record still says
+    /// `running` is NOT counted here, while `rocm services list --all` refreshes
+    /// liveness, demotes it to `stopped` and does count it.
+    ///
+    /// Witnessed rather than left implicit because the overlay's note sends the
+    /// user to that very command, so the two surfaces can disagree in front of
+    /// them. The record below is stale by construction: its status still says
+    /// `running`, and there is no process or listener behind it. That status
+    /// string is the whole of what decides the count — this path never consults
+    /// a pid and never probes the port, and the on-disk view it deserializes
+    /// into (`rocm_dash_daemon::registry::ServiceRecord`) carries no pid fields
+    /// at all. Asserting 0 is asserting that no refresh happens on this path —
+    /// if someone later adds one, this test fails and they are pointed at the
+    /// doc comment explaining the trade-off rather than silently flipping a
+    /// launch-time read into network I/O.
+    ///
+    /// Asserting 0 would also hold if the registry were never read, so this test
+    /// does not on its own show that any record reached the count;
+    /// [`resolved_args_counts_records_that_are_no_longer_running`] is what pins
+    /// that. Keep the two together.
+    #[test]
+    fn resolved_args_does_not_refresh_liveness_so_a_stale_running_record_is_missed() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "past-attempts-stale-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        // A crashed server as this path can see one: the status string was never
+        // rewritten, so it still says `running`.
+        std::fs::write(
+            p.services_dir().join("stale.json"),
+            br#"{"service_id":"svc-crashed","engine":"vllm","port":8002,"status":"running","created_at_unix_ms":3}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert_eq!(
+            args.services_past_attempts, 0,
+            "the overlay count is a raw status snapshot; refreshing it here \
+             would put per-service endpoint probes on the dashboard launch path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn runner_options_wires_services_dir_to_registry() {
         let p = paths();
@@ -779,6 +1059,32 @@ mod tests {
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
         );
+    }
+
+    #[test]
+    fn runner_options_never_skips_the_device_preflight() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Truth-tables the WSL gate as a pure function, independent of the test
+    /// host's actual environment: a regression back to the un-gated
+    /// `has_usable_amd_gpu()` would flip the `(false, true)` bare-metal case
+    /// to `true`, since the fail-open verdict fires on any unprobeable
+    /// platform, not just WSL.
+    ///
+    /// This pins the helper's body only. The call site's binding — that
+    /// `runner_options` passes `is_wsl_host()` itself rather than a literal —
+    /// is not pinned by any test: on an ordinary CI host with no usable GPU,
+    /// `has_usable_amd_gpu()` is already `false`, so a mutant literal `true`
+    /// there is indistinguishable from the real call from this crate's tests.
+    #[test]
+    fn gpu_reachable_for_preflight_only_substitutes_on_wsl() {
+        assert!(!gpu_reachable_for_preflight(false, true));
+        assert!(!gpu_reachable_for_preflight(false, false));
+        assert!(!gpu_reachable_for_preflight(true, false));
+        assert!(gpu_reachable_for_preflight(true, true));
     }
 
     #[test]
@@ -1024,5 +1330,156 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// EAI-8366 regression: `rocm dash --replay <missing>` must fail the upfront
+    /// validation with a clear "not found" error (→ non-zero exit) instead of
+    /// entering the alt-screen and surfacing a disconnect inside the TUI.
+    #[test]
+    fn validate_replay_path_rejects_missing_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-missing-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        // Guard against a pre-existing file from a prior crashed run.
+        let _ = std::fs::remove_file(&missing);
+
+        let err = validate_replay_path(&missing).expect_err("missing file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("replay file not found"),
+            "error must name the missing replay file: {msg}"
+        );
+    }
+
+    /// A directory passed to `--replay` is present but is not a replayable
+    /// recording; validation must reject it up front rather than in the TUI.
+    #[test]
+    fn validate_replay_path_rejects_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-dir-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let err = validate_replay_path(&dir).expect_err("a directory must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is a directory"),
+            "error must explain the path is a directory: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EAI-8366 regression for the readability branch the PR advertises but did
+    /// not cover: a present, regular recording that cannot be opened (mode 0o000)
+    /// must be rejected up front — not after the alt-screen has taken over. Unix
+    /// only (Windows has no equivalent open-time read bit) and skipped as root,
+    /// where the mode is not enforced.
+    #[cfg(unix)]
+    #[test]
+    fn validate_replay_path_rejects_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rocm_core::openmpi::running_as_root() {
+            // Mode 0o000 is not enforced for uid 0, so the open would succeed and
+            // the branch under test cannot be exercised.
+            return;
+        }
+
+        let file = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-unreadable-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::write(&file, "{}\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let err = validate_replay_path(&file).expect_err("an unreadable file must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not readable") || msg.contains("Permission denied"),
+            "error must explain the file is not readable: {msg}"
+        );
+
+        // Restore permissions so cleanup can remove the file.
+        let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// EAI-8366 regression covering *both* halves of the non-regular-file
+    /// contract, on a real one-shot stream rather than a stand-in:
+    ///
+    /// 1. a FIFO must not be rejected on shape — only a directory is a shape
+    ///    error, and requiring a regular file would break `--replay <(...)`;
+    /// 2. validation must not *pre-open* it. `open(2)` on a writer-less FIFO
+    ///    blocks until a writer arrives, so dropping the `is_file()` narrowing
+    ///    around the readability probe hangs `rocm dash` before the TUI starts
+    ///    (and, with a writer, would consume the stream the replay reader is
+    ///    about to read). The validation therefore runs on a worker thread and
+    ///    must report back well inside the timeout below.
+    ///
+    /// A readable character device such as `/dev/null` cannot stand in here: it
+    /// opens instantly, so it passes with or without the narrowing.
+    ///
+    /// Unix only: `mkfifo` has no Windows equivalent, and Windows named pipes
+    /// live in the `\\.\pipe\` namespace rather than on the filesystem, so the
+    /// blocking-open behaviour this pins cannot be staged there. The narrowing
+    /// under test is platform-independent, so this covers it for every target.
+    #[cfg(unix)]
+    #[allow(unsafe_code)] // libc FFI: mkfifo has no std equivalent
+    #[test]
+    fn validate_replay_path_accepts_a_fifo_without_opening_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let fifo = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-fifo-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+        // call, and `mkfifo` only reads it.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        // No writer is ever opened for this FIFO, so any `open` of it blocks
+        // indefinitely. The worker thread is deliberately not joined: if the
+        // validation regresses it stays parked in `open` until the test process
+        // exits, and the timeout below is what fails the test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(validate_replay_path(&probe).map_err(|err| format!("{err:#}")));
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(10));
+
+        let _ = std::fs::remove_file(&fifo);
+        let validation = outcome.unwrap_or_else(|err| {
+            panic!(
+                "validate_replay_path never returned for a writer-less FIFO ({err}): \
+                 non-regular replay paths must not be pre-opened"
+            )
+        });
+        validation.expect("a FIFO must pass validation, not be rejected on shape");
+    }
+
+    /// A present, readable recording passes validation so the normal replay
+    /// flow proceeds into the dashboard unchanged.
+    #[test]
+    fn validate_replay_path_accepts_readable_file() {
+        let file = std::env::temp_dir().join(format!(
+            "rocm-cli-replay-ok-{}-{}.ndjson",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        std::fs::write(&file, "{}\n").unwrap();
+
+        validate_replay_path(&file).expect("a readable file must pass validation");
+
+        let _ = std::fs::remove_file(&file);
     }
 }

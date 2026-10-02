@@ -49,8 +49,10 @@ already-ready environment.
 The Console needs no ROCm hardware: `rocm dash --demo` replays the project's
 seeded synthetic telemetry through the same UI as a live daemon, and visibly
 marks it **SIMULATED DATA**. `--chat-mock` provides the deterministic offline
-chat response. The CLI's service and chat commands use only the loopback mock.
-Neither demo downloads a model or calls a cloud provider.
+chat response; a message containing the phrase "install the sdk" instead
+triggers the mock's tool-approval demo path, surfacing an approval prompt
+instead of the plain reply. The CLI's service and chat commands use only the
+loopback mock. Neither demo downloads a model or calls a cloud provider.
 
 ## Storyboards
 

@@ -74,14 +74,28 @@ pub struct RunnerOptions {
     /// so the caller resolves it (via `rocm_core::resolve_amd_smi_binary`) and
     /// passes it here. `None` falls back to looking up `amd-smi` on `PATH`.
     pub amd_smi_binary: Option<OsString>,
-    /// **Test-only.** Skip the mandatory `/dev/kfd` pre-flight in amd-smi
+    /// **Test-only.** Skip the mandatory GPU-device pre-flight in amd-smi
     /// detection so a *fake* `amd_smi_binary` is actually invoked on a GPU-less
     /// CI host instead of short-circuiting to "no GPU". Never set in
-    /// production: the KFD guard prevents a *real* `amd-smi` from hanging in
+    /// production: the device guard prevents a *real* `amd-smi` from hanging in
     /// uninterruptible D-state. Only the daemon integration test that points
     /// `amd_smi_binary` at a deliberately-slow fake script flips this, so the
     /// off-critical-path detection behaviour is genuinely exercised.
-    pub amd_smi_skip_kfd_preflight: bool,
+    pub amd_smi_skip_device_preflight: bool,
+    /// Precomputed GPU-reachability verdict (from `rocm_core::has_usable_amd_gpu`)
+    /// that lets the amd-smi device pre-flight pass without a readable
+    /// `/dev/kfd` — the WSL case, where that verdict is the same one `serve`
+    /// and `examine` already act on. `rocm-dash-daemon`/`rocm-dash-collectors`
+    /// deliberately don't depend on `rocm-core` to compute this themselves;
+    /// the caller (`apps/rocm`) does and passes the answer through. `false`
+    /// (the default) preserves the bare-metal-only `/dev/kfd` check.
+    pub amd_smi_gpu_reachable: bool,
+    /// **Test-only.** When set, cycle timestamps come from the logical clock
+    /// this file controls instead of `Utc::now()` — see [`TestClockDirective`]
+    /// for the file's grammar. Production callers leave this unset; E2E
+    /// scenarios use it to sit still on, or step across, observation-validity
+    /// boundaries without racing wall-clock scheduling.
+    pub test_clock_offset_path: Option<PathBuf>,
 }
 
 impl Default for RunnerOptions {
@@ -101,7 +115,9 @@ impl Default for RunnerOptions {
             persist_dir: None,
             services_dir: None,
             amd_smi_binary: None,
-            amd_smi_skip_kfd_preflight: false,
+            amd_smi_skip_device_preflight: false,
+            amd_smi_gpu_reachable: false,
+            test_clock_offset_path: None,
         }
     }
 }
@@ -122,6 +138,131 @@ const fn vllm_metrics_enabled(opts: &RunnerOptions) -> bool {
     !opts.disable_vllm_metrics
 }
 
+/// **Test-only.** A directive read from the file `test_clock_offset_path`
+/// points at, controlling the daemon's logical observation clock.
+///
+/// Grammar — the file holds one trimmed token sequence:
+///
+/// | Content     | Meaning                                                      |
+/// |-------------|--------------------------------------------------------------|
+/// | `<int>`     | free-running: one `gpu_tick` of logical time per daemon cycle, shifted by `<int>` seconds |
+/// | `hold`      | held: logical time stops at the cycle that first reads this   |
+/// | `hold <int>`| held at that same cycle, then shifted by `<int>` seconds      |
+///
+/// `hold` exists because free-running logical time is NOT decoupled from the
+/// host: it advances one tick per cycle and the cycles are paced by a
+/// wall-clock interval, so a scenario descheduled between two assertions still
+/// loses observation-validity budget it never meant to spend (EAI-7960). A held
+/// clock cannot be moved by anything except the scenario rewriting the file, so
+/// a "still held" assertion can be made at any later moment and an expiry is
+/// crossed only by an explicit `hold <int>` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestClockDirective {
+    /// Logical time advances one tick per cycle, shifted by the given seconds.
+    FreeRunning(i64),
+    /// Logical time stands still at the hold point, shifted by the given seconds.
+    Held(i64),
+}
+
+impl Default for TestClockDirective {
+    /// What an absent or unparsable file means: the pre-`hold` behaviour.
+    fn default() -> Self {
+        Self::FreeRunning(0)
+    }
+}
+
+/// **Test-only.** The daemon's logical observation clock, driven by the file at
+/// `RunnerOptions::test_clock_offset_path`. Carried across cycles by `run_loop`
+/// because a held clock has to remember *where* it was held.
+#[derive(Debug, Default)]
+struct TestClock {
+    /// Last directive parsed. Retained when a read fails or yields content that
+    /// does not parse, so a transient unreadable file (a scenario rewriting it
+    /// non-atomically) can never silently resume a held clock.
+    directive: TestClockDirective,
+    /// Cycle count the clock was held at; `None` while free-running.
+    held_at_tick: Option<u64>,
+}
+
+impl TestClock {
+    /// Timestamp for this cycle: `Utc::now()` in production (no clock file), or
+    /// the logical time the file's directive describes.
+    fn cycle_timestamp(
+        &mut self,
+        epoch: DateTime<Utc>,
+        tick: Duration,
+        tick_count: u64,
+        offset_path: Option<&std::path::Path>,
+    ) -> DateTime<Utc> {
+        let Some(path) = offset_path else {
+            return Utc::now();
+        };
+        if let Some(directive) = read_test_clock_directive(path) {
+            self.directive = directive;
+        }
+        let (logical_ticks, offset_secs) = match self.directive {
+            TestClockDirective::FreeRunning(offset_secs) => {
+                self.held_at_tick = None;
+                (tick_count, offset_secs)
+            }
+            // Hold at the first cycle that saw a `hold`; later `hold <int>`
+            // directives shift from that same point rather than re-holding,
+            // so the expiry step's advance is exactly the offset it writes.
+            TestClockDirective::Held(offset_secs) => {
+                (*self.held_at_tick.get_or_insert(tick_count), offset_secs)
+            }
+        };
+        let tick_millis = tick.as_millis().saturating_mul(u128::from(logical_ticks));
+        let logical_millis = i64::try_from(tick_millis).unwrap_or(i64::MAX);
+        epoch
+            .checked_add_signed(chrono::TimeDelta::milliseconds(logical_millis))
+            .and_then(|at| at.checked_add_signed(chrono::TimeDelta::seconds(offset_secs)))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+}
+
+/// Read and parse the test clock file. `None` when it cannot be read or does
+/// not parse — the caller then keeps the directive already in force.
+fn read_test_clock_directive(path: &std::path::Path) -> Option<TestClockDirective> {
+    parse_test_clock_directive(std::fs::read_to_string(path).ok()?.trim())
+}
+
+/// Parse one [`TestClockDirective`]; see its grammar table.
+fn parse_test_clock_directive(value: &str) -> Option<TestClockDirective> {
+    if let Some(offset) = value.strip_prefix("hold") {
+        let offset = offset.trim();
+        return if offset.is_empty() {
+            Some(TestClockDirective::Held(0))
+        } else {
+            offset.parse().ok().map(TestClockDirective::Held)
+        };
+    }
+    value.parse().ok().map(TestClockDirective::FreeRunning)
+}
+
+/// Which detection call `run_loop`'s background gpu-init task makes, decided
+/// up front from [`RunnerOptions`] so the decision itself is a plain value a
+/// test can assert on without spawning the task or touching a real binary.
+enum AmdSmiDetectPlan {
+    SkipDevicePreflight(OsString),
+    Detect(OsString, bool),
+}
+
+/// `amd_smi_binary: None` means "no override", not "no detection" — it still
+/// runs the real pre-flight against the literal `amd-smi` command name, with
+/// the same threaded `gpu_reachable` verdict as an explicit binary.
+fn amd_smi_detect_plan(
+    binary: Option<OsString>,
+    skip_device_preflight: bool,
+    gpu_reachable: bool,
+) -> AmdSmiDetectPlan {
+    match binary {
+        Some(binary) if skip_device_preflight => AmdSmiDetectPlan::SkipDevicePreflight(binary),
+        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable),
+        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable),
+    }
+}
+
 /// Loop forever: tick host + gpu metrics + bench rows, apply through reducer, broadcast.
 ///
 /// `tick_override` lets tests run faster than `opts.gpu_tick`; production passes
@@ -138,6 +279,8 @@ pub async fn run_loop(
     let mut host = HostCollector::new();
     let tick = tick_override.unwrap_or(opts.gpu_tick);
     let mut ticker = interval(tick);
+    let test_clock_epoch = Utc::now();
+    let mut test_clock = TestClock::default();
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Compute multipliers vs the gpu tick.
@@ -218,17 +361,21 @@ pub async fn run_loop(
     // `rocm services` already reported it). Run detection off the critical path:
     // the loop starts ticking immediately (surfacing serving instances within
     // one discovery tick) and GPU metrics fill in the moment detection lands.
-    let amd_smi_binary = opts.amd_smi_binary.clone();
-    let amd_smi_skip_kfd_preflight = opts.amd_smi_skip_kfd_preflight;
+    let detect_plan = amd_smi_detect_plan(
+        opts.amd_smi_binary.clone(),
+        opts.amd_smi_skip_device_preflight,
+        opts.amd_smi_gpu_reachable,
+    );
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
     tokio::spawn(async move {
-        let gpu = match amd_smi_binary {
-            Some(binary) if amd_smi_skip_kfd_preflight => {
-                AmdSmiCollector::detect_with_binary_skipping_kfd_preflight(binary).await
+        let gpu = match detect_plan {
+            AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
+                AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            Some(binary) => AmdSmiCollector::detect_with_binary(binary).await,
-            None => AmdSmiCollector::detect().await,
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+                AmdSmiCollector::detect_with_binary(binary, gpu_reachable).await
+            }
         };
         let info = match &gpu {
             Some(g) => Some(g.system_info().await),
@@ -254,7 +401,12 @@ pub async fn run_loop(
         // Single wall-clock anchor for this loop iteration. All counter/direct
         // observations and the assembled Snapshot timestamp share this instant so
         // every instance refreshed in this cycle serialises Fresh deterministically.
-        let cycle_at = Utc::now();
+        let cycle_at = test_clock.cycle_timestamp(
+            test_clock_epoch,
+            tick,
+            tick_count,
+            opts.test_clock_offset_path.as_deref(),
+        );
 
         // Adopt the background amd-smi detection result the moment it lands,
         // without ever blocking the loop while it is still in flight. Until then
@@ -273,7 +425,7 @@ pub async fn run_loop(
                         );
                     } else {
                         warn!(
-                            "amd-smi not available (no /dev/kfd or `amd-smi version` failed); GPU disabled"
+                            "amd-smi not available (no accessible GPU device or `amd-smi version` failed); GPU disabled"
                         );
                     }
                     gpu = detected;
@@ -305,7 +457,28 @@ pub async fn run_loop(
                 }
             }
         } else if gpu_init_done {
-            warnings.push("amd-smi unavailable (no /dev/kfd or binary missing)".into());
+            // If the caller passed `amd_smi_gpu_reachable: true` (in practice,
+            // only the WSL wiring in `apps/rocm/src/dash.rs` does — it gates the
+            // rocm-core verdict on `is_wsl_host()`) and amd-smi *still* found
+            // nothing, that's a real contradiction worth calling out — plumbing
+            // readiness (e.g. `wsl_rocdxg_ready`) is not the same as amd-smi
+            // enumerating a supported GPU, and a generic "device inaccessible"
+            // message would flatly contradict what `examine` just told the same
+            // user. Otherwise (bare metal, or nothing told us the GPU is
+            // reachable) the device pre-flight itself may have failed, or it
+            // passed but the binary was missing/unresolvable/failed to run —
+            // both causes are named since either is possible here.
+            warnings.push(if opts.amd_smi_gpu_reachable {
+                "amd-smi is missing, unresolvable, or failed to run, even though a GPU was \
+                 detected by other means (WSL ROCDXG bridge) — if it is installed, this GPU \
+                 model may not be supported by the installed amd-smi/ROCm, or not supported on \
+                 WSL yet"
+                    .into()
+            } else {
+                "amd-smi unavailable (not installed, unresolvable, or the GPU device is \
+                 inaccessible)"
+                    .into()
+            });
             Vec::new()
         } else {
             // Detection is still in flight (spawned off the critical path), so
@@ -991,6 +1164,154 @@ fn avg_ms_from_histogram(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// Pins the `None` binary arm specifically: a revert back to hardcoding
+    /// `false` here (rather than threading `gpu_reachable` through, as the
+    /// `Some` arm already does) would not be caught by any integration test,
+    /// since exercising it end to end needs a real or PATH-resolved `amd-smi`
+    /// binary named literally `amd-smi`.
+    #[test]
+    fn detect_plan_threads_gpu_reachable_through_the_none_binary_arm() {
+        match amd_smi_detect_plan(None, false, true) {
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+                assert_eq!(binary, OsString::from("amd-smi"));
+                assert!(gpu_reachable);
+            }
+            AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
+        }
+
+        match amd_smi_detect_plan(None, false, false) {
+            AmdSmiDetectPlan::Detect(_, gpu_reachable) => assert!(!gpu_reachable),
+            AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
+        }
+    }
+
+    #[test]
+    fn detect_plan_skip_preflight_takes_priority_over_an_explicit_binary() {
+        match amd_smi_detect_plan(Some("fake-amd-smi".into()), true, false) {
+            AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
+                assert_eq!(binary, OsString::from("fake-amd-smi"));
+            }
+            AmdSmiDetectPlan::Detect(..) => panic!("expected SkipDevicePreflight"),
+        }
+    }
+
+    #[test]
+    fn test_clock_advances_by_ticks_and_external_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = dir.path().join("offset-secs");
+        std::fs::write(&offset, "0").unwrap();
+        let epoch = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut clock = TestClock::default();
+
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 3, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(3)
+        );
+
+        std::fs::write(&offset, "7").unwrap();
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 4, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(11)
+        );
+    }
+
+    /// EAI-7960 regression (the `hold` directive's whole reason to exist): once
+    /// held, cycles keep happening but logical time does not move, so an
+    /// observation's age — and therefore its validity budget — is frozen no
+    /// matter how long the scenario takes to reach its next assertion.
+    #[test]
+    fn held_test_clock_stops_advancing_with_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = dir.path().join("offset-secs");
+        std::fs::write(&offset, "0").unwrap();
+        let epoch = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut clock = TestClock::default();
+
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 5, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(5)
+        );
+
+        std::fs::write(&offset, "hold").unwrap();
+        let held = clock.cycle_timestamp(epoch, Duration::from_secs(1), 6, Some(&offset));
+        assert_eq!(held, epoch + chrono::TimeDelta::seconds(6));
+        // Hundreds of cycles later, still the same instant.
+        for tick_count in 7..300 {
+            assert_eq!(
+                clock.cycle_timestamp(epoch, Duration::from_secs(1), tick_count, Some(&offset)),
+                held,
+                "a held clock must not advance with cycles"
+            );
+        }
+
+        // An explicit advance steps from the hold point — not from "now" — so
+        // the step size a scenario writes is exactly the age it adds.
+        std::fs::write(&offset, "hold 7").unwrap();
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 400, Some(&offset)),
+            held + chrono::TimeDelta::seconds(7)
+        );
+
+        // Releasing the hold resumes tick-driven time from the current cycle.
+        std::fs::write(&offset, "0").unwrap();
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 401, Some(&offset)),
+            epoch + chrono::TimeDelta::seconds(401)
+        );
+    }
+
+    /// A scenario rewriting the file non-atomically can expose an empty read;
+    /// that must never resume a held clock (it would silently re-arm the very
+    /// race `hold` removes).
+    #[test]
+    fn unreadable_test_clock_file_keeps_the_directive_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let offset = dir.path().join("offset-secs");
+        std::fs::write(&offset, "hold").unwrap();
+        let epoch = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut clock = TestClock::default();
+
+        let held = clock.cycle_timestamp(epoch, Duration::from_secs(1), 9, Some(&offset));
+
+        std::fs::write(&offset, "").unwrap();
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 10, Some(&offset)),
+            held
+        );
+        std::fs::remove_file(&offset).unwrap();
+        assert_eq!(
+            clock.cycle_timestamp(epoch, Duration::from_secs(1), 11, Some(&offset)),
+            held
+        );
+    }
+
+    #[test]
+    fn test_clock_directive_grammar() {
+        assert_eq!(
+            parse_test_clock_directive("0"),
+            Some(TestClockDirective::FreeRunning(0))
+        );
+        assert_eq!(
+            parse_test_clock_directive("-3"),
+            Some(TestClockDirective::FreeRunning(-3))
+        );
+        assert_eq!(
+            parse_test_clock_directive("hold"),
+            Some(TestClockDirective::Held(0))
+        );
+        assert_eq!(
+            parse_test_clock_directive("hold 7"),
+            Some(TestClockDirective::Held(7))
+        );
+        assert_eq!(parse_test_clock_directive(""), None);
+        assert_eq!(parse_test_clock_directive("later"), None);
+        assert_eq!(parse_test_clock_directive("hold soon"), None);
+        assert_eq!(
+            TestClockDirective::default(),
+            TestClockDirective::FreeRunning(0)
+        );
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()

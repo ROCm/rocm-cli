@@ -22,6 +22,23 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Print a failure explanation to stderr, ignoring write failures (closed
+/// stderr, full disk) so an I/O error while explaining a failure can't itself
+/// panic the process.
+macro_rules! fail {
+    ($($arg:tt)*) => {{
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
+/// Relay a captured command's stdout/stderr, ignoring write failures for the
+/// same reason `fail!` does — relaying subprocess output can't itself panic
+/// the process if the pipe on the other end is closed.
+fn relay_output(out: &str, err: &str) {
+    let _ = write!(std::io::stdout(), "{out}");
+    let _ = write!(std::io::stderr(), "{err}");
+}
+
 /// Options controlling how a fix is applied.
 #[derive(Debug, Clone, Default)]
 pub struct FixOptions {
@@ -49,9 +66,20 @@ struct FixRecipe {
     runner: Option<fn(&FixOptions) -> i32>,
 }
 
+/// Valid on bare-metal Linux, Windows and WSL alike.
+///
+/// WSL is named explicitly rather than folded into `linux`: the default for a
+/// bare-metal recipe has to be "does not apply on WSL", because the platform has
+/// no amdgpu module, no /dev/kfd and no render group. Recipes that survive the
+/// move are the ones about wheels, environment variables and PATH.
+const LINUX_WINDOWS_AND_WSL: &[&str] = &["linux", "windows", "wsl"];
 const LINUX_AND_WINDOWS: &[&str] = &["linux", "windows"];
 const LINUX_ONLY: &[&str] = &["linux"];
 const WINDOWS_ONLY: &[&str] = &["windows"];
+const WSL_ONLY: &[&str] = &["wsl"];
+/// Both Linux families. For a problem that is neither about the `amdgpu` module
+/// nor about the Windows host driver, and so is real on either.
+const LINUX_AND_WSL: &[&str] = &["linux", "wsl"];
 
 /// The recipe registry. Mirrors the diagnosis catalog; only the four small,
 /// safe fixes carry a `runner` and are auto-applicable.
@@ -62,10 +90,11 @@ const RECIPES: &[FixRecipe] = &[
         rationale: "Your GPU's gfx target is not in the framework wheel's compiled kernel list. Re-install the framework from an index that includes this gfx, OR rebuild llama.cpp with AMDGPU_TARGETS=<gfx>.",
         auto_applicable: false,
         commands: &[
-            "# PyTorch (Linux): switch to the ROCm nightly that ships the gfx115x kernels.",
+            "# PyTorch (Linux): a nightly often carries kernels a release has not shipped yet.",
+            "# Pick the nightly for the ROCm major you have, not an older one.",
             "pip uninstall -y torch torchvision torchaudio",
             "pip install --pre torch torchvision torchaudio \\",
-            "  --index-url https://download.pytorch.org/whl/nightly/rocm6.4",
+            "  --index-url https://download.pytorch.org/whl/nightly/rocm7.14",
             "# PyTorch (Windows): use TheRock's per-gfx wheels (https://github.com/ROCm/TheRock).",
             "# llama.cpp:",
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<your_gfx_target>",
@@ -79,7 +108,7 @@ const RECIPES: &[FixRecipe] = &[
             "TheRock per-gfx wheels are the recommended fallback when the official pytorch index does not yet cover your gfx (and the only first-party option on Windows AMD).",
             "HSA_OVERRIDE_GFX_VERSION is NOT the right fix here -- it papers over the mismatch and risks page faults at runtime.",
         ],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -100,7 +129,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: Some(run_unset_override),
     },
     FixRecipe {
@@ -173,7 +202,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "rocminfo | head -n 5 && hipcc --version",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: Some(run_path_export),
     },
     FixRecipe {
@@ -202,9 +231,10 @@ const RECIPES: &[FixRecipe] = &[
         auto_applicable: false,
         commands: &[
             "pip uninstall -y torch torchvision torchaudio",
-            "# Linux: pick the index that matches your system ROCm major:",
-            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4",
-            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.3",
+            "# Linux: install the index for the ROCm major `rocm examine` reports:",
+            "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.14",
+            "# ROCm 10 has no released PyTorch index yet; it is on the nightly channel:",
+            "pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm10.0",
             "# Windows: use TheRock's wheels matching your HIP SDK major:",
             "#   https://github.com/ROCm/TheRock",
         ],
@@ -213,7 +243,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "python -c \"import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available())\"",
         notes: &[],
-        applies_on: LINUX_AND_WINDOWS,
+        applies_on: LINUX_WINDOWS_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -364,17 +394,390 @@ const RECIPES: &[FixRecipe] = &[
         applies_on: WINDOWS_ONLY,
         runner: None,
     },
+    // The number is a stable handle, not a position: `fix-16` is reserved by the
+    // vLLM out-of-memory entry on its own branch, so this one takes 17 rather
+    // than colliding and forcing whichever lands second to rename a published id.
+    FixRecipe {
+        fix_id: "fix-17-torch-dlpack",
+        title: "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
+        rationale: "vLLM's engine start aborts at import time when torch-c-dlpack-ext loads its CUDA prebuilt on a ROCm torch: it picks the variant from torch.cuda.is_available(), which is True on ROCm because PyTorch reuses the torch.cuda namespace for HIP, and it ships no ROCm variant. tvm_ffi imports it as OPTIONAL but guards only ImportError/AttributeError, while ctypes.CDLL raises OSError -- so the optional import kills the process. Both defects are upstream; nothing here is misconfigured. What you can change locally is the torch version: outside the 2.4-2.9 range there is no prebuilt to load, the extension raises the handled ImportError, and tvm_ffi falls back to its JIT path with a warning.",
+        auto_applicable: false,
+        // Three labelled groups, because the steps run in three different places
+        // and `print_recipe` renders them as one undifferentiated `$`-prefixed
+        // list. Unlabelled, a user pasting the block wholesale is relying on
+        // terminal stdin buffering to land the probes in the subshell -- and on
+        // the reinstall NOT landing there, since it replaces the very
+        // environment that shell is standing in.
+        commands: &[
+            "# --- step 1 of 3, in YOUR shell ---",
+            "# Opens an INTERACTIVE subshell with the engine's environment active,",
+            "# and does not return until you leave it. Run this line on its own.",
+            "rocm engines shell vllm",
+            "# --- step 2 of 3, INSIDE the subshell step 1 opened ---",
+            "# Confirm the trigger before changing anything. It has to be the",
+            "# ENGINE's interpreter, not the one on your PATH -- they are different",
+            "# interpreters, and only the engine's decides this failure.",
+            "python -c \"import torch; print(torch.__version__, torch.version.hip)\"",
+            "python -c \"import importlib.metadata as m; print(m.version('torch-c-dlpack-ext'))\"",
+            "# This entry applies ONLY when torch.version.hip is set, torch.__version__",
+            "# is in the 2.4-2.9 range, and torch-c-dlpack-ext is installed. Outside",
+            "# that range the extension raises a handled ImportError and this is not",
+            "# the failure you are looking at. Then leave the subshell:",
+            "exit",
+            "# --- step 3 of 3, back in YOUR OWN shell ---",
+            "# If all three held, put the engine's pinned torch back. Do NOT run",
+            "# this from inside the subshell: it replaces the environment that",
+            "# shell is standing in.",
+            "rocm engines install vllm --reinstall",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts",
+        notes: &[
+            "Running vLLM on ROCm is not by itself a reason to apply this. torch-c-dlpack-ext arrives as a transitive dependency of tilelang, which vLLM pins, and it only misbehaves on the torch versions it ships prebuilts for.",
+            "The usual way a runtime lands in the failing range is `rocm install sdk` being re-run after the engine was installed, which overwrites the engine's pinned torch. Reinstalling the engine puts the pin back.",
+            "A service that failed at startup is hidden from a plain `rocm services list`; pass --all to recover its id.",
+        ],
+        applies_on: LINUX_ONLY,
+        runner: None,
+    },
+    // WSL2 recipes. All print-only: every one of them either installs a package
+    // with sudo, edits loader configuration, or belongs to the Windows host, and
+    // none of that meets the bar the four auto-applicable fixes clear (small,
+    // reversible, user-scoped, verifiable in one line).
+    FixRecipe {
+        fix_id: "fix-wsl-1-gpu-not-exposed",
+        title: "Expose the GPU to the WSL distro (/dev/dxg)",
+        rationale: "WSL reaches the GPU through /dev/dxg, provided by the Windows host driver via GPU-PV. Without that device nothing else in the ROCm stack can work, so this comes before any package or loader question. In a container the device has to be passed in explicitly; on a host it means the Windows driver or the WSL kernel needs attention.",
+        auto_applicable: false,
+        commands: &[
+            "# In a container, pass the device and the WSL libraries in:",
+            "#   --device=/dev/dxg -v /usr/lib/wsl:/usr/lib/wsl",
+            "# On a WSL host, update WSL and the Windows AMD driver, then:",
+            "#   wsl --update",
+            "#   wsl --shutdown",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ls -l /dev/dxg",
+        notes: &[
+            "A container running on WSL2 reports itself as WSL but sees /dev/dxg only when it was started with the device. Check that before touching the Windows driver.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-2-dxcore-missing",
+        title: "Restore the WSL DXCore libraries",
+        rationale: "/usr/lib/wsl/lib holds the DXCore shims the ROCm runtime uses to talk to the Windows host driver. WSL mounts that directory itself, so a distro package manager can neither install nor repair it -- the fix is on the Windows side, plus a loader-path entry inside the distro.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows, refresh the WSL runtime that provides these libraries:",
+            "#   wsl --update",
+            "#   wsl --shutdown",
+            "# Inside the distro, put them on the loader path:",
+            "echo /usr/lib/wsl/lib | sudo tee /etc/ld.so.conf.d/wsl.conf",
+            "sudo ldconfig",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore",
+        notes: &["apt cannot repair /usr/lib/wsl: it is a mount supplied by WSL, not a package."],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-3-rocdxg-missing",
+        title: "Install ROCDXG in the WSL distro",
+        rationale: "ROCDXG (librocdxg) is the ROCm-to-DXCore shim the WSL path runs on. It is a distro-side package, so unlike the driver and DXCore pieces this one is entirely in the user's hands.",
+        auto_applicable: false,
+        commands: &[
+            "rocm install driver",
+            "# Then, once the plan looks right:",
+            "#   rocm install driver --yes",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ldconfig -p | grep librocdxg",
+        notes: &[
+            "Print-only on purpose: this downloads a .deb from a release page and installs it with sudo. `rocm install driver` prints the plan first so the URL and the package are reviewable before anything runs.",
+            "The download is checked against a digest pinned for that ROCDXG release. To install a release rocm-cli has no digest for, set ROCM_CLI_ROCDXG_SHA256 to the one published with it.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-4-rocdxg-not-linked",
+        title: "Refresh the linker cache so ROCDXG is loadable",
+        rationale: "librocdxg is installed but absent from the linker cache, so the runtime will not find it at load time. Usually a missed `ldconfig` after a manual install.",
+        auto_applicable: false,
+        commands: &["sudo ldconfig"],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "ldconfig -p | grep librocdxg",
+        notes: &[
+            "If ldconfig alone does not do it, the library landed outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-5-distro-too-old",
+        title: "Move to a distro release the WSL path supports",
+        rationale: "Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 floor every published Lemonade embeddable is linked against, so the engine cannot start there at all. This is a hard floor, not a recommendation.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows, install a supported distro alongside the current one:",
+            "#   wsl --install -d Ubuntu-24.04",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "grep VERSION_ID /etc/os-release",
+        notes: &[
+            "Distros install side by side, so the current one can stay until the new one is set up.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-6-host-driver-too-old",
+        title: "Update the AMD driver on the Windows host",
+        rationale: "Under WSL the GPU kernel-mode driver lives on the Windows host, not in the distro. When the distro-side plumbing is complete and ROCm still sees no GPU, the host driver is the remaining variable.",
+        auto_applicable: false,
+        commands: &[
+            "# On the Windows host, not in this distro:",
+            "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "rocminfo | head -n 20",
+        notes: &[
+            "Nothing inside the distro can carry this out, which is why it prints rather than runs.",
+            "The ROCm release and the Adrenalin release are paired; check the WSL install guide for the version that matches your ROCm.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-wsl-7-wsl1",
+        title: "Convert the distro from WSL 1 to WSL 2",
+        rationale: "WSL 1 translates syscalls rather than running a kernel, and exposes no GPU device at all. No driver or package work can give it ROCm support; the distro has to be converted.",
+        auto_applicable: false,
+        commands: &[
+            "# From Windows PowerShell:",
+            "#   wsl --set-version <distro> 2",
+            "#   wsl --set-default-version 2",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "uname -r",
+        notes: &[
+            "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
+        ],
+        applies_on: WSL_ONLY,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-19-shm-too-small",
+        title: "Raise the shared memory allowance",
+        rationale: "A serving workload needs gigabytes of /dev/shm; a container gives it 64 MB by default, and WSL2 ships the same default. When the allowance runs out the workload crashes without the message ever naming shared memory -- a data-loader worker killed by a bus error, or a failed write to a temporary file -- so there is no route from what the user sees back to the cause.",
+        auto_applicable: false,
+        // Two situations, one cause. A running container cannot be resized, so
+        // the container case is a restart rather than a command that changes
+        // this machine; the host case is a remount plus the fstab line that
+        // makes it survive a reboot.
+        commands: &[
+            "# Check what you have:",
+            "df -h /dev/shm",
+            "# In a container: start it again with a larger allowance.",
+            "#   docker run --shm-size=8g ...        # as fix-10-container shows",
+            "# On a host: remount, then make it stick across a reboot.",
+            "sudo mount -o remount,size=8g /dev/shm",
+            "# /etc/fstab:  tmpfs  /dev/shm  tmpfs  defaults,size=8g  0 0",
+        ],
+        needs_sudo: true,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "df -h /dev/shm",
+        notes: &[
+            "A running container cannot have its allowance changed. It has to be started again with the larger value.",
+            "This is reported below 1 GiB. Silence is not proof of enough: a container given 2 GiB clears that bar and can still be too small for a large model.",
+            "8g matches what fix-10-container already tells you to pass, so the two stay consistent.",
+        ],
+        // Not `LINUX_ONLY`: the size of a tmpfs has nothing to do with the
+        // amdgpu module, and WSL2 ships the same 64 MB default a container does.
+        applies_on: LINUX_AND_WSL,
+        runner: None,
+    },
 ];
+
+/// Assert that a recipe whose steps span more than one shell says which shell
+/// each group runs in.
+///
+/// Shared by the two copies of the plan — the catalog recipe here and the
+/// `Fix` [`crate::diagnose`] attaches to its finding — because a divergence
+/// between them is exactly the kind of thing a reader would meet and not the
+/// author.
+///
+/// Scope, so the guarantee is not read wider than it is: this holds the
+/// *command block* only, and only its shell boundary. It says nothing about
+/// `summary`, `notes` or `verify`. Byte-equality of the two blocks is a
+/// separate check — [`assert_plan_matches_the_catalog_copy`] — and the prose
+/// around them is deliberately not identical, because [`FixRecipe`] has a
+/// `rationale` field that `Fix` has no counterpart for: the upstream-defect
+/// explanation that `diagnose` carries as a note is printed by `rocm fix` out
+/// of `rationale` instead, and duplicating it into `notes` would print it
+/// twice.
+///
+/// Both renderers print every line of the block with the same `$ ` prefix, so
+/// ordering alone tells a reader nothing: it does not say that
+/// `rocm engines shell vllm` opened an interactive subshell the probes belong
+/// inside, nor that the reinstall must run outside it because it replaces the
+/// very environment that subshell is standing in. Rendered flat, a user pasting
+/// the block wholesale was left depending on terminal stdin buffering to land
+/// each line in the right shell. Hold the block to marking the boundary in both
+/// directions — ordered (open it, leave it, only then act) and labelled.
+#[cfg(test)]
+pub(crate) fn assert_engine_shell_boundary_is_labelled(fix_id: &str, commands: &[&str]) {
+    let position = |needle: &str| {
+        commands
+            .iter()
+            .position(|c| c.trim() == needle)
+            .unwrap_or_else(|| {
+                panic!("{fix_id}: the plan no longer runs `{needle}`:\n{commands:#?}")
+            })
+    };
+    let open = position("rocm engines shell vllm");
+    let leave = position("exit");
+    let act = position("rocm engines install vllm --reinstall");
+    assert!(
+        open < leave && leave < act,
+        "{fix_id}: the subshell has to be opened, then left, and only then may the \
+         reinstall run -- it replaces the environment that subshell stands in:\n{commands:#?}"
+    );
+    let is_comment = |c: &&str| c.trim_start().starts_with('#');
+    assert!(
+        commands[open + 1..leave].iter().any(|c| !is_comment(c)),
+        "{fix_id}: nothing actually runs inside the subshell, so opening one is \
+         unexplained:\n{commands:#?}"
+    );
+    let labelled = |from: usize, to: usize, want: &str| {
+        commands[from..to]
+            .iter()
+            .any(|c| is_comment(c) && c.contains(want))
+    };
+    assert!(
+        labelled(open, leave, "INSIDE"),
+        "{fix_id}: the block has to say the probes run INSIDE the subshell rather \
+         than merely list them after it:\n{commands:#?}"
+    );
+    assert!(
+        labelled(leave, act, "YOUR OWN shell"),
+        "{fix_id}: the block has to say the reinstall runs back in the user's own \
+         shell:\n{commands:#?}"
+    );
+}
+
+/// Assert that the command block a [`crate::diagnose::Fix`] carries is
+/// byte-identical to the catalog recipe's, line for line.
+///
+/// The two are hand-maintained copies of one plan in two modules, and the
+/// block is the part a user pastes into a shell, so a silent divergence is a
+/// user pasting steps that no longer match the ones `rocm fix` prints. Holding
+/// the shell boundary in both (see
+/// [`assert_engine_shell_boundary_is_labelled`]) leaves the wording free to
+/// drift; this closes that.
+#[cfg(test)]
+pub(crate) fn assert_plan_matches_the_catalog_copy(fix_id: &str, commands: &[&str]) {
+    let recipe = find_recipe(fix_id)
+        .unwrap_or_else(|| panic!("{fix_id}: no catalog recipe to compare the plan against"));
+    assert_eq!(
+        recipe.commands, commands,
+        "{fix_id}: the plan `diagnose` attaches has drifted from the catalog recipe \
+         `rocm fix` prints; they are one plan and a user may meet either copy"
+    );
+}
+
+/// Assert that the `needs_reboot` a [`crate::diagnose::Fix`] carries matches
+/// the catalog recipe's.
+///
+/// Same hand-maintained-copies problem as [`assert_plan_matches_the_catalog_copy`],
+/// for a single flag instead of the command block: `FixRecipe` and `Fix` set
+/// `needs_reboot` independently, so a silent divergence means `rocm diagnose`
+/// and `rocm fix <id>` tell a user different things about the same fix-id
+/// (this is what happened with `fix-5-amdgpu-load` before it was closed here).
+#[cfg(test)]
+pub(crate) fn assert_needs_reboot_matches_the_catalog(fix_id: &str, needs_reboot: bool) {
+    let recipe = find_recipe(fix_id)
+        .unwrap_or_else(|| panic!("{fix_id}: no catalog recipe to compare against"));
+    assert_eq!(
+        recipe.needs_reboot, needs_reboot,
+        "{fix_id}: diagnose's needs_reboot has drifted from the catalog recipe \
+         `rocm fix` reports; a user may see either surface for the same fix-id"
+    );
+}
 
 fn find_recipe(fix_id: &str) -> Option<&'static FixRecipe> {
     RECIPES.iter().find(|r| r.fix_id == fix_id)
 }
 
-const fn current_os() -> &'static str {
+/// The oldest ROCm major this CLI will leave on a machine.
+///
+/// A statement about the product, not a preference: the installer ships ROCm 7
+/// series wheels and supports the ROCm 10 layout, so 7 is the floor a user can
+/// actually end up on. Remediations are checked against it, because a step
+/// naming a wheel index older than this cannot help anyone the catalog can
+/// reach — and in `fix-8-wheel-rocm`'s case re-creates the very mismatch it
+/// reports.
+///
+/// Raise it when the installer stops producing ROCm 7.
+///
+/// Test-only: it exists to be asserted against, not to steer runtime behaviour.
+#[cfg(test)]
+pub(crate) const OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS: u32 = 7;
+
+/// Every PyTorch ROCm wheel index named in `commands`, as `(major, command)`.
+///
+/// Shared by the catalog's guard and `diagnose`'s, so the two cannot disagree
+/// about what counts as naming an index.
+#[cfg(test)]
+pub(crate) fn torch_rocm_indexes_named_in<'a>(
+    commands: impl IntoIterator<Item = &'a str>,
+) -> Vec<(u32, String)> {
+    commands
+        .into_iter()
+        .filter_map(|c| {
+            let tail = &c[c.find("download.pytorch.org/whl/")?..];
+            let digits: String = tail[tail.find("rocm")? + 4..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok().map(|major| (major, c.to_owned()))
+        })
+        .collect()
+}
+
+/// The platform family a recipe's `applies_on` is matched against.
+///
+/// WSL2 is its own family rather than `linux`, mirroring `diagnose`. That is what
+/// makes `rocm fix fix-4-render-group` on a WSL host refuse with "wrong OS"
+/// instead of running `usermod` for a group that governs nothing there — and it
+/// is why recipes valid on both platforms have to name `wsl` explicitly.
+///
+/// Not `const fn`: unlike the OS, WSL has to be probed at runtime.
+fn current_os() -> &'static str {
     if runtime_is_windows() {
         "windows"
     } else if runtime_is_linux() {
-        "linux"
+        if crate::is_wsl_host() { "wsl" } else { "linux" }
     } else {
         "other"
     }
@@ -390,6 +793,18 @@ fn looks_like_a_diagnosis_position(value: &str) -> bool {
     let trimmed = value.trim();
     let digits = trimmed.strip_prefix('#').unwrap_or(trimmed);
     !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether the CLI will apply `fix_id` itself, or `None` if it isn't a known
+/// fix. `RECIPES` is the authority: `apply()` dispatches on it, so this is the
+/// value any other surface describing a fix has to agree with.
+///
+/// Test-only: the one production consumer is `apply()`, which reads the recipe
+/// directly. This exists so `diagnose`'s tests can assert the two surfaces
+/// agree without exposing `RECIPES`.
+#[cfg(test)]
+pub(crate) fn auto_applicable_for(fix_id: &str) -> Option<bool> {
+    find_recipe(fix_id).map(|r| r.auto_applicable)
 }
 
 /// List every fix-id (id, kind, OS scope, title).
@@ -417,6 +832,46 @@ pub fn list_recipes() -> String {
     out
 }
 
+/// Canonical wording for a fix's remediation flags, shared by `rocm fix <id>`
+/// and `rocm diagnose` so the same `(sudo, reboot, relogin, auto_applicable)`
+/// values render as the same text from either command. This only
+/// standardizes wording, not the underlying values: `FixRecipe` (fix.rs) and
+/// diagnose's `Fix` still supply those independently, so a fix-id's rendered
+/// flags can still differ if the two disagree on a value; `assert_needs_reboot_matches_the_catalog`
+/// and `assert_plan_matches_the_catalog_copy` are targeted regression tests
+/// that pin specific fix-ids against that drift, not a blanket guarantee for
+/// every fix-id. Also out of scope: the bare `rocm fix` catalog listing
+/// (`list_recipes`) describes the same `auto_applicable` property with a
+/// separate, untouched AUTO/PRINT-ONLY vocabulary.
+// These mirror the `FixRecipe`/`Fix` struct fields, where
+// `clippy::struct_excessive_bools` is already allowed workspace-wide; that
+// allow doesn't reach this free function's parameters, so
+// `clippy::fn_params_excessive_bools` is separately allowed below.
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) fn format_flags(
+    needs_sudo: bool,
+    needs_reboot: bool,
+    needs_relogin: bool,
+    auto_applicable: bool,
+) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if needs_sudo {
+        flags.push("requires sudo");
+    }
+    if needs_reboot {
+        flags.push("requires reboot");
+    }
+    if needs_relogin {
+        flags.push("requires re-login");
+    }
+    flags.push(if auto_applicable {
+        "rocm fix can run it"
+    } else {
+        "manual only (`rocm fix` will NOT run it automatically)"
+    });
+    flags
+}
+
 fn print_recipe(r: &FixRecipe) {
     println!("Fix:        {}  -- {}", r.fix_id, r.title);
     println!("OS scope:   {}", r.applies_on.join(", "));
@@ -427,22 +882,13 @@ fn print_recipe(r: &FixRecipe) {
             println!("  $ {c}");
         }
     }
-    let mut flags = Vec::new();
-    if r.needs_sudo {
-        flags.push("requires sudo");
-    }
-    if r.needs_reboot {
-        flags.push("requires reboot");
-    }
-    if r.needs_relogin {
-        flags.push("requires re-login");
-    }
-    if !r.auto_applicable {
-        flags.push("manual only (this command will NOT run it)");
-    }
-    if !flags.is_empty() {
-        println!("Flags:      {}", flags.join(", "));
-    }
+    let flags = format_flags(
+        r.needs_sudo,
+        r.needs_reboot,
+        r.needs_relogin,
+        r.auto_applicable,
+    );
+    println!("Flags:      {}", flags.join(", "));
     for n in r.notes {
         println!("Note:       {n}");
     }
@@ -455,20 +901,18 @@ fn print_recipe(r: &FixRecipe) {
 #[must_use]
 pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     let Some(recipe) = find_recipe(fix_id) else {
-        eprintln!("Unknown fix-id: {fix_id}");
+        fail!("Unknown fix-id: {fix_id}");
         if looks_like_a_diagnosis_position(fix_id) {
             // `rocm diagnose` ranks findings `#1`, `#2`, and users reach for that
             // number here. It is a position in one report, not a name -- and it
-            // does not line up with the catalog's `fix-1 … fix-15` either, so a
+            // does not line up with the catalog's `fix-N` names either, so a
             // bare "unknown id" left them with nothing to correct.
-            eprintln!(
-                "`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id."
-            );
-            eprintln!(
+            fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
+            fail!(
                 "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
             );
         } else {
-            eprintln!("Run `rocm diagnose` to see which fix-id applies.");
+            fail!("Run `rocm diagnose` to see which fix-id applies.");
         }
         return 2;
     };
@@ -477,7 +921,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 
     let os = current_os();
     if !recipe.applies_on.contains(&os) {
-        println!(
+        fail!(
             "This fix only applies on: {}. Running OS is: {os}.",
             recipe.applies_on.join(", ")
         );
@@ -496,7 +940,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
     } else {
         // Internal error (auto-applicable recipe with no runner) -> 1, not 4
         // (4 is reserved for "attempted but the command failed").
-        eprintln!("Internal error: auto-applicable recipe has no runner.");
+        fail!("Internal error: auto-applicable recipe has no runner.");
         1
     }
 }
@@ -505,20 +949,43 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
 // Consent / environment helpers
 // ---------------------------------------------------------------------------
 
-fn confirm(prompt: &str, assume_yes: bool) -> bool {
+/// The half of the consent decision that needs no I/O: `Some(verdict)` when the
+/// answer is already determined, `None` when the user must actually be asked.
+///
+/// Split out from [`confirm`] so the two rules that matter — `--yes` approves,
+/// and a non-interactive shell *refuses* rather than silently proceeding — are
+/// testable without a controlled stdin. A test that drove `confirm` directly
+/// would block on `read_line` whenever the suite happened to run with a terminal
+/// attached.
+const fn consent_without_prompt(assume_yes: bool, stdin_is_terminal: bool) -> Option<bool> {
     if assume_yes {
-        return true;
+        return Some(true);
     }
-    if !std::io::stdin().is_terminal() {
-        println!("Non-interactive shell and --yes not passed; refusing to apply.");
-        return false;
+    if !stdin_is_terminal {
+        return Some(false);
+    }
+    None
+}
+
+fn confirm(prompt: &str, assume_yes: bool) -> bool {
+    if let Some(verdict) = consent_without_prompt(assume_yes, std::io::stdin().is_terminal()) {
+        if !verdict {
+            fail!("Non-interactive shell and --yes not passed; refusing to apply.");
+        }
+        return verdict;
     }
     print!("{prompt} [y/N]: ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        return false;
+    let confirmed = std::io::stdin().read_line(&mut line).is_ok() && is_affirmative_answer(&line);
+    if !confirmed {
+        fail!("Not confirmed; refusing to apply.");
     }
+    confirmed
+}
+
+/// Parse a user's typed response to a `[y/N]` prompt.
+fn is_affirmative_answer(line: &str) -> bool {
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
@@ -565,16 +1032,16 @@ fn run_render_group(opts: &FixOptions) -> i32 {
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default();
     if user.is_empty() {
-        println!("Could not determine current user from $USER/$LOGNAME.");
+        fail!("Could not determine current user from $USER/$LOGNAME.");
         return 3;
     }
     if !which("usermod") {
-        println!("`usermod` not on PATH; cannot add groups.");
+        fail!("`usermod` not on PATH; cannot add groups.");
         return 3;
     }
     let root = is_root();
     if !which("sudo") && !root {
-        println!("`sudo` is not on PATH and we are not root; cannot add groups.");
+        fail!("`sudo` is not on PATH and we are not root; cannot add groups.");
         return 3;
     }
     let (program, args): (&str, Vec<String>) = if root {
@@ -609,10 +1076,9 @@ fn run_render_group(opts: &FixOptions) -> i32 {
     }
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (rc, out, err) = run(program, &arg_refs, RUN_TIMEOUT);
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
-        println!("usermod exited {rc}; group membership NOT changed.");
+        fail!("usermod exited {rc}; group membership NOT changed.");
         return 4;
     }
     println!("Added {user} to render,video.");
@@ -644,15 +1110,26 @@ fn run_unset_override_linux() -> i32 {
     let Some(home) = home_dir() else {
         return 0;
     };
-    let candidates = [
+    report_persistent_override(&[
         home.join(".bashrc"),
         home.join(".bash_profile"),
         home.join(".zshrc"),
         home.join(".profile"),
         home.join(".config").join("fish").join("config.fish"),
-    ];
-    let hits: Vec<PathBuf> = candidates
-        .into_iter()
+    ])
+}
+
+/// Report which of `candidates` persist `HSA_OVERRIDE_GFX_VERSION`, and leave
+/// every one of them exactly as it was.
+///
+/// Takes the paths rather than deriving them from `$HOME`, for the same reason
+/// [`pin_device_in_rc_file`] takes its rc path: it makes the promise testable
+/// without mutating a process-global. And the promise needs testing — fix-2 is
+/// flagged `auto_applicable`, so `skills/rocm-doctor/` has to say plainly that
+/// this arm still only reports, and something has to hold that true.
+fn report_persistent_override(candidates: &[PathBuf]) -> i32 {
+    let hits: Vec<&PathBuf> = candidates
+        .iter()
         .filter(|f| {
             std::fs::read_to_string(f).is_ok_and(|b| b.contains("HSA_OVERRIDE_GFX_VERSION"))
         })
@@ -688,6 +1165,31 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
     }
     let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User");
     let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine");
+    report_and_clear_override_windows(opts, &user_val, &machine_val, |prompt| {
+        confirm(prompt, opts.yes)
+    })
+}
+
+/// Does the reporting/clearing work for [`run_unset_override_windows`], with
+/// the User/Machine scope values and the consent prompt taken as parameters
+/// rather than read from `ps_env_scope`/`confirm` directly. That's what makes
+/// the decline path testable without a real Windows host -- same reason
+/// [`pin_device_in_rc_file`] takes its consent as a closure.
+///
+/// A decline must still exit `5`: `skills/rocm-doctor/reference.md` documents
+/// `5` as "user declined", and a caller (human or agent) relies on that to
+/// tell "nothing happened because you said no" apart from "nothing happened
+/// because there was nothing to do". Declining just the User scope can't
+/// short-circuit straight to `return 5`, though -- if the Machine scope is
+/// also set, the guidance for clearing it (which needs an elevated shell)
+/// still has to print unconditionally, so the decline is recorded in a flag
+/// and checked only once both scopes have had their say.
+fn report_and_clear_override_windows(
+    opts: &FixOptions,
+    user_val: &str,
+    machine_val: &str,
+    consent: impl FnOnce(&str) -> bool,
+) -> i32 {
     if user_val.is_empty() && machine_val.is_empty() {
         println!("\nNo persistent HSA_OVERRIDE_GFX_VERSION found in either the User");
         println!("or Machine env scope. You're done after closing/reopening shells.");
@@ -700,20 +1202,22 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
     if !machine_val.is_empty() {
         println!("  Machine scope: {machine_val}");
     }
+    let mut declined = false;
     if !user_val.is_empty() {
         println!("\nClear from the User scope (no admin needed):");
         println!("  Will run: setx HSA_OVERRIDE_GFX_VERSION \"\"");
         if opts.dry_run {
             println!("  (dry-run; not executed)");
-        } else if confirm("Clear HSA_OVERRIDE_GFX_VERSION from User scope?", opts.yes) {
+        } else if consent("Clear HSA_OVERRIDE_GFX_VERSION from User scope?") {
             let (rc, out, err) = run("setx", &["HSA_OVERRIDE_GFX_VERSION", ""], RUN_TIMEOUT);
-            print!("{out}");
-            eprint!("{err}");
+            relay_output(&out, &err);
             if rc != 0 {
-                println!("setx exited {rc}; User scope NOT changed.");
+                fail!("setx exited {rc}; User scope NOT changed.");
                 return 4;
             }
             println!("Cleared from User scope. Reopen your terminal for it to take effect.");
+        } else {
+            declined = true;
         }
     }
     if !machine_val.is_empty() {
@@ -727,7 +1231,7 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
             "or remove it through System Properties -> Environment Variables -> System variables. This command does NOT elevate itself."
         );
     }
-    0
+    if declined { 5 } else { 0 }
 }
 
 /// fix-6: persist the ROCm/HIP bin directory on PATH (with consent).
@@ -743,12 +1247,12 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     // Same resolver `examine` uses, so the line we append names the install the
     // report pointed at -- including a versioned root like /opt/rocm-6.4.1.
     let Some(install) = crate::discover_rocm_installs().into_iter().next() else {
-        println!("No ROCm install found; nothing to add to PATH.");
+        fail!("No ROCm install found; nothing to add to PATH.");
         return 3;
     };
     let bin_path = install.path.join("bin");
     if !bin_path.is_dir() {
-        println!(
+        fail!(
             "{} does not exist; nothing to add to PATH.",
             bin_path.display()
         );
@@ -757,7 +1261,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
     let bin_dir_owned = bin_path.to_string_lossy().into_owned();
     let bin_dir = bin_dir_owned.as_str();
     let Some(rc_file) = shell_rc_file() else {
-        println!("Could not determine your home directory.");
+        fail!("Could not determine your home directory.");
         return 3;
     };
     let export_line = format!("export PATH=\"{bin_dir}:$PATH\"");
@@ -786,7 +1290,7 @@ fn run_path_export_linux(opts: &FixOptions) -> i32 {
         "# Added by rocm examine (fix-6-path)",
         &export_line,
     ) {
-        println!("Failed to write {}: {exc}", rc_file.display());
+        fail!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -803,12 +1307,12 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         sdk_path = newest_rocm_install_dir();
     }
     if sdk_path.is_empty() {
-        println!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
+        fail!("No HIP SDK install found. Run fix-13-hip-sdk-missing first.");
         return 3;
     }
     let bin_dir = Path::new(&sdk_path).join("bin");
     if !bin_dir.is_dir() {
-        println!(
+        fail!(
             "{} does not exist on disk; HIP SDK install looks incomplete.",
             bin_dir.display()
         );
@@ -835,10 +1339,9 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         return 5;
     }
     let (rc, out, err) = run("setx", &["PATH", &new_path], RUN_TIMEOUT);
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
-        println!("setx exited {rc}; User PATH NOT changed.");
+        fail!("setx exited {rc}; User PATH NOT changed.");
         return 4;
     }
     println!(
@@ -850,7 +1353,7 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
 /// fix-9: persist HIP_VISIBLE_DEVICES so the iGPU is hidden.
 fn run_hip_visible_devices(opts: &FixOptions) -> i32 {
     if let Some(idx) = opts.device_index.filter(|&i| i < 0) {
-        println!("--device-index must be >= 0 (got {idx}).");
+        fail!("--device-index must be >= 0 (got {idx}).");
         return 3;
     }
     if runtime_is_windows() {
@@ -870,11 +1373,32 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         return 0;
     };
     let Some(rc_file) = shell_rc_file() else {
-        println!("Could not determine your home directory.");
+        fail!("Could not determine your home directory.");
         return 3;
     };
+    pin_device_in_rc_file(&rc_file, idx, opts, || {
+        confirm(&format!("Append to {}?", rc_file.display()), opts.yes)
+    })
+}
+
+/// The part of fix-9 that actually touches the user's machine: decide whether
+/// the rc file already pins a device, honour `--dry-run`, ask for consent, and
+/// append.
+///
+/// Taking the rc path and the consent decision as parameters keeps this — the
+/// one auto-fix path on Linux that really mutates a file — testable end to end
+/// against a temp file, with no `$HOME` mutation and no dependency on whether
+/// stdin happens to be a terminal. Exit codes are the contract documented in
+/// `skills/rocm-doctor/reference.md`: 0 applied/dry-run/already-set, 4 write
+/// failed, 5 declined.
+fn pin_device_in_rc_file(
+    rc_file: &Path,
+    idx: i64,
+    opts: &FixOptions,
+    consent: impl FnOnce() -> bool,
+) -> i32 {
     let export_line = format!("export HIP_VISIBLE_DEVICES={idx}");
-    if let Ok(existing) = std::fs::read_to_string(&rc_file)
+    if let Ok(existing) = std::fs::read_to_string(rc_file)
         && existing.contains("HIP_VISIBLE_DEVICES=")
     {
         println!(
@@ -889,15 +1413,15 @@ fn run_hip_visible_devices_linux(opts: &FixOptions) -> i32 {
         println!("(dry-run; not executed)");
         return 0;
     }
-    if !confirm(&format!("Append to {}?", rc_file.display()), opts.yes) {
+    if !consent() {
         return 5;
     }
     if let Err(exc) = append_line(
-        &rc_file,
+        rc_file,
         "# Added by rocm examine (fix-9-igpu-dgpu)",
         &export_line,
     ) {
-        println!("Failed to write {}: {exc}", rc_file.display());
+        fail!("Failed to write {}: {exc}", rc_file.display());
         return 4;
     }
     println!(
@@ -941,10 +1465,9 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         &["HIP_VISIBLE_DEVICES", &idx.to_string()],
         RUN_TIMEOUT,
     );
-    print!("{out}");
-    eprint!("{err}");
+    relay_output(&out, &err);
     if rc != 0 {
-        println!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
+        fail!("setx exited {rc}; HIP_VISIBLE_DEVICES NOT changed.");
         return 4;
     }
     println!(
@@ -981,11 +1504,30 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
 /// It now asks the same resolver as `examine`, which also means `$ROCM_PATH` is
 /// honoured here for the first time.
 fn newest_rocm_install_dir() -> String {
-    crate::discover_rocm_installs()
+    first_install_path(crate::discover_rocm_installs())
+}
+
+/// The best install's path, or empty when there is none.
+fn first_install_path(installs: Vec<crate::RocmInstall>) -> String {
+    installs
         .into_iter()
         .next()
         .map(|install| install.path.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// [`newest_rocm_install_dir`] against a caller-supplied `$ROCM_PATH` and
+/// search roots, so a test can drive it without touching the process
+/// environment. Same seam as [`crate::discover_rocm_installs_in`].
+#[cfg(test)]
+fn newest_rocm_install_dir_in(
+    search_dirs: &[std::path::PathBuf],
+    env_override: Option<&std::path::Path>,
+) -> String {
+    first_install_path(crate::discover_rocm_installs_on_host_in(
+        search_dirs,
+        env_override,
+    ))
 }
 
 #[cfg(test)]
@@ -995,7 +1537,33 @@ mod tests {
     // Serializes tests that replace the process-global `ROCM_PATH` env var while
     // they run. Because env is shared across all test threads, two such tests
     // running concurrently can otherwise see each other's value mid-test.
+    //
+    // Deliberately kept alongside the seam rather than instead of it, and the
+    // split is not arbitrary: tests about resolution semantics take the seam
+    // and never touch the environment, and exactly one test — the one whose
+    // subject IS the `$ROCM_PATH` read — takes this lock. Anything provable
+    // through the seam should not be reaching for the lock.
     static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn is_affirmative_answer_accepts_only_y_and_yes() {
+        for accepted in ["y", "Y", "yes", "YES", "Yes", "  y  ", "  yes\n"] {
+            assert!(
+                is_affirmative_answer(accepted),
+                "expected {accepted:?} to be treated as a yes"
+            );
+        }
+    }
+
+    #[test]
+    fn is_affirmative_answer_rejects_everything_else() {
+        for declined in ["n", "no", "", "\n", "yep", "ye"] {
+            assert!(
+                !is_affirmative_answer(declined),
+                "expected {declined:?} to be treated as a decline"
+            );
+        }
+    }
 
     /// Plant a directory the shared resolver will accept as a ROCm install.
     /// `bin/rocminfo` is one of the markers it gates on; a bare directory is
@@ -1006,16 +1574,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_finds_the_install_the_rest_of_the_cli_found() {
         // Discriminating on purpose: the scanner this replaces looked only in
         // two hardcoded `C:\Program Files` directories and ignored $ROCM_PATH
         // outright, so it returned nothing here no matter what was planted.
         // Going through the shared resolver is what makes this pass -- and is
         // what stops fix-6-path putting 6.2 on PATH when 6.10 is installed.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-resolver-{}-{:?}",
             std::process::id(),
@@ -1024,35 +1588,121 @@ mod tests {
         let install = root.join("rocm-6.10.0");
         plant_install(&install);
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &install);
+        // A second, older install reachable through the hardcoded search roots.
+        // Passing it alongside the override is what exercises the ordering the
+        // assertion below claims: with `&[]` the search loop never runs, so
+        // "the override outranks the search roots" would hold vacuously.
+        //
+        // Planted in BOTH shapes because the resolver is told the host's
+        // layout: `rocm-6.2.0` is a versioned sibling and only matches on
+        // Linux, `6.2` is a bare-version child and only matches on Windows.
+        // Planting one shape would leave the search loop empty on the other
+        // platform and make the ordering half vacuous again -- on Windows
+        // first, which is the lane this test exists for.
+        let searched = root.join("search");
+        plant_install(&searched.join("rocm-6.2.0"));
+        plant_install(&searched.join("6.2"));
+
+        // The override goes in as an argument rather than through
+        // `std::env::set_var`: the environment is process-global, so a sibling
+        // test mutating $ROCM_PATH between this set and its read used to make
+        // this assertion fail on whichever test lost the race.
+        // `..._reads_rocm_path_from_the_environment` covers the real read.
+        let found = newest_rocm_install_dir_in(std::slice::from_ref(&searched), Some(&install));
+        // Run the same search WITHOUT the override, so the ordering claim below
+        // cannot pass by finding nothing to outrank. A planted decoy the
+        // resolver's layout does not recognise is indistinguishable, from the
+        // assertion's point of view, from no decoy at all.
+        let without_override = newest_rocm_install_dir_in(std::slice::from_ref(&searched), None);
+
+        // The check above only exercises whichever decoy shape THIS host's
+        // layout recognises, so deleting the other one leaves Linux green and
+        // the regression waits for the Windows lane to surface it. The seam
+        // already takes the layout, so driving it with both discriminates on
+        // every host for the cost of one loop.
+        let by_layout: Vec<(crate::RocmLayout, bool)> = [
+            (crate::RocmLayout::Siblings, "rocm-6.2.0"),
+            (crate::RocmLayout::Children, "6.2"),
+        ]
+        .into_iter()
+        .map(|(layout, decoy)| {
+            let installs = crate::discover_rocm_installs_in_layout(
+                std::slice::from_ref(&searched),
+                None,
+                layout,
+            );
+            (
+                layout,
+                installs.iter().any(|install| install.path.ends_with(decoy)),
+            )
+        })
+        .collect();
+
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !without_override.is_empty(),
+            "the decoy must be reachable through the search roots on this \
+             platform, or 'the override outranks them' holds vacuously"
+        );
+        for (layout, reached) in by_layout {
+            assert!(
+                reached,
+                "the {layout:?} decoy must be reachable under that layout, or \
+                 the ordering claim is vacuous on the platform that uses it"
+            );
         }
+        assert_eq!(
+            found,
+            install.to_string_lossy(),
+            "fix-6-path must resolve installs the same way examine does, and \
+             $ROCM_PATH must outrank the hardcoded search roots"
+        );
+    }
+
+    /// The seam tests above deliberately bypass `$ROCM_PATH`, so on their own
+    /// the production read could be deleted and the suite would stay green.
+    /// This one drives the real entry point against a real variable.
+    ///
+    /// It takes the lock rather than a seam because exercising the env read IS
+    /// the point — the escape hatch the contract guard advertises for exactly
+    /// this case.
+    #[test]
+    fn the_path_fix_reads_rocm_path_from_the_environment() {
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-fix-path-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let install = root.join("rocm-6.10.0");
+        plant_install(&install);
+
+        // Restored on drop rather than on the next line, so a panic inside the
+        // resolver cannot leave this key pointing at the directory removed
+        // below. `RestoredEnvVar` only restores; the lock above is what
+        // serializes, and the contract guard requires it here because
+        // `RestoredEnvVar::set(` is in its mutation list.
+        let restore = crate::test_env::RestoredEnvVar::set("ROCM_PATH", &install);
         let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        drop(restore);
+
         std::fs::remove_dir_all(&root).ok();
 
         assert_eq!(
             found,
             install.to_string_lossy(),
-            "fix-6-path must resolve installs the same way examine does"
+            "fix-6-path must reach $ROCM_PATH through the shared resolver"
         );
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn the_path_fix_reports_nothing_rather_than_a_directory_with_no_install_in_it() {
         // The old scan accepted any directory whose name started with a digit,
         // so an empty leftover could be put on PATH. The resolver requires a
         // marker.
-        let _guard = PROCESS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
             "rocm-fix-path-empty-{}-{:?}",
             std::process::id(),
@@ -1061,22 +1711,51 @@ mod tests {
         let empty = root.join("6.10");
         std::fs::create_dir_all(&empty).expect("create empty dir");
 
-        let previous = std::env::var_os("ROCM_PATH");
-        unsafe {
-            std::env::set_var("ROCM_PATH", &empty);
-        }
-        let found = newest_rocm_install_dir();
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("ROCM_PATH", value),
-                None => std::env::remove_var("ROCM_PATH"),
-            }
-        }
+        let found = newest_rocm_install_dir_in(&[], Some(&empty));
+
         std::fs::remove_dir_all(&root).ok();
 
         assert!(
             found.is_empty(),
             "an empty directory is not an install, but {found:?} was returned"
+        );
+    }
+
+    /// No entry sends a user to a wheel index older than any ROCm this CLI
+    /// installs.
+    ///
+    /// The decay this catches is invisible to everything else. The advice
+    /// compiles, the tests pass, and `assert_plan_matches_the_catalog_copy`
+    /// confirms the catalog and `diagnose` copies agree — which they did, while
+    /// both went stale together. A guard checking that two copies match each
+    /// other cannot notice that both have drifted from the world outside.
+    #[test]
+    fn no_remediation_names_a_wheel_index_older_than_the_rocm_we_install() {
+        let named: Vec<(&str, u32, String)> = RECIPES
+            .iter()
+            .flat_map(|r| {
+                torch_rocm_indexes_named_in(r.commands.iter().copied())
+                    .into_iter()
+                    .map(move |(major, command)| (r.fix_id, major, command))
+            })
+            .collect();
+
+        // Non-vacuity: entries do name wheel indexes, and a parser that matched
+        // none would leave the assertion below checking an empty list forever.
+        assert!(
+            !named.is_empty(),
+            "no entry was seen to name a wheel index, so this guard is checking nothing"
+        );
+
+        let stale: Vec<_> = named
+            .iter()
+            .filter(|(_, major, _)| *major < OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "these steps name a ROCm older than {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, the oldest \
+             this CLI installs, so a user following them installs a framework for a major they \
+             do not have: {stale:#?}"
         );
     }
 
@@ -1087,7 +1766,43 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        assert_eq!(count, 15, "expected 15 catalog entries");
+        // 17 bare-metal/Windows entries (fix-17 and fix-19 among them) plus the
+        // 7 WSL ones.
+        assert_eq!(count, 24, "expected 24 catalog entries");
+    }
+
+    #[test]
+    fn the_dlpack_recipe_says_which_shell_each_step_runs_in() {
+        let recipe =
+            find_recipe("fix-17-torch-dlpack").expect("fix-17-torch-dlpack must be in the catalog");
+        assert_engine_shell_boundary_is_labelled(recipe.fix_id, recipe.commands);
+    }
+
+    #[test]
+    fn current_os_reports_wsl_exactly_when_is_wsl_host_does() {
+        // `current_os()`'s wsl branch is `crate::is_wsl_host()`, which is
+        // `crate::wsl_signals_indicate_wsl()` against the real `/dev/dxg` and
+        // `/proc/version` -- `$WSL_DISTRO_NAME` plays no part any more, so
+        // there is nothing left to force portably here. The table-driven
+        // coverage of the predicate itself lives with
+        // `wsl_signals_indicate_wsl` in lib.rs; this test only checks that
+        // `current_os()` reports the same answer `is_wsl_host()` does on
+        // whatever machine actually runs it, whether that is a bare-metal CI
+        // runner, Windows, or a real WSL host.
+        assert_eq!(
+            current_os() == "wsl",
+            crate::is_wsl_host(),
+            "current_os() must agree with is_wsl_host()"
+        );
+    }
+
+    /// Whether a recipe applies on the platform the test is running on.
+    ///
+    /// Tests used to gate on `runtime_is_linux()`, which stopped being the same
+    /// question once WSL became its own family: a WSL host is Linux, but a
+    /// `LINUX_ONLY` recipe is correctly refused there.
+    fn recipe_applies_here(fix_id: &str) -> bool {
+        find_recipe(fix_id).is_some_and(|r| r.applies_on.contains(&current_os()))
     }
 
     #[test]
@@ -1147,6 +1862,12 @@ mod tests {
         // query that identifies the dGPU, so it is a print-only preview and
         // must return 0 -- not the environment/OS code 3. A dry-run without the
         // argument must likewise succeed, since the runner never mutates.
+        //
+        // fix-9 does not apply on WSL (no per-device topology to collide over),
+        // where the correct answer is the OS refusal this test exists to rule out.
+        if !recipe_applies_here("fix-9-igpu-dgpu") {
+            return;
+        }
         for dry_run in [false, true] {
             let opts = FixOptions {
                 dry_run,
@@ -1162,11 +1883,17 @@ mod tests {
 
     #[test]
     fn print_only_fix_returns_zero() {
-        if !runtime_is_linux() {
-            return;
-        }
-        let code = apply("fix-5-amdgpu-load", &FixOptions::default());
-        assert_eq!(code, 0);
+        // Pick a recipe that applies on THIS platform rather than naming a Linux
+        // one: the assertion is about print-only recipes succeeding, and hunting
+        // for an applicable one keeps that meaningful on every lane instead of
+        // skipping wherever the hardcoded id happens not to apply.
+        let fix_id = RECIPES
+            .iter()
+            .find(|r| !r.auto_applicable && r.applies_on.contains(&current_os()))
+            .map(|r| r.fix_id)
+            .expect("every supported platform has at least one print-only recipe");
+        let code = apply(fix_id, &FixOptions::default());
+        assert_eq!(code, 0, "{fix_id} is print-only here and must succeed");
     }
 
     #[test]
@@ -1230,5 +1957,340 @@ mod tests {
         // behaviour that a script could start depending on.
         assert_eq!(apply("#1", &FixOptions::default()), 2);
         assert_eq!(apply("bogus", &FixOptions::default()), 2);
+    }
+
+    #[test]
+    fn format_flags_covers_every_flag_combination_and_both_auto_states() {
+        // Exhaustive over all 2^4 = 16 combinations of the 3 optional flags
+        // (sudo/reboot/relogin) x both auto_applicable states, so a wording
+        // regression on any one flag, or on the always-present auto/manual
+        // marker, fails here rather than only being visible by eyeballing
+        // `rocm fix`/`rocm diagnose` output.
+        for bits in 0..16u8 {
+            let needs_sudo = bits & 1 != 0;
+            let needs_reboot = bits & 2 != 0;
+            let needs_relogin = bits & 4 != 0;
+            let auto_applicable = bits & 8 != 0;
+
+            let mut expected = Vec::new();
+            if needs_sudo {
+                expected.push("requires sudo");
+            }
+            if needs_reboot {
+                expected.push("requires reboot");
+            }
+            if needs_relogin {
+                expected.push("requires re-login");
+            }
+            expected.push(if auto_applicable {
+                "rocm fix can run it"
+            } else {
+                "manual only (`rocm fix` will NOT run it automatically)"
+            });
+
+            let flags = format_flags(needs_sudo, needs_reboot, needs_relogin, auto_applicable);
+            assert_eq!(
+                flags, expected,
+                "sudo={needs_sudo} reboot={needs_reboot} relogin={needs_relogin} auto={auto_applicable}"
+            );
+        }
+    }
+
+    #[test]
+    fn needs_reboot_true_fix_ids_match_the_known_set() {
+        // assert_needs_reboot_matches_the_catalog only ever runs for
+        // fix-5-amdgpu-load, so the other 23 fix-ids' hardcoded needs_reboot
+        // literals in diagnose.rs have no guard against drifting from the
+        // catalog. This doesn't reach into diagnose.rs, but it does catch an
+        // accidental catalog edit and pins the expected set by name so a
+        // deliberate catalog change forces a look at diagnose.rs's matching
+        // literals too.
+        let expected: std::collections::BTreeSet<&str> = [
+            "fix-3-rocm-kernel",
+            "fix-5-amdgpu-load",
+            "fix-11-iommu",
+            "fix-12-installer",
+            "fix-14-adrenalin-too-old",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&str> = RECIPES
+            .iter()
+            .filter(|r| r.needs_reboot)
+            .map(|r| r.fix_id)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "the catalog's needs_reboot:true set has changed -- update diagnose.rs's \
+             matching literals and this test's expected set together"
+        );
+    }
+
+    // ── Consent and mutation contract ──────────────────────────────
+    //
+    // `skills/rocm-doctor/reference.md` documents six exit codes, and the skill
+    // tells an agent it may run an auto-fix because the CLI "refuses on a
+    // non-interactive shell without --yes" and "confirms before mutating".
+    // Before these tests, codes 1, 4 and 5 were asserted nowhere in the repo and
+    // no test ever reached a runner that writes to disk: the two that look like
+    // they cover it don't — `dry_run_never_mutates_...` picks fix-2, whose Linux
+    // runner takes no FixOptions and never prompts, and diagnose.feature's
+    // preview scenario picks print-only fix-1, which returns before any runner.
+    //
+    // fix-9 is the auto-fix used here because its Linux runner is the one that
+    // genuinely appends to a file, and `pin_device_in_rc_file` lets that run
+    // against a temp path with an injected consent verdict.
+
+    /// A unique scratch path under the workspace's test-artifact dir, following
+    /// the convention in `lib.rs`'s tests (no `tempfile` dev-dependency here).
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("core")
+            .join(format!(
+                "fix-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        std::fs::create_dir_all(&dir).expect("failed to create scratch dir");
+        dir
+    }
+
+    fn pinning_opts() -> FixOptions {
+        FixOptions {
+            device_index: Some(1),
+            ..FixOptions::default()
+        }
+    }
+
+    #[test]
+    fn yes_flag_approves_without_prompting() {
+        assert_eq!(consent_without_prompt(true, false), Some(true));
+        assert_eq!(consent_without_prompt(true, true), Some(true));
+    }
+
+    #[test]
+    fn non_interactive_shell_refuses_instead_of_proceeding() {
+        // The rule the skill relies on: without --yes and with nothing to prompt,
+        // the answer is a definite NO, never an implicit yes.
+        assert_eq!(consent_without_prompt(false, false), Some(false));
+    }
+
+    #[test]
+    fn interactive_shell_without_yes_must_actually_ask() {
+        assert_eq!(consent_without_prompt(false, true), None);
+    }
+
+    /// `auto_applicable` means "the CLI has a runner", not "the runner mutates".
+    ///
+    /// fix-2's Linux arm only reports where the override is persisted; it never
+    /// edits dotfiles. `auto_applicable_recipes_have_a_runner` cannot catch a
+    /// regression here, because fix-2 does have a runner — so without this, a
+    /// doc promising a `--dry-run` preview the Linux user never gets stays
+    /// green. That is the drift `skills/rocm-doctor/` exists to prevent.
+    ///
+    /// Asserted on the files themselves rather than on an exit code: a runner
+    /// that started stripping the line would still return 0.
+    #[test]
+    fn reporting_a_persistent_override_never_edits_the_rc_file() {
+        let dir = scratch_dir("fix2-report");
+        let carries = dir.join(".bashrc");
+        let clean = dir.join(".profile");
+        let before = "export HSA_OVERRIDE_GFX_VERSION=10.3.0\nexport PATH=$PATH:/x\n";
+        std::fs::write(&carries, before).expect("seed rc file");
+        std::fs::write(&clean, "# nothing to see\n").expect("seed rc file");
+
+        let code = report_persistent_override(&[carries.clone(), clean.clone()]);
+
+        assert_eq!(code, 0, "reporting is a success, not a refusal");
+        assert_eq!(
+            std::fs::read_to_string(&carries).expect("rc file still readable"),
+            before,
+            "fix-2 on Linux must leave the user's dotfiles byte-identical — \
+             skills/rocm-doctor/ tells an agent it only reports"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&clean).expect("rc file still readable"),
+            "# nothing to see\n",
+            "a file that never carried the override must not be touched either"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Windows arm of fix-2 does mutate (it runs `setx` to clear the User
+    /// scope), so unlike the Linux arm above, a decline has to come back as
+    /// `5`, not `0` -- `skills/rocm-doctor/reference.md` documents `5` as
+    /// "user declined" and an agent tells that apart from "nothing to do"
+    /// this way.
+    #[test]
+    fn windows_decline_on_user_scope_returns_5() {
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| false);
+
+        assert_eq!(code, 5, "a declined User-scope clear must exit 5, not 0");
+    }
+
+    /// Declining the User scope must not swallow the Machine-scope guidance:
+    /// a user with both scopes set still needs the elevated-shell
+    /// instructions printed, so the decline can't `return 5` on the spot --
+    /// it has to fall through and let the Machine-scope block run first.
+    /// This test can't see stdout, but it pins the return code so a future
+    /// change that reintroduces an early `return 5` (skipping that block)
+    /// would have to change this assertion to keep passing.
+    #[test]
+    fn windows_decline_with_machine_scope_also_set_still_returns_5() {
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "11.0.0", |_| {
+                false
+            });
+
+        assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn windows_consent_granted_is_not_treated_as_a_decline() {
+        // `setx` isn't on this host, so a real run would report failure (`4`)
+        // -- the point here is only that the consent gate itself was
+        // reached and answered "yes", not routed as a decline.
+        let code =
+            report_and_clear_override_windows(&FixOptions::default(), "10.3.0", "", |_| true);
+
+        assert_ne!(
+            code, 5,
+            "granted consent must never be reported as declined"
+        );
+    }
+
+    #[test]
+    fn windows_dry_run_short_circuits_before_the_consent_gate() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = report_and_clear_override_windows(&opts, "10.3.0", "", |_| {
+            panic!("dry-run must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0, "a dry-run preview is not a decline");
+    }
+
+    #[test]
+    fn windows_nothing_persisted_in_either_scope_returns_0_without_prompting() {
+        let code = report_and_clear_override_windows(&FixOptions::default(), "", "", |_| {
+            panic!("nothing to clear means no consent gate at all")
+        });
+
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn declining_consent_returns_5_and_writes_nothing() {
+        let rc = scratch_dir("declined").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || false);
+
+        assert_eq!(code, 5, "a declined fix must exit 5");
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            "# existing\n",
+            "a declined fix must not touch the file"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn dry_run_returns_0_and_writes_nothing_even_with_consent() {
+        let rc = scratch_dir("dryrun").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+        let opts = FixOptions {
+            dry_run: true,
+            ..pinning_opts()
+        };
+
+        // Consent would be granted; --dry-run must short-circuit before it.
+        let code = pin_device_in_rc_file(&rc, 1, &opts, || {
+            panic!("dry-run must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            "# existing\n",
+            "a dry-run must not touch the file"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn granting_consent_appends_the_export_and_returns_0() {
+        let rc = scratch_dir("granted").join(".bashrc");
+        std::fs::write(&rc, "# existing\n").expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 3, &pinning_opts(), || true);
+
+        assert_eq!(code, 0);
+        let body = std::fs::read_to_string(&rc).expect("read rc");
+        assert!(
+            body.starts_with("# existing\n"),
+            "existing rc content must be preserved:\n{body}"
+        );
+        assert!(
+            body.contains("export HIP_VISIBLE_DEVICES=3"),
+            "expected the export line to be appended:\n{body}"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn an_rc_file_that_already_pins_a_device_is_left_alone() {
+        let rc = scratch_dir("already-pinned").join(".bashrc");
+        let original = "export HIP_VISIBLE_DEVICES=0\n";
+        std::fs::write(&rc, original).expect("seed rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || {
+            panic!("an already-pinned rc file must not reach the consent gate")
+        });
+
+        assert_eq!(code, 0, "already-pinned is success, not failure");
+        assert_eq!(
+            std::fs::read_to_string(&rc).expect("read rc"),
+            original,
+            "must not append a second, conflicting pin"
+        );
+        std::fs::remove_dir_all(rc.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn a_failed_write_returns_4_rather_than_reporting_success() {
+        // A directory where the rc file should be: the append fails at open().
+        // This is the only way the documented "attempted but the command
+        // failed" code is reachable for this fix.
+        let dir = scratch_dir("write-fails");
+        let rc = dir.join(".bashrc");
+        std::fs::create_dir_all(&rc).expect("create dir in place of rc file");
+
+        let code = pin_device_in_rc_file(&rc, 1, &pinning_opts(), || true);
+
+        assert_eq!(code, 4, "a failed write must exit 4, not 0");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_code_1_is_unreachable_by_construction() {
+        // apply() returns 1 only for an auto_applicable recipe with no runner.
+        // `auto_applicable_recipes_have_a_runner` keeps that impossible; assert
+        // the reachability argument here so reference.md's row 1 is accounted
+        // for rather than silently untested.
+        assert!(
+            RECIPES
+                .iter()
+                .all(|r| !r.auto_applicable || r.runner.is_some()),
+            "an auto-applicable recipe without a runner would make exit 1 reachable"
+        );
     }
 }

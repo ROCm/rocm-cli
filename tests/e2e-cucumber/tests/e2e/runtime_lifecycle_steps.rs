@@ -134,6 +134,12 @@ async fn activate_second(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user activates the second runtime again")]
+async fn activate_second_again(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", SECOND_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user rolls back")]
 async fn rollback(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback"]);
@@ -148,7 +154,21 @@ async fn list_runtimes(world: &mut E2eWorld) {
 
 #[when("the user uninstalls that runtime")]
 async fn uninstall(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user tries to uninstall that runtime without confirming")]
+async fn uninstall_without_yes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user dry-runs an uninstall of that runtime")]
+async fn uninstall_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "uninstall", FIRST_KEY, "--dry-run"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -186,6 +206,11 @@ async fn active_changed_from_nothing(world: &mut E2eWorld) {
         out.contains("changed_from_runtime_key: <unset>"),
         "expected no previous runtime, got:\n{out}"
     );
+    assert!(
+        !out.contains("rocm runtimes rollback"),
+        "no previous runtime is recorded, so rollback would hard-error; \
+         must not hint at a command that immediately fails:\n{out}"
+    );
 }
 
 #[then("that runtime becomes active having changed from the first")]
@@ -199,6 +224,11 @@ async fn active_changed_from_first(world: &mut E2eWorld) {
         out.contains(&format!("changed_from_runtime_key: {FIRST_KEY}")),
         "expected previous runtime {FIRST_KEY}, got:\n{out}"
     );
+    assert!(
+        out.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
+        "a previous runtime is recorded, so the built binary should hint at rollback as a \
+         recovery path, got:\n{out}"
+    );
 }
 
 #[then("the first runtime is active again")]
@@ -207,6 +237,26 @@ async fn first_active_again(world: &mut E2eWorld) {
     assert!(
         out.contains("runtime rolled back") && out.contains(&format!("runtime_key: {FIRST_KEY}")),
         "expected rollback to {FIRST_KEY}, got:\n{out}"
+    );
+}
+
+#[then("the second runtime is still the one in use")]
+async fn second_still_active(world: &mut E2eWorld) {
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert!(
+        listing.contains(&format!("* {SECOND_KEY}")),
+        "expected {SECOND_KEY} to still be the runtime in use, got:\n{listing}"
+    );
+}
+
+#[then("the first runtime is still the rollback target")]
+async fn first_still_rollback_target(world: &mut E2eWorld) {
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert!(
+        listing.contains(&format!("- {FIRST_KEY}")),
+        "re-selecting the runtime already in use is a no-op for the user, so it must not \
+         discard the rollback target the previous activation promised; expected {FIRST_KEY} \
+         still marked as the rollback target, got:\n{listing}"
     );
 }
 
@@ -302,6 +352,50 @@ async fn second_marked_rollback(world: &mut E2eWorld) {
     assert!(
         out.contains(&format!("- {SECOND_KEY}")),
         "expected {SECOND_KEY} marked as rollback target, got:\n{out}"
+    );
+}
+
+#[then("the CLI refuses and requires --yes")]
+async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(rc != 0, "expected refusal, got rc=0:\n{}", combined(world));
+    assert!(
+        combined(world).contains("requires --yes"),
+        "expected a --yes-required error, got:\n{}",
+        combined(world)
+    );
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let entry = root
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{FIRST_KEY}.json"));
+    assert!(
+        entry.exists(),
+        "registry entry must survive a refused uninstall: {}",
+        entry.display()
+    );
+}
+
+#[then("the dry run reports the plan without confirming or changing anything")]
+async fn uninstall_dry_run_reports_plan(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
+        "expected a dry-run plan with no changes made, got:\n{out}"
+    );
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let entry = root
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
+        .join(format!("{FIRST_KEY}.json"));
+    assert!(
+        entry.exists(),
+        "registry entry must survive a dry-run uninstall: {}",
+        entry.display()
     );
 }
 

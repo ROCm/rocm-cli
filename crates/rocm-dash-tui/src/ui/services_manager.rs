@@ -24,7 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
-use rocm_dash_core::metrics::{Instance, ObservationMetadata};
+use rocm_dash_core::metrics::{Instance, ObservationFreshness, ObservationMetadata};
 use rocm_dash_core::state::{SideEffect, State, StateEvent};
 
 use crate::ui::approval::{
@@ -232,6 +232,39 @@ fn port_str(port: Option<u16>) -> String {
     port.map_or_else(|| "—".to_string(), |p| p.to_string())
 }
 
+/// The window of row indices `ratatui`'s `List` will actually render, for a
+/// freshly created `ListState` (`offset` always starts at 0 each frame in
+/// this codebase — see `ListState::default()` below) with no
+/// `scroll_padding` (never set anywhere in this codebase). `List`'s own
+/// `get_items_bounds`/`apply_scroll_padding_to_selected_index` degenerate,
+/// with padding 0 and uniform single-line rows, to exactly this: keep
+/// `[0, max_height)` visible while `selected` fits in it, otherwise slide
+/// the window so `selected` is the last visible row.
+fn visible_list_window(selected: usize, len: usize, max_height: usize) -> std::ops::Range<usize> {
+    if max_height == 0 || len == 0 {
+        return 0..0;
+    }
+    if selected < max_height {
+        0..len.min(max_height)
+    } else {
+        (selected + 1 - max_height)..(selected + 1).min(len)
+    }
+}
+
+/// Plain-English note about managed-service records that are no longer
+/// running, or `None` when there are none.
+///
+/// The overlay lists only the live instances the daemon surfaces, so failed or
+/// stopped servers left no trace here at all. This names the command that shows
+/// them; it deliberately promises nothing the CLI cannot do today.
+fn past_attempts_note(past_attempts: usize) -> Option<String> {
+    (past_attempts > 0).then(|| {
+        format!(
+            "{past_attempts} local server record(s) are no longer running - see `rocm services list --all`"
+        )
+    })
+}
+
 /// Render the overlay (list, or the approval modal, or the job console).
 pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     f: &mut Frame,
@@ -239,6 +272,7 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     sm: &ServicesManagerState,
     instances: &HashMap<String, Instance, S>,
     _jobs: &State,
+    past_attempts: usize,
     theme: &Theme,
 ) {
     // The job console takes over while a lifecycle op is in flight / finished.
@@ -255,9 +289,39 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
     }
 
     let rows = service_rows(instances);
+    // Show HELD_LEGEND only when a row inside the actual rendered `List`
+    // viewport is held. This IS a scrolled, stateful `List` (the adjacent
+    // `vertical_scrollbar` call exists precisely because rows can overflow
+    // it) — scanning every row regardless of `sm.selected` shows a legend
+    // for a held marker the user cannot currently see, and can also steal a
+    // visible row for a legend nothing on-screen needs.
+    //
+    // `max_height` below is computed as if no legend row were reserved yet
+    // (the footer-only bound), the same "accept a one-row overcount, never
+    // undercount" trade-off `instances.rs`'s `draw_table` documents for the
+    // same any_held/legend circular dependency.
+    let note = past_attempts_note(past_attempts);
+    let note_rows = u16::from(note.is_some());
+    let selected = sm.selected.min(rows.len().saturating_sub(1));
+    // Footer (1) plus the optional past-attempts note. Unlike `any_held` below,
+    // `note_rows` depends only on the count, never on the window, so reserving
+    // it here introduces no circular dependency.
+    let max_visible = inner.height.saturating_sub(1 + note_rows) as usize;
+    let window = visible_list_window(selected, rows.len(), max_visible);
+    let any_held = rows.get(window).into_iter().flatten().any(|r| {
+        r.gen_tps.is_some_and(f64::is_finite)
+            && r.gen_tps_observation
+                .as_ref()
+                .is_some_and(|m| m.freshness == ObservationFreshness::Held)
+    });
     let body = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(note_rows),
+            Constraint::Length(1),
+            Constraint::Length(u16::from(any_held)),
+        ])
         .split(inner);
 
     if rows.is_empty() {
@@ -314,13 +378,33 @@ pub fn draw_services_manager<S: ::std::hash::BuildHasher>(
         f.render_stateful_widget(list, list_area, &mut ls);
     }
 
+    if let Some(note) = note {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                note,
+                Style::default().fg(theme.muted),
+            ))),
+            body[1],
+        );
+    }
+
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "↑↓←→ select · s stop · r restart · Esc close",
             Style::default().fg(theme.muted),
         ))),
-        body[1],
+        body[2],
     );
+
+    if any_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            body[3],
+        );
+    }
 
     // Approval modal sits on top of the list.
     if let Some(pending) = &sm.approval {
@@ -464,12 +548,21 @@ mod tests {
         jobs: &State,
         insts: &HashMap<String, Instance>,
     ) -> String {
+        render_with(sm, jobs, insts, 0)
+    }
+
+    fn render_with(
+        sm: &ServicesManagerState,
+        jobs: &State,
+        insts: &HashMap<String, Instance>,
+        past_attempts: usize,
+    ) -> String {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let theme = Theme::from_name("default-dark");
         let backend = TestBackend::new(120, 28);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_services_manager(f, f.area(), sm, insts, jobs, &theme))
+        term.draw(|f| draw_services_manager(f, f.area(), sm, insts, jobs, past_attempts, &theme))
             .unwrap();
         let buf = term.backend().buffer().clone();
         buf.content()
@@ -486,6 +579,253 @@ mod tests {
         assert!(out.contains("svc-a"), "service id listed");
         assert!(out.contains("llama3"), "model listed");
         assert!(out.contains("s stop"), "lifecycle hints");
+    }
+
+    #[test]
+    fn snapshot_shows_held_legend_when_a_row_is_held() {
+        use rocm_dash_core::metrics::{InstanceStatus, ObservationFreshness, ObservationMetadata};
+        let mut insts = HashMap::new();
+        insts.insert(
+            "held".into(),
+            Instance {
+                container_id: "held".into(),
+                container_name: "svc-held".into(),
+                model_name: "llama3".into(),
+                status: InstanceStatus::Running,
+                port: Some(8000),
+                gen_tps: Some(42.0),
+                gen_tps_observation: Some(ObservationMetadata {
+                    observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                    freshness: ObservationFreshness::Held,
+                }),
+                ..Instance::default()
+            },
+        );
+        let sm = ServicesManagerState::default();
+        let out = render(&sm, &State::default(), &insts);
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when a listed service's gen_tps is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_hides_held_legend_when_no_row_is_held() {
+        let sm = ServicesManagerState::default();
+        let out = render(&sm, &State::default(), &instances());
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when no listed service is held; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn visible_list_window_matches_hand_derived_model() {
+        // Selected fits inside the first page: window starts at 0.
+        assert_eq!(visible_list_window(0, 30, 16), 0..16);
+        assert_eq!(visible_list_window(15, 30, 16), 0..16);
+        // Selected just past the first page: window slides to keep it last.
+        assert_eq!(visible_list_window(16, 30, 16), 1..17);
+        assert_eq!(visible_list_window(29, 30, 16), 14..30);
+        // Fewer rows than the viewport: window never exceeds `len`.
+        assert_eq!(visible_list_window(2, 5, 16), 0..5);
+        // Degenerate inputs.
+        assert_eq!(visible_list_window(0, 0, 16), 0..0);
+        assert_eq!(visible_list_window(0, 30, 0), 0..0);
+    }
+
+    fn many_rows_one_held(held_index: usize, count: usize) -> HashMap<String, Instance> {
+        use rocm_dash_core::metrics::{InstanceStatus, ObservationFreshness, ObservationMetadata};
+        let mut m = HashMap::new();
+        for n in 0..count {
+            let id = format!("s{n:02}");
+            let held = n == held_index;
+            m.insert(
+                id.clone(),
+                Instance {
+                    container_id: id.clone(),
+                    container_name: id,
+                    model_name: "llama3".into(),
+                    status: InstanceStatus::Running,
+                    port: Some(8000),
+                    gen_tps: Some(1.0),
+                    gen_tps_observation: Some(ObservationMetadata {
+                        observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+                        freshness: if held {
+                            ObservationFreshness::Held
+                        } else {
+                            ObservationFreshness::Fresh
+                        },
+                    }),
+                    ..Instance::default()
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn overlay_names_records_that_are_no_longer_running() {
+        // The overlay renders only the live instances the daemon surfaces, so a
+        // host whose local servers had all failed saw no sign that any record
+        // existed. The note says how many, and names a command that exists.
+        let sm = ServicesManagerState::default();
+        let out = render_with(&sm, &State::default(), &instances(), 3);
+        assert!(
+            out.contains("3 local server record(s) are no longer running"),
+            "{out}"
+        );
+        assert!(out.contains("rocm services list --all"), "{out}");
+        // The rows are still there: the note takes a line, it does not replace
+        // the list or the key hints.
+        assert!(out.contains("svc-a"), "{out}");
+        assert!(out.contains("Esc close"), "{out}");
+
+        // Nothing to report -> no note at all.
+        let quiet = render_with(&sm, &State::default(), &instances(), 0);
+        assert!(!quiet.contains("no longer running"), "{quiet}");
+    }
+
+    #[test]
+    fn snapshot_hides_held_legend_when_held_row_scrolled_off_screen() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 30 rows, only the first ("s00") is held. Selecting the last row
+        // forces the list to scroll far enough that "s00" is no longer in
+        // the rendered viewport — the legend must not appear for a marker
+        // the user cannot see.
+        let insts = many_rows_one_held(0, 30);
+        let sm = ServicesManagerState {
+            selected: 29,
+            ..ServicesManagerState::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| {
+            draw_services_manager(
+                f,
+                f.area(),
+                &sm,
+                &insts,
+                &State::default(),
+                0,
+                &Theme::from_name("default-dark"),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !out.contains("s00"),
+            "test setup assumption broken: the held row must scroll off-screen; got:\n{out}"
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the only held row is scrolled off-screen; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_hides_held_legend_when_the_past_attempts_note_costs_a_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Same shape as the test above, but with a past-attempts note on
+        // screen — which pins the `note_rows` term of the `max_visible`
+        // bound, the one branch the zero-`past_attempts` sibling cannot see.
+        //
+        // Geometry on a 160x20 backend: `bento` spends 2 rows on borders and
+        // 1 on top padding, so `inner.height == 17`. The note takes a row, so
+        // the list viewport is `17 - note(1) - footer(1) == 15` rows and the
+        // scrolled list shows rows 15..30. `max_visible` must therefore be 15
+        // — `17 - (1 + note_rows)` — and "s14" is the first row outside it.
+        // Drop the `+ note_rows` term and `max_visible` becomes 16, pulling
+        // the held "s14" into the `any_held` scan while it stays off-screen:
+        // the legend would then advertise a marker the user cannot see.
+        // Why 14 is the boundary row, pinned on the pure helper so the fixture
+        // cannot drift into a weaker duplicate of the sibling above. Note that
+        // nothing about the *rendered* viewport is a safe setup assumption
+        // here: dropping the term flips `any_held`, which spends `body[3]` and
+        // shrinks the list by a further row, so the rows on screen move too.
+        assert_eq!(visible_list_window(29, 30, 15), 15..30);
+        let insts = many_rows_one_held(14, 30);
+        let sm = ServicesManagerState {
+            selected: 29,
+            ..ServicesManagerState::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| {
+            draw_services_manager(
+                f,
+                f.area(),
+                &sm,
+                &insts,
+                &State::default(),
+                2,
+                &Theme::from_name("default-dark"),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("no longer running"),
+            "test setup assumption broken: the note must render, else note_rows is 0; got:\n{out}"
+        );
+        assert!(
+            !out.contains("s14"),
+            "test setup assumption broken: the held row must scroll off-screen; got:\n{out}"
+        );
+        assert!(
+            !out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must not appear when the note's row pushed the only held row off-screen; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn snapshot_shows_held_legend_when_held_row_is_visible_after_scroll() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Same 30 rows as above, but the held row stays selected (and thus
+        // visible) — the legend must appear.
+        let insts = many_rows_one_held(0, 30);
+        let sm = ServicesManagerState::default(); // selected == 0
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| {
+            draw_services_manager(
+                f,
+                f.area(),
+                &sm,
+                &insts,
+                &State::default(),
+                0,
+                &Theme::from_name("default-dark"),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let out: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("s00"),
+            "test setup assumption broken: the held row must stay visible; got:\n{out}"
+        );
+        assert!(
+            out.contains(format::HELD_LEGEND),
+            "HELD_LEGEND must appear when the held row is actually visible; got:\n{out}"
+        );
     }
 
     #[test]

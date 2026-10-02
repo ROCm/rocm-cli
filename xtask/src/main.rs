@@ -11,10 +11,13 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
+mod architecture_doc;
+mod crate_edges;
 mod demos;
 mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
+mod env_mutation_contract;
 mod manifest;
 mod package;
 mod paths;
@@ -95,6 +98,17 @@ enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Fail if any first-party crate has gained a normal/build dependency
+    /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
+    /// Dev-dependency edges are exempt (Cargo permits those to cycle).
+    CheckCrateEdges,
+    /// Fail, naming every one, if a path cited (in backticks) in
+    /// `docs/architecture.md` isn't found where it's cited. Exactly where a
+    /// citation is checked depends on its shape (a slash path, a bare
+    /// filename, a bare directory name) — the failure message names the
+    /// expected location per citation; see `citation_exists`'s doc comment
+    /// in `xtask/src/architecture_doc.rs` for the full rule.
+    CheckArchitectureDoc,
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
         /// Verify the table is up to date without writing; exit non-zero if it would change.
@@ -184,8 +198,8 @@ enum Command {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]
         channel: String,
-        /// Recent installs to keep per channel, format, and GPU family when
-        /// pruning after an install or update.
+        /// Recent installs to keep per channel, format, GPU family, and
+        /// toolchain choice when pruning after an install or update.
         #[arg(long, default_value_t = 2)]
         keep: usize,
         /// Pre-warm root holding `config/`, `data/`, and `cache/`. Its
@@ -241,6 +255,8 @@ fn run() -> Result<()> {
         } => signing::verify(public_key.as_deref(), &input, &signature)?,
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
+        Command::CheckCrateEdges => crate_edges::run()?,
+        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,

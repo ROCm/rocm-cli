@@ -15,6 +15,14 @@ Feature: Release install lifecycle
   # signing key, and installs into its own directory rooted in the scenario's
   # temp dir, so ordering never affects the outcome. Cargo's release build cache
   # is shared naturally.
+  #
+  # CONSTRAINT: no @lifecycle scenario may depend on a scripted failure seam
+  # (anything gated behind the `rocm/e2e-test-hooks` feature). ci.yml's Windows
+  # lane runs these against binaries built WITHOUT that feature, deliberately,
+  # so it installs what a release installs. A scenario that reached a seam would
+  # fail on Windows only — the hook-carrying Linux lane would stay green — which
+  # is a confusing way to learn about it. Keep such scenarios in the always-on
+  # suite instead, where the hooks are compiled in.
 
   # ── Packaging + signature-verified install (Linux) ────────────────────
 

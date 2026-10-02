@@ -24,21 +24,32 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     ("artifact_prefetch.feature", "artifact-prefetch"),
     ("automations.feature", "automations"),
     ("bench.feature", "bench"),
+    ("bootstrap.feature", "bootstrap"),
     ("chat.feature", "chat"),
+    ("comfyui.feature", "comfyui"),
     ("config.feature", "config"),
     ("dash.feature", "dash"),
     ("dependency_guard.feature", "deps-guard"),
     ("diagnose.feature", "diagnose"),
+    ("download_progress_pty.feature", "download-progress"),
+    ("driver_install.feature", "driver-install"),
     ("engine_shell.feature", "engine-shell"),
     ("examine.feature", "examine"),
     ("install_lifecycle.feature", "lifecycle"),
+    // Not `records`: a key has to say what kind of record, and this file is
+    // about the ones a managed `rocm serve` leaves behind.
+    ("local_server_records.feature", "server-records"),
     ("logs.feature", "logs"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
+    ("remote.feature", "remote"),
+    ("rocm_doctor_skill.feature", "skill"),
     // Not `runtime`: `runtime_setup.feature` owns that key, and two files
     // sharing one key would collide on every index (`runtime-01` in both).
     ("runtime_lifecycle.feature", "runtime-lifecycle"),
     ("runtime_setup.feature", "runtime"),
+    ("service_record_cleanup.feature", "service-cleanup"),
+    ("therock_next_generation.feature", "therock-next"),
     ("update.feature", "update"),
 ];
 

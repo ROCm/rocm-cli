@@ -29,6 +29,17 @@ on:
         options: [all, mock]
         # No tier input: the harness resolves pass/xfail/skip per scenario, so a
         # platform runs one job covering everything applicable to it.
+      # Opt a dispatch into building the same downloadable Linux + Windows PR
+      # bundles a pull_request push produces (see pr-linux-binaries and the PR
+      # bundle steps on windows-build-and-test), without needing an open PR.
+      # On the Windows job this also runs the full 45min build/test/lifecycle
+      # suite, not just the packaging steps -- `heavy` is forced true on any
+      # dispatch, so every heavy-gated step in that job runs, same as it would
+      # on a PR push.
+      build_binaries:
+        description: "Also build downloadable PR-style binaries (Linux + Windows)"
+        type: boolean
+        default: false
 
 concurrency:
   # Manual dispatches get a UNIQUE group (run_id) so a stuck run never holds the
@@ -83,6 +94,7 @@ jobs:
       lint: ${{ steps.filter.outputs.lint || steps.all.outputs.forced }}
       tpn: ${{ steps.filter.outputs.tpn || steps.all.outputs.forced }}
       docs: ${{ steps.filter.outputs.docs || steps.all.outputs.forced }}
+      skills: ${{ steps.filter.outputs.skills || steps.all.outputs.forced }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -122,6 +134,14 @@ jobs:
               - '**/*.ps1'
               - '**/*.feature'
               - 'tests/e2e-cucumber/**'
+              # The containerised control-channel lane; its Dockerfile matches
+              # none of the extension globs above.
+              - 'tests/remote-ssh/**'
+              # skills/rocm-doctor/reference.md is an e2e FIXTURE: the
+              # rocm_doctor_skill.feature scenarios parse its catalog table and
+              # compare it to `rocm fix`. A skill-only edit must therefore run
+              # the E2E job, which gates on `heavy`.
+              - 'skills/**'
               - 'install*'
               # Pinned-key consistency compares docs/keys/* against the installers,
               # so a canonical-key-only change must trigger the heavy job that runs
@@ -157,6 +177,13 @@ jobs:
               - 'README.md'
               - 'CONTRIBUTING.md'
               - '.readthedocs.yaml'
+              - '.github/workflows/**'
+
+            # Published Agent Skills, graded by skillscope. The dataset and the
+            # skill's prose are one unit — a prompt can stop matching because the
+            # description changed — so any edit under skills/ re-runs the check.
+            skills:
+              - 'skills/**'
               - '.github/workflows/**'
 
       - name: Force full run off pull requests
@@ -358,7 +385,6 @@ jobs:
           python scripts/comfyui_therock_gpu_test.py --self-test
           python scripts/local_assistant_therock_gpu_test.py --self-test
           python scripts/vllm_therock_gpu_test.py --self-test
-          python scripts/wsl_preflight.py --self-test
 
       - name: Portable WSL build deps self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -481,8 +507,23 @@ jobs:
       SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     # Don't spend per-OS build/test cycles unless the cheap lint gate is green.
     needs: [changes, clippy, prek]
-    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
-    if: github.event_name != 'workflow_dispatch'
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest — unless
+    # the dispatch explicitly asked for PR-style binaries, which this job's
+    # build step produces. `clippy`/`prek` are themselves always skipped on
+    # workflow_dispatch (their own `if:`), and a job whose `needs` were SKIPPED
+    # (not just failed) is skipped by default too — so without `!cancelled()`
+    # plus the explicit skipped-or-success checks below, `build_binaries: true`
+    # could never actually run this job. The success requirement is still
+    # enforced on every other trigger, where clippy/prek always run for real.
+    # `!cancelled()` rather than `always()`: this job (like pr-linux-binaries
+    # below) still needs to be cancelled when a new commit supersedes the run,
+    # per this workflow's `concurrency: cancel-in-progress: true`.
+    if: >-
+      !cancelled()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name != 'workflow_dispatch' || github.event.inputs.build_binaries == 'true')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -583,7 +624,6 @@ jobs:
           python .\scripts\comfyui_therock_gpu_test.py --self-test
           python .\scripts\local_assistant_therock_gpu_test.py --self-test
           python .\scripts\vllm_therock_gpu_test.py --self-test
-          python .\scripts\wsl_preflight.py --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'
@@ -603,12 +643,200 @@ jobs:
 
       - name: Acceptance install lifecycle
         if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
         # Windows install lifecycle (packaging + native-crypto verify + user-PATH
         # + loopback HTTP + isolated smoke + uninstall) as opt-in @lifecycle E2E.
+        #
+        # Hand the suite the binaries the Build step already produced. Without
+        # this `cargo xtask e2e` builds `rocm`/`rocmd` for itself, and because it
+        # adds `--features rocm/e2e-test-hooks` the feature resolution differs
+        # from the Build step's — so cargo recompiles the whole release graph
+        # rather than reusing it. That second release build cost 3-4 minutes on
+        # every run, on the job that alone determines when CI goes green.
+        #
+        # Deliberately NOT built with `rocm/e2e-test-hooks`, unlike the prebuilt
+        # lanes in e2e-selfhosted.yml / nightly.yml. Those run the full suite,
+        # whose scripted failure seams are compiled out without the feature.
+        # `E2E_ONLY_LIFECYCLE` restricts this lane to @lifecycle scenarios, none
+        # of which touch a seam — and this lane packages and installs the binary
+        # through the real installer, so it should ship exactly what a release
+        # ships rather than a build carrying test hooks.
         env:
           E2E_INCLUDE_LIFECYCLE: "1"
           E2E_ONLY_LIFECYCLE: "1"
-        run: cargo xtask e2e
+        run: |
+          # Derive from CARGO_TARGET_DIR when it is set, falling back to the
+          # default target dir, so a future job-level CARGO_TARGET_DIR cannot
+          # leave this lane pointing at a stale path. The expression is
+          # byte-identical to the prebuilt lanes in nightly.yml and
+          # e2e-selfhosted.yml — which keeps the shared pin string meaningful —
+          # though those steps run under `shell: powershell` rather than pwsh.
+          $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+          $env:ROCM_CLI_BINARY = "$targetDir\release\rocm.exe"
+          $env:ROCM_CLI_ROCMD_BINARY = "$targetDir\release\rocmd.exe"
+          # Fail here, naming the missing binary, rather than letting a scenario
+          # die on a "failed to run" deep in the suite.
+          foreach ($bin in $env:ROCM_CLI_BINARY, $env:ROCM_CLI_ROCMD_BINARY) {
+            if (-not (Test-Path -LiteralPath $bin)) {
+              throw "expected the Build step to have produced $bin"
+            }
+          }
+          cargo xtask e2e
+
+      # Downloadable PR-testing bundle, reusing the release binaries built
+      # above rather than building Windows twice. Skipped on push-to-main /
+      # merge_group (nightly already covers main) and on an ordinary dispatch
+      # (build_binaries left at its false default).
+      - name: Package PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: cargo xtask package rocm-cli-pr-windows-amd64
+
+      - name: Add install instructions to job summary
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        shell: pwsh
+        run: |
+          @'
+          ## Try this PR's build (Windows x86_64)
+
+          Download `rocm-cli-pr-windows-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```powershell
+          Expand-Archive rocm-cli-pr-windows-amd64.zip -DestinationPath pr-artifact   # GitHub's wrapper zip
+          Expand-Archive pr-artifact\rocm-cli-pr-windows-amd64.zip -DestinationPath rocm-cli-pr
+          $dest = "$env:LOCALAPPDATA\rocm-cli\bin"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocm.exe,rocm-cli-pr\rocm-cli-pr-windows-amd64\bin\rocmd.exe $dest
+          $env:Path = "$dest;$env:Path"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          '@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload PR bundle
+        if: >-
+          needs.changes.outputs.heavy == 'true' &&
+          (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-windows-amd64
+          path: |
+            dist/rocm-cli-pr-windows-amd64.zip
+            dist/rocm-cli-pr-windows-amd64.zip.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  # Downloadable Linux PR-testing bundle. No job in THIS file builds a release
+  # binary in the release manylinux2014 container (build-and-test only does a
+  # debug, non-containerized build; release.yml and nightly.yml both already
+  # do the containerized build, just not for a PR), so this is a standalone
+  # job rather than an extension. Mirrors release.yml's Linux build minus
+  # versioning/signing/release-upload — these are unsigned, disposable,
+  # per-run artifacts for manual testing, not a publication.
+  pr-linux-binaries:
+    name: Build Linux PR binaries
+    runs-on: ubuntu-latest
+    # 30min: a cold containerised release build (image pull, yum install,
+    # rustup install, then `cargo build --release` for 3 crates) plus none of
+    # its steps below are individually bounded -- see the convention comment
+    # at the top of this block.
+    timeout-minutes: 30
+    needs: [changes, clippy, prek]
+    # `clippy`/`prek` are themselves always skipped on workflow_dispatch (their
+    # own `if:`), and a job whose `needs` were SKIPPED (not just failed) is
+    # skipped by default too — so without `!cancelled()` plus the explicit
+    # skipped-or-success checks below, `build_binaries: true` could never
+    # actually run this job. The success requirement is still enforced on
+    # every other trigger, where clippy/prek always run for real. `!cancelled()`
+    # rather than `always()`: this job still needs to be cancelled when a new
+    # commit supersedes the run, per this workflow's `concurrency:
+    # cancel-in-progress: true` (see windows-build-and-test above).
+    if: >-
+      !cancelled()
+      && needs.changes.result == 'success'
+      && (needs.clippy.result == 'success' || needs.clippy.result == 'skipped')
+      && (needs.prek.result == 'success' || needs.prek.result == 'skipped')
+      && (github.event_name == 'pull_request' || github.event.inputs.build_binaries == 'true')
+      && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Cache Cargo home and build artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            ~/.cargo/registry/src
+            ~/.cargo/rustup
+            target
+          key: Linux-manylinux-pr-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            Linux-manylinux-pr-
+
+      - name: Build release binaries
+        run: |
+          mkdir -p "$HOME/.cargo"
+          docker run --rm -v "$PWD":/work -w /work quay.io/pypa/manylinux2014_x86_64 /bin/bash -lc '
+            set -euo pipefail
+            yum install -y pkgconfig libcap-devel
+          '
+          docker run --rm \
+            -u "$(id -u):$(id -g)" \
+            -e CARGO_HOME=/host-cargo -e RUSTUP_HOME=/host-cargo/rustup \
+            -v "$HOME/.cargo":/host-cargo -v "$PWD":/work -w /work \
+            quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail
+              if [ ! -f /host-cargo/bin/cargo ]; then
+                curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+              fi
+              export PATH="/host-cargo/bin:$PATH"
+              cargo build --release -p rocm -p rocmd -p xtask
+            '
+
+      - name: Package PR bundle
+        run: |
+          chmod +x install.sh
+          cargo xtask package rocm-cli-pr-linux-amd64
+
+      - name: Add install instructions to job summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Try this PR's build (Linux x86_64)
+
+          Download `rocm-cli-pr-linux-amd64` from this run's **Artifacts**
+          section below, then:
+
+          ```sh
+          unzip rocm-cli-pr-linux-amd64.zip   # GitHub wraps the artifact in a zip
+          tar -xzf rocm-cli-pr-linux-amd64.tar.gz
+          dest="$HOME/rocm-cli-pr/bin"
+          install -Dm0755 rocm-cli-pr-linux-amd64/bin/rocm rocm-cli-pr-linux-amd64/bin/rocmd -t "$dest"
+          export PATH="$dest:$PATH"
+          rocm --version
+          ```
+
+          Unsigned build for manual testing only — not for production use.
+          EOF
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rocm-cli-pr-linux-amd64
+          path: |
+            dist/rocm-cli-pr-linux-amd64.tar.gz
+            dist/rocm-cli-pr-linux-amd64.tar.gz.sha256
+          retention-days: 7
+          if-no-files-found: error
 
   prek:
     # The fast lint gate: every toolchain-light lint/hygiene check, run from the
@@ -645,6 +873,58 @@ jobs:
         with:
           prek-version: 0.4.5
           extra-args: --all-files --no-group local-tools
+
+  remote-ssh:
+    # `rocm remote` drives ssh, scp, and the remote's service/serve tooling. Its
+    # unit tests use a scripted stand-in, which proves the control flow but
+    # assumes the real tools behave a certain way. This job checks that
+    # assumption against a real OpenSSH server in a container: argument
+    # handling, exit-code propagation, stdin delivery of a credential, file
+    # copy, batch-mode refusal, the shape Tailscale Funnel takes in the serve
+    # config (including that the fake refuses the ports the real daemon
+    # refuses), and — the one that matters most — that withdrawing a published
+    # endpoint actually removes it. A publish is configuration rather than a
+    # process, so it survives reboots, and a withdrawal that silently does
+    # nothing leaves a GPU endpoint exposed with nothing tracking it.
+    #
+    # No GPU, no ROCm, no tailnet: the remote's `rocm` and `tailscale` are
+    # stand-ins that answer in the shapes the real tools do.
+    name: remote control channel (containerised)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Gated like every other heavy job here: a fast lint failure should
+    # short-circuit before this spends 30 minutes on a container and a cold
+    # cargo build, and a manual dispatch should stay a fast loop.
+    needs: [changes, clippy, prek]
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.heavy == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Docker and the OpenSSH client are both present on ubuntu-latest; jq is
+      # the only extra, and only for asserting on JSON contracts.
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check the control-channel contracts
+        run: tests/remote-ssh/run.sh
+
+      # The pinned toolchain, and the rust-cache that comes with it, as every
+      # other cargo job in this workflow uses. Without it this lane builds the
+      # whole workspace cold against a different compiler from the rest of CI,
+      # inside a 30-minute timeout.
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # The same container, driven by the real binary this time: discover a
+      # target, probe it, serve, publish, reconcile status, re-publish after an
+      # out-of-band withdrawal, tear down, and refuse to publish over a
+      # Funnel-exposed port. Catches the orchestration mistakes a scripted
+      # stand-in cannot — an argument the CLI builds wrongly, a session record
+      # it fails to clean up.
+      - name: Build the CLI for the end-to-end run
+        run: cargo build -p rocm
+
+      - name: Drive rocm remote end to end
+        run: tests/remote-ssh/run-e2e.sh
 
   clippy:
     runs-on: ubuntu-latest
@@ -737,6 +1017,10 @@ jobs:
       - name: MANIFEST.md dependency table is current
         if: needs.changes.outputs.rust == 'true'
         run: cargo xtask manifest --check
+
+      - name: First-party crate dependency edges are within the allowlist
+        if: needs.changes.outputs.rust == 'true'
+        run: cargo xtask check-crate-edges
 
       # Surface the cache hit rate for the clippy compile so the effect is visible
       # in the logs, on the local-only path too — see build-and-test for why this
@@ -872,6 +1156,88 @@ jobs:
         if: needs.changes.outputs.lint == 'true'
         run: cargo xtask powershell-lint --shell powershell
 
+  # Grades the published Agent Skills under skills/ with AMD's skillscope
+  # harness. Only the `structural` command runs: it needs no agent, no API key
+  # and no network beyond the install, so a red run is never wrong for a
+  # reason of its own. It is advisory today, not blocking: `Skill checks
+  # (skillscope)` (this job's `name:`, not the `skill-evals` job id) is not a
+  # required status check in branch protection, so a failing run does not
+  # stop a merge. An admin must add that exact context to make it blocking.
+  # It checks the frontmatter an agent runtime
+  # parses (a `name` that disagrees with the folder makes the skill unloadable),
+  # the dataset's coverage bar, and every internal markdown reference — a link
+  # into a renamed file is not cosmetic here, because the agent follows it,
+  # finds nothing, and improvises.
+  #
+  # `routing` and `behavioral` are deliberately NOT run: both need an
+  # authenticated `claude` CLI and an ANTHROPIC_API_KEY, and this repo has no
+  # such secret. Turning them on is a caller change to skillscope's
+  # `skill-evals.yml` reusable workflow once one exists — they are the half of
+  # the question that asks whether the skill actually fires, so this job is not
+  # a substitute for them.
+  #
+  # skills/rocm-cli-assistant/ is deliberately out of scope. Despite its path it
+  # is not a published skill: apps/rocm/src/main.rs embeds it verbatim into the
+  # chat assistant's system prompt with include_str!, so giving it the YAML
+  # frontmatter this check requires would inject that frontmatter into a live
+  # prompt.
+  skill-evals:
+    name: Skill checks (skillscope)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch' && needs.changes.outputs.skills == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The `skillscope` step below names skills/rocm-doctor explicitly, so a
+      # third skills/<name>/ folder added later would pass this job green
+      # while never being graded -- the same silent-non-grading failure this
+      # job exists to catch, just one level deeper. Fail loudly instead: any
+      # directory under skills/ that isn't graded above or excluded by design
+      # (rocm-cli-assistant -- see AGENTS.md #7) forces a deliberate edit here.
+      - name: Guard against an ungraded skills/ directory
+        run: |
+          set -euo pipefail
+          # Without nullglob, a skills/ with no subdirectories leaves the
+          # pattern unexpanded and the loop runs once on the literal
+          # `skills/*/`, reporting `skills/* is neither graded ...` -- a
+          # made-up skill name, from a tree that has no ungraded skill in it.
+          # With it the loop simply does not run, which is the right answer for
+          # "nothing to grade".
+          shopt -s nullglob
+          known="rocm-doctor rocm-cli-assistant"
+          for dir in skills/*/; do
+            name="${dir%/}"
+            name="${name#skills/}"
+            case " $known " in
+              *" $name "*) ;;
+              *)
+                echo "::error::skills/$name is neither graded by skill-evals nor excluded by design ($known). Add it to the skillscope step's 'skills:' input, or add it to this guard's exclusion list with the reason, before merging." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      # The action is only a launcher: it sets up Python and uv, resolves which
+      # build of the harness to run, and execs it. It imports nothing from
+      # skillscope, so pinning it to a release SHA cannot break on a payload
+      # version it predates. What the pin does NOT cover: the composite's own
+      # steps (setup-python, setup-uv, setup-node) are on their own moving
+      # tags, and the harness itself is resolved at runtime via
+      # `uvx --from git+.../skillscope@<ref>` with no lockfile. Unlike this
+      # repo's usual SHA pin (AGENTS.md #6), this one does not reach the code
+      # that actually runs. install-claude stays off; structural needs no
+      # agent.
+      - name: Check skill structure, dataset, and references
+        uses: amd/skillscope@6dde8e8a34ad5456d3c2ff3418bc81c2cd9d5d69 # v0.1.0
+        with:
+          command: structural
+          skills: skills/rocm-doctor
+          args: --skill-files skill-card.md --skill-sections Description,Owner,License
+          install-claude: "false"
+
   license-headers:
     name: License header check (hawkeye)
     runs-on: ubuntu-latest
@@ -915,6 +1281,88 @@ jobs:
       - name: Check license headers
         run: |
           "${HAWKEYE_INSTALL_DIR}/hawkeye" check
+
+  architecture-doc:
+    name: Architecture doc path citations are current
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Deliberately NOT gated by the `changes` path filter: `cargo xtask
+    # check-architecture-doc` fails, naming every one, if a path citation in
+    # docs/architecture.md isn't found where it's cited (see
+    # `citation_exists`'s doc comment in xtask/src/architecture_doc.rs for
+    # exactly where each citation shape is checked), and the citations
+    # aren't limited to any fixed set of paths — the doc can cite any
+    # tracked file. A path-filter allowlist here would need to list every
+    # file the doc could ever cite and be kept current as citations are
+    # added, which is exactly the kind of drift this check exists to catch;
+    # a rename/removal of a currently-cited file wouldn't itself touch
+    # docs/architecture.md, so gating on that path (as a prior version of
+    # this job did) could skip the check on the very PR that goes stale.
+    # Run unconditionally instead.
+    #
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      # Shares build-and-test's/clippy's key prefix: `cargo xtask
+      # check-architecture-doc` fully links the same xtask binary (and its
+      # rocm-core/e2e-report dependencies) those jobs already compile, so a
+      # cache they populated lets this job's otherwise-unconditional run
+      # skip a cold compile instead of paying for one on every push/PR/
+      # merge_group event.
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/build-and-test
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # See clippy's equivalent step for why this is a probe (continue-on-error
+      # plus a follow-up health check) rather than a hard requirement, and why
+      # failure clears the Azure variables rather than the wrapper.
+      - name: Set up sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        run: |
+          disable() {
+            echo "SCCACHE_AZURE_CONNECTION_STRING=" >> "$GITHUB_ENV"
+            echo "SCCACHE_AZURE_BLOB_CONTAINER=" >> "$GITHUB_ENV"
+          }
+          if ! command -v sccache >/dev/null; then
+            echo "::warning::sccache is not installed; compiling without it."
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+            # Nothing will read the credential now; don't leave it in the job env.
+            disable
+            exit 0
+          fi
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          echo "active=true" >> "$GITHUB_OUTPUT"
+          if [ -z "${SCCACHE_AZURE_CONNECTION_STRING}" ]; then
+            echo "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            disable
+            exit 0
+          fi
+          if ! sccache --start-server; then
+            echo "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server || true
+            disable
+          fi
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Architecture doc path citations are current
+        run: cargo xtask check-architecture-doc
+
+      - name: sccache stats
+        if: steps.sccache_probe.outputs.active == 'true'
+        run: sccache --show-stats
 
   docs-build:
     name: Sphinx docs build (-W)
@@ -1055,6 +1503,14 @@ jobs:
 
       - name: Run E2E tests
         if: steps.gate.outputs.run == 'true'
+        # E2E_INCLUDE_DOCKER turns on the `rocm remote` scenarios that need a
+        # second machine, stood up as a container. This is the only lane that
+        # opts in: GitHub-hosted runners can build the fixture image, while the
+        # self-hosted GPU runners have a daemon but no route to the package
+        # mirror it installs from, so they skip rather than fail on an image
+        # they could never build.
+        env:
+          E2E_INCLUDE_DOCKER: "1"
         run: cargo xtask e2e
 
       - name: Upload E2E report

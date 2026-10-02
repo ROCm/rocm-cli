@@ -271,6 +271,7 @@ pub fn on_key(
                     "runtimes".to_string(),
                     "uninstall".to_string(),
                     rt.key.clone(),
+                    "--yes".to_string(),
                 ];
                 stage_approval(r, RuntimeAction::Uninstall, args);
             } else {
@@ -358,7 +359,12 @@ pub fn draw_runtime_manager(
     let inner = panel::bento(
         f,
         area,
-        Some("Runtimes — ROCm installs"),
+        // Not "ROCm installs": this is the screen the ComfyUI selection errors
+        // send users to ("Pick one in `/runtimes`"), so it must not label its
+        // rows with the noun those errors and `rocm runtimes --help` deliberately
+        // stopped using. "ROCm SDKs" matches the sibling install panel's
+        // vocabulary without stuttering against the "Runtimes" title.
+        Some("Runtimes — managed ROCm SDKs"),
         BoxRole::Primary,
         false,
         theme,
@@ -623,7 +629,7 @@ mod tests {
         assert_eq!(pending.action, RuntimeAction::Uninstall);
         assert_eq!(
             pending.args,
-            vec!["runtimes", "uninstall", "therock-nightly-gfx94"]
+            vec!["runtimes", "uninstall", "therock-nightly-gfx94", "--yes"]
         );
     }
 

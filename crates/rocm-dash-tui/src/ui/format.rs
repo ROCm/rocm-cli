@@ -14,9 +14,35 @@
 //! - SI units (k / M / B) for token throughput and request counts.
 //! - Percentages always with 1 decimal unless < 0.1, then 2 decimals.
 //! - Optional values render `-`.
+//! - [`display_or_placeholder`] is the one exception to "numeric": a small
+//!   shared UI helper for rendering an optional field's value, so every overlay
+//!   that has one stays visually consistent.
 
 use chrono::{DateTime, Utc};
 use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
+
+/// An optional field's value, or `placeholder` when unset.
+///
+/// For any overlay row that stays blank until the user fills it — by typing, or
+/// via the [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or by
+/// picking from a list. The callers are deliberately not enumerated here: that
+/// list has gone stale twice, and a grep for the function name is exact.
+///
+/// "Unset" means whitespace-only, matching every caller's own emptiness test,
+/// so a row never looks populated while the value would actually be treated as
+/// unset — rejected outright for the two required fields (install-manager
+/// channel, serve-wizard model), silently omitted for the rest. Whether to
+/// trim the *value* before passing it on is a separate,
+/// caller-specific decision: onboarding's install prefix is written only by the
+/// folder browser and so is kept byte-exact, while the typed fields elsewhere
+/// are trimmed. See `onboarding::build_install_args` for that contrast.
+pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
+    if v.trim().is_empty() {
+        placeholder.to_string()
+    } else {
+        v.to_string()
+    }
+}
 
 /// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
 /// Promotes to GiB at 1024, TiB at 1024², with one decimal.
@@ -115,6 +141,29 @@ pub fn tps_opt(value: Option<f64>) -> String {
 pub fn tokens_per_watt(value: Option<f64>) -> String {
     match value {
         Some(v) if v.is_finite() => format!("{v:.2} tok/W"),
+        _ => "-".to_string(),
+    }
+}
+
+/// Energy efficiency, held-observation-aware.
+///
+/// Same formatting as [`tokens_per_watt`], with [`HELD_MARKER`] appended when
+/// `obs` is Held — tok/W derives from the same per-tick `gen_tps` sample, so
+/// it goes stale exactly when gen_tps does.
+///
+/// - `None` or non-finite → `"-"` (unchanged from [`tokens_per_watt`])
+/// - `Some(v)`, Held → `"{v:.2} tok/W*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.2} tok/W"`
+pub fn tokens_per_watt_cell(value: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match value {
+        Some(v) if v.is_finite() => {
+            let base = format!("{v:.2} tok/W");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
         _ => "-".to_string(),
     }
 }
@@ -280,6 +329,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_or_placeholder_treats_whitespace_only_as_unset() {
+        assert_eq!(display_or_placeholder("", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("   ", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("release", "(default)"), "release");
+    }
+
+    #[test]
     fn mib_promotes_to_gib_then_tib() {
         assert_eq!(mib(0), "0 MiB");
         assert_eq!(mib(512), "512 MiB");
@@ -345,6 +401,27 @@ mod tests {
         assert_eq!(tokens_per_watt(None), "-");
         assert_eq!(tokens_per_watt(Some(0.42)), "0.42 tok/W");
         assert_eq!(tokens_per_watt(Some(f64::INFINITY)), "-");
+    }
+
+    #[test]
+    fn tokens_per_watt_cell_appends_held_marker() {
+        let held = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        };
+        let fresh = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        };
+        assert_eq!(tokens_per_watt_cell(None, None), "-");
+        assert_eq!(tokens_per_watt_cell(Some(f64::NAN), Some(&held)), "-");
+        assert_eq!(
+            tokens_per_watt_cell(Some(0.42), None),
+            "0.42 tok/W",
+            "unknown metadata must not fabricate a held marker"
+        );
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&fresh)), "0.42 tok/W");
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&held)), "0.42 tok/W*");
     }
 
     #[test]

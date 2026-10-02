@@ -35,6 +35,7 @@ tests/e2e-cucumber/
 │   ├── chat.feature
 │   ├── examine.feature
 │   ├── model_serving.feature
+│   ├── rocm_doctor_skill.feature # skill↔CLI contract (see below)
 │   └── runtime_setup.feature
 │
 ├── tests/                        # test binary + step modules
@@ -43,7 +44,8 @@ tests/e2e-cucumber/
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
 │       ├── runtime_steps.rs
-│       └── serving_steps.rs
+│       ├── serving_steps.rs
+│       └── skill_steps.rs
 │
 └── src/                          # shared test infrastructure
     ├── lib.rs
@@ -135,6 +137,7 @@ Scenarios carry stable-id and capability tags:
 |---|---|
 | `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
@@ -172,6 +175,8 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
+| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon R9700 (self-hosted) | no |
+| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -182,12 +187,14 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow runs non-blocking jobs — MI300X, Radeon R9700, and Strix
-Halo on Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then
-consolidates them into the same cross-platform grid. The
-shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
-the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
-through Lemonade on Strix Halo.
+The nightly workflow covers the same hardware as the table above, as
+non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
+`e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
+`E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
+grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
+MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
+checkpoint through Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on
@@ -236,3 +243,63 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
+- **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id>`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
+
+## The rocm-doctor skill contract
+
+`rocm_doctor_skill.feature` is the one feature that treats a file in this repo as
+an expected value. `skills/rocm-doctor/` is a published skill: this repo is its
+source of truth, and the [`amd/skills`](https://github.com/amd/skills) catalog
+vendors it from here. The skill owns no probe, no catalog and no fixes — all of
+that ships inside the binary — so what it does own is a **contract**: which
+fix-ids exist, which ones the CLI applies
+itself, which machines each is for, which fields a diagnosis carries, which
+confidence thresholds an agent reasons about, which verdicts `examine` can
+return, and where a report goes when nothing matched.
+
+`diagnose.feature` covers the same commands, so the division matters:
+
+|  | expected value lives in | catches |
+|---|---|---|
+| `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
+| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+
+Only the second can notice that a published document has gone stale, and that is
+the whole reason the feature exists. So anything already proven by
+`diagnose.feature` — that a fix for another OS is declined without writing
+anything, that the listing is complete, that a report says plainly whether a
+cause was established — stays there and is **not** restated here. If a scenario
+in this feature does not read `reference.md`, it is in the wrong file.
+
+Reading that document as test data is a deliberate, narrow exception to
+**Black-box only** above: nothing is imported from the rocm-cli codebase — a
+*documentation artifact* is read as test data, and that artifact is the thing
+under test. `skill_steps.rs` parses the specific claims each scenario names —
+the catalog table's cells, the auto-applicable prose line, the framework-routing
+bullets, the diagnose fields and thresholds — rather than restating them as
+constants, so editing one of those in `reference.md` starts being checked with
+no code change, and every one of those parsers asserts it found something — a
+heading it depends on being reworded upstream must fail loudly rather than
+quietly reduce an assertion to a no-op. Free-standing prose outside those
+spots — the failure-mode count in the catalog heading, the Linux-only/
+Windows-only recap line under the table, SKILL.md's "the other N are
+print-only" — is not parsed, so it can drift without failing anything here.
+
+Two rules follow:
+
+- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+  these scenarios fails, the CLI is right and the docs are what change.
+- A skill-only edit must still run this job, so `skills/**` is in the `heavy`
+  paths filter that gates the `e2e` job.
+
+No scenario asserts whether a symptom matched, in either direction — that is not
+a property this suite can hold still. The catalog scores several checkers from
+**host state alone**, with no symptom keyword involved, so a runner with `amdgpu`
+blacklisted is explained by `fix-5-amdgpu-load` whatever it is asked about; and
+on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
+assertion either way would encode one runner's state.
+
+Claims about *whether* a cause was established therefore live in
+`crates/rocm-core/src/diagnose.rs`, where the `Examination` is constructed rather
+than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+the no-GPU lane, and the GPU lanes alike.

@@ -110,6 +110,31 @@ pub fn binary_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
+/// Run `cargo metadata --format-version 1 --locked <extra_args>` and return its
+/// raw stdout, or a descriptive error if the subprocess fails to run or exits
+/// non-zero. Shared by every command that reduces `cargo metadata` to its own
+/// subset of fields ([`crate::affected`], [`crate::crate_edges`],
+/// [`crate::manifest`]), so the subprocess invocation and error handling can't
+/// drift between them.
+///
+/// Always passes `--locked` so callers read the committed `Cargo.lock` exactly,
+/// keeping repeated runs consistent and preventing resolution to newer
+/// registry versions mid-run.
+pub fn run_cargo_metadata(extra_args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args(["metadata", "--format-version", "1", "--locked"])
+        .args(extra_args)
+        .output()
+        .context("failed to run `cargo metadata`")?;
+    if !output.status.success() {
+        bail!(
+            "`cargo metadata` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

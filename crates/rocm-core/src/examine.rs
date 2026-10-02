@@ -10,11 +10,12 @@
 //! shapes mirror `examine.py` field-for-field so the catalog consumes the CLI's
 //! output unchanged.
 
-use crate::{runtime_is_linux, runtime_is_windows};
+use crate::{FrameworkInterpreter, RUNTIME_LIBRARY_PATH_ENV, runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +30,8 @@ const ENV_VALUE_MAX_CHARS: usize = 16_000;
 
 const TRACKED_ENV_VARS: &[&str] = &[
     "HSA_OVERRIDE_GFX_VERSION",
+    // Legacy ROCm releases need this to find the GPU through DXG under WSL.
+    "HSA_ENABLE_DXG_DETECTION",
     "HIP_VISIBLE_DEVICES",
     "ROCR_VISIBLE_DEVICES",
     "CUDA_VISIBLE_DEVICES",
@@ -93,9 +96,70 @@ pub struct Device {
     pub user_can_write: Option<bool>,
 }
 
-/// Structured machine state consumed by the diagnosis catalog. Field order and
-/// names mirror `examine.py`'s `Examination` dataclass so the JSON contract is
-/// identical.
+/// The oldest distro release the WSL path supports.
+///
+/// Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor
+/// every published Lemonade embeddable is linked against, so the engine cannot
+/// start there. See `docs/wsl.md`.
+pub const WSL_MIN_UBUNTU: (u32, u32) = (24, 4);
+
+/// WSL2-specific machine state. `None` on every other platform.
+///
+/// WSL reaches the GPU through `/dev/dxg` and the Windows host driver rather than
+/// the in-tree `amdgpu` module, so none of the bare-metal driver fields describe
+/// it. These are the facts the WSL half of the catalog reasons over.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WslFacts {
+    /// `1` or `2`. A kernel release that names neither is read as `2`: WSL 2 has
+    /// been the default for years, and the cost of the two errors is not
+    /// symmetric — calling a WSL 2 host "WSL 1" tells the user to convert a
+    /// distro that is already converted. `0` only in the default value, which
+    /// stands for "the probe did not run".
+    pub version: u8,
+    pub dxg_device: bool,
+    pub dxcore: bool,
+    pub wsl_lib_dir: bool,
+    pub librocdxg: bool,
+    pub rocdxg_dids: bool,
+    /// Whether the linker cache lists ROCDXG.
+    ///
+    /// `None` when `ldconfig` could not be run at all — on Debian and its
+    /// derivatives it lives in `/sbin`, off a non-root user's `PATH`. An
+    /// unreadable cache is not an unregistered library, and reporting it as one
+    /// told users with a working install to re-run `ldconfig`.
+    pub ldconfig_librocdxg: Option<bool>,
+    /// Whether `rocminfo` is on PATH.
+    pub rocminfo: bool,
+    /// Whether ROCm can actually enumerate a GPU here.
+    ///
+    /// `None` when `rocminfo` is absent, so the question could not be asked. This
+    /// is the only WSL-collected evidence that the plumbing is complete yet no
+    /// device is reachable, which is what distinguishes an out-of-date Windows
+    /// host driver from a distro-side fault. The bare-metal `has_amd_gpu` cannot
+    /// stand in: the probes that populate it are skipped here, so it is always
+    /// false on WSL and reads as "no GPU" on a perfectly healthy machine.
+    pub rocm_sees_gpu: Option<bool>,
+    /// `None` when the distro release could not be parsed, which fails closed:
+    /// an unreadable release is not evidence of a supported one.
+    pub distro_supported: Option<bool>,
+    /// `None` when WSL interop could not reach the Windows host — distinct from
+    /// a host that answered and reported no AMD adapter, which is `Some("")`.
+    pub host_driver_version: Option<String>,
+    pub host_reachable: bool,
+    /// Whether these facts were gathered from inside the distribution.
+    ///
+    /// `false` when inspected from the Windows host over `wsl.exe`, which sees
+    /// the GPU stack but no environment — so the checks that read one cannot
+    /// run, and a caller must say so rather than let "nothing matched" read as
+    /// a clean bill of health.
+    pub locally_probed: bool,
+}
+
+/// Structured machine state consumed by the diagnosis catalog.
+///
+/// Field order and names mirror `examine.py`'s `Examination` dataclass so the
+/// JSON contract is identical, except for the `wsl` section, which has no
+/// `examine.py` analogue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Examination {
     // platform
@@ -106,6 +170,8 @@ pub struct Examination {
     pub kernel_release: String,
     pub kernel_cmdline: String,
     pub is_wsl: bool,
+    /// Populated only when `is_wsl`; see [`WslFacts`].
+    pub wsl: Option<WslFacts>,
 
     // hardware
     pub cpu_vendor: String,
@@ -154,6 +220,16 @@ pub struct Examination {
     pub framework_rocm_version: String,
     pub framework_arch_list: Vec<String>,
     pub framework_notes: Vec<String>,
+    /// Which interpreter answered: `"managed-runtime"`, `"path"`, or `""` when
+    /// no framework was probed.
+    ///
+    /// The versions themselves carry no provenance — `hip=7.2.53211` reads the
+    /// same whether it came from a managed runtime or an ambient pip wheel — and
+    /// the distinction decides whether comparing it against the *system* ROCm
+    /// means anything. A managed runtime ships its own ROCm and never loads the
+    /// system's, so for it the comparison is meaningless. See
+    /// `check_8_wheel_rocm_mismatch` in `diagnose.rs`.
+    pub framework_source: String,
 
     // environment
     pub env: BTreeMap<String, String>,
@@ -161,6 +237,24 @@ pub struct Examination {
     // container
     pub in_container: bool,
     pub container_kind: String,
+
+    // Shared memory (Linux). A serving workload needs gigabytes of `/dev/shm`;
+    // a container gives it 64 MB by default. When it runs out the workload
+    // crashes without the message ever naming shared memory, so the user has no
+    // route from the error to the cause.
+    /// Size of the `/dev/shm` filesystem in bytes.
+    ///
+    /// The total, not the free space, is what decides: a 64 MB allowance cannot
+    /// hold an 8 GB workload even when completely empty, so judging on free
+    /// space would miss the case on an idle machine entirely.
+    ///
+    /// `None` when the path does not exist or cannot be queried, which is a
+    /// different answer from zero -- a machine we could not measure is not a
+    /// machine with a shortage.
+    pub shm_total_bytes: Option<u64>,
+    /// Free space on `/dev/shm` in bytes. Reported because "64 MB total" and
+    /// "64 MB total, 2 MB free" are different conversations.
+    pub shm_available_bytes: Option<u64>,
 
     // evidence
     pub dmesg_amdgpu_tail: Vec<String>,
@@ -183,6 +277,7 @@ impl Default for Examination {
             kernel_release: String::new(),
             kernel_cmdline: String::new(),
             is_wsl: false,
+            wsl: None,
             cpu_vendor: "unknown".to_owned(),
             cpu_model: String::new(),
             gpus: Vec::new(),
@@ -219,9 +314,12 @@ impl Default for Examination {
             framework_rocm_version: String::new(),
             framework_arch_list: Vec::new(),
             framework_notes: Vec::new(),
+            framework_source: String::new(),
             env: BTreeMap::new(),
             in_container: false,
             container_kind: String::new(),
+            shm_total_bytes: None,
+            shm_available_bytes: None,
             dmesg_amdgpu_tail: Vec::new(),
             notes: Vec::new(),
             probe_failures: Vec::new(),
@@ -230,9 +328,14 @@ impl Default for Examination {
     }
 }
 
-/// Route-out guidance shown when WSL2 is detected (out of scope for this
-/// catalog, which targets bare-metal Linux). Mirrors `examine.py`.
-pub const WSL_ROUTE_OUT_NOTE: &str = "Detected WSL2. rocm examine does not cover the ROCm-on-WSL flow (it requires Adrenalin Pro + the WSL kernel update on the Windows host). Either run `rocm examine` on the native Linux host, or follow AMD's WSL guide directly: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
+/// Guidance shown when WSL2 is detected.
+///
+/// Named for what it does. It used to be a route-out — `rocm examine` did not
+/// cover the ROCm-on-WSL flow and sent the user elsewhere — and it kept that
+/// name for a while after it stopped routing anyone anywhere. It now explains
+/// which checks are skipped on this platform and points at the one that covers
+/// it.
+pub const WSL_PLATFORM_NOTE: &str = "Detected WSL2. The GPU is reached through /dev/dxg and the Windows host driver, so the bare-metal driver checks do not apply and are skipped. Run `rocm diagnose` for the WSL-specific checks. Setup guide: https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html";
 
 /// Which framework probe to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,30 +352,50 @@ impl Examination {
     /// their defaults (matching `examine.py`'s degrade-gracefully behavior).
     #[must_use]
     pub fn probe(framework: FrameworkProbe) -> Self {
+        Self::probe_with_interpreter(framework, None)
+    }
+
+    /// As [`Self::probe`], but running the framework probe under `interpreter`
+    /// when one is given.
+    ///
+    /// The interpreter is injected rather than resolved here on purpose: which
+    /// runtime is active is registry and config policy, and threading it in
+    /// keeps that out of the host prober — and keeps the probe testable without
+    /// standing up a fake `$HOME` *and* a real torch.
+    #[must_use]
+    pub fn probe_with_interpreter(
+        framework: FrameworkProbe,
+        interpreter: Option<&FrameworkInterpreter>,
+    ) -> Self {
         let mut e = Self::default();
         probe_os(&mut e);
         if e.is_wsl {
-            // WSL2 is out of scope for the *driver* probes: it uses /dev/dxg and
-            // the Windows host driver, not the in-tree amdgpu module or
-            // /dev/kfd, so asking about modprobe, the render group or /dev/kfd
-            // would only mislead. The "wsl" status carries that verdict.
+            // WSL2 keeps the *driver* probes skipped: it reaches the GPU through
+            // /dev/dxg and the Windows host driver, not the in-tree amdgpu module
+            // or /dev/kfd, so asking about modprobe, the render group or
+            // /dev/kfd would only mislead.
             //
-            // The frameworks are a different matter. PyTorch on WSL2 is a
-            // supported, documented configuration, and stopping before the
-            // framework probe meant `--json` could never tell a WSL user which
-            // ROCm build their torch was compiled against -- a question that has
-            // nothing to do with the kernel module. So run that one, and only
-            // that one, before routing out.
-            probe_framework(&mut e, framework);
-            e.notes.push(WSL_ROUTE_OUT_NOTE.to_owned());
-            e.status = "wsl".to_owned();
+            // Everything else applies. This used to return here after the
+            // framework probe alone, which left `env`, the container fields and
+            // the ROCm install at their defaults -- so the WSL half of the
+            // catalog had nothing to read and questions with no kernel-module
+            // component, like "is HSA_OVERRIDE_GFX_VERSION set", went unanswered
+            // on the one platform most likely to need them.
+            probe_wsl(&mut e);
+            probe_rocm_install(&mut e);
+            probe_env(&mut e);
+            probe_container(&mut e);
+            probe_framework(&mut e, framework, interpreter);
+            // WSL2 ships the same 64 MB default a container does, so this is one
+            // of the platforms where the shortage is most likely to be real.
+            probe_shared_memory(&mut e);
+            e.status = e.compute_status();
             return e;
         }
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
-            probe_gpus_rocminfo(&mut e);
-            probe_gpus_sysfs_fallback(&mut e);
+            probe_gpus_after_lspci(&mut e, GpuProbeSources::host());
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -281,8 +404,9 @@ impl Examination {
             probe_rocm_install(&mut e);
             probe_env(&mut e);
             probe_container(&mut e);
+            probe_shared_memory(&mut e);
             probe_dmesg_amdgpu(&mut e);
-            probe_framework(&mut e, framework);
+            probe_framework(&mut e, framework, interpreter);
         } else if e.os_family == "windows" {
             probe_cpu_windows(&mut e);
             probe_gpus_windows(&mut e);
@@ -291,7 +415,7 @@ impl Examination {
             probe_msvc_redist_windows(&mut e);
             summarise_gpu_categories(&mut e);
             probe_env(&mut e);
-            probe_framework(&mut e, framework);
+            probe_framework(&mut e, framework, interpreter);
         } else {
             e.notes.push(format!(
                 "rocm examine supports Linux and Windows; got {}. This skill cannot help on this platform.",
@@ -328,26 +452,56 @@ impl Examination {
 /// Run a command with a timeout. Returns `(rc, stdout, stderr)`. `rc` is `127`
 /// when the program can't be spawned and `124` on timeout.
 pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, String, String) {
+    run_with_env(program, args, &[], timeout)
+}
+
+/// [`run`] with extra environment variables overlaid on the inherited ones.
+pub(crate) fn run_with_env(
+    program: &str,
+    args: &[&str],
+    envs: &[(String, OsString)],
+    timeout: Duration,
+) -> (i32, String, String) {
+    let (rc, stdout, stderr) = run_raw(program, args, envs, timeout);
+    (
+        rc,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+/// [`run`] without the UTF-8 assumption, for output that is not UTF-8.
+fn run_raw(
+    program: &str,
+    args: &[&str],
+    envs: &[(String, OsString)],
+    timeout: Duration,
+) -> (i32, Vec<u8>, Vec<u8>) {
     let Ok(mut child) = Command::new(program)
         .args(args)
+        .envs(envs.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     else {
-        return (127, String::new(), String::new());
+        return (127, Vec::new(), Vec::new());
     };
+    // Bytes, then a lossy conversion at the end. `read_to_string` FAILS on
+    // invalid UTF-8 and the error was discarded, so a single stray byte silently
+    // emptied the whole capture — which reads downstream as "the command printed
+    // nothing", not as "the output could not be decoded".
     let stdout_handle = child.stdout.take().map(|mut stdout| {
         thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stdout.read_to_string(&mut buf);
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
             buf
         })
     });
     let stderr_handle = child.stderr.take().map(|mut stderr| {
         thread::spawn(move || {
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
             buf
         })
     });
@@ -366,10 +520,10 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
             Err(_) => break None,
         }
     };
-    let stdout = stdout_handle
+    let stdout: Vec<u8> = stdout_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let stderr = stderr_handle
+    let stderr: Vec<u8> = stderr_handle
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
     let rc = match status {
@@ -377,6 +531,28 @@ pub(crate) fn run(program: &str, args: &[&str], timeout: Duration) -> (i32, Stri
         None => 124,
     };
     (rc, stdout, stderr)
+}
+
+/// Run a command whose output is UTF-16LE, as `wsl.exe`'s is.
+///
+/// Decoding is by declaration, not detection. Sniffing the encoding cannot work
+/// here: UTF-16LE text in a Latin or Cyrillic script is made entirely of bytes
+/// below 0x80, so it is *valid UTF-8* and decodes without error straight into
+/// mojibake — no NUL-density or validity test can tell the two apart. The one
+/// reliable fact is which program produced the bytes.
+fn run_utf16le(program: &str, args: &[&str], timeout: Duration) -> (i32, String) {
+    let (rc, stdout, _) = run_raw(program, args, &[], timeout);
+    (rc, decode_utf16le(&stdout))
+}
+
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let body = bytes.strip_prefix(&[0xFF, 0xFE]).unwrap_or(bytes);
+    // `chunks_exact` drops a trailing odd byte rather than panicking on it.
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn read_text(path: &str) -> String {
@@ -406,7 +582,7 @@ pub(crate) fn which(program: &str) -> bool {
     false
 }
 
-const SHORT: Duration = Duration::from_secs(5);
+pub(crate) const SHORT: Duration = Duration::from_secs(5);
 const MEDIUM: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------
@@ -456,6 +632,290 @@ fn probe_os(e: &mut Examination) {
     } else {
         e.os_family = "other".to_owned();
     }
+}
+
+/// Collect the WSL-specific facts the WSL half of the catalog reasons over.
+///
+/// Reuses [`crate::detect_wsl_summary`] for the plumbing it already probes rather
+/// than restating those paths, and adds the facts no existing caller needed: the
+/// WSL major version, whether the distro release clears the supported floor, and
+/// the Windows host driver version.
+fn probe_wsl(e: &mut Examination) {
+    let summary = crate::detect_wsl_summary();
+    let (host_reachable, host_driver_version) = host_driver_fields(crate::detect_wsl_host_driver());
+    let rocminfo = which("rocminfo");
+    e.wsl = Some(WslFacts {
+        version: if crate::is_wsl1_kernel(&e.kernel_release) {
+            1
+        } else {
+            2
+        },
+        dxg_device: summary.as_ref().is_some_and(|s| s.dxg_device),
+        dxcore: summary.as_ref().is_some_and(|s| s.dxcore),
+        wsl_lib_dir: Path::new("/usr/lib/wsl/lib").is_dir(),
+        librocdxg: summary.as_ref().is_some_and(|s| s.librocdxg),
+        rocdxg_dids: summary.as_ref().is_some_and(|s| s.rocdxg_dids),
+        // `None` when ldconfig itself could not be run, which the summary's
+        // bool cannot express -- recover it from the same source the summary used.
+        ldconfig_librocdxg: crate::ldconfig_lists_librocdxg(),
+        rocminfo,
+        rocm_sees_gpu: rocminfo.then(probe_rocminfo_sees_gpu),
+        distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
+        host_driver_version,
+        host_reachable,
+        locally_probed: true,
+    });
+    sync_shared_fields_from_wsl(e);
+    e.notes.push(WSL_PLATFORM_NOTE.to_owned());
+}
+
+/// Flatten a host-driver probe into the two [`WslFacts`] fields that carry it.
+///
+/// One place, so the in-guest and host-side probes cannot drift on the point
+/// that matters: `None` means the question went unanswered, and `Some("")` means
+/// it was answered with "no AMD adapter". Only the second is evidence.
+fn host_driver_fields(probe: crate::WslHostDriverProbe) -> (bool, Option<String>) {
+    match probe {
+        crate::WslHostDriverProbe::Unreachable => (false, None),
+        crate::WslHostDriverProbe::NoAmdDisplay => (true, Some(String::new())),
+        crate::WslHostDriverProbe::Version(version) => (true, Some(version)),
+    }
+}
+
+/// Collect the WSL facts from *outside* the distro, over `wsl.exe`.
+///
+/// Emits `key=value` lines rather than JSON so the guest side needs nothing but
+/// a POSIX shell. The Python preflight this replaces injected a Python program
+/// and so required `python3` in the distro — on a machine being checked precisely
+/// because it is not set up yet.
+///
+/// `librocdxg` is globbed across `/opt/rocm*` for the same reason the in-guest
+/// probe resolves it across installs: a versioned root must not read as missing.
+const WSL_REMOTE_PROBE: &str = r#"
+echo "kernel=$(uname -r 2>/dev/null)"
+if [ -e /dev/dxg ]; then echo dxg=1; else echo dxg=0; fi
+if [ -e /usr/lib/wsl/lib/libdxcore.so ]; then echo dxcore=1; else echo dxcore=0; fi
+if [ -d /usr/lib/wsl/lib ]; then echo wsllib=1; else echo wsllib=0; fi
+if ls /opt/rocm*/lib/librocdxg.so >/dev/null 2>&1 \
+  || ls /usr/local/rocm*/lib/librocdxg.so >/dev/null 2>&1; then echo librocdxg=1; else echo librocdxg=0; fi
+if ls /opt/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1 \
+  || ls /usr/local/rocm*/share/rocdxg/dids.conf >/dev/null 2>&1; then echo dids=1; else echo dids=0; fi
+for ldc in ldconfig /sbin/ldconfig /usr/sbin/ldconfig; do
+  if cache=$(command -v "$ldc" >/dev/null 2>&1 && "$ldc" -p 2>/dev/null); then
+    case "$cache" in *librocdxg.so*) echo ldconfig=1 ;; *) echo ldconfig=0 ;; esac
+    break
+  fi
+done
+if command -v rocminfo >/dev/null 2>&1; then
+  echo rocminfo=1
+  if rocminfo 2>/dev/null | grep -qi gfx; then echo rocmgfx=1; else echo rocmgfx=0; fi
+else
+  echo rocminfo=0
+fi
+. /etc/os-release 2>/dev/null
+echo "id=${ID}"
+echo "version=${VERSION_ID}"
+"#;
+
+/// Parse `wsl.exe -l -q` into distribution names.
+///
+/// `-q` prints one bare name per line, so the whole line is the name. It is NOT
+/// split on whitespace: `wsl --import "My Distro"` is legal, and truncating that
+/// to `My` would both fail to match what the user asked for and hand a wrong
+/// name to `wsl.exe -d`.
+///
+/// The header and `*` handling below is for tolerance only — `-q` emits neither,
+/// but a caller passing `-l -v` should not silently get its header row back as a
+/// distribution.
+#[must_use]
+pub fn parse_wsl_distro_list(text: &str) -> Vec<String> {
+    text.replace('\u{0}', "")
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.trim();
+            if line.is_empty() || line.to_uppercase().starts_with("NAME") {
+                return None;
+            }
+            let line = line.strip_prefix('*').map_or(line, str::trim);
+            (!line.is_empty()).then(|| line.to_owned())
+        })
+        .collect()
+}
+
+fn parse_remote_flag(fields: &BTreeMap<String, String>, key: &str) -> bool {
+    fields.get(key).is_some_and(|value| value == "1")
+}
+
+/// A remote flag that can also report that the question went unanswered.
+fn parse_remote_tristate(fields: &BTreeMap<String, String>, key: &str) -> Option<bool> {
+    match fields.get(key).map(String::as_str) {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Inspect a WSL distribution from the Windows host.
+///
+/// Returns an [`Examination`] the ordinary catalog can be run against, so the
+/// host-side check and the in-distro one share a single set of rules. Nothing
+/// needs to be installed in the target distro.
+///
+/// # Errors
+///
+/// When `wsl.exe` is unavailable, no distribution matches, or the probe cannot
+/// be run inside the selected distribution.
+pub fn probe_wsl_distro_from_host(distro: Option<&str>) -> Result<Examination, String> {
+    if !which("wsl.exe") {
+        return Err(
+            "wsl.exe was not found; inspecting a distribution this way only works from the Windows host"
+                .to_owned(),
+        );
+    }
+    // `-q` prints names only. `-l -v` adds a header row that is localised, and a
+    // header the parser fails to recognise is not skipped -- it is taken for a
+    // distribution name.
+    let (rc, listed) = run_utf16le("wsl.exe", &["-l", "-q"], MEDIUM);
+    if rc != 0 {
+        return Err("could not list WSL distributions".to_owned());
+    }
+    let distros = parse_wsl_distro_list(&listed);
+    let selected = select_wsl_distro(distro, &distros)?;
+
+    let (rc, out, _) = run(
+        "wsl.exe",
+        &["-d", &selected, "--exec", "/bin/sh", "-c", WSL_REMOTE_PROBE],
+        Duration::from_secs(30),
+    );
+    if rc != 0 {
+        return Err(format!(
+            "could not inspect '{selected}'; the distribution may be stopped or unreachable"
+        ));
+    }
+    let fields: BTreeMap<String, String> = out
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    let (host_reachable, host_driver_version) =
+        host_driver_fields(crate::detect_local_windows_host_driver());
+
+    let mut e = Examination {
+        os_family: "linux".to_owned(),
+        is_wsl: true,
+        kernel_release: fields.get("kernel").cloned().unwrap_or_default(),
+        distro_id: fields.get("id").cloned().unwrap_or_default(),
+        distro_version: fields.get("version").cloned().unwrap_or_default(),
+        ..Examination::default()
+    };
+    let rocminfo = parse_remote_flag(&fields, "rocminfo");
+    e.wsl = Some(WslFacts {
+        version: if crate::is_wsl1_kernel(&e.kernel_release) {
+            1
+        } else {
+            2
+        },
+        dxg_device: parse_remote_flag(&fields, "dxg"),
+        dxcore: parse_remote_flag(&fields, "dxcore"),
+        wsl_lib_dir: parse_remote_flag(&fields, "wsllib"),
+        librocdxg: parse_remote_flag(&fields, "librocdxg"),
+        rocdxg_dids: parse_remote_flag(&fields, "dids"),
+        ldconfig_librocdxg: parse_remote_tristate(&fields, "ldconfig"),
+        rocminfo,
+        rocm_sees_gpu: rocminfo.then(|| parse_remote_flag(&fields, "rocmgfx")),
+        distro_supported: distro_clears_wsl_floor(&e.distro_id, &e.distro_version),
+        // Running on the host, the driver is a local question rather than one
+        // that has to cross the interop boundary. It can still go unanswered —
+        // the inventory query can fail — and that must stay distinguishable from
+        // "the host has no AMD adapter", which is a finding.
+        host_driver_version,
+        host_reachable,
+        locally_probed: false,
+    });
+    sync_shared_fields_from_wsl(&mut e);
+    e.status = "wsl".to_owned();
+    Ok(e)
+}
+
+/// Choose which WSL distribution to inspect, given the requested name (if
+/// any) and the list of installed ones.
+///
+/// Pulled out of [`probe_wsl_distro_from_host`] so this refusal logic -- one
+/// of the few genuinely host-independent, blocking checks in the WSL host
+/// path -- can be exercised without `wsl.exe`, which the rest of that
+/// function requires and which this crate's e2e coverage otherwise never
+/// touches on a non-Windows test runner.
+fn select_wsl_distro(distro: Option<&str>, distros: &[String]) -> Result<String, String> {
+    match distro {
+        Some(name) => {
+            if !distros.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+                return Err(format!(
+                    "no WSL distribution named '{name}'; found: {}",
+                    distros.join(", ")
+                ));
+            }
+            Ok(name.to_owned())
+        }
+        None => match distros {
+            [] => Err("no WSL distributions were found".to_owned()),
+            [only] => Ok(only.clone()),
+            many => Err(format!(
+                "several WSL distributions are installed; name one with --distro: {}",
+                many.join(", ")
+            )),
+        },
+    }
+}
+
+/// Whether `rocminfo` enumerates a GPU agent.
+///
+/// Only the yes/no answer is taken. Parsing the agents into `gpus` is the job of
+/// the bare-metal probe, which stays skipped here — this exists so the WSL
+/// catalog can tell "the plumbing is complete but no device is reachable" from
+/// "the plumbing is incomplete", which is the difference between blaming the
+/// Windows host driver and blaming the distro.
+fn probe_rocminfo_sees_gpu() -> bool {
+    let (rc, out, _) = run("rocminfo", &[], MEDIUM);
+    rc == 0 && out.to_lowercase().contains("gfx")
+}
+
+/// Mirror the WSL facts onto the shared fields the cross-platform checks read.
+///
+/// Those checks (PATH, the wheel/ROCm pairing) are valid on WSL and enabled
+/// there, but they read fields the bare-metal GPU probe populates — and that
+/// probe is skipped here. Left at their defaults they do not read as "unknown",
+/// they read as "absent": `rocminfo_present: false` made the PATH check score 50
+/// on every WSL host that had ROCm installed.
+fn sync_shared_fields_from_wsl(e: &mut Examination) {
+    let Some(wsl) = e.wsl.as_ref() else {
+        return;
+    };
+    e.rocminfo_present = wsl.rocminfo;
+    e.rocminfo_status = match (wsl.rocminfo, wsl.rocm_sees_gpu) {
+        (false, _) => "missing".to_owned(),
+        (true, Some(true)) => "ok".to_owned(),
+        (true, Some(false)) => "no-agents".to_owned(),
+        (true, None) => "unknown".to_owned(),
+    };
+}
+
+/// Whether the distro release clears the WSL floor in [`WSL_MIN_UBUNTU`].
+///
+/// `None` means the release could not be read as a `major.minor` pair. That is
+/// deliberately not "supported": an unparseable release is not evidence of a good
+/// one, and reporting a perfect host on a release nobody could identify is how a
+/// user ends up chasing a GPU fault that is really a glibc floor.
+///
+/// Only Ubuntu carries a floor today, because that is the only distro the WSL
+/// path documents. Anything else returns `None` rather than a false verdict.
+fn distro_clears_wsl_floor(distro_id: &str, distro_version: &str) -> Option<bool> {
+    if !distro_id.eq_ignore_ascii_case("ubuntu") {
+        return None;
+    }
+    let (major, minor) = distro_version.split_once('.')?;
+    let major: u32 = major.parse().ok()?;
+    let minor: u32 = minor.parse().ok()?;
+    Some((major, minor) >= WSL_MIN_UBUNTU)
 }
 
 /// Extract the value of `iommu=<value>` from a kernel cmdline string.
@@ -604,6 +1064,23 @@ fn gfx_model_digit(gfx: &str, prefix: &str) -> Option<u32> {
     gfx.strip_prefix(prefix)?.chars().next()?.to_digit(10)
 }
 
+/// Whether an `lspci -nn` line describes a GPU this probe should enumerate.
+///
+/// Instinct parts report PCI class `1200` ("Processing accelerators"), not a
+/// display class: an MI300X enumerates as `Processing accelerators [1200]` with
+/// no display class anywhere on the device. Matching only the three display
+/// classes therefore skipped every datacenter GPU, so on a bare-metal Instinct
+/// host `lspci` contributed nothing and `has_amd_gpu` rested entirely on
+/// `rocminfo` or the sysfs fallback — and came back false when neither was
+/// reachable. Verified on an 8-GPU MI300X host, where all eight devices read
+/// `class=0x120000` in sysfs (EAI-8449).
+fn is_lspci_gpu_line(line: &str) -> bool {
+    line.contains("VGA compatible controller")
+        || line.contains("3D controller")
+        || line.contains("Display controller")
+        || line.contains("Processing accelerators")
+}
+
 fn probe_gpus_lspci(e: &mut Examination) {
     if !which("lspci") {
         e.probe_failures
@@ -617,10 +1094,7 @@ fn probe_gpus_lspci(e: &mut Examination) {
         return;
     }
     for line in out.lines() {
-        let is_controller = line.contains("VGA compatible controller")
-            || line.contains("3D controller")
-            || line.contains("Display controller");
-        if !is_controller {
+        if !is_lspci_gpu_line(line) {
             continue;
         }
         let pci_id = line
@@ -675,6 +1149,27 @@ fn extract_lspci_name(line: &str) -> String {
     trimmed.trim().to_owned()
 }
 
+/// The name a GPU carries when the kernel topology is all we have to go on.
+///
+/// A placeholder, not a name: it says "AMD GPU, source known, model unknown".
+/// Both probes that can produce a GPU without a marketing name use it, and
+/// [`gpu_name_is_unknown`] reads it back, so it has to be one string rather
+/// than three copies that could drift apart.
+const KERNEL_TOPOLOGY_GPU_NAME: &str = "AMD GPU (from kernel topology)";
+
+/// Whether this GPU still has no real model name.
+///
+/// [`KERNEL_TOPOLOGY_GPU_NAME`] has to count as unknown here. The membership
+/// pass runs *before* `rocminfo` and stamps that placeholder on every kernel
+/// node the PCI scan could not name; if a later probe treated it as a name
+/// already present, the placeholder would outrank the marketing name `rocminfo`
+/// supplies and the report would be strictly worse than before the membership
+/// pass existed -- on exactly the host the pass was written for, the ordinary
+/// ROCm container with `rocminfo` but no `pciutils`.
+fn gpu_name_is_unknown(name: &str) -> bool {
+    name.is_empty() || name == KERNEL_TOPOLOGY_GPU_NAME
+}
+
 fn probe_gpus_rocminfo(e: &mut Examination) {
     if !which("rocminfo") {
         e.rocminfo_present = false;
@@ -696,7 +1191,17 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
         return;
     }
     e.rocminfo_status = "ok".to_owned();
+    apply_rocminfo_gpu_agents(e, &out);
+}
 
+/// Fold a `rocminfo` reading into the GPU list, against caller-supplied output.
+///
+/// Split from the process launch the same way [`apply_kernel_gpu_membership`] is
+/// split from the `/sys` read, and for the same reason: the interesting
+/// behaviour here is how an agent is matched onto an existing entry, and a test
+/// that had to run the real `rocminfo` could only assert it on a host with a
+/// GPU. See `a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder`.
+fn apply_rocminfo_gpu_agents(e: &mut Examination, out: &str) {
     let mut gfx_targets: Vec<(String, String)> = Vec::new();
     let mut cur_name = String::new();
     let mut cur_marketing = String::new();
@@ -736,7 +1241,7 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
         if let Some(&gpu_idx) = amd_indices.get(idx) {
             let gpu = &mut e.gpus[gpu_idx];
             gpu.gfx_target = gfx.clone();
-            if !marketing.is_empty() && gpu.name.is_empty() {
+            if !marketing.is_empty() && gpu_name_is_unknown(&gpu.name) {
                 gpu.name = marketing;
             }
             gpu.is_apu = Some(gfx_is_apu_family(&gfx));
@@ -771,11 +1276,25 @@ fn probe_gpus_rocminfo(e: &mut Examination) {
 /// So ask the kernel here too, but only as a fallback: `lspci` carries PCI ids,
 /// vendor strings and the APU/discrete distinction that sysfs does not, and
 /// those are worth keeping whenever they are available.
-fn probe_gpus_sysfs_fallback(e: &mut Examination) {
+///
+/// Reached only when the KFD topology could not be read or described no GPU,
+/// since [`probe_gpus_kernel_membership_in`] would otherwise have contributed an
+/// entry per node already. What is left for this to cover is the host whose
+/// target comes from DRM ip-discovery instead — see
+/// [`crate::detect_linux_sysfs_gfx_target`].
+///
+/// `gfx_target` is supplied by the caller rather than read here so the pass has
+/// a seam like every other one in the sequence: the hosts it covers are ones a
+/// test cannot run on, and it is the only pass whose *output* distinguishes the
+/// sequence's correct order from running
+/// [`note_unnamed_kernel_topology_gpus`] after it. It stays a function rather
+/// than a value so the read is still skipped entirely when an AMD GPU is
+/// already listed.
+fn probe_gpus_sysfs_fallback(e: &mut Examination, gfx_target: fn() -> Option<String>) {
     if e.gpus.iter().any(|gpu| gpu.is_amd) {
         return;
     }
-    let Some(gfx_target) = crate::detect_linux_sysfs_gfx_target() else {
+    let Some(gfx_target) = gfx_target() else {
         return;
     };
     // `is_apu` is left unset rather than guessed: sysfs gives the target, not
@@ -783,7 +1302,7 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
     // `Some(false)` to populate has_apu / has_discrete_amd. Claiming either
     // would be inventing a fact, so both stay false and only has_amd_gpu moves.
     e.gpus.push(Gpu {
-        name: "AMD GPU (from kernel topology)".to_owned(),
+        name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
         gfx_target,
         is_amd: true,
         is_apu: None,
@@ -794,6 +1313,266 @@ fn probe_gpus_sysfs_fallback(e: &mut Examination) {
          available; PCI id and marketing name are unknown."
             .to_owned(),
     );
+}
+
+/// Where the GPU passes that follow the PCI scan read the host from.
+///
+/// They run in one particular order, stated by [`probe_gpus_after_lspci`], and
+/// until this existed that order was a claim only a doc comment made: the
+/// sequence read `/sys` and launched `rocminfo` itself, so no test could drive
+/// it. Moving [`note_unnamed_kernel_topology_gpus`] above `rocminfo`, below the
+/// sysfs fallback, or deleting it outright each left the whole suite green,
+/// even though the first reinstates the premature-note defect the pass was
+/// split out to remove.
+///
+/// Naming the sources is what makes the sequence drivable against a planted
+/// host, so its shape is pinned by assertion rather than by prose — see
+/// `the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback`.
+/// The passes themselves are the real ones; only where they read is injected.
+struct GpuProbeSources<'a> {
+    /// The KFD topology nodes directory the membership pass reconciles against.
+    kfd_nodes: &'a Path,
+    /// A `rocminfo` reading to fold in, or `None` to run `rocminfo` here.
+    ///
+    /// `None` is what the host uses; `Some` exists because a test cannot make a
+    /// machine with no GPU produce an agent listing, and the placeholder's fate
+    /// turns entirely on whether one arrived.
+    rocminfo: Option<&'a str>,
+    /// How the sysfs fallback learns the gfx target when nothing else named a
+    /// card. See [`probe_gpus_sysfs_fallback`] for why it is a function.
+    sysfs_gfx_target: fn() -> Option<String>,
+}
+
+impl GpuProbeSources<'_> {
+    /// The real host: the kernel's own KFD topology, the `rocminfo` on `PATH`,
+    /// and the sysfs target read.
+    fn host() -> Self {
+        Self {
+            kfd_nodes: Path::new("/sys/class/kfd/kfd/topology/nodes"),
+            rocminfo: None,
+            sysfs_gfx_target: crate::detect_linux_sysfs_gfx_target,
+        }
+    }
+}
+
+/// Every GPU pass after the PCI scan, in the order they have to run in.
+///
+/// The order is the whole point of gathering them here: each pass is correct
+/// only in one position, and three of the four constraints below are invisible
+/// to any test that calls the passes directly in an order it chose itself.
+///
+/// - The membership pass decides *which* AMD GPUs exist, so it runs before
+///   `rocminfo`: the PCI scan over-reports in a container, and `rocminfo` maps
+///   its agents onto the surviving entries by position, so it has to see the
+///   reconciled list rather than the whole bus.
+/// - [`note_unnamed_kernel_topology_gpus`] runs after `rocminfo`, which is the
+///   probe most likely to name a card the PCI scan missed, and before the sysfs
+///   fallback, which plants the same placeholder with a note of its own.
+fn probe_gpus_after_lspci(e: &mut Examination, sources: GpuProbeSources) {
+    // The topology status is dropped: both answers call for the same action
+    // here. It is returned at all so that a test can tell them apart -- see
+    // [`KfdTopology`].
+    probe_gpus_kernel_membership_in(e, sources.kfd_nodes);
+    match sources.rocminfo {
+        Some(out) => apply_rocminfo_gpu_agents(e, out),
+        None => probe_gpus_rocminfo(e),
+    }
+    note_unnamed_kernel_topology_gpus(e);
+    probe_gpus_sysfs_fallback(e, sources.sysfs_gfx_target);
+}
+
+/// What the kernel topology had to say, as opposed to what was done about it.
+///
+/// "There is no KFD to read" and "KFD listed no GPU" are different answers that
+/// happen to call for the same action -- leave the PCI enumeration standing --
+/// and that coincidence is precisely why the distinction went untested. With
+/// both collapsed into a no-op, replacing the read's early return with
+/// `unwrap_or_default()`, which turns "cannot read" into "read an empty
+/// topology", left the entire suite green: `apply_kernel_gpu_membership`'s own
+/// `nodes.is_empty()` guard absorbed the difference, so no assertion about the
+/// resulting report could ever have noticed.
+///
+/// Naming the answer separately from the action is what makes it assertable.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KfdTopology {
+    /// No KFD to read: `amdgpu` never loaded, the node directory is absent, or
+    /// this is a container without it. "Cannot say", not "no GPUs".
+    Unreadable,
+    /// KFD answered, describing this many GPU nodes. Zero is a real answer --
+    /// the driver is there and bound nothing -- and is not the same statement.
+    Read(usize),
+}
+
+/// KFD is a Linux interface, so off Linux there is no topology to read.
+///
+/// The gating is not cosmetic: [`probe_gpus_after_lspci`] is reached through a
+/// runtime `os_family == "linux"` test, not a `cfg`, so it and this call still
+/// have to compile on Windows — and Linux clippy cannot see that. The twin
+/// keeps the sequence itself in one place instead of a second, drifting copy.
+#[cfg(not(any(target_os = "linux", test)))]
+const fn probe_gpus_kernel_membership_in(_e: &mut Examination, _nodes_dir: &Path) {}
+
+/// Make the reported AMD GPU list the set the *kernel* exposes, named from what
+/// the PCI scan found, against a caller-supplied nodes directory.
+///
+/// The PCI bus answers a different question from the kernel. Matching the
+/// processing-accelerator class is what finally makes Instinct parts visible to
+/// [`probe_gpus_lspci`], but it also makes every card on the *host* bus visible
+/// to a container that was passed one of them: an MI300X node reports eight
+/// accelerators on the bus while KFD describes only the GPU the container may
+/// use. Enumerating from PCI alone would therefore tell that user they have
+/// eight GPUs, and `rocm serve` would then fail on a device `examine` had just
+/// advertised — worse than the under-detection this replaced, which at least
+/// failed honestly.
+///
+/// So count from the kernel and name from PCI. Only `is_amd` entries are
+/// touched: KFD describes AMD compute devices and says nothing about an NVIDIA
+/// card, which must survive untouched.
+///
+/// Split from the `/sys` path exactly as [`crate::kfd_gpu_nodes_in`] is, and for
+/// the same reason one level further out: it leaves the *whole* probe drivable
+/// from a test — the read, the "cannot say" early return, and the handoff to
+/// [`apply_kernel_gpu_membership`] — rather than only the reconcile that handoff
+/// calls.
+///
+/// The seam is not decoration. Before it, the handoff was a statement no test
+/// could reach, because its only caller read the host's own `/sys`: deleting the
+/// call left the entire workspace suite green, since every unit test drove the
+/// inner function directly with a hand-supplied node list. See
+/// `the_membership_probe_reconciles_the_topology_it_is_pointed_at`, which fails
+/// if that handoff goes away.
+#[cfg(any(target_os = "linux", test))]
+fn probe_gpus_kernel_membership_in(e: &mut Examination, nodes_dir: &Path) -> KfdTopology {
+    let Some(nodes) = crate::kfd_gpu_nodes_in(nodes_dir) else {
+        return KfdTopology::Unreadable;
+    };
+    apply_kernel_gpu_membership(e, &nodes);
+    KfdTopology::Read(nodes.len())
+}
+
+/// The reconcile itself, against a caller-supplied topology reading.
+///
+/// Split out from the sysfs read for the same reason as `detect_kfd_gfx_target_in`:
+/// the hosts this matters on are the ones a test cannot run on, and reading the
+/// real topology from a test would make the assertion depend on the machine.
+/// Its caller holds no logic of its own, so pairing this with
+/// [`crate::kfd_gpu_nodes_in`] over a planted directory covers the whole path
+/// bar the `/sys` path constant — see
+/// `the_membership_read_reconciles_a_planted_topology_end_to_end`.
+///
+/// An empty `nodes` is deliberately a no-op rather than "report no GPUs". A
+/// readable topology with no GPU node is what a host whose `amdgpu` failed to
+/// load looks like, and "your card is on the bus but the driver did not bind"
+/// is the single most useful thing `examine` can say there — so the PCI list
+/// stands, and the driver probes explain why nothing is usable.
+#[cfg(any(target_os = "linux", test))]
+fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode]) {
+    if nodes.is_empty() {
+        return;
+    }
+    let (from_pci, others): (Vec<Gpu>, Vec<Gpu>) = std::mem::take(&mut e.gpus)
+        .into_iter()
+        .partition(|gpu| gpu.is_amd);
+    let mut claimed = vec![false; from_pci.len()];
+
+    let mut gpus: Vec<Gpu> = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        // Matched by address, not by position: the two enumerations order
+        // devices independently, and on a partitioned Instinct several KFD
+        // nodes legitimately share one physical card's address.
+        let matched = from_pci
+            .iter()
+            .position(|gpu| pci_ids_match(&gpu.pci_id, &node.pci_id));
+        let Some(index) = matched else {
+            // Kernel-visible but absent from the PCI scan: no `lspci` on PATH,
+            // or a node whose address could not be decoded. The device is still
+            // usable, so it must be listed -- just without the enriched name.
+            //
+            // A placeholder, and deliberately not a note: `rocminfo` has not run
+            // yet and may well supply the real marketing name, so whether this
+            // device is *finally* unnamed is not knowable here. That verdict is
+            // left to `note_unnamed_kernel_topology_gpus`, after naming is done.
+            gpus.push(Gpu {
+                name: KERNEL_TOPOLOGY_GPU_NAME.to_owned(),
+                gfx_target: node.gfx_target.clone(),
+                pci_id: node.pci_id.clone(),
+                is_amd: true,
+                // Left unset rather than guessed, for the same reason
+                // `probe_gpus_sysfs_fallback` leaves it unset: KFD gives the
+                // target, not the packaging.
+                is_apu: None,
+            });
+            continue;
+        };
+        claimed[index] = true;
+        let mut gpu = from_pci[index].clone();
+        // The node's own target, so an APU+dGPU host labels each card with the
+        // target that belongs to it. Never an overwrite: `rocminfo` has not run
+        // yet here, but a target `lspci` resolved from the marketing name is a
+        // statement about this device and the node's is only a better one when
+        // there is nothing to compare it against.
+        if gpu.gfx_target.is_empty() {
+            gpu.gfx_target = node.gfx_target.clone();
+        }
+        gpus.push(gpu);
+    }
+
+    let unexposed: Vec<&str> = from_pci
+        .iter()
+        .zip(&claimed)
+        .filter(|(_, claimed)| !**claimed)
+        .map(|(gpu, _)| gpu.pci_id.as_str())
+        .collect();
+    if !unexposed.is_empty() {
+        // Not dropped silently: the addresses still belong in the report,
+        // because "the bus has it and the kernel does not" is a diagnosis.
+        e.notes.push(format!(
+            "{} AMD PCI device(s) are on the bus but not exposed by the kernel here, so they \
+             are not listed as GPUs: {}. In a container this is expected — only the \
+             passed-through GPUs are usable.",
+            unexposed.len(),
+            unexposed.join(", ")
+        ));
+    }
+    e.gpus = gpus;
+    e.gpus.extend(others);
+}
+
+/// Report which kernel-sourced GPUs ended up with no model name, once nothing
+/// left can supply one.
+///
+/// Separate from [`apply_kernel_gpu_membership`], which is where the count used
+/// to be taken, because that pass runs before `probe_gpus_rocminfo`. Counting
+/// there asserted "their marketing name is unknown" while the probe that most
+/// often knows the name had not yet run -- so the note fired even on hosts whose
+/// report went on to name every card.
+///
+/// Must run after `probe_gpus_rocminfo` and before [`probe_gpus_sysfs_fallback`]:
+/// the first is what resolves the placeholder, and the second plants the same
+/// placeholder again with a note of its own, which this would otherwise count a
+/// second time. Both bounds are asserted rather than merely asked for — see
+/// `the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback`,
+/// which fails if this call moves to either side of them or goes away.
+fn note_unnamed_kernel_topology_gpus(e: &mut Examination) {
+    let unnamed = e
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.is_amd && gpu.name == KERNEL_TOPOLOGY_GPU_NAME)
+        .count();
+    if unnamed > 0 {
+        e.notes.push(format!(
+            "{unnamed} GPU(s) were taken from the kernel topology because the PCI enumeration \
+             did not list them; their marketing name is unknown."
+        ));
+    }
+}
+
+/// Whether two PCI addresses name the same device. An empty address matches
+/// nothing: it means "unknown", not "wildcard".
+#[cfg(any(target_os = "linux", test))]
+const fn pci_ids_match(left: &str, right: &str) -> bool {
+    !left.is_empty() && left.eq_ignore_ascii_case(right)
 }
 
 fn summarise_gpu_categories(e: &mut Examination) {
@@ -1053,14 +1832,20 @@ const PYTORCH_PROBE: &str = concat!(
     "sys.stdout.write(json.dumps(out))\n",
 );
 
-fn probe_framework(e: &mut Examination, framework: FrameworkProbe) {
+fn probe_framework(
+    e: &mut Examination,
+    framework: FrameworkProbe,
+    interpreter: Option<&FrameworkInterpreter>,
+) {
     match framework {
         FrameworkProbe::Skip => e.framework = "skipped".to_owned(),
-        FrameworkProbe::PyTorch => probe_pytorch(e),
+        FrameworkProbe::PyTorch => probe_pytorch(e, interpreter),
         FrameworkProbe::LlamaCpp => probe_llama_cpp(e),
         FrameworkProbe::Auto => {
-            if which("python") || which("python3") {
-                probe_pytorch(e);
+            // A managed runtime brings its own interpreter, so the ambient PATH
+            // no longer decides whether torch is worth asking about.
+            if interpreter.is_some() || which("python") || which("python3") {
+                probe_pytorch(e, interpreter);
                 if e.framework == "pytorch" {
                     return;
                 }
@@ -1070,7 +1855,77 @@ fn probe_framework(e: &mut Examination, framework: FrameworkProbe) {
     }
 }
 
-fn probe_pytorch(e: &mut Examination) {
+fn probe_pytorch(e: &mut Examination, interpreter: Option<&FrameworkInterpreter>) {
+    match interpreter {
+        Some(interpreter) => probe_pytorch_in_runtime(e, interpreter),
+        None => probe_pytorch_on_path(e),
+    }
+}
+
+/// Probe the torch the engines will actually load.
+///
+/// Deliberately does not fall back to the `PATH` interpreter when the runtime's
+/// torch fails to import. Falling back would double the timeout budget and
+/// produce an examination whose fields describe one interpreter while its notes
+/// describe another — and a broken active runtime *is* the host's real answer,
+/// because that is the torch `rocm serve` will run.
+fn probe_pytorch_in_runtime(e: &mut Examination, interpreter: &FrameworkInterpreter) {
+    e.framework_source = "managed-runtime".to_owned();
+    e.framework_notes.push(format!(
+        "Probed torch with the active managed runtime's interpreter: {}",
+        interpreter.python.display()
+    ));
+    let env = runtime_library_path_env(e, &interpreter.library_paths);
+    let (rc, out, err) = run_with_env(
+        &interpreter.python.display().to_string(),
+        &["-c", PYTORCH_PROBE],
+        &env,
+        Duration::from_secs(20),
+    );
+    record_pytorch_probe(e, rc, &out, &err);
+}
+
+/// Compose the loader path a runtime's torch needs, runtime entries ahead of
+/// whatever the host already has, so the runtime's own ROCm wins.
+///
+/// A failure to compose it is recorded rather than swallowed: the import that
+/// follows would die on a missing ROCm library and read as a broken runtime,
+/// which is the misdiagnosis this whole path exists to avoid.
+fn runtime_library_path_env(
+    e: &mut Examination,
+    library_paths: &[PathBuf],
+) -> Vec<(String, OsString)> {
+    if library_paths.is_empty() {
+        return Vec::new();
+    }
+    let mut entries = library_paths.to_vec();
+    if let Some(existing) = std::env::var_os(RUNTIME_LIBRARY_PATH_ENV) {
+        // `runtime_path_list_split`, not `std::env::split_paths`: on Windows it
+        // trims, drops empty entries and host-normalises each one, on top of the
+        // same quoting rules `split_paths` applies. The sibling composition in
+        // `probe_runtime_devices` (`apps/rocm/src/therock.rs`, a different crate)
+        // already uses it, and the two building the same variable differently is
+        // how they drift.
+        //
+        // The quoting is what keeps the `join_paths` below on its `Ok` arm: this
+        // variable is `PATH` on Windows, a quoted entry anywhere in the inherited
+        // one is legal, and a splitter that left the `"` in place would fail the
+        // join and cost the interpreter every library path rather than one.
+        entries.extend(crate::runtime_path_list_split(&existing));
+    }
+    match std::env::join_paths(entries) {
+        Ok(joined) => vec![(RUNTIME_LIBRARY_PATH_ENV.to_owned(), joined)],
+        Err(err) => {
+            e.framework_notes.push(format!(
+                "Could not compose {RUNTIME_LIBRARY_PATH_ENV} for the runtime's interpreter ({err}); \
+                 its torch may fail to load the runtime's ROCm libraries."
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn probe_pytorch_on_path(e: &mut Examination) {
     let py = if which("python") {
         "python"
     } else if which("python3") {
@@ -1080,22 +1935,38 @@ fn probe_pytorch(e: &mut Examination) {
             .push("No python interpreter found to probe torch.".to_owned());
         return;
     };
+    e.framework_source = "path".to_owned();
     let (rc, out, err) = run(py, &["-c", PYTORCH_PROBE], Duration::from_secs(20));
-    let (out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3") {
-        let (_, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
+    let (rc, out, err) = if (rc != 0 || out.trim().is_empty()) && py == "python" && which("python3")
+    {
+        let (rc2, out2, err2) = run("python3", &["-c", PYTORCH_PROBE], Duration::from_secs(20));
         if out2.trim().is_empty() {
-            (out, err)
+            (rc, out, err)
         } else {
-            (out2, err2)
+            (rc2, out2, err2)
         }
     } else {
-        (out, err)
+        (rc, out, err)
     };
+    record_pytorch_probe(e, rc, &out, &err);
+}
+
+fn record_pytorch_probe(e: &mut Examination, rc: i32, out: &str, err: &str) {
     if out.trim().is_empty() {
-        e.framework_notes.push(
-            "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
+        // `run` reports 127 when the program could not be spawned and 124 on
+        // timeout. Those are facts about the interpreter, not about torch, and
+        // the venv advice below is actively wrong for a managed runtime — its
+        // interpreter is the one that was asked.
+        e.framework_notes.push(match rc {
+            127 => "The torch probe interpreter could not be started.".to_owned(),
+            124 => "The torch probe timed out.".to_owned(),
+            _ if e.framework_source == "managed-runtime" => {
+                "The active managed runtime's interpreter returned nothing for the torch probe."
+                    .to_owned()
+            }
+            _ => "Could not import torch; if PyTorch is in a venv, activate it and re-run inside that venv."
                 .to_owned(),
-        );
+        });
         if let Some(last) = err.trim().lines().last() {
             let snippet: String = last.chars().take(200).collect();
             e.framework_notes.push(format!("python stderr: {snippet}"));
@@ -1167,6 +2038,10 @@ fn probe_llama_cpp(e: &mut Examination) {
             .push(format!("{binary} --version exited rc={rc}"));
         return;
     }
+    // Set only now that this probe is the one answering. Setting it on finding
+    // the binary would, on the `Auto` fall-through from a failed runtime probe,
+    // relabel the runtime's answer as the ambient one.
+    e.framework_source = "path".to_owned();
     e.framework = "llama-cpp".to_owned();
     e.framework_version = body.trim().lines().next().map_or_else(
         || "unknown".to_owned(),
@@ -1239,6 +2114,76 @@ fn truncate_to_chars(value: String, max_chars: usize) -> String {
     } else {
         value
     }
+}
+
+/// The shared-memory filesystem a serving workload uses.
+const SHM_PATH: &str = "/dev/shm";
+
+/// Measure `/dev/shm`.
+///
+/// A direct `statvfs` rather than the shared disk-space helper, and that is not
+/// an oversight in the helper. `sysinfo` omits tmpfs, and `disk_space` guards
+/// against the consequence by comparing device ids -- so asking it about
+/// `/dev/shm` correctly returns "unknown" instead of confidently reporting the
+/// root filesystem's free space. The guard is right; this needs the number it
+/// declines to guess at.
+fn probe_shared_memory(e: &mut Examination) {
+    probe_shared_memory_at(e, SHM_PATH);
+}
+
+/// The body of [`probe_shared_memory`], with the path as a parameter so the
+/// unmeasurable branch is reachable from a test. A hard-coded `/dev/shm` cannot
+/// be made to fail on a host that has one.
+fn probe_shared_memory_at(e: &mut Examination, path: &str) {
+    let Some((total, available)) = filesystem_size(path) else {
+        // Recorded, not swallowed. The fields stay `None`, which the catalog
+        // reads as "not measured" rather than "no shortage" -- but without a
+        // trace here, an examination that could not measure is byte-identical
+        // to one that measured a healthy machine, and nothing tells a reader
+        // which they are looking at. `probe_failures` is the documented channel
+        // for exactly this (see `Examination::probe`), and a non-empty one also
+        // degrades `status` from `ok`, which is the signal a caller branches on.
+        e.probe_failures.push(format!(
+            "could not query {path}; shared-memory allowance unknown"
+        ));
+        return;
+    };
+    e.shm_total_bytes = Some(total);
+    e.shm_available_bytes = Some(available);
+}
+
+/// Total and available bytes for the filesystem mounted at `path`.
+///
+/// `None` when the path does not exist or the call fails, which callers must
+/// keep distinct from zero: a machine that could not be measured is not a
+/// machine with no space.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+fn filesystem_size(path: &str) -> Option<(u64, u64)> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call, and `stats` is a correctly sized, writable `statvfs` this thread
+    // owns. The call only reads the path and writes the struct.
+    let stats = unsafe {
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        if libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stats.assume_init()
+    };
+    // `f_frsize` is the fragment size the block counts are expressed in.
+    // `checked_mul` rather than a plain product: these are values the kernel
+    // hands back, and a probe has no business panicking on a surprising one.
+    let block = stats.f_frsize;
+    Some((
+        block.checked_mul(stats.f_blocks)?,
+        block.checked_mul(stats.f_bavail)?,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filesystem_size(_path: &str) -> Option<(u64, u64)> {
+    None
 }
 
 fn probe_container(e: &mut Examination) {
@@ -1450,6 +2395,359 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that read or replace the process-global
+    /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
+    /// thread, so a test that sets it and one that composes a child env from it
+    /// can otherwise see each other's value mid-test.
+    #[cfg(unix)]
+    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Replaces a process-global environment variable for as long as it lives,
+    /// putting the previous value back on drop.
+    ///
+    /// A scope guard rather than straight-line save/restore because the restore
+    /// has to survive a panic: an assertion firing between the two halves skips
+    /// the restore, and the mutated variable then leaks into every later test in
+    /// this binary. The lock above only serialises those tests -- it does not
+    /// undo the write, and recovering from its poison hands the next test the
+    /// leaked value.
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmeasurable_shared_memory_allowance_leaves_a_trace() {
+        // The distinction the fields exist to preserve, tested at the layer that
+        // can erase it. The catalog already refuses to report a shortage it
+        // could not measure; this is the other half. Without a record here, an
+        // examination that failed to measure is indistinguishable from one that
+        // measured a healthy machine, and a reader cannot tell which.
+        // A machine the CLI supports and has found a GPU on, so `compute_status`
+        // reaches the probe-failure branch instead of short-circuiting on a
+        // platform or hardware verdict first.
+        let mut e = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        };
+        probe_shared_memory_at(&mut e, "/nonexistent-shm-for-this-test");
+
+        assert_eq!(
+            e.shm_total_bytes, None,
+            "an unreadable path must not invent a measurement"
+        );
+        assert!(
+            e.probe_failures.iter().any(|f| f.contains("shared-memory")),
+            "the failure has to be recorded, not swallowed: {:?}",
+            e.probe_failures
+        );
+        // `probe_failures` is what degrades the overall verdict, so the trace is
+        // load-bearing rather than decorative.
+        assert_eq!(
+            e.compute_status(),
+            "degraded",
+            "a probe that could not run must not leave the machine looking clean"
+        );
+    }
+
+    /// Ported from the Python preflight this replaced, whose `wsl.exe` parser
+    /// was covered by a self-test that CI ran on both lanes. That coverage has to
+    /// land here, or deleting the script quietly drops it.
+    #[test]
+    fn the_distro_list_survives_the_markers_wsl_puts_around_it() {
+        // `-l -q` prints one bare name per line, which is what the probe asks
+        // for.
+        assert_eq!(
+            parse_wsl_distro_list("Ubuntu\nDebian\n"),
+            vec!["Ubuntu", "Debian"]
+        );
+        assert_eq!(
+            parse_wsl_distro_list("Ubuntu-24.04\n"),
+            vec!["Ubuntu-24.04"]
+        );
+
+        // A name may contain spaces: `wsl --import "My Distro"` is legal.
+        // Splitting on whitespace truncated it to "My", which then neither
+        // matched what the user asked for nor named a real distribution when
+        // handed back to `wsl.exe -d`.
+        assert_eq!(
+            parse_wsl_distro_list("My Distro\nUbuntu\n"),
+            vec!["My Distro", "Ubuntu"]
+        );
+
+        // The NUL padding of the raw UTF-16 output must not become part of a
+        // name, and blank lines are not distributions.
+        assert_eq!(
+            parse_wsl_distro_list("\0U\0b\0u\0n\0t\0u\0\n\0"),
+            vec!["Ubuntu"]
+        );
+        assert!(parse_wsl_distro_list("").is_empty());
+        assert!(parse_wsl_distro_list("\n\n  \n").is_empty());
+
+        // Tolerance only: `-q` emits no header, but a `-l -v` header must never
+        // come back as a distribution named "NAME".
+        assert!(parse_wsl_distro_list("  NAME   STATE   VERSION\n").is_empty());
+    }
+
+    #[test]
+    fn a_host_that_could_not_be_queried_is_unknown_not_driverless() {
+        use crate::WslHostDriverProbe;
+
+        // The distinction the catalog acts on. An earlier version flattened this
+        // to `Option<String>` and defaulted the `None`, so "could not ask the
+        // host" arrived as `Some("")` -- which reads as "the host has no AMD
+        // adapter" and reported a missing driver on a machine never looked at.
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::Unreachable),
+            (false, None),
+            "unreachable must stay unknown"
+        );
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::NoAmdDisplay),
+            (true, Some(String::new())),
+            "answered with no adapter is evidence, and is not the same thing"
+        );
+        assert_eq!(
+            host_driver_fields(WslHostDriverProbe::Version("32.0.1".to_owned())),
+            (true, Some("32.0.1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_named_distro_that_does_not_exist_is_refused() {
+        // This is the blocking refusal `probe_wsl_distro_from_host` returns
+        // to the caller of `rocm diagnose --distro <name>` -- a plain error,
+        // not a `continue-on-error` note the e2e suite can shrug off. It sat
+        // behind `wsl.exe` and was untested outside a real Windows+WSL host,
+        // which is not a lane this crate's unit tests run on.
+        let distros = vec!["Ubuntu".to_owned(), "Debian".to_owned()];
+        let err = select_wsl_distro(Some("Fedora"), &distros).expect_err("must be refused");
+        assert!(err.contains("Fedora"), "names the distro asked for: {err}");
+        assert!(err.contains("Ubuntu"), "lists what does exist: {err}");
+        assert!(err.contains("Debian"), "lists what does exist: {err}");
+    }
+
+    #[test]
+    fn a_named_distro_that_exists_is_selected_case_insensitively() {
+        // Matched case-insensitively against the installed list, but the name
+        // handed to `wsl.exe -d` afterwards is what the caller typed, not the
+        // list's original casing -- pre-existing behavior, preserved as-is by
+        // this extraction.
+        let distros = vec!["Ubuntu-24.04".to_owned()];
+        assert_eq!(
+            select_wsl_distro(Some("ubuntu-24.04"), &distros).expect("must be selected"),
+            "ubuntu-24.04"
+        );
+    }
+
+    #[test]
+    fn no_distro_named_falls_back_to_the_lone_one_or_refuses_ambiguity() {
+        assert_eq!(
+            select_wsl_distro(None, &["Ubuntu".to_owned()]).expect("the only one"),
+            "Ubuntu"
+        );
+        assert!(select_wsl_distro(None, &[]).is_err(), "nothing installed");
+        let many = vec!["Ubuntu".to_owned(), "Debian".to_owned()];
+        let err = select_wsl_distro(None, &many).expect_err("ambiguous without --distro");
+        assert!(
+            err.contains("--distro"),
+            "tells the user how to resolve it: {err}"
+        );
+    }
+
+    #[test]
+    fn sync_shared_fields_from_wsl_copies_the_actual_rocminfo_values() {
+        // The fields the cross-platform PATH and wheel/ROCm checks read.
+        // Asserting only that they are *set* would still pass if the sync
+        // copied the wrong value or a hardcoded default -- assert the actual
+        // values reached from each distinct `WslFacts` fixture instead.
+        let mut missing = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: false,
+                rocm_sees_gpu: None,
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut missing);
+        assert!(!missing.rocminfo_present);
+        assert_eq!(missing.rocminfo_status, "missing");
+
+        let mut healthy = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: Some(true),
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut healthy);
+        assert!(healthy.rocminfo_present);
+        assert_eq!(healthy.rocminfo_status, "ok");
+
+        let mut no_agents = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: Some(false),
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut no_agents);
+        assert!(no_agents.rocminfo_present);
+        assert_eq!(no_agents.rocminfo_status, "no-agents");
+
+        let mut unasked = Examination {
+            wsl: Some(WslFacts {
+                rocminfo: true,
+                rocm_sees_gpu: None,
+                ..WslFacts::default()
+            }),
+            ..Examination::default()
+        };
+        sync_shared_fields_from_wsl(&mut unasked);
+        assert!(unasked.rocminfo_present);
+        assert_eq!(unasked.rocminfo_status, "unknown");
+    }
+
+    #[test]
+    fn probe_wsl_leaves_rocminfo_status_synced_not_at_its_uninitialized_default() {
+        // `probe_wsl` never sets `rocminfo_status` itself -- only
+        // `sync_shared_fields_from_wsl`, called at its very end, does. If that
+        // call were ever removed, this field would stay at
+        // `Examination::default()`'s empty string on every host, WSL or not,
+        // regardless of whether rocminfo happens to be installed here -- so
+        // this holds without depending on real host state, unlike a test that
+        // compared against the actual probed rocminfo presence.
+        let mut e = Examination::default();
+        probe_wsl(&mut e);
+        assert_ne!(
+            e.rocminfo_status, "",
+            "sync_shared_fields_from_wsl must have run and set a real status"
+        );
+    }
+
+    #[test]
+    fn the_distro_list_decodes_as_utf16_whatever_script_it_is_in() {
+        fn utf16le(text: &str, bom: bool) -> Vec<u8> {
+            let mut bytes = if bom { vec![0xFF, 0xFE] } else { Vec::new() };
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+
+        assert_eq!(decode_utf16le(&utf16le("Ubuntu\n", true)), "Ubuntu\n");
+        assert_eq!(decode_utf16le(&utf16le("Ubuntu\n", false)), "Ubuntu\n");
+        assert_eq!(decode_utf16le(b""), "");
+
+        // The reason this is decoded by declaration rather than sniffed: in a
+        // Latin or Cyrillic script every UTF-16LE byte is below 0x80, so the
+        // bytes are *valid UTF-8* and decode without error into mojibake. Read
+        // as UTF-8 these names come back as "#\u{4}1\u{4}..." rather than
+        // failing, so no validity or NUL-density test could catch them.
+        for name in [
+            "Ubuntu-24.04\nÉtat\n",
+            "Ubuntu\nУбунту\n",
+            "Ubuntu\n日本語\n",
+        ] {
+            assert_eq!(decode_utf16le(&utf16le(name, true)), name);
+            assert_eq!(decode_utf16le(&utf16le(name, false)), name);
+        }
+
+        // A non-ASCII name must survive all the way through the parser.
+        assert_eq!(
+            parse_wsl_distro_list(&decode_utf16le(&utf16le("Ubuntu\nУбунту\n", true))),
+            vec!["Ubuntu", "Убунту"]
+        );
+
+        // An odd trailing byte is dropped rather than panicking.
+        let mut truncated = utf16le("Ubuntu", false);
+        truncated.push(0x00);
+        assert_eq!(decode_utf16le(&truncated), "Ubuntu");
+    }
+
+    #[test]
+    fn command_output_that_is_not_utf8_is_kept_rather_than_dropped() {
+        // `read_to_string` fails on invalid UTF-8, and the error was discarded --
+        // so one stray byte emptied a whole capture, which every caller then read
+        // as "the command printed nothing".
+        let (rc, out, _) = run("printf", &["ok\\xffdone"], SHORT);
+        if rc == 127 {
+            return; // no `printf` binary on this host
+        }
+        assert!(
+            out.starts_with("ok") && out.ends_with("done"),
+            "the undecodable byte must not take the rest of the output with it: {out:?}"
+        );
+    }
+
+    /// Ported from the same Python preflight, which owned this rule until the
+    /// catalog took it over. Its version was well covered and its tests went with
+    /// it, so the coverage has to live here or the floor becomes an untested
+    /// constant.
+    #[test]
+    fn the_distro_floor_fails_closed_on_anything_it_cannot_read() {
+        for supported in ["24.04", "24.10", "25.04", "26.04", "28.04"] {
+            assert_eq!(
+                distro_clears_wsl_floor("ubuntu", supported),
+                Some(true),
+                "ubuntu {supported} clears the floor"
+            );
+        }
+        // 22.04 ships glibc 2.35, below the 2.38 / GLIBCXX_3.4.32 floor the
+        // engines are linked against, so it cannot run them at all.
+        assert_eq!(distro_clears_wsl_floor("ubuntu", "22.04"), Some(false));
+        assert_eq!(distro_clears_wsl_floor("ubuntu", "20.04"), Some(false));
+
+        // Unreadable is `None`, never `Some(true)`. Reporting a release nobody
+        // could parse as supported is how a user ends up chasing a GPU fault
+        // that is really a glibc floor -- but claiming it is too old would send
+        // them to reinstall a perfectly good distro, so neither answer is safe.
+        for unreadable in ["24.04.1", "unknown", "", "24", "24.x", "..", "24.04.1.2"] {
+            assert_eq!(
+                distro_clears_wsl_floor("ubuntu", unreadable),
+                None,
+                "{unreadable:?} cannot be read as a release"
+            );
+        }
+
+        // Only Ubuntu carries a documented floor. Anything else abstains rather
+        // than applying Ubuntu's numbering to a distro that does not share it --
+        // Debian 12 is not "below 24.04".
+        for other in ["debian", "fedora", "arch", ""] {
+            assert_eq!(distro_clears_wsl_floor(other, "12.0"), None, "{other}");
+        }
+        assert_eq!(distro_clears_wsl_floor("UBUNTU", "24.04"), Some(true));
+    }
+
     #[test]
     fn examination_serializes_expected_keys() {
         let e = Examination::default();
@@ -1475,10 +2773,22 @@ mod tests {
 
     #[test]
     fn examination_top_level_keys_match_examine_py_contract() {
-        // The field set examine.py emits, plus the CLI-only `status` addition.
-        // diagnose.py reads against these names, so this is the frozen wire
-        // contract — adding/removing/renaming a top-level field is a contract
-        // change and must be intentional.
+        // The field set examine.py emits, plus the CLI-only `status` and `wsl`
+        // additions. diagnose.py reads against these names, so this is the frozen
+        // wire contract — adding/removing/renaming a top-level field is a
+        // contract change and must be intentional.
+        //
+        // `wsl` is one of the intentional ones: WSL2 has no examine.py analogue,
+        // and nesting its facts under a single key keeps the rest of the contract
+        // byte-identical instead of scattering ten flat `wsl_*` fields through it.
+        //
+        // `framework_source` is another. examine.py only ever probes the ambient
+        // interpreter, so it has no need to say which one answered; the CLI
+        // prefers the active managed runtime's, and the version strings alone
+        // cannot distinguish the two. Without it, `check_8_wheel_rocm_mismatch`
+        // compares a managed runtime's HIP against the *system* ROCm — versions
+        // that are free to differ on a perfectly healthy host — and tells the
+        // user to reinstall torch.
         let expected: std::collections::BTreeSet<&str> = [
             "os_family",
             "os_version",
@@ -1487,6 +2797,7 @@ mod tests {
             "kernel_release",
             "kernel_cmdline",
             "is_wsl",
+            "wsl",
             "cpu_vendor",
             "cpu_model",
             "gpus",
@@ -1523,9 +2834,15 @@ mod tests {
             "framework_rocm_version",
             "framework_arch_list",
             "framework_notes",
+            "framework_source",
             "env",
             "in_container",
             "container_kind",
+            // CLI additions beyond examine.py, added deliberately: the shared
+            // memory allowance, which a serving workload exhausts without the
+            // crash ever naming it.
+            "shm_total_bytes",
+            "shm_available_bytes",
             "dmesg_amdgpu_tail",
             "notes",
             "probe_failures",
@@ -1580,7 +2897,7 @@ mod tests {
         // anywhere. "skipped" is a distinct answer from "unknown" -- the latter
         // means the probe ran and found nothing.
         let mut e = Examination::default();
-        probe_framework(&mut e, FrameworkProbe::Skip);
+        probe_framework(&mut e, FrameworkProbe::Skip, None);
         assert_eq!(e.framework, "skipped");
     }
 
@@ -1590,11 +2907,215 @@ mod tests {
         // read the framework's ROCm build. Nothing else on the Examination may
         // move, or "skip" would be quietly doing work.
         let mut e = Examination::default();
-        probe_framework(&mut e, FrameworkProbe::Skip);
+        probe_framework(&mut e, FrameworkProbe::Skip, None);
         assert!(e.framework_version.is_empty());
         assert!(e.framework_rocm_version.is_empty());
         assert!(e.framework_arch_list.is_empty());
         assert!(e.framework_notes.is_empty());
+    }
+
+    /// What a healthy ROCm torch answers the probe, shared by the fakes below so
+    /// a change to the probe's contract lands in one place.
+    #[cfg(unix)]
+    const RUNTIME_TORCH_OK_JSON: &str = r#"{"ok":true,"version":"2.11.0+rocm7.14.1","hip":"7.14.60850","cuda":null,"is_available":true,"device_count":1,"arch_list":["gfx942"]}"#;
+
+    /// A stand-in for a managed runtime's interpreter.
+    ///
+    /// It answers like a ROCm torch **only** when the runtime's library
+    /// directory reached it on the loader path, which is what the real thing
+    /// does: a TheRock runtime's torch resolves HIP from a sibling
+    /// `_rocm_sdk_core` package, so without those directories the import dies on
+    /// `libroctx64.so.4`. Keying the fake on that means a probe that forgets the
+    /// library paths fails the test instead of quietly reporting a broken
+    /// runtime.
+    #[cfg(unix)]
+    fn plant_fake_runtime_interpreter(label: &str) -> (std::path::PathBuf, FrameworkInterpreter) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-{label}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let libs = root.join("lib");
+        std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
+        let python = root.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 case \"${env}\" in\n\
+                 *{marker}*) printf '%s' '{ok}' ;;\n\
+                 *) printf '%s' '{broken}' ;;\n\
+                 esac\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                marker = libs.display(),
+                ok = RUNTIME_TORCH_OK_JSON,
+                broken = r#"{"ok":false,"error":"ImportError: libroctx64.so.4: cannot open shared object file"}"#,
+            ),
+        )
+        .expect("plant the fake interpreter");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fake interpreter executable");
+
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![libs],
+        };
+        (root, interpreter)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_framework_probe_reads_the_active_runtimes_torch() {
+        // The bug this pins: torch lives only inside the managed runtime, so a
+        // probe that resolves its interpreter from PATH reports `unknown` for a
+        // host that has a working one.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, interpreter) = plant_fake_runtime_interpreter("runtime-torch");
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(e.framework, "pytorch");
+        assert_eq!(e.framework_version, "2.11.0+rocm7.14.1");
+        assert_eq!(e.framework_rocm_version, "hip=7.14.60850");
+        assert_eq!(e.framework_arch_list, vec!["gfx942".to_owned()]);
+        assert_eq!(e.framework_source, "managed-runtime");
+        assert!(
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("active managed runtime's interpreter")),
+            "the shift away from PATH must be self-describing: {:?}",
+            e.framework_notes
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_runtime_without_its_library_path_reports_the_import_failure() {
+        // Withholding the library paths turns "no torch" into "torch import
+        // failed", which reads as a broken runtime -- a worse answer than the
+        // silence it replaced. This pins how that case is REPORTED; the
+        // composition itself is pinned by
+        // `the_framework_probe_reads_the_active_runtimes_torch`, whose fake
+        // interpreter only answers when the loader path actually reached it.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, mut interpreter) = plant_fake_runtime_interpreter("runtime-no-libs");
+        interpreter.library_paths.clear();
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(e.framework, "unknown");
+        assert_eq!(e.framework_source, "managed-runtime");
+        assert!(
+            e.framework_notes
+                .iter()
+                .any(|note| note.contains("libroctx64.so.4")),
+            "expected the loader failure to be reported: {:?}",
+            e.framework_notes
+        );
+    }
+
+    /// A stand-in interpreter that records the loader path it was handed.
+    ///
+    /// `plant_fake_runtime_interpreter` only judges whether the runtime's own
+    /// directory arrived, which cannot see what became of the entries the host
+    /// already had. This one writes the whole variable out, so a test can assert
+    /// on both halves of the merge and on their ORDER -- which is what decides
+    /// whose ROCm the runtime's torch loads.
+    #[cfg(unix)]
+    fn plant_loader_path_recording_interpreter(
+        label: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, FrameworkInterpreter) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-{label}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let libs = root.join("lib");
+        std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
+        let recorded = root.join("loader-path");
+        let python = root.join("python");
+        std::fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"${env}\" > '{recorded}'\n\
+                 printf '%s' '{ok}'\n",
+                env = RUNTIME_LIBRARY_PATH_ENV,
+                recorded = recorded.display(),
+                ok = RUNTIME_TORCH_OK_JSON,
+            ),
+        )
+        .expect("plant the recording interpreter");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
+            .expect("make the recording interpreter executable");
+
+        let interpreter = FrameworkInterpreter {
+            python,
+            library_paths: vec![libs],
+        };
+        (root, recorded, interpreter)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_runtime_loader_path_keeps_the_entries_the_host_already_had() {
+        // The merge branch neither sibling reaches: one clears `library_paths`
+        // and returns before the merge, the other never sets the variable, so on
+        // a host that leaves it unset `if let Some(existing)` is skipped and the
+        // extend below it never runs.
+        //
+        // What it guards is that PREPENDING the runtime's directories does not
+        // DISCARD the inherited ones. A runtime's torch still resolves its C++
+        // runtime and other system libraries from the host, so dropping them
+        // would fail the import and report a healthy runtime broken -- the same
+        // misdiagnosis `runtime_library_path_env` exists to avoid, reached by a
+        // different route.
+        let _guard = PROCESS_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (root, recorded, interpreter) =
+            plant_loader_path_recording_interpreter("runtime-loader-merge");
+        // Under `root` so teardown takes it too, and named so it cannot appear
+        // as a substring of the runtime's own `lib` entry.
+        let inherited = root.join("host-lib");
+
+        // Dropped before `_guard`, so the variable is restored while this test
+        // still holds the lock, and restored at all if an assertion below panics.
+        let _env = EnvVarGuard::set(RUNTIME_LIBRARY_PATH_ENV, &inherited);
+        let mut e = Examination::default();
+        probe_framework(&mut e, FrameworkProbe::PyTorch, Some(&interpreter));
+
+        let seen = std::fs::read_to_string(&recorded)
+            .expect("the recording interpreter must have written its loader path");
+        let runtime_lib = interpreter.library_paths[0].display().to_string();
+        let inherited = inherited.display().to_string();
+        std::fs::remove_dir_all(&root).ok();
+
+        let runtime_at = seen.find(&runtime_lib);
+        let inherited_at = seen.find(&inherited);
+        assert!(
+            runtime_at.is_some(),
+            "the runtime's own library directory must reach the child: {seen:?}"
+        );
+        assert!(
+            inherited_at.is_some(),
+            "the inherited entry must survive the merge, or the runtime's torch \
+             loses the system libraries it still loads: {seen:?}"
+        );
+        assert!(
+            runtime_at < inherited_at,
+            "the runtime's ROCm must win over the host's, so its entries lead: {seen:?}"
+        );
     }
 
     #[test]
@@ -1613,12 +3134,574 @@ mod tests {
             }],
             ..Examination::default()
         };
-        probe_gpus_sysfs_fallback(&mut e);
+        // A target is deliberately on offer: the point is that the fallback
+        // declines it, not that there was nothing to take.
+        probe_gpus_sysfs_fallback(&mut e, || Some("gfx942".to_owned()));
         assert_eq!(e.gpus.len(), 1, "the fallback must not add a second entry");
         assert_eq!(e.gpus[0].pci_id, "1002:74a1");
         assert!(
             e.notes.is_empty(),
             "a no-op fallback should not annotate the report"
+        );
+    }
+
+    /// The eight MI300X accelerators an MI300X host's `lspci -nn -D` lists,
+    /// verbatim down to the `Device` name its `pci.ids` gives them.
+    fn mi300x_bus_gpus() -> Vec<Gpu> {
+        [
+            "0000:11:00.0",
+            "0000:2f:00.0",
+            "0000:46:00.0",
+            "0000:5d:00.0",
+            "0000:8b:00.0",
+            "0000:aa:00.0",
+            "0000:c2:00.0",
+            "0000:da:00.0",
+        ]
+        .into_iter()
+        .map(|pci_id| Gpu {
+            name: "Advanced Micro Devices, Inc. [AMD/ATI] Device".to_owned(),
+            gfx_target: String::new(),
+            pci_id: pci_id.to_owned(),
+            is_amd: true,
+            is_apu: Some(false),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn the_report_lists_the_gpus_the_kernel_exposes_not_every_card_on_the_bus() {
+        // The container this regressed in: `lspci` reads the *host* bus and
+        // finds all eight MI300X accelerators, while KFD describes only the one
+        // passed through. Enumerating from PCI told that user they had eight
+        // GPUs, seven of which `rocm serve` could not open.
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:5d:00.0".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            }],
+        );
+
+        assert_eq!(e.gpus.len(), 1, "only the exposed GPU may be listed");
+        // Matched by address, not by position: the exposed card is the fourth
+        // on the bus, so taking the first entry would name the wrong device.
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert!(
+            e.gpus[0].name.contains("Advanced Micro Devices"),
+            "the surviving entry keeps the name lspci gave it: {:?}",
+            e.gpus[0].name
+        );
+        // The seven are not erased from the report, only from `gpus[]`: "the
+        // bus has it and the kernel does not" is itself a diagnosis.
+        let note = e.notes.join("\n");
+        assert!(
+            note.contains("not exposed by the kernel") && note.contains("0000:11:00.0"),
+            "the unexposed devices must still be accounted for: {:?}",
+            e.notes
+        );
+    }
+
+    #[test]
+    fn a_kernel_visible_gpu_the_pci_scan_missed_is_still_listed() {
+        // The reverse case: no `lspci` on PATH, so nothing names the device --
+        // but the kernel exposes it and it is perfectly usable, so dropping it
+        // would under-report exactly the way this whole change is meant to fix.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:11:00.0".to_owned(),
+                    gfx_target: "gfx942".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:2f:00.0".to_owned(),
+                    gfx_target: "gfx942".to_owned(),
+                },
+            ],
+        );
+
+        assert_eq!(e.gpus.len(), 2);
+        assert!(e.gpus.iter().all(|gpu| gpu.is_amd));
+        // The address still comes through, because KFD states it even when
+        // lspci is unavailable to confirm it.
+        assert_eq!(e.gpus[0].pci_id, "0000:11:00.0");
+        assert_eq!(e.gpus[1].gfx_target, "gfx942");
+        // The note is no longer the membership pass's to emit -- `rocminfo` runs
+        // after it and may name these -- so the verdict comes from the pass that
+        // runs once naming is final. Nothing named them here, so it must fire.
+        note_unnamed_kernel_topology_gpus(&mut e);
+        assert!(
+            e.notes.join("\n").contains("marketing name is unknown"),
+            "an unnamed entry must say so: {:?}",
+            e.notes
+        );
+    }
+
+    #[test]
+    fn each_kernel_node_labels_its_own_card_and_leaves_other_vendors_alone() {
+        // An APU + a discrete card. Reading the target per node is what makes
+        // this safe: a single host-wide answer would stamp the APU's gfx1103
+        // onto the dGPU, and diagnose's iGPU/dGPU check splits on exactly this
+        // field to tell the user which GPU to pin.
+        let mut e = Examination {
+            gpus: vec![
+                Gpu {
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
+                        .to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: "0000:03:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                },
+                Gpu {
+                    name: "NVIDIA Corporation Device".to_owned(),
+                    gfx_target: String::new(),
+                    pci_id: "0000:46:00.0".to_owned(),
+                    is_amd: false,
+                    is_apu: Some(false),
+                },
+                Gpu {
+                    name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                    pci_id: "0000:64:00.0".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                },
+            ],
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[
+                crate::KfdGpuNode {
+                    pci_id: "0000:64:00.0".to_owned(),
+                    gfx_target: "gfx1103".to_owned(),
+                },
+                crate::KfdGpuNode {
+                    pci_id: "0000:03:00.0".to_owned(),
+                    gfx_target: "gfx1100".to_owned(),
+                },
+            ],
+        );
+
+        let apu = &e.gpus[0];
+        let discrete = &e.gpus[1];
+        assert_eq!(apu.pci_id, "0000:64:00.0");
+        assert_eq!(apu.gfx_target, "gfx1103");
+        assert_eq!(apu.is_apu, Some(true), "lspci's packaging verdict survives");
+        assert_eq!(discrete.pci_id, "0000:03:00.0");
+        assert_eq!(
+            discrete.gfx_target, "gfx1100",
+            "the discrete card takes its own node's target, not the APU's"
+        );
+        // KFD says nothing about an NVIDIA card, so the entry must survive.
+        let nvidia = e
+            .gpus
+            .iter()
+            .find(|gpu| !gpu.is_amd)
+            .expect("the NVIDIA entry must survive");
+        assert_eq!(nvidia.pci_id, "0000:46:00.0");
+        assert_eq!(nvidia.gfx_target, "", "a non-AMD entry gets no AMD target");
+        assert!(
+            e.notes.is_empty(),
+            "a topology that accounts for every AMD card needs no note: {:?}",
+            e.notes
+        );
+    }
+
+    #[test]
+    fn a_target_the_pci_scan_already_resolved_is_never_overwritten() {
+        // lspci resolves a target from the marketing name, which is a statement
+        // about that specific device. The node's answer is only a better one
+        // when there is nothing to compare it against.
+        let mut e = Examination {
+            gpus: vec![Gpu {
+                name: "Advanced Micro Devices, Inc. [AMD/ATI] Phoenix1".to_owned(),
+                gfx_target: "gfx1103".to_owned(),
+                pci_id: "0000:64:00.0".to_owned(),
+                is_amd: true,
+                is_apu: Some(true),
+            }],
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:64:00.0".to_owned(),
+                gfx_target: "gfx1150".to_owned(),
+            }],
+        );
+        assert_eq!(e.gpus[0].gfx_target, "gfx1103");
+    }
+
+    #[test]
+    fn a_kernel_that_exposes_no_gpu_leaves_the_pci_enumeration_standing() {
+        // A host whose `amdgpu` never bound: the topology is readable and
+        // describes nothing. "Your card is on the bus but the driver did not
+        // bind" is the most useful thing examine can say there, so the PCI
+        // list must survive for the driver probes to explain.
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(&mut e, &[]);
+        assert_eq!(
+            e.gpus.len(),
+            8,
+            "an empty topology must not empty the report"
+        );
+        assert!(e.notes.is_empty());
+    }
+
+    #[test]
+    fn the_membership_read_reconciles_a_planted_topology_end_to_end() {
+        // Everything above hands `apply_kernel_gpu_membership` a node list
+        // directly. This drives the real read as well -- sysfs bytes in, report
+        // out -- so the `location_id` decode and the reconcile are covered
+        // together rather than each assuming the other.
+        // One GPU node, at the fourth accelerator on the bus: what the
+        // container sees when it is passed 0000:5d:00.0 out of the host's eight.
+        let (root, nodes) = plant_kfd_topology("membership", &[(23808, 90402)]);
+        let read = crate::kfd_gpu_nodes_in(&nodes).expect("the planted topology must be readable");
+        std::fs::remove_dir_all(&root).ok();
+
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        apply_kernel_gpu_membership(&mut e, &read);
+        summarise_gpu_categories(&mut e);
+
+        assert_eq!(e.gpus.len(), 1, "the report lists what the kernel exposes");
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert!(e.has_amd_gpu);
+        assert!(e.has_discrete_amd);
+    }
+
+    /// Plant a KFD topology: one CPU node, then one GPU node per
+    /// `(location_id, gfx_target_version)` pair. Returns the `nodes` directory;
+    /// the caller removes `root` once the read is done.
+    fn plant_kfd_topology(tag: &str, gpu_nodes: &[(u32, u32)]) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-examine-kfd-{tag}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        let nodes = root.join("nodes");
+        std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
+        std::fs::write(
+            nodes.join("0").join("properties"),
+            "cpu_cores_count 56\ngfx_target_version 0\nlocation_id 0\ndomain 0\n",
+        )
+        .expect("plant the CPU node properties");
+        for (index, (location_id, version)) in gpu_nodes.iter().enumerate() {
+            let dir = nodes.join((index + 1).to_string());
+            std::fs::create_dir_all(&dir).expect("plant the GPU node");
+            std::fs::write(
+                dir.join("properties"),
+                format!(
+                    "simd_count 1216\ngfx_target_version {version}\nlocation_id {location_id}\n\
+                     domain 0\n"
+                ),
+            )
+            .expect("plant the GPU node properties");
+        }
+        (root, nodes)
+    }
+
+    #[test]
+    fn the_membership_probe_reconciles_the_topology_it_is_pointed_at() {
+        // The *wiring*, not the reconcile. Every test above hands
+        // `apply_kernel_gpu_membership` a node list directly, which proves that
+        // function and says nothing about whether the probe ever reaches it --
+        // deleting the handoff left the whole workspace suite green. So drive
+        // the probe's own entry point instead, over a planted topology, and the
+        // read, the handoff and the gfx-target fill are all covered at once.
+        let (root, nodes) = plant_kfd_topology("membership-probe", &[(23808, 90402)]);
+        let mut e = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        probe_gpus_kernel_membership_in(&mut e, &nodes);
+        std::fs::remove_dir_all(&root).ok();
+        summarise_gpu_categories(&mut e);
+
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "the probe must reduce the eight-card bus to the one node the kernel exposes: {:#?}",
+            e.gpus
+        );
+        assert_eq!(e.gpus[0].pci_id, "0000:5d:00.0");
+        // `mi300x_bus_gpus` leaves every target empty, the way lspci does when
+        // `pci.ids` spells an Instinct part "Device 74a1". The node's target is
+        // the only thing that can fill it, so this is exactly the statement the
+        // review found untested.
+        assert_eq!(
+            e.gpus[0].gfx_target, "gfx942",
+            "the probe must fill the target its own topology attributes to that card"
+        );
+        assert!(e.has_amd_gpu);
+    }
+
+    #[test]
+    fn the_membership_probe_leaves_the_report_alone_when_the_topology_is_unreadable() {
+        // "Unreadable" and "readable but empty" are different answers -- "cannot
+        // say" versus "the driver bound nothing" -- and each is a no-op for its
+        // own reason. Asserting only that the report is untouched cannot tell
+        // them apart: it passed even with the early return replaced by
+        // `unwrap_or_default()`, which collapses the first into the second,
+        // because `apply_kernel_gpu_membership`'s own empty-guard absorbed it.
+        //
+        // So discriminate on something only the early return can produce: the
+        // reconcile must never be *entered* at all. A planted topology with a
+        // CPU node and no GPU node is the readable-but-empty case, and it is
+        // given an empty PCI list so that entering the reconcile would be
+        // observable -- if that path ran, it would take the `nodes.is_empty()`
+        // guard. The unreadable case is given the eight-card bus, which the
+        // reconcile would rewrite to nothing had it been reached with an empty
+        // node list.
+        let mut unreadable = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        let verdict = probe_gpus_kernel_membership_in(
+            &mut unreadable,
+            &std::env::temp_dir().join("rocm-cli-absent-kfd-topology-nodes"),
+        );
+        assert_eq!(
+            unreadable.gpus,
+            mi300x_bus_gpus(),
+            "an unreadable topology must leave the PCI enumeration untouched"
+        );
+        assert!(
+            unreadable.notes.is_empty(),
+            "notes: {:#?}",
+            unreadable.notes
+        );
+        // The discriminating assertion. Every assertion above is satisfied by
+        // the reconcile's `nodes.is_empty()` guard just as well as by the early
+        // return, which is why they could not fail when the two were collapsed.
+        // This one can only hold if the read itself reported "cannot say".
+        assert_eq!(
+            verdict,
+            KfdTopology::Unreadable,
+            "a missing node directory is \"cannot say\", which is not the same answer as \
+             \"KFD listed no GPU\" -- collapsing them must fail here"
+        );
+
+        // The other case, through the same entry point: a topology the kernel
+        // *does* expose, listing zero GPUs. Also a no-op on the report, but for
+        // its own reason -- the driver bound nothing, which is a fact, where the
+        // case above is the absence of one.
+        let (root, nodes) = plant_kfd_topology("membership-readable-empty", &[]);
+        let mut empty = Examination {
+            gpus: mi300x_bus_gpus(),
+            ..Examination::default()
+        };
+        let verdict = probe_gpus_kernel_membership_in(&mut empty, &nodes);
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            verdict,
+            KfdTopology::Read(0),
+            "a readable topology with no GPU node must report itself read, not unreadable"
+        );
+        assert_eq!(
+            empty.gpus,
+            mi300x_bus_gpus(),
+            "a readable topology with no GPU node must leave the PCI list standing: the card is \
+             on the bus and the driver did not bind, which is the single most useful thing \
+             `examine` can say there"
+        );
+        assert!(empty.notes.is_empty(), "notes: {:#?}", empty.notes);
+    }
+
+    #[test]
+    fn a_rocminfo_marketing_name_outranks_the_kernel_topology_placeholder() {
+        // The ordinary ROCm container: `rocminfo` present, `pciutils` absent --
+        // the shape this whole change was written for. The PCI scan enumerates
+        // nothing, so the membership pass contributes the kernel's node under a
+        // placeholder name, and `rocminfo` runs *after* it.
+        //
+        // The placeholder must therefore not count as a name already present.
+        // When it did, it outranked the marketing name and the user saw
+        // "AMD GPU (from kernel topology)" on a host that previously reported
+        // "AMD Instinct MI300X" -- a regression the change inflicted on its own
+        // target scenario.
+        let mut e = Examination::default();
+        apply_kernel_gpu_membership(
+            &mut e,
+            &[crate::KfdGpuNode {
+                pci_id: "0000:5d:00.0".to_owned(),
+                gfx_target: "gfx942".to_owned(),
+            }],
+        );
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "the kernel's node must be listed even with no PCI scan to name it"
+        );
+        assert_eq!(e.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+
+        apply_rocminfo_gpu_agents(
+            &mut e,
+            "Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n\
+             Agent 2\n  Name:  gfx942\n  Marketing Name:  AMD Instinct MI300X\n  \
+             Device Type:  GPU\n",
+        );
+        note_unnamed_kernel_topology_gpus(&mut e);
+
+        assert_eq!(
+            e.gpus.len(),
+            1,
+            "`rocminfo` must map its agent onto the kernel's entry, not add a second: {:#?}",
+            e.gpus
+        );
+        assert_eq!(
+            e.gpus[0].name, "AMD Instinct MI300X",
+            "the marketing name must survive the placeholder, not lose to it"
+        );
+        assert_eq!(e.gpus[0].gfx_target, "gfx942");
+        assert_eq!(
+            e.gpus[0].pci_id, "0000:5d:00.0",
+            "the address the kernel supplied must not be lost in the naming"
+        );
+        assert!(
+            !e.notes.join("\n").contains("marketing name is unknown"),
+            "the name is known -- `rocminfo` just supplied it -- so the note must not fire: {:#?}",
+            e.notes
+        );
+    }
+
+    /// The notes [`note_unnamed_kernel_topology_gpus`] emits, and only those.
+    ///
+    /// Matched on "their marketing name is unknown" rather than the looser
+    /// "marketing name is unknown", because `probe_gpus_sysfs_fallback` emits a
+    /// note of its own ending "PCI id and marketing name are unknown" — and
+    /// telling the two apart is exactly what catches the note being taken after
+    /// the fallback instead of before it.
+    fn unknown_name_notes(e: &Examination) -> Vec<&String> {
+        e.notes
+            .iter()
+            .filter(|note| note.contains("their marketing name is unknown"))
+            .collect()
+    }
+
+    #[test]
+    fn the_unknown_name_note_is_taken_between_rocminfo_and_the_sysfs_fallback() {
+        // The test above proves the *passes* compose when a caller runs them in
+        // the right order. It cannot notice the real call site running them in
+        // the wrong one -- it chooses the order itself. So drive
+        // `probe_gpus_after_lspci`, which is the sequence `Examination::probe`
+        // runs, against planted hosts. Each scenario below is failed by exactly
+        // one way of misplacing `note_unnamed_kernel_topology_gpus`:
+        //
+        //   A. above `probe_gpus_rocminfo` -- the premature-note defect this
+        //      pass was split out to remove: a named card gets noted as unnamed.
+        //   B. deleted -- a genuinely unnamed card goes unremarked.
+        //   C. below `probe_gpus_sysfs_fallback` -- the fallback's own
+        //      placeholder is counted on top of the fallback's own note.
+
+        // A. The ordinary ROCm container: KFD exposes the one passed-through
+        //    MI300X, `pciutils` is absent so the PCI scan named nothing, and
+        //    `rocminfo` supplies the marketing name. Naming is finished by the
+        //    time the note is taken, so there is nothing to report.
+        let (root, nodes) = plant_kfd_topology("sequence-named", &[(23808, 90402)]);
+        let mut named = Examination::default();
+        probe_gpus_after_lspci(
+            &mut named,
+            GpuProbeSources {
+                kfd_nodes: &nodes,
+                rocminfo: Some(
+                    "Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n\
+                     Agent 2\n  Name:  gfx942\n  Marketing Name:  AMD Instinct MI300X\n  \
+                     Device Type:  GPU\n",
+                ),
+                sysfs_gfx_target: || Some("gfx942".to_owned()),
+            },
+        );
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(
+            named.gpus.len(),
+            1,
+            "the kernel exposes one card and `rocminfo` names it: {:#?}",
+            named.gpus
+        );
+        assert_eq!(
+            named.gpus[0].name, "AMD Instinct MI300X",
+            "the marketing name must reach the report"
+        );
+        assert_eq!(
+            unknown_name_notes(&named),
+            Vec::<&String>::new(),
+            "the note must be taken after `rocminfo`, which named this card: {:#?}",
+            named.notes
+        );
+
+        // B. The same host with a `rocminfo` that lists no GPU agent. Nothing
+        //    ever named the card, so the note is the only thing that tells the
+        //    user why the report says "AMD GPU (from kernel topology)".
+        let (root, nodes) = plant_kfd_topology("sequence-unnamed", &[(23808, 90402)]);
+        let mut unnamed = Examination::default();
+        probe_gpus_after_lspci(
+            &mut unnamed,
+            GpuProbeSources {
+                kfd_nodes: &nodes,
+                rocminfo: Some("Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n"),
+                sysfs_gfx_target: || Some("gfx942".to_owned()),
+            },
+        );
+        std::fs::remove_dir_all(&root).ok();
+        assert_eq!(unnamed.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+        assert_eq!(
+            unknown_name_notes(&unnamed).len(),
+            1,
+            "an entry nothing could name must say so exactly once: {:#?}",
+            unnamed.notes
+        );
+
+        // C. No KFD topology to read at all, so the membership pass is a no-op
+        //    and the sysfs fallback is what finds the card -- the DRM
+        //    ip-discovery host it exists for. The fallback plants the same
+        //    placeholder *and* explains it in a note of its own, so the count
+        //    must already have been taken: reporting it again would tell the
+        //    user twice, in two different wordings, about one card.
+        let mut fallback = Examination::default();
+        probe_gpus_after_lspci(
+            &mut fallback,
+            GpuProbeSources {
+                kfd_nodes: &std::env::temp_dir().join("rocm-cli-absent-kfd-for-sequence"),
+                rocminfo: Some("Agent 1\n  Name:  AMD Ryzen\n  Device Type:  CPU\n"),
+                sysfs_gfx_target: || Some("gfx1103".to_owned()),
+            },
+        );
+        assert_eq!(
+            fallback.gpus.len(),
+            1,
+            "the fallback must supply the card the topology could not: {:#?}",
+            fallback.gpus
+        );
+        assert_eq!(fallback.gpus[0].name, KERNEL_TOPOLOGY_GPU_NAME);
+        assert_eq!(
+            unknown_name_notes(&fallback),
+            Vec::<&String>::new(),
+            "the fallback already explains its own placeholder; the note must be taken \
+             before it, not after: {:#?}",
+            fallback.notes
+        );
+        assert_eq!(
+            fallback.notes.len(),
+            1,
+            "one card, one explanation: {:#?}",
+            fallback.notes
         );
     }
 
@@ -1696,6 +3779,41 @@ mod tests {
             extract_lspci_name(line),
             "Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX]"
         );
+    }
+
+    #[test]
+    fn lspci_matches_instinct_processing_accelerator_class() {
+        // An MI300X carries no display class at all: it enumerates under PCI
+        // class 1200. Matching only the display classes skipped it, which is
+        // how a bare-metal Instinct host reported has_amd_gpu: false (EAI-8449).
+        let mi300x = "0000:11:00.0 Processing accelerators [1200]: Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X] [1002:74a1] (rev 02)";
+        assert!(is_lspci_gpu_line(mi300x));
+        assert_eq!(
+            extract_lspci_name(mi300x),
+            "Advanced Micro Devices, Inc. [AMD/ATI] Aqua Vanjaram [Instinct MI300X]"
+        );
+        // Instinct is discrete, and has_discrete_amd depends on that verdict.
+        assert!(
+            !classify_amd_marketing_name(&extract_lspci_name(mi300x)).1,
+            "an Instinct part must not be classified as an APU"
+        );
+
+        // The display classes still match.
+        assert!(is_lspci_gpu_line(
+            "0000:03:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 31 [Radeon RX 7900 XTX] [1002:744c]"
+        ));
+        assert!(is_lspci_gpu_line(
+            "0000:01:00.0 3D controller [0302]: NVIDIA Corporation Device [10de:2204]"
+        ));
+        assert!(is_lspci_gpu_line(
+            "0000:00:02.0 Display controller [0380]: Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:164e]"
+        ));
+
+        // The MI300X host also exposes an AMD-vendor PCI bridge per GPU; those
+        // are not GPUs and must stay out of the enumeration.
+        assert!(!is_lspci_gpu_line(
+            "0000:10:00.0 PCI bridge [0604]: Advanced Micro Devices, Inc. [AMD/ATI] Device [1002:1501]"
+        ));
     }
 
     #[test]

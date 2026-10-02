@@ -12,7 +12,7 @@
 //! maps the verdict onto a CLI-side action.
 //!
 //! It must never gain a mutating capability and never touches the read-only
-//! chat seam (`agent.rs:59-62`).
+//! chat seam ([`crate::agent::AgentClient`]).
 //!
 //! Keymap mirrors the frozen rocm-cli `pending_approval` screen: Up/Down/Tab
 //! move the cursor; `y` approves; `n` denies; Esc cancels; Enter performs the
@@ -47,6 +47,14 @@ impl ApprovalRequest {
 }
 
 /// Which button the cursor is on.
+///
+/// `Approve` is the shared default — it governs the ten manager-embedded
+/// approval flows (install/stop/reinstall/etc., each via their own
+/// `ApprovalChoice::default()` call) where the user just explicitly
+/// requested the action being confirmed. The chat/tool-call approval flow
+/// (`AppState::open_approval`) is a different case — an unreviewed tool
+/// call the model wants to run — and opts into `Deny` explicitly there
+/// instead of moving this shared default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApprovalChoice {
     #[default]

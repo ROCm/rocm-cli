@@ -54,6 +54,12 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
+The license-headers hook (`hawkeye`) runs on both commit and push for matching files. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard rather than skipping when the binary is missing:
+
+```bash
+cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
+```
+
 ### Workspace layout
 
 | Path | Description |
@@ -64,6 +70,14 @@ cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_
 | `crates/rocm-dash-*` | Dashboard TUI libraries |
 | `crates/rocm-engine-protocol` | Engine IPC protocol |
 | `engines/` | Inference engine adapters (lemonade, vllm) |
+
+### Module organization
+
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full.
+
+Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
+
+`docs/architecture.md`'s path citations are enforced by `cargo xtask check-architecture-doc` (`xtask/src/architecture_doc.rs`) — it fails CI if a citation isn't found where it's cited, naming the expected location per citation (exactly where depends on its shape: a slash path, a bare filename, or a bare directory name; see `citation_exists`'s doc comment in that file for the full rule) — though it doesn't check the accuracy of the surrounding prose.
 
 ### Test commands
 

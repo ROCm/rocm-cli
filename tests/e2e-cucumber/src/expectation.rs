@@ -24,7 +24,9 @@ use crate::capability::HostCapability;
 const ID_PREFIX: &str = "id:";
 const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
+const REQUIRES_DOCKER_TAG: &str = "requires-docker";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
 const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
@@ -33,6 +35,13 @@ const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
 const MERGE_QUEUE_TAG: &str = "merge-queue";
+
+// `@serial` deliberately has no entry here, and `from_tags` below silently
+// ignores it like any other unrecognized tag: it isn't an expectation-
+// resolution concern, it's a cucumber-rs *runner* concern, consumed directly
+// by its default `Runner::Basic::which_scenario` (unmodified by this crate) to
+// force a scenario to run without any concurrent sibling. A feature file's
+// `@serial` tag works whether or not it's listed here.
 
 /// The resolved expectation for one scenario on one host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +60,41 @@ pub enum Expectation {
     Skip { reason: String },
 }
 
+/// Whether a container runtime is usable here.
+///
+/// Probed rather than assumed: a developer machine may have the client without
+/// a running daemon.
+///
+/// Necessary but not sufficient — see the `requires_docker` gate, which also
+/// wants an explicit opt-in. A daemon answering does not mean the fixture image
+/// can be built: a self-hosted runner behind a restricted network has both a
+/// working daemon and no route to the package mirror the image installs from.
+fn docker_available() -> bool {
+    std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Facts extracted from a scenario's tags.
 #[derive(Debug, Clone)]
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
+    /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
+    /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
+    /// is a different situation in which the assertion does not hold. Skipped
+    /// wherever the probed device count is not known to exceed one.
+    ///
+    /// `@requires-gpu` cannot express this: it asks only whether *a* device is
+    /// usable, and Strix Halo answers yes with exactly one. The distinction is
+    /// load-bearing for the visibility-mask ordinal scenarios, where a mask token
+    /// that names a device the host does not have makes the product's ordinal
+    /// probe report "unknown" rather than a visible set, and `--gpu` validation
+    /// then takes its permissive fallback instead of refusing.
+    pub requires_multi_gpu: bool,
     /// `@requires-gfx-target`: the scenario needs a detected chip name but does
     /// not access the GPU. This permits resolver dry-runs on WSL before GPU
     /// passthrough is ready without weakening `@requires-gpu` serve scenarios.
@@ -99,6 +138,12 @@ pub struct ScenarioDecl {
     /// xfail `serve_timeout_secs` in expectations.toml (which shortens a known-bug
     /// serve to fail fast); this lengthens a genuinely-slow expected-pass serve.
     pub serve_timeout_secs: Option<u64>,
+    /// `@requires-docker`: the scenario's premise is a second machine, stood up
+    /// as a container. `rocm remote` drives a real SSH connection to a real
+    /// host, and no amount of local stubbing produces one — so the successful
+    /// serve/status/attach/stop paths can only be exercised where a container
+    /// runtime exists. Skipped elsewhere rather than silently uncovered.
+    pub requires_docker: bool,
     /// `@nightly`: an expensive scenario (e.g. a large-model serve) that is skipped
     /// on ordinary per-PR / on-demand runs to keep them fast, and only runs when
     /// the nightly workflow opts in via `E2E_INCLUDE_NIGHTLY`.
@@ -121,7 +166,9 @@ impl ScenarioDecl {
     /// leading `@` shape cucumber-rs supplies at runtime and bare unit fixtures.
     pub fn from_tags<S: AsRef<str>>(tags: &[S]) -> Self {
         let mut id = None;
+        let mut requires_docker = false;
         let mut requires_gpu = false;
+        let mut requires_multi_gpu = false;
         let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
@@ -145,8 +192,12 @@ impl ScenarioDecl {
                 requires_os = Some(rest.to_ascii_lowercase());
             } else if let Some(rest) = tag.strip_prefix(SERVE_TIMEOUT_PREFIX) {
                 serve_timeout_secs = rest.parse::<u64>().ok();
+            } else if tag == REQUIRES_DOCKER_TAG {
+                requires_docker = true;
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == REQUIRES_MULTI_GPU_TAG {
+                requires_multi_gpu = true;
             } else if tag == REQUIRES_GFX_TARGET_TAG {
                 requires_gfx_target = true;
             } else if tag == REQUIRES_NO_GPU_TAG {
@@ -166,6 +217,7 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
+            requires_multi_gpu,
             requires_gfx_target,
             requires_no_gpu,
             requires_bare_metal,
@@ -173,6 +225,7 @@ impl ScenarioDecl {
             requires_engine,
             requires_os,
             serve_timeout_secs,
+            requires_docker,
             nightly,
             lifecycle,
             merge_queue,
@@ -388,32 +441,64 @@ pub struct PlatformManifest<'a> {
     pub expectations: Vec<ResolvedScenario>,
 }
 
+/// Which opt-in scenario sets a run includes.
+///
+/// A struct rather than a row of bools: they are all the same type, so a
+/// mis-ordered argument silently changes which set runs and the compiler cannot
+/// help. Naming them at the call site is what makes that visible.
+///
+/// Every field defaults to `false`, because each one guards a set that is
+/// expensive, slow, or needs something the host may not have. A run opts in;
+/// nothing opts in on its behalf.
+///
+/// - `nightly` — set by the nightly workflow (via `E2E_INCLUDE_NIGHTLY`).
+///   Ordinary per-PR and on-demand runs leave it false so expensive `@nightly`
+///   scenarios stay out of the fast path.
+/// - `lifecycle` — set (via `E2E_INCLUDE_LIFECYCLE`) only when the caller opts
+///   into the expensive, OS-mutating release-lifecycle scenarios. The default
+///   fast suite keeps them out.
+/// - `docker` — set (via `E2E_INCLUDE_DOCKER`) by the GitHub-hosted lane, for
+///   `@requires-docker` scenarios that stand a second machine up in a container.
+///   Necessary but not sufficient: `docker_available` must also answer, since
+///   a self-hosted GPU runner has a daemon but no route to the package mirror
+///   the fixture image builds from.
+/// - `merge_queue` — set only in the merge queue (via `E2E_MERGE_QUEUE`). Per-PR
+///   runs leave it false so heavy `@merge-queue` serves stay off the PR path (a
+///   cheaper per-engine canary covers them) and run once before the change lands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Included {
+    pub nightly: bool,
+    pub lifecycle: bool,
+    pub docker: bool,
+    pub merge_queue: bool,
+}
+
 /// Resolve a scenario's expectation on this host.
 ///
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
-///    a `@merge-queue` scenario outside the merge queue, a `@requires-gpu`
-///    scenario on a host with no AMD GPU, a `@requires-bare-metal` scenario on
-///    WSL2, a `@requires-os:<os>` scenario on a different OS, or a scenario whose
+///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
+///    scenario without a usable container runtime, a `@requires-gpu` scenario on
+///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
+///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    `@requires-os:<os>` scenario on a different OS, or a scenario whose
 ///    effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
-/// `include_nightly` is set by the nightly workflow (via `E2E_INCLUDE_NIGHTLY`);
-/// ordinary per-PR / on-demand runs pass `false` so expensive `@nightly`
-/// scenarios stay out of the fast path. `include_lifecycle` is set (via
-/// `E2E_INCLUDE_LIFECYCLE`) only when the caller opts into the expensive,
-/// OS-mutating release-lifecycle scenarios; the default fast suite keeps them out.
-/// `include_merge_queue` is set only in the merge queue (via `E2E_MERGE_QUEUE`);
-/// per-PR runs pass `false` so heavy `@merge-queue` serves stay off the PR path (a
-/// cheaper per-engine canary covers them) and run once before the change lands.
+/// Which opt-in sets are in play is carried by [`Included`], which documents
+/// what each one gates and who sets it.
 pub fn resolve(
     decl: &ScenarioDecl,
     cap: &HostCapability,
     matrix: &Expectations,
-    include_nightly: bool,
-    include_lifecycle: bool,
-    include_merge_queue: bool,
+    included: Included,
 ) -> Expectation {
+    let Included {
+        nightly: include_nightly,
+        lifecycle: include_lifecycle,
+        docker: include_docker,
+        merge_queue: include_merge_queue,
+    } = included;
     // (1) Applicability / skip.
     if decl.nightly && !include_nightly {
         return Expectation::Skip {
@@ -430,9 +515,29 @@ pub fn resolve(
             reason: "merge-queue-only scenario; set E2E_MERGE_QUEUE to run".to_owned(),
         };
     }
+    if decl.requires_docker && !(include_docker && docker_available()) {
+        return Expectation::Skip {
+            reason: "needs a second machine in a container; set E2E_INCLUDE_DOCKER=1 on a \
+                     runner that can build the fixture image"
+                .to_owned(),
+        };
+    }
     if decl.requires_gpu && !cap.has_amd_gpu {
         return Expectation::Skip {
             reason: "requires an AMD GPU; none detected on this host".to_owned(),
+        };
+    }
+    if decl.requires_multi_gpu && cap.amd_gpu_count.is_none_or(|count| count <= 1) {
+        // An unknown count skips as well: the premise is "more than one device
+        // is present", and a host that cannot be counted has not shown that.
+        // Running there is what turned a real multi-GPU assertion into a
+        // single-GPU failure in the first place.
+        let detected = cap.amd_gpu_count.map_or_else(
+            || "the count could not be probed".to_owned(),
+            |count| format!("{count} detected"),
+        );
+        return Expectation::Skip {
+            reason: format!("requires more than one AMD GPU; {detected}"),
         };
     }
     if decl.requires_gfx_target && cap.gfx_target.is_none() {
@@ -537,6 +642,7 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx942".into()),
                 has_amd_gpu: true,
+                amd_gpu_count: Some(8),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
@@ -546,6 +652,7 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
+                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -555,6 +662,7 @@ mod tests {
                 is_wsl: false,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
+                amd_gpu_count: Some(1),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
@@ -563,11 +671,17 @@ mod tests {
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
             // it from bare metal. That is precisely why `@requires-os:linux`
             // cannot stand in for `@requires-bare-metal`.
+            //
+            // The device COUNT is unknown on every WSL host: that platform
+            // reaches the GPU through `/dev/dxg`, exposing neither a KFD
+            // topology nor an amdgpu DRM card for the count probe to read. So
+            // `@requires-multi-gpu` skips there whatever the hardware is.
             "wsl2" => HostCapability {
                 os_family: "linux".into(),
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: true,
+                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -580,6 +694,7 @@ mod tests {
                 is_wsl: true,
                 gfx_target: None,
                 has_amd_gpu: false,
+                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
@@ -591,6 +706,7 @@ mod tests {
                 is_wsl: true,
                 gfx_target: Some("gfx1151".into()),
                 has_amd_gpu: false,
+                amd_gpu_count: None,
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
@@ -600,6 +716,7 @@ mod tests {
                 is_wsl: false,
                 gfx_target: None,
                 has_amd_gpu: false,
+                amd_gpu_count: Some(0),
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
@@ -667,14 +784,12 @@ serve_timeout_secs = 90
                 &scenario,
                 &cap("wsl-no-passthrough"),
                 &matrix,
-                false,
-                false,
-                false,
+                Included::default(),
             ),
             Expectation::ExpectPass
         );
         assert!(matches!(
-            resolve(&scenario, &cap("mock"), &matrix, false, false, false,),
+            resolve(&scenario, &cap("mock"), &matrix, Included::default()),
             Expectation::Skip { .. }
         ));
     }
@@ -696,17 +811,47 @@ serve_timeout_secs = 90
         let d = decl(&["id:big", "requires-gpu", "nightly"]);
         assert!(d.nightly);
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, true, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: true,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         // The nightly gate is cheapest-first: a @nightly scenario that ALSO can't
         // run here (no GPU) still skips regardless of the include flag.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, true, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: true,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -723,16 +868,78 @@ serve_timeout_secs = 90
         ]);
         assert!(d.lifecycle);
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, true, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: true,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         // Even when included, an inapplicable OS still skips (os gate is checked).
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false, true, false),
+            resolve(
+                &d,
+                &cap("strix-windows"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: true,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
+            Expectation::Skip { .. }
+        ));
+    }
+
+    #[test]
+    fn docker_scenario_skips_unless_included() {
+        // A container-backed scenario is opt-in, not merely "docker is here".
+        // A runner can have a working daemon and still be unable to build the
+        // fixture image — the self-hosted GPU boxes have exactly that shape, and
+        // failing there on an image they could never build told us nothing.
+        let d = ScenarioDecl {
+            requires_docker: true,
+            ..decl(&["@id:x"])
+        };
+        let m = Expectations::default();
+        assert!(matches!(
+            resolve(&d, &cap("mi300x"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        // And it is not opted in by any of the other sets.
+        assert!(matches!(
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: true,
+                    lifecycle: true,
+                    merge_queue: true,
+                    docker: false,
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -749,22 +956,62 @@ serve_timeout_secs = 90
         ]);
         assert!(d.merge_queue);
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false, false, true),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: true
+                }
+            ),
             Expectation::ExpectPass
         );
         // Independent of the nightly axis: a merge-queue scenario is not opted in
         // by E2E_INCLUDE_NIGHTLY.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, true, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: true,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         // Cheapest-first: still skips where it can't run at all (no GPU).
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false, false, true),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: true
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -789,17 +1036,47 @@ serve_timeout_secs = 90
 
         // MI300X: default engine vLLM → xfail.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Ubuntu: gfx1151 → lemonade default → NOT vLLM → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         // Strix Windows: lemonade default → expect-pass (this is the XPASS fix).
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-windows"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
     }
@@ -809,9 +1086,147 @@ serve_timeout_secs = 90
         let m = eai7333_matrix();
         let d = decl(&["id:serve-default-engine-inference", "requires-gpu"]);
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
+    }
+
+    #[test]
+    fn multi_gpu_tag_parses_in_both_shapes() {
+        assert!(decl(&["id:x", "requires-multi-gpu"]).requires_multi_gpu);
+        assert!(decl(&["@id:x", "@requires-multi-gpu"]).requires_multi_gpu);
+        // Absent by default, and `@requires-gpu` does not imply it — otherwise
+        // every existing GPU scenario would silently stop running on Strix.
+        let gpu_only = decl(&["id:x", "requires-gpu"]);
+        assert!(!gpu_only.requires_multi_gpu);
+        assert!(gpu_only.requires_gpu);
+        // Nor the reverse: the tags are independent flags on the same scenario.
+        assert!(!decl(&["id:x", "requires-multi-gpu"]).requires_gpu);
+    }
+
+    /// Both directions of the gate. A scenario whose premise is a second device
+    /// must RUN where one exists and SKIP where it does not — a gate that only
+    /// ever skips would silently retire the assertion everywhere.
+    #[test]
+    fn requires_multi_gpu_runs_only_where_a_second_device_is_present() {
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:serve-rocr-reindexed-gpu-index-rejected",
+            "requires-gpu",
+            "requires-multi-gpu",
+            "requires-os:linux",
+        ]);
+        // MI300X has eight devices → the premise holds → the scenario runs.
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, Included::default()),
+            Expectation::ExpectPass
+        );
+        // Strix Halo has exactly one. `@requires-gpu` is satisfied there, which
+        // is why the scenario used to run and fail on its premise.
+        assert!(matches!(
+            resolve(&d, &cap("strix-ubuntu"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        // No GPU at all, and a host whose count could not be probed (WSL), skip
+        // too: neither has SHOWN a second device.
+        for host in ["mock", "wsl2"] {
+            assert!(
+                matches!(
+                    resolve(&d, &cap(host), &m, Included::default()),
+                    Expectation::Skip { .. }
+                ),
+                "{host} must not run a multi-GPU scenario"
+            );
+        }
+    }
+
+    /// The tag line of a scenario in a real `.feature` file, by `@id:` slug.
+    /// Tags share one line with the id in this suite, which is what makes the
+    /// lookup exact rather than a guess about declaration order.
+    fn feature_tags(feature_text: &'static str, id: &str) -> Vec<&'static str> {
+        feature_text
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                line.starts_with('@')
+                    && line
+                        .split_whitespace()
+                        .any(|tag| tag == format!("@id:{id}").as_str())
+            })
+            .unwrap_or_else(|| panic!("no tag line for @id:{id}"))
+            .split_whitespace()
+            .collect()
+    }
+
+    /// The gate is only worth anything if the scenario in the file actually
+    /// carries it, so resolve the REAL tag line rather than a hand-written copy:
+    /// dropping `@requires-multi-gpu` from the feature file has to fail a test,
+    /// not silently restore the single-GPU failure this was added to fix.
+    ///
+    /// The sibling `serve-19` is asserted in the same breath to stay UNGATED: its
+    /// `HIP_VISIBLE_DEVICES=0` mask names a device every GPU host has, so its
+    /// visible set resolves on one GPU and the refusal holds there. Gating it too
+    /// would retire live coverage on the Strix lanes for no reason.
+    #[test]
+    fn the_rocr_reindexed_scenario_is_gated_on_multi_gpu_and_its_sibling_is_not() {
+        let feature = include_str!("../features/model_serving.feature");
+        let m = Expectations::default();
+
+        let rocr = ScenarioDecl::from_tags(&feature_tags(
+            feature,
+            "serve-rocr-reindexed-gpu-index-rejected",
+        ));
+        assert!(rocr.requires_multi_gpu, "serve-20 must carry the gate");
+        assert!(matches!(
+            resolve(&rocr, &cap("strix-ubuntu"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        assert_eq!(
+            resolve(&rocr, &cap("mi300x"), &m, Included::default()),
+            Expectation::ExpectPass
+        );
+
+        let masked =
+            ScenarioDecl::from_tags(&feature_tags(feature, "serve-masked-gpu-index-rejected"));
+        assert!(
+            !masked.requires_multi_gpu,
+            "serve-19 holds on a single GPU and must keep running there"
+        );
+        for host in ["strix-ubuntu", "mi300x"] {
+            assert_eq!(
+                resolve(&masked, &cap(host), &m, Included::default()),
+                Expectation::ExpectPass,
+                "{host} must still run serve-19"
+            );
+        }
+    }
+
+    /// The single-GPU skip must name the count, not just repeat the `@requires-gpu`
+    /// reason: on Strix Halo a GPU *is* present, so "none detected" would send a
+    /// reader of the report looking for a missing device that is right there.
+    #[test]
+    fn multi_gpu_skip_reason_distinguishes_itself_from_the_no_gpu_one() {
+        let m = Expectations::default();
+        let d = decl(&["id:x", "requires-gpu", "requires-multi-gpu"]);
+        let Expectation::Skip { reason } =
+            resolve(&d, &cap("strix-ubuntu"), &m, Included::default())
+        else {
+            panic!("a single-GPU host must skip a multi-GPU scenario");
+        };
+        assert!(
+            reason.contains("more than one") && reason.contains('1'),
+            "reason should name the shortfall, got: {reason}"
+        );
     }
 
     #[test]
@@ -820,16 +1235,46 @@ serve_timeout_secs = 90
         let d = decl(&["id:serve-no-gpu-fails-fast", "requires-no-gpu"]);
         // The mock host has no AMD GPU → the no-GPU premise applies → runs.
         assert_eq!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         // Every GPU host skips it — the premise can't hold there.
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -840,7 +1285,17 @@ serve_timeout_secs = 90
         let d = decl(&["id:diagnose-matches-known-symptom", "requires-bare-metal"]);
         for wsl in ["wsl2", "wsl"] {
             assert!(matches!(
-                resolve(&d, &cap(wsl), &m, false, false, false),
+                resolve(
+                    &d,
+                    &cap(wsl),
+                    &m,
+                    Included {
+                        nightly: false,
+                        lifecycle: false,
+                        docker: false,
+                        merge_queue: false
+                    }
+                ),
                 Expectation::Skip { .. }
             ));
         }
@@ -848,9 +1303,57 @@ serve_timeout_secs = 90
         // which is where these scenarios earn their keep as a required check.
         for host in ["mock", "mi300x", "strix-ubuntu", "strix-windows"] {
             assert_eq!(
-                resolve(&d, &cap(host), &m, false, false, false),
+                resolve(
+                    &d,
+                    &cap(host),
+                    &m,
+                    Included {
+                        nightly: false,
+                        lifecycle: false,
+                        docker: false,
+                        merge_queue: false
+                    }
+                ),
                 Expectation::ExpectPass,
                 "{host} is bare metal and must still run the scenario"
+            );
+        }
+    }
+
+    #[test]
+    fn combining_requires_os_and_requires_bare_metal_narrows_to_native_linux() {
+        // diagnose-08's exact tag set. It needs a Linux host (the assertion reads
+        // back a shell rc file) that is ALSO not WSL (the only auto-applicable
+        // fix reaching the consent gate does not apply there). Neither tag says
+        // that alone, so the pair has to compose — and a `-n` filtered local run
+        // bypasses this resolution entirely, which makes it worth pinning here
+        // rather than trusting a hand-run of the suite.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:diagnose-fix-requires-agreement-before-changing-anything",
+            "requires-os:linux",
+            "requires-bare-metal",
+        ]);
+        for wsl in ["wsl", "wsl2"] {
+            assert!(
+                matches!(
+                    resolve(&d, &cap(wsl), &m, Included::default()),
+                    Expectation::Skip { .. }
+                ),
+                "{wsl} is linux but not bare metal, so the scenario has no premise"
+            );
+        }
+        assert!(matches!(
+            resolve(&d, &cap("strix-windows"), &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
+        // `mock` is deliberately absent: the fixture models it as os_family
+        // "other", so it cannot stand for the real mock lane here.
+        for host in ["mi300x", "strix-ubuntu"] {
+            assert_eq!(
+                resolve(&d, &cap(host), &m, Included::default()),
+                Expectation::ExpectPass,
+                "{host} is native Linux and must still run the scenario"
             );
         }
     }
@@ -864,13 +1367,33 @@ serve_timeout_secs = 90
         assert!(d.requires_wsl);
         for wsl in ["wsl", "wsl2"] {
             assert_eq!(
-                resolve(&d, &cap(wsl), &m, false, false, false),
+                resolve(
+                    &d,
+                    &cap(wsl),
+                    &m,
+                    Included {
+                        nightly: false,
+                        lifecycle: false,
+                        docker: false,
+                        merge_queue: false
+                    }
+                ),
                 Expectation::ExpectPass
             );
         }
         for platform in ["mock", "mi300x", "strix-ubuntu", "strix-windows"] {
             assert!(matches!(
-                resolve(&d, &cap(platform), &m, false, false, false),
+                resolve(
+                    &d,
+                    &cap(platform),
+                    &m,
+                    Included {
+                        nightly: false,
+                        lifecycle: false,
+                        docker: false,
+                        merge_queue: false
+                    }
+                ),
                 Expectation::Skip { .. }
             ));
         }
@@ -884,7 +1407,17 @@ serve_timeout_secs = 90
         let m = Expectations::default();
         let d = decl(&["id:some-linux-scenario", "requires-os:linux"]);
         assert_eq!(
-            resolve(&d, &cap("wsl2"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("wsl2"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
     }
@@ -905,7 +1438,17 @@ reason = "unrelated open bug"
         .unwrap();
         let d = decl(&["id:diagnose-matches-known-symptom", "requires-bare-metal"]);
         assert!(matches!(
-            resolve(&d, &cap("wsl2"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("wsl2"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -921,12 +1464,32 @@ reason = "unrelated open bug"
         ]);
         // MI300X: vLLM available → not skipped (expect-pass here, no matrix entry).
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         // Strix Windows: vLLM can't start → skip (N/A).
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-windows"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -940,15 +1503,45 @@ reason = "unrelated open bug"
         // Runs on a Linux GPU host; skips where os_family != linux (windows, and
         // the "other" fixture host).
         assert_eq!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         assert!(matches!(
-            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-windows"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::Skip { .. }
         ));
     }
@@ -958,11 +1551,31 @@ reason = "unrelated open bug"
         let m = Expectations::default();
         let d = decl(&["id:examine-version"]);
         assert_eq!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
         assert_eq!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
     }
@@ -981,11 +1594,31 @@ reason = "short-name not surfaced"
         let d = decl(&["id:serve-short-name-expansion"]);
         // No requires-gpu → runs everywhere, always xfail.
         assert!(matches!(
-            resolve(&d, &cap("mock"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mock"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectXfail { .. }
         ));
         assert!(matches!(
-            resolve(&d, &cap("mi300x"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("mi300x"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectXfail { .. }
         ));
     }
@@ -1008,12 +1641,32 @@ reason = "lemonade vulkan fallback"
         ]);
         // Strix Ubuntu (linux, lemonade) → xfail.
         assert!(matches!(
-            resolve(&d, &cap("strix-ubuntu"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-ubuntu"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectXfail { .. }
         ));
         // Strix Windows (windows, lemonade) → os mismatch → expect-pass.
         assert_eq!(
-            resolve(&d, &cap("strix-windows"), &m, false, false, false),
+            resolve(
+                &d,
+                &cap("strix-windows"),
+                &m,
+                Included {
+                    nightly: false,
+                    lifecycle: false,
+                    docker: false,
+                    merge_queue: false
+                }
+            ),
             Expectation::ExpectPass
         );
     }
@@ -1107,46 +1760,21 @@ flaky = true
         assert!(!m.is_xfail("examine-both-forms-agree-on-gpu", &cap("wsl"), "lemonade"));
     }
 
-    /// EAI-8031 is the Windows `owner/repo:variant` direct-serve path only. The
-    /// row must not widen: the Strix Halo Ubuntu lane serves the same checkpoint
-    /// correctly, and on Windows the short-recipe-name path still passes, so
-    /// letting either inherit the xfail would turn a real regression into a
-    /// silently expected failure.
+    /// EAI-8031's row (Windows lane cold-downloading its HF checkpoint every
+    /// scenario, racing serve readiness) is resolved by wiring `HF_HOME` into
+    /// the Windows lane the same way every Linux lane already has it — not by
+    /// this test, which only guards against a silent regression. Deleting the
+    /// row's own scoping tests alongside the row left nothing to fail if
+    /// someone re-added it without re-diagnosing the underlying cause; this
+    /// makes reintroducing it a deliberate decision instead of a copy-paste.
     #[test]
-    fn hf_checkpoint_serve_xfail_is_scoped_to_windows_gpu_hosts() {
+    fn hf_checkpoint_serve_has_no_xfail_on_windows_gpu_hosts() {
         let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        assert!(m.is_xfail(
+        assert!(!m.is_xfail(
             "serve-hf-checkpoint-inference",
             &cap("strix-windows"),
             "lemonade"
         ));
-        assert!(!m.is_xfail(
-            "serve-hf-checkpoint-inference",
-            &cap("strix-ubuntu"),
-            "lemonade"
-        ));
-        assert!(!m.is_xfail(
-            "serve-lemonade-inference",
-            &cap("strix-windows"),
-            "lemonade"
-        ));
-    }
-
-    /// The shortened wait must stay clear of a HEALTHY serve on this host (~120s
-    /// measured), or a fixed EAI-8031 would keep failing and never surface as the
-    /// XPASS that tells us to delete the row.
-    #[test]
-    fn hf_checkpoint_serve_xfail_shortens_the_wait_with_headroom() {
-        let m = Expectations::parse(include_str!("../expectations.toml")).unwrap();
-        let secs = m
-            .serve_timeout_for(
-                "serve-hf-checkpoint-inference",
-                &cap("strix-windows"),
-                "lemonade",
-            )
-            .expect("the EAI-8031 row shortens the serve wait");
-        assert!(secs < 600, "must be shorter than the global default");
-        assert!(secs >= 240, "must stay well above a ~120s healthy serve");
     }
 
     #[test]
