@@ -24,7 +24,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 
 use super::{
-    InstalledRuntimeManifest, ParsedVersion, RuntimeFreshness, compare_version_strings,
+    InstalledRuntimeManifest, RuntimeFreshness, VersionOrderKey, compare_version_strings,
     parse_host_version, parse_version, runtime_freshness, select_rocm_version,
     select_startup_update_manifest, sort_manifests_newest_install_first,
 };
@@ -56,10 +56,15 @@ use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 /// * `7.0.0rc20250929` — TheRock's real nightly date-stamped rc.
 /// * `7.9rc1` — a stage riding on a two-component version, which is the one
 ///   `parse_version_for_ordering` branch nothing else here reaches.
-/// * `custom-build` — not a version at all. A manifest adopted from an existing
-///   environment carries whatever its `rocm_sdk` probe reported, so the
-///   comparator's unreadable arms are reachable in production and have to be
-///   reachable here too.
+/// * `7.2.4.70204` — a four-component release, the shape ROCm's own packages
+///   are named with.
+/// * `7.0.0-rc1` — a PEP 440 pre-release spelled with the `-` separator.
+/// * `custom-build` / `latest` — not versions at all. A manifest adopted from
+///   an existing environment carries whatever its `rocm_sdk` probe reported, so
+///   the comparator's unreadable arms are reachable in production and have to
+///   be reachable here too. *Two* of them, so a triple can mix two distinct
+///   unreadable strings with a readable one — the `(None, None)` arm is
+///   otherwise only ever reached reflexively.
 const VERSIONS: &[&str] = &[
     "7.0.0",
     "7.0.0a1",
@@ -78,7 +83,10 @@ const VERSIONS: &[&str] = &[
     "7.9.0+local",
     "07.9.0",
     "7.10.0",
+    "7.2.4.70204",
+    "7.0.0-rc1",
     "custom-build",
+    "latest",
 ];
 
 const CHANNELS: &[&str] = &["release", "nightly"];
@@ -124,8 +132,8 @@ fn version_list() -> impl Strategy<Value = Vec<String>> {
 /// `compare_version_strings_orders_pep440_stages`, whose expected values are
 /// written out rather than derived from the implementation.
 fn oracle(left: &str, right: &str) -> Option<Ordering> {
-    let left: ParsedVersion = parse_host_version(left)?;
-    let right: ParsedVersion = parse_host_version(right)?;
+    let left: VersionOrderKey = parse_host_version(left)?;
+    let right: VersionOrderKey = parse_host_version(right)?;
     Some(left.cmp(&right))
 }
 
@@ -646,11 +654,153 @@ fn compare_version_strings_orders_pep440_stages() {
         Ordering::Greater
     );
 
-    // A date-stamped nightly rc orders by its number, not as text.
+    // TheRock's real date-stamped nightly rcs. Equal digit counts, so numeric
+    // and lexicographic agree and the old comparator got this right too — kept
+    // as a shape check on the real input, not as evidence of the fix.
     assert_eq!(
         compare_version_strings("7.0.0rc20250929", "7.0.0rc20251001"),
         Ordering::Less
     );
+    // Unequal digit counts, which is where a stage number compared as text
+    // diverges. This one the old comparator also got right (both sides match
+    // its strict grammar and `stage_number` was always numeric); it is here
+    // because `rc9`/`rc10` is the pair a reader expects to see pinned.
+    assert_eq!(
+        compare_version_strings("7.0.0rc9", "7.0.0rc10"),
+        Ordering::Less
+    );
+}
+
+/// Exhaustive total-order check over the whole alphabet.
+///
+/// The `proptest` properties above draw triples at random; over an alphabet
+/// this small every triple can simply be enumerated, which is both cheaper and
+/// complete — no sampling gap, no dependence on a seed. It is kept alongside
+/// the properties rather than replacing them because the properties also run
+/// over generated *manifest sets*, which are not enumerable.
+///
+/// A comparator that is antisymmetric, transitive and never reports `Equal` for
+/// two distinct strings is a total order, which is exactly what `sort_by`
+/// requires and what the old comparator failed to be.
+#[test]
+fn compare_version_strings_is_a_total_order_over_the_alphabet() {
+    for left in VERSIONS {
+        assert_eq!(
+            compare_version_strings(left, left),
+            Ordering::Equal,
+            "{left:?} must equal itself"
+        );
+        for right in VERSIONS {
+            assert_eq!(
+                compare_version_strings(left, right),
+                compare_version_strings(right, left).reverse(),
+                "antisymmetry broken for {left:?} / {right:?}"
+            );
+            assert!(
+                left == right || compare_version_strings(left, right) != Ordering::Equal,
+                "distinct strings {left:?} and {right:?} compare Equal, so a sort \
+                 could order them either way"
+            );
+        }
+    }
+    for a in VERSIONS {
+        for b in VERSIONS {
+            if compare_version_strings(a, b) != Ordering::Less {
+                continue;
+            }
+            for c in VERSIONS {
+                if compare_version_strings(b, c) != Ordering::Less {
+                    continue;
+                }
+                assert_eq!(
+                    compare_version_strings(a, c),
+                    Ordering::Less,
+                    "transitivity broken: {a:?} < {b:?} < {c:?}"
+                );
+            }
+        }
+    }
+    // Every rotation of the alphabet sorts to the same sequence, which is the
+    // property `select_rocm_version` depends on: the chosen version must not
+    // depend on the order the index listed its candidates in.
+    let mut baseline: Vec<&str> = VERSIONS.to_vec();
+    baseline.sort_by(|left, right| compare_version_strings(left, right));
+    for shift in 0..VERSIONS.len() {
+        let mut rotated: Vec<&str> = VERSIONS[shift..]
+            .iter()
+            .chain(&VERSIONS[..shift])
+            .copied()
+            .collect();
+        rotated.sort_by(|left, right| compare_version_strings(left, right));
+        assert_eq!(rotated, baseline, "rotation by {shift} sorted differently");
+    }
+}
+
+/// A four-component release is a real shape — ROCm's own packages are named
+/// `7.2.4.70204` — and it must order by its numbers, not sink below everything.
+///
+/// Rejecting it would be worse than the bug this suite exists for: an installed
+/// `7.2.4.70204` would sort below an index `6.4.3` and `rocm update --apply`
+/// would offer to install ROCm 6 over ROCm 7.
+#[test]
+fn compare_version_strings_orders_four_component_releases() {
+    assert_eq!(
+        compare_version_strings("7.2.4.70204", "6.4.3"),
+        Ordering::Greater
+    );
+    // Above its own three-component release, below the next patch.
+    assert_eq!(
+        compare_version_strings("7.2.4.70204", "7.2.4"),
+        Ordering::Greater
+    );
+    assert_eq!(
+        compare_version_strings("7.2.4.70204", "7.2.5"),
+        Ordering::Less
+    );
+    // Trailing zeros do not make a new release: PEP 440 pads the shorter side.
+    assert_eq!(oracle("7.2.4.0", "7.2.4"), Some(Ordering::Equal));
+    assert_eq!(oracle("7.9.0.0", "7.9"), Some(Ordering::Equal));
+}
+
+/// PEP 440 spells one version several ways, and the module says its order is
+/// PEP 440's, so the spellings must land on one key.
+///
+/// `7.0.0-rc1` is the case that matters most: it is a legal spelling of
+/// `7.0.0rc1`, and treating it as unreadable would sort a release candidate
+/// below `0.0.0`.
+#[test]
+fn compare_version_strings_accepts_pep440_spellings() {
+    for spelling in [
+        "7.0.0rc1",
+        "7.0.0.rc1",
+        "7.0.0-rc1",
+        "7.0.0_rc1",
+        "7.0.0RC1",
+        "7.0.0c1",
+        "7.0.0pre1",
+        "v7.0.0rc1",
+    ] {
+        assert_eq!(
+            oracle(spelling, "7.0.0rc1"),
+            Some(Ordering::Equal),
+            "{spelling} must be the same version as 7.0.0rc1"
+        );
+        assert_eq!(
+            compare_version_strings(spelling, "7.0.0"),
+            Ordering::Less,
+            "{spelling} must precede the final release"
+        );
+    }
+    assert_eq!(oracle("7.0.0alpha1", "7.0.0a1"), Some(Ordering::Equal));
+    assert_eq!(oracle("7.0.0beta1", "7.0.0b1"), Some(Ordering::Equal));
+    assert_eq!(oracle("7.0.0rev1", "7.0.0.post1"), Some(Ordering::Equal));
+    // An omitted stage numeral is zero, per PEP 440.
+    assert_eq!(oracle("7.0.0rc", "7.0.0rc0"), Some(Ordering::Equal));
+
+    // A host build number is still not a stage: `-98` is packaging metadata,
+    // and `parse_host_version` drops it without disturbing `-rc1`.
+    assert_eq!(oracle("7.2.4-98", "7.2.4"), Some(Ordering::Equal));
+    assert_eq!(oracle("7.2.4-98", "7.13.0"), Some(Ordering::Less));
 }
 
 /// A two-component version is a release, not a string: `7.9` is `7.9.0`, which
@@ -689,17 +839,22 @@ fn compare_version_strings_orders_7_9_below_7_10_0() {
 /// and unreadable strings are ordered against each other by the string.
 ///
 /// This is the position that replaced the old silent switch to a string
-/// compare. Sorting low is the conservative end: `select_rocm_version` takes
-/// the maximum, so junk can only be selected when every candidate is junk.
+/// compare. Sorting low is the safe end *here*: `select_rocm_version` takes the
+/// maximum, so junk can only be selected when every candidate is junk. It is
+/// the wrong end for `runtime_freshness`, which is why that caller asks
+/// `actionable_version_relation` instead — see
+/// `runtime_freshness_follows_the_version_order`.
 #[test]
 fn compare_version_strings_places_unreadable_versions_below_readable_ones() {
-    // Not a release segment this tool models (four components), a bare stage
-    // label, and outright prose.
-    for unreadable in ["7.1.2.3", "7.0.0rc", "latest", ""] {
+    // What is genuinely unreadable: an epoch, a combined stage suffix, prose,
+    // and the empty string. Note what is NOT in this list — `7.1.2.3` is a
+    // four-component release and `7.0.0rc` is `rc0`; both are real versions and
+    // are ordered as such.
+    for unreadable in ["1!2.0", "7.0.0rc1.dev1", "latest", ""] {
         assert_eq!(
             compare_version_strings(unreadable, "7.0.0.dev1"),
             Ordering::Less,
-            "{unreadable} must sort below the lowest readable version"
+            "{unreadable:?} must sort below the lowest readable version"
         );
         assert_eq!(
             compare_version_strings("7.0.0.dev1", unreadable),
@@ -851,6 +1006,38 @@ fn runtime_freshness_follows_the_version_order() {
             &older_installed.runtime_key
         ),
         RuntimeFreshness::UpdateAvailable
+    );
+
+    // A four-component installed version against an older index must not be
+    // offered an "update". Sorting an unreadable string low is safe for the
+    // "newest candidate" pickers and would be a downgrade offer here, which is
+    // why this caller requires both sides to be identifiable rather than
+    // reusing the sort order.
+    let packaged = at("7.2.4.70204");
+    assert_eq!(
+        runtime_freshness(&packaged, "6.4.3", None, &packaged.runtime_key),
+        RuntimeFreshness::AheadOfIndex
+    );
+
+    // A runtime adopted from an existing environment carries whatever its probe
+    // reported. That cannot be ordered against an index version at all, so no
+    // update is offered rather than one that might be a downgrade.
+    let unidentifiable = at("custom-build");
+    assert_eq!(
+        runtime_freshness(&unidentifiable, "7.10.0", None, &unidentifiable.runtime_key),
+        RuntimeFreshness::AheadOfIndex
+    );
+    // ...but an exact string match is still "the same build", so an
+    // unparseable version that equals the index's stays up to date rather than
+    // being declared ahead of it.
+    assert_eq!(
+        runtime_freshness(
+            &unidentifiable,
+            "custom-build",
+            None,
+            &unidentifiable.runtime_key
+        ),
+        RuntimeFreshness::UpToDate
     );
 
     // A pre-release installed against its own final release is an upgrade, and
