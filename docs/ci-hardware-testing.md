@@ -113,9 +113,12 @@ mixed-silicon pool. `every_self_hosted_lane_pins_a_hardware_label` in
 the lane simply passes on the wrong GPU and reports under the label it was
 named for.
 
-`e2e` is the blocking, GitHub-hosted mock job: `@requires-gpu` scenarios
+`e2e` is the blocking, GitHub-hosted mock job: `@requires-real-gpu` scenarios
 resolve to skip here, and known bugs resolve to xfail from
-`expectations.toml`. It is a required check and must stay green.
+`expectations.toml`. It is a required check and must stay green. It also runs
+every scenario that plants a simulated machine (a WSL2 distribution, a
+bare-metal host, several Instinct GPUs; see [testing.md](testing.md)), so those
+premises no longer need the lane whose hardware they describe.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
 `e2e-wsl`, and `e2e-gpu-w7900`) run on AMD GPU systems, so they
@@ -137,15 +140,14 @@ Windows-to-WSL execution boundary, and whatever GPU access WSL exposes on that
 machine. The GPU preflight is advisory here precisely because GPU-on-WSL is
 what the lane is proving out: where it is unavailable the capability probe
 resolves those scenarios to not-applicable and the rest of the suite still
-runs. Scenarios the product deliberately routes around on WSL carry
-`@requires-bare-metal`;
-scenarios whose premise *is* a WSL host carry `@requires-wsl`, and this is the
-only lane that runs them.
+runs. Scenarios whose premise is the real WSL2 machine carry `@requires-wsl`,
+and this is the only lane that runs them; one that only needs the CLI to *see*
+WSL2 plants a simulated WSL machine instead and runs on every Linux lane.
 
-`rocm diagnose` is no longer one of the things routed around: it carries a WSL
-catalog of its own, so the `@requires-wsl` diagnose scenarios — that a WSL host
-is never given a bare-metal cause, and that a WSL remedy is explained rather
-than carried out — are proven here and nowhere else.
+`rocm diagnose` carries a WSL catalog of its own. Its WSL scenarios — that a
+WSL host is never given a bare-metal cause, and that a WSL remedy is explained
+rather than carried out — run on a simulated WSL machine, so every Linux lane
+proves them, the mock lane included.
 
 ### What the WSL distro needs
 
@@ -157,12 +159,13 @@ anyway, because `rocm install driver` emits a hard `command -v sudo`
 precondition into its WSL plan even for a root caller.
 
 What the lane deliberately does *not* provision is ROCm's WSL driver bridge.
-Installing ROCDXG is `rocm install driver`'s own job, and the `@requires-wsl`
-driver scenarios assert on the plan that command produces — a lane that
-pre-installed it would hand those scenarios a host already in the state the
-command under test exists to reach. That costs no coverage today, because
-`rocm-smi` is absent too, so `@requires-gpu` scenarios resolve to skip either
-way (see `e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
+Installing ROCDXG is `rocm install driver`'s own job. The driver-install
+scenarios assert on the plan that command produces for a simulated WSL
+machine, so they no longer read this distro, but a lane that pre-installed it
+would still put the real-WSL scenarios on a host already in the state that
+command exists to reach. That costs no coverage today, because `rocm-smi` is
+absent too, so `@requires-real-gpu` scenarios resolve to skip either way (see
+`e2e-wsl`'s own step comments in `e2e-selfhosted.yml`).
 
 GPU coverage additionally needs ROCm's WSL passthrough to be complete —
 `/dev/dxg` and dxcore alone are not enough, `librocdxg.so` and its ldconfig

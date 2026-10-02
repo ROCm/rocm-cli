@@ -97,7 +97,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # assertions wherever vLLM can't start (e.g. a lemonade-only Strix host),
   # narrowing coverage this scenario exists to provide. See therock-next-09 for
   # the vLLM-specific route, which pays for its own runtime instead.
-  @id:therock-next-07-live-install-auto-detects-arch @requires-gpu @nightly
+  @id:therock-next-07-live-install-auto-detects-arch @requires-real-gpu @nightly
   Scenario: therock-next-07 - Installing the SDK from the live ROCm 10 preview source auto-detects the exact arch
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override
@@ -155,7 +155,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # this line and still be unservable, so this scenario reuses the same
   # serve/chat steps every other engine-canary scenario does rather than
   # stopping at "install reported the right pins".
-  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-gpu @requires-engine:vllm
+  @id:therock-next-09-live-install-reports-vllm-rocm10x-discovery-pins @requires-real-gpu @requires-engine:vllm
   Scenario: therock-next-09 - Installing vLLM against a live ROCm 10 preview runtime reports the discovery pins
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK from the ROCm 10 preview source with no family override
