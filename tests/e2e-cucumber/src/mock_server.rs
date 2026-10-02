@@ -519,14 +519,33 @@ impl MockServer {
     async fn spawn(model_name: &str, with_metrics: bool) -> Self {
         let last_chat_request = Arc::new(Mutex::new(None));
         let chat_paths = Arc::new(Mutex::new(Vec::new()));
+        let app = Self::router(
+            model_name,
+            with_metrics,
+            Arc::clone(&last_chat_request),
+            Arc::clone(&chat_paths),
+        );
+        Self {
+            server: http_server::spawn(app).await,
+            scripted: None,
+            last_chat_request,
+            chat_paths,
+        }
+    }
+
+    fn router(
+        model_name: &str,
+        with_metrics: bool,
+        last_chat_request: Arc<Mutex<Option<Value>>>,
+        chat_paths: Arc<Mutex<Vec<String>>>,
+    ) -> Router {
         let state = ServerState {
             model_name: model_name.to_string(),
             metrics: with_metrics.then(|| Arc::new(MetricsCounter::new())),
             scripted_metrics: None,
-            last_chat_request: Arc::clone(&last_chat_request),
-            chat_paths: Arc::clone(&chat_paths),
+            last_chat_request,
+            chat_paths,
         };
-
         let mut app = Router::new()
             .route("/v1/models", get(handle_models))
             .route("/models", get(handle_models))
@@ -535,14 +554,28 @@ impl MockServer {
         if with_metrics {
             app = app.route("/metrics", get(handle_metrics));
         }
-        let app = app.with_state(state);
+        app.with_state(state)
+    }
 
-        Self {
-            server: http_server::spawn(app).await,
-            scripted: None,
-            last_chat_request,
-            chat_paths,
-        }
+    /// Serve the OpenAI-compatible routes for `model_name` on `listener` until
+    /// the process is killed — what the `fake-vllm` stand-in runs, since a real
+    /// engine is launched on the host and port the CLI chose rather than an
+    /// ephemeral one.
+    ///
+    /// # Errors
+    ///
+    /// The server's own I/O error, if it stops serving.
+    pub async fn serve_until_killed(
+        model_name: &str,
+        listener: tokio::net::TcpListener,
+    ) -> std::io::Result<()> {
+        let app = Self::router(
+            model_name,
+            true,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        axum::serve(listener, app).await
     }
 
     /// Every URI path a chat request has arrived on, in order.

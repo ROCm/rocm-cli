@@ -16,6 +16,7 @@ pub mod reader_failure;
 pub mod send_until;
 pub mod serve_log;
 pub mod shared_runtime;
+pub mod simulated_host;
 
 use std::path::{Path, PathBuf};
 

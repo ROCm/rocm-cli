@@ -137,7 +137,7 @@ fn write_gpu_probe_shim(path: &Path) {
 /// turns "two ready runtimes" into one or zero, and the scenario then fails on a
 /// confusing downstream assertion instead of on the fixture. If this step starts
 /// failing after an edit here, suspect the manifest shape first.
-fn plant_ready_runtime(data: &Path, key: &str) {
+pub(crate) fn plant_ready_runtime(data: &Path, key: &str) -> std::path::PathBuf {
     let install_root = data.join("runtimes").join("roots").join(key);
     let sdk_root = install_root.join("sdk");
     let sdk_bin = sdk_root.join("bin");
@@ -181,6 +181,7 @@ fn plant_ready_runtime(data: &Path, key: &str) {
         serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
     )
     .unwrap_or_else(|e| panic!("failed to write the planted runtime manifest: {e}"));
+    install_root
 }
 
 /// Combined stdout+stderr of the recorded `rocm` invocation. The refusal is an

@@ -22,6 +22,18 @@ path = "src/bin/rocm-demo-env.rs"
 name = "fake-tailscale"
 path = "src/bin/fake-tailscale.rs"
 
+# Stand-in for the hardware-describing tools (`uname`, `lspci`, `ldconfig`, ...)
+# a simulated host is read with; see `src/simulated_host.rs`.
+[[bin]]
+name = "fake-host-tool"
+path = "src/bin/fake-host-tool.rs"
+
+# Stand-in for a managed runtime's `vllm`: serves the mock OpenAI routes on the
+# host and port the CLI launches it with.
+[[bin]]
+name = "fake-vllm"
+path = "src/bin/fake-vllm.rs"
+
 [dependencies]
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }

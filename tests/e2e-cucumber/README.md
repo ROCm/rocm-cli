@@ -136,10 +136,10 @@ Scenarios carry stable-id and capability tags:
 | Tag | Meaning |
 |---|---|
 | `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
-| `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
-| `@requires-real-gpu` | Needs a **physical** AMD GPU, not a simulated host — it serves a model on the device. Implies `@requires-gpu`, and additionally resolves to **skip** unless the run sets `E2E_HARDWARE=real`, which only the self-hosted GPU lanes do. Everywhere else (`E2E_HARDWARE` unset or `simulated`) GPU behaviour is exercised against a simulated host; see `docs/testing.md`. |
-| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
-| `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
+| `@requires-gpu` | Needs a usable AMD GPU on the machine the suite runs on. No scenario carries it directly any more: a scenario that only needs the CLI to *see* a GPU plants a simulated machine (see `docs/testing.md`), and one that needs to *use* the device takes `@requires-real-gpu`, which implies this gate. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-real-gpu` | Needs a **physical** AMD GPU, not a simulated host — it serves a model on it, installs a runtime for it, or inspects the real machine. Implies `@requires-gpu`, and additionally resolves to **skip** unless the run sets `E2E_HARDWARE=real`, which only the self-hosted GPU lanes do. Everywhere else (`E2E_HARDWARE` unset or `simulated`) GPU behaviour is exercised against a simulated host; see `docs/testing.md`. |
+| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable. No scenario carries it today: the multi-GPU premises plant a simulated machine with the GPUs they need instead (see `docs/testing.md`); it remains for one whose premise cannot be simulated. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
+| `@requires-bare-metal` | Premise is a **real** host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. A scenario that only needs the CLI to *see* a bare-metal machine plants one instead (`Given a bare-metal Linux machine with an AMD GPU`) and runs on every Linux lane. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
@@ -185,8 +185,9 @@ consolidates its own platforms: `ci.yml`'s `e2e-report` the mock platform,
 `e2e-selfhosted.yml`'s `e2e-report` the self-hosted platforms, and
 `nightly.yml`'s `e2e-report-nightly` the nightly lanes below. `e2e-wsl` runs the suite in an
 Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
-exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
-skip there.
+exercises `@requires-wsl` scenarios — those about the real WSL2 machine; a
+scenario that only needs the CLI to *see* WSL2 plants a simulated one and runs
+on every Linux lane. `@requires-bare-metal` scenarios resolve to skip there.
 
 The nightly workflow covers the same hardware as the table above, as
 non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,

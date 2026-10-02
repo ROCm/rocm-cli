@@ -246,8 +246,18 @@ async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
     // root-detection deterministic: it shells out to `id -u`, which is not on
     // this PATH, so the spawn itself fails and reads as "not root" regardless of
     // who runs the suite -- the same `sudo usermod` branch fails on every host,
-    // CI or developer machine, root or not.
-    world.command_env.push(("PATH", bin_dir.into_os_string()));
+    // CI or developer machine, root or not. On a simulated machine its own tool
+    // stand-ins stay reachable, so the machine is still the one the CLI probes;
+    // the filtered copy of the real PATH is left out on purpose, since it is
+    // where `id` would come from.
+    let mut path = vec![bin_dir];
+    if let Some(host) = &world.simulated_host {
+        path.extend(host.path.first().cloned());
+    }
+    world.command_env.push((
+        "PATH",
+        std::env::join_paths(path).expect("PATH entries contain no separator"),
+    ));
     world.command_env.push(("USER", "e2e-test-user".into()));
     world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }

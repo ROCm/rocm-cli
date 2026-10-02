@@ -82,11 +82,12 @@ Feature: Diagnosing failures and listing fixes
   # with nothing installed. fix-9 does not apply on WSL2 — a single device with
   # no topology cannot have an iGPU/dGPU collision — so there the run stops at
   # the wrong-platform refusal before the gate is ever reached. That is designed
-  # behaviour, not a bug, so it is a skip rather than an xfail. The gate is
-  # shared code and stays covered by the mock and Linux GPU lanes.
-  @id:diagnose-fix-requires-agreement-before-changing-anything @requires-os:linux @requires-bare-metal
+  # behaviour, not a bug. So the machine is a simulated bare-metal one, which
+  # lets every Linux lane reach the gate, the WSL2 one included.
+  @id:diagnose-fix-requires-agreement-before-changing-anything @requires-os:linux
   Scenario: diagnose-08 - A fix that changes the machine is not applied without agreement
-    Given a user who has chosen a fix that would change the machine
+    Given a bare-metal Linux machine with an AMD GPU
+    And a user who has chosen a fix that would change the machine
     When the user asks the CLI to apply it without agreeing to the change
     Then the CLI refuses and explains that it needs agreement
     And the file the fix would have changed is untouched
@@ -169,12 +170,12 @@ Feature: Diagnosing failures and listing fixes
   # a test of the runner's health. Clearing the threshold comes from the keyword
   # alone and holds on every host.
   #
-  # @requires-os:linux because the checker is registered linux-only, and
-  # @requires-bare-metal because WSL2 does not run the catalog at all — the two
-  # are not interchangeable, WSL2 reports an os_family of linux.
-  @id:diagnose-recognises-the-engine-import-failure @requires-bare-metal @requires-os:linux
+  # @requires-os:linux because the checker is registered linux-only, and a
+  # simulated bare-metal machine because WSL2 does not run the catalog at all.
+  @id:diagnose-recognises-the-engine-import-failure @requires-os:linux
   Scenario: diagnose-13 - A vLLM engine-startup import failure is recognised from its error text
-    Given a user who hit the vLLM engine-startup import failure
+    Given a bare-metal Linux machine with an AMD GPU
+    And a user who hit the vLLM engine-startup import failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the CLI reports the engine-startup import failure as an established cause
 
@@ -206,13 +207,14 @@ Feature: Diagnosing failures and listing fixes
   # while every other listed scenario kept passing. Linux-only because the
   # recipe itself is `applies_on: LINUX_ONLY`.
   #
-  # @requires-bare-metal on top of that, same reasoning as diagnose-08:
+  # A simulated bare-metal machine on top of that, same reasoning as diagnose-08:
   # `fix-4-render-group`'s `applies_on` does not include `wsl`, so on a WSL2
   # host the CLI refuses it as the wrong platform before ever invoking the
   # (faked) `usermod` — there is no command-failure branch to reach there.
-  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux @requires-bare-metal
+  @id:diagnose-fix-command-failure-reported-on-stderr @requires-os:linux
   Scenario: diagnose-15 - A fix whose helper command fails explains why, on stderr, with exit code 4
-    Given a user who has approved a fix whose helper command will fail
+    Given a bare-metal Linux machine with an AMD GPU
+    And a user who has approved a fix whose helper command will fail
     When the user asks the CLI to apply the approved fix
     Then the CLI reports the command failure on stderr with exit code 4
 
@@ -225,13 +227,14 @@ Feature: Diagnosing failures and listing fixes
   # Linux-only for the same reason diagnose-08 is: the recipe under test
   # (`fix-9-igpu-dgpu`) only appends a shell rc file on Linux.
   #
-  # @requires-bare-metal for the same reason as diagnose-08: `fix-9-igpu-dgpu`
-  # does not apply on WSL2 (no per-device topology to collide over there), so
-  # the run stops at the wrong-platform refusal before the confirmation prompt
-  # is ever printed.
-  @id:diagnose-fix-interactive-decline-reported @requires-os:linux @requires-bare-metal
+  # A simulated bare-metal machine for the same reason as diagnose-08:
+  # `fix-9-igpu-dgpu` does not apply on WSL2 (no per-device topology to collide
+  # over there), so the run would stop at the wrong-platform refusal before the
+  # confirmation prompt is ever printed.
+  @id:diagnose-fix-interactive-decline-reported @requires-os:linux
   Scenario: diagnose-16 - Declining the confirmation prompt on a real terminal is reported the same way
-    Given a user who has chosen a fix that would change the machine
+    Given a bare-metal Linux machine with an AMD GPU
+    And a user who has chosen a fix that would change the machine
     When the user is asked interactively to apply it and types no
     Then the CLI declines on the terminal and explains that it needs agreement
     And the file the fix would have changed is untouched
@@ -240,10 +243,12 @@ Feature: Diagnosing failures and listing fixes
   # bare-metal questions — render group, /dev/kfd, modprobe amdgpu — have no
   # answer there and any finding naming one would be a false positive. This is
   # the guard on the platform split; it is what makes covering WSL2 safe rather
-  # than merely louder. @requires-os:linux would not express it: WSL2 is linux.
-  @id:diagnose-wsl-never-reports-bare-metal-causes @requires-wsl
+  # than merely louder. The WSL2 machine is simulated, so every Linux lane holds
+  # the guard, not only the WSL one.
+  @id:diagnose-wsl-never-reports-bare-metal-causes @requires-os:linux
   Scenario: diagnose-17 - A WSL machine is never given a bare-metal cause
-    Given a user who hit a known ROCm failure
+    Given a WSL machine with an AMD GPU passed through
+    And a user who hit a known ROCm failure
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then no reported cause is one that only exists on bare-metal Linux
     And the result says this platform is covered
@@ -251,10 +256,12 @@ Feature: Diagnosing failures and listing fixes
   # The remedies for a WSL GPU problem mostly live on the Windows host or install
   # packages with sudo, so none of them are ones the CLI carries out. A caller
   # that could not tell "explained" from "attempted" would report a changed
-  # machine when nothing was touched.
-  @id:diagnose-wsl-fix-is-explained-not-attempted @requires-wsl
+  # machine when nothing was touched. The WSL2 machine is simulated, as in
+  # diagnose-17.
+  @id:diagnose-wsl-fix-is-explained-not-attempted @requires-os:linux
   Scenario: diagnose-18 - A WSL remedy is explained rather than carried out
-    Given a user who has chosen a WSL remedy that belongs on the Windows host
+    Given a WSL machine with an AMD GPU passed through
+    And a user who has chosen a WSL remedy that belongs on the Windows host
     When the user asks the CLI to apply that fix
     Then the CLI explains the remedy instead of carrying it out
     And nothing on the machine is changed
