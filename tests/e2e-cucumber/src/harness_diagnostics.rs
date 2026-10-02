@@ -32,6 +32,16 @@
 //! the panic, so a descriptor that changed underneath the process is visible rather
 //! than inferred. This only observes the streams; it does not modify them.
 //!
+//! **What this does not recover.** Only the panic *message* survives: the
+//! `file:line` and any backtrace are handed to the panic hook, not carried in the
+//! unwind payload, and the hook installed at that moment is cucumber's empty one.
+//! So a one-line entry with no location is everything there is, not a truncation.
+//! And only a panic that unwinds out of `run()` reaches this boundary — one inside
+//! a fixture server's task or thread (`http_server::spawn` drops its
+//! `JoinHandle`) is contained there, and while the empty hook is installed it
+//! prints nothing either. The step that needed that server then fails on a
+//! symptom — a refused connection, a timeout — with no trace of the cause.
+//!
 //! The whole boundary lives in the library target rather than inline in the
 //! `harness = false` cucumber test binary, so its logic gets real `#[test]`
 //! coverage — the custom harness never executes plain `#[test]` functions placed
@@ -78,6 +88,8 @@ pub fn describe_std_streams() -> Vec<String> {
         // `/proc/self/fd/N` names the open file the descriptor currently refers to
         // ("pipe:[12345]", a tty, a path). Two snapshots naming different targets
         // is the signature of a descriptor being replaced underneath the process.
+        // Linux-only despite the `cfg(unix)` above: elsewhere there is no `/proc`,
+        // so this half reads `target unknown (..)` and only the flags are reported.
         fn target(n: i32) -> String {
             std::fs::read_link(format!("/proc/self/fd/{n}")).map_or_else(
                 |e| format!("target unknown ({e})"),
