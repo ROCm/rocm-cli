@@ -396,6 +396,83 @@ async fn user_inspects_both_ways(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The runtime key config names as active while the registry holds nothing.
+const FORGOTTEN_RUNTIME_KEY: &str = "release-tarball-gfx942";
+
+/// Where the `Given` plants that folder, recomputed rather than carried on the
+/// World: it is a pure function of the scenario's isolated root, so a field
+/// would only be a second place for it to be wrong.
+fn planted_setup_runtime_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("setup-runtime")
+}
+
+#[given("setup names a runtime folder the registry has forgotten")]
+async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let install_root = planted_setup_runtime_root(world);
+    std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    // The install tree's own copy of its manifest. This is what makes the
+    // registry entry recoverable, so planting it is what makes the scenario's
+    // ordering load-bearing: run the text form first and
+    // `recover_setup_runtime_registration` re-files this into the registry,
+    // after which `--json` can resolve `active_runtime_root` without having
+    // earned it. Without this file recovery bails and both orders agree.
+    let manifest = serde_json::json!({
+        "runtime_key": FORGOTTEN_RUNTIME_KEY,
+        // `:` is safe in a field value; only the registry filename comes from
+        // `runtime_key`.
+        "runtime_id": "therock-release:gfx942",
+        "channel": "release",
+        "format": "tarball",
+        "family": "gfx942",
+        "family_source": "manual",
+        "version": "1.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/release-tarball-gfx942.tar.gz",
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write local runtime manifest");
+    // Black-box: plain JSON matching the CLI's on-disk config schema, not a
+    // typed import from the crates. Every field defaults, so naming these two
+    // is enough. The isolated registry starts empty, which IS the state under
+    // test.
+    let config = serde_json::json!({
+        "active_runtime_key": FORGOTTEN_RUNTIME_KEY,
+        "setup": { "therock_venv": install_root },
+    });
+    std::fs::write(
+        root.path().join("config").join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user inspects the system for scripting before reading")]
+async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
+    // The order is the scenario. The `Given` plants an install tree the text
+    // form's `recover_setup_runtime_registration` can re-file the registry
+    // entry from, so running it first would hand the machine-readable form an
+    // `active_runtime_root` it is supposed to have no way to resolve — swap
+    // these two lines and the last `Then` fails. The text form still runs,
+    // second, so the comparison step can hold the two to each other.
+    let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    let (human, _, _) = crate::run_rocm(world, &["examine"]);
+    world.cli_stderr = Some(human);
+    world.cli_output = Some(json);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects the system without probing frameworks")]
 async fn user_inspects_skipping_frameworks(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -430,6 +507,14 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
     // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
     // set `install_root` freely.
     ("active_runtime_root", &["active_runtime_root"]),
+    // Setup's folder, which is a different fact from the active runtime's: it
+    // can name a stale or removed install while another runtime is active, and
+    // it is readable when the registry is not.
+    ("setup_runtime_root", &["setup_runtime_root"]),
+    (
+        "setup_runtime_pip_cache_dir",
+        &["setup_runtime_pip_cache_dir"],
+    ),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -485,7 +570,11 @@ async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
         panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
     };
     // Both forms resolve the active manifest the same way, so a disagreement
-    // means one of the two paths is looking at a different runtime.
+    // means one of the two paths is looking at a different runtime. What this
+    // cannot see: were the registry entry missing, the human run — which goes
+    // first — would re-file it before `--json` ever looked. examine-16 plants
+    // exactly that state and runs the machine-readable form first, so the
+    // divergence stays visible there.
     if let Some(stated) = human_states(human, "active_runtime_root") {
         assert_eq!(
             root, stated,
@@ -564,6 +653,65 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
         "the machine-readable form withholds what the readable one states:\n{}\n\n\
          A caller reading `--json` cannot learn these without scraping text.",
         withheld.join("\n")
+    );
+}
+
+#[then("the machine-readable form names the setup runtime folder")]
+async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
+    let planted = planted_setup_runtime_root(world).display().to_string();
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let value = parsed_json(world);
+    // The folder itself against what the `Given` planted, which is the
+    // correctness half: two forms agreeing on a wrong path would still agree.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_root")
+            .and_then(serde_json::Value::as_str),
+        Some(planted.as_str()),
+        "config names the setup runtime folder and the text form prints it, so a \
+         caller reading `--json` must not have to scrape text for it:\n{value:#}"
+    );
+    // The pip cache against the TEXT form rather than a path built here.
+    // `managed_pip_cache_dir` runs its argument through
+    // `normalize_runtime_path_for_host`, which rewrites separators and the drive
+    // letter on Windows; re-deriving it in the test would re-implement that and
+    // fail on the Windows lane for a product that is behaving. Holding the two
+    // forms to each other is also the fact this ticket is about.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_pip_cache_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        human_states(human, "setup_runtime_pip_cache_dir"),
+        "the pip cache is the text form's sibling fact, derived from the same \
+         folder, so the two forms must not name different ones:\n{value:#}"
+    );
+}
+
+#[then("it does not pass that folder off as the active runtime's")]
+async fn assert_json_keeps_setup_and_active_apart(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    // Without this the scenario would pass on a host where nothing is active at
+    // all, which is not the state the two fields have to stay distinct in.
+    assert!(
+        value
+            .pointer("/summary/active_runtime_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty()),
+        "the planted config names an active runtime key:\n{value:#}"
+    );
+    // Setup's folder is where setup was pointed, which can be a stale or removed
+    // install while a different runtime is active. Answering `active_runtime_root`
+    // with it would mislabel, so the unresolvable root stays null.
+    assert_eq!(
+        value.pointer("/summary/active_runtime_root"),
+        Some(&serde_json::Value::Null),
+        "no registry entry resolves, so the active runtime has no root to name — \
+         reporting setup's folder here would be a different fact under this \
+         label:\n{value:#}"
     );
 }
 
@@ -759,4 +907,109 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
         "examine reported {reported}, but KFD reports gfx_target_version {packed} \
          ({major}.{minor}.{revision} = {expected})\n{output}"
     );
+}
+
+/// The `gfx_target_version` of every GPU the KFD topology describes, read
+/// straight from sysfs.
+///
+/// `None` when the topology is unreadable, which is the normal case off Linux.
+/// CPU nodes report a `gfx_target_version` of `0` and are skipped, so the length
+/// is the kernel's own GPU count and the values say whether those GPUs are all
+/// the same part.
+fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
+        .ok()?
+        .flatten()
+    {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let version = properties.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "gfx_target_version" {
+                return None;
+            }
+            parts.next()?.parse::<u32>().ok()
+        });
+        if let Some(value) = version.filter(|value| *value != 0) {
+            versions.push(value);
+        }
+    }
+    Some(versions)
+}
+
+/// Whether `lspci` is on PATH, which is what supplies the PCI addresses this
+/// step asserts. Without it the CLI's topology fallback is the right answer and
+/// there is nothing here to check.
+fn host_has_lspci() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
+}
+
+#[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
+async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
+    let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
+        return;
+    };
+    if !host_has_lspci() {
+        return;
+    }
+    let expected = versions.len();
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .expect("`examine --json` did not report a gpus array");
+    let amd: Vec<&serde_json::Value> = gpus
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+
+    assert_eq!(
+        amd.len(),
+        expected,
+        "the kernel describes {expected} GPU node(s) but the report lists {} AMD GPU(s): {gpus:#?}",
+        amd.len()
+    );
+    for gpu in &amd {
+        let pci_id = gpu
+            .get("pci_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !pci_id.is_empty(),
+            "an AMD GPU was reported without a PCI address, so it came from the \
+             topology fallback rather than the PCI enumeration: {gpu:#?}"
+        );
+    }
+
+    // The other half of the enumeration: each listed card must also carry the
+    // target the kernel attributes to it. `lspci` cannot supply one -- it reads
+    // a marketing name, and on an Instinct host `pci.ids` often spells that
+    // "Device 74a1" -- so on a box without `rocminfo` the per-node target from
+    // the topology is the only thing that can fill `gfx_target`, and that fill
+    // is what makes the field non-empty here.
+    //
+    // Gated on the topology being uniform, on the same premise-failure footing
+    // as the guards above: where nodes disagree, which target belongs to which
+    // card is a question this step cannot answer from a node count alone, so it
+    // says nothing rather than something it has not established. The other
+    // premise -- node count equal to the number of AMD entries -- is already
+    // guaranteed by the assertion above, which fails first if it does not hold.
+    if versions.iter().any(|version| *version != versions[0]) {
+        return;
+    }
+    for gpu in &amd {
+        let gfx_target = gpu
+            .get("gfx_target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !gfx_target.is_empty(),
+            "the kernel describes {expected} GPU node(s) all of one target, but an AMD GPU was \
+             reported with no gfx_target, so the topology's target never reached the report: \
+             {gpu:#?}"
+        );
+    }
 }

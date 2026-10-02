@@ -68,12 +68,14 @@ Expected result:
 - The launcher opens; choosing "Set up this system" there opens the setup
   screen. It does not open automatically before the main TUI, and the user
   does not need to type `/setup`.
-- The setup shows a recommended ROCm folder.
-- The setup shows `downloads stay inside: <ROCm folder>\pip-cache` so the user
-  can see that pip downloads stay inside the chosen ROCm folder.
-- The install-folder row opens an interactive folder picker. Arrow keys and the
-  mouse can choose folders; Enter opens or selects; Esc returns without losing
-  the current setup screen.
+- On the "Install ROCm SDK (pip)" step's Configure screen, the Folder row reads
+  `(default managed folder · Tab to browse)` until a folder is chosen. `Tab`
+  opens the folder picker; arrow keys choose, Enter opens or selects, Esc
+  returns without losing the Configure screen or an already-chosen folder.
+  Leaving the row unset installs to the default managed folder.
+- On that same screen `←`/`→` toggle Release/Nightly, and `Tab` opens the
+  folder picker rather than toggling the channel — the same Tab-to-browse
+  binding the Install and Serve forms use.
 - The setup asks for approval before installing anything.
 - The setup shows what is being installed and shows progress.
 - Install logs show only in the foreground progress card, with PageUp/PageDown
@@ -218,10 +220,23 @@ rocm services logs <service-id>
 
 Expected result:
 
-- `rocm services` shows only living local servers.
-- `rocm services list --all` shows saved history, including failed or stopped
-  attempts.
+- `rocm services` lists only living local servers, but its `Status:` line
+  counts the whole registry, so a failed or stopped record is counted as
+  `N not running` even though no row for it is shown.
+- When such records exist, `rocm services` ends with a `Past attempts:` block
+  giving their count and three runnable commands: `See them: rocm services list
+  --all`, `Read the newest: rocm services logs <service-id>` (with the id of the
+  newest record that is no longer running) and `Reclaim the space: rocm services
+  prune`. Paste the `Read the newest:` line as-is and confirm it opens the logs
+  for that attempt.
+- On a machine that has never served, `rocm services` prints no `Past attempts:`
+  block at all.
+- `rocm services list --all` shows saved history, including the failed or
+  stopped attempts the default view hides.
 - The logs command shows the exact service failure or startup output.
+- `rocm storage report` lists these records under `local server records` with
+  the folder that holds them; no `rocm storage` command deletes them, and the
+  row's note points at `rocm services prune` to reclaim the space.
 - Stop and restart require explicit approval:
 
 ```powershell

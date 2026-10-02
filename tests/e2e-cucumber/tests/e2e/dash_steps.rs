@@ -21,6 +21,11 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
 const DASH_CLOCK_OFFSET_FILE: &str = "dash-clock-offset-secs";
 
+/// The services overlay's own panel title, drawn by `draw_services_manager` on
+/// the overlay's border row. It is on screen exactly while the overlay is, so
+/// it proves both that the overlay opened and - as an absence - that it closed.
+const SERVICES_OVERLAY_TITLE: &str = "Services — managed inference servers";
+
 /// The Observe instances table's TTFT cell while the scripted mock is serving:
 /// its histogram pins time-to-first-token at exactly 50 ms
 /// (`ttft_sum_s = ticks × 0.050` over `ttft_count = ticks`), and the cell is
@@ -186,6 +191,81 @@ async fn open_observe_view(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to switch to the Observe tab: {e}"));
 }
 
+#[when("the user opens the managed services overlay")]
+async fn open_services_overlay(world: &mut E2eWorld) {
+    // `s` opens the services overlay, but only from the Observe tab, so the
+    // step before this one is load-bearing.
+    //
+    // Sent exactly once, never through `send_until`: once the overlay has focus
+    // the *same* key stages a stop approval for the selected row
+    // (`services_manager::on_key` -> `request_lifecycle`), so a second copy
+    // still queued in the terminal when the title appears would put a stop
+    // modal over the overlay in any scenario whose list is not empty.
+    // `send_until` says so itself - idempotent keys only.
+    //
+    // One send is enough here because the preceding step (`the user opens the
+    // Observe view`) returns only after the dashboard has *acted on* a key, so
+    // the event loop is provably reading by the time this runs. That startup
+    // race is the only thing the retry bought, and it is already closed. Any
+    // future ordering that drops that guarantee has to re-establish it before
+    // this step, not restore the retry.
+    let tui = session(world);
+    tui.send("s")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay key: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open the services overlay: {e}"));
+}
+
+#[then("the overlay reports the record that is no longer running")]
+async fn services_overlay_reports_past_attempts(world: &mut E2eWorld) {
+    // The overlay renders only the live instances the daemon scrapes, so the
+    // failed record left no trace here at all. The count is read from the
+    // registry at launch, so it survives the daemon never having seen it.
+    //
+    // Asserted as the one note line the overlay renders, pointer included: the
+    // count is only useful attached to the command that can show the record,
+    // which the overlay itself cannot. Waiting for the pointer separately would
+    // also pass with it rendered anywhere else on screen, or detached from the
+    // count it belongs to.
+    session(world)
+        .wait_for_screen(
+            "1 local server record(s) are no longer running - see `rocm services list --all`",
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("the overlay never counted the failed record and named how to see it: {e}")
+        });
+}
+
+#[when("the user closes the managed services overlay")]
+async fn close_services_overlay(world: &mut E2eWorld) {
+    // An open overlay eats the quit key - it closes the overlay instead - so a
+    // scenario that opened one has to close it before the quit step, or the
+    // dashboard is still running when that step gives up.
+    //
+    // What proves it closed is the overlay's *own* title going away. A panel
+    // title the overlay was covering proves nothing on its own: which Observe
+    // rows the overlay's rectangle covers depends on that tab's layout - the
+    // no-live-data banner shifts the band down a row - so with live telemetry
+    // such a title moves out from under the overlay and is visible while the
+    // overlay is still up. This step would then return early and the quit key
+    // would be eaten after all. `SERVICES_OVERLAY_TITLE` is drawn by the
+    // overlay itself, so its absence cannot be satisfied while it is open.
+    //
+    // Sent exactly once, for the reason `open_services_overlay` gives: Esc past
+    // the overlay is not idempotent either - on the Observe tab it opens the
+    // launcher menu (`KeyAction::OpenMenu`) - and the event loop has provably
+    // been reading keys since the overlay opened.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to send the services overlay close key: {e}"));
+    tui.wait_until_gone(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to close the services overlay: {e}"));
+}
+
 #[when("the user opens the Chat view")]
 async fn open_chat_view(world: &mut E2eWorld) {
     // Same resend-until-it-takes rationale as `open_observe_view`: nothing
@@ -309,6 +389,69 @@ async fn choose_serving(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to select Serving: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open Serving: {e}"));
+}
+
+#[when("the user opens onboarding setup")]
+async fn open_onboarding_setup(world: &mut E2eWorld) {
+    // `n` opens the onboarding wizard from the Observe tab
+    // (`KeyAction::OpenOnboarding`). Same resend-until-it-takes rationale as
+    // `open_observe_view`: nothing before this proves the event loop is
+    // reading input yet. The wizard's panel title is step-independent, so it
+    // is a safe marker regardless of which step renders first.
+    session(world)
+        .send_until("n", "Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("failed to open onboarding setup: {e}"));
+}
+
+#[when("the user continues past the onboarding welcome screen")]
+async fn continue_past_onboarding_welcome(world: &mut E2eWorld) {
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to continue past the welcome screen: {e}"));
+}
+
+#[when("the user chooses to install the ROCm SDK")]
+async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
+    // "Install ROCm SDK (pip)" is the choose-menu's default (first) entry, so
+    // confirming needs no prior navigation keys.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
+}
+
+#[when("the user browses for an install folder")]
+async fn browse_for_install_folder(world: &mut E2eWorld) {
+    session(world)
+        .send("\t")
+        .unwrap_or_else(|e| panic!("failed to open the install-folder browser: {e}"));
+}
+
+#[when("the user chooses the current folder")]
+async fn choose_current_folder(world: &mut E2eWorld) {
+    // "[ use this folder ]" is the browser's first, already-selected entry.
+    session(world)
+        .send("\r")
+        .unwrap_or_else(|e| panic!("failed to choose the current folder: {e}"));
+}
+
+#[when("the user closes onboarding setup")]
+async fn close_onboarding_setup(world: &mut E2eWorld) {
+    // Two `Esc`: the first backs Configure out to Choose, the second closes
+    // the wizard entirely — it owns every key while open (see
+    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
+    // until it is gone.
+    let tui = session(world);
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to leave Configure: {e}"));
+    tui.wait_until_gone("Tab browse folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("Configure sub-view did not close: {e}"));
+    tui.send("\u{1b}")
+        .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
+    tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("onboarding wizard did not close: {e}"));
 }
 
 #[when("the user accepts the local endpoint")]
@@ -928,6 +1071,53 @@ async fn serving_actions_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Serving actions", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("Serving actions did not appear: {e}"));
+}
+
+#[then("the onboarding welcome screen is displayed")]
+async fn onboarding_welcome_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Let's get ROCm set up on this machine.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding welcome screen did not appear: {e}"));
+}
+
+#[then("the onboarding setup choices are displayed")]
+async fn onboarding_choices_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Install ROCm SDK (pip)", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the onboarding setup choices did not appear: {e}"));
+}
+
+#[then("the SDK Configure step is displayed")]
+async fn sdk_configure_step_displayed(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_for_screen("default managed folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the SDK Configure step did not appear: {e}"));
+}
+
+#[then("the install-folder browser is displayed")]
+async fn install_folder_browser_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Pick an install folder", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
+}
+
+#[then("the Configure step shows the chosen folder instead of the placeholder")]
+async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "the Folder row shows a chosen path rather than the unset placeholder",
+            |screen| {
+                screen.contains("Folder:")
+                    && !screen.contains("default managed folder · Tab to browse")
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
 }
 
 #[then("the managed model is displayed")]

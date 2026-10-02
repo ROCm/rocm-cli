@@ -146,6 +146,20 @@ impl InstallManagerState {
             "--format".to_string(),
             FORMATS[self.format_idx.min(FORMATS.len() - 1)].to_string(),
         ];
+        // The crate's rule is "byte-exact where the folder browser is the only
+        // writer; trimmed where a human types". This field is both — the
+        // browser fills it, and `type_char` lets it be edited — so it is
+        // trimmed, like `channel` above and like every other typed field in
+        // this form. `onboarding::build_install_args` is the other side of that
+        // rule: nothing but the browser can write its prefix, so it stays exact.
+        //
+        // The tradeoff is deliberate and worth stating, because it is a real
+        // loss: a directory whose name genuinely ends in whitespace (legal on
+        // Linux) and is picked through the browser will be staged trimmed, and
+        // the install goes elsewhere. That is accepted here because the same
+        // whitespace is far more often a typo or a paste artefact on a field a
+        // user types into, and silently installing to a path with an invisible
+        // trailing space is the worse of the two failures.
         let prefix = self.prefix.trim();
         if !prefix.is_empty() {
             args.push("--prefix".to_string());
@@ -378,14 +392,20 @@ fn field_line<'a>(
     theme: &Theme,
 ) -> Line<'a> {
     let (label, value): (&str, String) = match field {
-        Field::Channel => ("Channel", display(&i.channel, "(e.g. release)")),
+        Field::Channel => (
+            "Channel",
+            crate::ui::format::display_or_placeholder(&i.channel, "(e.g. release)"),
+        ),
         Field::Format => (
             "Format",
             FORMATS[i.format_idx.min(FORMATS.len() - 1)].to_string(),
         ),
         Field::Prefix => (
             "Folder",
-            display(&i.prefix, "(default managed folder · Tab to browse)"),
+            crate::ui::format::display_or_placeholder(
+                &i.prefix,
+                "(default managed folder · Tab to browse)",
+            ),
         ),
         Field::DryRun => (
             "Mode",
@@ -433,14 +453,6 @@ fn field_line<'a>(
         Span::styled(format!("{label:<8}"), label_style),
         Span::styled(value, value_style),
     ])
-}
-
-fn display(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
-        placeholder.to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -506,6 +518,70 @@ mod tests {
             ..Default::default()
         };
         assert!(i.build_args().unwrap_err().contains("channel"));
+    }
+
+    #[test]
+    fn prefix_is_trimmed_before_staging() {
+        let i = InstallManagerState {
+            prefix: "  /opt/rocm-sdk ".into(),
+            ..Default::default()
+        };
+        let args = i.build_args().unwrap();
+        let idx = args.iter().position(|a| a == "--prefix").unwrap();
+        assert_eq!(
+            args[idx + 1],
+            "/opt/rocm-sdk",
+            "this prefix is typed as well as browser-filled, so surrounding \
+             whitespace is treated as a typo — unlike onboarding's prefix, \
+             which the folder browser is the only writer of"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_prefix_stages_no_prefix_flag() {
+        let i = InstallManagerState {
+            prefix: "   ".into(),
+            ..Default::default()
+        };
+        let args = i.build_args().unwrap();
+        assert!(
+            !args.iter().any(|a| a == "--prefix"),
+            "a blank prefix means 'default managed folder', which the Folder \
+             row already renders as its placeholder"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_channel_and_prefix_render_placeholders() {
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let i = InstallManagerState {
+            channel: "   ".into(),
+            prefix: "   ".into(),
+            ..Default::default()
+        };
+        let jobs = State::default();
+        term.draw(|f| draw_install_manager(f, f.area(), &i, &jobs, &theme))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("(e.g. release)"),
+            "a whitespace-only channel must render the placeholder, not the literal spaces: {out:?}"
+        );
+        assert!(
+            out.contains("default managed folder"),
+            "a whitespace-only prefix must render the placeholder, not the literal spaces: {out:?}"
+        );
     }
 
     #[test]

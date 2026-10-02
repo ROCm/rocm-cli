@@ -290,3 +290,27 @@ Feature: Interactive dashboard
     And the instance detail body shows a scrollbar
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #75/#441: the Configure step's Folder row (`Tab` opens the shared
+  # FolderBrowser) is a unit/snapshot-tested render, but nothing before this
+  # drove it through the real crossterm event loop. The final Then is not a
+  # restatement of "the browser opened" — that only proves the popup rendered,
+  # not that confirming a folder actually changes what Configure stages, which
+  # is the behaviour #75 restores.
+  @id:dash-onboarding-configure-folder-browse @requires-os:linux
+  Scenario: dash-23 - The onboarding Configure step opens the install-folder browser
+    When the user opens the dashboard with demo data
+    And the user opens the Observe view
+    And the user opens onboarding setup
+    Then the onboarding welcome screen is displayed
+    When the user continues past the onboarding welcome screen
+    Then the onboarding setup choices are displayed
+    When the user chooses to install the ROCm SDK
+    Then the SDK Configure step is displayed
+    When the user browses for an install folder
+    Then the install-folder browser is displayed
+    When the user chooses the current folder
+    Then the Configure step shows the chosen folder instead of the placeholder
+    When the user closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully
