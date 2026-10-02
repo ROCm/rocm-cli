@@ -58,7 +58,11 @@ use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 ///   `parse_version_for_ordering` branch nothing else here reaches.
 /// * `7.2.4.70204` — a four-component release, the shape ROCm's own packages
 ///   are named with.
-/// * `7.0.0-rc1` — a PEP 440 pre-release spelled with the `-` separator.
+/// * `7.0.0-rc1` / `v7.0.0` — PEP 440 spellings of versions already in this
+///   list. Every pair of spellings is one version but two strings, which is
+///   the distinction the comparator and the "is there a newer build?" callers
+///   have to draw differently: the comparator must keep them apart so `sort` is
+///   deterministic, while an update verdict must call them the same build.
 /// * `custom-build` / `latest` — not versions at all. A manifest adopted from
 ///   an existing environment carries whatever its `rocm_sdk` probe reported, so
 ///   the comparator's unreadable arms are reachable in production and have to
@@ -85,6 +89,7 @@ const VERSIONS: &[&str] = &[
     "7.10.0",
     "7.2.4.70204",
     "7.0.0-rc1",
+    "v7.0.0",
     "custom-build",
     "latest",
 ];
@@ -422,7 +427,17 @@ proptest! {
                  update (a downgrade)",
                 installed, latest
             ),
-            Ordering::Equal => {}
+            // Two spellings of one version are one version. With no required
+            // composition there is nothing to repair, so the only honest
+            // verdict is "up to date" — offering an update here would have the
+            // CLI re-download a multi-gigabyte runtime it already has.
+            Ordering::Equal => prop_assert_eq!(
+                verdict,
+                RuntimeFreshness::UpToDate,
+                "installed {} and index {} are the same version, but the CLI \
+                 reports {:?}",
+                installed, latest, verdict
+            ),
         }
     }
 }
@@ -733,6 +748,67 @@ fn compare_version_strings_is_a_total_order_over_the_alphabet() {
             .collect();
         rotated.sort_by(|left, right| compare_version_strings(left, right));
         assert_eq!(rotated, baseline, "rotation by {shift} sorted differently");
+    }
+}
+
+/// An update verdict asks "is there a newer build?", which is a question about
+/// versions, not about strings.
+///
+/// The comparator's last tiebreak is the raw string, so two spellings of one
+/// version sort apart — deliberately, because `sort` needs every distinct
+/// string to have a distinct place. Inheriting that tiebreak for the update
+/// decision turns a spelling difference into an update offer, and applying it
+/// re-downloads a multi-gigabyte runtime the machine already has.
+///
+/// This is reachable precisely because the parser was widened to accept these
+/// spellings: PyPI normalises versions, so an index can serve `7.0.0rc1` while
+/// an older manifest recorded the `7.0.0-rc1` it was installed from.
+#[test]
+fn runtime_freshness_treats_equal_spellings_as_one_version() {
+    let at = |version: &str| {
+        manifest(
+            "therock-release-wheel-gfx120X-all-runtime".to_owned(),
+            "release".to_owned(),
+            "wheel".to_owned(),
+            "gfx120X-all".to_owned(),
+            version.to_owned(),
+            false,
+            1_000,
+        )
+    };
+
+    for (installed, latest) in [
+        ("7.0.0-rc1", "7.0.0rc1"),
+        ("7.0.0_rc1", "7.0.0rc1"),
+        ("7.0.0RC1", "7.0.0rc1"),
+        ("v7.0.0", "7.0.0"),
+        ("7.0.0rc", "7.0.0rc0"),
+        ("7.9", "7.9.0"),
+        ("7.2.4.0", "7.2.4"),
+        ("7.0.0alpha1", "7.0.0a1"),
+    ] {
+        let runtime = at(installed);
+        assert_eq!(
+            runtime_freshness(&runtime, latest, None, &runtime.runtime_key),
+            RuntimeFreshness::UpToDate,
+            "installed {installed} and index {latest} are one version"
+        );
+        // ...and the same both ways round, so no spelling is privileged.
+        let reversed = at(latest);
+        assert_eq!(
+            runtime_freshness(&reversed, installed, None, &reversed.runtime_key),
+            RuntimeFreshness::UpToDate,
+            "installed {latest} and index {installed} are one version"
+        );
+
+        // The comparator still separates them: that is what `sort` needs, and
+        // keeping both behaviours pinned together is the point of this test.
+        assert_ne!(
+            compare_version_strings(installed, latest),
+            Ordering::Equal,
+            "the comparator must still order {installed} and {latest} \
+             deterministically"
+        );
     }
 }
 
