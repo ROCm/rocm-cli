@@ -80,7 +80,9 @@ The guard accepts `ScopedTestEnv` or **any** static named `*_TEST_LOCK` taken
 inside the test body. The suffix is the rule, so a new lock
 is recognised the day it is declared rather than when someone remembers to add
 it to a list. The exemption is per test function, not per file: one test taking
-a lock does not cover its neighbours.
+a lock does not cover its neighbours. "Taken" means acquired: a `*_TEST_LOCK`
+counts only with a `.lock(` in the same statement, so `let _x = &SOME_TEST_LOCK;`
+names a lock without holding it and does not satisfy the guard.
 
 Two things the shape above gets right, both of which the guard checks only
 partly:
