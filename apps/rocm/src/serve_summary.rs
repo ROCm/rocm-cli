@@ -53,7 +53,9 @@ pub(crate) struct DeploymentSummary {
     /// Full chat-completions endpoint, e.g. `http://127.0.0.1:1337/v1/chat/completions`.
     pub chat_endpoint: String,
     pub service_id: String,
-    /// `"ready"`, `"starting"`, or an existing service's status.
+    /// `"ready"`, `"running"` (lists the model, cannot serve yet), `"starting"`,
+    /// `"failed"` (the engine exited during startup), or an existing service's
+    /// status.
     pub status: String,
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
@@ -94,14 +96,17 @@ pub(crate) fn format_tps(tps: Option<f64>) -> String {
 /// printed so it is unit-testable and identical across engines).
 pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
     // The server answered its health check within the startup window. A launch
-    // that timed out lands here with `status == "starting"`; the heading and a
-    // note must make that visibly different from a healthy deployment so the
-    // summary is never mistaken for success.
+    // that timed out lands here with `status == "starting"`, and one whose engine
+    // exited with `status == "failed"`; the heading and a note must make both
+    // visibly different from a healthy deployment so the summary is never
+    // mistaken for success, and a failed launch is never read as "wait longer".
     let ready = summary.status == "ready";
     let heading = if summary.already_running {
         "Deployment summary (already running)"
     } else if ready {
         "Deployment summary"
+    } else if summary.status == "failed" {
+        "Deployment summary (failed)"
     } else {
         "Deployment summary (not ready yet)"
     };
@@ -284,29 +289,22 @@ mod tests {
     }
 
     /// A launch whose engine died must not be described as "may still be
-    /// loading" — the wait ended because the server is gone, not because it is
-    /// slow, and the next action is reading the engine error.
+    /// loading" or "not ready yet" — the wait ended because the server is gone,
+    /// not because it is slow, and the next action is reading the engine error.
     #[test]
-    fn failed_launch_note_points_at_the_engine_error() {
+    fn failed_launch_points_at_the_engine_error() {
         let summary = DeploymentSummary {
             status: "failed".to_owned(),
             ..base_summary()
         };
         let rendered = render_summary(&summary);
+        assert!(
+            rendered.starts_with("Deployment summary (failed)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("exited during startup"), "{rendered}");
+        assert!(!rendered.contains("not ready yet"), "{rendered}");
         assert!(!rendered.contains("may still be loading"), "{rendered}");
-    }
-
-    /// A launch that merely ran out of wait keeps the "give it more time" wording.
-    #[test]
-    fn starting_launch_note_says_it_may_still_be_loading() {
-        let summary = DeploymentSummary {
-            status: "starting".to_owned(),
-            ..base_summary()
-        };
-        let rendered = render_summary(&summary);
-        assert!(rendered.contains("may still be loading"), "{rendered}");
-        assert!(!rendered.contains("exited during startup"), "{rendered}");
     }
 
     #[test]
