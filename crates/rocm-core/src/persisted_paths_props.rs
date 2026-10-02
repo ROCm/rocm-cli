@@ -7,11 +7,12 @@
 //!
 //! `RocmCliConfig::load` fails loudly on a file it cannot parse.
 //! `AppPaths::discover` reads the same file a second way, through
-//! `configured_managed_root_from_config`, which turns any read or parse error
-//! into "no managed root" — and that one field decides where the runtime
-//! registry, the active-runtime marker and the service records live. So a
-//! config that one reader calls corrupt, the other calls "absent", and the
-//! data dir moves to the default with no message.
+//! `configured_managed_root_from_config`, for the one field that decides where
+//! the runtime registry, the active-runtime marker and the service records
+//! live. It used to turn any read or parse error into "no managed root", so a
+//! config one reader called corrupt the other called "absent", and the data
+//! dir moved to the default with no message. Discovery must now either fail
+//! or still find the recorded root.
 //!
 //! No environment is read or written: `discover_from_paths` is the env-free
 //! core of `discover`.
@@ -41,7 +42,6 @@ fn fresh_paths() -> (PathBuf, AppPaths) {
 }
 
 #[test]
-#[ignore = "CONFIRMED BUG: a truncated config.json silently moves data_dir back to the default"]
 fn data_dir_never_silently_relocates_when_config_is_unreadable() {
     let total = AtomicUsize::new(0);
     let unreadable = AtomicUsize::new(0);
@@ -58,7 +58,7 @@ fn data_dir_never_silently_relocates_when_config_is_unreadable() {
         config.setup.therock_venv = Some(managed_root.clone());
         config.active_runtime_key = Some("therock-release-gfx1151-7.13.0".to_owned());
         config.save(&paths).unwrap();
-        let healthy = AppPaths::discover_from_paths(paths.clone(), false, false);
+        let healthy = AppPaths::discover_from_paths(paths.clone(), false, false).unwrap();
         prop_assert_eq!(&healthy.data_dir, &managed_root);
 
         // An interrupted `RocmCliConfig::save` (a plain `fs::write`).
@@ -71,12 +71,16 @@ fn data_dir_never_silently_relocates_when_config_is_unreadable() {
             return Ok(());
         }
         unreadable.fetch_add(1, Ordering::Relaxed);
-        prop_assert_eq!(
-            &discovered.data_dir,
-            &managed_root,
-            "config.json is unreadable to RocmCliConfig::load, yet AppPaths::discover \
-             silently moved data_dir (registry, marker, services) to the default"
-        );
+        // Failing is the agreement with `load`; a data dir is only acceptable
+        // if it is still the recorded one.
+        if let Ok(discovered) = discovered {
+            prop_assert_eq!(
+                &discovered.data_dir,
+                &managed_root,
+                "config.json is unreadable to RocmCliConfig::load, yet AppPaths::discover \
+                 silently moved data_dir (registry, marker, services) to the default"
+            );
+        }
         Ok(())
     });
     eprintln!(
