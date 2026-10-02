@@ -267,6 +267,9 @@ impl TuiSession {
         for (key, value) in std::env::vars_os() {
             cmd.env(key, value);
         }
+        for key in world.isolate_env_removals() {
+            cmd.env_remove(key);
+        }
         for (key, value) in world.isolate_env().into_iter().chain(world.pty_env()) {
             cmd.env(key, value);
         }

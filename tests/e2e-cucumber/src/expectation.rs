@@ -85,9 +85,9 @@ fn docker_available() -> bool {
 /// `simulated` (the default) is the per-PR shape: a scenario that needs a GPU
 /// describes the host it wants itself, by planting a simulated one, so it runs
 /// identically on a GitHub-hosted runner and on a GPU box. Scenarios whose
-/// premise cannot be simulated — a model actually generating tokens on a
-/// device — are tagged `@requires-real-gpu` and only run when a lane on real
-/// hardware opts in with `E2E_HARDWARE=real`.
+/// premise cannot be simulated — a model generating tokens on a device, a
+/// runtime really installed for it — are tagged `@requires-real-gpu` and only
+/// run when a lane on real hardware opts in with `E2E_HARDWARE=real`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HardwareMode {
     #[default]
@@ -129,8 +129,9 @@ pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
     /// `@requires-real-gpu`: the scenario needs a physical AMD GPU, not a
-    /// simulated host — it serves a model, or checks the simulation against the
-    /// real kernel. Implies `@requires-gpu`, and additionally skips unless the
+    /// simulated host — it serves a model on it, installs a runtime for it,
+    /// inspects the real machine, or checks the simulation against the real
+    /// kernel. Implies `@requires-gpu`, and additionally skips unless the
     /// run opted into real hardware with `E2E_HARDWARE=real` (see
     /// [`HardwareMode`]).
     pub requires_real_gpu: bool,
@@ -926,7 +927,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -942,7 +942,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -960,7 +959,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -989,7 +987,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1005,7 +1002,6 @@ serve_timeout_secs = 90
                     lifecycle: true,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1022,7 +1018,6 @@ serve_timeout_secs = 90
                     lifecycle: true,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1084,7 +1079,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1100,7 +1094,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: true,
-
                     ..Included::default()
                 }
             ),
@@ -1118,7 +1111,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1135,7 +1127,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: true,
-
                     ..Included::default()
                 }
             ),
@@ -1172,7 +1163,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1189,7 +1179,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1206,7 +1195,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1228,7 +1216,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1303,46 +1290,59 @@ serve_timeout_secs = 90
             .collect()
     }
 
-    /// The gate is only worth anything if the scenario in the file actually
-    /// carries it, so resolve the REAL tag line rather than a hand-written copy:
-    /// dropping `@requires-multi-gpu` from the feature file has to fail a test,
-    /// not silently restore the single-GPU failure this was added to fix.
-    ///
-    /// The sibling `serve-19` is asserted in the same breath to stay UNGATED: its
-    /// `HIP_VISIBLE_DEVICES=0` mask names a device every GPU host has, so its
-    /// visible set resolves on one GPU and the refusal holds there. Gating it too
-    /// would retire live coverage on the Strix lanes for no reason.
+    /// The scenario body of a real `.feature` file, by `@id:` slug: the lines
+    /// after its tag line, up to the next tag line.
+    fn feature_body(feature_text: &'static str, id: &str) -> String {
+        let mut lines = feature_text.lines().map(str::trim);
+        lines
+            .by_ref()
+            .find(|line| {
+                line.starts_with('@')
+                    && line
+                        .split_whitespace()
+                        .any(|tag| tag == format!("@id:{id}").as_str())
+            })
+            .unwrap_or_else(|| panic!("no tag line for @id:{id}"));
+        // The scenario's own lines end where the next one's comment or tags
+        // begin, so its neighbour's commentary is never read as its steps.
+        lines
+            .take_while(|line| !line.starts_with('@') && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
+    /// names a device that is not there and the refusal stops following from the
+    /// mask (see the scenario's comment). It used to hold that premise with
+    /// `@requires-multi-gpu`, which left it running only on multi-GPU lanes. It
+    /// now plants a simulated two-GPU machine instead, so the premise holds on
+    /// every Linux lane. Read from the REAL feature file, so dropping the second
+    /// simulated GPU fails here rather than quietly reinstating the single-GPU
+    /// failure the gate was added for. Its sibling serve-19 is held the same way.
     #[test]
-    fn the_rocr_reindexed_scenario_is_gated_on_multi_gpu_and_its_sibling_is_not() {
+    fn the_rocr_reindexed_scenarios_plant_their_own_second_gpu() {
         let feature = include_str!("../features/model_serving.feature");
         let m = Expectations::default();
-
-        let rocr = ScenarioDecl::from_tags(&feature_tags(
-            feature,
+        for id in [
             "serve-rocr-reindexed-gpu-index-rejected",
-        ));
-        assert!(rocr.requires_multi_gpu, "serve-20 must carry the gate");
-        assert!(matches!(
-            resolve(&rocr, &cap("strix-ubuntu"), &m, Included::default()),
-            Expectation::Skip { .. }
-        ));
-        assert_eq!(
-            resolve(&rocr, &cap("mi300x"), &m, Included::default()),
-            Expectation::ExpectPass
-        );
-
-        let masked =
-            ScenarioDecl::from_tags(&feature_tags(feature, "serve-masked-gpu-index-rejected"));
-        assert!(
-            !masked.requires_multi_gpu,
-            "serve-19 holds on a single GPU and must keep running there"
-        );
-        for host in ["strix-ubuntu", "mi300x"] {
-            assert_eq!(
-                resolve(&masked, &cap(host), &m, Included::default()),
-                Expectation::ExpectPass,
-                "{host} must still run serve-19"
+            "serve-masked-gpu-index-rejected",
+        ] {
+            assert!(
+                feature_body(feature, id).contains("Given a machine with two AMD Instinct GPUs"),
+                "{id} must describe a two-GPU machine"
             );
+            let decl = ScenarioDecl::from_tags(&feature_tags(feature, id));
+            assert!(
+                !decl.requires_gpu && !decl.requires_multi_gpu,
+                "{id} brings its own GPUs, so it must not wait for a lane that has them"
+            );
+            for host in ["strix-ubuntu", "mi300x", "wsl2"] {
+                assert_eq!(
+                    resolve(&decl, &cap(host), &m, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} must run on {host}"
+                );
+            }
         }
     }
 
@@ -1379,7 +1379,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1396,7 +1395,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1412,7 +1410,6 @@ serve_timeout_secs = 90
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1435,7 +1432,6 @@ serve_timeout_secs = 90
                         lifecycle: false,
                         docker: false,
                         merge_queue: false,
-
                         ..Included::default()
                     }
                 ),
@@ -1455,7 +1451,6 @@ serve_timeout_secs = 90
                         lifecycle: false,
                         docker: false,
                         merge_queue: false,
-
                         ..Included::default()
                     }
                 ),
@@ -1521,7 +1516,6 @@ serve_timeout_secs = 90
                         lifecycle: false,
                         docker: false,
                         merge_queue: false,
-
                         ..Included::default()
                     }
                 ),
@@ -1539,7 +1533,6 @@ serve_timeout_secs = 90
                         lifecycle: false,
                         docker: false,
                         merge_queue: false,
-
                         ..Included::default()
                     }
                 ),
@@ -1665,7 +1658,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1698,7 +1690,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1726,7 +1717,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1743,7 +1733,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1769,7 +1758,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1785,7 +1773,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1801,7 +1788,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1823,7 +1809,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1839,7 +1824,6 @@ reason = "unrelated open bug"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1870,7 +1854,6 @@ reason = "short-name not surfaced"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1886,7 +1869,6 @@ reason = "short-name not surfaced"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1921,7 +1903,6 @@ reason = "lemonade vulkan fallback"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),
@@ -1938,7 +1919,6 @@ reason = "lemonade vulkan fallback"
                     lifecycle: false,
                     docker: false,
                     merge_queue: false,
-
                     ..Included::default()
                 }
             ),

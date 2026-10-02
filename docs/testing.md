@@ -310,8 +310,9 @@ The cucumber suite runs in one of two hardware modes, chosen by
   one, so it behaves the same on a laptop, a GitHub-hosted runner and a GPU box.
 - `real` — set by the self-hosted GPU lanes. Scenarios tagged
   `@requires-real-gpu`, whose premise a simulated host cannot provide (a model
-  actually generating tokens on a device), run only here, and still only on a
-  host with a usable AMD GPU.
+  generating tokens on a device, a runtime really installed for it, the real
+  machine's own detection), run only here, and still only on a host with a
+  usable AMD GPU.
 
 Any other value aborts the run, so a misspelt `real` cannot silently skip the
 real-GPU scenarios. To run them locally on a GPU host:
@@ -320,10 +321,46 @@ real-GPU scenarios. To run them locally on a GPU host:
 E2E_HARDWARE=real cargo xtask e2e
 ```
 
-The simulated host is a directory the scenario populates and hands to the
-binary in `ROCM_CLI_TEST_HOST_ROOT`; the hardware probes read it in place of
-`/`. Only an `e2e-test-hooks` build (which `cargo xtask e2e` produces) honours
-it — see `docs/release-trust.md`.
+A scenario describes its machine with a Given step — `a machine with an AMD
+Instinct GPU`, `a machine with eight AMD Instinct GPUs`, `a bare-metal Linux
+machine with an AMD GPU`, `a WSL machine with an AMD GPU passed through`, `a
+Linux machine with no AMD GPU` (see
+[simulated_host_steps.rs](../tests/e2e-cucumber/tests/e2e/simulated_host_steps.rs)).
+The step writes a directory laid out as the kernel lays out `/dev`, `/sys` and
+`/proc` ([simulated_host.rs](../tests/e2e-cucumber/src/simulated_host.rs)) and
+hands it to the binary in `ROCM_CLI_TEST_HOST_ROOT`, which the hardware probes
+read in place of `/`. Only an `e2e-test-hooks` build (which `cargo xtask e2e`
+produces) honours it — see [release-trust.md](release-trust.md).
+
+The programs the CLI asks about the machine — `uname`, `lsmod`, `modinfo`,
+`ldconfig`, `lspci`, `rocminfo`, `rocm_agent_enumerator`, `amd-smi`, `mpirun`,
+the kernel log, and on WSL `powershell.exe` — are taken off the real `PATH`.
+The ones the simulated machine has come back as the `fake-host-tool` stand-in,
+answering from canned output stored in the same directory; the ones it lacks
+are simply absent. The runner's own GPU scoping (`HIP_VISIBLE_DEVICES`,
+`ROCR_VISIBLE_DEVICES`, `ROCM_PATH`, ...) is unset and `HOME` points into the
+scenario, so a GPU runner's GPUs, hardware tools and installs cannot answer
+for the simulated machine. A `serve` on it reaches the `fake-vllm` stand-in
+planted as the managed runtime's `vllm`. Container detection reads its markers
+(`/.dockerenv`, `/run/.containerenv`, `/proc/1/cgroup`) under the same root, so a
+simulated machine is never in a container.
+
+What is not simulated: package-manager state (the ROCm repositories,
+`dpkg`/`rpm`) and discovered ROCm installs, which the CLI prints and acts on;
+and the identity of the user running the suite. The CLI still reads `$USER`, runs
+the real `id -Gn` for the user's groups, and runs the real `stat` on the planted
+device nodes, which are plain files owned by that user, so group membership
+(`render`, `video`) and device access describe the runner, not the simulated
+machine. No simulated scenario asserts on any of these. Simulated scenarios
+carry `@requires-os:linux`: the Windows lane probes the registry, not a
+filesystem.
+
+A scenario on a simulated machine proves the CLI reads that machine correctly,
+not that the real kernel still looks like it. Detection on the machine the
+suite runs on is kept by `@requires-real-gpu` scenarios such as
+`@id:examine-detects-this-machines-gpu-and-driver`, which repeats
+`@id:examine-detects-gpu-and-driver`'s assertions against a real GPU host on
+every GPU lane, the Windows one included.
 
 ## CI test selection
 

@@ -1271,13 +1271,13 @@ jobs:
 
       # NO librocdxg provisioning step here, deliberately — see the same note
       # in e2e-wsl (e2e-selfhosted.yml): installing ROCDXG is the CLI's own job
-      # now, and a lane that pre-installed it would hand the @requires-wsl
-      # driver scenarios a host already in the state they exist to reach.
+      # now, and a lane that pre-installed it would put the real-WSL scenarios
+      # on a host already in the state that command exists to reach.
 
       # GPU preflight, bounded like the native lanes — but ADVISORY here. GPU
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
-      # then resolves @requires-gpu scenarios to skip and the rest still runs. A
+      # then resolves the real-GPU scenarios to skip and the rest still runs. A
       # GPU that IS present but stays held fails the job, since that would
       # corrupt the serve scenarios' results.
       #

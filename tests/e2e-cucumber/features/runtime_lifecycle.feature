@@ -147,7 +147,7 @@ Feature: Runtime lifecycle state machine
   # scenario's job is the user-visible half: rc=0, the report's counts, and a
   # server that answers afterwards.
   #
-  # Why @requires-gpu: `restart_internal_managed_service` stops the engine process
+  # Why @requires-real-gpu: `restart_internal_managed_service` stops the engine process
   # and waits up to 45 s on a real HTTP readiness probe before returning, so no
   # mock engine or substitution hook exists that could satisfy it on the mock lane.
   # This scenario therefore only runs on the self-hosted GPU lanes defined in
@@ -158,8 +158,8 @@ Feature: Runtime lifecycle state machine
   # manages its own runtime, so `classify_service_runtime_state` exempts it by
   # design and it is never stale — on a lemonade-default host the report would
   # correctly say `services_on_previous_runtime: 0` and asserting a restart there
-  # would be a guaranteed false failure. Same reasoning as `serve-11`.
-  @id:runtime-lifecycle-activate-restart-services-succeeds @requires-gpu @requires-engine:vllm
+  # would be a guaranteed false failure.
+  @id:runtime-lifecycle-activate-restart-services-succeeds @requires-real-gpu @requires-engine:vllm
   Scenario: runtime-lifecycle-12 - Activating with --restart-services --yes stops and respawns the running server
     Given a managed runtime is active
     And a model is being served on GPU
