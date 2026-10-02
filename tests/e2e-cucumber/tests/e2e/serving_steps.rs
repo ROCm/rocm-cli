@@ -167,6 +167,9 @@ async fn serve_and_wait(world: &mut E2eWorld, args: &[&str], model: &str, ready_
 /// the job times out.
 const SERVE_PORT: u16 = 11435;
 
+const FAILING_VLLM_MODEL: &str = "e2e/vllm-startup-exit";
+const FAKE_VLLM_ERROR: &str = "e2e fake vLLM: startup failed";
+
 /// The port the CLI's built-in local assistant (lemonade Qwen3-4B) listens on.
 /// The CLI auto-starts this assistant independently of any scenario; on Instinct
 /// it falls back to a Vulkan llama-server that pins a GPU core (EAI-7052),
@@ -706,6 +709,38 @@ async fn setup_failed_local_server(world: &mut E2eWorld) {
     });
 }
 
+#[given("a vLLM server will exit during startup")]
+async fn setup_vllm_startup_exit(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let script = root.path().join("fake-vllm-exit.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nsleep 3\nprintf '%s\\n' '{FAKE_VLLM_ERROR}' >&2\nexit 1\n"
+        ),
+    )
+    .unwrap_or_else(|e| panic!("failed to write {}: {e}", script.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("failed to mark {} executable: {e}", script.display()));
+    }
+    assert!(
+        script.is_absolute(),
+        "ROCM_CLI_VLLM_COMMAND requires an absolute path: {}",
+        script.display()
+    );
+    world
+        .command_env
+        .push(("ROCM_CLI_VLLM_COMMAND", script.into_os_string()));
+    // Keep the engine budget longer than the assertion below: only the terminal
+    // state written after the fake exits should end this launch promptly.
+    world
+        .command_env
+        .push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", "60".into()));
+}
+
 #[given("the served model has been detected")]
 async fn setup_model_detected(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
@@ -1004,6 +1039,37 @@ async fn user_serves_with_rocr_hiding_hip_named_gpus(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user launches it as a managed model server")]
+async fn user_launches_failing_vllm_server(world: &mut E2eWorld) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("failed to reserve an OS-assigned serve port");
+    let port = listener
+        .local_addr()
+        .expect("reserved listener has no local address")
+        .port()
+        .to_string();
+    drop(listener);
+
+    let started = Instant::now();
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            FAILING_VLLM_MODEL,
+            "--engine",
+            "vllm",
+            "--managed",
+            "--port",
+            &port,
+        ],
+    );
+    world.cli_elapsed = Some(started.elapsed());
+    world.model_name = Some(FAILING_VLLM_MODEL.to_owned());
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the user is told to allow public binding first")]
 async fn assert_public_bind_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1101,6 +1167,48 @@ fn serve_output(world: &E2eWorld) -> String {
         world.cli_output.as_deref().unwrap_or(""),
         world.cli_stderr.as_deref().unwrap_or("")
     )
+}
+
+#[then("the managed launch is reported as failed")]
+async fn assert_managed_launch_failed(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        output
+            .lines()
+            .any(|line| line.trim() == "readiness: failed"),
+        "expected a failed readiness verdict, got:\n{output}"
+    );
+    assert!(
+        !output.contains("readiness: starting")
+            && !output.contains("not ready")
+            && !output.contains("may still be loading"),
+        "a terminal launch must not be described as still loading:\n{output}"
+    );
+}
+
+#[then("the failed launch returns promptly")]
+async fn assert_failed_launch_returns_promptly(world: &mut E2eWorld) {
+    let elapsed = world.cli_elapsed.expect("managed launch was not timed");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "failed launch took {:.1}s, so it did not stop on the terminal engine state:\n{}",
+        elapsed.as_secs_f64(),
+        serve_output(world)
+    );
+}
+
+#[then("the service state reports the launch as failed")]
+async fn assert_failed_launch_service_state(world: &mut E2eWorld) {
+    let listed = crate::run_rocm_ok(world, &["services", "list", "--all"]);
+    let expected_model = format!("  model: {FAILING_VLLM_MODEL}");
+    let failed_record = listed.split("\n- ").any(|record| {
+        record.lines().any(|line| line == expected_model)
+            && record.lines().any(|line| line == "  status: failed")
+    });
+    assert!(
+        failed_record,
+        "expected the failed launch and service record to agree:\n{listed}"
+    );
 }
 
 #[then("serving is refused before any engine starts")]

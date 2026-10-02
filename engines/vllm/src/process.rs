@@ -152,7 +152,7 @@ pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &request.host,
         request.port,
         &request.model_ref,
-        vllm_ready_timeout(),
+        ready_timeout(),
         request.log_path.as_deref(),
     ) {
         // Terminate the whole vLLM process tree so the EngineCore worker (which
@@ -582,8 +582,9 @@ fn vllm_enforce_eager_enabled() -> bool {
 /// Defaults to [`DEFAULT_VLLM_READY_TIMEOUT`]. A valid-but-slow cold start
 /// (large weight download, first-decode compile) can exceed the default, so the
 /// timeout is configurable via `ROCM_CLI_VLLM_READY_TIMEOUT_SECS` (a positive
-/// integer number of seconds).
-fn vllm_ready_timeout() -> Duration {
+/// integer number of seconds). Public so the CLI's managed-launch path waits on
+/// the same budget the engine itself honors instead of a shorter one of its own.
+pub fn ready_timeout() -> Duration {
     resolve_vllm_ready_timeout(std::env::var("ROCM_CLI_VLLM_READY_TIMEOUT_SECS").ok())
 }
 
