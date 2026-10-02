@@ -32,6 +32,8 @@ pub mod disk_space;
 pub mod examine;
 pub mod fix;
 pub mod openmpi;
+#[cfg(test)]
+mod persisted_paths_props;
 pub mod proc_lifecycle;
 pub mod runtime;
 #[cfg(test)]

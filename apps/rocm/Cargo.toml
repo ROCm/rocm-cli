@@ -58,3 +58,9 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+[dev-dependencies]
+# Property tests for state rocm persists (config.json, the runtime registry,
+# the active-runtime marker). Same spec as rocm-core so the workspace resolves
+# one proptest with one feature set; test-only, so no shipped binary gains it.
+proptest = { version = "1", default-features = false, features = ["std"] }

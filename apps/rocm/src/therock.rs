@@ -6403,6 +6403,10 @@ fn slugify(value: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "therock_persisted_state_props.rs"]
+mod persisted_state_props;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
