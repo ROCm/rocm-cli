@@ -1076,20 +1076,45 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The report artifact a lane's upload step names (`name: e2e-*-report`).
     fn uploaded_report_artifact(workflow: &str, text: &str, job: &str) -> String {
-        let names: Vec<&str> = job_block(text, job)
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("name: "))
-            .filter(|name| name.starts_with("e2e-") && name.ends_with("-report"))
-            .collect();
-        assert_eq!(
-            names.len(),
-            1,
-            "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
-             found {names:?}"
-        );
+        // A lane with an `sdk_version` matrix (ROCMAI-430) uploads one artifact
+        // per leg, each behind its own mutually exclusive `if:` — pair every
+        // artifact name with the `if:` directly above it in the same step, then
+        // pick the `current` leg to stand for the whole lane, the same way a
+        // channel axis below is checked through its `release` leg.
+        let mut last_if: Option<&str> = None;
+        let mut candidates: Vec<(&str, Option<&str>)> = Vec::new();
+        for line in job_block(text, job).lines() {
+            let trimmed = line.trim();
+            if let Some(cond) = trimmed.strip_prefix("if: ") {
+                last_if = Some(cond);
+            } else if let Some(name) = trimmed.strip_prefix("name: ")
+                && name.starts_with("e2e-")
+                && name.ends_with("-report")
+            {
+                candidates.push((name, last_if));
+            }
+        }
+        let chosen = match candidates.as_slice() {
+            [(name, _)] => *name,
+            _ => {
+                candidates
+                    .iter()
+                    .find(|(_, cond)| {
+                        cond.is_some_and(|c| c.contains("matrix.sdk_version == 'current'"))
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow} job `{job}` should upload exactly one `e2e-*-report` \
+                             artifact, or one `current`-leg one among an sdk_version matrix, \
+                             found {candidates:?}"
+                        )
+                    })
+                    .0
+            }
+        };
         // The report job has no `matrix` context, so a lane with a channel axis is
         // checked through its `release` leg, which stands for the whole lane.
-        names[0].replace("${{ matrix.channel }}", "release")
+        chosen.replace("${{ matrix.channel }}", "release")
     }
 
     #[test]

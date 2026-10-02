@@ -83,6 +83,12 @@ jobs:
       # Narrow GPU-serve gate; forced true off-PR so the merge queue always runs
       # the full matrix and its required checks are never starved.
       serve: ${{ steps.filter.outputs.serve || steps.all.outputs.forced }}
+      # ROCMAI-430: the three most recent rows of the official release list
+      # (rocm.docs.amd.com/en/latest/release/versions.html, see
+      # xtask/src/rocm_releases.rs), fanned out ONLY on a release-branch push —
+      # everywhere else (PR, merge queue, manual dispatch) this stays a
+      # single-element `current` matrix, same cost as before this existed.
+      sdk_version_matrix: ${{ steps.sdk_matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -147,8 +153,17 @@ jobs:
         if: github.event_name != 'pull_request'
         run: echo "forced=true" >> "$GITHUB_OUTPUT"
 
+      - name: Compute sdk_version matrix (ROCMAI-430)
+        id: sdk_matrix
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo 'matrix=["current","n-1","n-2"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix=["current"]' >> "$GITHUB_OUTPUT"
+          fi
+
   e2e-gpu:
-    name: E2E tests (MI300X)
+    name: E2E tests (MI300X, ${{ matrix.sdk_version }})
     timeout-minutes: 90
     # `mi300x`, not `amd-gpu`: every AMD GPU runner carries `amd-gpu`, including
     # the Strix Halo hosts, so `[self-hosted, linux, amd-gpu]` let this lane land
@@ -156,6 +171,14 @@ jobs:
     # `e2e-gpu-report`, which the consolidated grid renders as MI300X.
     runs-on: [self-hosted, linux, mi300x]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      # n-1/n-2 (ROCMAI-430) only fan out on a release-branch push — see the
+      # `changes` job's `sdk_version_matrix` output; everywhere else this is a
+      # single-element `["current"]` matrix, so the ordinary PR/merge-queue path
+      # runs exactly one job, unchanged from before this matrix existed.
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # No build-and-test gate (cross-workflow needs is unavailable): the job builds
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
@@ -319,7 +342,8 @@ jobs:
           # (16 days stale on both MI300X runners when measured — EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped dispatch — lets a manual
           # run select only the large-model scenario instead of the whole suite.
@@ -331,11 +355,30 @@ jobs:
             cargo xtask e2e
           fi
 
-      - name: Upload E2E report
-        if: always()
+      # Three mutually-exclusive steps, not one templated `name:` (ROCMAI-430):
+      # `xtask::e2e_report`'s static contract test greps `name: e2e-*` lines
+      # literally, so a GH-expression-computed name would be invisible to it. The
+      # `current` leg's name is UNCHANGED from before this matrix existed — it's
+      # also what a single-element (non-release-branch) matrix always uploads.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-n-2-report
           path: tests/e2e-cucumber/results/
 
   # Second AMD GPU architecture: the Strix Halo (gfx1151) Ubuntu lane. DevLab
@@ -349,7 +392,7 @@ jobs:
   # still points at RUNNER_WORKSPACE to dodge checkout's `git clean -ffdx`
   # mid-job. Non-blocking while this hardware is proven out.
   e2e-gpu-strix-ubuntu:
-    name: E2E tests (Strix Halo, Ubuntu)
+    name: E2E tests (Strix Halo, Ubuntu, ${{ matrix.channel }}, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     # Raised from 35 after moving to the pool: RUNNER_WORKSPACE (CARGO_TARGET_DIR,
@@ -375,6 +418,10 @@ jobs:
       fail-fast: false
       matrix:
         channel: [release, nightly]
+        # See `e2e-gpu` (ROCMAI-430): layered alongside the pre-existing
+        # `channel` dimension above, not replacing it — this lane is the only
+        # per-PR job with two independent matrix axes.
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       # A pool host can be busy with other CI work between GPU preflight and
@@ -458,7 +505,8 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm` for why the old
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
@@ -469,18 +517,37 @@ jobs:
             cargo xtask e2e
           fi
 
-      - name: Upload E2E report
-        if: always()
+      # Three mutually-exclusive steps per the `sdk_version` leg, same as
+      # `e2e-gpu` (ROCMAI-430); the `current` leg's name is unchanged from
+      # before the matrix existed, keeping `${{ matrix.channel }}` as the only
+      # templated segment so `without_channel_matrix_segment` still strips it
+      # down to the canonical base name.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-n-2-report
           path: tests/e2e-cucumber/results/
 
   # First real Windows GPU coverage: the Strix Halo Windows 11 runner. The
   # existing windows-build-and-test uses GitHub-hosted windows-latest, which has
   # no GPU. Non-blocking so it never gates the PR.
   e2e-gpu-strix-windows:
-    name: E2E tests (Strix Halo, Windows)
+    name: E2E tests (Strix Halo, Windows, ${{ matrix.sdk_version }})
     # 45min: see e2e-gpu — one collapsed job runs all serves + per-scenario
     # install sdk; the cap must exceed the run so the job writes platform.json.
     # Matches e2e-gpu-strix-ubuntu's raised cap: this lane moved onto the same
@@ -490,6 +557,10 @@ jobs:
     timeout-minutes: 45
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-windows.
     if: >-
       always()
@@ -771,7 +842,7 @@ jobs:
           # decision lives in `xtask e2e-prewarm` rather than being reimplemented
           # here in PowerShell, so this lane and the Linux lanes cannot drift
           # (EAI-8057; the old existence-only guard never reinstalled).
-          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" --release-label "${{ matrix.sdk_version }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Optional scenario-name filter for a scoped manual dispatch.
@@ -783,11 +854,25 @@ jobs:
             cargo xtask e2e
           }
 
-      - name: Upload E2E report
-        if: always()
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-windows-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-windows-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-windows-n-2-report
           path: tests/e2e-cucumber/results/
 
   # WSL2 coverage on real hardware: an Ubuntu-24.04 distro installed fresh
@@ -804,7 +889,7 @@ jobs:
   # scenarios the host cannot satisfy resolve to skip from the capability
   # probe, so nothing is filtered out here.
   e2e-wsl:
-    name: E2E tests (Strix Halo, WSL2)
+    name: E2E tests (Strix Halo, WSL2, ${{ matrix.sdk_version }})
     # 120min: like the native pool lanes, every job here is cold (fresh distro,
     # fresh build, fresh prewarm) — plus the ~5min/job distro-install overhead
     # the pool maintainer flagged. Conservative starting budget; tune down once
@@ -815,6 +900,10 @@ jobs:
     timeout-minutes: 120
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     # See `e2e-gpu`: no build-and-test gate (cross-workflow); strix-wsl. Gated on
     # `serve` like the sibling lanes rather than the broader `heavy`: the
     # consolidated report gates on `serve` too, so a heavy-but-not-serve change
@@ -1304,7 +1393,8 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm` for why the old
           # existence-only guard froze this lane on its first runtime (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped manual dispatch.
           NAME_FILTER="${{ github.event.inputs.name_filter }}"
@@ -1349,27 +1439,43 @@ jobs:
           }
           exit 0
 
-      - name: Upload E2E report
-        if: always()
+      # The copy-out step above is deliberately best-effort (it must not report
+      # red just because an earlier step already failed the job), so a copy
+      # that failed for its own reason leaves results/ empty. `error` makes
+      # that a failed step here, in the lane that owns the copy, where default
+      # `warn` would upload nothing without a word. The consolidated report
+      # job's missing-report check flags the absent artifact too, and is the
+      # only signal on a `continue-on-error` lane: a failed step there does
+      # not turn the lane's check red. Only the WSL lanes need this guard:
+      # every other lane writes report.json directly in-job, with no
+      # guest-to-host copy step that can fail on its own. Each of the three
+      # legs below needs its own `if-no-files-found: error`, not just `current`.
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-strix-wsl-report
           path: tests/e2e-cucumber/results/
-          # The copy-out step above is deliberately best-effort (it must not
-          # report red just because an earlier step already failed the job),
-          # so a copy that failed for its own reason leaves results/ empty.
-          # `error` makes that a failed step here, in the lane that owns the
-          # copy, where default `warn` would upload nothing without a word.
-          # The consolidated report job's missing-report check flags the absent
-          # artifact too, and is the only signal on a `continue-on-error` lane:
-          # a failed step there does not turn the lane's check red. Only the
-          # WSL lanes need this guard: every other lane writes report.json
-          # directly in-job, with no guest-to-host copy step that can fail on
-          # its own.
+          if-no-files-found: error
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-n-1-report
+          path: tests/e2e-cucumber/results/
+          if-no-files-found: error
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-strix-wsl-n-2-report
+          path: tests/e2e-cucumber/results/
           if-no-files-found: error
 
   e2e-gpu-w7900:
-    name: E2E tests (W7900)
+    name: E2E tests (W7900, ${{ matrix.sdk_version }})
     # 90min: matches every other Linux GPU lane — same collapsed suite. The card
     # is smaller than the Instinct parts, so do not tighten this below their cap.
     timeout-minutes: 90
@@ -1379,6 +1485,10 @@ jobs:
     # vice versa.
     runs-on: [self-hosted, linux, w7900]
     needs: [changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk_version: ${{ fromJSON(needs.changes.outputs.sdk_version_matrix) }}
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -1464,7 +1574,8 @@ jobs:
           # See the e2e-gpu lane and `xtask e2e-prewarm`.
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm" \
+              --release-label "${{ matrix.sdk_version }}"
 
           # Optional scenario-name filter for a scoped manual dispatch — a cheap
           # way to exercise this lane against a single scenario without the full suite.
@@ -1476,11 +1587,25 @@ jobs:
             cargo xtask e2e
           fi
 
-      - name: Upload E2E report
-        if: always()
+      - name: Upload E2E report (current)
+        if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-gpu-w7900-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-1)
+        if: always() && matrix.sdk_version == 'n-1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-n-1-report
+          path: tests/e2e-cucumber/results/
+
+      - name: Upload E2E report (n-2)
+        if: always() && matrix.sdk_version == 'n-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-gpu-w7900-n-2-report
           path: tests/e2e-cucumber/results/
 
   # Consolidate this workflow's self-hosted platform reports into one GPU-side
