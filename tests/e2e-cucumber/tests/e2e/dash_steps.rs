@@ -32,9 +32,10 @@ const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
 /// `xtask check-crate-edges`). The two copies are instead pinned to each other
 /// by `dash::tests::e2e_harness_plants_the_file_rocm_dash_reads` in
 /// `apps/rocm/src/dash.rs`, which reads this file's source and fails in the
-/// every-PR unit lane. It needs this constant declared on one line, and needs
-/// `dash_clock_path` below to keep that name and to keep building the path
-/// from `.join(..)` links — otherwise the guard stops seeing this.
+/// every-PR unit lane. It needs this constant's value to stay a plain string
+/// literal (formatting is free; a `concat!` is not), and needs `dash_clock_path`
+/// below to keep that name and to keep building the path from `.join(..)`
+/// links — otherwise the guard stops seeing this.
 const DASH_CLOCK_OFFSET_FILE: &str = "test-clock-offset";
 
 /// The services overlay's own panel title, drawn by `draw_services_manager` on

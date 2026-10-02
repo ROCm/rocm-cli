@@ -1205,8 +1205,13 @@ mod tests {
     /// the every-PR unit lane.
     #[test]
     fn e2e_harness_plants_the_file_rocm_dash_reads() {
+        // Anchored on the name and the first string literal after its `=`, not on
+        // the exact single-line spelling: a rustfmt reflow that moves the value
+        // to its own line is not drift and must not fail this.
         let declared = E2E_DASH_STEPS_SRC
-            .split_once("const DASH_CLOCK_OFFSET_FILE: &str = \"")
+            .split_once("const DASH_CLOCK_OFFSET_FILE")
+            .and_then(|(_, rest)| rest.split_once('='))
+            .and_then(|(_, rest)| rest.split_once('"'))
             .and_then(|(_, rest)| rest.split_once('"'))
             .map(|(value, _)| value)
             .expect("e2e dash_steps.rs no longer declares DASH_CLOCK_OFFSET_FILE as a literal");
