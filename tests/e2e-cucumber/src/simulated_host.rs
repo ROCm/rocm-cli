@@ -447,6 +447,225 @@ fn link(target: &Path, link: &Path) -> io::Result<()> {
     }
 }
 
+/// The KFD topology nodes directory, relative to a root.
+const KFD_NODES: &str = "sys/class/kfd/kfd/topology/nodes";
+
+/// The `key value` pairs of a KFD node's `properties` file.
+fn kfd_properties(node: &Path) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(node.join("properties")).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| {
+                let (key, value) = line.split_once(' ')?;
+                Some((key.to_owned(), value.trim().to_owned()))
+            })
+            .collect(),
+    )
+}
+
+fn property<'a>(properties: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    properties
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Whether a KFD property is a non-zero number, read the way the CLI reads it
+/// (as an integer), so a `00` or padded value is not mistaken for a GPU.
+fn is_nonzero(value: Option<&str>) -> bool {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .is_some_and(|v| v != 0)
+}
+
+/// Every way the bare-metal layout under `simulated` departs from the real
+/// kernel's under `real` (normally `/`), as human-readable lines; empty when
+/// they agree.
+///
+/// A simulated machine is only worth trusting while it is laid out the way the
+/// kernel lays out the real one. If a kernel moves a property, a scenario on the
+/// simulated machine keeps passing while the product fails on hardware — the
+/// exact shape of the bug where `gfx_target_version` was read from a file no
+/// kernel has. This is the check that notices: run on a real GPU host, it holds
+/// every fixture assumption against the live `/dev` and `/sys`.
+#[must_use]
+pub fn bare_metal_layout_drift(real: &Path, simulated: &Path) -> Vec<String> {
+    let mut drift = Vec::new();
+    for device in ["dev/kfd", "sys/module/amdgpu"] {
+        if simulated.join(device).exists() && !real.join(device).exists() {
+            drift.push(format!(
+                "the simulated machine has /{device}; this kernel does not"
+            ));
+        }
+    }
+
+    let gpu_nodes = |root: &Path| -> Vec<(PathBuf, Vec<(String, String)>)> {
+        let Ok(entries) = std::fs::read_dir(root.join(KFD_NODES)) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| Some((entry.path(), kfd_properties(&entry.path())?)))
+            .filter(|(_, props)| is_nonzero(property(props, "gfx_target_version")))
+            .collect()
+    };
+    let real_gpus = gpu_nodes(real);
+    let simulated_gpus = gpu_nodes(simulated);
+    if real_gpus.is_empty() {
+        drift.push(format!(
+            "no KFD GPU node on this kernel states gfx_target_version in its properties \
+             file under /{KFD_NODES}, which is where the simulated machine puts it"
+        ));
+    }
+    let Some((_, simulated_props)) = simulated_gpus.first() else {
+        return drift;
+    };
+    for (node, real_props) in &real_gpus {
+        let name = node.file_name().unwrap_or_default().to_string_lossy();
+        for (key, _) in simulated_props {
+            if property(real_props, key).is_none() {
+                drift.push(format!(
+                    "KFD node {name} has no `{key}` property, which the simulated machine states"
+                ));
+            }
+        }
+        if !node.join("gpu_id").is_file() {
+            drift.push(format!("KFD node {name} has no gpu_id file"));
+        }
+        if let Some(minor) = property(real_props, "drm_render_minor")
+            && !real.join(format!("dev/dri/renderD{minor}")).exists()
+        {
+            drift.push(format!(
+                "KFD node {name} names render minor {minor}, but /dev/dri/renderD{minor} \
+                 does not exist"
+            ));
+        }
+    }
+    // The simulated CPU node, like a real one, reports a target of 0.
+    let cpu_nodes_with_target = std::fs::read_dir(real.join(KFD_NODES))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| kfd_properties(&entry.path()))
+        .filter(|props| is_nonzero(property(props, "cpu_cores_count")))
+        .filter(|props| is_nonzero(property(props, "gfx_target_version")))
+        .count();
+    if cpu_nodes_with_target > 0 {
+        drift.push(format!(
+            "{cpu_nodes_with_target} CPU KFD node(s) report a non-zero gfx_target_version"
+        ));
+    }
+
+    // Each AMD DRM card exposes the files the simulated one does.
+    let amd_cards: Vec<PathBuf> = std::fs::read_dir(real.join("sys/class/drm"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|card| {
+            card.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("card") && !name.contains('-')
+            }) && std::fs::read_to_string(card.join("device/vendor"))
+                .is_ok_and(|vendor| vendor.trim() == "0x1002")
+        })
+        .collect();
+    if amd_cards.is_empty() {
+        drift.push("no DRM card under /sys/class/drm reports vendor 0x1002".to_owned());
+    }
+    for card in &amd_cards {
+        let device = std::fs::read_to_string(card.join("device/device")).unwrap_or_default();
+        if !device.trim().starts_with("0x") || device.trim().len() != 6 {
+            drift.push(format!(
+                "{} has device id {:?}, not the 0xNNNN form the simulated machine writes",
+                card.display(),
+                device.trim()
+            ));
+        }
+    }
+    drift
+}
+
+/// Every way this WSL2 distribution under `real` (normally `/`) departs from
+/// what the simulated WSL machine assumes, as human-readable lines.
+///
+/// The CLI recognises WSL2 by `/dev/dxg` and a `microsoft-standard-WSL2` kernel
+/// string, and finds the host runtime through `/usr/lib/wsl/lib/libdxcore.so`;
+/// those are the facts the simulated machine plants.
+#[must_use]
+pub fn wsl_layout_drift(real: &Path) -> Vec<String> {
+    let mut drift = Vec::new();
+    for path in ["dev/dxg", "usr/lib/wsl/lib/libdxcore.so"] {
+        if !real.join(path).exists() {
+            drift.push(format!(
+                "the simulated WSL machine has /{path}; this one does not"
+            ));
+        }
+    }
+    let version = std::fs::read_to_string(real.join("proc/version")).unwrap_or_default();
+    if !version.contains("microsoft-standard-WSL2") {
+        drift.push(format!(
+            "/proc/version does not carry the microsoft-standard-WSL2 kernel string the \
+             simulated machine uses: {}",
+            version.trim()
+        ));
+    }
+    drift
+}
+
+/// Every way an `lspci -nn -D` listing departs from the line shape the
+/// simulated machine's stand-in prints for an AMD GPU, as human-readable lines.
+///
+/// The product parses these lines for the PCI address and marketing name; a
+/// stand-in that prints a shape the real tool does not would let the simulated
+/// scenarios pass on a parse the product never gets to do on hardware.
+#[must_use]
+pub fn lspci_drift(real_listing: &str) -> Vec<String> {
+    let gpu_classes = [
+        "VGA compatible controller",
+        "3D controller",
+        "Display controller",
+        "Processing accelerators",
+    ];
+    let amd_gpus: Vec<&str> = real_listing
+        .lines()
+        .filter(|line| line.contains("[1002:") && gpu_classes.iter().any(|c| line.contains(c)))
+        .collect();
+    if amd_gpus.is_empty() {
+        return vec!["lspci -nn -D lists no AMD GPU".to_owned()];
+    }
+    amd_gpus
+        .into_iter()
+        .filter(|line| !matches_simulated_lspci_line(line))
+        .map(|line| format!("lspci line not in the simulated shape: {line}"))
+        .collect()
+}
+
+/// `DDDD:BB:DD.F <class> [cccc]: <vendor> <name> [1002:dddd]...` — the shape
+/// [`SimulatedHost::lspci`] prints.
+fn matches_simulated_lspci_line(line: &str) -> bool {
+    let Some((address, rest)) = line.split_once(' ') else {
+        return false;
+    };
+    let address_ok = address.len() == 12
+        && address.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == ':',
+            10 => c == '.',
+            _ => c.is_ascii_hexdigit(),
+        });
+    let class_ok = rest.split_once("]: ").is_some_and(|(class, _)| {
+        class
+            .rsplit_once(" [")
+            .is_some_and(|(_, code)| code.len() == 4)
+    });
+    let id_ok = rest.find("[1002:").is_some_and(|i| {
+        rest[i + 6..].get(..5).is_some_and(|tail| {
+            tail.ends_with(']') && tail[..4].chars().all(|c| c.is_ascii_hexdigit())
+        })
+    });
+    address_ok && class_ok && id_ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +790,87 @@ mod tests {
         let bin = root.path().join(TOOL_OUTPUT_DIR).join("bin");
         assert!(bin.join("powershell.exe").symlink_metadata().is_ok());
         assert!(bin.join("lspci").symlink_metadata().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    fn planted(host: &SimulatedHost) -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("tempdir");
+        let tool = root.path().join("tool");
+        std::fs::write(&tool, "").expect("tool");
+        host.plant(root.path(), &tool, std::ffi::OsStr::new(""))
+            .expect("plant");
+        root
+    }
+
+    #[test]
+    fn a_simulated_machine_does_not_drift_from_itself() {
+        let a = planted(&SimulatedHost::instinct_mi300x(2));
+        let b = planted(&SimulatedHost::instinct_mi300x(1));
+        assert_eq!(
+            bare_metal_layout_drift(a.path(), b.path()),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The bug this exists for: a kernel that stated the target somewhere other
+    /// than `properties` must be reported, not silently matched.
+    #[test]
+    fn a_kernel_without_the_target_in_properties_is_drift() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        let node = real.path().join(KFD_NODES).join("1");
+        let props = std::fs::read_to_string(node.join("properties")).expect("props");
+        std::fs::write(
+            node.join("properties"),
+            props
+                .lines()
+                .filter(|line| !line.starts_with("gfx_target_version"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .expect("rewrite");
+        std::fs::write(node.join("gfx_target_version"), "90402\n").expect("standalone");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert!(
+            drift.iter().any(|line| line.contains("gfx_target_version")),
+            "{drift:#?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_property_is_named() {
+        let real = planted(&SimulatedHost::instinct_mi300x(1));
+        let node = real.path().join(KFD_NODES).join("1");
+        let props = std::fs::read_to_string(node.join("properties")).expect("props");
+        std::fs::write(node.join("properties"), props.replace("location_id", "loc")).expect("w");
+        let simulated = planted(&SimulatedHost::instinct_mi300x(1));
+        let drift = bare_metal_layout_drift(real.path(), simulated.path());
+        assert!(
+            drift.iter().any(|line| line.contains("`location_id`")),
+            "{drift:#?}"
+        );
+    }
+
+    #[test]
+    fn the_stand_ins_lspci_shape_matches_its_own_grammar() {
+        let host = SimulatedHost::instinct_mi300x(8);
+        assert_eq!(lspci_drift(&host.lspci()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_real_lspci_line_in_another_shape_is_drift() {
+        // `lspci` without `-D` drops the domain; the product's address match
+        // would then never line up with the KFD-derived one.
+        let listing = "11:00.0 Processing accelerators [1200]: Advanced Micro Devices, Inc. \
+                       [AMD/ATI] Aqua Vanjaram [Instinct MI300X] [1002:74a1]";
+        assert_eq!(lspci_drift(listing).len(), 1);
+        // A real line with a trailing revision is still the same shape.
+        let ok = "0000:c5:00.0 Display controller [0380]: Advanced Micro Devices, Inc. \
+                  [AMD/ATI] Strix Halo [Radeon Graphics] [1002:1586] (rev c1)";
+        assert_eq!(lspci_drift(ok), Vec::<String>::new());
     }
 }
