@@ -88,8 +88,8 @@ with a message naming the detected version and pointing at
 
 Supported discovery paths:
 
-- `ROCM_CLI_VLLM_COMMAND=/path/to/vllm`
-- `ROCM_CLI_VLLM_PYTHON=/path/to/python` where a sibling `vllm` command exists
+- `ROCM_CLI_VLLM_COMMAND=path_to_vllm`, where `path_to_vllm` is the absolute path to the `vllm` executable
+- `ROCM_CLI_VLLM_PYTHON=path_to_python`, where `path_to_python` is the absolute path to a Python interpreter that has a sibling `vllm` command
 - the active ROCm CLI-managed TheRock runtime, if vLLM has been installed into
   that Python environment
 - `vllm` on `PATH`
