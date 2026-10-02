@@ -1520,6 +1520,63 @@ jobs:
           name: e2e-report
           path: tests/e2e-cucumber/results/
 
+  # The same suite on a GitHub-hosted Windows runner. The self-hosted GPU lanes
+  # (e2e-selfhosted.yml) run only the scenarios that need their GPU
+  # (E2E_GPU_ONLY), so this is where everything else meets native Windows —
+  # path handling, the Windows probes, the PowerShell surfaces. Built with
+  # `rocm/e2e-test-hooks` by `cargo xtask e2e`, like the Linux lane above and
+  # unlike windows-build-and-test's lifecycle run, which must ship exactly what
+  # a release ships. Scenarios on a simulated machine are `@requires-os:linux`
+  # and skip here: the Windows probes ask the registry, not a filesystem.
+  e2e-windows:
+    name: E2E tests (Windows)
+    timeout-minutes: 60
+    runs-on: windows-latest
+    needs: [changes, build-and-test]
+    if: >-
+      always()
+      && needs.changes.result == 'success'
+      && (github.event_name != 'workflow_dispatch'
+          || inputs.platform == 'all' || inputs.platform == 'mock')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Same gate as the Linux `e2e` job.
+      - name: Decide whether to run
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ needs.build-and-test.result }}" = "success" ] \
+            && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Run E2E tests
+        if: steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: cargo xtask e2e
+
+      # Its own grid in the run Summary; see e2e-report for why the consolidated
+      # (required) report does not wait for this lane.
+      - name: Report summary
+        if: always() && steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: cargo xtask e2e-report --artifacts-dir tests/e2e-cucumber/results --html-out tests/e2e-cucumber/results/consolidated.html >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload E2E report
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-windows-report
+          path: tests/e2e-cucumber/results/
+
   # Consolidate the mock (GitHub-hosted) platform's report into the cross-platform
   # report: a platform × tier matrix in the run Summary plus a single merged HTML
   # artifact. `if: always()` so a failing platform still appears; runs on
@@ -1527,8 +1584,11 @@ jobs:
   #
   # The self-hosted GPU platforms are consolidated by e2e-selfhosted.yml's own
   # report job (they moved there so an offline runner can't stall this workflow's
-  # required checks). This job only depends on the mock `e2e` lane; the `*-report`
-  # glob still auto-includes any new GitHub-hosted platform added here.
+  # required checks). This job only depends on the mock `e2e` lane, and downloads
+  # only its artifact. `e2e-windows` summarizes itself instead: waiting on it here
+  # would put a cold Windows release build in front of this REQUIRED check, and
+  # matching it by glob would include it or not depending on which job finished
+  # first.
   e2e-report:
     name: E2E consolidated report
     runs-on: ubuntu-latest
@@ -1549,9 +1609,9 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
-      # Pull every e2e artifact matching the glob. `xtask e2e-report` turns each
-      # into one labeled platform and the `*-report` glob makes new platforms
-      # appear automatically. Layout note: download-artifact@v8 extracts a match
+      # Pull the mock lane's artifact (named exactly; see the job comment for why
+      # not a glob). `xtask e2e-report` turns it into one labeled platform.
+      # Layout note: download-artifact@v8 extracts a match
       # into e2e-artifacts/<artifact-name>/ when several match, but flattens
       # straight into e2e-artifacts/ when EXACTLY ONE matches (its source picks
       # the root path when `artifacts.length === 1`). After the ci.yml ⇄
@@ -1561,7 +1621,7 @@ jobs:
       - name: Download all E2E reports
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: '*-report'
+          pattern: 'e2e-report'
           path: e2e-artifacts
 
       - name: Build consolidated report + step summary

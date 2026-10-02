@@ -1340,6 +1340,14 @@ async fn main() {
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
+    // Which share of the suite this lane runs: a self-hosted GPU lane runs only
+    // what needs its GPU, narrowed to the `@gpu-smoke` canaries on a pull
+    // request; see `restrict_to_lane`. Selected inside the filter, like
+    // `E2E_ONLY_LIFECYCLE`, so expectation resolution still runs.
+    let lane = e2e_cucumber::expectation::LaneSelection {
+        gpu_only: std::env::var_os("E2E_GPU_ONLY").is_some_and(|v| v == "1"),
+        smoke_only: std::env::var_os("E2E_GPU_SMOKE_ONLY").is_some_and(|v| v == "1"),
+    };
     // `@requires-real-gpu` scenarios run only where a lane on real hardware opts
     // in; everywhere else GPU behaviour is exercised against a simulated host.
     // An unrecognised value aborts the run instead of silently skipping them.
@@ -1464,6 +1472,8 @@ async fn main() {
                         hardware,
                     },
                 );
+                let expectation =
+                    e2e_cucumber::expectation::restrict_to_lane(&decl, expectation, lane);
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {

@@ -67,6 +67,8 @@ fn parse_descriptor(name: &str) -> Descriptor {
     let (platform, os) = match core {
         // The bare mock expect-pass artifact is `e2e-report` → core "report" or "".
         "" | "report" => ("Mock", "Linux"),
+        // The GitHub-hosted Windows lane: no GPU, native Windows.
+        "windows" => ("Mock", "Windows"),
         "gpu" => ("MI300X", "Linux"),
         "gpu-rad3" => ("R9700", "Linux"),
         "gpu-mi350p" => ("MI350P", "Linux"),
@@ -1758,6 +1760,7 @@ mod tests {
     fn parse_descriptor_maps_known_artifacts() {
         for (name, platform, os) in [
             ("e2e-report", "Mock", "Linux"),
+            ("e2e-windows-report", "Mock", "Windows"),
             ("e2e-gpu-report", "MI300X", "Linux"),
             ("e2e-gpu-rad3-report", "R9700", "Linux"),
             ("e2e-gpu-mi350p-report", "MI350P", "Linux"),

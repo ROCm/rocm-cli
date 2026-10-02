@@ -145,6 +145,8 @@ Scenarios carry stable-id and capability tags:
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
+| `@merge-queue` | A heavy real-GPU serve (default-engine endpoint, inference, readiness) that runs only in the merge queue, which opts in with `E2E_MERGE_QUEUE=1`; the `@gpu-smoke` canaries cover the same ground on the pull request. |
+| `@gpu-smoke` | A cheap per-engine real-GPU canary. On a pull request and in the merge queue the self-hosted GPU lanes set `E2E_GPU_SMOKE_ONLY=1`, under which these (and, in the queue, the `@merge-queue` serves) are the only real-GPU scenarios that run; every other one resolves to **skip** with that reason. Scenarios that need no GPU never run on a GPU lane: those lanes set `E2E_GPU_ONLY=1` and leave them to the hosted Linux and Windows jobs. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 
 Known bugs are **not** tagged in the `.feature` files — they live in
@@ -164,7 +166,15 @@ serve does not compete with the first for device memory, and the failure quotes
 the service log tail plus the device's free-VRAM state, which is where the
 engine's own reason for the stall is recorded.
 
-CI runs one job per platform, each executing the full suite. The mock job lives
+CI runs one job per platform. The two GitHub-hosted jobs, `e2e` on Linux and
+`e2e-windows` on Windows, run every scenario that needs no GPU on every pull
+request — on Linux including every GPU scenario that plants a simulated
+machine. The self-hosted GPU jobs run only the scenarios that need their GPU
+(`E2E_GPU_ONLY=1`), and on a pull request and in the merge queue only the
+`@gpu-smoke` canaries of those (plus, in the queue, the `@merge-queue` serves);
+they run the full real-GPU set on pushes to `main` and `release/**`, on
+dispatch, and nightly. The WSL job has no GPU and runs the whole non-GPU suite
+inside a real WSL2 distribution. The mock job lives
 in the `CI` workflow (`ci.yml`); the self-hosted GPU jobs live in a separate
 `E2E self-hosted` workflow (`e2e-selfhosted.yml`) so a job queued on an offline
 self-hosted runner can never stall `ci.yml`'s merge-required checks:
@@ -172,6 +182,7 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | Job | Workflow | Platform | Blocking |
 |---|---|---|---|
 | `e2e` | `ci.yml` | Mock (no GPU, GitHub-hosted) | yes |
+| `e2e-windows` | `ci.yml` | Mock / Windows (no GPU, GitHub-hosted) | no |
 | `e2e-gpu` | `e2e-selfhosted.yml` | MI300X (self-hosted) | no |
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
