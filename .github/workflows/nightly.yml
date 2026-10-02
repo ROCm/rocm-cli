@@ -361,6 +361,10 @@ jobs:
     # `mi300x`, not `amd-gpu` — see the same pin on e2e-selfhosted.yml's e2e-gpu.
     runs-on: [self-hosted, linux, mi300x]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       # Include @nightly scenarios (the large-model serve). See src/expectation.rs.
       E2E_INCLUDE_NIGHTLY: "1"
@@ -461,21 +465,21 @@ jobs:
           # e2e-gpu lane and `xtask e2e-prewarm` for the full rationale (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
-      # Canonical artifact name, matching the per-PR workflow rather than a
-      # `-nightly-` variant. `parse_descriptor` in the e2e-report crate maps
-      # these names to Platform/OS, and an unrecognised one falls back to a
-      # titlecased platform with the OS hardcoded to Linux — which would have
-      # labelled the Windows lane below as Linux. Artifacts are scoped to their
-      # run, so sharing the name with the per-PR workflow collides with nothing.
+      # Channel-suffixed so the release and nightly matrix legs don't collide
+      # within this run (actions/upload-artifact rejects duplicate names).
+      # The manifest's channel field (platform.json's versions.channel) is
+      # authoritative for column identity; this suffix is only the fallback
+      # the report reads when no manifest channel exists, so it must stay in
+      # sync with the values the descriptor parser strips.
       - name: Upload E2E report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-report
+          name: e2e-gpu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # rad3 R9700 counterpart to e2e-gpu-nightly. Mirrors the per-PR e2e-gpu-rad3
@@ -488,6 +492,10 @@ jobs:
     timeout-minutes: 90
     runs-on: [self-hosted, linux, r9700]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -563,7 +571,7 @@ jobs:
           # not a one-shot. See `xtask e2e-prewarm` (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -571,7 +579,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-rad3-report
+          name: e2e-gpu-rad3-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   e2e-gpu-nightly-mi350p:
@@ -579,6 +587,10 @@ jobs:
     timeout-minutes: 90
     runs-on: [self-hosted, linux, mi350p]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -654,7 +666,7 @@ jobs:
           # not a one-shot. See `xtask e2e-prewarm`.
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -662,7 +674,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-mi350p-report
+          name: e2e-gpu-mi350p-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
@@ -679,6 +691,10 @@ jobs:
     # registered.
     runs-on: [self-hosted, linux, strix-halo, native]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       HOME: /home/ubuntu/actions-runner/e2e-home
       CARGO_HOME: /home/ubuntu/actions-runner/.cargo
@@ -857,7 +873,7 @@ jobs:
           # Cache, not a one-shot: refreshed when the channel index has a newer
           # version. See `xtask e2e-prewarm` (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -865,7 +881,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-ubuntu-report
+          name: e2e-gpu-strix-ubuntu-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # Windows counterpart to e2e-gpu-nightly-strix. Keep the PowerShell-native
@@ -877,6 +893,10 @@ jobs:
     timeout-minutes: 90
     runs-on: [self-hosted, windows, strix-halo, native]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       E2E_INCLUDE_NIGHTLY: "1"
       E2E_SERVE_TIMEOUT_SECS: "300"
@@ -1064,7 +1084,7 @@ jobs:
           # Cache, not a one-shot: refreshed when the channel index has a newer
           # version. The decision lives in `xtask e2e-prewarm` so this lane cannot
           # drift from the Linux ones (EAI-8057).
-          cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+          cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           cargo xtask e2e
@@ -1073,7 +1093,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-windows-report
+          name: e2e-gpu-strix-windows-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # WSL2 counterpart to e2e-gpu-nightly-strix: an Ubuntu-24.04 distro installed
@@ -1092,6 +1112,10 @@ jobs:
     timeout-minutes: 120
     runs-on: [self-hosted, windows, devlab-dispatch, strix-halo]
     continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     env:
       # wsl.exe emits UTF-16 by default; without this its own error/status text
       # comes back mangled when captured through PowerShell. Matches the
@@ -1462,7 +1486,7 @@ jobs:
           # Cache, not a one-shot: refreshed when the channel index has a newer
           # version. See `xtask e2e-prewarm` (EAI-8057).
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
           '@
@@ -1494,7 +1518,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-strix-wsl-report
+          name: e2e-gpu-strix-wsl-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
           # The copy-out step above is deliberately best-effort (it must not
           # report red just because an earlier step already failed the job),

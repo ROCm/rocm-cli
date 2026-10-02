@@ -165,6 +165,11 @@ pub struct PlatformVersions {
     /// Installed lemonade server version, e.g. "10.6.0" (`lemond --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lemonade: Option<String>,
+    /// Release channel ("release" | "nightly") the active runtime was installed
+    /// under, read from its registry record — never a workflow-passed label, so
+    /// a mislabeled `--channel` flag can't misreport what's actually installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
 }
 
 /// Collect component versions for the report from the installed managed runtime.
@@ -192,8 +197,9 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     // ROCm/vLLM/lemonade versions come from the installed managed runtime. Only
     // available when CI provides a persistent runtimes dir (E2E_SHARED_RUNTIMES_DIR)
     // — mock has no runtime, and per-scenario isolated installs are gone by now.
-    if let Some((rocm, root)) = runtimes_dir.and_then(active_runtime_install_root) {
+    if let Some((rocm, channel, root)) = runtimes_dir.and_then(active_runtime_install_root) {
         v.rocm = Some(rocm);
+        v.channel = channel;
         // vLLM: parse the version out of `.../site-packages/vllm-<ver>.dist-info`.
         v.vllm = vllm_version_from_venv(&root);
         // lemonade: `<root>/engines/lemonade/runtime/lemond --version`.
@@ -203,8 +209,9 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
     v
 }
 
-/// Read the active managed runtime's `(version, install_root)` from the runtimes
-/// registry. Returns `None` when the tree names no single runtime.
+/// Read the active managed runtime's `(version, channel, install_root)` from the
+/// runtimes registry. Returns `None` when the tree names no single runtime.
+/// `channel` is `None` for a registry record predating the field.
 ///
 /// Which runtime that is comes from [`crate::shared_runtime::runtime_key_to_activate`],
 /// the same answer the scenarios activate — so the version this report attributes
@@ -235,12 +242,16 @@ pub fn collect_versions(runtimes_dir: Option<&std::path::Path>) -> PlatformVersi
 /// reads as unknown, which is the honest outcome; a wrong version reads as fact.
 fn active_runtime_install_root(
     runtimes_dir: &std::path::Path,
-) -> Option<(String, std::path::PathBuf)> {
+) -> Option<(String, Option<String>, std::path::PathBuf)> {
     let key = crate::shared_runtime::runtime_key_to_activate(runtimes_dir)?;
     let manifest = runtimes_dir.join("registry").join(format!("{key}.json"));
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(manifest).ok()?).ok()?;
     let version = json.get("version")?.as_str()?.to_owned();
+    let channel = json
+        .get("channel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     // Resolve the root inside the shared tree first; fall back to the manifest's
     // recorded install_root only if that derived path doesn't exist.
     let derived = runtimes_dir.join("wheel").join(&key);
@@ -249,7 +260,7 @@ fn active_runtime_install_root(
     } else {
         std::path::PathBuf::from(json.get("install_root")?.as_str()?)
     };
-    Some((version, root))
+    Some((version, channel, root))
 }
 
 /// Select the canonical aggregate wheel runtime from `rocm runtimes list` output.
@@ -981,6 +992,15 @@ Local model engines
     }
 
     fn write_manifest(runtimes_dir: &std::path::Path, key: &str, version: &str) {
+        write_manifest_with_channel(runtimes_dir, key, version, "release");
+    }
+
+    fn write_manifest_with_channel(
+        runtimes_dir: &std::path::Path,
+        key: &str,
+        version: &str,
+        channel: &str,
+    ) {
         let registry = runtimes_dir.join("registry");
         std::fs::create_dir_all(&registry).expect("create registry");
         let install_root = runtimes_dir.join("wheel").join(key);
@@ -991,6 +1011,7 @@ Local model engines
                 "runtime_key": key,
                 "version": version,
                 "install_root": install_root,
+                "channel": channel,
             })
             .to_string(),
         )
@@ -1006,15 +1027,17 @@ Local model engines
         let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
         let dir = tmp.path();
         write_manifest(dir, "release-wheel-gfx94x-dcgpu-7-13-0", "7.13.0");
-        write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
+        write_manifest_with_channel(dir, "release-wheel-multi-arch-7-14-0", "7.14.0", "nightly");
         std::fs::write(
             dir.join("active.json"),
             r#"{"runtime_key": "release-wheel-multi-arch-7-14-0"}"#,
         )
         .expect("write marker");
 
-        let (version, root) = active_runtime_install_root(dir).expect("a runtime is named");
+        let (version, channel, root) =
+            active_runtime_install_root(dir).expect("a runtime is named");
         assert_eq!(version, "7.14.0");
+        assert_eq!(channel.as_deref(), Some("nightly"));
         assert_eq!(
             root,
             dir.join("wheel").join("release-wheel-multi-arch-7-14-0")
