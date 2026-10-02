@@ -30,7 +30,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{exe_label, quote_display_arg, resolve_exe};
 use crate::ui::format;
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
@@ -186,7 +186,7 @@ fn request_lifecycle(sm: &mut ServicesManagerState, rows: &[ServiceRow], action:
                 "{} services {} {} --yes",
                 exe_label(&cmd),
                 action.verb(),
-                row.id
+                quote_display_arg(&row.id)
             ),
             format!("model: {}   port: {}", row.model, port_str(row.port)),
             String::new(),
