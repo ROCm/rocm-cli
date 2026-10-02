@@ -946,23 +946,27 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// Every `GPU preflight` step block in `text`, in file order.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         let lines: Vec<&str> = text.lines().collect();
-        let mut steps = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("- name: GPU preflight") {
-                continue;
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
+            .map(|(i, _)| step_block(&lines, i))
+            .collect()
+    }
+
+    /// The whole step whose `- name:` line is `lines[at]`: that line and every
+    /// line below it until one is indented no deeper than it.
+    fn step_block(lines: &[&str], at: usize) -> String {
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
             }
-            let step_indent = indent_of(line);
-            let mut step = format!("{line}\n");
-            for body in &lines[i + 1..] {
-                if !body.trim().is_empty() && indent_of(body) <= step_indent {
-                    break;
-                }
-                step.push_str(body);
-                step.push('\n');
-            }
-            steps.push(step);
+            step.push_str(body);
+            step.push('\n');
         }
-        steps
+        step
     }
 
     /// The lines of a step's `run: |` block, still indented.
@@ -1087,13 +1091,19 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// nightly lane job-level `continue-on-error: true` means a regression would
     /// not even turn the run red.
     ///
-    /// Matching the step NAME rather than a substring of the job is deliberate —
-    /// the surrounding comments discuss the clock at length, so a bare substring
-    /// would stay satisfied by prose after the step itself was deleted, which is
-    /// exactly the failure this pins.
+    /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
+    /// surrounding comments discuss the clock at length, and a comment line that
+    /// happened to embed the step's text would otherwise keep this satisfied after
+    /// the step itself was deleted — exactly the failure this pins.
+    ///
+    /// The two copies' `run:` bodies are also compared byte for byte, after
+    /// dedenting. They are kept in sync by hand until the lanes are deduplicated
+    /// (#294), and presence and order say nothing about what each copy runs —
+    /// the same drift `apu_preflight_twins_do_not_drift` once caught too late.
     #[test]
     fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
         const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        let mut bodies = Vec::new();
         for (workflow, job, suite_step) in [
             (
                 "e2e-selfhosted.yml",
@@ -1107,22 +1117,37 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             ),
         ] {
             let job_block = nested_block(&read_workflow(workflow), job);
-            let settle = job_block.find(STEP).unwrap_or_else(|| {
+            let lines: Vec<&str> = job_block.lines().collect();
+            let settle = lines.iter().position(|l| *l == STEP).unwrap_or_else(|| {
                 panic!(
                     "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
                      steps its clock backwards mid-run and cucumber subtracts SystemTime \
                      stamps, so the durations that lane reports become fiction"
                 )
             });
-            let suite = job_block
-                .find(suite_step)
+            let suite = lines
+                .iter()
+                .position(|l| *l == suite_step)
                 .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
             assert!(
                 settle < suite,
                 "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
                  correction has to land while nothing is being timed"
             );
+            let step = step_block(&lines, settle);
+            let body = run_block(&step)
+                .and_then(|block| dedent(&block))
+                .unwrap_or_else(|| panic!("{workflow}'s clock-settling step has no `run: |` body"));
+            bodies.push((workflow, body));
         }
+        let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
+            unreachable!("exactly two lanes are checked above");
+        };
+        assert_eq!(
+            first_body, second_body,
+            "the clock-settling step has drifted between {first} and {second} — the \
+             copies are kept in sync by hand until the lanes are deduplicated (#294)"
+        );
     }
 
     #[test]
