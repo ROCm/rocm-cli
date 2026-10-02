@@ -1942,6 +1942,19 @@ impl AppPaths {
         self.data_dir.join("telemetry")
     }
 
+    /// The directive file that moves `rocm dash`'s telemetry daemon off wall time
+    /// and onto a logical observation clock (see `docs/release-trust.md`).
+    ///
+    /// `rocm dash` reads it in every build, and nothing in rocm-cli creates it —
+    /// only the E2E harness plants one, in its isolated data root. Both resolve it
+    /// through this one method, so the path the harness plants and the path the
+    /// dashboard reads cannot drift apart. If they did, the dashboard would
+    /// silently stay on wall time, and the clock-driven scenarios would not fail
+    /// outright: they would keep passing, but only by timing.
+    pub fn dash_test_clock_file(&self) -> PathBuf {
+        self.telemetry_state_dir().join("test-clock-offset")
+    }
+
     /// Log file for the rocm-dash telemetry daemon, under the shared logs dir.
     ///
     /// Deliberately under the canonical `AppPaths` data root
