@@ -28,6 +28,7 @@ use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rocm_core::browser::Opener;
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -165,6 +166,18 @@ enum Command {
         /// architecture check.
         #[arg(long, conflicts_with = "distro")]
         report: bool,
+        /// Also offer the prefilled issue form, so the report can be filed.
+        ///
+        /// Still sends nothing. This opens the form with the same content
+        /// `--report` printed, already filled in; it reaches the tracker only
+        /// when you submit it yourself. On a machine with no desktop, or one
+        /// reached over SSH, the link is printed instead of opened.
+        ///
+        /// Requires `--report`, so the content is always shown before the
+        /// form is offered. Not combinable with `--json`, which is for
+        /// scripts, and a script is not a person who can read a form.
+        #[arg(long, requires = "report", conflicts_with = "json")]
+        send: bool,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -2079,7 +2092,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             distro,
             report,
-        }) => diagnose(symptom, top, json, distro, report),
+            send,
+        }) => diagnose(symptom, top, json, distro, report, send),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2756,6 +2770,7 @@ fn diagnose(
     json: bool,
     distro: Option<String>,
     report_requested: bool,
+    send: bool,
 ) -> Result<()> {
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
@@ -2790,7 +2805,7 @@ fn diagnose(
         .is_some_and(|wsl| !wsl.locally_probed);
     let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if report_requested {
-        return show_prepared_report(&examination, &report, json);
+        return show_prepared_report(&examination, &report, json, send);
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2829,11 +2844,50 @@ fn established_entry(report: &rocm_core::DiagnoseReport) -> (Option<&str>, bool)
     })
 }
 
+/// Act on a delivery decision, and say what happened.
+///
+/// Takes the decision rather than making it, and takes the opener rather than
+/// being one. Both for the same reason: the decision is tested in `rocm-core`
+/// against every environment, and this half has to be tested against an opener
+/// that does not exist, on a machine with no browser. A function that decided
+/// and opened could be verified on neither.
+fn perform_delivery(
+    delivery: &rocm_core::report_delivery::Delivery,
+    opener: &dyn Opener,
+) -> String {
+    use rocm_core::report_delivery::{DESTINATION, Delivery};
+    match delivery {
+        // No mail client is started here on purpose, and the reason is worth
+        // the line: this is the branch for a machine held over SSH, or a
+        // server with no mail client at all, where starting one would open on
+        // somebody else's desktop or fail silently. The address is named as
+        // well as the link, because a machine in this state often cannot act
+        // on a `mailto:` at all and the user has to send the mail by hand.
+        Delivery::Show(url) => format!(
+            "Nothing has been sent. To send this yourself, mail the report above to \
+             {DESTINATION}, or open:\n  {url}"
+        ),
+        Delivery::Open(url) => match opener.open(url) {
+            Ok(()) => format!(
+                "Nothing has been sent yet. A prefilled mail to {DESTINATION} was opened, and \
+                 it is sent only when you send it:\n  {url}"
+            ),
+            // A failed open is not a failed command. The user still has the
+            // address and the link, which is the whole of what this offers.
+            Err(error) => format!(
+                "Nothing has been sent. A mail client could not be started ({error}). To send \
+                 this yourself, mail the report above to {DESTINATION}, or open:\n  {url}"
+            ),
+        },
+    }
+}
+
 /// Print the report this machine would contribute, and send nothing.
 fn show_prepared_report(
     examination: &rocm_core::Examination,
     report: &rocm_core::DiagnoseReport,
     json: bool,
+    send: bool,
 ) -> Result<()> {
     let (entry, fix_offered) = established_entry(report);
     // Exit 0 either way. A refusal is this command working, not failing: it
@@ -2850,7 +2904,17 @@ fn show_prepared_report(
                 println!();
                 println!("{}", serde_json::to_string_pretty(&prepared)?);
                 println!();
-                println!("Nothing has been sent. Sending is not implemented yet.");
+                // The content is printed above before this decides anything,
+                // so a report is always read before its form is offered. That
+                // ordering is the promise `--send` makes, and `--send`
+                // requires `--report` so it cannot be skipped.
+                let delivery = rocm_core::report_delivery::deliver(&prepared, send, &|key| {
+                    std::env::var(key).ok()
+                });
+                println!(
+                    "{}",
+                    perform_delivery(&delivery, &rocm_core::browser::SystemOpener)
+                );
             }
             Ok(())
         }
@@ -22166,6 +22230,113 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use rocm_core::browser::Opener;
+    use rocm_core::report_delivery::Delivery;
+
+    use super::perform_delivery;
+
+    /// An opener that records rather than opens, and can be told to fail.
+    ///
+    /// The whole reason the opener is a trait: the real one spawns a browser
+    /// against whatever desktop exists, so neither "it was opened" nor "it was
+    /// deliberately not opened" can be observed in CI without this.
+    struct RecordingOpener {
+        opened: RefCell<Vec<String>>,
+        fails: bool,
+    }
+
+    impl RecordingOpener {
+        fn working() -> Self {
+            Self {
+                opened: RefCell::new(Vec::new()),
+                fails: false,
+            }
+        }
+        fn broken() -> Self {
+            Self {
+                opened: RefCell::new(Vec::new()),
+                fails: true,
+            }
+        }
+        fn opened(&self) -> Vec<String> {
+            self.opened.borrow().clone()
+        }
+    }
+
+    impl Opener for RecordingOpener {
+        fn open(&self, url: &str) -> anyhow::Result<()> {
+            self.opened.borrow_mut().push(url.to_owned());
+            if self.fails {
+                anyhow::bail!("no browser here");
+            }
+            Ok(())
+        }
+    }
+
+    /// Nothing is opened unless the decision was to open.
+    ///
+    /// The assertion that matters is on the opener, not on the wording. A
+    /// message saying no browser was started is satisfied by any string; an
+    /// opener that recorded nothing is the actual claim.
+    #[test]
+    fn a_delivery_that_is_not_an_open_never_reaches_the_browser() {
+        let delivery = Delivery::Show("mailto:nobody@example.invalid".to_owned());
+        let opener = RecordingOpener::working();
+        let said = perform_delivery(&delivery, &opener);
+
+        assert!(
+            opener.opened().is_empty(),
+            "a mail client was started for {delivery:?}, which is the one thing this path must \
+             not do on a machine the user is holding over SSH"
+        );
+        assert!(
+            said.contains("Nothing has been sent"),
+            "the user has to be told nothing left the machine: {said}"
+        );
+        // A machine in this state often cannot act on a `mailto:` at all, so
+        // the address has to be readable on its own, not only inside the link.
+        assert!(
+            said.contains(rocm_core::report_delivery::DESTINATION),
+            "a user who has to send the mail by hand needs the address: {said}"
+        );
+    }
+
+    /// Opening is what an open decision does, and the user is told it is not
+    /// filed yet.
+    #[test]
+    fn an_open_decision_reaches_the_browser_and_is_still_not_a_send() {
+        let url = "https://example.invalid/new?body=x";
+        let opener = RecordingOpener::working();
+        let said = perform_delivery(&Delivery::Open(url.to_owned()), &opener);
+
+        assert_eq!(
+            opener.opened(),
+            vec![url.to_owned()],
+            "premise failed: an open decision must reach the opener, otherwise the cases above \
+             are satisfied by never opening anything"
+        );
+        assert!(
+            said.contains("only when you send it"),
+            "opening a prefilled mail is not sending it, and the user has to know which one \
+             happened: {said}"
+        );
+    }
+
+    /// A browser that will not start still leaves the user the link.
+    #[test]
+    fn a_browser_that_fails_to_start_still_hands_the_user_the_link() {
+        let url = "https://example.invalid/new?body=x";
+        let said = perform_delivery(&Delivery::Open(url.to_owned()), &RecordingOpener::broken());
+
+        assert!(
+            said.contains(url),
+            "the link is the whole of what this offers, so a failed browser must not lose it: \
+             {said}"
+        );
+        assert!(said.contains("Nothing has been sent"));
+    }
 
     /// A diagnosis report holding exactly one finding.
     ///

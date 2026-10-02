@@ -301,6 +301,18 @@ fix` takes the id, not the position.
   GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
   matrix and says that rather than claiming the architecture could not be
   read.
+- `--send`, which requires `--report`, additionally offers a prefilled mail
+  carrying that report. It still sends nothing: the mail opens already filled
+  in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
+  and it leaves the machine only when you send it yourself. Requiring
+  `--report` is what guarantees the content is shown before the mail is
+  offered. A mail client opens only when you asked and the machine looks like
+  a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
+  set, the address and the link are printed instead, which is also what
+  happens on a machine with no mail client. It is not combinable with
+  `--json`, which exists for scripts, and a script is not a person who can
+  read a mail before sending it. Note that a mail carries your address, which
+  the report itself does not.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id

@@ -1194,6 +1194,36 @@ envelope also carries `architecture_matrix`, the same compatibility-matrix
 snapshot stamp a genuine report carries, so a refusal is just as traceable to
 a matrix revision as a report is.
 
+Offer a prefilled mail carrying that report, which still sends nothing:
+
+```bash
+rocm diagnose --report --send
+```
+
+Two argument rules are worth checking by hand, because both are the kind that
+only break when somebody reorders a declaration. `--send` without `--report`
+must be refused, since showing the content first is the guarantee `--send`
+makes. `--send` with `--json` must also be refused: that combination is for
+scripts, and starting a browser from a scripted invocation is not wanted.
+
+Whether `--send` opens a mail client or prints the address and link depends on
+the machine, and the printed line says which happened. It prints rather than
+opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
+`ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
+configured reaches the same printed form, which is why the address appears on
+its own and not only inside the `mailto:` link. That is the common case on
+servers and in containers. The opt-out is the easiest to check on a desktop:
+
+```bash
+ROCM_NO_BROWSER=1 rocm diagnose --report --send
+```
+
+The destination is `ROCmCLI@amd.com`, fixed in code. A report also carries its
+classification in the mail subject, because a mailbox has no labels: the
+subject names the matched catalog entry, or `unrecognised`, then the
+architecture and the distribution. Check that the subject carries no field the
+report body does not.
+
 On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
 `crates/rocm-core/src/report.rs`), the command prints the full `Report`:
 `schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
