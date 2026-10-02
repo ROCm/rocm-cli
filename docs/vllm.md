@@ -13,7 +13,7 @@ The adapter does not install vLLM automatically and does not run CPU mode.
 Install or build vLLM in a ROCm-capable Python environment first, then make the
 `vllm` command visible to ROCm CLI.
 
-Native Windows vLLM serving is skipped in this adapter. Use WSL/Linux for vLLM
+Native Windows vLLM serving is skipped in this adapter. Use WSL or Linux for vLLM
 ROCm serving, or choose a different engine explicitly. No CPU fallback is used.
 
 For ROCm CLI-managed TheRock runtimes, prefer building vLLM from source against
