@@ -90,9 +90,6 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
     is_wsl_host && has_usable_gpu
 }
 
-/// Name of the logical-clock directive file, read from the telemetry state dir.
-const DASH_TEST_CLOCK_FILE: &str = "test-clock-offset";
-
 /// Path of the daemon's logical observation clock, or `None` to use wall time.
 ///
 /// State-based, not compile-time-gated: the file simply does not exist on a
@@ -128,7 +125,7 @@ const DASH_TEST_CLOCK_FILE: &str = "test-clock-offset";
 /// `rocm dash` path, where the TUI owns the terminal (see `logging.rs`) and a
 /// stray write would corrupt the display.
 fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
-    let path = paths.telemetry_state_dir().join(DASH_TEST_CLOCK_FILE);
+    let path = paths.dash_test_clock_file();
     if !path.is_file() {
         return None;
     }
@@ -1076,14 +1073,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Source of the E2E step file that plants the clock directive, read at
-    /// compile time (test builds only) so
-    /// [`e2e_harness_plants_the_file_rocm_dash_reads`] can check its literals
-    /// against production's. Same cross-tree reach `e2e-cucumber`'s
-    /// `installer_fixture.rs` already makes for `install.ps1`.
-    const E2E_DASH_STEPS_SRC: &str =
-        include_str!("../../../tests/e2e-cucumber/tests/e2e/dash_steps.rs");
-
     /// A private scratch directory under `target/`, matching the convention the
     /// bench-parent test below already uses (no `tempfile` dev-dependency in
     /// this crate). Named per test so parallel tests cannot collide.
@@ -1160,7 +1149,7 @@ mod tests {
         let root = scratch_dir("dash-clock-warn");
         let p = paths_at(&root);
         std::fs::create_dir_all(p.telemetry_state_dir()).unwrap();
-        let clock = p.telemetry_state_dir().join(DASH_TEST_CLOCK_FILE);
+        let clock = p.dash_test_clock_file();
         std::fs::write(&clock, "0").unwrap();
 
         let mut resolved = None;
@@ -1193,68 +1182,6 @@ mod tests {
             logs.is_empty(),
             "a wall-time launch must log nothing, got: {logs}"
         );
-    }
-
-    /// `apps/rocm` is a binary crate, so the E2E harness cannot import
-    /// [`DASH_TEST_CLOCK_FILE`]; the file name and the `telemetry`
-    /// subdirectory are a second copy on the harness side, previously kept in
-    /// step by a comment alone. Renaming *or relocating* either side would not
-    /// fail — `rocm dash` would simply not find the planted file and quietly
-    /// use wall time, leaving the dash clock scenarios to time out on an
-    /// unrelated-looking symptom. Pin the two sides together here instead, in
-    /// the every-PR unit lane.
-    #[test]
-    fn e2e_harness_plants_the_file_rocm_dash_reads() {
-        // Anchored on the name and the first string literal after its `=`, not on
-        // the exact single-line spelling: a rustfmt reflow that moves the value
-        // to its own line is not drift and must not fail this.
-        let declared = E2E_DASH_STEPS_SRC
-            .split_once("const DASH_CLOCK_OFFSET_FILE")
-            .and_then(|(_, rest)| rest.split_once('='))
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map(|(value, _)| value)
-            .expect("e2e dash_steps.rs no longer declares DASH_CLOCK_OFFSET_FILE as a literal");
-        assert_eq!(
-            declared, DASH_TEST_CLOCK_FILE,
-            "the E2E harness plants `{declared}`, but `rocm dash` reads `{DASH_TEST_CLOCK_FILE}`"
-        );
-
-        // Check the directory chain inside the harness's own path builder, not
-        // across the whole step file: an unrelated `.join("telemetry")`
-        // elsewhere in it must not be able to satisfy this on its own.
-        let builder = E2E_DASH_STEPS_SRC
-            .split_once("fn dash_clock_path(")
-            .and_then(|(_, rest)| rest.split_once("\n}"))
-            .map(|(body, _)| body)
-            .expect("e2e dash_steps.rs no longer defines `fn dash_clock_path`");
-
-        // Every directory `rocm dash` puts between the data root and the clock
-        // file, in order, then the file itself. Taking the whole relative path
-        // rather than its last component means *relocating* the telemetry state
-        // dir is caught too, not only renaming its leaf.
-        let p = paths();
-        let telemetry = p.telemetry_state_dir();
-        let mut chain: Vec<String> = telemetry
-            .strip_prefix(&p.data_dir)
-            .expect("the telemetry state dir lives under the data root")
-            .components()
-            .map(|c| format!(".join({:?})", c.as_os_str().to_string_lossy()))
-            .collect();
-        chain.push(".join(DASH_CLOCK_OFFSET_FILE)".to_owned());
-
-        let mut cursor = 0;
-        for link in &chain {
-            let offset = builder[cursor..].find(link.as_str()).unwrap_or_else(|| {
-                panic!(
-                    "`rocm dash` reads `{}`, but the E2E harness's `dash_clock_path` does not \
-                     build that path — expected `{link}` after the part already matched. \
-                     Harness body:\n{builder}",
-                    telemetry.join(DASH_TEST_CLOCK_FILE).display()
-                )
-            });
-            cursor += offset + link.len();
-        }
     }
 
     #[test]

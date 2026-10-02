@@ -17,26 +17,6 @@ use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
 const MANAGED_MODEL_PROMPT: &str = "hello from the terminal";
-/// File the daemon's test-only logical clock reads every cycle (see
-/// `rocm_dash_daemon::runner`'s `TestClockDirective` for the grammar).
-///
-/// `rocm dash` looks for exactly `<ROCM_CLI_DATA_DIR>/telemetry/test-clock-offset`
-/// and falls back to wall time when it is absent, so a rename or a move on
-/// either side would drop the whole mechanism without failing: the dashboard
-/// would just run on wall time and these scenarios would time out on a symptom
-/// that points nowhere near the cause.
-///
-/// `apps/rocm` is a binary crate, so this cannot import its
-/// `DASH_TEST_CLOCK_FILE` — and hosting the constant in a library both sides
-/// could depend on would add a first-party crate edge for one string (see
-/// `xtask check-crate-edges`). The two copies are instead pinned to each other
-/// by `dash::tests::e2e_harness_plants_the_file_rocm_dash_reads` in
-/// `apps/rocm/src/dash.rs`, which reads this file's source and fails in the
-/// every-PR unit lane. It needs this constant's value to stay a plain string
-/// literal (formatting is free; a `concat!` is not), and needs `dash_clock_path`
-/// below to keep that name and to keep building the path from `.join(..)`
-/// links — otherwise the guard stops seeing this.
-const DASH_CLOCK_OFFSET_FILE: &str = "test-clock-offset";
 
 /// The services overlay's own panel title, drawn by `draw_services_manager` on
 /// the overlay's border row. It is on screen exactly while the overlay is, so
@@ -1343,15 +1323,70 @@ async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
 /// Path of this scenario's test-clock file, inside the isolated data root the
 /// CLI resolves from `ROCM_CLI_DATA_DIR` — no env var of its own, so the
 /// binary under test carries no test-only branch.
+///
+/// Resolved through `rocm_core::AppPaths::dash_test_clock_file`, the same method
+/// `rocm dash` reads it with, so where the harness plants the file and where the
+/// dashboard looks for it cannot drift apart. Only the data root is the harness's
+/// own: it is the directory this suite hands the CLI as `ROCM_CLI_DATA_DIR`.
 fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
-    world
+    isolated_app_paths(world).dash_test_clock_file()
+}
+
+/// The `AppPaths` the CLI under test resolves for this scenario: the same roots
+/// [`crate::E2eWorld::isolate_env`] hands it as `ROCM_CLI_*_DIR`.
+fn isolated_app_paths(world: &E2eWorld) -> rocm_core::AppPaths {
+    let root = world
         .isolated_root
         .as_ref()
         .expect("scenario has no isolated root")
-        .path()
-        .join("data")
-        .join("telemetry")
-        .join(DASH_CLOCK_OFFSET_FILE)
+        .path();
+    rocm_core::AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        cache_dir: root.join("cache"),
+    }
+}
+
+/// Wait until `rocm dash`'s own client log records that it found the planted
+/// clock file — the WARN it logs only when it switches off wall time.
+///
+/// Without this, nothing proves the dashboard under test is on the logical
+/// clock at all. Measured: with `rocm dash` made to ignore the file, dash-09
+/// still passes, because the 6 s validity window simply elapses on wall time
+/// inside the expiry step's wait. The held-clock assertions then hold only by
+/// timing, which is the flake the clock exists to remove. Checking the log is
+/// deterministic: the line names the exact file, or it never appears.
+///
+/// Polled rather than read once: the client log is written by a non-blocking
+/// appender, so the line can trail the launch slightly.
+///
+/// Takes the resolved paths rather than the world: a `&E2eWorld` held across the
+/// `.await` below would need `E2eWorld: Sync`, which it is not.
+async fn assert_dashboard_reads_the_planted_clock(paths: rocm_core::AppPaths) {
+    let clock = paths.dash_test_clock_file().display().to_string();
+    let log_dir = paths.client_log_dir();
+    let deadline = std::time::Instant::now() + default_timeout();
+    loop {
+        let found = std::fs::read_dir(&log_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+            .any(|log| {
+                log.lines()
+                    .any(|line| line.contains("TEST mode") && line.contains(&clock))
+            });
+        if found {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`rocm dash` never logged that it found the planted clock file {clock} \
+             (searched {}), so it is on wall time and the held-clock assertions \
+             below would pass or fail by timing alone",
+            log_dir.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// Publish a clock directive atomically (write a sibling temp file, then
@@ -1419,6 +1454,8 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 /// 6 s window with margin, and it stays there.
 #[when("dashboard observation time is held")]
 async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
+    // Holding a clock the dashboard never picked up would do nothing, silently.
+    assert_dashboard_reads_the_planted_clock(isolated_app_paths(world)).await;
     write_dash_clock(&dash_clock_path(world), "hold");
 }
 
