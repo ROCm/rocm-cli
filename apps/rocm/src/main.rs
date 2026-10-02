@@ -3997,10 +3997,28 @@ fn managed_startup_exit(spawn: &rocm_core::DetachedSpawn) -> Option<ExitStatus> 
 /// tail of the child's own service log, which is the only record of why it died —
 /// the child is detached, so nothing else reaches the terminal.
 fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
+    managed_engine_startup_failure_detail_polling(
+        status,
+        log_path,
+        MANAGED_ENGINE_STARTUP_LOG_POLL_INTERVAL,
+    )
+}
+
+/// How long to wait between re-reads of an empty service log before giving up on
+/// a tail. A child that died at startup may still be flushing its last lines.
+const MANAGED_ENGINE_STARTUP_LOG_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// [`managed_engine_startup_failure_detail`] with the re-read interval injected,
+/// so a test of the no-log branch need not sit through the real waits.
+fn managed_engine_startup_failure_detail_polling(
+    status: ExitStatus,
+    log_path: &Path,
+    poll_interval: Duration,
+) -> String {
     let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
         for _ in 0..5 {
-            thread::sleep(Duration::from_millis(120));
+            thread::sleep(poll_interval);
             recent_lines = read_optional_tail_lines(log_path, 80, "service log");
             if !recent_lines.is_empty() {
                 break;
@@ -27613,7 +27631,13 @@ install therock";
         fs::create_dir_all(&root).expect("test dir");
         let log_path = root.join("absent.log");
 
-        let detail = managed_engine_startup_failure_detail(exit_status_from_code(1), &log_path);
+        // Zero interval: the re-read loop still runs all of its iterations, so the
+        // branch it guards is exercised, without ~600 ms of real sleeps.
+        let detail = managed_engine_startup_failure_detail_polling(
+            exit_status_from_code(1),
+            &log_path,
+            Duration::ZERO,
+        );
 
         let _ = fs::remove_dir_all(&root);
         assert!(
