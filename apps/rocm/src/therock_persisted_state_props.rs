@@ -247,35 +247,81 @@ fn every_corruption_class_is_wiped_by_managed_python_recording() {
     assert!(wiped.is_empty(), "wiped to defaults: {wiped:?}");
 }
 
-/// The end-to-end path a user can reach without hand-editing `config.json`:
-/// a legacy rocm-dash `config.toml` holding `inf` migrates into a config the
-/// loader rejects, and the next managed-Python step replaces it with defaults.
+/// The end-to-end path a user could reach without hand-editing `config.json`:
+/// a legacy rocm-dash `config.toml` holding `inf`. It used to migrate into a
+/// config the loader rejects, which the next managed-Python step then replaced
+/// with defaults. Now the migration refuses the file, so nothing unreadable is
+/// written, and the managed-Python step meets a missing config, which it may
+/// create.
 #[test]
-#[ignore = "CONFIRMED BUG: legacy `gpu_tick = inf` -> unreadable config.json -> wiped to defaults"]
-fn legacy_inf_tick_migration_then_python_bootstrap_loses_migrated_settings() {
+fn legacy_inf_tick_never_reaches_config_json() {
     let (root, paths) = fresh_paths("legacy-chain");
     std::fs::create_dir_all(&root).unwrap();
     let legacy = root.join("config.toml");
-    std::fs::write(
-        &legacy,
-        "default_engine = \"vllm\"\n[daemon]\ngpu_tick = inf\n[tui]\ntheme = \"nord\"\n",
-    )
-    .unwrap();
-    let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy).unwrap();
-    assert!(migrated.is_some(), "legacy file was migrated");
-    let load_error = RocmCliConfig::load(&paths).expect_err("migrated config is unreadable");
-    eprintln!("load after migration: {load_error:#}");
+    let text = "default_engine = \"vllm\"\n[daemon]\ngpu_tick = inf\n[tui]\ntheme = \"nord\"\n";
+    std::fs::write(&legacy, text).unwrap();
 
-    let _ = record_managed_python_config(&paths, Path::new("/usr/bin/python3"));
-    let after = RocmCliConfig::load(&paths).expect("config is readable again");
-    let _ = std::fs::remove_dir_all(&root);
-    // Migration also refuses to run again: config.json now exists.
-    assert_eq!(
-        after.default_engine.as_deref(),
-        Some("vllm"),
-        "migrated default_engine was silently discarded"
+    let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+        .expect_err("a legacy file with an infinite tick must not migrate");
+    assert!(
+        format!("{error:#}").contains("daemon.gpu_tick = inf"),
+        "unexpected error: {error:#}"
     );
-    assert_eq!(after.dashboard.tui.theme, "nord");
+    assert!(!paths.config_path().exists(), "config.json was written");
+
+    record_managed_python_config(&paths, Path::new("/usr/bin/python3")).unwrap();
+    let after = RocmCliConfig::load(&paths);
+    let legacy_after = std::fs::read_to_string(&legacy).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(after.is_ok(), "config.json is readable: {:?}", after.err());
+    assert_eq!(legacy_after, text, "the legacy TOML was modified");
+}
+
+/// rocm-dash's reader and the migration into `config.json` read the same
+/// legacy file. They must agree on whether it is readable: a file the
+/// dashboard rejects must not be migrated, and one it accepts must migrate
+/// into a `config.json` that loads.
+#[test]
+fn legacy_tick_readers_agree_on_which_files_are_readable() {
+    let ticks = [
+        "0",
+        "0.5",
+        "120",
+        "nan",
+        "inf",
+        "-inf",
+        "-1.0",
+        "-0.0",
+        "1.7976931348623157e308",
+    ];
+    let mut disagreements = Vec::new();
+    for tick in ticks {
+        let (root, paths) = fresh_paths("legacy-agree");
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy = root.join("config.toml");
+        // rocm-dash requires the whole `[daemon]` table, so every other key
+        // holds a value both readers accept; only `instance_tick` varies.
+        std::fs::write(
+            &legacy,
+            format!(
+                "[daemon]\nlisten = \"unix:/tmp/rocm-dash.sock\"\ngpu_tick = 1.0\n\
+                 discovery_tick = 5.0\ninstance_tick = {tick}\n"
+            ),
+        )
+        .unwrap();
+        let dash_accepts = rocm_dash_core::config::Config::load(&legacy).is_ok();
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy);
+        let migration_accepts = matches!(migrated, Ok(Some(_)));
+        let loadable = RocmCliConfig::load(&paths).is_ok();
+        let _ = std::fs::remove_dir_all(&root);
+        if dash_accepts != migration_accepts || !loadable {
+            disagreements.push(format!(
+                "{tick}: dashboard accepts={dash_accepts}, migration accepts={migration_accepts}, \
+                 config.json loadable={loadable}"
+            ));
+        }
+    }
+    assert!(disagreements.is_empty(), "{disagreements:#?}");
 }
 
 // ---------------------------------------------------------------------------
