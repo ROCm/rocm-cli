@@ -5504,8 +5504,24 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Record the managed interpreter under `tools.python` in `config.json`.
+///
+/// A `config.json` that exists but cannot be read is an error here, as it is
+/// for [`RocmCliConfig::load`] itself: it is not "no config yet", and saving
+/// over it would replace the user's active runtime, TheRock folder, providers
+/// and preferences with defaults. The callers fail rather than skip the
+/// record: the install cannot finish against that file anyway (activating the
+/// new runtime loads it strictly), and failing here does so before any runtime
+/// is downloaded.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = RocmCliConfig::load(paths).unwrap_or_default();
+    let mut config = RocmCliConfig::load(paths).with_context(|| {
+        format!(
+            "cannot record the managed Python in {} because that file cannot be read; it was \
+             left unchanged. Repair it, or move it aside to start from default settings, then \
+             run the command again",
+            paths.config_path().display()
+        )
+    })?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -5548,7 +5564,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
             "Using existing Python {version} at {}.",
             manifest.executable.display()
         ));
-        let _ = record_managed_python_config(paths, &manifest.executable);
+        record_managed_python_config(paths, &manifest.executable)?;
         return Ok(PythonLauncher {
             executable: manifest.executable,
             source: "managed",
@@ -5618,7 +5634,7 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
         installed_at_unix_ms: unix_time_millis(),
     };
     save_managed_python_manifest(paths, &manifest)?;
-    let _ = record_managed_python_config(paths, &executable);
+    record_managed_python_config(paths, &executable)?;
     progress_line(format!(
         "Python {version} is ready at {}.",
         executable.display()

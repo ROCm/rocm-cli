@@ -154,7 +154,6 @@ fn corrupt(bytes: &[u8], how: &Corruption) -> Vec<u8> {
 /// that turns "unreadable, fix it" into "valid but empty", and every later
 /// command acts on the empty state.
 #[test]
-#[ignore = "CONFIRMED BUG: record_managed_python_config overwrites an unparseable config.json with defaults"]
 fn managed_python_recording_never_replaces_an_unreadable_config_with_defaults() {
     let total = AtomicUsize::new(0);
     let unreadable = AtomicUsize::new(0);
@@ -212,17 +211,17 @@ fn managed_python_recording_never_replaces_an_unreadable_config_with_defaults() 
 }
 
 /// The property above stops at its first (shrunk) counterexample. This walks
-/// every corruption class once so each is shown to reach the wipe on its own.
+/// every corruption class once, and asserts what the user is told together
+/// with what is left on disk: the error says the file was left unchanged, and
+/// it was, byte for byte.
 #[test]
-#[ignore = "CONFIRMED BUG: every unreadable-config class is wiped, not just truncation"]
-fn every_corruption_class_is_wiped_by_managed_python_recording() {
+fn no_corruption_class_is_wiped_by_managed_python_recording() {
     let classes = [
         Corruption::TruncateAt(40),
         Corruption::NullTick,
         Corruption::RetypeOnboardingDismissed,
         Corruption::TopPOutOfRange,
     ];
-    let mut wiped = Vec::new();
     for how in classes {
         let (root, paths) = fresh_paths("config-wipe-class");
         let mut config = RocmCliConfig {
@@ -237,14 +236,34 @@ fn every_corruption_class_is_wiped_by_managed_python_recording() {
             RocmCliConfig::load(&paths).is_err(),
             "{how:?} is unreadable"
         );
-        let _ = record_managed_python_config(&paths, Path::new("/usr/bin/python3"));
-        let after = RocmCliConfig::load(&paths);
+
+        let error = record_managed_python_config(&paths, Path::new("/usr/bin/python3"))
+            .expect_err("recording over an unreadable config must fail");
+        let after = std::fs::read(paths.config_path()).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        if after.is_ok_and(|after| after.active_runtime_key.is_none()) {
-            wiped.push(format!("{how:?}"));
-        }
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged")
+                && message.contains("config.json"),
+            "{how:?}: unexpected error: {message}"
+        );
+        assert_eq!(after, damaged, "{how:?}: config.json was rewritten");
     }
-    assert!(wiped.is_empty(), "wiped to defaults: {wiped:?}");
+}
+
+/// With no `config.json` at all, recording the managed Python is the first
+/// write and must still succeed: "missing" is defaults, as `load` promises.
+#[test]
+fn managed_python_recording_creates_a_missing_config() {
+    let (root, paths) = fresh_paths("config-missing");
+    record_managed_python_config(&paths, Path::new("/usr/bin/python3")).unwrap();
+    let loaded = RocmCliConfig::load(&paths).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    let tool = loaded.tools.get("python").expect("python was recorded");
+    assert!(tool.managed);
+    assert_eq!(tool.path.as_deref(), Some(Path::new("/usr/bin/python3")));
 }
 
 /// The end-to-end path a user could reach without hand-editing `config.json`:
