@@ -42,3 +42,27 @@ pub(crate) fn workspace_test_artifact_dir() -> PathBuf {
         .join("tests")
         .join("rocmd")
 }
+
+/// Build the record a supervisor would construct for `service_id`, to learn
+/// the paths it derives before the real call does.
+#[cfg(target_os = "linux")]
+pub(crate) fn identity_probe_record(
+    paths: &AppPaths,
+    service_id: &str,
+    port: u16,
+) -> rocm_core::ManagedServiceRecord {
+    rocm_core::ManagedServiceRecord::new(
+        paths,
+        service_id,
+        "llamacpp",
+        "a-model",
+        "a-model",
+        "127.0.0.1",
+        port,
+        "managed",
+        std::process::id(),
+        None,
+        None,
+        Some("gpu_required".to_owned()),
+    )
+}

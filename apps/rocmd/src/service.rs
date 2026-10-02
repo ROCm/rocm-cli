@@ -845,6 +845,8 @@ fn wait_for_service_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::test_support::identity_probe_record;
     use crate::test_support::{temp_app_paths, unique_test_root};
     #[cfg(unix)]
     use crate::watchers::load_service_record;
@@ -1596,6 +1598,64 @@ mod tests {
         assert_eq!(
             reloaded.engine_pid, None,
             "a confirmed stop must clear the engine PID"
+        );
+        Ok(())
+    }
+
+    /// The identity check is only as good as the token the launcher writes down.
+    /// `rocm_core::identity_state` treats a missing token as a best-effort match
+    /// — the legacy `(None, _)` branch — so a record written without one is
+    /// signalled blind, which is the original defect restored in full. Every
+    /// other test here hands itself a record with the token already set, and so
+    /// proves nothing about the code that is supposed to put it there.
+    ///
+    /// This drives the real `supervise_service` and reads the manifest it
+    /// persisted. It is stopped at that first write by making the service log
+    /// path a directory, so the `fs::File::create` immediately after it fails:
+    /// going further reaches the engine spawn, and the failure path past that
+    /// calls `std::process::exit`, which inside a test binary would take the
+    /// whole suite with it.
+    ///
+    /// Linux-only: `rocm_core::process_start_ticks` reads `/proc` and returns
+    /// `None` everywhere else, so on other platforms there is no token to write.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_service_persists_the_supervisor_identity_token() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-records-identity");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-supervise-identity";
+        let log_path = identity_probe_record(&paths, service_id, 11443).log_path;
+        // A directory where the supervisor expects to create a file.
+        fs::create_dir_all(&log_path)?;
+
+        let outcome = supervise_service(
+            &paths,
+            service_id.to_owned(),
+            "llamacpp".to_owned(),
+            "a-model".to_owned(),
+            "a-model".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11443,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let error =
+            outcome.expect_err("the log path is a directory, so the engine spawn is unreachable");
+        assert!(
+            format!("{error:#}").contains("failed to create"),
+            "stopped somewhere other than the log file: {error:#}"
+        );
+        assert!(
+            persisted?.supervisor_start_ticks.is_some(),
+            "supervise_service must persist the supervisor's start-time token beside its PID"
         );
         Ok(())
     }
