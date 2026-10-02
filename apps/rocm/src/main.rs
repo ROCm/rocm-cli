@@ -8829,14 +8829,35 @@ pub(crate) fn activate_runtime(
     let manifest = select_runtime_manifest(&manifests, selector)?;
     validate_runtime_manifest_for_activation(manifest)?;
     let current = current_runtime_manifest(config, &manifests);
-    let previous_runtime_key = current
+    // Re-selecting the runtime already in use is a no-op to the user: they have
+    // not left anything, so there is no new rollback target — and no reason to
+    // forget the one the activation that put them here recorded. Deriving the
+    // target from `current` unconditionally used to clear it, silently removing
+    // the recovery path that activation had just offered.
+    let (previous_runtime_key, previous_runtime_id) = if current
         .as_ref()
-        .map(|manifest| manifest.runtime_key.clone())
-        .filter(|runtime_key| runtime_key != &manifest.runtime_key);
-    let previous_runtime_id = current
-        .as_ref()
-        .map(|manifest| manifest.runtime_id.clone())
-        .filter(|_| previous_runtime_key.is_some());
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key)
+    {
+        let runtime_key = config.previous_runtime_key.clone();
+        let runtime_id = runtime_key
+            .as_deref()
+            .and_then(|runtime_key| {
+                manifests
+                    .iter()
+                    .find(|candidate| candidate.runtime_key == runtime_key)
+            })
+            .map(|previous| previous.runtime_id.clone());
+        (runtime_key, runtime_id)
+    } else {
+        // `current` differs from the requested runtime here by construction, so
+        // this can never record a runtime as its own rollback target.
+        (
+            current
+                .as_ref()
+                .map(|manifest| manifest.runtime_key.clone()),
+            current.as_ref().map(|manifest| manifest.runtime_id.clone()),
+        )
+    };
 
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
