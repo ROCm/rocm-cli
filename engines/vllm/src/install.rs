@@ -651,6 +651,13 @@ fn dry_run_resolved_pin(stdout: &str, pkg: &str) -> Option<String> {
 /// aborts the whole resolution before `uv` ever reaches the index that
 /// actually has torch.
 ///
+/// Uses `--index-url`, not `--extra-index-url`: the latter is kept
+/// pip-compatible by `uv`, meaning it is checked *after* the implicit
+/// default PyPI index, not before it. This call installs a single exact
+/// pin with `--no-deps`, so there is nothing legitimate for PyPI to supply;
+/// leaving it reachable only risks `uv` silently satisfying the pin from a
+/// same-numbered public PyPI release instead of AMD's build.
+///
 /// `--no-deps` matters just as much here as it does in
 /// [`discover_pinned_requirement`]: this torch wheel's own metadata pins an
 /// exact `rocm[libraries]==<version>` dependency, naming the ROCm release
@@ -675,7 +682,7 @@ fn vllm_rocm10_discover_torch_install_args(
     args.push("--no-deps".to_owned());
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
-    args.push("--extra-index-url".to_owned());
+    args.push("--index-url".to_owned());
     args.push(build.torch_index_url.to_owned());
     args
 }
@@ -687,6 +694,14 @@ fn vllm_rocm10_discover_torch_install_args(
 /// [`installed_stack_pins`] found before the full-dependency install ran. A
 /// single call realigns the whole stack together rather than one `uv`
 /// invocation per package.
+///
+/// Uses `--index-url`, for the same reason
+/// [`vllm_rocm10_discover_torch_install_args`] does: torch's pin always
+/// carries a `+rocmX.Y` local version with no PyPI equivalent, but
+/// torchvision/torchaudio do not, so `--extra-index-url`'s lower-than-default
+/// priority would let a same-numbered public PyPI wheel silently win over
+/// AMD's build here, reproducing the exact ABI mismatch this realign step
+/// exists to prevent.
 fn vllm_rocm10_discover_realign_install_args(
     python: &Path,
     build: &VllmRocmDiscoverBuild,
@@ -703,7 +718,7 @@ fn vllm_rocm10_discover_realign_install_args(
     args.push("--no-deps".to_owned());
     args.push("--prerelease".to_owned());
     args.push("allow".to_owned());
-    args.push("--extra-index-url".to_owned());
+    args.push("--index-url".to_owned());
     args.push(build.torch_index_url.to_owned());
     args
 }
@@ -1708,6 +1723,12 @@ mod tests {
         assert!(args.contains(&"allow".to_owned()));
         assert!(args.contains(&build.torch_index_url.to_owned()));
         assert!(
+            args.contains(&"--index-url".to_owned()),
+            "{args:?} must use --index-url, not --extra-index-url, or a same-numbered public \
+             PyPI wheel can silently outrank AMD's build"
+        );
+        assert!(!args.contains(&"--extra-index-url".to_owned()));
+        assert!(
             !args.contains(&build.vllm_index_url.to_owned()),
             "{args:?} must never reference vllm_index_url, or `uv` may probe torch under it \
              and hit a fatal 403 from a nonexistent sub-path"
@@ -1913,7 +1934,8 @@ exit 0
         );
 
         let torch_install = real_installs[0];
-        assert!(torch_install.contains(&"--extra-index-url".to_owned()));
+        assert!(torch_install.contains(&"--index-url".to_owned()));
+        assert!(!torch_install.contains(&"--extra-index-url".to_owned()));
         assert!(!torch_install.contains(&"--config-file".to_owned()));
 
         let remaining_install = real_installs[1];
@@ -1938,7 +1960,8 @@ exit 0
              or the full-dependency resolve can leave an ABI-incompatible build in place: \
              {stack_realign:?}"
         );
-        assert!(stack_realign.contains(&"--extra-index-url".to_owned()));
+        assert!(stack_realign.contains(&"--index-url".to_owned()));
+        assert!(!stack_realign.contains(&"--extra-index-url".to_owned()));
         assert!(!stack_realign.contains(&"--config-file".to_owned()));
 
         Ok(())
