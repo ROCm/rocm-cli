@@ -38,31 +38,47 @@ use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 /// PyPI-style simple index (`rocm`, `torch`, ...) and a TheRock tarball
 /// catalogue whose "version" is just the middle of a file name.
 ///
-/// Every entry is a shape one of those sources really publishes:
+/// Every entry is a shape one of those sources really publishes, and most were
+/// chosen because `parse_version` — the strict grammar gate, which the
+/// comparator used to order with — rejects them:
 /// * `7.9.0` / `7.10.0` — the numeric-vs-lexicographic near miss.
 /// * `7.9` — a two-component name (tarball catalogue, host-reported ROCm).
 /// * `7.0.0rc1` / `7.0.0a1` / `7.0.0b1` — PEP 440 pre-releases. `rc` and `a`
-///   are understood by `parse_version`; `b` (beta) is not, and betas are
+///   are in `parse_version`'s grammar; `b` (beta) is not, and betas are
 ///   completely ordinary on PyPI.
-/// * `7.0.0.post1` / `7.0.0.dev1` — PEP 440 post/dev releases, also unparsed.
+/// * `7.0.0.post1` / `7.0.0.dev1` — PEP 440 post/dev releases, also outside it.
 /// * `7.9.0+local` — local version metadata.
 /// * `07.9.0` — leading zero.
+/// * `7.0.0rc9` / `7.0.0rc10` — a stage number where the numeric and the
+///   lexicographic answer differ, so a `stage_number` compared as text is
+///   caught. (`7.0.0rc20250929` / `7.0.0rc20251001` have equal digit counts and
+///   cannot distinguish the two.)
 /// * `7.0.0rc20250929` — TheRock's real nightly date-stamped rc.
+/// * `7.9rc1` — a stage riding on a two-component version, which is the one
+///   `parse_version_for_ordering` branch nothing else here reaches.
+/// * `custom-build` — not a version at all. A manifest adopted from an existing
+///   environment carries whatever its `rocm_sdk` probe reported, so the
+///   comparator's unreadable arms are reachable in production and have to be
+///   reachable here too.
 const VERSIONS: &[&str] = &[
     "7.0.0",
     "7.0.0a1",
     "7.0.0b1",
     "7.0.0rc1",
     "7.0.0rc2",
+    "7.0.0rc9",
+    "7.0.0rc10",
     "7.0.0rc20250929",
     "7.0.0rc20251001",
     "7.0.0.post1",
     "7.0.0.dev1",
     "7.9",
+    "7.9rc1",
     "7.9.0",
     "7.9.0+local",
     "07.9.0",
     "7.10.0",
+    "custom-build",
 ];
 
 const CHANNELS: &[&str] = &["release", "nightly"];
@@ -97,6 +113,16 @@ fn version_list() -> impl Strategy<Value = Vec<String>> {
 ///
 /// Returns `None` when either side is unreadable, so unparseable junk never
 /// asserts an intended order.
+///
+/// Note what this oracle is and is not. It caught the original defect because
+/// the two parsers really did disagree. Now that `parse_host_version` defers to
+/// the same parser the comparator orders with, it can no longer independently
+/// confirm *what* the order should be — it confirms that the comparator does
+/// not contradict the parsed key, which still catches a reversed comparison or
+/// a tiebreak applied ahead of the numeric key. The semantics themselves are
+/// pinned by the hand-written ladder in
+/// `compare_version_strings_orders_pep440_stages`, whose expected values are
+/// written out rather than derived from the implementation.
 fn oracle(left: &str, right: &str) -> Option<Ordering> {
     let left: ParsedVersion = parse_host_version(left)?;
     let right: ParsedVersion = parse_host_version(right)?;
@@ -562,69 +588,144 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal reproducers
+// Regression tests
 // ---------------------------------------------------------------------------
 //
 // The properties above are the detectors; these pin the exact inputs proptest
-// shrank to, so the defects stay reproducible regardless of which equivalent
-// counterexample a future shrink lands on. Each asserts the *current* (wrong)
-// behaviour and says what it must become once the comparator is fixed.
+// shrank to when the comparator mixed a numeric and a string relation, so the
+// specific defects stay covered regardless of which equivalent counterexample a
+// future shrink lands on. Each names the behaviour it used to have.
 
-/// `compare_version_strings` has a three-element cycle over version strings a
-/// PEP 440 index publishes verbatim.
+/// `compare_version_strings` orders one release's stages the way PEP 440 does.
 ///
-/// `7.0.0 < 7.0.0b1` and `7.0.0b1 < 7.0.0rc1`, but `7.0.0 > 7.0.0rc1`. The
-/// cycle exists because the comparator falls back to a plain string compare
-/// whenever either side misses `parse_version`'s `X.Y.Z[rcN|aN]` grammar —
-/// `b1` (beta), `.post1`, `.dev1` and a missing patch component all miss it —
-/// while parseable pairs are compared numerically. Mixing the two relations in
-/// one comparator cannot be transitive, so `sort_by` has no defined result.
+/// It used to have a three-element cycle here — `7.0.0 < 7.0.0b1`, `7.0.0b1 <
+/// 7.0.0rc1`, yet `7.0.0 > 7.0.0rc1` — because it fell back to a plain string
+/// compare whenever either side missed `parse_version`'s `X.Y.Z[rcN|aN]`
+/// grammar. `b1` (beta), `.post1`, `.dev1` and a missing patch component all
+/// miss it, while parseable pairs were compared numerically, and mixing two
+/// relations in one comparator cannot be transitive.
 #[test]
-fn repro_compare_version_strings_has_a_cycle() {
-    assert_eq!(compare_version_strings("7.0.0", "7.0.0b1"), Ordering::Less);
+fn compare_version_strings_orders_pep440_stages() {
+    // dev < alpha < beta < rc < final < post, all within 7.0.0.
+    let ascending = [
+        "7.0.0.dev1",
+        "7.0.0a1",
+        "7.0.0b1",
+        "7.0.0rc1",
+        "7.0.0rc2",
+        "7.0.0",
+        "7.0.0.post1",
+    ];
+    for (index, earlier) in ascending.iter().enumerate() {
+        for later in &ascending[index + 1..] {
+            assert_eq!(
+                compare_version_strings(earlier, later),
+                Ordering::Less,
+                "{earlier} must precede {later}"
+            );
+            assert_eq!(
+                compare_version_strings(later, earlier),
+                Ordering::Greater,
+                "{later} must follow {earlier}"
+            );
+        }
+    }
+
+    // The pairs that used to form the cycle, stated directly.
+    assert_eq!(
+        compare_version_strings("7.0.0", "7.0.0b1"),
+        Ordering::Greater
+    );
     assert_eq!(
         compare_version_strings("7.0.0b1", "7.0.0rc1"),
         Ordering::Less
     );
-    // Transitivity demands `Less`; the comparator says the opposite.
     assert_eq!(
         compare_version_strings("7.0.0", "7.0.0rc1"),
         Ordering::Greater
     );
 
-    // The same cycle with `.post1`, which is what a rebuilt wheel carries.
+    // A date-stamped nightly rc orders by its number, not as text.
     assert_eq!(
-        compare_version_strings("7.0.0", "7.0.0.post1"),
-        Ordering::Less
-    );
-    assert_eq!(
-        compare_version_strings("7.0.0.post1", "7.0.0rc1"),
+        compare_version_strings("7.0.0rc20250929", "7.0.0rc20251001"),
         Ordering::Less
     );
 }
 
-/// A two-component version is compared as text, so `7.9` reads as newer than
-/// `7.10.0`.
+/// A two-component version is a release, not a string: `7.9` is `7.9.0`, which
+/// precedes `7.10.0`.
 ///
-/// `parse_host_version`, in the same module, reads `7.9` as `7.9.0` and gets
-/// the opposite answer — the module disagrees with itself about which build is
-/// newer.
+/// This used to compare as text and report `Greater`, disagreeing with
+/// `parse_host_version` in the same module, which already read `7.9` as
+/// `7.9.0`. Both now share one parser, so the module cannot contradict itself.
 #[test]
-fn repro_compare_version_strings_inverts_7_9_against_7_10_0() {
-    assert_eq!(
-        compare_version_strings("7.9", "7.10.0"),
-        Ordering::Greater,
-        "should be Less: 7.9 is 7.9.0, which precedes 7.10.0"
-    );
+fn compare_version_strings_orders_7_9_below_7_10_0() {
+    assert_eq!(compare_version_strings("7.9", "7.10.0"), Ordering::Less);
+    assert_eq!(compare_version_strings("7.10.0", "7.9"), Ordering::Greater);
     assert_eq!(oracle("7.9", "7.10.0"), Some(Ordering::Less));
+
+    // A stage may ride on the minor component when no patch was given, so
+    // `7.9rc1` is `7.9.0rc1` and precedes `7.9`. Dropping the stage on a
+    // two-component version would silently make these two equal.
+    assert_eq!(compare_version_strings("7.9rc1", "7.9"), Ordering::Less);
+    assert_eq!(compare_version_strings("7.9rc1", "7.9.0"), Ordering::Less);
+    assert_eq!(
+        compare_version_strings("7.9rc1", "7.8.0"),
+        Ordering::Greater
+    );
+
+    // Numerically equal but textually different stays a *total* order: the two
+    // spellings are separated by the string, never reported as equal.
+    assert_eq!(compare_version_strings("7.9", "7.9.0"), Ordering::Less);
+    assert_eq!(
+        compare_version_strings("7.9.0+local", "7.9.0"),
+        Ordering::Greater
+    );
+    assert_eq!(oracle("7.9", "7.9.0"), Some(Ordering::Equal));
 }
 
-/// Which version an install picks depends on the order the index listed them.
+/// A string the ordering parser cannot read sorts below every version it can,
+/// and unreadable strings are ordered against each other by the string.
+///
+/// This is the position that replaced the old silent switch to a string
+/// compare. Sorting low is the conservative end: `select_rocm_version` takes
+/// the maximum, so junk can only be selected when every candidate is junk.
+#[test]
+fn compare_version_strings_places_unreadable_versions_below_readable_ones() {
+    // Not a release segment this tool models (four components), a bare stage
+    // label, and outright prose.
+    for unreadable in ["7.1.2.3", "7.0.0rc", "latest", ""] {
+        assert_eq!(
+            compare_version_strings(unreadable, "7.0.0.dev1"),
+            Ordering::Less,
+            "{unreadable} must sort below the lowest readable version"
+        );
+        assert_eq!(
+            compare_version_strings("7.0.0.dev1", unreadable),
+            Ordering::Greater
+        );
+    }
+    assert_eq!(compare_version_strings("alpha", "beta"), Ordering::Less);
+
+    // A readable candidate wins over an unreadable one however they are listed.
+    for listed in [["latest", "7.0.0"], ["7.0.0", "latest"]] {
+        let versions = listed.map(str::to_owned);
+        assert_eq!(
+            select_rocm_version(super::TheRockChannel::Nightly, &versions, None).as_deref(),
+            Some("7.0.0")
+        );
+    }
+}
+
+/// Which version an install picks is a function of the candidate set, not of
+/// the order the index listed them in.
 ///
 /// `parse_simple_index_versions` returns versions in index-document order, so
-/// this is the publisher's HTML ordering deciding which build a user gets.
+/// this used to let the publisher's HTML ordering decide which build a user
+/// got: these same three versions gave `7.0.0a1` in one order and
+/// `7.0.0.post1` in the other.
 #[test]
-fn repro_select_rocm_version_depends_on_index_order() {
+fn select_rocm_version_ignores_index_order() {
     let listed_one = [
         "7.0.0.post1".to_owned(),
         "7.0.0".to_owned(),
@@ -637,33 +738,32 @@ fn repro_select_rocm_version_depends_on_index_order() {
     ];
     let first = select_rocm_version(super::TheRockChannel::Nightly, &listed_one, None);
     let second = select_rocm_version(super::TheRockChannel::Nightly, &listed_two, None);
-    assert_ne!(
-        first, second,
-        "the same three versions in two orders give two different answers"
-    );
-    // Neither is right: `7.0.0.post1` is the newest of the three.
-    assert_eq!(first.as_deref(), Some("7.0.0a1"));
-    assert_eq!(second.as_deref(), Some("7.0.0.post1"));
+    assert_eq!(first, second, "index order must not change the answer");
+    // `7.0.0.post1` is the newest of the three, and an alpha never wins.
+    assert_eq!(first.as_deref(), Some("7.0.0.post1"));
 }
 
-/// `select_rocm_version` does not return the newest candidate.
+/// `select_rocm_version` returns the newest candidate.
+///
+/// It used to return `7.9` here, because `7.9` beat `7.10.0` as text.
 #[test]
-fn repro_select_rocm_version_picks_the_older_of_two() {
+fn select_rocm_version_picks_the_newer_of_two() {
     let versions = ["7.10.0".to_owned(), "7.9".to_owned()];
     assert_eq!(
         select_rocm_version(super::TheRockChannel::Nightly, &versions, None).as_deref(),
-        Some("7.9"),
-        "should be 7.10.0"
+        Some("7.10.0")
     );
 }
 
-/// The update verdict points the wrong way in both directions.
+/// The update verdict points the same way as the version order.
 ///
-/// `AheadOfIndex` makes `update_available()` false, so `rocm update --apply`
-/// reports "no newer runtime found" and installs nothing; `UpdateAvailable`
-/// makes it proceed and install `latest_version`.
+/// Both directions used to be inverted for this pair. `AheadOfIndex` makes
+/// `update_available()` false, so `rocm update --apply` reported "no newer
+/// runtime found" for a runtime that really was a release behind;
+/// `UpdateAvailable` made it proceed and install `latest_version`, which for an
+/// installed `7.10.0` against an index offering `7.9` was a silent downgrade.
 #[test]
-fn repro_runtime_freshness_offers_a_downgrade_and_hides_an_upgrade() {
+fn runtime_freshness_follows_the_version_order() {
     let at = |version: &str| {
         manifest(
             "therock-release-wheel-gfx120X-all-runtime".to_owned(),
@@ -676,15 +776,14 @@ fn repro_runtime_freshness_offers_a_downgrade_and_hides_an_upgrade() {
         )
     };
 
-    // Installed 7.10.0, index offers 7.9 -> the CLI calls 7.9 an update.
+    // Installed 7.10.0, index offers 7.9 -> nothing to install.
     let newer_installed = at("7.10.0");
     assert_eq!(
         runtime_freshness(&newer_installed, "7.9", None, &newer_installed.runtime_key),
-        RuntimeFreshness::UpdateAvailable,
-        "should be AheadOfIndex"
+        RuntimeFreshness::AheadOfIndex
     );
 
-    // Installed 7.9, index offers 7.10.0 -> the CLI refuses to update.
+    // Installed 7.9, index offers 7.10.0 -> a real upgrade is offered.
     let older_installed = at("7.9");
     assert_eq!(
         runtime_freshness(
@@ -693,8 +792,20 @@ fn repro_runtime_freshness_offers_a_downgrade_and_hides_an_upgrade() {
             None,
             &older_installed.runtime_key
         ),
-        RuntimeFreshness::AheadOfIndex,
-        "should be UpdateAvailable"
+        RuntimeFreshness::UpdateAvailable
+    );
+
+    // A pre-release installed against its own final release is an upgrade, and
+    // the final release against the pre-release is not.
+    let prerelease = at("7.0.0rc1");
+    assert_eq!(
+        runtime_freshness(&prerelease, "7.0.0", None, &prerelease.runtime_key),
+        RuntimeFreshness::UpdateAvailable
+    );
+    let final_release = at("7.0.0");
+    assert_eq!(
+        runtime_freshness(&final_release, "7.0.0rc1", None, &final_release.runtime_key),
+        RuntimeFreshness::AheadOfIndex
     );
 }
 
@@ -867,6 +978,16 @@ fn generator_reach_report() {
     assert!(
         pair_mixed_parse > SAMPLES / 20,
         "generator rarely mixes parseable and unparseable versions"
+    );
+    // The comparator has an arm for a version the *ordering* parser cannot
+    // read, and it is only exercised if the generator can produce one. Guarding
+    // on `pair_mixed_parse` alone does not cover this: that counter is about
+    // `parse_version`'s strict grammar, and every entry in `VERSIONS` could be
+    // readable for ordering while still mixing under the strict one.
+    assert!(
+        pair_oracle_comparable < pair_total,
+        "generator never produces a version the ordering parser cannot read, so \
+         the comparator's unreadable arms go unexercised"
     );
     assert!(
         set_with_timestamp_tie > SAMPLES / 20,
