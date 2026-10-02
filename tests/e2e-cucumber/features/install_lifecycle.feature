@@ -145,6 +145,21 @@ Feature: Release install lifecycle
     Then the removal is reported as complete
     And the local server this machine manages is no longer running
 
+  # EAI-8014: when a managed service record cannot be read, uninstall cannot tell
+  # whether a server is still running, so it must refuse rather than delete the
+  # tooling that would be needed to stop it.
+  @id:lifecycle-linux-uninstall-refuses-unreadable-record @lifecycle @requires-os:linux
+  Scenario: lifecycle-25 - Linux - uninstall refuses and keeps everything when a service record cannot be read
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And a managed service record that cannot be parsed
+    When the user uninstalls from the installed binary
+    Then the removal is refused with advice to repair or delete that record
+    And the installed rocm binary and manifest are still present
+    And the isolated XDG state is still present
+
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
 
   @id:lifecycle-windows-install-signed @lifecycle @requires-os:windows

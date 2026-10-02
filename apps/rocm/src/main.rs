@@ -543,6 +543,10 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    ///
+    /// Managed model servers that are still running are stopped first. If one
+    /// cannot be stopped, nothing is removed, the command exits non-zero, and
+    /// it names what to repair or stop by hand.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -18765,9 +18769,6 @@ fn stop_managed_services_before_uninstall(paths: &AppPaths) -> Result<ManagedSer
                 continue;
             }
             if verdict == StoppedRecordVerdict::BlockAuthRefused {
-                report
-                    .stopped
-                    .retain(|stopped| stopped != &record.service_id);
                 report.failed.push(FailedManagedServiceStop {
                     service_id: record.service_id.clone(),
                     reason: format!(
@@ -40059,6 +40060,38 @@ ID_LIKE="suse opensuse"
         let mut child = child;
         let _ = child.kill();
         let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_plan_warning_for_only_stopped_records_promises_no_stop() {
+        let (root, paths) = test_paths("uninstall-warning-stopped-records");
+        let mut record = managed_record_for_pid(&paths, u32::MAX - 1, None);
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let plan = build_uninstall_plan(
+            &paths,
+            &UninstallOptions {
+                yes: true,
+                force_dev_binaries: true,
+                ..UninstallOptions::default()
+            },
+        )
+        .expect("build the plan");
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("managed service record"))
+            .expect("the plan warns about managed services");
+        assert!(
+            warning.contains("none is recorded as running"),
+            "records that are not live must be described as such: {warning}"
+        );
+        assert!(
+            !warning.contains("will be stopped"),
+            "no stop is promised when nothing is live: {warning}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

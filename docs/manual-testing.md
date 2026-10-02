@@ -375,3 +375,21 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall With a Running Managed Server
+
+Start a managed server (`rocm serve <model>`), then run:
+
+```powershell
+rocm uninstall --yes
+```
+
+Expected result:
+
+- The plan warns the server will be stopped before removal.
+- The server is stopped, then the files are removed and the command exits 0.
+
+To check the refusal path, corrupt a file under the `services` directory
+(for example write `{` into `services/bad.json`) and run `rocm uninstall --yes`
+again. It must exit non-zero, name the file, advise repairing or deleting it,
+and leave the install, config, and data directories in place.

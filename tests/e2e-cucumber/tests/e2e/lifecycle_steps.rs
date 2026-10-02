@@ -59,6 +59,7 @@ pub struct LifecycleState {
     /// service record so uninstall must stop it. Killed on `Drop` if a scenario
     /// fails before uninstall reaches it, so no scenario leaks a process.
     managed_server: Option<std::process::Child>,
+    broken_record: Option<PathBuf>,
 }
 
 impl Drop for LifecycleState {
@@ -397,6 +398,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_data: None,
         smoke_cache: None,
         managed_server: None,
+        broken_record: None,
     });
 }
 
@@ -527,6 +529,21 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
         },
     );
     state_mut(world).managed_server = Some(server);
+}
+
+/// An unparseable `*.json` under the isolated `services/` dir: the CLI cannot
+/// tell whether it describes a running server.
+#[given("a managed service record that cannot be parsed")]
+async fn given_unparseable_service_record(world: &mut E2eWorld) {
+    let services_dir = state(world)
+        .smoke_data
+        .as_ref()
+        .expect("isolated data dir must be seeded before planting a service record")
+        .join("services");
+    std::fs::create_dir_all(&services_dir).expect("failed to create services dir");
+    std::fs::write(services_dir.join("broken.json"), b"{ not json")
+        .expect("failed to write unparseable record");
+    state_mut(world).broken_record = Some(services_dir.join("broken.json"));
 }
 
 // ── When: package ──────────────────────────────────────────────────────
@@ -987,7 +1004,9 @@ async fn when_uninstall(world: &mut E2eWorld) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    state_mut(world).last_output = combined;
+    let st = state_mut(world);
+    st.last_output = combined;
+    st.last_rc = output.status.code().unwrap_or(-1);
 }
 
 #[when("the user uninstalls from the installed binary keeping config data and cache")]
@@ -1264,6 +1283,56 @@ async fn then_removal_complete(world: &mut E2eWorld) {
     assert!(
         out.contains("uninstall complete"),
         "uninstall did not report completion:\n{out}"
+    );
+}
+
+#[then("the removal is refused with advice to repair or delete that record")]
+async fn then_removal_refused(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    let record = st.broken_record.as_ref().expect("no broken record planted");
+    assert_ne!(
+        st.last_rc, 0,
+        "uninstall succeeded despite an unreadable record:\n{out}"
+    );
+    assert!(
+        out.contains("repair or delete"),
+        "refusal did not advise repairing or deleting the record:\n{out}"
+    );
+    assert!(
+        out.contains(&record.display().to_string()),
+        "refusal did not name the unreadable record {}:\n{out}",
+        record.display()
+    );
+    assert!(
+        !out.contains("uninstall complete"),
+        "refused uninstall still reported completion:\n{out}"
+    );
+}
+
+#[then("the installed rocm binary and manifest are still present")]
+async fn then_install_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    for path in [
+        installed_binary(&st.install_dir, "rocm"),
+        st.install_dir.join(".rocm-cli-manifest"),
+    ] {
+        assert!(
+            path.exists(),
+            "refused uninstall removed {}",
+            path.display()
+        );
+    }
+}
+
+#[then("the isolated XDG state is still present")]
+async fn then_xdg_kept(world: &mut E2eWorld) {
+    let st = state(world);
+    let record = st.broken_record.as_ref().expect("no broken record planted");
+    assert!(
+        record.exists(),
+        "refused uninstall removed {}",
+        record.display()
     );
 }
 
