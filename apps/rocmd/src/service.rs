@@ -119,7 +119,8 @@ const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 /// What a stop did about one PID recorded in a service manifest.
 struct RecordedPidStop {
     pid: u32,
-    /// Which recorded PID this is: `supervisor` or `engine`.
+    /// Which recorded PID this is: `supervisor`, `engine`, or
+    /// `supervisor_and_engine` when the record holds the same PID for both.
     role: &'static str,
     /// Stable label for what happened, from
     /// [`rocm_core::TerminationOutcome::as_str`], plus `self` for the stopping
@@ -170,6 +171,9 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> Vec<Recorde
             continue;
         };
         if let Some(existing) = entries.iter_mut().find(|(seen, _, _)| *seen == pid) {
+            // Only the engine entry can land here, aliasing the supervisor: the
+            // one PID is both, and is reported as both.
+            existing.1 = "supervisor_and_engine";
             if existing.2.is_none() {
                 existing.2 = ticks;
             }
@@ -1681,6 +1685,50 @@ mod tests {
         assert_eq!(
             reloaded.stop_requested_unix_ms, None,
             "a confirmed stop must clear the deferred-cleanup marker"
+        );
+        Ok(())
+    }
+
+    /// A launcher that is also the server is recorded under both roles. The
+    /// stop handles that PID once, and must report it under both.
+    #[test]
+    fn a_pid_recorded_as_supervisor_and_engine_is_reported_under_both_roles() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-aliased-pid-role");
+        paths.ensure()?;
+        // Not running, so the stop confirms it without signalling anything.
+        let aliased_pid = 999_999_999;
+        let service_id = "svc-aliased-pid-role";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11449,
+            "managed",
+            aliased_pid,
+            None,
+            None,
+            None,
+        );
+        record.engine_pid = Some(aliased_pid);
+        record.status = "ready".to_owned();
+        record.write()?;
+
+        let result = stop_managed_service(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        let outcomes = value
+            .get("pid_outcomes")
+            .and_then(Value::as_array)
+            .context("pid_outcomes")?;
+        assert_eq!(outcomes.len(), 1, "{value}");
+        assert_eq!(
+            outcomes[0].get("role").and_then(Value::as_str),
+            Some("supervisor_and_engine"),
+            "{value}"
         );
         Ok(())
     }
