@@ -20,6 +20,10 @@ __pycache__/
 /plans/
 /workspace/
 /e2e-consolidated-report.md
+# proptest writes failing-case seeds here. The classification corpora are swept
+# exhaustively by deterministic tests alongside the properties, so a regression
+# cannot hide behind seed luck and these files carry no coverage of their own.
+**/proptest-regressions/
 
 # Sphinx docs: _toc.yml is generated from _toc.yml.in at build time
 docs/rocm-docs/sphinx/_toc.yml

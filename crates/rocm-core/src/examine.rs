@@ -2391,6 +2391,15 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
     e.msvc_redist_present = Some(present);
 }
 
+/// Property-based coverage of the pure GPU classifiers above.
+///
+/// A child module of `examine` rather than a sibling, so it can reach the
+/// private classifiers here *and* the crate-root install-family tables it has
+/// to cross-check them against.
+#[cfg(test)]
+#[path = "examine_proptests.rs"]
+mod proptests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
