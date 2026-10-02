@@ -4381,6 +4381,14 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         value if value.starts_with("gfx1153") => Some("gfx1153".to_owned()),
         "gfx1200" | "gfx1201" => Some("gfx120X-all".to_owned()),
         value if value.starts_with("gfx125") => Some("gfx125X-dcgpu".to_owned()),
+        // Renoir / Cezanne / Lucienne / Barcelo: Vega-architecture *integrated*
+        // graphics, so the `gfx90` catch-all below would file it under
+        // `gfx90X-dcgpu` — a datacenter family, which also makes vLLM the
+        // preferred serving engine. It gets a single-target family of its own,
+        // like gfx900/gfx906/gfx908/gfx90a beside it. Whether a channel
+        // publishes a gfx90c payload is the index's answer, not this table's:
+        // when it does not, the install says so by name.
+        value if value.starts_with("gfx90c") => Some("gfx90c".to_owned()),
         value if value.starts_with("gfx900") => Some("gfx900".to_owned()),
         value if value.starts_with("gfx906") => Some("gfx906".to_owned()),
         value if value.starts_with("gfx908") => Some("gfx908".to_owned()),
@@ -4417,6 +4425,7 @@ pub const fn known_therock_families() -> &'static [&'static str] {
         "gfx906",
         "gfx908",
         "gfx90a",
+        "gfx90c",
         "gfx94X-dcgpu",
         "gfx950-dcgpu",
         "gfx101X-dgpu",
@@ -5066,6 +5075,14 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "8040s",
         gfx_target: "gfx1151",
     },
+    AmdMarketingGfxTarget {
+        pattern: "strix halo",
+        gfx_target: "gfx1151",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "ryzen ai max",
+        gfx_target: "gfx1151",
+    },
     // RDNA3.5 APUs.
     AmdMarketingGfxTarget {
         pattern: "890m",
@@ -5076,6 +5093,10 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1150",
     },
     AmdMarketingGfxTarget {
+        pattern: "strix point",
+        gfx_target: "gfx1150",
+    },
+    AmdMarketingGfxTarget {
         pattern: "860m",
         gfx_target: "gfx1152",
     },
@@ -5083,11 +5104,20 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "840m",
         gfx_target: "gfx1152",
     },
+    // Krackan Point. `gfx_target_from_amd_pci_device_id("1114")` and the
+    // 860M/840M SKUs it sells as both say gfx1152, and gfx1150 and gfx1152 are
+    // separate TheRock build families, so naming it gfx1150 picked the wrong
+    // runtime build.
+    AmdMarketingGfxTarget {
+        pattern: "krackan",
+        gfx_target: "gfx1152",
+    },
     AmdMarketingGfxTarget {
         pattern: "820m",
         gfx_target: "gfx1153",
     },
-    // RDNA3 APUs.
+    // RDNA3 APUs. `lspci` prints the codename with a trailing die number
+    // (`Phoenix1`, `Phoenix3`), which is a different token from `phoenix`.
     AmdMarketingGfxTarget {
         pattern: "780m",
         gfx_target: "gfx1103",
@@ -5100,6 +5130,26 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         pattern: "740m",
         gfx_target: "gfx1103",
     },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix1",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix2",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "phoenix3",
+        gfx_target: "gfx1103",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "hawk point",
+        gfx_target: "gfx1103",
+    },
     // RDNA2 APUs.
     AmdMarketingGfxTarget {
         pattern: "680m",
@@ -5110,7 +5160,15 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
         gfx_target: "gfx1035",
     },
     AmdMarketingGfxTarget {
+        pattern: "rembrandt",
+        gfx_target: "gfx1035",
+    },
+    AmdMarketingGfxTarget {
         pattern: "610m",
+        gfx_target: "gfx1036",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "raphael",
         gfx_target: "gfx1036",
     },
     AmdMarketingGfxTarget {
@@ -5120,6 +5178,34 @@ const AMD_MARKETING_GFX_TARGETS: &[AmdMarketingGfxTarget] = &[
     AmdMarketingGfxTarget {
         pattern: "van gogh",
         gfx_target: "gfx1033",
+    },
+    // `lspci` spells it as one word, and the Steam Deck's own display name is
+    // the part number rather than any Radeon model.
+    AmdMarketingGfxTarget {
+        pattern: "vangogh",
+        gfx_target: "gfx1033",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "custom gpu 0405",
+        gfx_target: "gfx1033",
+    },
+    // Vega-based Ryzen 4000/5000 iGPUs. These sell as a bare "AMD Radeon
+    // Graphics", so the codename `lspci` reports is the only usable signal.
+    AmdMarketingGfxTarget {
+        pattern: "renoir",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "cezanne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "lucienne",
+        gfx_target: "gfx90c",
+    },
+    AmdMarketingGfxTarget {
+        pattern: "barcelo",
+        gfx_target: "gfx90c",
     },
 ];
 
@@ -9962,6 +10048,40 @@ mod tests {
         assert_eq!(
             normalize_therock_family("gfx1103"),
             Some("gfx110X-all".to_owned())
+        );
+    }
+
+    /// A Renoir-class iGPU is its own family, not a datacenter one.
+    ///
+    /// gfx90c is Vega-architecture *integrated* graphics, so the `gfx90`
+    /// catch-all would answer `gfx90X-dcgpu` — which is not just a wrong label:
+    /// `preferred_serve_engine_for_therock_family` reads `-dcgpu` and picks
+    /// vLLM. Answering `None` instead is no better: every `--family` value is
+    /// then rejected for this host, so the "re-run with an explicit
+    /// `--family`" advice the install prints cannot be followed. Its neighbours
+    /// are genuinely discrete and keep their families.
+    #[test]
+    fn a_renoir_class_igpu_is_its_own_family_and_not_a_datacenter_one() {
+        assert_eq!(
+            normalize_therock_family("gfx90c"),
+            Some("gfx90c".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx90c:xnack-"),
+            Some("gfx90c".to_owned())
+        );
+        assert!(known_therock_families().contains(&"gfx90c"));
+        assert_eq!(
+            preferred_serve_engine_for_therock_family(Some("gfx90c")),
+            None
+        );
+        assert_eq!(
+            normalize_therock_family("gfx90a"),
+            Some("gfx90a".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx900"),
+            Some("gfx900".to_owned())
         );
     }
 

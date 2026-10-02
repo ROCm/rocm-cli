@@ -75,7 +75,9 @@ repository.
 | base64 | 0.22.1 | MIT OR Apache-2.0 |
 | base64ct | 1.8.3 | Apache-2.0 OR MIT |
 | bit-set | 0.5.3 | MIT/Apache-2.0 |
+| bit-set | 0.8.0 | Apache-2.0 OR MIT |
 | bit-vec | 0.6.3 | MIT/Apache-2.0 |
+| bit-vec | 0.8.0 | Apache-2.0 OR MIT |
 | bitflags | 1.3.2 | MIT/Apache-2.0 |
 | bitflags | 2.13.0 | MIT OR Apache-2.0 |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 |
@@ -353,7 +355,9 @@ repository.
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
+| proptest | 1.11.0 | MIT OR Apache-2.0 |
 | pulldown-cmark | 0.12.2 | MIT |
+| quick-error | 1.2.3 | MIT/Apache-2.0 |
 | quick-xml | 0.39.4 | MIT |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
 | quinn-proto | 0.11.15 | MIT OR Apache-2.0 |
@@ -367,6 +371,7 @@ repository.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 |
+| rand_xorshift | 0.4.0 | MIT OR Apache-2.0 |
 | ratatui | 0.30.2 | MIT |
 | ratatui-core | 0.1.2 | MIT |
 | ratatui-crossterm | 0.1.2 | MIT |
@@ -402,6 +407,7 @@ repository.
 | rustls-platform-verifier-android | 0.1.1 | MIT OR Apache-2.0 |
 | rustls-webpki | 0.103.13 | ISC |
 | rustversion | 1.0.22 | MIT OR Apache-2.0 |
+| rusty-fork | 0.3.1 | MIT/Apache-2.0 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense/MIT |
 | schannel | 0.1.29 | MIT |
@@ -513,6 +519,7 @@ repository.
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucd-trie | 0.1.7 | MIT OR Apache-2.0 |
 | uds_windows | 1.2.1 | MIT |
+| unarray | 0.1.4 | MIT OR Apache-2.0 |
 | unicase | 2.9.0 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
@@ -532,6 +539,7 @@ repository.
 | vt100 | 0.16.2 | MIT |
 | vte | 0.15.0 | Apache-2.0 OR MIT |
 | vtparse | 0.6.2 | MIT |
+| wait-timeout | 0.2.1 | MIT/Apache-2.0 |
 | walkdir | 2.5.0 | Unlicense/MIT |
 | want | 0.3.1 | MIT |
 | wasi | 0.11.1+wasi-snapshot-preview1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |

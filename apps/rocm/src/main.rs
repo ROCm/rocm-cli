@@ -31458,6 +31458,30 @@ install therock";
         assert!(vram_capacity_is_meaningful(None, 1));
     }
 
+    /// Every APU, not just the RDNA3+ ones.
+    ///
+    /// `gfx_is_apu_family` used to recognise only gfx1103 and gfx115x, so the
+    /// pre-RDNA3 APUs below were read as discrete parts with real private VRAM.
+    /// They have none: the BIOS carve-out this compares against is a few hundred
+    /// MB on a Ryzen desktop iGPU, so `rocm serve` warned about "low VRAM" on a
+    /// 64 GB machine that is serving the model out of system RAM — the exact
+    /// false warning this gate exists to withhold. (Van Gogh is the Steam Deck.)
+    #[test]
+    fn vram_capacity_is_withheld_on_every_apu_not_just_rdna3() {
+        for (target, part) in [
+            ("gfx90c", "Renoir / Cezanne / Lucienne / Barcelo"),
+            ("gfx1033", "Van Gogh"),
+            ("gfx1035", "Rembrandt, Radeon 680M"),
+            ("gfx1036", "Raphael, Radeon 610M"),
+        ] {
+            assert!(
+                !vram_capacity_is_meaningful(Some(target), 1),
+                "{part} ({target}) is an APU with no private VRAM, but its \
+                 carve-out is being treated as a real capacity"
+            );
+        }
+    }
+
     /// Every distro whose plan actually emits privileged commands, so the
     /// escalation tests below sweep all of them rather than whichever one was
     /// remembered. Adding a distro to the planner without adding it here would
