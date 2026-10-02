@@ -161,11 +161,13 @@ pub(crate) fn local_webhook_event_from_request(
         "server-recover" if service_id.unwrap_or_default().is_empty() => {
             bail!("server-recover webhook events require service_id");
         }
-        "cache-warm" if crate::payload_string(&request.payload, "artifact_ref").is_none() => {
+        "cache-warm"
+            if crate::watchers::payload_string(&request.payload, "artifact_ref").is_none() =>
+        {
             bail!("cache-warm webhook events require payload.artifact_ref");
         }
         "driver-upgrade"
-            if crate::payload_string(&request.payload, "component").as_deref()
+            if crate::watchers::payload_string(&request.payload, "component").as_deref()
                 != Some("driver") =>
         {
             bail!("driver-upgrade webhook events require payload.component=driver");
