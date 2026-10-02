@@ -2,9 +2,32 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
+
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+
+/// How many GPU entries the stub `amd-smi` describes.
+///
+/// Chosen for the size of the resulting JSON, not for realism: it clears
+/// ~150KiB, comfortably past the ~64KiB pipe buffer whose overflow is the whole
+/// premise of `examine-20`. A stub that printed a few hundred bytes would pass
+/// against the defect.
+const STUB_GPU_COUNT: usize = 1200;
+
+/// Where the `amd-smi` stub and its payload live inside the isolated root.
+///
+/// Derived rather than carried on the World so the Given and the When agree on
+/// it without a field whose only purpose is this one scenario.
+fn stub_bin_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("amd-smi-stub")
+}
 
 /// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
 ///
@@ -1271,5 +1294,107 @@ async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
         }),
         "the CLI installed this runtime and its ROCm wheels, so the search has to \
          find the copy it put there. Reported copies:\n{copies:#?}"
+    );
+}
+
+#[given("amd-smi reports more output than a pipe buffer holds")]
+async fn stub_amd_smi_with_large_output(world: &mut E2eWorld) {
+    let bin_dir = stub_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir).expect("failed to create the amd-smi stub directory");
+
+    // The payload is built here rather than in the script so its size is set in
+    // Rust, where the constant explaining it lives.
+    let gpus: Vec<serde_json::Value> = (0..STUB_GPU_COUNT)
+        .map(|index| {
+            serde_json::json!({
+                "gpu": index,
+                "asic": {
+                    "market_name": "stub-accelerator",
+                    "vendor_id": "0x1002",
+                    "device_id": format!("0x{index:04x}"),
+                    // amd-smi's real `static -a` output per GPU is far wider
+                    // than the handful of fields worth asserting on; this
+                    // stands in for that bulk.
+                    "padding": "0".repeat(64),
+                }
+            })
+        })
+        .collect();
+    let payload = bin_dir.join("payload.json");
+    std::fs::write(
+        &payload,
+        serde_json::to_string(&gpus).expect("failed to render the stub amd-smi payload"),
+    )
+    .expect("failed to write the stub amd-smi payload");
+
+    // Answers every probe the snapshot makes (`static` and `monitor`) with the
+    // same document: which one it is does not matter to a test about output
+    // size, and branching on argv would only add a way to get it wrong.
+    let stub = bin_dir.join("amd-smi");
+    std::fs::write(
+        &stub,
+        format!("#!/bin/sh\nexec cat {}\n", payload.display()),
+    )
+    .expect("failed to write the amd-smi stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to make the amd-smi stub executable");
+    }
+}
+
+#[when("the daemon gathers a bridge snapshot")]
+async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
+    let rocmd = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
+        panic!(
+            "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \
+             ROCM_CLI_BINARY, provide the matching prebuilt rocmd path explicitly"
+        )
+    });
+
+    let mut command = std::process::Command::new(rocmd);
+    command.arg("bridge-snapshot");
+    world.isolate_cmd(&mut command);
+
+    // The stub wins because the isolated `<data>/runtimes` registry is empty and
+    // `HOME` is isolated too, so `resolve_amd_smi_binary` exhausts its
+    // managed-SDK lookups and falls through to the bare `PATH` name.
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(stub_bin_dir(world)).chain(std::env::split_paths(&inherited)),
+    )
+    .expect("failed to build the stub PATH");
+    command.env("PATH", path);
+
+    let output = command
+        .output()
+        .expect("failed to run rocmd bridge-snapshot");
+    world.cli_output = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    world.cli_rc = Some(output.status.code().unwrap_or(-1));
+}
+
+#[then("the snapshot reports amd-smi as available and carries every GPU it described")]
+async fn assert_telemetry_survived_large_output(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}");
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(stdout).expect("bridge-snapshot did not emit JSON");
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(true),
+        "amd-smi answered with a valid document, so the only thing that can have made it \
+         unavailable is this side failing to read it: note={:?}",
+        gpu["note"]
+    );
+    assert_eq!(
+        gpu["static_snapshot"].as_array().map(Vec::len),
+        Some(STUB_GPU_COUNT),
+        "the snapshot must carry every GPU amd-smi described; a short read is the same defect \
+         arriving quietly rather than as a timeout"
     );
 }

@@ -35,6 +35,7 @@ pub mod fix;
 pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod process;
 pub mod report;
 pub mod report_delivery;
 pub mod runtime;

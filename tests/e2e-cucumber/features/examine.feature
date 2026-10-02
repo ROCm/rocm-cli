@@ -275,3 +275,28 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system in machine-readable form
     Then the inspection attributes a code object manager library to that runtime
+
+  # ROCMAI-448. `rocmd` captured child output by waiting for the child to exit
+  # and only then draining its pipes, so a child that wrote more than one OS
+  # pipe buffer (~64KiB) blocked in `write`, never exited, and was killed at the
+  # timeout. The probe runs under a 2s budget, so on a multi-GPU host -- where
+  # `amd-smi static -a -g all --json` comfortably clears that buffer -- GPU
+  # telemetry reported `amd_smi_available: false` with a spurious timeout note,
+  # permanently. That answer feeds `bridge-snapshot`, the `examine_snapshot` and
+  # `bridge_snapshot` tools, and the automation watcher.
+  #
+  # The size of the output is the whole premise, so the stub emits ~150KiB --
+  # over two buffers. A stub that printed a few hundred bytes would pass against
+  # the defect and test nothing.
+  #
+  # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
+  # occur naturally, which would strand this on a lane that does not run per-PR.
+  # A stub `amd-smi` on `PATH` reaches the same code because the isolated
+  # `<data>/runtimes` registry is empty by design (see `E2eWorld::default`), so
+  # `resolve_amd_smi_binary` falls through its managed-SDK lookups to the bare
+  # `PATH` name. Linux-only because the stub is a shell script.
+  @id:examine-telemetry-survives-large-amd-smi-output @requires-os:linux
+  Scenario: examine-20 - GPU telemetry survives an amd-smi that outruns the pipe buffer
+    Given amd-smi reports more output than a pipe buffer holds
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as available and carries every GPU it described

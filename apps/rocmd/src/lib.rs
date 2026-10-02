@@ -509,7 +509,8 @@ fn run_bubblewrap_sandbox(
         policy,
     );
 
-    let output = run_process_with_timeout(command, Duration::from_mins(1))?;
+    let output =
+        rocm_core::process::run_with_timeout(command, Duration::from_mins(1), "sandbox process")?;
     let value = parse_sandbox_child_output(output, "bubblewrap sandbox")?;
     record_sandbox_audit(paths, tool, "bubblewrap", true, service_id.as_deref())?;
     Ok(sandbox_report(tool, "bubblewrap", value))
@@ -1348,51 +1349,6 @@ fn append_sandbox_tool_command_args(
 }
 
 #[cfg(target_os = "linux")]
-fn run_process_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn sandbox process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll sandbox process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect sandbox process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out sandbox process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "sandbox process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn parse_sandbox_child_output(output: std::process::Output, label: &str) -> Result<Value> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -1481,7 +1437,7 @@ fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
+    let output = rocm_core::process::run_with_timeout(command, AMD_SMI_PROBE_TIMEOUT, "process")
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -2396,7 +2352,7 @@ fn run_rocm_capture_for_paths(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
@@ -2406,45 +2362,6 @@ fn run_rocm_capture_for_paths(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
