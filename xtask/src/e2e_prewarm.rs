@@ -90,8 +90,19 @@ pub enum Decision {
 /// must not be turned red, nor a multi-GiB download triggered, because the
 /// package index was briefly unreachable — `rocm update` reports that per runtime
 /// as `status=error`, and an offline runner would otherwise reinstall on every run.
+///
+/// `pin` is the exact `--version`/`--build-date` the caller pre-warmed with, if
+/// any. `rocm update` always resolves a channel to the index's LATEST version —
+/// it has no notion of "stay on the version I originally pinned" — so `status`
+/// alone cannot drive this decision once a pin is in play: an n-1/n-2 pin is
+/// permanently `update_available` against a `release` index that has moved on,
+/// and following that status would silently replace the pin with latest. A
+/// pinned run instead looks for an already-installed runtime whose key names
+/// that exact pin, ignoring `status` entirely, and installs fresh (never
+/// `update`/`repair`, which only ever apply the index's latest key) when none is
+/// found.
 #[must_use]
-pub fn decide(update_report: &str, channel: &str) -> Decision {
+pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision {
     // The empty-registry wording from `render_update_report`. Checked before the
     // per-runtime scan because there are no `runtime` lines at all in that case.
     if update_report.contains("managed runtimes: none") {
@@ -134,6 +145,24 @@ pub fn decide(update_report: &str, channel: &str) -> Decision {
         .iter()
         .filter(|line| line.channel.as_deref() == Some(channel))
         .collect::<Vec<_>>();
+
+    // A pin overrides every status-driven branch below: those all chase the
+    // index's latest, which is the one thing a pin explicitly opts out of.
+    if let Some(pin) = pin {
+        return match channel_runtimes
+            .iter()
+            .find(|line| key_matches_pin(line.serving_runtime_key(), pin))
+        {
+            Some(pinned) => Decision::Reuse {
+                reason: format!("runtime already matches the pinned version {pin}"),
+                activate: Some(pinned.serving_runtime_key().to_owned()),
+            },
+            // `update`/`repair` only ever apply the report's `target=` key, which
+            // is the index's latest — never this pin — so a miss means a fresh
+            // side-by-side `install sdk --version/--build-date`, not an update.
+            None => Decision::Install,
+        };
+    }
 
     // A current composition already in the tree satisfies the lane even while an
     // obsolete same-channel entry survives until the retention pass removes it.
@@ -432,9 +461,78 @@ impl RuntimeLine {
     }
 }
 
+/// Whether `runtime_key` names the exact pin the caller asked for.
+///
+/// Runtime keys are slugified (`runtime_key`/`wheel_runtime_key` in
+/// `apps/rocm/src/therock.rs` both dash-join their fields), so a dotted
+/// `--version` like `7.11.0` shows up as `7-11-0` inside the key. A
+/// `--build-date` instead recovers as an eight-digit `YYYYMMDD` run (e.g.
+/// `20260605`) via `runtime_version_build_date`, with no dashes at all, so it
+/// needs its own digits-only comparison rather than the dash-normalized one —
+/// and the caller may have spelled it `MMDDYYYY` (`normalize_requested_build_date`
+/// accepts that too), which digit-stripping alone can't reorder.
+///
+/// Stripping punctuation from an arbitrary `--version` can also yield a short
+/// digit run that isn't a build date at all (`7.13.0` -> `7130`), and that run
+/// can collide with a fragment of some *other* runtime's hex fingerprint
+/// suffix. So the digits-only comparison only ever fires for an exact 8-digit
+/// run (the one shape a recovered build date has) and only matches a run in
+/// the key that isn't itself a piece of a longer digit sequence.
+fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
+    if runtime_key.contains(pin) || runtime_key.contains(&pin.replace('.', "-")) {
+        return true;
+    }
+    let digits_only: String = pin.chars().filter(char::is_ascii_digit).collect();
+    if digits_only.len() != 8 {
+        return false;
+    }
+    // Runtime keys only ever carry the YYYYMMDD order; reorder an MMDDYYYY
+    // pin before comparing (same digit-position heuristic as
+    // `normalize_requested_build_date` in `apps/rocm/src/therock.rs`).
+    let yyyymmdd = if digits_only.starts_with("20") {
+        digits_only
+    } else if digits_only[4..].starts_with("20") {
+        format!(
+            "{}{}{}",
+            &digits_only[4..8],
+            &digits_only[0..2],
+            &digits_only[2..4]
+        )
+    } else {
+        return false;
+    };
+    key_contains_delimited_digit_run(runtime_key, &yyyymmdd)
+}
+
+/// Whether `key` contains `run` (a fixed-length digit string) as a maximal
+/// digit run — i.e. not immediately preceded or followed by another digit,
+/// so it can't be a sub-span of some longer, unrelated digit sequence (such
+/// as a fingerprint suffix that happens to contain the same digits).
+fn key_contains_delimited_digit_run(key: &str, run: &str) -> bool {
+    let bytes = key.as_bytes();
+    key.match_indices(run).any(|(start, _)| {
+        let before_is_digit = start > 0 && bytes[start - 1].is_ascii_digit();
+        let end = start + run.len();
+        let after_is_digit = end < bytes.len() && bytes[end].is_ascii_digit();
+        !before_is_digit && !after_is_digit
+    })
+}
+
 /// Bring the shared pre-warm tree at `prewarm_dir` to the runtime state the
 /// `channel` requires, keeping `keep` recent installs per channel/format/family.
-pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
+///
+/// `version`/`build_date` pin the SDK to an exact TheRock package instead of
+/// the channel's latest; the CLI's own `--version`/`--build-date` flags are
+/// mutually exclusive (enforced by clap at the `xtask` command layer), so at
+/// most one of these is ever `Some`.
+pub fn run(
+    channel: &str,
+    keep: usize,
+    prewarm_dir: &Path,
+    version: Option<&str>,
+    build_date: Option<&str>,
+) -> Result<()> {
+    let pin = version.or(build_date);
     let rocm = resolve_rocm_binary()?;
     for sub in ["config", "data", "cache"] {
         let dir = prewarm_dir.join(sub);
@@ -454,7 +552,7 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
     repair_dangling_active_runtime(&rocm, prewarm_dir)?;
 
     let decision = match probe(&rocm, prewarm_dir) {
-        Ok(report) => decide(&report, channel),
+        Ok(report) => decide(&report, channel, pin),
         Err(error) => {
             // `rocm update` itself failed (not a per-runtime index error). Fall
             // back to the guard the lanes used before this existed: install only
@@ -492,9 +590,14 @@ pub fn run(channel: &str, keep: usize, prewarm_dir: &Path) -> Result<()> {
             // then for `nightly` arrives here with a release runtime already
             // active and no terminal to confirm on. It would just leave the
             // packages behind.
-            rocm_command(&rocm, prewarm_dir)
-                .args(["install", "sdk", "--channel", channel, "--yes"])
-                .status_ok("rocm install sdk")?;
+            let mut command = rocm_command(&rocm, prewarm_dir);
+            command.args(["install", "sdk", "--channel", channel, "--yes"]);
+            if let Some(version) = version {
+                command.args(["--version", version]);
+            } else if let Some(build_date) = build_date {
+                command.args(["--build-date", build_date]);
+            }
+            command.status_ok("rocm install sdk")?;
         }
         Decision::Update { runtime_key } => {
             println!(
@@ -1211,13 +1314,13 @@ Local model engines
 
     #[test]
     fn no_managed_runtime_installs() {
-        assert_eq!(decide(EMPTY, "release"), Decision::Install);
+        assert_eq!(decide(EMPTY, "release", None), Decision::Install);
     }
 
     #[test]
     fn newer_version_in_the_index_updates_that_runtime() {
         assert_eq!(
-            decide(&report("update_available", "release"), "release"),
+            decide(&report("update_available", "release"), "release", None),
             Decision::Update {
                 runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
             }
@@ -1227,7 +1330,7 @@ Local model engines
     #[test]
     fn same_version_runtime_with_a_stale_composition_is_repaired() {
         assert_eq!(
-            decide(&report("repair_available", "release"), "release"),
+            decide(&report("repair_available", "release"), "release", None),
             Decision::Repair {
                 runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
             }
@@ -1246,7 +1349,7 @@ Local model engines
             report("up_to_date", "release")
         );
 
-        let Decision::Reuse { reason, .. } = decide(&text, "release") else {
+        let Decision::Reuse { reason, .. } = decide(&text, "release", None) else {
             panic!("an installed current composition must prevent repeated repair");
         };
         assert!(reason.contains("up to date"), "{reason}");
@@ -1255,7 +1358,7 @@ Local model engines
     #[test]
     fn current_runtime_is_reused_and_activated() {
         let Decision::Reuse { reason, activate } =
-            decide(&report("up_to_date", "release"), "release")
+            decide(&report("up_to_date", "release"), "release", None)
         else {
             panic!("an up-to-date runtime must be reused, not reinstalled");
         };
@@ -1264,6 +1367,81 @@ Local model engines
             activate.as_deref(),
             Some("release-wheel-gfx94x-dcgpu-7-13-0"),
             "reuse must name the runtime it means, or the lane serves whatever the pointer holds"
+        );
+    }
+
+    #[test]
+    fn distinct_version_pins_yield_distinct_runtime_keys() {
+        let text = "update\n  \
+runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel channel=release status=up_to_date\n  \
+runtime release-wheel-gfx94x-dcgpu-7-11-0 format=wheel channel=release status=up_to_date\n";
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.13.0")) else {
+            panic!("a runtime already matching the pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.11.0")) else {
+            panic!("a runtime already matching the other pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-11-0")
+        );
+
+        assert_ne!(
+            decide(text, "release", Some("7.13.0")),
+            decide(text, "release", Some("7.11.0")),
+            "two distinct pins against the same tree must resolve to distinct runtime keys"
+        );
+    }
+
+    #[test]
+    fn build_date_pin_matches_the_digits_only_key() {
+        // A build date reaches the runtime key as an 8-digit run with no
+        // dashes (runtime_version_build_date's scan format), while the flag
+        // is documented and passed as YYYY-MM-DD — the two must still match.
+        let text = "update\n  \
+runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release status=up_to_date\n";
+
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("2026-06-05")) else {
+            panic!("a runtime already matching the dashed build-date pin must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0a20260605")
+        );
+    }
+
+    #[test]
+    fn version_pin_digits_do_not_match_an_unrelated_fingerprint_fragment() {
+        // digits_only("7.13.0") is "7130", which appears verbatim inside this
+        // other runtime's 16-hex fingerprint suffix. It must not match: this
+        // key belongs to version 7.9.0, not 7.13.0.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-aa7130bbccddeeff",
+            "7.13.0"
+        ));
+    }
+
+    #[test]
+    fn build_date_pin_matches_regardless_of_mmddyyyy_or_yyyymmdd_spelling() {
+        let key = "nightly-wheel-multi-arch-7-13-0a20260605-0123456789abcdef";
+        assert!(key_matches_pin(key, "2026-06-05"));
+        assert!(key_matches_pin(key, "06-05-2026"));
+    }
+
+    #[test]
+    fn unpinned_prewarm_key_is_unchanged() {
+        assert_eq!(
+            decide(&report("up_to_date", "release"), "release", None),
+            Decision::Reuse {
+                reason: "runtime is up to date with the channel index".to_owned(),
+                activate: Some("release-wheel-gfx94x-dcgpu-7-13-0".to_owned()),
+            }
         );
     }
 
@@ -1280,6 +1458,7 @@ Local model engines
                 "release-wheel-multi-arch-7-13-0-0123456789abcdef",
             ),
             "release",
+            None,
         ) else {
             panic!("a migrated tree must be reused");
         };
@@ -1302,6 +1481,7 @@ Local model engines
                 "release-wheel-multi-arch-7-15-0-deadbeefdeadbeef",
             ),
             "release",
+            None,
         ) else {
             panic!("a runtime ahead of the index must be reused");
         };
@@ -1319,7 +1499,7 @@ Local model engines
         // conservative pre-warm decision must reuse rather than download again.
         let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
 status=error message=failed to reach https://repo.amd.com/rocm/whl after 3 tries\n";
-        let Decision::Reuse { reason, .. } = decide(text, "release") else {
+        let Decision::Reuse { reason, .. } = decide(text, "release", None) else {
             panic!("an unattributable index error must reuse the existing tree");
         };
         assert!(reason.contains("could not establish"), "{reason}");
@@ -1332,14 +1512,17 @@ status=error message=failed to reach https://repo.amd.com/rocm/whl after 3 tries
 status=error message=failed to reach the index\n",
             report("up_to_date", "nightly")
         );
-        assert!(matches!(decide(&text, "release"), Decision::Reuse { .. }));
+        assert!(matches!(
+            decide(&text, "release", None),
+            Decision::Reuse { .. }
+        ));
     }
 
     #[test]
     fn index_error_on_an_attributable_line_is_reused() {
         let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
 channel=release status=error message=failed to reach the index\n";
-        let Decision::Reuse { reason, .. } = decide(text, "release") else {
+        let Decision::Reuse { reason, .. } = decide(text, "release", None) else {
             panic!("an unreadable freshness status must reuse the existing tree");
         };
         assert!(reason.contains("could not establish"), "{reason}");
@@ -1350,7 +1533,7 @@ channel=release status=error message=failed to reach the index\n";
         // A per-channel pre-warm still shares one tree layout, and EAI-8056 adds a
         // nightly lane: a release runtime must never be mistaken for a nightly one.
         assert_eq!(
-            decide(&report("up_to_date", "release"), "nightly"),
+            decide(&report("up_to_date", "release"), "nightly", None),
             Decision::Install
         );
     }
@@ -1364,13 +1547,16 @@ channel=release status=error message=failed to reach the index\n";
             report("update_available", "nightly")
         );
         assert_eq!(
-            decide(&text, "nightly"),
+            decide(&text, "nightly", None),
             Decision::Update {
                 runtime_key: "nightly-wheel-gfx94x-dcgpu-7-13-0".to_owned()
             }
         );
         // …and the release lane reading the same tree still sees a cache hit.
-        assert!(matches!(decide(&text, "release"), Decision::Reuse { .. }));
+        assert!(matches!(
+            decide(&text, "release", None),
+            Decision::Reuse { .. }
+        ));
     }
 
     #[test]
@@ -1378,6 +1564,7 @@ channel=release status=error message=failed to reach the index\n";
         let Decision::Reuse { reason, .. } = decide(
             "update\n  runtime weird-key format=wheel channel=release\n",
             "release",
+            None,
         ) else {
             panic!("a report with no status must reuse");
         };
@@ -1421,6 +1608,6 @@ message=connect timed out after 30 s";
         );
         assert!(RuntimeLine::parse("    cli: installed=0.1.0 status=not_configured").is_none());
         // …and end to end, the real empty report still resolves to a cold install.
-        assert_eq!(decide(EMPTY, "release"), Decision::Install);
+        assert_eq!(decide(EMPTY, "release", None), Decision::Install);
     }
 }
