@@ -208,7 +208,7 @@ fn rocm_library_filename(shortname: &str) -> String {
 /// turns "two ready runtimes" into one or zero, and the scenario then fails on a
 /// confusing downstream assertion instead of on the fixture. If this step starts
 /// failing after an edit here, suspect the manifest shape first.
-fn plant_ready_runtime(data: &Path, key: &str) {
+pub(crate) fn plant_ready_runtime(data: &Path, key: &str) -> std::path::PathBuf {
     let manifest = plant_ready_runtime_tree(data, key);
     let registry = data.join("runtimes").join("registry");
     std::fs::create_dir_all(&registry)
@@ -218,6 +218,7 @@ fn plant_ready_runtime(data: &Path, key: &str) {
         serde_json::to_vec_pretty(&manifest).expect("manifest serialises"),
     )
     .unwrap_or_else(|e| panic!("failed to write the planted runtime manifest: {e}"));
+    data.join("runtimes").join("roots").join(key)
 }
 
 /// The on-disk half of [`plant_ready_runtime`]: the install root and what the
