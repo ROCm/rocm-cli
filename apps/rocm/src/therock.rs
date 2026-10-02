@@ -6654,9 +6654,29 @@ fn load_runtime_manifests_reporting_unparsed(
             Err(_) => unparsed.push(path),
         }
     }
-    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
+    sort_manifests_newest_install_first(&mut manifests);
     unparsed.sort();
     Ok((manifests, unparsed))
+}
+
+/// Order installed runtimes newest install first, breaking ties on the runtime
+/// key.
+///
+/// The tiebreak is what makes this a function of the registry contents rather
+/// than of the order `read_dir` happened to return them in. Two runtimes can
+/// share an `installed_at_unix_ms` — a `--devel` install and its plain sibling
+/// land in the same millisecond, and the field is only millisecond-resolution —
+/// and `select_startup_update_manifest` falls back to the first entry when no
+/// active runtime key is configured, so without it the filesystem decided which
+/// runtime the startup update check looked at. `select_runtimes_to_remove`
+/// already applies the same rule to its retention groups.
+fn sort_manifests_newest_install_first(manifests: &mut [InstalledRuntimeManifest]) {
+    manifests.sort_by(|left, right| {
+        right
+            .installed_at_unix_ms
+            .cmp(&left.installed_at_unix_ms)
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+    });
 }
 
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {

@@ -26,7 +26,7 @@ use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 use super::{
     InstalledRuntimeManifest, ParsedVersion, RuntimeFreshness, compare_version_strings,
     parse_host_version, parse_version, runtime_freshness, select_rocm_version,
-    select_startup_update_manifest,
+    select_startup_update_manifest, sort_manifests_newest_install_first,
 };
 use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 
@@ -439,12 +439,13 @@ proptest! {
             .collect();
         prop_assume!(order.len() == manifests.len());
 
-        // Both views go through the same "newest install first" sort the
-        // registry loader applies.
+        // Both views go through the registry loader's own "newest install
+        // first" sort, called rather than re-implemented so the property
+        // cannot drift away from what the loader actually does.
         let mut baseline = manifests.clone();
         let mut reordered = permute(&manifests, &order);
-        baseline.sort_by_key(|item| std::cmp::Reverse(item.installed_at_unix_ms));
-        reordered.sort_by_key(|item| std::cmp::Reverse(item.installed_at_unix_ms));
+        sort_manifests_newest_install_first(&mut baseline);
+        sort_manifests_newest_install_first(&mut reordered);
 
         let left = select_startup_update_manifest(&baseline, None);
         let right = select_startup_update_manifest(&reordered, None);
@@ -752,6 +753,63 @@ fn select_rocm_version_picks_the_newer_of_two() {
     assert_eq!(
         select_rocm_version(super::TheRockChannel::Nightly, &versions, None).as_deref(),
         Some("7.10.0")
+    );
+}
+
+/// The registry sort puts the newest install first and breaks a tie on the
+/// runtime key, in that order.
+///
+/// The order-independence property cannot pin this down: it sorts both views
+/// with this same function, so any deterministic rule satisfies it. Reversing
+/// the tiebreak, or sorting oldest-install-first, would both pass it. The
+/// direction is user-observable, because `select_startup_update_manifest`
+/// reports on the first entry when no active runtime key is configured.
+#[test]
+fn registry_sort_is_newest_install_first_then_by_key() {
+    let at = |key: &str, installed_at_unix_ms: u128| {
+        manifest(
+            key.to_owned(),
+            "release".to_owned(),
+            "wheel".to_owned(),
+            "gfx120X-all".to_owned(),
+            "7.0.0".to_owned(),
+            false,
+            installed_at_unix_ms,
+        )
+    };
+    let keys = |manifests: &[InstalledRuntimeManifest]| {
+        manifests
+            .iter()
+            .map(|item| item.runtime_key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Newest install first, regardless of how they were read.
+    let mut by_time = vec![at("older", 1_000), at("newer", 2_000)];
+    sort_manifests_newest_install_first(&mut by_time);
+    assert_eq!(keys(&by_time), ["newer", "older"]);
+    let mut by_time_reversed = vec![at("newer", 2_000), at("older", 1_000)];
+    sort_manifests_newest_install_first(&mut by_time_reversed);
+    assert_eq!(keys(&by_time_reversed), ["newer", "older"]);
+
+    // Same millisecond: the lower key wins, and the input order does not.
+    let mut tied = vec![at("bbb", 2_000), at("aaa", 2_000)];
+    sort_manifests_newest_install_first(&mut tied);
+    assert_eq!(keys(&tied), ["aaa", "bbb"]);
+    let mut tied_reversed = vec![at("aaa", 2_000), at("bbb", 2_000)];
+    sort_manifests_newest_install_first(&mut tied_reversed);
+    assert_eq!(keys(&tied_reversed), ["aaa", "bbb"]);
+
+    // The timestamp outranks the key: a later install with a higher key still
+    // comes first.
+    let mut mixed = vec![at("aaa", 1_000), at("zzz", 2_000)];
+    sort_manifests_newest_install_first(&mut mixed);
+    assert_eq!(keys(&mixed), ["zzz", "aaa"]);
+
+    // And that is what the startup update check reports on.
+    assert_eq!(
+        select_startup_update_manifest(&tied, None).map(|item| item.runtime_key.as_str()),
+        Some("aaa")
     );
 }
 
