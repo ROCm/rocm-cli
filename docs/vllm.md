@@ -113,7 +113,7 @@ python3 scripts/vllm_therock_gpu_test.py \
   --model facebook/opt-125m
 ```
 
-The acceptance script is Linux/WSL only. It requires vLLM to be discoverable
+The acceptance script is Linux or WSL only. It requires vLLM to be discoverable
 through a ROCm CLI-managed TheRock runtime manifest, launches with
 `gpu_required`, checks `/health` and `/v1/completions`, and verifies loaded
 ROCm libraries come from the managed TheRock SDK wheel directories. It rejects
