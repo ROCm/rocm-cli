@@ -1208,9 +1208,22 @@ async fn main() {
     // per-engine canary covers them on the PR fast path); set by
     // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
+    // `@requires-real-gpu` scenarios run only where a lane on real hardware opts
+    // in; everywhere else GPU behaviour is exercised against a simulated host.
+    // An unrecognised value aborts the run instead of silently skipping them.
+    let hardware = e2e_cucumber::expectation::HardwareMode::parse(
+        std::env::var(e2e_cucumber::expectation::HardwareMode::ENV)
+            .ok()
+            .as_deref(),
+    )
+    .unwrap_or_else(|err| panic!("{err}"));
     eprintln!(
-        "Host capability: platform={} os={} gpu={} effective_engine={}",
-        cap.platform_slug, cap.os_family, cap.has_amd_gpu, cap.effective_serve_engine,
+        "Host capability: platform={} os={} gpu={} effective_engine={} hardware={}",
+        cap.platform_slug,
+        cap.os_family,
+        cap.has_amd_gpu,
+        cap.effective_serve_engine,
+        hardware.as_str(),
     );
 
     // Shared record of each scenario's resolved expectation, keyed by @id.
@@ -1316,6 +1329,7 @@ async fn main() {
                         lifecycle: include_lifecycle,
                         docker: include_docker,
                         merge_queue: include_merge_queue,
+                        hardware,
                     },
                 );
                 let run = (!only_lifecycle || decl.lifecycle)

@@ -167,6 +167,31 @@ export ROCM_TEST_APK_REPOS="--repository http://dl-cdn.alpinelinux.org/alpine/v3
   --repository http://dl-cdn.alpinelinux.org/alpine/v3.20/community"
 ```
 
+## Simulated and real GPU hardware
+
+The cucumber suite runs in one of two hardware modes, chosen by
+`E2E_HARDWARE`:
+
+- `simulated` (the default, and what every GitHub-hosted run uses) — a scenario
+  that needs a GPU describes the host it wants itself, by planting a simulated
+  one, so it behaves the same on a laptop, a GitHub-hosted runner and a GPU box.
+- `real` — set by the self-hosted GPU lanes. Scenarios tagged
+  `@requires-real-gpu`, whose premise a simulated host cannot provide (a model
+  actually generating tokens on a device), run only here, and still only on a
+  host with a usable AMD GPU.
+
+Any other value aborts the run, so a misspelt `real` cannot silently skip the
+real-GPU scenarios. To run them locally on a GPU host:
+
+```bash
+E2E_HARDWARE=real cargo xtask e2e
+```
+
+The simulated host is a directory the scenario populates and hands to the
+binary in `ROCM_CLI_TEST_HOST_ROOT`; the hardware probes read it in place of
+`/`. Only an `e2e-test-hooks` build (which `cargo xtask e2e` produces) honours
+it — see `docs/release-trust.md`.
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs
