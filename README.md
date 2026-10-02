@@ -216,7 +216,7 @@ rocm serve qwen
 ```
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
-box. You can also serve any compatible Hugging Face model directly — see
+box. You can also serve any compatible Hugging Face model directly. See
 [Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 

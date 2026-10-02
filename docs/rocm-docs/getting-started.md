@@ -32,8 +32,6 @@ that approve it without a prompt.
 :end-before: "You can also serve any compatible Hugging Face model directly"
 ```
 
-You can also serve any compatible Hugging Face model directly — see
-[Model serving](commands.md#model-serving) for the GGUF-vs-safetensors rule,
 You can also serve any compatible Hugging Face model directly. See
 [Model serving](commands.md#model-serving) for the GGUF-vs-safetensors rule,
 since which form works depends on the engine your GPU selects.

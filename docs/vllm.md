@@ -29,10 +29,6 @@ can still *serve* an already-built vLLM.
 ## Torch alignment on engine install
 
 Installing an engine into a managed TheRock runtime can change the torch in that
-runtime. Two installers write torch into the same environment — the SDK install
-writes TheRock's build, and the engine install then writes the build from its own
-index — so `rocm engines install` settles which one stays and prints the result
-Installing an engine into a managed TheRock runtime can change the torch in that
 runtime. Two installers write torch into the same environment: the SDK install
 writes TheRock's build, and the engine install then writes the build from its own
 index. So `rocm engines install` settles which one stays and prints the result
@@ -59,7 +55,6 @@ would have installed and the one it kept. The device check still runs, so an
 opt-out that leaves the runtime unable to serve says so rather than failing later
 during serving.
 
-Use it when you are deliberately running a torch the alignment would replace — a
 Use it when you are deliberately running a torch the alignment would replace (a
 locally built wheel, a version under test, or a stack pinned for a reproduction). It
 is an escape hatch, not a supported configuration: the resulting combination is
@@ -186,7 +181,6 @@ rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
 
 The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
 for a display, another workload, or a second server; raise it to give a large
-model more KV cache. Applies to vLLM only — it is ignored, with a note in the
 model more KV cache. Applies to vLLM only; it is ignored, with a note in the
 serve output, for other engines. An out-of-range or unparsable value fails the
 command rather than falling back silently.
