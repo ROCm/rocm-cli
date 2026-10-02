@@ -40063,6 +40063,7 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_plan_warning_for_only_stopped_records_promises_no_stop() {
         let (root, paths) = test_paths("uninstall-warning-stopped-records");
