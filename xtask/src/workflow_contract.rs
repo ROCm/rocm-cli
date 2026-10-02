@@ -1078,6 +1078,53 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// Both WSL2 lanes must settle the clock before anything times a scenario.
+    ///
+    /// cucumber measures scenario durations by subtracting `SystemTime` stamps, so
+    /// a guest whose clock steps backwards mid-run kills the suite (#455 makes that
+    /// survivable; this keeps the durations real). The hazard is invisible: the
+    /// step's absence breaks nothing that any other test here observes, and on the
+    /// nightly lane job-level `continue-on-error: true` means a regression would
+    /// not even turn the run red.
+    ///
+    /// Matching the step NAME rather than a substring of the job is deliberate —
+    /// the surrounding comments discuss the clock at length, so a bare substring
+    /// would stay satisfied by prose after the step itself was deleted, which is
+    /// exactly the failure this pins.
+    #[test]
+    fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
+        const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        for (workflow, job, suite_step) in [
+            (
+                "e2e-selfhosted.yml",
+                "  e2e-wsl:",
+                "      - name: Run E2E tests on Strix Halo WSL2",
+            ),
+            (
+                "nightly.yml",
+                "  e2e-wsl-nightly:",
+                "      - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)",
+            ),
+        ] {
+            let job_block = nested_block(&read_workflow(workflow), job);
+            let settle = job_block.find(STEP).unwrap_or_else(|| {
+                panic!(
+                    "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
+                     steps its clock backwards mid-run and cucumber subtracts SystemTime \
+                     stamps, so the durations that lane reports become fiction"
+                )
+            });
+            let suite = job_block
+                .find(suite_step)
+                .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
+            assert!(
+                settle < suite,
+                "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
+                 correction has to land while nothing is being timed"
+            );
+        }
+    }
+
     #[test]
     fn apu_preflight_twins_do_not_drift() {
         // The nightly lanes are copies of their per-PR twins. One was left on the

@@ -1175,6 +1175,82 @@ jobs:
           '@
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # Same clock hazard as `e2e-wsl` in e2e-selfhosted.yml, which this job
+      # mirrors: a fresh guest whose clock is still being corrected steps
+      # backwards mid-run, and cucumber measures scenario durations with
+      # `SystemTime`. See that job's copy of this step for the full reasoning.
+      # Kept in sync by hand until the two lanes are deduplicated (#294);
+      # `both_wsl_lanes_settle_the_clock_before_running_the_suite` in
+      # xtask/src/workflow_contract.rs fails if either copy goes missing.
+      - name: Settle the clock before anything times a scenario
+        shell: powershell
+        run: |
+          # `shell: powershell` runs with $ErrorActionPreference = 'Stop', under
+          # which a native command's stderr becomes a terminating error. `w32tm`
+          # writes there routinely on a machine with no configured time source, so
+          # relax the preference rather than let a best-effort probe abort the
+          # step. Under 'Continue', neither a native command's exit code nor its
+          # stderr can fail this step; their raw output still reaches the log.
+          #
+          # That preference does NOT cover everything, which is why the calls below
+          # are inside a try as well. It governs errors raised by a command that
+          # ran -- not command *resolution*: an unresolvable `w32tm` raises
+          # CommandNotFoundException, which is catchable whatever the preference is
+          # set to. Wrapping makes the step's "never fails the lane" promise
+          # unconditional instead of resting on which statement happens to
+          # terminate.
+          $ErrorActionPreference = 'Continue'
+
+          try {
+            # Host first, and deliberately not concurrently with the guest below:
+            # in WSL2 the guest clock tracks the host, so settling the host is what
+            # gives the guest's own sync an already-correct reference to land on.
+            # Note this pins only the guest side for the rest of the job; the host
+            # keeps its time service running, so a later host-side correction can
+            # still propagate inward. Stopping a service on a shared runner is a
+            # bigger hammer than this hazard warrants.
+            Write-Host "host time before: $((Get-Date).ToUniversalTime().ToString('o'))"
+            & w32tm /resync /force
+            & w32tm /query /status
+            Write-Host "host time after:  $((Get-Date).ToUniversalTime().ToString('o'))"
+
+            # See .github/scripts/Invoke-WslBash.ps1. No -PipeFail: the guest script
+            # below is a sequence of probes that must each be allowed to fail.
+            & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
+          printf 'guest time before: %s\n' "$(date -u +%FT%T.%NZ)"
+          if command -v timedatectl >/dev/null 2>&1 && timedatectl show >/dev/null 2>&1; then
+            timedatectl show -p NTP -p NTPSynchronized -p TimeUSec || true
+            # Wait for the client to report a completed sync before switching it
+            # off: an unsynchronised clock means a correction is still owed, and
+            # it must land here -- while nothing is timing a scenario -- rather
+            # than arriving mid-suite. Already-synchronised returns immediately,
+            # since then nothing is pending.
+            # 30s: comfortably past a first NTP exchange on a reachable source,
+            # and the whole budget is only spent by a guest that has none -- in
+            # which case nothing was going to step it anyway, so burning it once
+            # per job is cheaper than a correction landing mid-suite.
+            timedatectl set-ntp true 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+              sleep 1
+            done
+            # Then take the stepper out of the picture for the rest of the job.
+            timedatectl set-ntp false 2>/dev/null || true
+            timedatectl show -p NTP -p NTPSynchronized || true
+          else
+            # No systemd in this guest: there is no in-guest NTP client to settle,
+            # so any step the suite sees came from the host. Say so -- the next
+            # failure is read against this line.
+            echo "timedatectl unavailable; no in-guest NTP client to settle"
+          fi
+          printf 'guest time after:  %s\n' "$(date -u +%FT%T.%NZ)"
+          '@
+          } catch {
+            Write-Host "guest clock probe did not run: $_"
+          }
+          # Best-effort by design: never fail the lane on a clock it could not settle.
+          exit 0
+
       - name: Ensure native build deps
         shell: powershell
         run: |

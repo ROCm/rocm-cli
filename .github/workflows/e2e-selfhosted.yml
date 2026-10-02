@@ -1049,6 +1049,99 @@ jobs:
           '@
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # cucumber measures every scenario's duration with `SystemTime` rather than
+      # a monotonic clock, and panics outright when the subtraction underflows
+      # (`writer/junit.rs:433`, `writer/json.rs:218`/`:284`). So a wall clock that
+      # steps BACKWARDS by any amount between a scenario's start and finish kills
+      # the whole run — and because the panic is raised inside the writer, it lands
+      # in the window where cucumber has swapped the panic hook for an empty one,
+      # so the job dies mid-suite reporting nothing at all. That is what this lane
+      # has been doing on most runs; the message was only recovered once the
+      # harness started catching the panic at the run boundary (#445):
+      #
+      #   failed to compute duration between SystemTime { tv_sec: 1790582151 } and
+      #   SystemTime { tv_sec: 1790582185 }: second time provided was later than self
+      #
+      # i.e. the scenario "finished" 33s before it started. Nothing else in the
+      # matrix sees this because nothing else runs in a freshly booted guest whose
+      # clock is still being corrected underneath it.
+      #
+      # Land the correction up front, while nothing is timing anything, and then
+      # stop the clock being stepped again for the rest of the job. Both sides are
+      # touched because either can be the one that moves: the guest tracks the
+      # Windows host's clock, so a host-side correction lands in the guest too.
+      # Every command is best-effort — this is a hazard to reduce, not a
+      # precondition to enforce, and a lane that cannot settle its clock should
+      # still run and fail with a real diagnosis.
+      - name: Settle the clock before anything times a scenario
+        shell: powershell
+        run: |
+          # `shell: powershell` runs with $ErrorActionPreference = 'Stop', under
+          # which a native command's stderr becomes a terminating error. `w32tm`
+          # writes there routinely on a machine with no configured time source, so
+          # relax the preference rather than let a best-effort probe abort the
+          # step. Under 'Continue', neither a native command's exit code nor its
+          # stderr can fail this step; their raw output still reaches the log.
+          #
+          # That preference does NOT cover everything, which is why the calls below
+          # are inside a try as well. It governs errors raised by a command that
+          # ran -- not command *resolution*: an unresolvable `w32tm` raises
+          # CommandNotFoundException, which is catchable whatever the preference is
+          # set to. Wrapping makes the step's "never fails the lane" promise
+          # unconditional instead of resting on which statement happens to
+          # terminate.
+          $ErrorActionPreference = 'Continue'
+
+          try {
+            # Host first, and deliberately not concurrently with the guest below:
+            # in WSL2 the guest clock tracks the host, so settling the host is what
+            # gives the guest's own sync an already-correct reference to land on.
+            # Note this pins only the guest side for the rest of the job; the host
+            # keeps its time service running, so a later host-side correction can
+            # still propagate inward. Stopping a service on a shared runner is a
+            # bigger hammer than this hazard warrants.
+            Write-Host "host time before: $((Get-Date).ToUniversalTime().ToString('o'))"
+            & w32tm /resync /force
+            & w32tm /query /status
+            Write-Host "host time after:  $((Get-Date).ToUniversalTime().ToString('o'))"
+
+            # See .github/scripts/Invoke-WslBash.ps1. No -PipeFail: the guest script
+            # below is a sequence of probes that must each be allowed to fail.
+            & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -Script @'
+          printf 'guest time before: %s\n' "$(date -u +%FT%T.%NZ)"
+          if command -v timedatectl >/dev/null 2>&1 && timedatectl show >/dev/null 2>&1; then
+            timedatectl show -p NTP -p NTPSynchronized -p TimeUSec || true
+            # Wait for the client to report a completed sync before switching it
+            # off: an unsynchronised clock means a correction is still owed, and
+            # it must land here -- while nothing is timing a scenario -- rather
+            # than arriving mid-suite. Already-synchronised returns immediately,
+            # since then nothing is pending.
+            # 30s: comfortably past a first NTP exchange on a reachable source,
+            # and the whole budget is only spent by a guest that has none -- in
+            # which case nothing was going to step it anyway, so burning it once
+            # per job is cheaper than a correction landing mid-suite.
+            timedatectl set-ntp true 2>/dev/null || true
+            for _ in $(seq 1 30); do
+              [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "yes" ] && break
+              sleep 1
+            done
+            # Then take the stepper out of the picture for the rest of the job.
+            timedatectl set-ntp false 2>/dev/null || true
+            timedatectl show -p NTP -p NTPSynchronized || true
+          else
+            # No systemd in this guest: there is no in-guest NTP client to settle,
+            # so any step the suite sees came from the host. Say so -- the next
+            # failure is read against this line.
+            echo "timedatectl unavailable; no in-guest NTP client to settle"
+          fi
+          printf 'guest time after:  %s\n' "$(date -u +%FT%T.%NZ)"
+          '@
+          } catch {
+            Write-Host "guest clock probe did not run: $_"
+          }
+          # Best-effort by design: never fail the lane on a clock it could not settle.
+          exit 0
+
       # A freshly installed distro has none of this; install unconditionally
       # (idempotent) rather than gating on passwordless sudo like the old
       # static-host step did — this guest always runs as root. `sudo` itself
