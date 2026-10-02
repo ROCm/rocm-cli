@@ -95,8 +95,10 @@ dependencies (e.g. `lm-format-enforcer`), which AMD's index doesn't host; a
 generated `uv.toml` sets `ignore-error-codes = [403]` for that index so `uv`
 falls through to PyPI for those instead of treating the index's 403 as fatal.
 That same full-dependency resolve can also pull in an unconstrained `torch`
-from PyPI, undoing the exact ROCm pin just installed; the install re-pins
-torch back to it immediately afterwards.
+from PyPI, undoing the exact ROCm pin just installed, and transitively an
+unconstrained `torchvision`/`torchaudio` with it; the install re-pins torch,
+plus whatever of torchvision/torchaudio was already installed by the SDK
+install, back to their prior exact builds immediately afterwards.
 Every other
 ROCm SDK version, including 7.2.3, keeps using the static pin table; an SDK
 version with no matching row there falls back to the table's default pin,
