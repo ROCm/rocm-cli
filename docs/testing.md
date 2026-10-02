@@ -221,6 +221,13 @@ suite runs on is kept by `@requires-real-gpu` scenarios such as `examine-18`,
 which repeats `examine-04`'s assertions against a real GPU host on every GPU
 lane, the Windows one included.
 
+A simulated machine is only worth trusting while it is laid out the way the
+kernel lays out a real one, so two `@nightly` scenarios
+(`examine-19`, `examine-20`) hold every fixture assumption against the live
+`/dev`, `/sys`, `/proc/version` and `lspci` of a real GPU host and a real WSL2
+distribution. When a kernel or driver update moves something, they fail with
+the exact difference; update `tests/e2e-cucumber/src/simulated_host.rs` to match.
+
 ## CI test selection
 
 On pull requests, CI does not test the whole workspace. The `test` job runs

@@ -119,6 +119,9 @@ pub struct E2eWorld {
     /// invocation as `ROCM_CLI_TEST_HOST_ROOT`, and the directory of tool
     /// stand-ins put at the front of `PATH`. `None` means the real host.
     pub simulated_host: Option<SimulatedHostRoot>,
+    /// How a simulated machine differs from the real one this scenario runs
+    /// on, for the real-hardware check that keeps the fixtures honest.
+    pub layout_drift: Option<Vec<String>>,
     /// Per-scenario serve-readiness timeout override (seconds), set by the
     /// `before` hook from `expectations.toml` when this scenario is a known bug
     /// with a `serve_timeout_secs`. Lets an xfail serve that never becomes ready
@@ -346,6 +349,7 @@ impl Default for E2eWorld {
             isolated_root: Some(root),
             legacy_rocm_path: None,
             simulated_host: None,
+            layout_drift: None,
             serve_timeout_override: None,
             expect_xfail: false,
             command_env: Vec::new(),

@@ -24,7 +24,8 @@ Feature: GPU detection and system inspection
   # version -- naming an MI300X `gfx943` instead of `gfx942`. The machine is
   # simulated, with the KFD topology laid out as the kernel lays it out, so this
   # runs on every Linux lane rather than only where an Instinct GPU is installed.
-  # The same cross-check against a real kernel is examine-18.
+  # The same cross-check against a real kernel is examine-18, and examine-19
+  # holds the simulated layout against a real one.
   @id:examine-detects-gpu-and-driver @requires-os:linux
   Scenario: examine-04 - System inspection detects the GPU and driver
     Given a machine with an AMD Instinct GPU
@@ -241,3 +242,25 @@ Feature: GPU detection and system inspection
     Then the inspection reports which GPU is installed
     And the inspection names the GPU target that the kernel reports
     And the inspection reports that the driver is available
+
+  # The GPU scenarios above run on simulated machines, which are only worth
+  # trusting while they are laid out the way the kernel lays out a real one. If a
+  # kernel moved a property, every simulated scenario would keep passing while the
+  # CLI failed on hardware -- the shape of the bug examine-04 pins, where the
+  # target was read from a file no kernel has. So on a real GPU host, every
+  # fixture assumption is held against the live /dev, /sys and `lspci`. Nightly,
+  # because kernels change on the scale of runner reimages, not pull requests.
+  @id:examine-simulated-machine-matches-the-kernel @requires-real-gpu @requires-bare-metal @requires-os:linux @nightly
+  Scenario: examine-19 - The simulated GPU machine is laid out like a real GPU host
+    When the simulated GPU machine is compared with this machine's kernel
+    Then the simulated machine is laid out the same way
+
+  # The WSL2 counterpart: the device node, dxcore runtime and kernel string the
+  # simulated WSL machine relies on, held against a real WSL2 distribution.
+  # `@requires-wsl` alone, not `@requires-real-gpu`: the check reads only what
+  # WSL itself mounts, and the WSL lane deliberately runs without ROCm
+  # passthrough, so a GPU gate would keep it from ever running there.
+  @id:examine-simulated-wsl-machine-matches-wsl @requires-wsl @nightly
+  Scenario: examine-20 - The simulated WSL machine is laid out like a real WSL2 host
+    When the simulated WSL machine is compared with this machine
+    Then the simulated machine is laid out the same way
