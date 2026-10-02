@@ -47,11 +47,6 @@ pub use types::{
     ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PlannedAction,
     ReplayState, ResolvedArgs, UpdateStatus, format_mmss,
 };
-// `NO_CHAT_BACKEND_MSG` has no current caller through this `crate::app::`
-// path (call sites use `super::types::` directly), but it was reachable here
-// pre-split and the re-export list claims parity with `crate::app::*`.
-#[allow(unused_imports)]
-pub(crate) use types::NO_CHAT_BACKEND_MSG;
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
 /// How many snapshots to keep for sparklines.
