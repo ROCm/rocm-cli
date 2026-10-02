@@ -26,6 +26,7 @@ includes = [
 excludes = [
   "target/**",
   ".claude/**",
+  ".supergoal/**",
   ".tmp-*/**",
   "third_party/**",
   "skills/rocm-doctor/**",

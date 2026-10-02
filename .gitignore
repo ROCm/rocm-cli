@@ -16,6 +16,7 @@ __pycache__/
 # skillscope writes its JSON run reports here.
 /.skillscope/
 /.claude
+/.supergoal/
 /plans/
 /workspace/
 /e2e-consolidated-report.md
