@@ -26,6 +26,14 @@ use crate::E2eWorld;
 // `:` form only in `runtime_id`, which is a manifest field value, never a filename.
 const FIRST_KEY: &str = "release-tarball-gfx942";
 const SECOND_KEY: &str = "release-tarball-gfx1100";
+/// Two keys that differ only in letter case. Each is its own `<key>.json` in the
+/// registry, so the pair can only coexist on a case-sensitive filesystem — which
+/// is why the scenario using them is Linux-only.
+const LOWER_TWIN_KEY: &str = "release-tarball-gfx942";
+const UPPER_TWIN_KEY: &str = "RELEASE-TARBALL-GFX942";
+/// Matches neither twin exactly and both case-insensitively — the shape the
+/// resolver used to settle silently by picking one.
+const CASE_ONLY_SELECTOR: &str = "Release-Tarball-Gfx942";
 const IMPORT_KEY: &str = "release-tarball-gfx1151";
 
 /// Write a read-only `tarball` runtime manifest into the isolated registry and
@@ -107,6 +115,13 @@ async fn two_runtimes_second_active(world: &mut E2eWorld) {
     crate::run_rocm_ok(world, &["runtimes", "activate", SECOND_KEY]);
 }
 
+#[given("two registered runtimes whose keys differ only in letter case")]
+async fn two_case_twin_runtimes(world: &mut E2eWorld) {
+    // Distinct families only so each twin gets its own install root.
+    plant_runtime(world, LOWER_TWIN_KEY, "gfx942");
+    plant_runtime(world, UPPER_TWIN_KEY, "gfx1100");
+}
+
 #[given("a registered read-only runtime")]
 async fn one_readonly_runtime(world: &mut E2eWorld) {
     let install_root = plant_runtime(world, FIRST_KEY, "gfx942");
@@ -143,6 +158,19 @@ async fn activate_second_again(world: &mut E2eWorld) {
 #[when("the user rolls back")]
 async fn rollback(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user activates a runtime with a selector that matches both only by letter case")]
+async fn activate_by_case_only_selector(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "activate", CASE_ONLY_SELECTOR]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user activates one of them by its exact key")]
+async fn activate_upper_twin_exactly(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", UPPER_TWIN_KEY]);
     record(world, stdout, stderr, rc);
 }
 
@@ -334,6 +362,60 @@ async fn listing_explains_markers(world: &mut E2eWorld) {
     assert!(
         out.contains("legend: * = active, - = rollback target"),
         "expected the marker legend, got:\n{out}"
+    );
+}
+
+#[then("the CLI refuses and names both runtimes")]
+async fn refuses_naming_both_twins(world: &mut E2eWorld) {
+    let out = combined(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a selector matching two runtimes only by letter case must not succeed:\n{out}"
+    );
+    assert!(
+        out.contains("differ only in letter case"),
+        "expected the case-ambiguity refusal, got:\n{out}"
+    );
+    // The advice is "name one of them exactly", so both exact keys must be on
+    // screen for the user to follow it.
+    for key in [LOWER_TWIN_KEY, UPPER_TWIN_KEY] {
+        assert!(
+            out.contains(key),
+            "the refusal must name `{key}` so the user can pick it exactly:\n{out}"
+        );
+    }
+}
+
+/// The refusal has to leave the registry as it was. Read back through
+/// `runtimes list` rather than trusting the error alone: a refusal printed after
+/// a partial activation would still read as a refusal.
+#[then("no runtime is active")]
+async fn no_runtime_active(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert_eq!(rc, 0, "runtimes list failed:\n{stdout}\n{stderr}");
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("* ")),
+        "the refused activation must not have activated anything:\n{stdout}"
+    );
+}
+
+/// The remediation the refusal names actually works: the exact key activates
+/// that runtime, and only that one.
+#[then("that exact runtime becomes active")]
+async fn exact_twin_active(world: &mut E2eWorld) {
+    let _ = ok_output(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert_eq!(rc, 0, "runtimes list failed:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("* {UPPER_TWIN_KEY}")),
+        "expected {UPPER_TWIN_KEY} active after naming it exactly:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("* {LOWER_TWIN_KEY}")),
+        "its case twin must not be the active one:\n{stdout}"
     );
 }
 

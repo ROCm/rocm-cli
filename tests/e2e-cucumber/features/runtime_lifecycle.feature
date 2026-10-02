@@ -80,3 +80,17 @@ Feature: Runtime lifecycle state machine
     When the user activates the second runtime again
     Then the second runtime is still the one in use
     And the first runtime is still the rollback target
+
+  # A selector that matched installed runtime keys only by letter case used to
+  # settle the tie silently, so the user could act on a runtime they never named.
+  # It now refuses and names the candidates, and naming one exactly works. Two
+  # keys that differ only in case are two registry files, so they can only
+  # coexist on a case-sensitive filesystem: Linux-only.
+  @id:runtime-lifecycle-case-twin-selector-refused @requires-os:linux
+  Scenario: runtime-lifecycle-09 - A selector matching two runtimes only by letter case is refused with both named
+    Given two registered runtimes whose keys differ only in letter case
+    When the user activates a runtime with a selector that matches both only by letter case
+    Then the CLI refuses and names both runtimes
+    And no runtime is active
+    When the user activates one of them by its exact key
+    Then that exact runtime becomes active

@@ -464,6 +464,14 @@ Normal user testing should switch versions by activating the exact runtime key
 printed by `rocm runtimes list`. The TUI equivalent is `/runtimes`, then arrow
 to an installed ROCm entry and press Enter.
 
+A runtime selector is matched against keys exactly first. If it matches no key
+exactly but more than one key ignoring letter case — possible on a
+case-sensitive filesystem, where `Foo` and `foo` are separate registry entries —
+`runtimes activate`, `runtimes uninstall` and `update --runtime` refuse and list
+the matching keys instead of picking one. For `activate`,
+`@id:runtime-lifecycle-case-twin-selector-refused` also checks that nothing
+became active and that naming one key exactly then works.
+
 Developer-only previous-runtime regression check:
 
 ```bash
