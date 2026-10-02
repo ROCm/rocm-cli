@@ -32,10 +32,12 @@ pub(crate) fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result
     };
     let signaled_pids = pids_where(|stop| stop.signaled);
     let force_signaled_pids = pids_where(|stop| stop.forced);
-    // Everything that was deliberately not signalled: the stopping process
-    // itself, a PID that was already gone, and — the case this list used not to
-    // be able to express — a PID that is live but provably belongs to somebody
-    // else now. `pid_outcomes` says which.
+    // Everything that was deliberately not signalled, which is no longer one
+    // kind of thing: the stopping process itself; a PID that was already gone;
+    // a PID that is live but provably belongs to somebody else now; and a live
+    // PID whose identity could not be read at all, which may still be the engine
+    // and may still hold the device. Only `pid_outcomes` separates them, and
+    // only `stopped` reports that the last of those is not a completed stop.
     let skipped_pids = pids_where(|stop| !stop.signaled);
     let all_stopped = stops.iter().all(|stop| stop.stopped);
     let pid_outcomes = stops
@@ -48,30 +50,50 @@ pub(crate) fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result
             })
         })
         .collect::<Vec<_>>();
-    // The status records that a stop was carried out, as it always has. Whether
-    // every process is confirmed gone is a separate question, answered by
-    // `stopped` in the result rather than by overloading the status string.
-    record.status = "stopped".to_owned();
-    // Recorded PIDs go stale the instant their processes exit, and a stale PID
-    // is exactly what the identity check exists to catch — so do not leave one
-    // behind for the next stop to find. Cleared only once every recorded process
-    // is confirmed gone: an unconfirmed survivor is still the service's, and a
-    // later stop has to be able to reach it.
+    // Claim a stop only when every recorded process is confirmed gone, and
+    // otherwise record that one was *asked for*. This is the contract
+    // `rocm services stop` already keeps on these same records
+    // (`stop_internal_managed_service`), and until now `rocmd` could not keep it
+    // because it had no idea whether a signal had achieved anything. It does
+    // now, so the two commands no longer leave the same manifest in two
+    // different states.
     if all_stopped {
+        record.status = "stopped".to_owned();
+        record.stop_requested_unix_ms = None;
+        // Recorded PIDs go stale the instant their processes exit, and a stale
+        // PID is exactly what the identity check exists to catch — so do not
+        // leave one behind for the next stop to find. Only safe here: an
+        // unconfirmed survivor is still the service's, and a later stop has to
+        // be able to reach it.
         record.supervisor_pid = 0;
         record.supervisor_start_ticks = None;
         record.engine_pid = None;
         record.engine_start_ticks = None;
+    } else {
+        // The marker `rocm`'s liveness refresh keys its deferred key cleanup on
+        // (`settle_pending_stop_key_cleanup`). It is what tells a service the
+        // operator stopped from one that merely crashed, and it is why the key
+        // below can be left in place without stranding it forever: the refresh
+        // drops it once the processes are actually observed gone.
+        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
     }
     record.write()?;
-    // Best-effort and idempotent: a missing key file is not an error, so this
-    // is safe to call unconditionally on every stop (including loopback
-    // services that never had a key, and repeated stops of an already-stopped
-    // service). Leaving the 0600 key file behind after stop would strand a
-    // plaintext secret on disk for a service that no longer exists.
-    let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
-        paths, service_id,
-    ));
+    // Drop the 0600 endpoint key file with the service, rather than stranding a
+    // plaintext secret on disk for something that is no longer running.
+    // Best-effort and idempotent: a missing key file is not an error, so a
+    // loopback service that never had one, and a repeated stop, both pass
+    // through here harmlessly.
+    //
+    // Gated, because an unconfirmed stop may have left the engine alive and
+    // still enforcing that key — and this is the only copy. Discarding it would
+    // lock the CLI's own probes, chat and service discovery out of a service
+    // that is otherwise fine, with no way to re-mint it. The marker written
+    // above hands the cleanup to the liveness refresh instead.
+    if all_stopped {
+        let _ = std::fs::remove_file(rocm_engine_protocol::endpoint_key_file_path(
+            paths, service_id,
+        ));
+    }
     Ok(json!({
         "service": record,
         "signaled_pids": signaled_pids,
@@ -202,10 +224,11 @@ fn terminate_recorded_pid(identity: &rocm_core::ProcessIdentity) -> rocm_core::T
     // the engine running and still holding the device.
     //
     // This is the same reach the stop has always had on Windows, and it costs no
-    // safety: `process_start_ticks` has no `/proc` to read there, so a Windows
-    // identity can never be refuted in the first place. It is still gated on the
-    // same verdict `terminate_verified` reaches, so a refuted root's subtree
-    // stays untouched wherever identity *is* verifiable.
+    // safety: `process_start_ticks` has no `/proc` to read there, so it returns
+    // `None`, no Windows identity can be refuted in the first place, and this
+    // gate can only ever turn away a PID that is not running. Nothing here
+    // relies on it doing more — identity verification proper is Linux-only until
+    // `rocm_core` can read a Windows process creation time.
     #[cfg(windows)]
     if matches!(
         rocm_core::identity_state(identity),
@@ -1598,6 +1621,55 @@ mod tests {
         assert_eq!(
             reloaded.engine_pid, None,
             "a confirmed stop must clear the engine PID"
+        );
+        Ok(())
+    }
+
+    /// A confirmed stop closes out the pending-stop protocol it shares with
+    /// `rocm services stop`: the deferred-cleanup marker is for a stop that
+    /// could *not* be confirmed, so leaving one set behind a completed stop
+    /// would keep asking `rocm`'s liveness refresh to finish work that is done.
+    ///
+    /// `rocmd` never wrote this field at all before it could tell a completed
+    /// stop from an attempted one, so a marker left by `rocm` outlived a `rocmd`
+    /// stop of the same service.
+    #[cfg(unix)]
+    #[test]
+    fn a_confirmed_stop_clears_the_pending_stop_marker() -> Result<()> {
+        let (root, paths) = temp_app_paths("stop-clears-pending-marker");
+        paths.ensure()?;
+
+        let service_id = "svc-pending-marker";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11445,
+            "managed",
+            // Not running, so the stop is confirmed without signalling anything.
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+
+        let result = stop_managed_service(&paths, service_id);
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let value = result?;
+        assert_eq!(value.get("stopped").and_then(Value::as_bool), Some(true));
+        let reloaded = reloaded?;
+        assert_eq!(reloaded.status, "stopped");
+        assert_eq!(
+            reloaded.stop_requested_unix_ms, None,
+            "a confirmed stop must clear the deferred-cleanup marker"
         );
         Ok(())
     }
