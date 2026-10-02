@@ -58,3 +58,61 @@ impl Drop for RestoredEnvVar {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RestoredEnvVar;
+    use std::path::Path;
+
+    /// Serializes the env mutation below, as the contract guard requires.
+    static TEST_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Used by nothing else in the tree, so no other test reads it mid-flight.
+    const KEY: &str = "ROCM_CORE_TEST_ENV_RESTORE_PROBE";
+
+    /// The restore is this type's whole purpose, and it is what the two callers
+    /// rely on to keep a panicking test from leaking a value into the next one.
+    ///
+    /// Both prior states are needed, because they catch different mistakes:
+    ///
+    /// * *previously unset* must come back **unset**, not merely empty — which a
+    ///   `var().unwrap_or_default()`-style capture would get wrong — and it also
+    ///   catches capturing the previous value *after* the mutation, which would
+    ///   "restore" the new value and leave the key set;
+    /// * *previously set* must come back to that exact value, which a `Drop`
+    ///   that does nothing would leave as the planted one.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
+    fn dropping_the_guard_restores_the_previous_state() {
+        let _guard = TEST_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SAFETY: serialized by the lock above, and nothing else reads this key.
+        unsafe { std::env::remove_var(KEY) };
+        drop(RestoredEnvVar::set(KEY, Path::new("planted")));
+        assert_eq!(
+            std::env::var_os(KEY),
+            None,
+            "a key that was unset must be unset again, not empty or still planted"
+        );
+
+        // SAFETY: as above.
+        unsafe { std::env::set_var(KEY, "before") };
+        let restore = RestoredEnvVar::set(KEY, Path::new("planted"));
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(std::ffi::OsStr::new("planted")),
+            "the guard must actually set the value it was given"
+        );
+        drop(restore);
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(std::ffi::OsStr::new("before")),
+            "a key that was set must get its previous value back"
+        );
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(KEY) };
+    }
+}
