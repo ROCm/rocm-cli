@@ -131,9 +131,12 @@ Every workspace crate (except the `e2e-cucumber` harness) has a committed line-c
 floor in `coverage-floors.toml`. CI fails when a crate drops more than a small tolerance
 below its floor, so deleting a test is a check failure rather than a silent loss.
 
-Check the floors locally — needs `cargo install cargo-llvm-cov`:
+Check the floors locally. This needs both the instrumentation tooling and the LLVM
+tools the toolchain ships separately — CI installs the same two:
 
 ```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
 cargo xtask coverage
 ```
 
