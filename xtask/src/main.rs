@@ -36,13 +36,13 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "rocm-cli repository tasks")]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Generate a 2048-bit RSA signing keypair (PKCS#8 private + SPKI public PEM).
     Keygen {
         /// Path to write the PKCS#8 private-key PEM.
