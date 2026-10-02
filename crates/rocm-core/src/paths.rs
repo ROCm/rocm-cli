@@ -303,6 +303,12 @@ pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
     ]
 }
 
+// Declared here rather than at the crate root so the property can reach the
+// private, env-free `AppPaths::discover_from_paths`.
+#[cfg(test)]
+#[path = "persisted_paths_props.rs"]
+mod persisted_paths_props;
+
 #[cfg(test)]
 mod tests {
     use super::*;
