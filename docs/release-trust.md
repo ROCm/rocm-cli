@@ -47,12 +47,23 @@ python scripts/release_readiness.py \
 ```
 
 The verifier confirms each named archive has the required rocm-cli bundle
-files, confirms the `.sha256` sidecar matches the archive bytes and names the
-archive being published, and confirms a non-empty `.sig` sidecar exists when
-signatures are required. If a public key is provided with `--public-key`, it
-also verifies the detached signature with `openssl`. Release CI also enables
-`--require-rocm-asset-names`, which rejects branch-like, path-like, or
-otherwise unsupported archive names before upload.
+files, and confirms the `.sha256` sidecar matches the archive bytes and names
+the archive being published.
+
+`--require-signatures` requires signatures that *verify*, not merely exist: each
+archive must have a non-empty `.sig` sidecar, and that signature must check out
+against the release signing public key via `cargo xtask verify`. The key is
+taken from `--public-key` when given, otherwise from the inline
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
+signing-key secret. If neither resolves, the gate fails. It deliberately does
+not fall back to checking that a `.sig` file is present: a sidecar produced by
+the wrong key, truncated, or corrupted would pass such a check, and because an
+unset GitHub secret expands to the empty string, the fallback would be reached
+silently whenever the secret was removed or rotated away. The log line
+`signature verification key:` names the key the run actually used.
+
+Release CI also enables `--require-rocm-asset-names`, which rejects branch-like,
+path-like, or otherwise unsupported archive names before upload.
 
 Release CI also enables `--require-exact-assets`. That rejects stale
 publishable files in `dist`, including old `.tar.gz`/`.zip` archives and orphan

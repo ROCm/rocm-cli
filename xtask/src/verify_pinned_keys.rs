@@ -258,13 +258,20 @@ fn check_pinned_keys(root: &Path, ci_public_key: Option<&str>) -> Result<Vec<Str
 
 /// When a CI signing public key is configured, it must equal the canonical current
 /// release key — the key CI verifies release artifacts against.
+///
+/// An absent key is reported rather than passed over in silence. This check cannot
+/// *demand* one: `ci.yml` never exposes the signing secret, so requiring it would
+/// fail every PR. But "no key configured" and "key matches" must not look alike in
+/// the log, or a secret that was rotated away reads as a clean run.
 fn check_ci_public_key(
     ci_public_key: Option<&str>,
     current_release_body: Option<&str>,
 ) -> Result<Vec<String>> {
     let env_pem = ci_public_key.unwrap_or_default();
     if env_pem.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![
+            "ci public key: not configured — cross-check skipped".to_owned(),
+        ]);
     }
     let env_body = pem_body(env_pem)
         .context("the configured CI signing public key is not a valid PUBLIC KEY PEM")?;
@@ -381,17 +388,15 @@ mod tests {
     fn ci_public_key_cross_check() {
         let current = pem_body(SAMPLE).unwrap();
 
-        // No CI key configured -> nothing to assert.
-        assert!(
-            check_ci_public_key(None, Some(&current))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            check_ci_public_key(Some("   "), Some(&current))
-                .unwrap()
-                .is_empty()
-        );
+        // No CI key configured -> nothing to assert, but the skip is reported so an
+        // unset/rotated-away secret does not read as a passing cross-check.
+        for absent in [None, Some("   "), Some("")] {
+            let reported = check_ci_public_key(absent, Some(&current)).unwrap();
+            assert!(
+                reported.iter().any(|m| m.contains("not configured")),
+                "absent CI key should report a skip, got {reported:?}"
+            );
+        }
 
         // Configured but no canonical current key yet -> skipped, not an error.
         let skipped = check_ci_public_key(Some(SAMPLE), None).unwrap();

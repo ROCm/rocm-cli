@@ -47,9 +47,10 @@ LINUX_EXECUTABLES = (
     "bin/rocmd",
     "install.sh",
 )
+SIGNING_PUBLIC_KEY_ENV = "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
 PRODUCTION_TRUST_ENV_NAMES = (
     "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
-    "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM",
+    SIGNING_PUBLIC_KEY_ENV,
     "ROCM_CLI_METADATA_PUBLIC_KEY_PATH",
     "ROCM_CLI_METADATA_PUBLIC_KEY_PEM",
     "ROCM_CLI_MODEL_RECIPE_INDEX_PATH",
@@ -381,8 +382,8 @@ def validate_archive(
     archive: Path,
     *,
     require_signatures: bool,
+    verify: bool,
     public_key: Path | None,
-    verify_with_env_key: bool = False,
     require_rocm_asset_names: bool,
 ) -> list[str]:
     messages: list[str] = []
@@ -409,7 +410,6 @@ def validate_archive(
         )
     messages.append(f"checksum ok: {archive.name}")
 
-    verify = public_key is not None or verify_with_env_key
     signature = Path(f"{archive}.sig")
     if require_signatures or verify:
         if not signature.is_file():
@@ -456,6 +456,30 @@ def env_text(name: str) -> str | None:
     if value is None or not value.strip():
         return None
     return value
+
+
+def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
+    """Resolve the public key release signatures are verified against.
+
+    Returns the key path and a label naming where it came from. A ``None`` path
+    means `cargo xtask verify` reads the inline PEM from
+    ``ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`` itself, so no temporary key file has to
+    be materialized here.
+
+    Raises when no key resolves. That is the point of this function: GitHub
+    expands an unset secret to the empty string, so a missing key is
+    indistinguishable from a deliberately absent one. Verification has to fail
+    closed, or rotating the secret away would silently downgrade the release
+    gate to "a .sig file exists".
+    """
+    if explicit is not None:
+        return explicit, f"--public-key {explicit}"
+    if env_text(SIGNING_PUBLIC_KEY_ENV) is not None:
+        return None, f"${SIGNING_PUBLIC_KEY_ENV}"
+    raise ReadinessError(
+        "signature verification requires a release signing public key: pass "
+        f"--public-key or set {SIGNING_PUBLIC_KEY_ENV}"
+    )
 
 
 def require_any(label: str, names: list[str]) -> None:
@@ -521,14 +545,13 @@ def validate_release(
     *,
     assets: list[str],
     require_signatures: bool,
+    verify: bool,
     public_key: Path | None,
-    verify_with_env_key: bool = False,
     require_production_trust: bool,
     require_rocm_asset_names: bool,
     require_exact_assets: bool,
 ) -> list[str]:
     archives = discover_archives(dist, assets)
-    verify = public_key is not None or verify_with_env_key
     messages: list[str] = []
     if require_exact_assets:
         if not assets:
@@ -545,8 +568,8 @@ def validate_release(
             validate_archive(
                 archive,
                 require_signatures=require_signatures,
+                verify=verify,
                 public_key=public_key,
-                verify_with_env_key=verify_with_env_key,
                 require_rocm_asset_names=require_rocm_asset_names,
             )
         )
@@ -635,6 +658,7 @@ def run_self_test(root: Path) -> None:
             dist,
             assets=[],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=False,
@@ -655,6 +679,7 @@ def run_self_test(root: Path) -> None:
             exact_dist,
             assets=[exact_linux_archive.name, exact_windows_archive.name],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=True,
@@ -672,6 +697,7 @@ def run_self_test(root: Path) -> None:
                 exact_dist,
                 assets=[exact_linux_archive.name, exact_windows_archive.name],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
@@ -692,6 +718,7 @@ def run_self_test(root: Path) -> None:
                 exact_dist,
                 assets=[exact_linux_archive.name, exact_windows_archive.name],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
@@ -729,6 +756,7 @@ def run_self_test(root: Path) -> None:
                 strict_nightly_alias.name,
             ],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=True,
@@ -743,6 +771,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -761,6 +790,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -775,6 +805,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -792,6 +823,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -809,6 +841,7 @@ def run_self_test(root: Path) -> None:
                     dist,
                     assets=[],
                     require_signatures=True,
+                    verify=False,
                     public_key=None,
                     require_production_trust=True,
                     require_rocm_asset_names=False,
@@ -847,6 +880,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=True,
                 require_rocm_asset_names=False,
@@ -864,6 +898,7 @@ def run_self_test(root: Path) -> None:
                     "missing-installer-alias.tar.gz",
                 ],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -877,6 +912,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=["../rocm-cli-linux-amd64.tar.gz"],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -892,12 +928,51 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=["rocm-cli-test-linux-amd64.tar.gz"],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
                 require_exact_assets=False,
             ),
         )
+
+        expect_failure(
+            "signature verification with no resolvable key",
+            lambda: run_with_env(
+                {SIGNING_PUBLIC_KEY_ENV: None},
+                lambda: resolve_signing_key(None),
+            ),
+        )
+        # GitHub expands an unset secret to the empty string, so this is what an
+        # unconfigured ROCM_CLI_SIGNING_PUBLIC_KEY_PEM actually looks like in CI.
+        # It must fail exactly like an absent one rather than resolving to a key.
+        expect_failure(
+            "signature verification with an empty key",
+            lambda: run_with_env(
+                {SIGNING_PUBLIC_KEY_ENV: ""},
+                lambda: resolve_signing_key(None),
+            ),
+        )
+
+        env_key, env_source = run_with_env(
+            {SIGNING_PUBLIC_KEY_ENV: "-----BEGIN PUBLIC KEY-----\nself-test\n"},
+            lambda: resolve_signing_key(None),
+        )
+        if env_key is not None or SIGNING_PUBLIC_KEY_ENV not in env_source:
+            raise ReadinessError(
+                f"expected the environment key to resolve, got {env_source}"
+            )
+
+        explicit = root / "explicit-public-key.pem"
+        explicit_key, explicit_source = run_with_env(
+            {SIGNING_PUBLIC_KEY_ENV: "-----BEGIN PUBLIC KEY-----\nself-test\n"},
+            lambda: resolve_signing_key(explicit),
+        )
+        if explicit_key != explicit or str(explicit) not in explicit_source:
+            raise ReadinessError(
+                f"expected --public-key to win over the environment, got {explicit_source}"
+            )
+        print("release readiness self-test: signing key resolution ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
@@ -917,12 +992,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-signatures",
         action="store_true",
-        help="Require every archive to have a non-empty .sig sidecar.",
+        help="Require every archive to carry a detached signature that verifies "
+        "against the release signing public key.",
     )
     parser.add_argument(
         "--public-key",
         type=Path,
-        help="Verify detached signatures with this public key.",
+        help="Verify detached signatures with this public key instead of the one "
+        f"in {SIGNING_PUBLIC_KEY_ENV}.",
     )
     parser.add_argument(
         "--require-production-trust",
@@ -968,37 +1045,31 @@ def main() -> None:
     require_production_trust = args.require_production_trust or truthy(
         os.environ.get("ROCM_CLI_REQUIRE_PRODUCTION_TRUST")
     )
-    # Verify archives against the release public key whenever one is configured,
-    # not just check that a key input exists — so a private/public key mismatch
-    # fails here instead of at users' installers. Mandatory under production
-    # trust; otherwise opportunistic: if a signing public key is present in the
-    # environment (release/nightly wire it from the secret), verify against it.
-    # An explicit --public-key still wins; with neither, behavior is unchanged.
-    #
-    # When relying on the environment key, `cargo xtask verify` reads it directly
-    # from ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, so no temp key file is materialized here.
-    public_key = args.public_key
-    verify_with_env_key = False
+    # Requiring signatures means requiring they verify. Checking only that a
+    # .sig exists would pass an artifact signed by the wrong key, truncated, or
+    # corrupted — so whenever signatures are required, so is cryptographic
+    # verification, and a key that cannot be resolved is a hard failure rather
+    # than a quiet downgrade to the presence check.
+    verify = (
+        require_signatures or require_production_trust or args.public_key is not None
+    )
+    public_key: Path | None = None
+    messages: list[str] = []
     try:
-        if public_key is None and (
-            require_production_trust
-            or env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is not None
-        ):
-            if env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is None:
-                raise ReadinessError(
-                    "production trust requires the release signing public key: set "
-                    "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM (or pass --public-key)"
-                )
-            verify_with_env_key = True
-        messages = validate_release(
-            Path(args.dist),
-            assets=args.asset,
-            require_signatures=require_signatures,
-            public_key=public_key,
-            verify_with_env_key=verify_with_env_key,
-            require_production_trust=require_production_trust,
-            require_rocm_asset_names=args.require_rocm_asset_names,
-            require_exact_assets=args.require_exact_assets,
+        if verify:
+            public_key, key_source = resolve_signing_key(args.public_key)
+            messages.append(f"signature verification key: {key_source}")
+        messages.extend(
+            validate_release(
+                Path(args.dist),
+                assets=args.asset,
+                require_signatures=require_signatures,
+                verify=verify,
+                public_key=public_key,
+                require_production_trust=require_production_trust,
+                require_rocm_asset_names=args.require_rocm_asset_names,
+                require_exact_assets=args.require_exact_assets,
+            )
         )
     except ReadinessError as error:
         fail(str(error))
