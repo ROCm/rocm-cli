@@ -447,3 +447,32 @@ Feature: Diagnosing failures and listing fixes
   Scenario: diagnose-30 - What a report would carry never identifies the machine
     When the user asks the CLI what a report would carry in machine-readable form
     Then the answer names no user, no host, and no file path
+
+  # `--send` promises the report is always read before its form is offered.
+  # That promise only holds if asking for the form without asking to see the
+  # report first is refused outright, before anything about this machine is
+  # examined — so this is the same exit code any other argument mistake gets,
+  # not a diagnosis outcome, and it is true on every host and every lane.
+  @id:diagnose-send-without-report-is-refused
+  Scenario: diagnose-31 - Asking the CLI for a way to send a report, without asking to see it first, is refused
+    When the user asks the CLI for a way to send a report, without asking to see the report first
+    Then the CLI refuses and explains that the report must be requested too
+
+  # Forces the same headless shape a server or container presents: no display,
+  # no forwarded display, no override asking for a browser anyway. Linux-only
+  # because the CLI only reads the environment for this decision on Linux;
+  # Windows and macOS always treat a user as present, so there is no
+  # environment that forces this branch on those hosts.
+  #
+  # Host-independent beyond that, and for the same structural reason
+  # diagnose-29 and diagnose-30 are: the WSL lane refuses before any GPU
+  # probe, and most other lanes have no GPU on the compatibility matrix
+  # either, so a report is prepared on some lanes and refused on others.
+  # Written so whichever branch a lane reaches is a real assertion rather
+  # than a skip.
+  @id:diagnose-send-on-a-headless-machine-prints-instead-of-opening @requires-os:linux
+  Scenario: diagnose-32 - Asking to send on a machine with no desktop prints the address and a link instead of starting a mail client
+    When the user asks the CLI for a way to send a report, with no desktop available to open it on
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+    And the CLI prints the address to mail and a link, and starts nothing
