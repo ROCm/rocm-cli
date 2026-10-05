@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+#[cfg(test)]
+mod advised_commands;
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
