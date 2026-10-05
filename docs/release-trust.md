@@ -277,6 +277,14 @@ Some reads stay on the real machine even in a hook build:
   the probes execute, such as `ldconfig`.
 - The package-manager install hints, which read the real `/etc/os-release`.
 
+One check is routed but keeps the real device as a veto: the `rocm dash`
+pre-flight that decides whether to start `amd-smi`. Because it gates a real
+process, `amd-smi` runs only when both the real `/dev/kfd` and the simulated
+host's `/dev/kfd` are readable. A simulated host can hide the GPU from the
+dashboard, but cannot start `amd-smi` on a machine without one. On WSL the
+pre-flight still accepts the CLI's GPU-reachability verdict instead of a device
+node, as it always has, so the veto does not apply there.
+
 ## Remaining Owner Step
 
 The repo still needs a real project-owned public signing key and matching
