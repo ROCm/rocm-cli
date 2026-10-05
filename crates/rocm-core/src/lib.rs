@@ -2599,10 +2599,13 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 ///
 /// Search the conventional locations, and report "could not ask" as `None`
 /// rather than as an empty answer.
+///
+/// Deliberately not routed through [`host_path`]: these are programs this
+/// process executes, not files it reads to describe the machine, and a
+/// simulated host root holds no working linker to run.
 fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
-        let program = host_path(program);
-        if let Some(text) = capture_optional_command(&program.to_string_lossy(), &["-p"]) {
+        if let Some(text) = capture_optional_command(program, &["-p"]) {
             return Some(text);
         }
     }
