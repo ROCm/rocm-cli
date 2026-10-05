@@ -398,27 +398,35 @@ That command copies `config.json` and `runtimes/` into a temporary
 ComfyUI in that temporary app state, then removes the temporary state after it
 stops the process it started.
 
-`rocm comfyui install --reinstall` replaces only ComfyUI's code in its
-`source/` folder and leaves the user's content there (`models/`, `user/`,
-`output/`, `input/`, `custom_nodes/`, `extra_model_paths.yaml`) in place. It
-leaves the install untouched when the new source cannot be obtained, and a
-re-run finishes a swap that was interrupted. The swap itself is unit-tested
-directly, without a fake Python, so it also runs on Windows; the tests stop it
-before each filesystem change in turn and check that a re-run converges, and
-on Unix also cover symlinked model folders and that the user's files keep
-their inode and ctime:
+`rocm comfyui install --reinstall` deletes only the top-level entries a
+ComfyUI release shipped in its `source/` folder, keeps the preserved ones
+(`models/`, `user/`, `output/`, `input/`, `custom_nodes/`, `datasets/`,
+`extra_model_paths.yaml`) and leaves anything else in place. It leaves the
+install untouched when the new source cannot be obtained, `start` refuses a
+folder whose swap was interrupted, and a re-run finishes it. The swap is
+unit-tested directly, without a fake Python. Most of those tests also run on
+Windows: stopping the swap before each filesystem change in turn and checking
+that a re-run converges, unknown entries and `datasets/` left in place, and
+`main.py` removed first and moved in last. The symlink tests (symlinked model
+folders, links inside them, loops, dangling links, the copy fallback) and the
+inode/ctime test are Unix-only:
 
 ```bash
 cargo test -p rocm --bin rocm comfyui::source_swap
-cargo test -p rocm --bin rocm comfyui::tests::reinstall
+cargo test -p rocm --bin rocm comfyui::tests
 ```
 
-The e2e scenarios `comfyui-05` to `comfyui-08` (`comfyui.feature`, Linux, no
-GPU) cover the same through the built binary, including a failed download and
-a reinstall refused while ComfyUI runs:
+The second filter covers the install-level tests: `reinstall_*`,
+`install_after_an_interrupted_reinstall_finishes_it` and
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`.
+
+The e2e scenarios `comfyui-05` to `comfyui-09` (`comfyui.feature`, Linux, no
+GPU) cover the same through the built binary: what is kept and left in place,
+a failed download, the dry run, a reinstall refused while ComfyUI runs, and
+`start` refusing a half-replaced folder until the command it names is run:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-0[5678]"
+cargo xtask e2e -- -n "comfyui-0[56789]"
 ```
 
 To reuse an already installed ComfyUI app without reinstalling dependencies:

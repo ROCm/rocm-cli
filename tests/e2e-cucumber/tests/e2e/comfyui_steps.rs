@@ -574,17 +574,25 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 
 /// The user's own content in a used ComfyUI install, relative to `source/`:
 /// one file in each entry a reinstall keeps.
-const USER_FILES: [(&str, &str); 6] = [
+const USER_FILES: [(&str, &str); 9] = [
     ("models/checkpoints/my-model.safetensors", "user model"),
     ("user/default/workflows/my-workflow.json", "user workflow"),
     ("output/ComfyUI_00001_.png", "user image"),
     ("input/my-upload.png", "user upload"),
     ("custom_nodes/my-node/__init__.py", "user node"),
+    ("datasets/my-set/0001.png", "user dataset"),
     ("extra_model_paths.yaml", "user model paths"),
+    // No ComfyUI release ships these; a reinstall leaves them where they are.
+    (".git/HEAD", "ref: refs/heads/master"),
+    ("styles.csv", "user styles"),
 ];
 
 /// The kept-entries list the CLI prints, in its order.
-const KEPT_LIST: &str = "models, user, output, input, custom_nodes, extra_model_paths.yaml";
+const KEPT_LIST: &str =
+    "models, user, output, input, custom_nodes, datasets, extra_model_paths.yaml";
+
+/// The entries no release shipped, as the CLI lists them.
+const LEFT_IN_PLACE_LIST: &str = ".git, styles.csv";
 
 /// `source/` of the ComfyUI install that belongs to the planted runtime.
 fn comfyui_source_dir(world: &E2eWorld) -> PathBuf {
@@ -673,6 +681,7 @@ async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str) {
         ("models/checkpoints/put_checkpoints_here", ""),
         ("output/_output_images_will_be_put_here", ""),
         ("custom_nodes/websocket_image_save.py", "new release"),
+        ("comfy/added_upstream.py", "new release"),
     ] {
         write_fixture(&release.join(relative), contents);
     }
@@ -733,6 +742,10 @@ async fn reinstall_reports_and_keeps(world: &mut E2eWorld) {
     assert!(
         stdout.contains(&format!("  kept: {KEPT_LIST}\n")),
         "the reinstall must name what it kept, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  left in place: {LEFT_IN_PLACE_LIST}\n")),
+        "the reinstall must name what it left alone, got:\n{stdout}"
     );
 }
 
@@ -892,5 +905,99 @@ async fn stop_comfyui(world: &mut E2eWorld) {
     assert_eq!(
         rc, 0,
         "`rocm comfyui stop` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Leaves the installed folder as a reinstall killed part-way through
+/// replacing the code would: the swap's marker present (naming what the user
+/// had) and `main.py`, the first thing removed, gone. The swap's own unit test
+/// (`interrupted_swap_converges_when_run_again`) interrupts it for real at
+/// every step; this plants the end state so the CLI's handling of it can be
+/// driven through the binary.
+#[given("the reinstall was cut short while replacing ComfyUI's code")]
+async fn reinstall_cut_short(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    write_fixture(
+        &source.join(".rocm-cli-reinstall-in-progress"),
+        &KEPT_LIST.replace(", ", "\n"),
+    );
+    std::fs::remove_file(source.join("main.py")).expect("main.py was installed");
+}
+
+#[when("the user starts ComfyUI")]
+async fn start_comfyui(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(
+        world,
+        &["comfyui", "start", "--no-open-browser", "--port", "1"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+const FINISH_ADVICE: &str = "a reinstall was interrupted; run `rocm comfyui install --runtime-id e2e-comfyui-runtime` to finish it";
+
+#[then("start refuses and names the command that finishes the reinstall")]
+async fn start_refuses_mid_swap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(world.cli_rc, Some(0), "start must refuse:\n{stderr}");
+    assert!(
+        stderr.contains(FINISH_ADVICE),
+        "start must name the command that finishes the reinstall, got:\n{stderr}"
+    );
+}
+
+/// Runs the command `start` named, taken from its own output rather than
+/// restated, so the advice is what gets proven.
+#[when("the user runs the command start named")]
+async fn run_named_command(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let command = stderr
+        .split('`')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no backticked command in:\n{stderr}"))
+        .to_owned();
+    let args: Vec<&str> = command
+        .strip_prefix("rocm ")
+        .unwrap_or_else(|| panic!("not a rocm command: {command}"))
+        .split_whitespace()
+        .collect();
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &args);
+    assert_eq!(
+        rc, 0,
+        "`{command}` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the user's own files are untouched")]
+async fn user_files_untouched(world: &mut E2eWorld) {
+    assert_user_files_intact(world);
+}
+
+#[then("ComfyUI status reports the interrupted reinstall")]
+async fn status_reports_interruption(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(
+        stdout.contains(&format!("  note: {FINISH_ADVICE}\n")),
+        "status must report the interrupted reinstall, got:\n{stdout}"
+    );
+}
+
+#[then("ComfyUI status no longer reports an interrupted reinstall")]
+async fn status_clear_of_interruption(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(
+        !stdout.contains("interrupted"),
+        "status still reports the interruption:\n{stdout}"
+    );
+    assert!(
+        !comfyui_source_dir(world)
+            .join(".rocm-cli-reinstall-in-progress")
+            .exists()
     );
 }

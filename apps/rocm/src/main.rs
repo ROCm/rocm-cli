@@ -864,9 +864,11 @@ enum ComfyuiCommand {
         /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
-        /// Replace ComfyUI's code even if it is already installed. Your models, user
-        /// folder (saved workflows), output, input, custom_nodes and
-        /// extra_model_paths.yaml are left in place. Refused while ComfyUI is running.
+        /// Replace ComfyUI's code even if it is already installed. Only what a ComfyUI
+        /// release shipped is deleted: models, user (saved workflows), output, input,
+        /// custom_nodes, datasets, extra_model_paths.yaml and anything else of yours are
+        /// left in place. Refused while the ComfyUI started by `rocm comfyui start` is
+        /// running.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.

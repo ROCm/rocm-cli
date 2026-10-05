@@ -329,13 +329,15 @@ rocm comfyui install --reinstall
 
 Expected result:
 
-- The dry run prints `reinstall: replaces the ComfyUI code in <folder>` and
-  `keeps: models, user, output, input, custom_nodes, extra_model_paths.yaml`,
-  and its `install command:` ends in `--reinstall`. The ComfyUI folder is not
-  changed.
+- The dry run prints `reinstall: replaces the ComfyUI code in <folder>`,
+  `keeps:` naming the preserved folders the install has (from `models, user,
+  output, input, custom_nodes, datasets, extra_model_paths.yaml`) and
+  `leaves in place:`, and its `install command:` ends in `--reinstall`. The
+  ComfyUI folder is not changed.
 - The reinstall prints `kept:` naming the folders the install already had,
   and the model file, the saved workflow and the image are all still there
-  afterwards, unchanged.
+  afterwards, unchanged. Put a file such as `styles.csv` at the top of that
+  folder first: it is listed under `left in place:` and still there after.
 - With the network disconnected (and no archive cached under the ComfyUI
   folder's `downloads/`), the reinstall fails and the existing install and
   your files are untouched.

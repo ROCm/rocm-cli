@@ -139,3 +139,22 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
+
+  # A reinstall killed while it replaces the code leaves a half-replaced
+  # folder. `start` must not launch it; it names the install command that
+  # finishes the reinstall, and the scenario runs that exact command (read from
+  # the CLI's own message) and proves the condition is cleared.
+  @id:comfyui-interrupted-reinstall-blocks-start @requires-os:linux
+  Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    Given the reinstall was cut short while replacing ComfyUI's code
+    When the user starts ComfyUI
+    Then start refuses and names the command that finishes the reinstall
+    And ComfyUI status reports the interrupted reinstall
+    When the user runs the command start named
+    Then ComfyUI status no longer reports an interrupted reinstall
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
