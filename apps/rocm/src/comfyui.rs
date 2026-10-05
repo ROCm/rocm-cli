@@ -3254,7 +3254,8 @@ mod tests {
 
     /// Writes the archive `download_and_extract_source` would otherwise
     /// download, so a reinstall runs offline. Its top-level folder mirrors
-    /// GitHub's `ComfyUI-master/`.
+    /// GitHub's `ComfyUI-master/`. Only the unix-only install tests use it.
+    #[cfg(unix)]
     fn plant_cached_source_archive(app_root: &Path, files: &[(&str, &str)]) -> Result<()> {
         let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
         fs::create_dir_all(
