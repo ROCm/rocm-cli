@@ -206,10 +206,8 @@ mod tests {
     fn words_a_real_shell_reads(line: &str) -> Vec<String> {
         static GLOB_BAIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         let dir = GLOB_BAIT.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!(
-                "rocm-dash-quote-glob-bait-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("rocm-dash-quote-glob-bait-{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create glob-bait dir");
             for name in ["a", "1"] {
                 std::fs::write(dir.join(name), b"").expect("create glob-bait file");
