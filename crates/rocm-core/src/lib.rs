@@ -31,6 +31,7 @@ pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
@@ -40,7 +41,7 @@ pub mod terminal;
 mod test_env;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
     render_report_text as render_diagnose_text, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{

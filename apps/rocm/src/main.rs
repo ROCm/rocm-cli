@@ -28,6 +28,9 @@ use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rocm_core::model_readiness::{
+    AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
+};
 use rocm_core::{
     AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
     AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot, CodexBridgeSnapshot,
@@ -153,6 +156,19 @@ enum Command {
         /// name only when more than one is installed.
         #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
         distro: Option<String>,
+        /// Also answer whether a model would run on this machine, before
+        /// downloading it.
+        ///
+        /// Takes a curated model name or alias (see `rocm model`). Nothing is
+        /// fetched: the answer comes from the recipe and this host's GPU. A
+        /// model the catalog does not carry is reported as undetermined rather
+        /// than blocked — `rocm serve` still accepts it, this just cannot say
+        /// in advance whether it fits.
+        ///
+        /// A flag rather than a positional: `diagnose` takes no positional
+        /// today, and one added now would be ambiguous against `--symptom`.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -2077,7 +2093,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             top,
             json,
             distro,
-        }) => diagnose(symptom, top, json, distro),
+            model,
+        }) => diagnose(symptom, top, json, distro, model),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2748,7 +2765,34 @@ fn examine(json: bool, framework: rocm_core::FrameworkProbe) -> Result<()> {
     Ok(())
 }
 
-fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<String>) -> Result<()> {
+fn diagnose(
+    symptom: Option<String>,
+    top: usize,
+    json: bool,
+    distro: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
+    // The model verdict is about THIS machine, always. `--distro` retargets the
+    // environment examination at another one, but the GPU memory and engine
+    // selection behind a model verdict are read locally -- so answering for a
+    // model here would describe the wrong host under a heading naming another.
+    // Refuse rather than substitute, the same way `--distro` itself does when it
+    // cannot reach a machine.
+    //
+    // Keyed on whether `--distro` was passed, not on anything the probe below
+    // populates. An examination-derived signal (e.g. whether `examination.wsl`
+    // ended up set, or `locally_probed`) would make this refusal depend on
+    // probe internals instead of on the flag the user actually typed --
+    // exactly the kind of coupling that lets a future change to the probe
+    // silently let a `--distro` run fall through and answer for the local host
+    // under a heading naming another machine.
+    if model.is_some() && distro.is_some() {
+        bail!(
+            "--model answers for the machine running this command, and --distro points the \
+             examination at a different one. Run `rocm diagnose --model <model>` inside the \
+             distribution instead."
+        );
+    }
     // `rocm diagnose` is a query: it exits 0 whether it matched, found nothing,
     // or is out of scope. Callers read `has_match` / `out_of_scope` /
     // `route_when_no_match` from `--json` rather than branching on the exit code.
@@ -2780,11 +2824,21 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         .wsl
         .as_ref()
         .is_some_and(|wsl| !wsl.locally_probed);
-    let report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
+    if let Some(model_ref) = &model {
+        report.model = Some(assess_model_on_this_host(model_ref, &examination));
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print!("{}", rocm_core::render_diagnose_text(&report, top));
+        if let Some(readiness) = &report.model {
+            println!();
+            print!(
+                "{}",
+                rocm_core::model_readiness::render_model_readiness_text(readiness)
+            );
+        }
         // Inspecting a distribution from outside it collects no environment, so
         // the checks that read one never run. Without saying so, "no known
         // misconfiguration matched" reads as a clean bill of health for the
@@ -2799,6 +2853,228 @@ fn diagnose(symptom: Option<String>, top: usize, json: bool, distro: Option<Stri
         }
     }
     Ok(())
+}
+
+/// Answer `--model` for the machine running the command.
+///
+/// Gathers only what the verdict needs, and keeps every "could not read it"
+/// apart from every "it is not there": an unreadable recipe index becomes
+/// `Unreachable` rather than an empty catalog, and GPU memory that `amd-smi`
+/// could not report becomes `Unknown` rather than zero. Both collapses would
+/// turn a gap in what the CLI can see into a confident refusal of the model.
+fn assess_model_on_this_host(
+    model_ref: &str,
+    examination: &rocm_core::Examination,
+) -> ModelReadiness {
+    let paths = AppPaths::discover().ok();
+    assess_model_with_host_paths(model_ref, examination, paths.as_ref())
+}
+
+/// Testable core of [`assess_model_on_this_host`].
+///
+/// Takes the discovered `AppPaths` as an explicit parameter so the GPU-summary
+/// lookup and the config lookup read the same directories, instead of each
+/// racing its own `AppPaths::discover()` call. That used to be two separate
+/// calls: one (implicitly `None`) feeding [`detect_host_gpu_summary`], another
+/// feeding the config lookup a few lines later. Both resolve identically today
+/// because `AppPaths::discover()` is deterministic within a process, but
+/// `detect_host_gpu_summary`'s paths-driven TheRock-manifest gfx-target
+/// fallback only ever sees a path when one is passed in -- silently skipping
+/// it here is exactly the kind of drift that would let this command name a
+/// different engine than `rocm serve` for the same model.
+fn assess_model_with_host_paths(
+    model_ref: &str,
+    examination: &rocm_core::Examination,
+    paths: Option<&AppPaths>,
+) -> ModelReadiness {
+    let host_gpu_summary = detect_host_gpu_summary(paths);
+    let host = HostFacts {
+        accelerator_memory: host_accelerator_memory(&host_gpu_summary, examination),
+        system_ram_gib: rocm_core::detect_system_ram_gib(),
+    };
+    let configured_engine = paths
+        .and_then(|paths| RocmCliConfig::load(paths).ok())
+        .and_then(|config| config.default_engine);
+    match load_model_recipe_registry() {
+        Ok(registry) => assess_model_for_host(
+            model_ref,
+            &ModelCatalogSource::Available(&registry),
+            &host,
+            configured_engine.as_deref(),
+            Some(&host_gpu_summary),
+        ),
+        Err(error) => assess_model_for_host(
+            model_ref,
+            &ModelCatalogSource::Unreachable {
+                detail: format!("{error:#}"),
+            },
+            &host,
+            configured_engine.as_deref(),
+            Some(&host_gpu_summary),
+        ),
+    }
+}
+
+/// The memory pool an engine on this host would allocate a model from.
+///
+/// The APU case is why this is not simply a sum of `total_vram`. An APU has no
+/// private VRAM; `amd-smi` reports the fixed BIOS carve-out (often ~4 GiB) while
+/// the allocator serves the model out of GTT-backed system RAM. Comparing a
+/// recipe minimum against the carve-out would refuse a 22 GiB model on a 128 GiB
+/// Strix Halo, which serves it fine. [`vram_capacity_is_meaningful`] is the same
+/// test `serve`'s low-VRAM warning uses, so the two cannot disagree about which
+/// hosts the figure describes.
+///
+/// The examination is what makes "there is no GPU" reachable at all. `amd-smi`
+/// answers "how much memory", and its absence is ambiguous — no GPU, or no
+/// `amd-smi`. The examination reads the devices themselves, so it can tell those
+/// two apart, and they deserve different answers: one is a machine that needs a
+/// GPU, the other a machine whose GPU could not be measured.
+/// Whether the examination has positive or unresolved evidence of an AMD GPU,
+/// used to tell "no GPU" apart from "GPU present but VRAM unmeasured" when
+/// `amd-smi` produced nothing.
+///
+/// `examination.has_amd_gpu` cannot answer this on WSL: the hardware probes
+/// that set it are skipped there (see [`rocm_core::Examination::probe_with_interpreter`]),
+/// so it reads `false` on every WSL host, healthy or not, and this command
+/// would report a working machine as having no GPU at all -- `Blocked`
+/// instead of the `Undetermined` a genuinely unmeasurable host deserves.
+/// `rocm_sees_gpu`, not `has_amd_gpu`, is the WSL-native signal, per the same
+/// reasoning `fix-wsl-6-host-driver-too-old` already uses in `diagnose.rs`.
+/// Only `Some(false)` -- rocminfo positively enumerating no device -- counts
+/// as "no GPU"; `None` means rocminfo was absent so the question went unasked,
+/// which is not evidence of anything and must not read as a confident no.
+fn examination_reports_amd_gpu(examination: &rocm_core::Examination) -> bool {
+    match examination.wsl.as_ref() {
+        Some(wsl) => wsl.rocm_sees_gpu != Some(false),
+        None => examination.has_amd_gpu,
+    }
+}
+
+fn host_accelerator_memory(
+    host_gpu_summary: &rocm_core::HostGpuSummary,
+    examination: &rocm_core::Examination,
+) -> AcceleratorMemory {
+    classify_accelerator_memory(
+        gpu_vram_usage().as_deref(),
+        host_gpu_summary.gfx_target.as_deref(),
+        examination_reports_amd_gpu(examination),
+        rocm_core::usable_amd_gpu_indices().as_deref(),
+    )
+}
+
+/// The pure classification behind [`host_accelerator_memory`], split out so it
+/// can be exercised with fixed input instead of a live `amd-smi` subprocess.
+/// Deciding whether a host is an APU and which figure represents its memory is
+/// the actual judgement this command depends on; entangled with the
+/// subprocess call it was untestable, and a checker that silently regressed
+/// to always reporting `Dedicated` would leave every test green.
+fn classify_accelerator_memory(
+    vram: Option<&[GpuVramUsage]>,
+    gfx_target: Option<&str>,
+    gpu_reported: bool,
+    usable_indices: Option<&[u32]>,
+) -> AcceleratorMemory {
+    let Some(vram) = vram else {
+        if gpu_reported {
+            return AcceleratorMemory::Unknown;
+        }
+        return AcceleratorMemory::None;
+    };
+    if vram_capacity_is_meaningful(gfx_target, vram.len()) {
+        // `rocm serve` pins exactly one ordinal -- there is no tensor-parallel
+        // path anywhere in this binary -- so summing every card's VRAM into one
+        // figure can report a model READY when it would OOM on every individual
+        // card. Narrow to the mask-visible rows (a `HIP_VISIBLE_DEVICES` mask
+        // hides devices the same way it does for `rocm serve` itself) and take
+        // the most capable one: that is the best case `--gpu auto` could
+        // actually land on, so it is the right upper bound for "would this
+        // fit", even though it cannot name which ordinal the verdict answers
+        // for. `usable_indices` of `None` means the mask could not be probed,
+        // so every reported row is treated as visible rather than refusing to
+        // answer.
+        let max_gib = vram
+            .iter()
+            .filter(|usage| usable_indices.is_none_or(|indices| indices.contains(&usage.index)))
+            .map(|usage| usage.total_mb as f64 / 1024.0)
+            .fold(0.0_f64, f64::max);
+        return AcceleratorMemory::Dedicated(max_gib);
+    }
+    // This is an APU: the carve-out `amd-smi` reports above is the wrong pool,
+    // per `vram_capacity_is_meaningful`'s own doc. The right pool is the GTT
+    // aperture, and nothing in this binary can read it -- `amd-smi` does not
+    // report it, and no code path here calls `rocm-smi`, the tool that does.
+    // Total system RAM is not a substitute: the GTT aperture is capped well
+    // below installed RAM by BIOS/kernel policy, and asserting installed RAM
+    // as the engine's allocation pool trades the carve-out's under-estimate
+    // for an over-estimate in exactly the direction that produces a false
+    // `Ready` for a model that does not actually fit -- the wrong answer this
+    // command exists to prevent. This is deliberately not `Unknown`: that
+    // variant means no telemetry at all, for which "run `amd-smi metric
+    // --json`" is a real next step. Here `amd-smi` already ran and answered --
+    // it just named the wrong pool -- so the same remediation would send a
+    // Strix Halo user in a circle forever. Until the real aperture can be
+    // read, this reports `UnifiedMemoryUnreadable`, so the verdict reads
+    // `Undetermined` with no dead-end command attached, rather than a
+    // confident wrong one.
+    AcceleratorMemory::UnifiedMemoryUnreadable
+}
+
+/// Assess a model against this host, with `serve`'s own engine decision.
+///
+/// The engine is not re-derived here. `select_serve_engine` is the one place
+/// that answers "which engine serves this model on this host", and passing it in
+/// is what keeps `rocm diagnose --model` from confidently naming an engine
+/// `rocm serve` would never pick. An engine ruled out by the platform gate is
+/// reported as such rather than silently swapped for another: `serve` does not
+/// fall back either, and a verdict that pretended otherwise would be wrong in
+/// the user's favour.
+fn assess_model_for_host(
+    model_ref: &str,
+    catalog: &ModelCatalogSource<'_>,
+    host: &HostFacts,
+    configured_default_engine: Option<&str>,
+    host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+) -> ModelReadiness {
+    let engine_for = |recipe: &ModelRecipeRecord| {
+        let selection = select_serve_engine(
+            None,
+            configured_default_engine,
+            Some(recipe),
+            host_gpu_summary,
+        );
+        HostEngineChoice {
+            unsupported_here: unsupported_here_for(
+                &selection.engine,
+                engine_ruled_out_by_platform(&selection.engine),
+            ),
+            engine: selection.engine,
+            source: selection.source.to_owned(),
+        }
+    };
+    rocm_core::model_readiness::assess_model_readiness(model_ref, catalog, host, &engine_for)
+}
+
+/// Whether the platform gate rules this engine out on this host.
+///
+/// One place, so the `/model` adapter-availability note and the readiness
+/// verdict cannot answer differently about the same host and engine.
+const fn engine_ruled_out_by_platform(engine: &str) -> bool {
+    rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm")
+}
+
+/// The `unsupported_here` message for an engine, given whether the platform
+/// gate already ruled it out.
+///
+/// Split out from the `engine_for` closure in [`assess_model_for_host`] so it
+/// can be unit-tested on both branches directly, instead of only indirectly
+/// through whichever platform the test happens to run on. `ruled_out` is a
+/// plain `bool` rather than re-deriving it from `engine` here, so a test can
+/// exercise the "ruled out" branch on Linux CI and the "allowed" branch on a
+/// Windows runner without either one being unreachable.
+fn unsupported_here_for(engine: &str, ruled_out: bool) -> Option<String> {
+    ruled_out
+        .then(|| format!("{engine} has no adapter on native Windows; serve it from WSL or Linux"))
 }
 
 fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
@@ -17426,9 +17702,19 @@ fn append_model_fit_lines(
                     output,
                     "      reason: current telemetry has no aggregate GPU VRAM reading"
                 );
+                // Not `/examine`: an `Examination` is a static host snapshot and
+                // carries no VRAM figure at all, so sending the user there for a
+                // missing VRAM reading is a confident dead end. But naming
+                // `amd-smi metric --json` directly is just as much of one here:
+                // every production caller of this function hardcodes
+                // `aggregate_gpu_vram_gib = None`, so the reading this function
+                // sees never changes no matter what the user runs. `rocm
+                // diagnose --model` is the command that actually threads a live
+                // reading through (`host_accelerator_memory`), so it is pointed
+                // at instead of a command this one cannot act on.
                 let _ = writeln!(
                     output,
-                    "      action: run /examine or refresh GPU telemetry, then retry /model {}",
+                    "      action: run `rocm diagnose --model {}` for a live reading",
                     recipe_display_ref(recipe)
                 );
             }
@@ -17458,19 +17744,36 @@ fn append_manual_alternative_lines(
     }
 }
 
+/// Curated models to suggest in place of one that does not fit, for `/model`.
+///
+/// The *selection policy* — declared alternatives first, else same-task curated
+/// recipes, capped — lives in `rocm_core::model_readiness::curated_alternatives`
+/// and is shared with `rocm diagnose --model`, so the two commands cannot come
+/// to answer "what should I run instead" differently. What stays local is the
+/// predicate and the wording: `/model` asks only whether the VRAM minimum is
+/// met, while `diagnose --model` asks the whole readiness question, and each is
+/// right for its own report.
 #[allow(dead_code)]
 fn manual_alternative_recommendations(
     recipe: &ModelRecipeRecord,
     aggregate_gpu_vram_gib: Option<f64>,
 ) -> Vec<String> {
-    let declared = recipe
-        .manual_alternatives
-        .iter()
-        .filter_map(|candidate_ref| {
-            resolve_builtin_model_recipe(candidate_ref).map(|candidate| (candidate_ref, candidate))
-        })
-        .filter(|(_, candidate)| recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib))
-        .map(|(candidate_ref, candidate)| {
+    let catalog = builtin_model_recipes();
+    rocm_core::model_readiness::curated_alternatives(Some(recipe), &catalog, &|candidate| {
+        recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib)
+    })
+    .into_iter()
+    .map(|(candidate_ref, candidate)| {
+        // A declared alternative is shown with its requirement, a fallback with
+        // its name alone. The two branches are exclusive -- a fallback only runs
+        // when no declared candidate survived the predicate, and a candidate
+        // that failed it in one branch fails it in the other -- so testing the
+        // declared list here recovers exactly which branch produced this pick.
+        if recipe
+            .manual_alternatives
+            .iter()
+            .any(|declared| declared == candidate_ref)
+        {
             format!(
                 "{} ({})",
                 candidate_ref,
@@ -17479,19 +17782,11 @@ fn manual_alternative_recommendations(
                     |value| format!("{} min GPU", format_gib(f64::from(value)))
                 )
             )
-        })
-        .collect::<Vec<_>>();
-    if !declared.is_empty() {
-        return declared;
-    }
-    builtin_model_recipes()
-        .into_iter()
-        .filter(|candidate| candidate.canonical_model_id != recipe.canonical_model_id)
-        .filter(|candidate| candidate.task == recipe.task)
-        .filter(|candidate| recipe_is_manual_fit(candidate, aggregate_gpu_vram_gib))
-        .take(3)
-        .map(|candidate| recipe_display_ref(&candidate).to_owned())
-        .collect()
+        } else {
+            candidate_ref.to_owned()
+        }
+    })
+    .collect()
 }
 
 #[allow(dead_code)]
@@ -17573,7 +17868,7 @@ fn append_model_engine_support_lines(
 
 #[allow(dead_code)]
 const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'static str> {
-    if rocm_core::runtime_is_windows() && engine.eq_ignore_ascii_case("vllm") {
+    if engine_ruled_out_by_platform(engine) {
         Some(
             "runtime_status=unsupported_native_windows reason=native Windows skipped; use WSL/Linux vLLM ROCm; gpu_execution_required=true; run /engine for adapter details",
         )
@@ -17582,12 +17877,12 @@ const fn model_registry_adapter_availability_note(engine: &str) -> Option<&'stat
     }
 }
 
+/// One definition, shared with `rocm diagnose --model`: a model named in a
+/// suggestion has to be a string the user can paste back into `rocm serve`, and
+/// two answers to "what do I call this recipe" is one too many.
 #[allow(dead_code)]
 fn recipe_display_ref(recipe: &ModelRecipeRecord) -> &str {
-    recipe
-        .aliases
-        .first()
-        .map_or(recipe.canonical_model_id.as_str(), String::as_str)
+    rocm_core::model_readiness::recipe_display_ref(recipe)
 }
 
 #[allow(dead_code)]
@@ -21756,7 +22051,7 @@ fn effective_gpu_count(detected: Option<usize>, vram: Option<&[GpuVramUsage]>) -
 }
 
 /// A GPU's local VRAM occupancy as reported by `amd-smi metric --json`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GpuVramUsage {
     index: u32,
     used_mb: u64,
@@ -22151,6 +22446,16 @@ fn drm_device_is_amd(device_dir: &Path) -> bool {
 /// Parse `amd-smi metric --json` output into per-GPU VRAM usage. Accepts both
 /// the `{"gpu_data": [...]}` envelope and a bare top-level array, mirroring the
 /// schema variance handled by the dashboard amd-smi collector.
+///
+/// A row reporting `total_vram: 0` is dropped rather than kept as a measurement
+/// of an empty pool. `amd-smi` emits that shape when it enumerated the device
+/// but could not read its memory controller (a driver hiccup, not a 0 GiB
+/// GPU), and every other reader of this figure already treats zero as "not a
+/// real reading": [`GpuVramUsage::free_fraction`] returns `None` on it rather
+/// than reporting the GPU fully occupied. Keeping the row here would let
+/// [`host_accelerator_memory`] construct `AcceleratorMemory::Dedicated(0.0)`,
+/// which reads as "measured, and it is nothing" rather than "could not
+/// measure" -- turning a diagnostic gap into a confident `Blocked` verdict.
 fn parse_gpu_vram_usage(value: &serde_json::Value) -> Vec<GpuVramUsage> {
     let entries = value
         .get("gpu_data")
@@ -22173,6 +22478,9 @@ fn parse_gpu_vram_usage(value: &serde_json::Value) -> Vec<GpuVramUsage> {
             let total_mb = entry
                 .pointer("/mem_usage/total_vram/value")
                 .and_then(serde_json::Value::as_u64)?;
+            if total_mb == 0 {
+                return None;
+            }
             Some(GpuVramUsage {
                 index,
                 used_mb,
@@ -30785,7 +31093,7 @@ install therock";
 
         // The claim itself (onboarding only opens via an explicit `n` on the
         // Observe tab, never automatically) is proven by
-        // `crates/rocm-dash-tui/src/app/mod.rs`'s
+        // `crates/rocm-dash-tui/src/app/event_loop.rs`'s
         // `startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus`
         // test and the `onboarding.rs` module doc — this assertion only
         // guards the string, not the behavior.
@@ -35749,6 +36057,64 @@ ID_LIKE="suse opensuse"
         assert!(err.to_string().contains("protected system location"));
     }
 
+    /// The gate above is the last thing between a registry entry and
+    /// `fs::remove_dir_all`, and the path it is handed is text somebody else
+    /// wrote. One folder has many spellings, so the refusal has to survive all
+    /// of them — a trailing separator, a doubled one, a `.`, or a `..` that
+    /// walks back out of the user's home directory. Each of these names `/etc`.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_runtime_install_root_rejects_every_spelling_of_a_protected_path() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let home = home.display().to_string();
+        let spellings = [
+            "/etc/".to_owned(),
+            "//etc".to_owned(),
+            "/./etc".to_owned(),
+            "/etc/.".to_owned(),
+            format!("{home}/../../etc"),
+        ];
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|text| ensure_runtime_install_root_is_safe_to_remove(Path::new(text)).is_ok())
+            .collect();
+
+        assert!(
+            accepted.is_empty(),
+            "accepted as safe to recursively delete: {accepted:?}"
+        );
+    }
+
+    /// The same question — "is this a system location?" — also keeps the local
+    /// assistant from installing into one, and there the folder arrives as
+    /// free-form JSON from a model rather than from a file the user wrote. A
+    /// trailing separator is exactly the sort of thing generated text carries,
+    /// so the refusal has to survive every spelling here too.
+    #[test]
+    #[cfg(unix)]
+    fn the_assistant_cannot_name_a_system_install_folder_by_respelling_it() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let home = home.display().to_string();
+        let spellings = [
+            "/usr/".to_owned(),
+            "/opt/".to_owned(),
+            "//usr".to_owned(),
+            "/./opt".to_owned(),
+            format!("{home}/../../usr"),
+        ];
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|text| !chat_install_prefix_is_system(Path::new(text)))
+            .collect();
+
+        assert!(
+            accepted.is_empty(),
+            "accepted as a user install folder: {accepted:?}"
+        );
+    }
+
     #[test]
     fn plan_runtime_uninstall_does_not_mutate() -> Result<()> {
         let (root, paths) = test_paths("runtime-uninstall-plan-dry-run");
@@ -38055,6 +38421,13 @@ ID_LIKE="suse opensuse"
         assert!(rendered.contains("recommended_system_ram: 16 GiB"));
         assert!(rendered.contains("system_ram_fit: unknown"));
         assert!(rendered.contains("gpu_fit: unknown"));
+        // Every production caller of this function hardcodes
+        // `aggregate_gpu_vram_gib = None` (see `Command::Model` and the `/model`
+        // assistant tool), so this branch is the only one `rocm model` ever
+        // actually reaches -- its remediation must name a command this same
+        // path can act on, not one whose reading this function never sees.
+        assert!(rendered.contains("action: run `rocm diagnose --model"));
+        assert!(!rendered.contains("amd-smi metric --json"));
         assert!(rendered.contains("engine_support:"));
         assert!(rendered.contains("engine_action: use /engine install <engine>"));
         assert!(rendered.contains("source: built-in recipe registry"));
@@ -39523,5 +39896,458 @@ ID_LIKE="suse opensuse"
                 "whitespace-only stdin must yield no prompt; input: {input:?}"
             );
         }
+    }
+
+    /// Hosts whose engine choice differs, so the assertion below is exercised on
+    /// more than one branch of `select_serve_engine`.
+    fn engine_selection_hosts() -> Vec<(&'static str, rocm_core::HostGpuSummary)> {
+        vec![
+            (
+                "Instinct MI300X",
+                rocm_core::HostGpuSummary {
+                    name: Some("AMD Instinct MI300X".to_owned()),
+                    gfx_target: Some("gfx942".to_owned()),
+                    therock_family: Some("gfx94X-dcgpu".to_owned()),
+                },
+            ),
+            (
+                "Strix Halo",
+                rocm_core::HostGpuSummary {
+                    name: Some("AMD Radeon 8060S".to_owned()),
+                    gfx_target: Some("gfx1151".to_owned()),
+                    therock_family: Some("gfx1151".to_owned()),
+                },
+            ),
+            ("no detected GPU", rocm_core::HostGpuSummary::default()),
+        ]
+    }
+
+    /// I3 — `rocm diagnose --model` never names an engine `rocm serve` would not
+    /// select.
+    ///
+    /// Two layers agreeing about one decision. The defect this catches is not a
+    /// wrong `select_serve_engine`, it is the readiness path re-deriving the
+    /// choice from `recipe.preferred_engines` and drifting: that reads correctly
+    /// and is wrong on exactly the hosts where serve overrides the recipe. So
+    /// both real call sites are driven with the same inputs and compared, rather
+    /// than either being called with literal arguments.
+    #[test]
+    fn the_engine_doctor_names_is_the_engine_serve_would_select() {
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let host = HostFacts {
+            accelerator_memory: AcceleratorMemory::Dedicated(192.0),
+            system_ram_gib: Some(1024.0),
+        };
+
+        // Non-vacuity: at least one pair must be a case where serve OVERRIDES the
+        // recipe's own first preference, because that is the only case a
+        // re-derivation would get wrong. Native Windows has no such case --
+        // `preferred_serve_engine_for_host_gpu_summary` never prefers vLLM there
+        // -- so the check is stated where it exists and the equality assertion
+        // below still runs everywhere.
+        if !rocm_core::runtime_is_windows() {
+            let overridden = engine_selection_hosts().into_iter().any(|(_, summary)| {
+                registry.recipes.iter().any(|recipe| {
+                    let selected = select_serve_engine(None, None, Some(recipe), Some(&summary));
+                    recipe
+                        .preferred_engines
+                        .first()
+                        .is_some_and(|preferred| !preferred.eq_ignore_ascii_case(&selected.engine))
+                })
+            });
+            assert!(
+                overridden,
+                "no host/recipe pair here exercises serve overriding the recipe's preferred \
+                 engine, so the comparison below cannot catch the readiness path re-deriving \
+                 the choice itself"
+            );
+        }
+
+        for (label, summary) in engine_selection_hosts() {
+            for recipe in &registry.recipes {
+                let expected = select_serve_engine(None, None, Some(recipe), Some(&summary));
+                let report = assess_model_for_host(
+                    &recipe.canonical_model_id,
+                    &ModelCatalogSource::Available(&registry),
+                    &host,
+                    None,
+                    Some(&summary),
+                );
+                assert_eq!(
+                    report.engine.as_deref(),
+                    Some(expected.engine.as_str()),
+                    "on {label}, `rocm diagnose --model {}` names {:?} but `rocm serve` would \
+                     select `{}`",
+                    recipe.canonical_model_id,
+                    report.engine,
+                    expected.engine
+                );
+            }
+        }
+    }
+
+    /// When the platform gate rules an engine out, the message names it and
+    /// points at WSL/Linux -- the actual escape hatch, not a guess.
+    #[test]
+    fn unsupported_here_for_names_the_engine_when_ruled_out() {
+        let message =
+            unsupported_here_for("vllm", true).expect("a ruled-out engine gets a message");
+        assert!(
+            message.contains("vllm"),
+            "the message has to name the engine it is talking about: {message:?}"
+        );
+        assert!(
+            message.to_lowercase().contains("wsl") || message.to_lowercase().contains("linux"),
+            "the message has to point at the actual escape hatch: {message:?}"
+        );
+    }
+
+    /// When the platform gate allows an engine, there is nothing to report --
+    /// asserted directly against the pure helper, not by relying on whichever
+    /// OS this test happens to run on.
+    #[test]
+    fn unsupported_here_for_is_none_when_allowed() {
+        assert_eq!(unsupported_here_for("vllm", false), None);
+        assert_eq!(unsupported_here_for("llamacpp", false), None);
+    }
+
+    /// Regression test for the engine-consistency bug: `assess_model_on_this_host`
+    /// used to call `AppPaths::discover()` twice -- once (implicitly `None`) for
+    /// the GPU summary, once for the config lookup a few lines later -- so the
+    /// two could read different directories. Writing a `default_engine` to one
+    /// known `AppPaths` and driving both the config lookup and the GPU-summary
+    /// lookup off that same value pins it down: if a future change reintroduces
+    /// a second, independent `AppPaths::discover()` for either half, the
+    /// configured engine this test writes to disk stops reaching the verdict.
+    #[test]
+    fn the_configured_default_engine_reaches_the_readiness_verdict_from_the_same_paths_as_the_gpu_summary()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-diagnose-model-engine-consistency-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = AppPaths {
+            config_dir: dir.clone(),
+            data_dir: dir.clone(),
+            cache_dir: dir.clone(),
+        };
+        let config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..Default::default()
+        };
+        config
+            .save(&paths)
+            .expect("write a config.json under the temp AppPaths");
+
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let recipe = registry
+            .recipes
+            .first()
+            .expect("the builtin registry ships at least one recipe");
+        let examination = rocm_core::Examination::default();
+
+        // `configured_default` outranks the host GPU summary and the recipe's own
+        // preference in `select_serve_engine`, so this stays deterministic
+        // regardless of what this test happens to run on.
+        let summary = detect_host_gpu_summary(Some(&paths));
+        let expected = select_serve_engine(None, Some("vllm"), Some(recipe), Some(&summary));
+
+        let readiness =
+            assess_model_with_host_paths(&recipe.canonical_model_id, &examination, Some(&paths));
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            readiness.engine.as_deref(),
+            Some(expected.engine.as_str()),
+            "the config written under this AppPaths said default_engine = \"vllm\", but the \
+             readiness verdict named {:?} -- the config lookup and the GPU-summary lookup must \
+             read the same discovered AppPaths",
+            readiness.engine
+        );
+    }
+
+    /// A row reporting `total_vram: 0` is not a measurement of an empty GPU; it
+    /// is `amd-smi` enumerating a device it could not read the memory
+    /// controller for. Keeping the row would let `host_accelerator_memory`
+    /// report `AcceleratorMemory::Dedicated(0.0)`, which the readiness verdict
+    /// then treats as "measured, and it is nothing" (`Blocked`) rather than
+    /// "could not measure" (`Undetermined`).
+    #[test]
+    fn parse_gpu_vram_usage_drops_a_zero_total_row() {
+        let value = json!({
+            "gpu_data": [
+                {
+                    "gpu": 0,
+                    "mem_usage": {
+                        "used_vram": {"value": 0},
+                        "total_vram": {"value": 0},
+                    },
+                },
+                {
+                    "gpu": 1,
+                    "mem_usage": {
+                        "used_vram": {"value": 512},
+                        "total_vram": {"value": 16384},
+                    },
+                },
+            ],
+        });
+
+        let rows = parse_gpu_vram_usage(&value);
+
+        assert_eq!(
+            rows,
+            vec![GpuVramUsage {
+                index: 1,
+                used_mb: 512,
+                total_mb: 16384,
+            }],
+            "a zero-total row must be dropped, not kept as a 0 GiB measurement: {rows:?}"
+        );
+    }
+
+    /// All rows reporting a zero total collapses to no telemetry at all, so
+    /// `gpu_vram_usage()`'s own `is_empty` check turns it into `None` --
+    /// "could not measure" -- rather than a `Vec` of one unusable row.
+    #[test]
+    fn parse_gpu_vram_usage_returns_nothing_when_every_row_is_zero_total() {
+        let value = json!({
+            "gpu_data": [{
+                "gpu": 0,
+                "mem_usage": {
+                    "used_vram": {"value": 0},
+                    "total_vram": {"value": 0},
+                },
+            }],
+        });
+
+        assert!(parse_gpu_vram_usage(&value).is_empty());
+    }
+
+    /// A single dedicated GPU reports its measured total, unmodified.
+    #[test]
+    fn classify_accelerator_memory_reports_dedicated_vram_for_a_discrete_gpu() {
+        let vram = [GpuVramUsage {
+            index: 0,
+            used_mb: 1024,
+            total_mb: 16384,
+        }];
+        let result = classify_accelerator_memory(Some(&vram), Some("gfx942"), true, None);
+        assert_eq!(result, AcceleratorMemory::Dedicated(16.0));
+    }
+
+    /// The defect this guards against: an APU's `amd-smi` carve-out figure is
+    /// not the pool the engine actually allocates from (the real pool is the
+    /// GTT aperture, which nothing in this binary can read), so asserting
+    /// installed system RAM as a stand-in used to fabricate a number that
+    /// could read `Ready` for a model that does not actually fit. The correct,
+    /// honest answer is `UnifiedMemoryUnreadable`, not a number of any kind,
+    /// and not the plain `Unknown` used for genuine no-telemetry hosts either
+    /// -- confirming this never again quietly regresses to reporting a
+    /// fabricated figure (or worse, the APU's own tiny carve-out as
+    /// `Dedicated`), and never again collapses back into the generic
+    /// `Unknown`, whose `amd-smi` remediation would be a dead end here.
+    #[test]
+    fn classify_accelerator_memory_reports_unifiedmemoryunreadable_not_total_ram_for_an_apu() {
+        let apu_carveout = [GpuVramUsage {
+            index: 0,
+            used_mb: 2048,
+            total_mb: 4096,
+        }];
+        let result = classify_accelerator_memory(Some(&apu_carveout), Some("gfx1151"), true, None);
+        assert_eq!(
+            result,
+            AcceleratorMemory::UnifiedMemoryUnreadable,
+            "an APU's memory pool must read UnifiedMemoryUnreadable, not a fabricated figure, \
+             and not the generic Unknown either: {result:?}"
+        );
+    }
+
+    /// No VRAM telemetry at all, but the examination positively saw an AMD
+    /// GPU: unmeasurable, not absent.
+    #[test]
+    fn classify_accelerator_memory_reports_unknown_when_gpu_present_but_unmeasured() {
+        let result = classify_accelerator_memory(None, None, true, None);
+        assert_eq!(result, AcceleratorMemory::Unknown);
+    }
+
+    /// No VRAM telemetry and no evidence of an AMD GPU: there is nothing to
+    /// allocate a model from.
+    #[test]
+    fn classify_accelerator_memory_reports_none_when_no_gpu_is_present() {
+        let result = classify_accelerator_memory(None, None, false, None);
+        assert_eq!(result, AcceleratorMemory::None);
+    }
+
+    /// An APU paired with a discrete card (more than one GPU reported) keeps
+    /// the discrete card's warning meaningful, per `vram_capacity_is_meaningful`
+    /// -- the multi-GPU case cannot attribute the gfx target to one ordinal, so
+    /// it is never treated as the unified-memory case even when the target
+    /// looks like an APU family.
+    #[test]
+    fn classify_accelerator_memory_treats_multi_gpu_as_dedicated_even_with_apu_gfx_target() {
+        let vram = [
+            GpuVramUsage {
+                index: 0,
+                used_mb: 1024,
+                total_mb: 4096,
+            },
+            GpuVramUsage {
+                index: 1,
+                used_mb: 2048,
+                total_mb: 8192,
+            },
+        ];
+        let result = classify_accelerator_memory(Some(&vram), Some("gfx1151"), true, None);
+        assert_eq!(result, AcceleratorMemory::Dedicated(8.0));
+    }
+
+    /// The defect a reviewer caught: `rocm serve` pins exactly one GPU
+    /// ordinal, never the sum of every card, so summing VRAM across GPUs can
+    /// report a model READY when it would OOM on every individual card. On an
+    /// 8x192 GiB host a sum of ~1536 GiB would clear even the largest curated
+    /// recipe's minimum; the true per-card figure (192 GiB) is what the
+    /// verdict must compare against. Were this still summing, the assertion
+    /// below would see `Dedicated(1536.0)`, not `Dedicated(192.0)`.
+    #[test]
+    fn classify_accelerator_memory_takes_the_largest_card_not_the_sum() {
+        let vram: Vec<GpuVramUsage> = (0..8)
+            .map(|index| GpuVramUsage {
+                index,
+                used_mb: 0,
+                total_mb: 192 * 1024,
+            })
+            .collect();
+        let result = classify_accelerator_memory(Some(&vram), Some("gfx942"), true, None);
+        assert_eq!(
+            result,
+            AcceleratorMemory::Dedicated(192.0),
+            "a homogeneous 8-GPU host must report one card's capacity, not the sum of all \
+             eight, or a model that OOMs on every card reads READY: {result:?}"
+        );
+    }
+
+    /// A `HIP_VISIBLE_DEVICES`-style mask hides a GPU from `rocm serve` the
+    /// same way it hides one from auto-selection (see
+    /// `select_auto_gpu_index`'s own mask handling) -- but `amd-smi` enumerates
+    /// at the driver level and knows nothing about that mask, so its rows
+    /// still include the hidden card. Narrowing by `usable_indices` is what
+    /// keeps a masked-out GPU's capacity from inflating the verdict for a
+    /// model that could never actually land on it.
+    #[test]
+    fn classify_accelerator_memory_ignores_a_gpu_masked_out_by_the_visibility_filter() {
+        let vram = [
+            GpuVramUsage {
+                index: 0,
+                used_mb: 0,
+                total_mb: 8 * 1024,
+            },
+            GpuVramUsage {
+                index: 1,
+                used_mb: 0,
+                total_mb: 192 * 1024,
+            },
+        ];
+        // Only index 0 is visible: the 192 GiB card at index 1 is masked out.
+        let result = classify_accelerator_memory(Some(&vram), Some("gfx942"), true, Some(&[0]));
+        assert_eq!(
+            result,
+            AcceleratorMemory::Dedicated(8.0),
+            "a masked-out GPU's VRAM must not count toward the verdict: {result:?}"
+        );
+    }
+
+    /// The end-to-end proof, one layer above `classify_accelerator_memory`'s own
+    /// unit tests: not just that the function picks the right number, but that
+    /// picking the wrong one would have changed the verdict a user actually
+    /// sees. Two 8 GiB cards sum to 16 GiB, comfortably above `qwen3.5-4b`'s 12
+    /// GiB minimum -- a verdict built on the sum would read READY, and `rocm
+    /// serve` pins exactly one ordinal, so that model would OOM on every card
+    /// this host has. No single card clears 12 GiB, so the correct verdict is
+    /// BLOCKED. Were `classify_accelerator_memory` still summing, this would
+    /// observe `Ready`, not `Blocked`.
+    #[test]
+    fn a_host_whose_vram_sum_clears_the_minimum_but_no_single_card_does_is_blocked_not_ready() {
+        let vram = [
+            GpuVramUsage {
+                index: 0,
+                used_mb: 0,
+                total_mb: 8 * 1024,
+            },
+            GpuVramUsage {
+                index: 1,
+                used_mb: 0,
+                total_mb: 8 * 1024,
+            },
+        ];
+        let accelerator_memory =
+            classify_accelerator_memory(Some(&vram), Some("gfx942"), true, None);
+        // Premise check: if this is ever 16.0 (the sum) instead of 8.0 (the
+        // largest single card), the scenario below no longer tests what it
+        // claims to.
+        assert_eq!(accelerator_memory, AcceleratorMemory::Dedicated(8.0));
+
+        let host = HostFacts {
+            accelerator_memory,
+            system_ram_gib: Some(1024.0),
+        };
+        let registry = rocm_core::builtin_model_recipe_registry();
+        let report = assess_model_for_host(
+            "qwen3.5-4b",
+            &ModelCatalogSource::Available(&registry),
+            &host,
+            None,
+            None,
+        );
+        assert_eq!(
+            report.verdict,
+            rocm_core::model_readiness::ModelVerdict::Blocked,
+            "qwen3.5-4b needs 12 GiB; two 8 GiB cards sum to 16 GiB (which would clear it) but \
+             no single card does (8 GiB each) -- the verdict must be BLOCKED, not READY, or \
+             `rocm serve` would pin one 8 GiB card to a model that does not fit on it: {report:#?}"
+        );
+    }
+
+    /// `has_amd_gpu` is always `false` on WSL (the probes that set it are
+    /// skipped there), so `host_accelerator_memory` must read `rocm_sees_gpu`
+    /// instead on a WSL host -- and only a confirmed `Some(false)` counts as
+    /// "no GPU"; `None` means rocminfo was absent, which is not evidence of
+    /// anything, per the same reasoning `fix-wsl-6-host-driver-too-old` in
+    /// `diagnose.rs` already uses.
+    #[test]
+    fn examination_reports_amd_gpu_reads_rocm_sees_gpu_on_wsl() {
+        let wsl_examination = |rocm_sees_gpu: Option<bool>| rocm_core::Examination {
+            is_wsl: true,
+            wsl: Some(rocm_core::examine::WslFacts {
+                rocm_sees_gpu,
+                ..Default::default()
+            }),
+            ..rocm_core::Examination::default()
+        };
+
+        assert!(
+            !examination_reports_amd_gpu(&wsl_examination(Some(false))),
+            "rocminfo positively enumerating no device must read as no GPU"
+        );
+        assert!(
+            examination_reports_amd_gpu(&wsl_examination(Some(true))),
+            "rocminfo positively enumerating a device must read as a GPU present"
+        );
+        assert!(
+            examination_reports_amd_gpu(&wsl_examination(None)),
+            "rocminfo absent (the question went unasked) must not read as a confident no"
+        );
+    }
+
+    /// Off WSL, the bare-metal probes are what set `has_amd_gpu`, so this must
+    /// keep using it rather than a WSL-only signal that was never populated.
+    #[test]
+    fn examination_reports_amd_gpu_reads_has_amd_gpu_off_wsl() {
+        let mut examination = rocm_core::Examination::default();
+        assert!(!examination_reports_amd_gpu(&examination));
+        examination.has_amd_gpu = true;
+        assert!(examination_reports_amd_gpu(&examination));
     }
 }

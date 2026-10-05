@@ -1241,3 +1241,30 @@ The install is covered by unit tests over the generated plan (`cargo test -p
 rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
+
+## Model Fit Preflight
+
+`rocm diagnose --model <ref>` answers whether a curated model will run on this
+host before anything downloads. It reports one of four verdicts: `ready`,
+`degraded` (runs, but under the recipe's recommended system RAM),
+`blocked` (will not run here, with alternatives that would), or
+`undetermined` (the CLI could not judge it — an unreachable catalog, an
+unmeasured GPU, or a ref outside the curated set).
+
+```bash
+rocm diagnose --model qwen-smoke --json   # smallest curated recipe
+rocm diagnose --model glm5 --json         # largest curated recipe
+```
+
+On a host with a measured GPU, the smallest recipe should report `ready` (or
+`degraded`, if this host's system RAM is below its recommendation) and name
+the engine `rocm serve` would pick; the largest should report `blocked` with
+at least one alternative that fits. On a host with no GPU visible to ROCm,
+both report `blocked` with no fitting alternative. Either way, the command
+must exit 0 — it is a query, not a check that only passes on a compatible
+host — and must not populate the model-weight cache.
+
+The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
+including the two that need a synthetic signed catalog to trigger
+deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
+produce them on an arbitrary real host.

@@ -1271,3 +1271,676 @@ async fn assert_command_failure_reported_on_stderr(world: &mut E2eWorld) {
         "the command-failure explanation must not also be on stdout:\n{stdout}"
     );
 }
+
+// ── `rocm diagnose --model` ────────────────────────────────────────
+
+/// The largest curated recipe. Its 905 GiB minimum is above any single machine
+/// the suite runs on, which is what makes the "will not run" half of
+/// diagnose-21 hold on every lane rather than only on the small ones.
+const OVERSIZED_MODEL_REF: &str = "glm5";
+
+/// The smallest curated recipe (2 GiB minimum). Any machine that measured
+/// dedicated GPU memory can serve it, so the "ready" half of diagnose-22 holds
+/// on every discrete-GPU lane rather than only the Instinct one. An APU lane
+/// does not qualify for that half even though `amd-smi` telemetry exists
+/// there too: it names the BIOS carve-out, not the pool the engine allocates
+/// from, so those hosts report no measured figure and land in the
+/// "could not measure" half instead, alongside hosts with no GPU at all and
+/// hosts with no telemetry whatsoever.
+const SMALLEST_MODEL_REF: &str = "qwen-smoke";
+
+/// A recipe index path that cannot exist, used to make the catalog source
+/// genuinely unreachable rather than merely empty. Under the scenario's isolated
+/// root so it is impossible for a runner to have planted one there.
+fn unreachable_index_path(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("no-such-recipe-index.json")
+}
+
+/// A model-weight cache the scenario owns and that starts out absent, so
+/// "nothing was fetched" is a question about a directory the runner cannot have
+/// pre-populated. The shared `HF_HOME` the harness normally sets could not
+/// answer it: it is deliberately shared across scenarios and already holds
+/// weights.
+fn scenario_weights_dir(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("weights-must-stay-empty")
+}
+
+/// Read the `model` section of a `rocm diagnose --model ... --json` report.
+fn model_section(world: &E2eWorld) -> serde_json::Value {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let report: serde_json::Value =
+        serde_json::from_str(output).expect("diagnose --json did not emit valid JSON");
+    report
+        .get("model")
+        .cloned()
+        .filter(|value| !value.is_null())
+        .unwrap_or_else(|| panic!("diagnose --model emitted no model section:\n{output}"))
+}
+
+fn model_field<'a>(model: &'a serde_json::Value, field: &str) -> &'a serde_json::Value {
+    model
+        .get(field)
+        .unwrap_or_else(|| panic!("the model section has no `{field}`: {model:#}"))
+}
+
+fn model_verdict(model: &serde_json::Value) -> &str {
+    model_field(model, "verdict")
+        .as_str()
+        .expect("verdict is not a string")
+}
+
+/// Whether this host measured its own GPU memory. Everything downstream of it
+/// differs per lane, so it is read back from the report rather than assumed.
+fn measured_gpu_gib(model: &serde_json::Value) -> Option<f64> {
+    model_field(model, "available_gpu_memory_gib").as_f64()
+}
+
+#[given("a user asking about a model no single machine could serve")]
+async fn user_asks_about_an_oversized_model(world: &mut E2eWorld) {
+    world.model_name = Some(OVERSIZED_MODEL_REF.to_string());
+    let weights = scenario_weights_dir(world);
+    world
+        .command_env
+        .push(("HF_HOME", weights.into_os_string()));
+}
+
+#[given("a user asking about the smallest curated model")]
+async fn user_asks_about_the_smallest_model(world: &mut E2eWorld) {
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[given("a machine that cannot reach the model recipe catalog")]
+async fn machine_cannot_reach_the_catalog(world: &mut E2eWorld) {
+    // The public key path is supplied too. Without it the CLI fails earlier, on
+    // the missing key rather than the missing index, and the scenario would be
+    // asserting about a different unreachable thing than the one it names.
+    let index = unreachable_index_path(world);
+    let key = index.with_extension("pem");
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        key.into_os_string(),
+    ));
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[when("the user asks the CLI whether that model would run, in machine-readable form")]
+async fn user_asks_whether_a_model_would_run(world: &mut E2eWorld) {
+    let model = world.model_name.clone().expect("no model named");
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--model", &model, "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the model is never reported as ready")]
+async fn assert_model_is_never_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_ne!(
+        model_verdict(&model),
+        "ready",
+        "the `{OVERSIZED_MODEL_REF}` recipe needs more memory than any single machine here has, \
+         so no lane may call it ready: {model:#}"
+    );
+}
+
+#[then("a machine that measured its GPU is told the model will not run, and what would")]
+async fn assert_measured_machine_is_blocked_with_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    assert_eq!(
+        model_verdict(&model),
+        "blocked",
+        "this machine measured {available} GiB against a 905 GiB recipe, so the answer is a \
+         refusal and not anything softer: {model:#}"
+    );
+    let alternatives = model_field(&model, "alternatives")
+        .as_array()
+        .expect("alternatives is not an array")
+        .clone();
+    assert!(
+        !alternatives.is_empty(),
+        "a refusal with nothing offered instead leaves the user where they started: {model:#}"
+    );
+    // The point of naming an alternative is that it runs HERE. One that does not
+    // fit either is worse than silence: it costs the user a second download to
+    // find out.
+    for alternative in &alternatives {
+        let required = alternative
+            .get("required_gpu_memory_gib")
+            .and_then(serde_json::Value::as_f64);
+        assert!(
+            required.is_none_or(|required| required <= available),
+            "`{}` was offered as what would run instead, but it needs {required:?} GiB and this \
+             machine measured {available} GiB: {model:#}",
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<unnamed>")
+        );
+    }
+}
+
+#[then(
+    "a machine that could not measure its GPU is told why, rather than that the model is incompatible"
+)]
+async fn assert_unmeasured_machine_is_told_why(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_some() {
+        return;
+    }
+    // Four different machines land here and none of them deserves the same
+    // answer. One has no GPU at all, which is a fact and a refusal the CLI can
+    // stand behind. Another has an engine this platform's gate rules out
+    // before memory is even considered -- the gate runs first because a model
+    // that fits in memory still will not run on an engine with no adapter
+    // here, and reporting a memory verdict instead would be true and useless.
+    // A third has a GPU whose memory it could not read at all, which is a gap
+    // in what the CLI can see and must not be dressed up as a verdict about
+    // the model. The fourth is an APU: `amd-smi` telemetry exists, but it
+    // names the BIOS carve-out rather than the pool the engine allocates
+    // from, and there is no command that makes the right pool readable today
+    // -- so that gap earns its own reason, distinct from the no-telemetry-at-
+    // all case, and no dead-end remediation. None of the four may be reported
+    // as "this model is too big for you".
+    let evidence = model_field(&model, "evidence").to_string();
+    match model_verdict(&model) {
+        "blocked" => {
+            // Two causes reach `blocked` with nothing measured: the engine
+            // platform gate, and no GPU being visible at all. They must not
+            // be told apart by sniffing the same evidence text a collapse
+            // would corrupt -- `fix.summary` is written by two independent
+            // call sites in `assess_model_for_host`, so a future bug that
+            // makes one cause's evidence drift into the other's still gets
+            // caught here instead of passing silently.
+            let fix_summary = model_field(&model, "fix")
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match fix_summary {
+                "serve this model from a platform that has the engine" => {
+                    let engine = model_field(&model, "engine").as_str().unwrap_or_default();
+                    assert!(
+                        evidence.contains(&format!("{engine} has no adapter")),
+                        "the engine-platform refusal has to name the engine this host ruled \
+                         out, or the user cannot tell which one to avoid: {model:#}"
+                    );
+                    assert!(
+                        evidence.contains("WSL or Linux"),
+                        "the engine-platform refusal has to offer the other-platform remedy, \
+                         or the user has nothing to act on: {model:#}"
+                    );
+                }
+                "make a GPU visible to ROCm, then ask again" => {
+                    assert!(
+                        evidence.contains("no GPU is visible to ROCm"),
+                        "the GPU-visibility refusal has to name the absent GPU, or the user \
+                         reads this as a fact about the model: {model:#}"
+                    );
+                    assert!(
+                        model_field(&model, "fix")
+                            .get("commands")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|commands| commands
+                                .iter()
+                                .any(|command| command.as_str() == Some("rocm diagnose"))),
+                        "a host with no GPU at all has a real next step (`rocm diagnose`); \
+                         losing it would strand the user: {model:#}"
+                    );
+                }
+                other => panic!(
+                    "a machine that measured nothing reached a blocked verdict behind a fix \
+                     summary (`{other}`) this scenario does not know how to tell apart: \
+                     {model:#}"
+                ),
+            }
+            assert!(
+                model_field(&model, "available_gpu_memory_gib").is_null(),
+                "a machine that measured nothing must not report a figure it compared against: \
+                 {model:#}"
+            );
+        }
+        "undetermined" => match model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default()
+        {
+            "accelerator_memory_unknown" => {
+                assert!(
+                    evidence.contains("could not be read"),
+                    "the no-telemetry-at-all reason has to say the memory could not be read, or \
+                     the user reads it as a fact about the model: {model:#}"
+                );
+                assert!(
+                    !model_field(&model, "fix").is_null(),
+                    "a host with no telemetry at all has a real next step (`amd-smi metric \
+                     --json`); collapsing this into the APU case would drop it: {model:#}"
+                );
+            }
+            "unified_memory_unreadable" => {
+                assert!(
+                    evidence.contains("no dedicated VRAM"),
+                    "the APU reason has to name the missing dedicated-VRAM pool, or the user \
+                     reads it as a fact about the model: {model:#}"
+                );
+                assert!(
+                    model_field(&model, "fix").is_null(),
+                    "there is no command that makes the APU's pool readable today; offering one \
+                     would be a dead end: {model:#}"
+                );
+            }
+            other => panic!(
+                "a machine that could not measure its GPU reported an undetermined reason \
+                 `{other}` this scenario does not know about: {model:#}"
+            ),
+        },
+        other => panic!(
+            "a machine that could not measure its GPU reported `{other}`, which claims more than \
+             it knows: {model:#}"
+        ),
+    }
+}
+
+#[then("the human-readable answer names what would run instead")]
+async fn assert_human_answer_names_alternatives(world: &mut E2eWorld) {
+    let model = model_section(world);
+    if measured_gpu_gib(&model).is_none() {
+        return;
+    }
+    let expected = model_field(&model, "alternatives")
+        .as_array()
+        .and_then(|alternatives| alternatives.first().cloned())
+        .and_then(|alternative| {
+            alternative
+                .get("model_ref")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .expect("the machine-readable answer offered no alternative to look for");
+    // The same question again without `--json`: the structured answer being
+    // right is no use if the report the user actually reads does not carry it.
+    let (stdout, _, rc) = crate::run_rocm(world, &["diagnose", "--model", OVERSIZED_MODEL_REF]);
+    assert_eq!(rc, 0, "diagnose should exit 0 (it is a query)");
+    assert!(
+        stdout.contains(&expected),
+        "the human-readable report never names `{expected}` as what would run instead:\n{stdout}"
+    );
+}
+
+#[then("no model weights were fetched")]
+async fn assert_no_weights_were_fetched(world: &mut E2eWorld) {
+    // Two places a fetch would land: the model-weight cache the scenario pointed
+    // the CLI at, and rocm-cli's own artifact cache under the isolated data dir.
+    // Neither exists before the run, so their continued absence is not something
+    // the runner could have arranged in advance.
+    let weights = scenario_weights_dir(world);
+    assert!(
+        !weights.exists(),
+        "asking whether a model would run created {} -- the answer is supposed to cost no \
+         download",
+        weights.display()
+    );
+    let artifacts = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("models")
+        .join("artifacts");
+    assert!(
+        !artifacts.exists(),
+        "asking whether a model would run populated the artifact cache at {}",
+        artifacts.display()
+    );
+}
+
+#[then("a machine with enough measured GPU memory is told the model is ready")]
+async fn assert_fitting_model_is_ready(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    let Some(available) = measured_gpu_gib(&model) else {
+        return;
+    };
+    let required = model_field(&model, "required_gpu_memory_gib")
+        .as_f64()
+        .unwrap_or(0.0);
+    if available < required {
+        return;
+    }
+    // `degraded` is allowed alongside `ready`: a machine whose system RAM is
+    // below the recipe's recommendation still runs it, and calling that a
+    // failure would make the scenario a test of the runner's RAM.
+    assert!(
+        matches!(model_verdict(&model), "ready" | "degraded"),
+        "this machine measured {available} GiB against a {required} GiB recipe, so the model runs \
+         here: {model:#}"
+    );
+}
+
+#[then("the answer names the engine that would serve it")]
+async fn assert_answer_names_the_engine(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // Named whatever the verdict, as long as a recipe was read: which engine
+    // would serve a model does not depend on whether it fits, and withholding it
+    // on a refusal is what would leave the user unable to check an alternative.
+    if model_field(&model, "canonical_model_id").is_null() {
+        return;
+    }
+    let engine = model_field(&model, "engine")
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !engine.is_empty(),
+        "the answer names no engine, so the user cannot tell what `rocm serve` would start: \
+         {model:#}"
+    );
+}
+
+#[then("the CLI reports that it could not determine the answer")]
+async fn assert_catalog_failure_is_undetermined(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "a catalog that could not be read says nothing about the model, so no verdict about the \
+         model may be reported: {model:#}"
+    );
+}
+
+#[then("the reason given is the unreachable catalog, not the model")]
+async fn assert_reason_is_the_catalog(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "catalog_unreachable",
+        "the reason must name the source, not the model: {model:#}"
+    );
+    let index = unreachable_index_path(world);
+    let file_name = index
+        .file_name()
+        .expect("index path has no file name")
+        .to_string_lossy()
+        .into_owned();
+    let evidence = model_field(&model, "evidence").to_string();
+    assert!(
+        evidence.contains(&file_name),
+        "the evidence never names the source that could not be read ({}): {evidence}",
+        index.display()
+    );
+}
+
+#[then("nothing is claimed about whether the model fits this machine")]
+async fn assert_nothing_claimed_about_fit(world: &mut E2eWorld) {
+    let model = model_section(world);
+    // The recipe was never read, so its requirement is not known. Reporting one
+    // anyway -- even a plausible one -- is how an unreachable source turns into
+    // a confident statement about the model.
+    for field in ["required_gpu_memory_gib", "canonical_model_id"] {
+        assert!(
+            model_field(&model, field).is_null(),
+            "`{field}` was reported for a model whose recipe was never read: {model:#}"
+        );
+    }
+}
+
+/// A ref shaped like a real model name but planted nowhere in the built-in
+/// catalog. Deliberately not a nonsense string: the point of the scenario is
+/// that a well-formed ref outside the curated set is still undetermined, not
+/// that a malformed one is.
+const UNCURATED_MODEL_REF: &str = "e2e-fixtures/not-a-curated-model";
+
+#[given("a user asking about a model the curated catalog does not carry")]
+async fn user_asks_about_an_uncurated_model(world: &mut E2eWorld) {
+    world.model_name = Some(UNCURATED_MODEL_REF.to_string());
+}
+
+#[then("the reason given is that the model is not curated, not that it does not fit")]
+async fn assert_reason_is_not_curated(world: &mut E2eWorld) {
+    let model = model_section(world);
+    assert_eq!(
+        model_verdict(&model),
+        "undetermined",
+        "a model the catalog never carried is not a refusal, and must not be scored as one: \
+         {model:#}"
+    );
+    assert_eq!(
+        model_field(&model, "undetermined_reason")
+            .as_str()
+            .unwrap_or_default(),
+        "model_not_curated",
+        "the reason must name the missing metadata, or the user reads it as a fact about \
+         whether the model fits: {model:#}"
+    );
+}
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("e2e-cucumber must live under <workspace>/tests")
+        .to_path_buf()
+}
+
+fn xtask_command() -> std::process::Command {
+    if let Some(binary) = std::env::var_os("ROCM_XTASK_BINARY") {
+        std::process::Command::new(binary)
+    } else {
+        let mut command = std::process::Command::new(
+            std::env::var_os("CARGO").unwrap_or_else(|| std::ffi::OsString::from("cargo")),
+        );
+        command.arg("xtask");
+        command
+    }
+}
+
+/// A ref that exists only in the synthetic catalog [`user_asks_about_a_ram_degraded_model`]
+/// signs and points the CLI at.
+const DEGRADED_MODEL_REF: &str = "e2e-fixtures/ram-degraded";
+
+/// A recipe that needs almost no GPU memory -- so it clears the fit check on
+/// any lane that measured a GPU at all -- but recommends more system RAM than
+/// any real test host has, so the RAM softening is the only thing left that
+/// can fire. Built fresh per scenario (mirrors the signed-catalog pattern in
+/// `artifact_steps.rs`) because no built-in recipe can produce this
+/// combination: every built-in recipe's RAM recommendation scales with its
+/// GPU requirement, and `detect_system_ram_gib` has no env-var override to
+/// fake the other side of the comparison.
+#[given("a user asking about a model that recommends far more system RAM than this host has")]
+async fn user_asks_about_a_ram_degraded_model(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let index = root.join("degraded-recipes.json");
+    let signature = root.join("degraded-recipes.json.sig");
+    let public_key = root.join("degraded-recipe-public.pem");
+    let private_key = root.join("degraded-recipe-private.pem");
+
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "source": "e2e-ram-degraded",
+        "recipes": [{
+            "canonical_model_id": DEGRADED_MODEL_REF,
+            "aliases": [],
+            "task": "chat",
+            "source": "signed_recipe_index",
+            "revision": "main",
+            "loader": "transformers",
+            "trust_remote_code": false,
+            "dtype": "float16",
+            "device_policy": "gpu_required",
+            "min_gpu_mem_gb": 1,
+            "recommended_system_ram_gb": 999_999,
+            "artifacts": [],
+            "engine_recipes": [],
+            "manual_alternatives": [],
+            "featured": false,
+            "chat_template_mode": "auto",
+            // `lemonade`, not `vllm`: this scenario carries no platform tag and
+            // runs on every lane, including native Windows, where vLLM has no
+            // adapter and would be ruled out before the RAM softening this
+            // scenario exists to exercise ever runs -- turning the expected
+            // `degraded` into `blocked` on exactly the lane that also measures
+            // a GPU. `lemonade` is not ruled out on any lane this suite runs.
+            "preferred_engines": ["lemonade"],
+            "warnings": []
+        }]
+    });
+    std::fs::write(
+        &index,
+        serde_json::to_vec_pretty(&document).expect("failed to serialize recipe fixture"),
+    )
+    .expect("failed to write recipe fixture");
+
+    let keygen = xtask_command()
+        .args(["keygen", "--private-out"])
+        .arg(&private_key)
+        .arg("--public-out")
+        .arg(&public_key)
+        .current_dir(workspace_root())
+        .status()
+        .expect("failed to run xtask keygen");
+    assert!(keygen.success(), "xtask keygen failed");
+    let sign = xtask_command()
+        .args(["sign", "--private-key"])
+        .arg(&private_key)
+        .arg("--in")
+        .arg(&index)
+        .arg("--out")
+        .arg(&signature)
+        .current_dir(workspace_root())
+        .status()
+        .expect("failed to run xtask sign");
+    assert!(sign.success(), "xtask sign failed");
+
+    world
+        .command_env
+        .push(("ROCM_CLI_MODEL_RECIPE_INDEX_PATH", index.into_os_string()));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH",
+        signature.into_os_string(),
+    ));
+    world.command_env.push((
+        "ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
+        public_key.into_os_string(),
+    ));
+    world.model_name = Some(DEGRADED_MODEL_REF.to_string());
+}
+
+#[then("a machine with enough measured GPU memory to run it is told the model is degraded")]
+async fn assert_ram_short_machine_is_degraded(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "diagnose should exit 0 (it is a query)"
+    );
+    let model = model_section(world);
+    let Some(_available) = measured_gpu_gib(&model) else {
+        // No GPU measurement means this lane cannot clear the fit check at
+        // all, so it lands on the "no GPU visible" or "memory unknown" halves
+        // that the reused unmeasured-machine step already covers -- not on
+        // degraded.
+        return;
+    };
+    assert_eq!(
+        model_verdict(&model),
+        "degraded",
+        "this recipe needs 1 GiB of GPU memory (which any measuring lane clears) and recommends \
+         999999 GiB of system RAM (which no real host has), so the RAM softening is the only \
+         path left, and blocked or ready are both wrong here: {model:#}"
+    );
+}
+
+// ── `--model` with `--distro` ──────────────────────────────────────
+
+#[given("a user who asks --model together with --distro")]
+async fn user_asks_model_with_distro(world: &mut E2eWorld) {
+    world.model_name = Some(SMALLEST_MODEL_REF.to_string());
+}
+
+#[when("the user asks the CLI to diagnose with both flags")]
+async fn user_diagnoses_with_model_and_distro(world: &mut E2eWorld) {
+    let model_ref = world.model_name.clone().expect("no model ref set");
+    // No distro name given: the refusal must fire on the flag itself, before
+    // any probe that would need one to exist runs at all -- so this holds on
+    // a lane with no WSL and no `wsl.exe`, not only on a WSL host.
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["diagnose", "--model", &model_ref, "--distro"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and says --model answers for this machine, not the one --distro names")]
+async fn assert_model_with_distro_refused(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let rc = world.cli_rc.expect("no exit code recorded");
+    assert_ne!(
+        rc, 0,
+        "--model together with --distro must be refused, not answered:\n{output}"
+    );
+    assert!(
+        output.contains("--model answers for the machine running this command")
+            && output.contains("--distro points the examination at a different one"),
+        "the refusal must say --model answers for this machine and --distro names another \
+         one, not some other failure (e.g. wsl.exe missing, which would mean the refusal fired \
+         too late -- after a probe attempt rather than on the flag itself):\n{output}"
+    );
+    // The refusal must fire before any probe, so it must not also carry a
+    // probe failure (e.g. "wsl.exe was not found") -- that would mean the two
+    // flags together produced the right exit code for the wrong reason.
+    assert!(
+        !output.to_lowercase().contains("wsl.exe"),
+        "the refusal must preempt the distro probe entirely, not race it:\n{output}"
+    );
+}
+
+#[then("no model verdict is reported")]
+async fn assert_no_model_verdict_on_refusal(world: &mut E2eWorld) {
+    let output = world.cli_output.clone().unwrap_or_default();
+    let model_ref = world.model_name.clone().expect("no model ref set");
+    // Not a bare `contains("rocm diagnose --model ")`: the refusal's own
+    // remediation text names that command (with a literal `<model>`
+    // placeholder) as what to run instead, so that substring appears in a
+    // correct refusal too. A real verdict line always follows the command
+    // with the actual ref and a colon (`render_model_readiness_text`'s
+    // leading line); the placeholder never does.
+    let verdict_marker = format!("rocm diagnose --model {model_ref}:");
+    assert!(
+        !output.contains(&verdict_marker),
+        "a refused request must not also report a model verdict for the wrong machine:\n{output}"
+    );
+}

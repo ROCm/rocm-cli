@@ -22,10 +22,10 @@
 //! `slash.rs`/`summary.rs` mechanical-relocation convention: this file holds
 //! the shared `AgentClient` seam; `snapshot` holds the pure JSON telemetry
 //! helpers; `tools` holds the rig `Tool` wrappers and dispatch; `clients`
-//! holds the four backend implementations. Unlike `app/mod.rs`'s private
-//! siblings, this file re-exports the submodules' public items — this module
-//! (and its pre-split `crate::agent::*` surface) has in-crate and cross-crate
-//! consumers, so the existing paths must keep resolving.
+//! holds the four backend implementations. Like `app/mod.rs`, this file
+//! re-exports the submodules' public items — this module (and its pre-split
+//! `crate::agent::*` surface) has in-crate and cross-crate consumers, so the
+//! existing paths must keep resolving.
 
 use async_trait::async_trait;
 
