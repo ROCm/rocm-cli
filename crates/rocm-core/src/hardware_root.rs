@@ -22,6 +22,15 @@
 //! this process's environment, not the hardware. The package-manager install
 //! hints in `openmpi.rs` still read the real `/etc/os-release`.
 //!
+//! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
+//! pre-flight. It decides whether a real `amd-smi` process may start, so
+//! `apps/rocm/src/dash.rs` passes `host_path("/dev/kfd")` to the dash daemon
+//! and the collector requires both that path and the real `/dev/kfd` to be
+//! readable. A simulated root can hide the GPU from the dashboard but cannot
+//! start `amd-smi` on a machine without one. The WSL reachability verdict
+//! still substitutes for the whole device check, as it always has, so the veto
+//! does not cover it.
+//!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the
 //! `e2e-test-hooks` Cargo feature honours [`TEST_HOST_ROOT_ENV`], which re-roots
