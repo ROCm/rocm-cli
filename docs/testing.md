@@ -113,6 +113,32 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Advised commands must parse
+
+`apps/rocm/src/advised_commands.rs` holds every command the CLI or its docs tell
+a user to run to the real parser. It collects the `rocm`/`rocmd` invocations
+named in four places:
+
+- the `--help` of every visible command
+- production Rust string literals: backtick spans, literals that start with a
+  command, and labelled lines such as `next step: rocm …`
+- `README.md`, `docs/` and `skills/`
+- the VHS tapes
+
+It fills in placeholders such as `<model>`, `{}` and `[--flag]` groups, then
+routes each command the way `rocm` itself does. A command that clap rejects
+fails the test. So does a single word that ends up at the natural-language
+planner, because that means the advised subcommand does not exist.
+
+When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
+a reason, only when the text starts with `rocm` but is not advice to run
+anything, such as a log line or an error message that names the command. To see
+every command it found and the result for each:
+
+```bash
+cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ignored --nocapture
+```
+
 Run the cross-platform smoke test:
 
 ```bash
