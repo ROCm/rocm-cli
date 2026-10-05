@@ -823,6 +823,13 @@ result to the manifest as it is once the stop ends, so a write made meanwhile is
 kept — and a restart that recorded new processes meanwhile makes the stop
 unconfirmed rather than having its PIDs cleared.
 
+`features/managed_service_stop.feature` (`service-stop-01`, Linux, mock lane)
+drives the real `rocmd sandbox-tool stop_server` against a live recorded
+process and checks the confirmed report against the process, the record and
+the endpoint key file. Run it with
+`ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
+cargo test -p e2e-cucumber --test e2e -- -n "service-stop-01"`.
+
 Manual restricted-tool smoke:
 
 ```bash
