@@ -662,13 +662,36 @@ fn uninstall_case(
             }
         }
 
+        // Shared caches the review must talk about truthfully: one inside the
+        // own cache dir, one inside the own data dir, one outside everything.
+        let shared_caches = [
+            rocm.join("cache").join("uv-shared"),
+            rocm.join("data").join("hf-hub"),
+            home.join(".cache").join("uv"),
+        ];
+        for cache in &shared_caches {
+            std::fs::create_dir_all(cache).expect("shared cache");
+            std::fs::write(cache.join("blob"), b"cached").expect("shared cache blob");
+        }
+        let candidates: Vec<crate::SharedCache> = shared_caches
+            .iter()
+            .map(|path| crate::SharedCache {
+                path: path.clone(),
+                kept: "a shared cache is",
+                name: "a shared cache",
+                loss: "It is shared.",
+                pronoun: "it",
+            })
+            .collect();
+
         let options = UninstallOptions {
             yes: true,
             keep_binaries: true,
             ..UninstallOptions::default()
         };
-        let plan = build_uninstall_plan(&paths, &options)
+        let plan = crate::build_uninstall_plan_for_home(&paths, &options, Some(&home))
             .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
+        let notes = crate::shared_cache_notes_for(&plan.actions, &candidates);
         let rendered = crate::render_uninstall_plan(
             &plan,
             &UninstallOptions {
@@ -678,23 +701,39 @@ fn uninstall_case(
         );
         let planned: BTreeSet<PathBuf> = plan.actions.iter().map(|e| e.path.clone()).collect();
         prop_assert_eq!(&listed_in_render(&rendered), &planned, "{}", rendered);
+        let refused = !plan.refused.is_empty();
+        if refused {
+            reach.lock().expect("reach lock").hit("plan: refused");
+            // The review names every refused root and the flag that clears it.
+            for root in &plan.refused {
+                prop_assert!(
+                    rendered.contains(&root.path.display().to_string())
+                        && rendered.contains(&format!("--keep-{}", root.kind)),
+                    "refused {} root not named with its remedy:\n{}",
+                    root.kind,
+                    rendered
+                );
+            }
+        }
 
         let before = snapshot(&sandbox);
         let mut expected_gone = BTreeSet::new();
-        for path in &planned {
-            assert_inside_sandbox(&sandbox, path);
-            if let Some(id) = identity_of(path) {
-                expected_gone.extend(subtree_ids(&before, id));
+        if !refused {
+            for path in &planned {
+                assert_inside_sandbox(&sandbox, path);
+                if let Some(id) = identity_of(path) {
+                    expected_gone.extend(subtree_ids(&before, id));
+                }
             }
         }
-        for entry in &plan.actions {
-            remove_path(&entry.path).map_err(|error| {
-                TestCaseError::fail(format!(
-                    "remove_path({}) failed: {error:#}",
-                    entry.path.display()
-                ))
-            })?;
-        }
+        // The real removal step, which refuses on its own when the plan does.
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        prop_assert_eq!(
+            outcome.is_err(),
+            refused,
+            "apply_uninstall_plan result {:?} disagrees with the plan's refusal",
+            outcome
+        );
         let after = snapshot(&sandbox);
         let actually_gone: BTreeSet<(u64, u64)> = before
             .keys()
@@ -764,6 +803,31 @@ fn uninstall_case(
             describe(&missed)
         );
 
+        // Every shared cache is mentioned exactly once, and the review warns
+        // that it will be deleted exactly when the removal deleted it.
+        for cache in &shared_caches {
+            let text = cache.display().to_string();
+            let mentions: Vec<&String> = notes.iter().filter(|n| n.contains(&text)).collect();
+            prop_assert_eq!(mentions.len(), 1, "{} mentioned {:?}", text, mentions);
+            let warned = mentions[0].contains("WILL BE DELETED");
+            if !refused {
+                let deleted = !cache.join("blob").exists();
+                prop_assert_eq!(
+                    warned,
+                    deleted,
+                    "{} deleted={} but the review said: {}",
+                    text,
+                    deleted,
+                    mentions[0]
+                );
+                reach.lock().expect("reach lock").hit(if deleted {
+                    "shared cache: deleted and warned"
+                } else {
+                    "shared cache: kept and noted"
+                });
+            }
+        }
+
         if require_safety {
             for sentinel in [
                 home.join("Documents/thesis.txt"),
@@ -821,11 +885,10 @@ fn uninstall_removes_exactly_what_the_review_lists() {
 }
 
 /// Safety: `rocm uninstall` must never delete a folder ROCm CLI did not create.
-/// It applies no guard at all to the three AppPaths roots, so a data/cache/
-/// config dir that names `$HOME` (directly, or through a link spelled with a
-/// trailing `/`) is deleted wholesale. Shrinks to `cache_dir = $HOME`.
+/// A data/cache/config dir that names `$HOME` (directly, or through a link,
+/// however spelled) must be refused or unlinked, never emptied — the shape
+/// this used to shrink to was `cache_dir = $HOME`.
 #[test]
-#[ignore = "finding: rocm uninstall applies no guard to config/data/cache roots"]
 fn uninstall_never_deletes_a_folder_rocm_cli_did_not_create() {
     if let Err(error) = run_uninstall_property(case_count(), true) {
         panic!("{error}");

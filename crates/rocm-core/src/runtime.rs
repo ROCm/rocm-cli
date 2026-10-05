@@ -656,34 +656,104 @@ fn strip_managed_runtime_leaf(path: &Path) -> Option<PathBuf> {
     runtimes_dir.parent().map(Path::to_path_buf)
 }
 
+/// Why a folder must never be recursively deleted by ROCm CLI.
+///
+/// Returned by [`runtime_protected_location`] so a caller that refuses can say
+/// *why* from the same value it decided on, instead of restating the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedLocation {
+    /// The top of a filesystem: `/`, or a drive root such as `C:\` on Windows.
+    FilesystemRoot,
+    /// The user's home folder itself.
+    Home,
+    /// A folder that contains the user's home folder, such as `/home`.
+    ContainsHome,
+    /// A system location such as `/usr` or `C:\Windows`, or a folder inside one.
+    System,
+}
+
+impl ProtectedLocation {
+    /// What the folder is, phrased to follow "it is".
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::FilesystemRoot => "the top of the filesystem",
+            Self::Home => "your home folder",
+            Self::ContainsHome => "a folder that contains your home folder",
+            Self::System => "a protected system location",
+        }
+    }
+}
+
+/// Whether ROCm CLI must refuse to recursively delete `path`.
+///
+/// The single predicate every recursive delete of a folder ROCm CLI did not
+/// pick a fixed name for goes through: `rocm runtimes uninstall`,
+/// `rocm storage remove-old-installs`, and the config/data/cache roots
+/// `rocm uninstall` removes. See [`runtime_protected_location`].
 pub fn runtime_install_root_is_protected(path: &Path) -> bool {
+    runtime_protected_location(path).is_some()
+}
+
+/// Why `path` is protected, if it is, judged against the current user's home.
+pub fn runtime_protected_location(path: &Path) -> Option<ProtectedLocation> {
+    runtime_protected_location_for_home(path, runtime_home_dir().as_deref())
+}
+
+/// [`runtime_protected_location`] with the home folder passed in, so a caller
+/// (or a test) can judge a path against a home other than the process's own.
+///
+/// Anything strictly inside `home` is never protected, so a user install under
+/// `~/.rocm` stays removable even when home itself sits under a protected root
+/// (`/root` for a root user). Home itself, and every folder that contains it,
+/// is protected: removing either deletes everything the user owns. A `home`
+/// that is itself a filesystem root grants no exemption, or it would exempt
+/// every folder on the machine.
+pub fn runtime_protected_location_for_home(
+    path: &Path,
+    home: Option<&Path>,
+) -> Option<ProtectedLocation> {
     let path = normalize_runtime_path_for_host(path);
-    if let Some(home) = runtime_home_dir() {
-        let home = normalize_runtime_path_for_host(&home);
-        if runtime_path_is_same_or_inside(&path, &home) && !runtime_paths_equivalent(&path, &home) {
-            return false;
+    if is_filesystem_root(&path) {
+        return Some(ProtectedLocation::FilesystemRoot);
+    }
+
+    let home = home
+        .map(normalize_runtime_path_for_host)
+        .filter(|home| !is_filesystem_root(home));
+    if let Some(home) = home {
+        if runtime_paths_equivalent(&path, &home) {
+            return Some(ProtectedLocation::Home);
+        }
+        if runtime_path_is_same_or_inside(&path, &home) {
+            return None;
+        }
+        if runtime_path_is_same_or_inside(&home, &path) {
+            return Some(ProtectedLocation::ContainsHome);
         }
     }
 
-    if runtime_is_windows() {
-        let system_roots = ["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"];
-        return system_roots
-            .iter()
-            .map(Path::new)
-            .any(|root| runtime_path_is_same_or_inside(&path, root));
-    }
+    let system_roots: &[&str] = if runtime_is_windows() {
+        &["C:/Windows", "C:/Program Files", "C:/Program Files (x86)"]
+    } else {
+        &[
+            "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
+            "/sys", "/usr", "/var",
+        ]
+    };
+    system_roots
+        .iter()
+        .map(Path::new)
+        .any(|root| runtime_path_is_same_or_inside(&path, root))
+        .then_some(ProtectedLocation::System)
+}
 
-    if runtime_paths_equivalent(&path, Path::new("/")) {
-        return true;
-    }
-
-    [
-        "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
-        "/sys", "/usr", "/var",
-    ]
-    .iter()
-    .map(Path::new)
-    .any(|root| runtime_path_is_same_or_inside(&path, root))
+/// `/`, or a Windows drive root such as `C:/`: anchored, with nothing above it
+/// once `.`, `..` and repeated separators are resolved (`//..` is `/`).
+fn is_filesystem_root(path: &Path) -> bool {
+    let resolved = comparable_runtime_path_text(path, RuntimePlatform::current());
+    let resolved = Path::new(&resolved);
+    resolved.has_root() && resolved.parent().is_none()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1807,6 +1877,109 @@ mod tests {
                 );
             }
 
+            /// Home itself and every folder that contains it are refused, and
+            /// for the right reason, however they are spelled; anything
+            /// strictly inside home stays removable. Judged against a fixed
+            /// home so the property does not depend on the host's.
+            #[test]
+            fn home_and_its_ancestors_are_refused_however_spelled(
+                text in path_text(proptest::sample::select(vec![
+                    FIXED_HOME.to_owned(),
+                    "/home".to_owned(),
+                    "/".to_owned(),
+                    format!("{FIXED_HOME}/.rocm"),
+                    format!("{FIXED_HOME}x"),
+                    "/tmp".to_owned(),
+                ])),
+            ) {
+                let resolved = lexically_resolved(&text);
+                let verdict =
+                    runtime_protected_location_for_home(Path::new(&text), Some(Path::new(FIXED_HOME)));
+                let expected = if resolved == "/" {
+                    Some(ProtectedLocation::FilesystemRoot)
+                } else if resolved == FIXED_HOME {
+                    Some(ProtectedLocation::Home)
+                } else if FIXED_HOME.starts_with(&format!("{resolved}/")) {
+                    Some(ProtectedLocation::ContainsHome)
+                } else if lexically_same_or_inside(&resolved, FIXED_HOME) {
+                    None
+                } else {
+                    // Elsewhere: the system list decides, which the other
+                    // properties in this module already pin.
+                    verdict
+                };
+                prop_assert_eq!(verdict, expected, "{} resolves to {}", text, resolved);
+            }
+        }
+
+        const FIXED_HOME: &str = "/home/alice";
+
+        /// The cases the issue reported, plus the root-user and root-home
+        /// shapes, pinned as examples.
+        #[test]
+        fn home_and_its_ancestors_are_named_for_what_they_are() {
+            let home = Some(Path::new(FIXED_HOME));
+            let cases: [(&str, Option<ProtectedLocation>); 11] = [
+                ("/", Some(ProtectedLocation::FilesystemRoot)),
+                ("//", Some(ProtectedLocation::FilesystemRoot)),
+                ("//..", Some(ProtectedLocation::FilesystemRoot)),
+                ("/home/alice", Some(ProtectedLocation::Home)),
+                ("/home/alice/", Some(ProtectedLocation::Home)),
+                ("/home/alice/.rocm/..", Some(ProtectedLocation::Home)),
+                ("/home", Some(ProtectedLocation::ContainsHome)),
+                ("/home/alice/.cache", None),
+                ("/home/alicex", None),
+                ("/usr/local", Some(ProtectedLocation::System)),
+                ("/tmp/rocm", None),
+            ];
+            for (path, expected) in cases {
+                assert_eq!(
+                    runtime_protected_location_for_home(Path::new(path), home),
+                    expected,
+                    "{path}"
+                );
+            }
+        }
+
+        /// Root's home sits under a protected root; it is refused as a home,
+        /// and what is inside it stays removable.
+        #[test]
+        fn a_root_users_home_is_refused_as_a_home() {
+            let home = Some(Path::new("/root"));
+            assert_eq!(
+                runtime_protected_location_for_home(Path::new("/root"), home),
+                Some(ProtectedLocation::Home)
+            );
+            assert_eq!(
+                runtime_protected_location_for_home(Path::new("/root/.rocm"), home),
+                None
+            );
+        }
+
+        /// A home of `/` must not exempt the whole machine.
+        #[test]
+        fn a_home_at_the_filesystem_root_exempts_nothing() {
+            let home = Some(Path::new("/"));
+            assert_eq!(
+                runtime_protected_location_for_home(Path::new("/etc"), home),
+                Some(ProtectedLocation::System)
+            );
+            assert_eq!(
+                runtime_protected_location_for_home(Path::new("/"), home),
+                Some(ProtectedLocation::FilesystemRoot)
+            );
+        }
+
+        /// The public gate refuses the real home, which it used to report as
+        /// removable.
+        #[test]
+        fn the_public_gate_refuses_the_users_own_home() {
+            let home = runtime_home_dir().expect("a home directory");
+            assert!(
+                runtime_install_root_is_protected(&home),
+                "{}",
+                home.display()
+            );
         }
     }
 }

@@ -819,6 +819,20 @@ On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
 
+`rocm uninstall` never removes `/`, your home folder, a folder that contains
+it, or a protected system location such as `/usr` or `C:\Windows` — the same
+rule `rocm runtimes uninstall` and `rocm storage remove-old-installs` apply. If
+the config, data, or cache folder is one of those (for example
+`ROCM_CLI_DATA_DIR=/`, or an SDK installed with `--prefix ~`), the review lists
+it under "Refused", the command exits with an error, and nothing is removed.
+Re-run with the `--keep-config`, `--keep-data`, or `--keep-cache` flag the
+message names to remove everything else and leave that folder in place.
+
+The review also names the shared uv and Hugging Face caches. Normally they are
+left in place; if one sits inside a folder being removed (for example
+`ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
+confirm, and which `--keep-` flag keeps it.
+
 ### Shell completions
 
 `rocm completions <shell>` prints a completion script for the given shell to

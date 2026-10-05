@@ -530,6 +530,22 @@ ROCM_DELETION_PROP_CASES=4096 cargo test -p rocm --bin rocm deletion_properties
 The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
 local run. They are Unix-only because they plant symlinks.
 
+The uninstall properties also point roots at the sandbox's own home folder and
+plant shared caches inside and outside the removed roots. They check that a
+protected root refuses the whole uninstall and removes nothing, that no file
+ROCm CLI did not create is deleted, and that the review says a shared cache
+WILL BE DELETED exactly when the removal deletes it.
+
+The protected-location rule itself (`/`, the home folder, folders containing
+it, and the system list) is shared by every recursive delete of a folder ROCm
+CLI did not name itself, and is tested in `rocm-core`:
+
+```bash
+cargo test -p rocm-core --lib runtime::tests::delete_guard_properties
+cargo test -p rocm --bin rocm uninstall_
+cargo test -p rocm --bin rocm shared_cache
+```
+
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
 behaviour through the built binary, confined to the scenario's own folder:
 

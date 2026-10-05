@@ -52,9 +52,9 @@ use rocm_core::{
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, prepend_runtime_path, process_is_running,
     read_http_response_bounded, resolve_builtin_model_recipe, resolve_model_recipe,
-    runtime_install_root_is_protected, runtime_path_is_same_or_inside,
-    runtime_python_activation_hint, runtime_python_env_bin_dir, runtime_python_executable_in_env,
-    shell_command_for_host, uv_cache_source, write_all_tcp_stream,
+    runtime_path_is_same_or_inside, runtime_python_activation_hint, runtime_python_env_bin_dir,
+    runtime_python_executable_in_env, shell_command_for_host, uv_cache_source,
+    write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -594,6 +594,14 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    #[command(
+        after_help = "Never removes the top of the filesystem, your home folder, a folder that \
+contains it, or a protected system location: if the config, data, or cache folder is one of \
+those, the whole uninstall is refused and nothing is removed. The review names the folder and \
+the --keep-<config|data|cache> flag that leaves it out. A folder that is a link is unlinked, \
+never followed. Shared caches (uv, Hugging Face) inside a removed folder are listed as deleted \
+before you confirm."
+    )]
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -9813,10 +9821,11 @@ fn ensure_runtime_install_root_is_safe_to_remove(path: &Path) -> Result<()> {
     // ever calling this function (see storage.rs); check it here too so the
     // single source of truth for "may ROCm CLI delete this folder?" refuses
     // it for every caller, including a direct `runtimes uninstall <key>`.
-    if runtime_install_root_is_protected(path) {
+    if let Some(why) = rocm_core::runtime_protected_location(path) {
         bail!(
-            "refusing to remove runtime folder {} in a protected system location",
-            path.display()
+            "refusing to remove runtime folder {} because it is {}",
+            path.display(),
+            why.describe()
         );
     }
     Ok(())
@@ -14392,9 +14401,9 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
         );
     };
     let prefix_path = Path::new(&prefix);
-    if chat_install_prefix_is_system(prefix_path) {
+    if let Some(why) = chat_install_prefix_protection(prefix_path) {
         bail!(
-            "local assistant cannot request system install folder `{}`",
+            "local assistant cannot request install folder `{}`: it is {why}",
             prefix_path.display()
         );
     }
@@ -14919,9 +14928,9 @@ fn validate_chat_rocm_command_safety(args: &[String]) -> Result<()> {
             );
         };
         let prefix_path = Path::new(prefix);
-        if chat_install_prefix_is_system(prefix_path) {
+        if let Some(why) = chat_install_prefix_protection(prefix_path) {
             bail!(
-                "local assistant cannot request system install folder `{}`",
+                "local assistant cannot request install folder `{}`: it is {why}",
                 prefix_path.display()
             );
         }
@@ -14987,8 +14996,19 @@ fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn chat_install_prefix_is_system(prefix: &Path) -> bool {
-    prefix.as_os_str().is_empty() || runtime_install_root_is_protected(prefix)
+    chat_install_prefix_protection(prefix).is_some()
+}
+
+/// Why the local assistant may not install into `prefix`, if it may not: the
+/// same protected-location rule every recursive delete uses, since an install
+/// folder is one a later uninstall or a broken-venv rebuild may remove.
+fn chat_install_prefix_protection(prefix: &Path) -> Option<&'static str> {
+    if prefix.as_os_str().is_empty() {
+        return Some("an empty path");
+    }
+    rocm_core::runtime_protected_location(prefix).map(rocm_core::ProtectedLocation::describe)
 }
 
 pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> bool {
@@ -16263,9 +16283,9 @@ fn internal_mcp_install_sdk_args(
     ];
     if let Some(prefix) = json_string(arguments, "prefix") {
         let prefix_path = Path::new(&prefix);
-        if chat_install_prefix_is_system(prefix_path) {
+        if let Some(why) = chat_install_prefix_protection(prefix_path) {
             bail!(
-                "install_sdk prefix `{}` is a system folder; choose a user folder instead",
+                "install_sdk prefix `{}` is {why}; choose a user folder instead",
                 prefix_path.display()
             );
         }
@@ -20990,14 +21010,88 @@ struct UninstallPlanEntry {
     path: PathBuf,
 }
 
+/// A config/data/cache root `rocm uninstall` will not remove, and why.
+#[derive(Debug, Clone)]
+struct RefusedRoot {
+    kind: &'static str,
+    path: PathBuf,
+    why: rocm_core::ProtectedLocation,
+}
+
+impl RefusedRoot {
+    fn describe(&self) -> String {
+        format!(
+            "{} folder {} is {}",
+            self.kind,
+            self.path.display(),
+            self.why.describe()
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
+    /// Roots the plan would otherwise remove but that sit in a protected
+    /// location. Any entry here refuses the whole uninstall.
+    refused: Vec<RefusedRoot>,
     skipped: Vec<String>,
     warnings: Vec<String>,
 }
 
+impl UninstallPlan {
+    /// How to get past a refusal, derived from the refused roots themselves:
+    /// each root's `--keep-<kind>` flag is exactly what leaves it out of the
+    /// plan, so the advice cannot name a flag that does not clear it.
+    fn refusal_advice(&self) -> Option<String> {
+        if self.refused.is_empty() {
+            return None;
+        }
+        let flags = self
+            .refused
+            .iter()
+            .map(|root| format!("--keep-{}", root.kind))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let pronoun = if self.refused.len() == 1 {
+            "it"
+        } else {
+            "them"
+        };
+        Some(format!(
+            "Re-run with {flags} to remove everything else and leave {pronoun} in place."
+        ))
+    }
+
+    /// The error a real (non-dry-run) uninstall stops with when anything was
+    /// refused. It is raised before the confirmation prompt and before the
+    /// first removal, which is what makes "nothing was removed" true.
+    fn refusal_error(&self) -> Option<String> {
+        let advice = self.refusal_advice()?;
+        let reasons = self
+            .refused
+            .iter()
+            .map(RefusedRoot::describe)
+            .collect::<Vec<_>>()
+            .join("; the ");
+        Some(format!(
+            "uninstall refused, nothing was removed: the {reasons}, and ROCm CLI never removes \
+             such a folder. {advice}"
+        ))
+    }
+}
+
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
+    build_uninstall_plan_for_home(paths, options, rocm_core::runtime_home_dir().as_deref())
+}
+
+/// [`build_uninstall_plan`] judged against `home` rather than the process's
+/// own, so the protected-root check can be tested in a sandbox.
+fn build_uninstall_plan_for_home(
+    paths: &AppPaths,
+    options: &UninstallOptions,
+    home: Option<&Path>,
+) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
     if options.keep_binaries {
@@ -21042,17 +21136,23 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         // the entry that is actually removed, and `dir/` and `dir` dedup to one
         // line. Existence is the entry's own, not its target's: a dangling link
         // is listed and then really removed, instead of reported as absent.
-        if let Ok(Some((entry, _))) = existing_entry(&path) {
-            plan.actions.push(UninstallPlanEntry { kind, path: entry });
-        } else {
+        let Ok(Some((path, _metadata))) = existing_entry(&path) else {
             plan.skipped
                 .push(format!("{kind} path not present: {}", path.display()));
+            continue;
+        };
+        // The same predicate `rocm runtimes uninstall` and `rocm storage
+        // remove-old-installs` apply before a recursive delete. These roots come
+        // from environment variables or `setup.therock_venv`, so `/` or the
+        // home folder is one typo away.
+        if let Some(why) = rocm_core::runtime_protected_location_for_home(&path, home) {
+            plan.refused.push(RefusedRoot { kind, path, why });
+            continue;
         }
+        plan.actions.push(UninstallPlanEntry { kind, path });
     }
 
-    for note in shared_cache_notes(paths) {
-        plan.warnings.push(note);
-    }
+    plan.warnings.extend(shared_cache_notes(&plan.actions));
 
     let managed_services = load_managed_services(paths).unwrap_or_default();
     if !managed_services.is_empty() {
@@ -21129,6 +21229,19 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
             let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
         }
     }
+    if !plan.refused.is_empty() {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Refused (ROCm CLI never removes these folders):");
+    }
+    for root in &plan.refused {
+        let _ = writeln!(
+            output,
+            "  - {}: {} is {}",
+            root.kind,
+            root.path.display(),
+            root.why.describe()
+        );
+    }
     if !plan.warnings.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "Please review:");
@@ -21145,44 +21258,96 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
     }
     if options.dry_run {
         let _ = writeln!(output);
-        let _ = writeln!(output, "Choose Review uninstall to approve removal.");
+        if let Some(advice) = plan.refusal_advice() {
+            let _ = writeln!(output, "This uninstall would be refused. {advice}");
+        } else {
+            let _ = writeln!(output, "Choose Review uninstall to approve removal.");
+        }
     }
     output
 }
 
-/// Caches that ROCm CLI causes to be filled but does not own, so uninstall
-/// leaves them in place.
+/// Caches that ROCm CLI causes to be filled but does not own.
 ///
 /// These are usually the largest things on disk after an install, so a plan
 /// that stays silent about them reads as a clean slate it does not deliver.
-/// Only paths that exist and sit outside everything already being removed are
-/// reported, so the notes stay truthful as caches move under the data
-/// directory.
-fn shared_cache_notes(paths: &AppPaths) -> Vec<String> {
-    let removed_roots = [
-        paths.config_dir.clone(),
-        paths.data_dir.clone(),
-        paths.cache_dir.clone(),
-    ];
-    shared_cache_notes_for(&removed_roots, &shared_cache_candidates())
+/// Each one that exists is reported either way: left in place when it sits
+/// outside every root being removed, or deleted when it sits inside one — the
+/// case where staying silent would be worst, because a root pointed at
+/// something like `~/.cache` takes these caches with it.
+fn shared_cache_notes(planned: &[UninstallPlanEntry]) -> Vec<String> {
+    shared_cache_notes_for(planned, &shared_cache_candidates())
 }
 
-/// The pure part of [`shared_cache_notes`], so the filtering is testable without
-/// depending on the caller's real environment.
+/// A shared cache, named the two ways a plan may need to talk about it.
+struct SharedCache {
+    path: PathBuf,
+    /// Leads the "left in place" note, which ends "... not removed: <path>".
+    kept: &'static str,
+    /// What the cache is, for the "will be deleted" warning.
+    name: &'static str,
+    /// Why losing it matters, as a sentence.
+    loss: &'static str,
+    /// `it` or `them`, to agree with `name`.
+    pronoun: &'static str,
+}
+
+/// The pure part of [`shared_cache_notes`], so the classification is testable
+/// without depending on the caller's real environment.
+///
+/// A planned root only takes a cache with it when it is a real directory: a
+/// root that is a symlink is unlinked, never followed, so what sits behind it
+/// survives. Containment is judged on resolved paths when both resolve, so a
+/// cache reached through a linked ancestor is still recognised as inside.
 fn shared_cache_notes_for(
-    removed_roots: &[PathBuf],
-    candidates: &[(PathBuf, &'static str)],
+    planned: &[UninstallPlanEntry],
+    candidates: &[SharedCache],
 ) -> Vec<String> {
-    candidates
+    let removed_dirs: Vec<&UninstallPlanEntry> = planned
         .iter()
-        .filter(|(path, _)| path.exists())
-        .filter(|(path, _)| !removed_roots.iter().any(|root| path.starts_with(root)))
-        .map(|(path, description)| format!("{description} not removed: {}", path.display()))
-        .collect()
+        .filter(|entry| {
+            fs::symlink_metadata(&entry.path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        })
+        .collect();
+    let inside = |cache: &Path, root: &Path| match (cache.canonicalize(), root.canonicalize()) {
+        (Ok(cache), Ok(root)) => cache.starts_with(root),
+        _ => cache.starts_with(root),
+    };
+
+    let mut deleted = Vec::new();
+    let mut kept = Vec::new();
+    for cache in candidates.iter().filter(|cache| cache.path.exists()) {
+        if let Some(root) = removed_dirs
+            .iter()
+            .find(|root| inside(&cache.path, &root.path))
+        {
+            deleted.push(format!(
+                "{} WILL BE DELETED: {} is inside the {} folder being removed ({}). {} \
+                 Re-run with --keep-{} to keep {}.",
+                cache.name,
+                cache.path.display(),
+                root.kind,
+                root.path.display(),
+                cache.loss,
+                root.kind,
+                cache.pronoun,
+            ));
+        } else {
+            kept.push(format!(
+                "{} not removed: {}",
+                cache.kept,
+                cache.path.display()
+            ));
+        }
+    }
+    // Deletions first: they are the notes a reader must not skim past.
+    deleted.extend(kept);
+    deleted
 }
 
-/// The shared caches worth reporting, with why each is left alone.
-fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
+/// The shared caches worth reporting, with why each matters.
+fn shared_cache_candidates() -> Vec<SharedCache> {
     let mut candidates = Vec::new();
 
     // `uv` writes to `UV_CACHE_DIR` when set, otherwise its own default. Read it
@@ -21191,10 +21356,13 @@ fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
     let uv_cache = env_path("UV_CACHE_DIR")
         .or_else(|| rocm_core::runtime_home_dir().map(|home| home.join(".cache").join("uv")));
     if let Some(path) = uv_cache {
-        candidates.push((
+        candidates.push(SharedCache {
             path,
-            "the uv package cache is shared with other uv projects on this computer and is",
-        ));
+            kept: "the uv package cache is shared with other uv projects on this computer and is",
+            name: "the uv package cache",
+            loss: "It is shared with other uv projects on this computer.",
+            pronoun: "it",
+        });
     }
 
     let hf_cache = env_path("HF_HOME")
@@ -21205,10 +21373,13 @@ fn shared_cache_candidates() -> Vec<(PathBuf, &'static str)> {
                 .map(|home| home.join(".cache").join("huggingface").join("hub"))
         });
     if let Some(path) = hf_cache {
-        candidates.push((
+        candidates.push(SharedCache {
             path,
-            "downloaded model files are slow to fetch again and may include your own, so they are",
-        ));
+            kept: "downloaded model files are slow to fetch again and may include your own, so they are",
+            name: "downloaded model files",
+            loss: "They are slow to fetch again and may include your own.",
+            pronoun: "them",
+        });
     }
 
     candidates
@@ -23067,27 +23238,104 @@ mod tests {
         assert_eq!(super::exit_code_for(result), ExitCode::from(2));
     }
 
-    /// A cache that has moved inside a directory uninstall already removes must
-    /// not be reported as "not removed" — the note would be false.
+    fn test_shared_cache(path: PathBuf) -> super::SharedCache {
+        super::SharedCache {
+            path,
+            kept: "the uv package cache is shared with other uv projects on this computer and is",
+            name: "the uv package cache",
+            loss: "It is shared with other uv projects on this computer.",
+            pronoun: "it",
+        }
+    }
+
+    fn planned_root(kind: &'static str, path: PathBuf) -> super::UninstallPlanEntry {
+        super::UninstallPlanEntry { kind, path }
+    }
+
+    /// A shared cache inside a root uninstall removes is deleted with it, so the
+    /// plan must say so — loudly, with the flag that keeps it — rather than
+    /// drop the note it would otherwise print. This is the `~/.cache` case:
+    /// the warning used to vanish exactly when the cache was about to go.
     #[test]
-    fn shared_cache_notes_skip_paths_already_being_removed() {
+    fn shared_cache_inside_a_removed_root_is_reported_as_deleted() {
         let root = std::env::temp_dir().join(format!("rocm-shared-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let data = root.join("data");
-        let inside = data.join("uv-cache");
+        let cache = root.join("dot-cache");
+        let inside = cache.join("uv");
         std::fs::create_dir_all(&inside).unwrap();
 
         let notes = super::shared_cache_notes_for(
-            &[root.join("config"), data, root.join("cache")],
-            &[(inside, "the uv package cache")],
+            &[planned_root("cache", cache.clone())],
+            &[test_shared_cache(inside.clone())],
         );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let note = &notes[0];
+        assert!(note.contains("WILL BE DELETED"), "{note}");
+        assert!(note.contains(&inside.display().to_string()), "{note}");
+        assert!(note.contains(&cache.display().to_string()), "{note}");
+        // The advice is checked against the plan in
+        // `uninstall_keep_flag_named_by_the_shared_cache_warning_keeps_it`.
+        assert!(note.contains("--keep-cache"), "{note}");
+    }
+
+    /// The flag the warning names really keeps the cache: with it, the root
+    /// leaves the plan and the same cache is reported as left in place.
+    #[test]
+    fn uninstall_keep_flag_named_by_the_shared_cache_warning_keeps_it() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("dot-cache"),
+        };
+        let inside = paths.cache_dir.join("uv");
+        std::fs::create_dir_all(&inside).unwrap();
+        let options = super::UninstallOptions {
+            keep_binaries: true,
+            keep_cache: true,
+            ..super::UninstallOptions::default()
+        };
+        let plan = super::build_uninstall_plan_for_home(&paths, &options, None).unwrap();
+        let notes = super::shared_cache_notes_for(&plan.actions, &[test_shared_cache(inside)]);
+        let _ = std::fs::remove_dir_all(&root);
 
         assert!(
-            notes.is_empty(),
-            "a cache inside a removed directory must not be reported: {notes:?}"
+            plan.actions.iter().all(|entry| entry.kind != "cache"),
+            "{plan:?}"
         );
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not removed"), "{notes:?}");
+    }
 
+    /// A root that is a symlink is unlinked, never followed, so a cache behind
+    /// it survives and must not be reported as deleted.
+    #[test]
+    #[cfg(unix)]
+    fn shared_cache_behind_a_linked_root_is_not_reported_as_deleted() {
+        let root = std::env::temp_dir().join(format!("rocm-shared-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real-cache");
+        let inside = real.join("uv");
+        std::fs::create_dir_all(&inside).unwrap();
+        let link = root.join("cache-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let notes = super::shared_cache_notes_for(
+            &[planned_root("cache", link)],
+            &[test_shared_cache(link_join_uv(&root))],
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("not removed"), "{notes:?}");
+    }
+
+    #[cfg(unix)]
+    fn link_join_uv(root: &Path) -> PathBuf {
+        root.join("cache-link").join("uv")
     }
 
     /// A cache that exists outside everything being removed is reported, with
@@ -23098,10 +23346,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let outside = root.join("elsewhere").join("uv");
         std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(root.join("data")).unwrap();
 
         let notes = super::shared_cache_notes_for(
-            &[root.join("data")],
-            &[(outside.clone(), "the uv package cache")],
+            &[planned_root("data", root.join("data"))],
+            &[test_shared_cache(outside.clone())],
         );
 
         assert_eq!(notes.len(), 1, "{notes:?}");
@@ -23119,10 +23368,106 @@ mod tests {
     fn shared_cache_notes_ignore_missing_paths() {
         let missing = std::env::temp_dir().join("rocm-definitely-not-here-12345");
         let notes = super::shared_cache_notes_for(
-            &[std::env::temp_dir()],
-            &[(missing, "the uv package cache")],
+            &[planned_root("cache", std::env::temp_dir())],
+            &[test_shared_cache(missing)],
         );
         assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// `ROCM_CLI_DATA_DIR=/` used to plan `- data: /`. The root is refused, the
+    /// review names it, why, and the flag that clears it — and that flag does.
+    /// The "nothing was removed" half of the message is proven where removal
+    /// happens: `uninstall_refuses_and_removes_nothing_when_a_root_is_protected`
+    /// below and the `uninstall-03` E2E scenario.
+    #[test]
+    fn uninstall_plan_refuses_the_filesystem_root() {
+        let root = std::env::temp_dir().join(format!("rocm-refuse-root-{}", std::process::id()));
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: PathBuf::from("/"),
+            cache_dir: root.join("cache"),
+        };
+        let options = super::UninstallOptions {
+            keep_binaries: true,
+            ..super::UninstallOptions::default()
+        };
+        let plan = super::build_uninstall_plan_for_home(&paths, &options, None).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .all(|entry| entry.path != Path::new("/")),
+            "{plan:?}"
+        );
+        assert_eq!(plan.refused.len(), 1, "{plan:?}");
+        assert_eq!(plan.refused[0].kind, "data");
+        assert_eq!(
+            plan.refused[0].why,
+            rocm_core::ProtectedLocation::FilesystemRoot
+        );
+        let error = plan.refusal_error().expect("a refusal error");
+        assert!(
+            error.contains("data folder / is the top of the filesystem"),
+            "{error}"
+        );
+        assert!(error.contains("--keep-data"), "{error}");
+        let rendered = super::render_uninstall_plan(
+            &plan,
+            &super::UninstallOptions {
+                dry_run: true,
+                ..options
+            },
+        );
+        assert!(
+            rendered.contains("  - data: / is the top of the filesystem"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Choose Review uninstall"), "{rendered}");
+
+        let keep = super::UninstallOptions {
+            keep_data: true,
+            ..options
+        };
+        let plan = super::build_uninstall_plan_for_home(&paths, &keep, None).unwrap();
+        assert!(
+            plan.refused.is_empty(),
+            "--keep-data must clear it: {plan:?}"
+        );
+    }
+
+    /// The home folder itself — `setup.therock_venv` set to `$HOME` reaches the
+    /// data root this way — is refused, and nothing at all is removed: not the
+    /// home folder, and not the other roots either.
+    #[test]
+    fn uninstall_refuses_and_removes_nothing_when_a_root_is_protected() {
+        let root = std::env::temp_dir().join(format!("rocm-refuse-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        std::fs::write(home.join("Documents").join("thesis.txt"), b"keep").unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: PathBuf::from(format!("{}/", home.display())),
+            cache_dir: root.join("cache"),
+        };
+        let options = super::UninstallOptions {
+            yes: true,
+            keep_binaries: true,
+            ..super::UninstallOptions::default()
+        };
+        let plan = super::build_uninstall_plan_for_home(&paths, &options, Some(&home)).unwrap();
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        let thesis_left = home.join("Documents").join("thesis.txt").is_file();
+        let config_left = root.join("config").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(plan.refused.len(), 1, "{plan:?}");
+        assert_eq!(plan.refused[0].why, rocm_core::ProtectedLocation::Home);
+        let error = format!("{:#}", outcome.expect_err("a refused plan must not apply"));
+        assert!(error.contains("nothing was removed"), "{error}");
+        assert!(error.contains("is your home folder"), "{error}");
+        assert!(thesis_left, "the home folder was emptied");
+        assert!(config_left, "a refused plan still removed another root");
     }
 
     use super::*;
@@ -27495,7 +27840,7 @@ model recipes
                 serde_json::json!({
                     "prefix": if cfg!(windows) { "C:\\Windows\\rocm" } else { "/opt/rocm" }
                 }),
-                "system install folder",
+                "cannot request install folder",
             ),
             (
                 serde_json::json!({
@@ -35101,6 +35446,24 @@ ID_LIKE="suse opensuse"
         let err = ensure_runtime_install_root_is_safe_to_remove(&protected)
             .expect_err("protected system path must be refused");
         assert!(err.to_string().contains("protected system location"));
+    }
+
+    /// `rocm runtimes uninstall` and `rocm storage remove-old-installs` share
+    /// the protected-location predicate with `rocm uninstall`, so a runtime
+    /// whose `install_root` is the home folder itself (`--prefix ~`) is refused
+    /// too — and the refusal says it is the home folder, not a system location.
+    #[test]
+    fn ensure_runtime_install_root_refuses_the_home_folder_by_name() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let err = ensure_runtime_install_root_is_safe_to_remove(&home)
+            .expect_err("the home folder must be refused");
+        let message = err.to_string();
+        // A home of `/` is caught earlier, by the has-no-parent check.
+        assert!(
+            message.contains("is your home folder") || message.contains("unsafe runtime folder"),
+            "{message}"
+        );
+        assert!(!message.contains("system location"), "{message}");
     }
 
     /// The gate above is the last thing between a registry entry and

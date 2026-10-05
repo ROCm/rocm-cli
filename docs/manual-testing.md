@@ -375,3 +375,64 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall Safety
+
+Run these in a throwaway home on Linux or WSL, never against your real one, and
+only with `--dry-run` where the step says so. Each block starts a fresh sandbox:
+
+```bash
+export SANDBOX=$(mktemp -d)
+export HOME=$SANDBOX/home ROCM_CLI_CONFIG_DIR=$SANDBOX/config \
+  ROCM_CLI_DATA_DIR=$SANDBOX/data ROCM_CLI_CACHE_DIR=$SANDBOX/cache
+mkdir -p "$HOME/Documents" "$ROCM_CLI_CONFIG_DIR"
+echo keep > "$HOME/Documents/keep.txt"
+```
+
+A protected data folder is refused (dry run only):
+
+```bash
+ROCM_CLI_DATA_DIR=/ rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the review lists `data: / is the top of the filesystem` under
+"Refused", never under the items to remove, ends with `This uninstall would be
+refused. Re-run with --keep-data ...`, and the command exits non-zero.
+
+The home folder as the data folder is refused for real, and the advised flag
+works:
+
+```bash
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries --keep-data
+```
+
+Expected result: the first command exits non-zero with `uninstall refused,
+nothing was removed: the data folder <home> is your home folder ...`, and
+`$HOME/Documents/keep.txt` and the config folder are both still there. The
+second exits 0, removes the config folder, and leaves `keep.txt` alone.
+
+A shared cache inside the cache folder is named as deleted (dry run):
+
+```bash
+mkdir -p "$HOME/.cache/uv" "$HOME/.cache/huggingface/hub"
+ROCM_CLI_CACHE_DIR=$HOME/.cache rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: under "Please review", `the uv package cache WILL BE DELETED`
+and `downloaded model files WILL BE DELETED`, each naming the cache folder and
+`--keep-cache`. With the default cache folder the same two caches are reported
+as `not removed` instead.
+
+A symlinked cache folder written with a trailing slash is unlinked, not
+emptied:
+
+```bash
+mkdir -p "$SANDBOX/real-cache" && touch "$SANDBOX/real-cache/keep"
+ln -s "$SANDBOX/real-cache" "$SANDBOX/rocm-cache"
+ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
+  rocm uninstall --yes --keep-binaries --keep-config --keep-data
+```
+
+Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
+gone, and `real-cache/keep` is still there.
