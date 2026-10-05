@@ -83,11 +83,6 @@ pub use proc_lifecycle::{
 };
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
-#[cfg(test)]
-use rocm_install::{
-    RocmLayout, discover_rocm_installs_in, discover_rocm_installs_in_layout,
-    discover_rocm_installs_on_host_in,
-};
 use runtime::env_path_override;
 pub use runtime::{
     RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform, current_executable_path,

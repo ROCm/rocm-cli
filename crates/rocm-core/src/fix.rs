@@ -14,6 +14,10 @@
 //! `3` environment/OS not right, `4` a command failed, `5` user declined.
 
 use crate::examine::{run, which};
+#[cfg(test)]
+use crate::rocm_install::{
+    RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
+};
 use crate::{runtime_is_linux, runtime_is_windows};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1524,10 +1528,7 @@ fn newest_rocm_install_dir_in(
     search_dirs: &[std::path::PathBuf],
     env_override: Option<&std::path::Path>,
 ) -> String {
-    first_install_path(crate::discover_rocm_installs_on_host_in(
-        search_dirs,
-        env_override,
-    ))
+    first_install_path(discover_rocm_installs_on_host_in(search_dirs, env_override))
 }
 
 #[cfg(test)]
@@ -1620,17 +1621,14 @@ mod tests {
         // the regression waits for the Windows lane to surface it. The seam
         // already takes the layout, so driving it with both discriminates on
         // every host for the cost of one loop.
-        let by_layout: Vec<(crate::RocmLayout, bool)> = [
-            (crate::RocmLayout::Siblings, "rocm-6.2.0"),
-            (crate::RocmLayout::Children, "6.2"),
+        let by_layout: Vec<(RocmLayout, bool)> = [
+            (RocmLayout::Siblings, "rocm-6.2.0"),
+            (RocmLayout::Children, "6.2"),
         ]
         .into_iter()
         .map(|(layout, decoy)| {
-            let installs = crate::discover_rocm_installs_in_layout(
-                std::slice::from_ref(&searched),
-                None,
-                layout,
-            );
+            let installs =
+                discover_rocm_installs_in_layout(std::slice::from_ref(&searched), None, layout);
             (
                 layout,
                 installs.iter().any(|install| install.path.ends_with(decoy)),
