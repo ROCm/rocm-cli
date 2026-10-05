@@ -10178,7 +10178,7 @@ exit 1
             "",
         ] {
             let quoted = quote_display_arg(hostile);
-            let output = std::process::Command::new("sh")
+            let output = std::process::Command::new(crate::shell_quote::TEST_SH)
                 .arg("-c")
                 .arg(format!("printf %s {quoted}"))
                 .output()
