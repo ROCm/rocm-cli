@@ -107,6 +107,7 @@ pub use managed_runtime::{
 };
 use managed_runtime::{
     TheRockFamilyManifest, managed_sdk_tool_path, managed_therock_environment_records,
+    sort_records_newest_install_first,
 };
 pub use model_catalog::{
     ModelArtifactCacheStatus, ModelCatalogPlatform, ModelRecipeArtifactRecord,
@@ -337,7 +338,7 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
 /// `PATH`, so the home-directory fallbacks below never find it.
 fn resolve_amd_smi_binary_in_registry(registry_dir: &Path) -> Option<OsString> {
     let mut records = managed_therock_environment_records(registry_dir);
-    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    sort_records_newest_install_first(&mut records);
     records.into_iter().find_map(|(_, record)| {
         amd_smi_bin_dirs_for_record(&record)
             .iter()
