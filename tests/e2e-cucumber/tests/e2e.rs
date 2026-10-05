@@ -42,6 +42,7 @@ mod e2e {
     pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;
+    pub mod uninstall_steps;
     pub mod update_steps;
 }
 

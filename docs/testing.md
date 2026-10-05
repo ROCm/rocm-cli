@@ -513,6 +513,30 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Uninstall And Download Removal
+
+`rocm uninstall` and `rocm storage remove-downloads` both end in the same
+removal helper. Their property tests build a real sandbox tree with planted
+symlinks (live, dangling, and spelled with a trailing `/` or `/.`), sibling
+folders whose names are prefixes of a removed root, and sentinel files outside
+it. Each case runs the real plan and removal code, then compares the tree by
+`(dev, ino)` against what the review listed:
+
+```bash
+cargo test -p rocm --bin rocm deletion_properties
+ROCM_DELETION_PROP_CASES=4096 cargo test -p rocm --bin rocm deletion_properties
+```
+
+The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
+local run. They are Unix-only because they plant symlinks.
+
+The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
+behaviour through the built binary, confined to the scenario's own folder:
+
+```bash
+cargo xtask e2e -- -n "uninstall-"
+```
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity

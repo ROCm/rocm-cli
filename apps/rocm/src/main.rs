@@ -10,6 +10,7 @@ mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
+// Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
 #[cfg(all(test, unix))]
 mod deletion_properties;
 mod endpoint_keys;
@@ -21037,7 +21038,12 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 .push(format!("{kind} removal disabled by command line flag"));
             continue;
         }
-        if path.exists() {
+        // Planned under the spelling `remove_path` acts on, so the review names
+        // the entry that is actually removed, and `dir/` and `dir` dedup to one
+        // line. Existence is the entry's own, not its target's: a dangling link
+        // is listed and then really removed, instead of reported as absent.
+        let path = entry_path(&path);
+        if fs::symlink_metadata(&path).is_ok() {
             plan.actions.push(UninstallPlanEntry { kind, path });
         } else {
             plan.skipped
@@ -21280,12 +21286,37 @@ fn is_dev_binary_layout(path: &Path) -> bool {
         == Some("target")
 }
 
+/// `path` respelled so it names the final entry itself.
+///
+/// A trailing separator (`link/`) or a trailing `.` (`link/.`) makes the kernel
+/// resolve a final symlink, so `symlink_metadata` reports the link's *target*
+/// directory and a recursive delete walks into it. Rebuilding the path from its
+/// components drops exactly those spellings (plus repeated separators and
+/// interior `.`), none of which otherwise change which entry is named. `..` is
+/// kept: dropping it lexically would change the meaning through a link.
+fn entry_path(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// Remove the entry `path` names: a file or symlink is unlinked (never
+/// followed, however `path` is spelled), a real directory is removed
+/// recursively, and an entry that is already gone is a no-op.
+///
+/// Normalizing here rather than only at plan time covers every caller —
+/// `rocm uninstall` and `rocm storage remove-downloads` — whatever spelling
+/// their plan carries.
 fn remove_path(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let path = entry_path(path);
+    let path = path.as_path();
+    // Not `path.exists()`: that follows links, so a dangling link would read as
+    // already gone, be skipped, and still be reported as removed by the caller.
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
+        }
+    };
     if metadata.file_type().is_symlink() || metadata.is_file() {
         fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {
