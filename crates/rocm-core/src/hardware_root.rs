@@ -67,12 +67,23 @@ const fn hardware_root() -> Option<PathBuf> {
 /// A relative `path` is returned unchanged: only absolute host paths name the
 /// machine, and joining a relative one under the root would invent a location
 /// nobody asked for.
+///
+/// `path` must not contain `..`: [`Path::join`] does not normalise, so a `..`
+/// after the leading `/` would walk back out of the root. This is a documented
+/// precondition rather than a check: callers pass fixed literals, apart from
+/// the discovered ROCm install paths `rocm_relative_file_exists` probes under.
 fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     match (root, path.strip_prefix("/")) {
         (Some(root), Ok(relative)) => root.join(relative),
         _ => path.to_path_buf(),
     }
 }
+
+/// Serialises every test that sets [`TEST_HOST_ROOT_ENV`], including the
+/// downstream probe test in `examine.rs`, so two of them never see each other's
+/// simulated root.
+#[cfg(test)]
+pub(crate) static HOST_ROOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -105,15 +116,13 @@ mod tests {
         );
     }
 
-    static PROCESS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// The release build must not honour the variable at all — this is the
     /// property that makes it safe to ship the hook in the product's code. The
     /// variable is really set, so a build that started reading it fails here.
     #[cfg(not(feature = "e2e-test-hooks"))]
     #[test]
     fn a_build_without_the_hook_ignores_the_variable() {
-        let _guard = PROCESS_ENV_TEST_LOCK
+        let _guard = HOST_ROOT_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _root =
@@ -126,7 +135,7 @@ mod tests {
     #[cfg(feature = "e2e-test-hooks")]
     #[test]
     fn a_hook_build_honours_the_variable_and_ignores_an_empty_one() {
-        let _guard = PROCESS_ENV_TEST_LOCK
+        let _guard = HOST_ROOT_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         {
