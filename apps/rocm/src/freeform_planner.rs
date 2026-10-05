@@ -968,7 +968,9 @@ fn strip_json_fence(content: &str) -> &str {
     trimmed
 }
 
-pub(crate) fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
+pub(crate) fn validate_provider_planner_tool_call(
+    call: &ProviderPlannerToolCall,
+) -> Result<Vec<String>> {
     if call.tool != "rocm" {
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
@@ -2032,7 +2034,10 @@ mod tests {
             plan.notes
         );
         assert!(
-            !plan.notes.iter().any(|note| note.chars().any(char::is_control)),
+            !plan
+                .notes
+                .iter()
+                .any(|note| note.chars().any(char::is_control)),
             "no note may carry a control character into the plan block: {:?}",
             plan.notes
         );
