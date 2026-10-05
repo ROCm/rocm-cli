@@ -66,11 +66,28 @@ pub fn runner_options(
         // amd-smi ships inside the managed runtime wheel's bin dir, not on PATH;
         // resolve the path so the GPU collector can find it.
         amd_smi_binary: Some(rocm_core::resolve_amd_smi_binary()),
-        // Production always runs the real `/dev/kfd` pre-flight; only daemon
+        // Production always runs the real GPU-device pre-flight; only daemon
         // integration tests with a fake binary skip it.
-        amd_smi_skip_kfd_preflight: false,
+        amd_smi_skip_device_preflight: false,
+        // Runs once per dashboard launch here, not per refresh tick, so the
+        // extra subprocess spawn is negligible.
+        amd_smi_gpu_reachable: gpu_reachable_for_preflight(
+            rocm_core::is_wsl_host(),
+            rocm_core::has_usable_amd_gpu(),
+        ),
         test_clock_offset_path: dash_test_clock_offset_path(),
     }
+}
+
+/// The verdict may only substitute for the device open on WSL: `has_usable_amd_gpu()`
+/// is deliberately fail-open on an unprobeable platform (so it never blocks a
+/// launch), which is the wrong polarity for this pre-flight's hang guard — an
+/// unknown verdict must NOT skip the real `/dev/kfd` open. Restricting the
+/// substitution to WSL (where there is no device node the dash crates can
+/// probe directly, only the shared ROCDXG-plumbing probe this same function
+/// backs) keeps bare-metal behaviour byte-identical to a plain `/dev/kfd` check.
+const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) -> bool {
+    is_wsl_host && has_usable_gpu
 }
 
 #[cfg(feature = "e2e-test-hooks")]
@@ -1042,6 +1059,32 @@ mod tests {
             !opts.disable_vllm_metrics,
             "vLLM metrics must stay on by default even when Docker discovery is off"
         );
+    }
+
+    #[test]
+    fn runner_options_never_skips_the_device_preflight() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Truth-tables the WSL gate as a pure function, independent of the test
+    /// host's actual environment: a regression back to the un-gated
+    /// `has_usable_amd_gpu()` would flip the `(false, true)` bare-metal case
+    /// to `true`, since the fail-open verdict fires on any unprobeable
+    /// platform, not just WSL.
+    ///
+    /// This pins the helper's body only. The call site's binding — that
+    /// `runner_options` passes `is_wsl_host()` itself rather than a literal —
+    /// is not pinned by any test: on an ordinary CI host with no usable GPU,
+    /// `has_usable_amd_gpu()` is already `false`, so a mutant literal `true`
+    /// there is indistinguishable from the real call from this crate's tests.
+    #[test]
+    fn gpu_reachable_for_preflight_only_substitutes_on_wsl() {
+        assert!(!gpu_reachable_for_preflight(false, true));
+        assert!(!gpu_reachable_for_preflight(false, false));
+        assert!(!gpu_reachable_for_preflight(true, false));
+        assert!(gpu_reachable_for_preflight(true, true));
     }
 
     #[test]

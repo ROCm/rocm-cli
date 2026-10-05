@@ -134,6 +134,12 @@ async fn activate_second(world: &mut E2eWorld) {
     record(world, stdout, stderr, rc);
 }
 
+#[when("the user activates the second runtime again")]
+async fn activate_second_again(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", SECOND_KEY]);
+    record(world, stdout, stderr, rc);
+}
+
 #[when("the user rolls back")]
 async fn rollback(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback"]);
@@ -231,6 +237,26 @@ async fn first_active_again(world: &mut E2eWorld) {
     assert!(
         out.contains("runtime rolled back") && out.contains(&format!("runtime_key: {FIRST_KEY}")),
         "expected rollback to {FIRST_KEY}, got:\n{out}"
+    );
+}
+
+#[then("the second runtime is still the one in use")]
+async fn second_still_active(world: &mut E2eWorld) {
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert!(
+        listing.contains(&format!("* {SECOND_KEY}")),
+        "expected {SECOND_KEY} to still be the runtime in use, got:\n{listing}"
+    );
+}
+
+#[then("the first runtime is still the rollback target")]
+async fn first_still_rollback_target(world: &mut E2eWorld) {
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    assert!(
+        listing.contains(&format!("- {FIRST_KEY}")),
+        "re-selecting the runtime already in use is a no-op for the user, so it must not \
+         discard the rollback target the previous activation promised; expected {FIRST_KEY} \
+         still marked as the rollback target, got:\n{listing}"
     );
 }
 
