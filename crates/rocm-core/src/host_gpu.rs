@@ -907,7 +907,7 @@ pub(crate) const fn detect_linux_sysfs_gfx_target() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn detect_linux_kfd_gfx_target() -> Option<String> {
+pub(crate) fn detect_linux_kfd_gfx_target() -> Option<String> {
     detect_kfd_gfx_target_in(&host_path("/sys/class/kfd/kfd/topology/nodes"))
 }
 
@@ -1149,7 +1149,7 @@ fn linux_drm_amdgpu_card_count() -> Option<usize> {
 /// means the topology could not be read even though `/dev/kfd` exists, so
 /// availability is unknown and must not be treated as zero.
 #[cfg(target_os = "linux")]
-fn linux_kfd_gpu_node_count() -> Option<usize> {
+pub(crate) fn linux_kfd_gpu_node_count() -> Option<usize> {
     linux_kfd_gpu_node_count_in(&host_path("/sys/class/kfd/kfd/topology/nodes"))
 }
 

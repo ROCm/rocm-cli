@@ -1872,7 +1872,7 @@ fn probe_rocm_install(e: &mut Examination) {
         .unwrap_or_default();
 
     for marker in AMDGPU_INSTALL_MARKERS {
-        if crate::host_path(marker).exists() {
+        if Path::new(marker).exists() {
             e.rocm_install_method = "amdgpu-install".to_owned();
             e.rocm_repos_seen.push((*marker).to_owned());
         }
@@ -5423,5 +5423,84 @@ mod tests {
                 e.os_version
             );
         }
+    }
+
+    /// The probes themselves, not just `host_path`, answer from a simulated
+    /// host root. Plants a bare-metal machine with one GPU, inside a Podman
+    /// container, then runs the converted probes and asserts they describe it
+    /// rather than the machine the test runs on. A probe that still names its
+    /// absolute path directly reads the real host and fails here.
+    ///
+    /// The container is planted twice — first by Podman's marker, then by the
+    /// cgroup alone with no marker — so a probe reading the real host's markers
+    /// or cgroup answers differently whether the test runs bare, under Docker
+    /// or under Podman. The GPU is a gfx1101, and `/proc/version` names no WSL
+    /// kernel.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn converted_probes_read_the_simulated_host_root() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let plant = |relative: &str, body: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("planted path has a parent"))
+                .expect("create planted directory");
+            std::fs::write(path, body).expect("write planted file");
+        };
+        plant(
+            "sys/class/kfd/kfd/topology/nodes/0/properties",
+            "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n",
+        );
+        plant(
+            "sys/class/kfd/kfd/topology/nodes/1/properties",
+            "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
+        );
+        plant("dev/kfd", "");
+        plant(
+            "proc/version",
+            "Linux version 6.8.0-generic (buildd@lcy02)\n",
+        );
+        plant("run/.containerenv", "");
+
+        let (gpu_nodes, gfx_target, kfd, wsl, podman, cgroup_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+
+            let gpu_nodes = crate::host_gpu::linux_kfd_gpu_node_count();
+            let gfx_target = crate::host_gpu::detect_linux_kfd_gfx_target();
+            let kfd = stat_device("/dev/kfd", "nobody", &[]);
+            let wsl = crate::is_wsl_host();
+            let mut podman = Examination::default();
+            probe_container(&mut podman);
+
+            // Without a marker file, only the cgroup can say "container".
+            std::fs::remove_file(root.join("run/.containerenv")).expect("remove marker");
+            plant("proc/1/cgroup", "0::/kubepods/besteffort/pod1234\n");
+            let mut cgroup_only = Examination::default();
+            probe_container(&mut cgroup_only);
+
+            (gpu_nodes, gfx_target, kfd, wsl, podman, cgroup_only)
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(gpu_nodes, Some(1), "one GPU node in the planted topology");
+        assert_eq!(gfx_target.as_deref(), Some("gfx1101"));
+        assert!(kfd.exists, "the planted /dev/kfd is found");
+        assert_eq!(kfd.path, "/dev/kfd", "the logical path is reported");
+        assert!(!wsl, "the planted host is bare metal, not WSL");
+        assert!(podman.in_container);
+        assert_eq!(podman.container_kind, "podman");
+        assert!(cgroup_only.in_container);
+        assert_eq!(cgroup_only.container_kind, "container");
     }
 }
