@@ -1394,7 +1394,7 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
 /// way the endpoint has stopped answering, which on its own is exactly what
 /// recovery restarts. `stop_requested_unix_ms` is what tells the operator's
 /// stop apart from a crash; a confirmed stop, and any fresh launch, clear it.
-pub(crate) fn stop_requested(record: &ManagedServiceRecord) -> bool {
+pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
     record.stop_requested_unix_ms.is_some()
 }
 

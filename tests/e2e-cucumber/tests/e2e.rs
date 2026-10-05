@@ -727,9 +727,11 @@ pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
 
-/// The `rocmd` a rocmd-backed scenario drives. Unlike [`rocm_binary`] there is
-/// no fallback to `PATH`: the harness must be told which build to pair with the
-/// `rocm` under test, or it could silently test a different `rocmd`.
+/// The `rocmd` a rocmd-backed scenario drives.
+///
+/// Unlike [`rocm_binary`] there is no fallback to `PATH`: the harness must be
+/// told which build to pair with the `rocm` under test, or it could silently
+/// test a different `rocmd`.
 pub fn rocmd_binary() -> PathBuf {
     let configured = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
         panic!(
