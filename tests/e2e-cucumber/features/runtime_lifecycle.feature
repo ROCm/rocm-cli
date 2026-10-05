@@ -65,3 +65,18 @@ Feature: Runtime lifecycle state machine
     Then the listing explains the active and rollback markers
     And the first runtime is marked active
     And the second runtime is marked as the rollback target
+
+  # Re-selecting the runtime you are already on changes nothing the user can
+  # see, so it must not quietly take away the recovery path the previous
+  # activation had just offered ("if this causes problems, run `rocm runtimes
+  # rollback`"). It used to: the activation recomputed the rollback target from
+  # the runtime being left, and when there was none it cleared the recorded one
+  # instead of leaving it alone. The shortest command sequence that exposes this
+  # is three activations in a row, which is why none of the hand-written
+  # examples above caught it: every one- and two-command sequence conforms.
+  @id:runtime-lifecycle-reactivating-keeps-rollback-target
+  Scenario: runtime-lifecycle-08 - Re-selecting the runtime already in use keeps the rollback target
+    Given two registered runtimes with the second active after the first
+    When the user activates the second runtime again
+    Then the second runtime is still the one in use
+    And the first runtime is still the rollback target

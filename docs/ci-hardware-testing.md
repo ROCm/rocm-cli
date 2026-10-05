@@ -148,11 +148,18 @@ and GitHub step summary.
 
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
 `e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
-`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in every workflow,
-because the report derives each platform's name and OS from the artifact name.
-An unrecognised name renders as a guessed platform on Linux, which would report
-a Windows lane as Linux; `xtask`'s
-`every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards against it.
+`e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in `ci.yml` and
+`e2e-selfhosted.yml`, because the report derives each platform's name and OS
+from the artifact name. `nightly.yml`'s self-hosted lanes run a `channel:
+[release, nightly]` matrix and append the channel as the final segment before
+the `-report` affix (e.g. `e2e-gpu-strix-windows-nightly-report`); the report
+strips that segment before matching, so the platform/OS derivation is
+unaffected, and the channel itself is read from each artifact's
+`platform.json` (or, if absent, this suffix) to keep release and nightly runs
+of the same platform in separate columns. An unrecognised name renders as a
+guessed platform on Linux, which would report a Windows lane as Linux;
+`xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
+against it.
 
 ## Triggers
 

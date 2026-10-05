@@ -38,6 +38,7 @@ mod e2e {
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
     pub mod serving_steps;
+    pub mod skill_steps;
     pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;
@@ -65,10 +66,35 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// Wall-clock time the last measured `rocm` invocation took, for scenarios
+    /// where the *duration* bounds the behaviour under test —
+    /// `service-cleanup-07`, where a prune that returned while the managed-launch
+    /// lock was still held cannot have waited for it. It is a one-sided bound:
+    /// the measurement brackets the whole child process, so a long elapsed time
+    /// does not establish that the prune blocked. Set by the When step that
+    /// measures it; `None` everywhere else.
+    pub cli_elapsed: Option<std::time::Duration>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
     pub remote_env: Vec<(String, String)>,
+    /// Tells `service-cleanup-07`'s staged launch to let go of the managed-launch
+    /// lock. Set by the Given that takes the lock, taken by the When that spawns
+    /// the prune, so the hold begins at the spawn and cannot be eaten by however
+    /// long the harness took between the two steps.
+    ///
+    /// On the World rather than in a `static`: the suite runs up to 64 scenarios
+    /// concurrently (see `max_concurrent` below) and two of them share that When
+    /// step's text, so a process-global slot could be filled by one scenario and
+    /// emptied by another. A World is constructed per scenario, so "only the
+    /// launch-lock scenario sees a sender" holds by construction.
+    pub launch_release: Option<std::sync::mpsc::Sender<()>>,
+    /// The thread holding that lock. Kept so `Drop` can join it before the
+    /// `TempDir` goes, instead of leaving it detached to write a record into a
+    /// directory that may already have been removed. Dropping `launch_release`
+    /// first disconnects its channel, so a scenario that never reached the When
+    /// step does not wait out the thread's receive timeout.
+    pub launch_stage: Option<std::thread::JoinHandle<()>>,
     /// Container standing in for a second machine, for the `@requires-docker`
     /// scenarios. Held on the World so it lives for the scenario and is torn
     /// down when the World drops, even if a step panics.
@@ -114,6 +140,14 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
+    /// skill scenarios. That document is the EXPECTED-value fixture for the
+    /// skill↔CLI contract checks — see `e2e::skill_steps`.
+    pub skill_reference: Option<String>,
+    /// The symptom text a rocm-doctor scenario hands to `rocm diagnose`. Its own
+    /// field rather than borrowing `model_name`, which means a served model and
+    /// has nothing to do with a user's error report.
+    pub skill_symptom: Option<String>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -237,7 +271,10 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            cli_elapsed: None,
             remote_env: Vec::new(),
+            launch_release: None,
+            launch_stage: None,
             remote_machine: None,
             current_scenario: None,
             isolated_root: Some(root),
@@ -248,6 +285,8 @@ impl Default for E2eWorld {
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            skill_reference: None,
+            skill_symptom: None,
         }
     }
 }
@@ -546,6 +585,16 @@ impl Drop for E2eWorld {
         // removed — so it never outlives the scenario or races teardown.
         if let Some(tui) = self.tui.take() {
             drop(tui);
+        }
+        // Let `service-cleanup-07`'s staged launch finish and join it, so its last
+        // write lands while the isolated root still exists rather than panicking
+        // in a detached thread after the TempDir below is gone. Dropping the
+        // sender first disconnects the channel the thread is blocked on, so a
+        // scenario that failed before the When step returns immediately instead of
+        // waiting out that thread's receive timeout.
+        self.launch_release.take();
+        if let Some(stage) = self.launch_stage.take() {
+            let _ = stage.join();
         }
         if let Some(mock) = self.mock.take() {
             mock.stop();
