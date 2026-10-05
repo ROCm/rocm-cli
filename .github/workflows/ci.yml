@@ -1532,7 +1532,21 @@ jobs:
     name: E2E tests (Windows)
     timeout-minutes: 60
     runs-on: windows-latest
-    needs: [changes, build-and-test]
+    # Only `changes`: unlike the Linux `e2e` job this does not wait for the
+    # Linux `build-and-test`, which tells it nothing about the Windows build and
+    # would put that job's duration in front of this one's.
+    needs: [changes]
+    # Same compile cache as windows-build-and-test (see build-and-test for the
+    # design: Azure backend, written only by push and merge_group), under its
+    # own prefix — this build carries `rocm/e2e-test-hooks`, so its entries
+    # would never match that job's anyway.
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_AZURE_CONNECTION_STRING: ${{ secrets.CACHE_AZURE_CONNECTION_STRING }}
+      SCCACHE_AZURE_BLOB_CONTAINER: cache
+      SCCACHE_AZURE_KEY_PREFIX: rocm-cli/e2e-windows
+      SCCACHE_AZURE_RW_MODE: ${{ (github.event_name == 'push' || github.event_name == 'merge_group') && 'READ_WRITE' || 'READ_ONLY' }}
     if: >-
       always()
       && needs.changes.result == 'success'
@@ -1541,27 +1555,93 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Same gate as the Linux `e2e` job.
+      # Whether the real work runs this time: on a dispatch, or when the change
+      # is heavy (`merge_group` forces heavy). The job itself always runs, so the
+      # check is always reported — required checks that never report stall the
+      # merge queue.
       - name: Decide whether to run
         id: gate
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ needs.build-and-test.result }}" = "success" ] \
-            && [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+            || [ "${{ needs.changes.outputs.heavy }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Installs sccache. Runs BEFORE setup-rust-toolchain, whose rust-cache step
+      # runs `cargo metadata` and honours RUSTC_WRAPPER. `version` is pinned so
+      # the compiler wrapper does not float with the latest sccache release.
+      # continue-on-error for the same reason as build-and-test: a failed install
+      # is handled by the probe, not by failing the job.
+      - name: Set up sccache
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+
+      # Keep the remote backend only if it answers — see the equivalent step in
+      # build-and-test for why this is a probe, and why failure clears the Azure
+      # variables rather than the wrapper.
+      - name: Probe sccache cache backend
+        id: sccache_probe
+        if: steps.gate.outputs.run == 'true'
+        shell: pwsh
+        run: |
+          # This script decides whether to use the cache; a non-zero status from
+          # the commands it runs is an answer, not a job failure. Pin the native
+          # error preference off so a future runner default cannot turn a failed
+          # probe into a failed step.
+          $PSNativeCommandUseErrorActionPreference = $false
+          # Every Out-File below passes -Encoding utf8 explicitly. PowerShell 7
+          # (`shell: pwsh`) already defaults to UTF-8, but Windows PowerShell 5.1
+          # defaults to UTF-16LE, which the runner cannot parse — so an edit that
+          # switched this step to `shell: powershell` would silently corrupt the
+          # environment file rather than fail visibly.
+          function Disable-Backend {
+            "SCCACHE_AZURE_CONNECTION_STRING=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "SCCACHE_AZURE_BLOB_CONTAINER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          if (-not (Get-Command sccache -ErrorAction SilentlyContinue)) {
+            Write-Output "::warning::sccache is not installed; compiling without it."
+            "RUSTC_WRAPPER=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            # Nothing will read the credential now; don't leave it in the job env.
+            Disable-Backend
+            exit 0
+          }
+          # sccache is the compiler wrapper from here on, remote backend or not,
+          # so there are statistics worth reporting either way.
+          "active=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $env:SCCACHE_AZURE_CONNECTION_STRING) {
+            Write-Output "::notice::No cache credential available (expected on forks); compiling without a shared cache."
+            Disable-Backend
+            exit 0
+          }
+          sccache --start-server
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::sccache could not reach the cache backend; compiling without a shared cache."
+            # Leave no half-started server behind for the cargo steps to find.
+            sccache --stop-server *> $null
+            Disable-Backend
+          }
+          exit 0
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         if: steps.gate.outputs.run == 'true'
+        with:
+          cache-on-failure: true
 
       - name: Run E2E tests
         if: steps.gate.outputs.run == 'true'
         shell: pwsh
         run: cargo xtask e2e
+
+      - name: sccache stats
+        if: always() && steps.sccache_probe.outputs.active == 'true'
+        shell: pwsh
+        run: sccache --show-stats
 
       # Its own grid in the run Summary; see e2e-report for why the consolidated
       # (required) report does not wait for this lane.
