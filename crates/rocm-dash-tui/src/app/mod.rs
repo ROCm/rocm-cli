@@ -2,14 +2,15 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Dashboard reducer: `AppState` and its `apply_event`/`apply_action` entry
-//! points.
+//! Dashboard reducer: `AppState` and its `apply_event` entry point (the
+//! `apply_action`-adjacent reducer impl it dispatches into lives in
+//! `actions.rs`).
 //!
 //! Split into focused submodules to keep this file to the reducer's core:
 //! `app/types.rs` (shared type/enum defs), `app/event_loop.rs` (terminal
 //! lifecycle + tick loop), `app/scrollbar.rs` (mouse hit-testing), and
-//! `app/actions.rs` (`KeyAction` dispatch). `crate::app::*` paths for
-//! everything moved out are unchanged via the re-exports below.
+//! `app/actions.rs` (`KeyAction` dispatch). `crate::app::*` paths for the
+//! public surface moved out are unchanged via the re-exports below.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -20,8 +21,8 @@ use rocm_dash_core::protocol::Event;
 use crate::ui::theme::Theme;
 
 // Submodules holding cohesive pieces of `AppState` + free fns split out of
-// this file to keep the core reducer + event loop focused (a file→dir module
-// move: `crate::app::*` paths are unchanged).
+// this file to keep the core reducer focused (a file→dir module move:
+// `crate::app::*` paths for the public surface are unchanged).
 mod actions;
 mod chat;
 mod event_loop;
@@ -30,6 +31,10 @@ mod slash;
 mod summary;
 mod types;
 
+// Re-exports restoring the pre-split `crate::app::*` public surface. A
+// `pub(crate)` item with no caller through that path isn't re-exported just
+// because it was reachable there pre-split (see the removed
+// `NO_CHAT_BACKEND_MSG` re-export this rule cost).
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use event_loop::{
     HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
@@ -37,10 +42,11 @@ pub(crate) use event_loop::{
 };
 
 pub use event_loop::{run, spawn_termination_watcher};
-// Only reached today via a test (`launcher.rs`'s
-// `the_front_door_comes_back_after_a_session_ends_cleanly`), so a plain
-// (non-test) build sees no caller through this `crate::app::` path.
-#[allow(unused_imports)]
+// Only reached via a test (`launcher.rs`'s
+// `the_front_door_comes_back_after_a_session_ends_cleanly`); gated to that
+// build so the compiler (not a hand-maintained `#[allow]`) flags this as dead
+// if that caller ever disappears.
+#[cfg(test)]
 pub(crate) use event_loop::restore_after_session;
 pub use scrollbar::{FooterChip, PaneFocus, ScrollDrag, ScrollTarget, ScrollbarHandle};
 pub use types::{
@@ -2301,7 +2307,7 @@ mod tests {
             agent.as_ref().unwrap(),
             local_agent.as_ref().unwrap()
         ));
-        // The Local arm's restore line (mirrors app.rs): the factory cannot help.
+        // The Local arm's restore line (mirrors event_loop.rs): the factory cannot help.
         let args = args_with_anthropic_key(Some("k"));
         assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
         agent = local_agent.clone();

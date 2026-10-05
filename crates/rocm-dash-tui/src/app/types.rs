@@ -5,7 +5,7 @@
 //! Shared type and enum definitions for the dashboard reducer: `Focus`,
 //! `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`,
 //! and the slash/plan/approval payload types. No `AppState` access — split
-//! out of `app/mod.rs` to keep the core reducer + event loop focused.
+//! out of `app/mod.rs` to keep the core reducer focused.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {

@@ -4,7 +4,7 @@
 
 //! `KeyAction` dispatch: translating a key press (or a resolved mouse hit)
 //! into a `KeyAction`, and applying it to reducer state. Split out of
-//! `app/mod.rs` to keep the core reducer + event loop focused.
+//! `app/mod.rs` to keep the core reducer focused.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 

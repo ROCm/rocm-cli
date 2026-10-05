@@ -4,7 +4,7 @@
 
 //! Mouse/scroll hit-testing: resolving a raw `MouseEvent` against recorded
 //! scrollbar tracks, the tab bar, and footer-legend chips into a `KeyAction`.
-//! Split out of `app/mod.rs` to keep the core reducer + event loop focused.
+//! Split out of `app/mod.rs` to keep the core reducer focused.
 
 #[cfg(test)]
 use crossterm::event::KeyModifiers;
