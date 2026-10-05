@@ -176,16 +176,18 @@ fn tracked_files(root: &Path) -> Result<Vec<PathBuf>> {
 ///   word (`rocm-dash-collectors`) — the doc's convention for citing a
 ///   crate directory by its Cargo package name.
 ///
-/// One deliberate blind spot remains, same "safer to miss than false-flag"
-/// tradeoff: a bare, non-hyphenated word (`xtask`) is not treated as a
-/// candidate — nothing at the lexical level distinguishes a real bare
-/// directory from a plain English word or shell command (e.g. `grep`).
+/// Deliberate blind spots remain here, same "safer to miss than
+/// false-flag" tradeoff as elsewhere in this module: a bare, non-hyphenated
+/// word (`xtask`) is not treated as a candidate — nothing at the lexical
+/// level distinguishes a real bare directory from a plain English word or
+/// shell command (e.g. `grep`).
 ///
 /// A slash-path whose every component is a known [`PROSE_SLASH_WORDS`] entry
 /// (`read/write`, `and/or`, `GPU/CPU`) is rejected rather than accepted
 /// unconditionally — see that constant's doc comment for why this guard is
 /// narrow (a curated list, not a dictionary check) rather than a complete
-/// fix.
+/// fix, which leaves a second blind spot: a prose slash-pair not in that
+/// list is still wrongly accepted as a path candidate.
 fn is_path_candidate(span: &str) -> bool {
     if span.is_empty() || !is_path_safe(span) {
         return false;
@@ -281,7 +283,7 @@ fn is_directory_shaped(span: &str) -> bool {
 }
 
 /// Whether a possessive clause continues through to the next citation,
-/// given `sentence_boundary_seen` — whether a sentence-ending `.` has
+/// given `sentence_boundary_seen` — whether a sentence-ending `.`/`?`/`!` has
 /// occurred anywhere since the clause's owner was last confirmed — for the
 /// continuation step (the initial `'s` owner-establishing step is a
 /// separate, exact-match check and unaffected by this).
@@ -293,8 +295,8 @@ fn is_directory_shaped(span: &str) -> bool {
 /// (the original, stricter design) rejects exactly this ordinary writing: a
 /// doc edit this mundane should not need unusual phrasing just to keep CI
 /// green. So the clause continues through *any* text, with one
-/// unconditional exception: a sentence-ending `.` always ends it. That's
-/// the safety net against the masking risk the module doc warns about —
+/// unconditional exception: a sentence-ending `.`/`?`/`!` always ends it.
+/// That's the safety net against the masking risk the module doc warns about —
 /// without it, a later sentence naming an unrelated file from a *different*
 /// crate in the same heading, with no new possessive clause of its own,
 /// would silently inherit an earlier owner instead of falling back to the
@@ -340,30 +342,36 @@ const fn continues_possessive_clause(sentence_boundary_seen: bool) -> bool {
 /// abbreviation out, or this list extended deliberately.
 const SENTENCE_BOUNDARY_ABBREVIATIONS: [&str; 3] = ["e.g", "i.e", "etc"];
 
-/// Whether `text` contains a period that ends a sentence *anywhere* within
-/// it — not just at its end, despite scanning one word at a time; the name
-/// says "contains", not "ends with", because callers scan one accumulated
-/// chunk of prose for any sentence boundary, not just a trailing one (see
-/// [`continues_possessive_clause`] for why that distinction matters here).
+/// Whether `text` contains a `.`/`?`/`!` that ends a sentence *anywhere*
+/// within it — not just at its end, despite scanning one word at a time; the
+/// name says "contains", not "ends with", because callers scan one
+/// accumulated chunk of prose for any sentence boundary, not just a trailing
+/// one (see [`continues_possessive_clause`] for why that distinction matters
+/// here).
 ///
-/// A period counts as sentence-ending only when followed by whitespace or
-/// nothing (the end of `text`) — one directly glued to the next character
-/// on both sides never does, which already excludes a version number like
-/// `v1.0` or a filename like `agent.rs` *unless* it sits at the very end of
-/// `text` (a file name right before a sentence-ending period, as in this
-/// module's own doc comments, correctly still counts). The remaining case a
-/// trailing-whitespace check alone can't tell apart from a real sentence end
-/// is an abbreviation like `` e.g. ``/`` i.e. ``/`` etc. `` — checked
-/// against [`SENTENCE_BOUNDARY_ABBREVIATIONS`].
+/// Any of the three counts as sentence-ending only when followed by
+/// whitespace or nothing (the end of `text`) — one directly glued to the
+/// next character on both sides never does, which already excludes a
+/// version number like `v1.0` or a filename like `agent.rs` *unless* it sits
+/// at the very end of `text` (a file name right before a sentence-ending
+/// period, as in this module's own doc comments, correctly still counts).
+/// The remaining case a trailing-whitespace check alone can't tell apart
+/// from a real sentence end is a period-only abbreviation like `` e.g. ``/``
+/// i.e. ``/`` etc. `` — checked against
+/// [`SENTENCE_BOUNDARY_ABBREVIATIONS`]; `?` and `!` have no such exceptions,
+/// so either always ends the sentence it closes.
 fn contains_a_sentence_boundary(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| {
-        if b != b'.'
+        if !matches!(b, b'.' | b'?' | b'!')
             || !bytes
                 .get(i + 1)
                 .is_none_or(|&next| next.is_ascii_whitespace())
         {
             return false;
+        }
+        if b != b'.' {
+            return true;
         }
         // Walk back over the token this period ends — alphanumerics and
         // embedded periods only (`e.g.`'s own internal `.`), so surrounding
@@ -425,11 +433,11 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     let mut last_code_span: Option<String> = None;
     // The active possessive owner within the current clause.
     let mut possessive_owner: Option<String> = None;
-    // Whether a sentence-ending `.` has occurred since `possessive_owner`
-    // was last (re)confirmed — tracked separately from `inter_text` because
-    // that buffer gets cleared by asides and pending hyphenated spans
-    // (see [`continues_possessive_clause`]), which must not also erase the
-    // memory of an already-seen sentence boundary.
+    // Whether a sentence-ending `.`/`?`/`!` has occurred since
+    // `possessive_owner` was last (re)confirmed — tracked separately from
+    // `inter_text` because that buffer gets cleared by asides and pending
+    // hyphenated spans (see [`continues_possessive_clause`]), which must not
+    // also erase the memory of an already-seen sentence boundary.
     let mut sentence_boundary_seen = false;
 
     // Accumulate heading directories until End(Heading) commits them.
@@ -956,6 +964,40 @@ mod tests {
         // always followed by more markdown text, never the end of the
         // scanned chunk itself.
         assert!(contains_a_sentence_boundary("done."));
+    }
+
+    #[test]
+    fn contains_a_sentence_boundary_detects_a_question_mark_and_an_exclamation_point() {
+        // Regression: only `.` was ever checked, so a clause ending in `?`
+        // or `!` instead of `.` didn't count as a sentence boundary — the
+        // owner would wrongly keep "continuing" into a different sentence.
+        assert!(contains_a_sentence_boundary("done? "));
+        assert!(contains_a_sentence_boundary("done! "));
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_leak_an_owner_across_a_sentence_boundary_ended_by_an_exclamation_point()
+     {
+        // End-to-end regression for the same gap: `runtime.rs` narrows to
+        // `engines/vllm`, but the clause must not continue past the `!` that
+        // ends its sentence — `state.rs` belongs to no possessive clause of
+        // its own and must fall back to the heading's full list, not inherit
+        // `engines/vllm`.
+        let markdown = "\
+### `engines/lemonade`, `engines/vllm` — inference engines
+
+`engines/vllm`'s `runtime.rs` is done! `state.rs` other.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "state.rs")
+            .expect("expected a state.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec!["engines/lemonade".to_string(), "engines/vllm".to_string()],
+            "state.rs must not inherit engines/vllm across the `!` sentence boundary"
+        );
     }
 
     #[test]
@@ -1636,6 +1678,37 @@ Intro. `rocm-dash-tui`'s old thing was split into `agent/mod.rs`.
             vec!["rocm-dash-tui".to_string()],
             "agent/mod.rs should narrow to rocm-dash-tui even though an \
              earlier sentence in the same paragraph already ended"
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_narrows_through_a_slash_qualified_owner_confirmed_after_an_earlier_sentence()
+     {
+        // Regression: the `sentence_boundary_seen = false` reset at the end
+        // of the main citation `Code` arm — the one that fires for every
+        // path-candidate span, not just the pending-hyphenated or aside
+        // cases above — is only exercised indirectly via
+        // `run_passes_against_the_real_doc`. Without it, an owner confirmed
+        // via the slash-qualified `'s` exact-match branch (`` `crates/
+        // rocm-dash-tui`'s `` here) would still carry the earlier "Intro."
+        // sentence's boundary forward, failing the very next file's
+        // continuation check and falling back to the heading's full list
+        // instead of narrowing to `crates/rocm-dash-tui`.
+        let markdown = "\
+### `crates/rocm-dash-core`, `crates/rocm-dash-tui` — dashboard/telemetry
+
+Intro. `crates/rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "agent/mod.rs")
+            .expect("expected an agent/mod.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec!["crates/rocm-dash-tui".to_string()],
+            "agent/mod.rs should narrow to crates/rocm-dash-tui even though \
+             an earlier sentence in the same paragraph already ended"
         );
     }
 
