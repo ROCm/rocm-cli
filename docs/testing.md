@@ -467,8 +467,8 @@ to an installed ROCm entry and press Enter.
 A runtime selector is matched against keys exactly first. If it matches no key
 exactly but more than one key ignoring letter case — possible on a
 case-sensitive filesystem, where `Foo` and `foo` are separate registry entries —
-`runtimes activate`, `runtimes uninstall` and `update --runtime` refuse and list
-the matching keys instead of picking one. For `activate`,
+every command that takes a runtime selector refuses and lists the matching keys
+instead of picking one. For `runtimes activate`,
 `@id:runtime-lifecycle-case-twin-selector-refused` also checks that nothing
 became active and that naming one key exactly then works.
 

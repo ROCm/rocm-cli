@@ -120,6 +120,31 @@ async fn two_case_twin_runtimes(world: &mut E2eWorld) {
     // Distinct families only so each twin gets its own install root.
     plant_runtime(world, LOWER_TWIN_KEY, "gfx942");
     plant_runtime(world, UPPER_TWIN_KEY, "gfx1100");
+
+    // The two keys are two registry files only on a case-sensitive filesystem,
+    // and `@requires-os:linux` does not guarantee one: the isolated root follows
+    // `$TMPDIR`, which can sit on a casefolded or mounted case-insensitive
+    // directory. There the second write overwrites the first, the selector has a
+    // single case-insensitive match, activation succeeds, and the refusal step
+    // would blame the resolver for a fixture that never existed. Counting the
+    // entries proves the premise; testing for the lower-case file would not,
+    // because on such a filesystem that path resolves to the upper-case one.
+    let registry = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry");
+    let planted = std::fs::read_dir(&registry).expect("registry dir").count();
+    assert_eq!(
+        planted,
+        2,
+        "the case twins collapsed into one registry entry in {}: this filesystem is \
+         case-insensitive, so the scenario has no premise on this host",
+        registry.display()
+    );
 }
 
 #[given("a registered read-only runtime")]
