@@ -1895,11 +1895,11 @@ fn detect_distro_name() -> Option<String> {
 }
 
 fn parse_os_release_pretty_name(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let value = line.strip_prefix("PRETTY_NAME=")?.trim();
-        let value = value.trim_matches('"').trim_matches('\'').trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
+    // Through the shared parser (see `os_release`). The `trim` and the empty
+    // check are this caller's own: a blank PRETTY_NAME falls back to "Linux".
+    crate::os_release::field(text, "PRETTY_NAME")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn detect_cpu_model_with_windows_inventory(

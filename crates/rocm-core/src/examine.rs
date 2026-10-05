@@ -715,18 +715,7 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
         e.kernel_cmdline = read_text("/proc/cmdline").trim().to_owned();
-        let osr = read_text("/etc/os-release");
-        for line in osr.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let value = value.trim().trim_matches('"');
-            match key {
-                "ID" => e.distro_id = value.to_owned(),
-                "VERSION_ID" => e.distro_version = value.to_owned(),
-                _ => {}
-            }
-        }
+        record_distro(e, &read_text("/etc/os-release"));
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
@@ -738,6 +727,25 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "windows".to_owned();
     } else {
         e.os_family = "other".to_owned();
+    }
+}
+
+/// Fill the distro fields from os-release `text`, through the same parser the
+/// driver plan uses, so the two report the same distro.
+///
+/// An unreadable file leaves both fields empty and says why in
+/// `probe_failures`, naming the line — an empty distro with no explanation
+/// would read as "nothing to report" rather than "something to fix". A missing
+/// file reads as empty text, which is not a failure.
+fn record_distro(e: &mut Examination, text: &str) {
+    match crate::os_release::parse(text) {
+        Ok(mut fields) => {
+            e.distro_id = fields.remove("ID").unwrap_or_default();
+            e.distro_version = fields.remove("VERSION_ID").unwrap_or_default();
+        }
+        Err(unreadable) => e.probe_failures.push(format!(
+            "/etc/os-release {unreadable}; the distro is not reported."
+        )),
     }
 }
 
@@ -3037,6 +3045,41 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The message and the state it describes, asserted together: an
+    /// unreadable os-release names its line in `probe_failures` *and* leaves
+    /// the distro unreported — and a readable one reports the distro with no
+    /// failure recorded.
+    #[test]
+    fn an_unreadable_os_release_names_its_line_instead_of_a_distro() {
+        let mut e = Examination::default();
+        record_distro(
+            &mut e,
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/etc/os-release line 3 is not a plain assignment: \"export ID=debian\"; \
+                 the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+
+        let mut e = Examination::default();
+        record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+        assert_eq!(
+            (e.distro_id.as_str(), e.distro_version.as_str()),
+            ("ubuntu", "24.04")
+        );
+
+        // No file at all is not a failure: there is nothing to fix.
+        let mut e = Examination::default();
+        record_distro(&mut e, "");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+    }
 
     /// Serialises the tests that read or replace the process-global
     /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
