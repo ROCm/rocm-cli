@@ -276,15 +276,23 @@ Feature: Diagnosing failures and listing fixes
   # diagnose-05 only proves the manual/zero-optional-flags wording, because
   # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
   # sudo+re-login combination only exists on a fix gated to bare-metal Linux
-  # (fix-4-render-group), so it needs its own scenario -- but, like
-  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
-  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
-  # under test renders identically regardless of which lane runs it. The step
-  # asserts only that printed text, never the exit code -- `fix-4-render-group`
-  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
-  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
-  @id:diagnose-fix-preview-states-required-flags
-  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
+  # (fix-4-render-group), so it needs its own scenario.
+  #
+  # Unlike diagnose-14, this one IS OS-gated. `print_recipe` still runs before
+  # the fix's own platform gate (see `apply` in fix.rs), but the Flags: line it
+  # prints comes from `class_here()`, which looks up the catalog entry for the
+  # *running* host's OS. "AUTO" only renders where `fix-4-render-group` is
+  # actually `Auto` -- bare-metal Linux. Everywhere else (`applies_on` has no
+  # other member) `class_here()` falls back to PRINT-ONLY, the generic "this
+  # fix does not apply here" answer diagnose-11 already covers -- not a second,
+  # platform-specific behaviour worth asserting under this scenario's name.
+  #
+  # The step still asserts only the printed Flags: text, never the exit code --
+  # `fix-4-render-group` gates its own dry-run on host state ($USER,
+  # `usermod`/`sudo` on PATH), so unlike PREVIEW_FIX_ID its exit code is not
+  # guaranteed to be 0 even on Linux.
+  @id:diagnose-fix-preview-states-required-flags @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable here
     Given a user who has chosen a fix that needs sudo and a re-login
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
@@ -381,3 +389,31 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose with both flags
     Then the CLI refuses and says --model answers for this machine, not the one --distro names
     And no model verdict is reported
+
+  # One entry behaves differently depending on the machine: it persists the
+  # change on Windows, and on Linux it only reports where the value is set,
+  # because the code that would write it takes no options and never does.
+  # The listing said "the CLI will run this" on both, so a user on Linux — and
+  # an agent reading the same listing — was told a change was coming that never
+  # came. Host-independent on purpose: the assertion is that the listing agrees
+  # with the machine in front of it, whichever machine that is.
+  @id:diagnose-fix-applicability-is-per-machine
+  Scenario: diagnose-27 - A fix that only explains itself here is not advertised as one the CLI will run
+    Given a fix the CLI carries out on one kind of machine and only explains on another
+    When the user asks the CLI which fixes it offers
+    Then that fix is shown as what it does on this machine
+
+  # The other half of the same defect. This entry does have a fix and the CLI
+  # will carry it out, but not until it is told which device to pin; asked
+  # plainly it prints the query that identifies one and stops. It was marked as
+  # a fix the CLI applies, so the report of a change that never happened looked
+  # like success.
+  # @requires-bare-metal because the entry under test is scoped to bare-metal
+  # Linux and Windows. On WSL it is refused at the platform gate instead, which
+  # is a different contract with its own scenario — and the right one, since the
+  # catalog does not claim this remedy applies there.
+  @id:diagnose-fix-needing-an-argument-says-so @requires-bare-metal
+  Scenario: diagnose-28 - A fix that needs more information says what it needs and changes nothing
+    Given a user who has chosen a fix that cannot run until it is told what to act on
+    When the user asks the CLI to apply it without saying what to act on
+    Then the CLI names what it still needs and reports no change

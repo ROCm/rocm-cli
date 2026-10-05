@@ -286,17 +286,20 @@ fix` takes the id, not the position.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
-to list the whole catalog. Each fix is marked AUTO (this command carries out
-the change) or PRINT-ONLY (it prints the steps for you to run yourself —
-usually because the right command depends on a choice only you can make,
-sometimes because it also needs sudo or a reboot).
+to list the whole catalog. Each fix carries a marker saying what happens on
+this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
+once given the argument it names), PRINT-ONLY (it prints the steps for you to
+run yourself — usually because the right command depends on a choice only you
+can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
+(no reliable fix exists, so nothing will be changed -- no catalog entry
+carries this marker today; it is reserved for a future detect-but-cannot-repair
+failure).
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
-- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`;
-  without it, that fix only prints the `rocminfo` (Linux) or `hipInfo.exe`
-  (Windows) query needed to find the index and makes no change, despite
-  being marked AUTO.
+- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
+  NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
+  `hipInfo.exe` (Windows) query needed to find the index and makes no change.
 
 ### ROCm installation
 
