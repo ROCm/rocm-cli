@@ -181,7 +181,11 @@ pub fn running_as_root() -> bool {
 
 /// Whether the current process is running as root. Always false off Linux.
 #[cfg(not(target_os = "linux"))]
-pub const fn running_as_root() -> bool {
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
+pub fn running_as_root() -> bool {
     false
 }
 
