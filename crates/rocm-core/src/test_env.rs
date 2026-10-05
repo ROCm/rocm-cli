@@ -70,6 +70,22 @@ mod tests {
     /// Used by nothing else in the tree, so no other test reads it mid-flight.
     const KEY: &str = "ROCM_CORE_TEST_ENV_RESTORE_PROBE";
 
+    /// Leaves [`KEY`] unset when a test exits, including by a failed assertion.
+    ///
+    /// Declare it after the lock so it drops while the lock is still held. A
+    /// test about not leaking environment state should not leak the probe when
+    /// it fails, which is exactly when someone would be looking at it.
+    struct UnsetKeyOnExit;
+
+    impl Drop for UnsetKeyOnExit {
+        #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024
+        fn drop(&mut self) {
+            // SAFETY: dropped inside the caller's `TEST_ENV_TEST_LOCK` scope,
+            // and nothing else reads this key.
+            unsafe { std::env::remove_var(KEY) };
+        }
+    }
+
     /// The restore is this type's whole purpose, and it is what the two callers
     /// rely on to keep a panicking test from leaking a value into the next one.
     ///
@@ -87,6 +103,7 @@ mod tests {
         let _guard = TEST_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _unset_on_exit = UnsetKeyOnExit;
 
         // SAFETY: serialized by the lock above, and nothing else reads this key.
         unsafe { std::env::remove_var(KEY) };
@@ -111,8 +128,37 @@ mod tests {
             Some(std::ffi::OsStr::new("before")),
             "a key that was set must get its previous value back"
         );
+    }
 
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(KEY) };
+    /// The path the module docs promise: a test that panics while holding the
+    /// guard still gets its previous value back. An explicit `drop` runs the
+    /// same destructor today, but only an unwind proves the restore survives a
+    /// change such as `panic = "abort"`, under which destructors stop running
+    /// on panic and this test aborts instead of passing.
+    ///
+    /// The panic is raised with [`std::panic::resume_unwind`], which unwinds
+    /// without calling the panic hook, so a passing run prints no panic message
+    /// and no process-wide hook has to be swapped while other tests run.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn unwinding_past_the_guard_restores_the_previous_state() {
+        let _guard = TEST_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _unset_on_exit = UnsetKeyOnExit;
+
+        // SAFETY: serialized by the lock above, and nothing else reads this key.
+        unsafe { std::env::set_var(KEY, "before") };
+        let unwound = std::panic::catch_unwind(|| {
+            let _restore = RestoredEnvVar::set(KEY, Path::new("planted"));
+            std::panic::resume_unwind(Box::new("a test failing mid-way"));
+        });
+
+        assert!(unwound.is_err(), "the closure must have unwound");
+        assert_eq!(
+            std::env::var_os(KEY).as_deref(),
+            Some(std::ffi::OsStr::new("before")),
+            "unwinding past the guard must put the previous value back"
+        );
     }
 }
