@@ -23,6 +23,13 @@ use std::time::Duration;
 const RUN_TIMEOUT: Duration = Duration::from_mins(1);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Shared verbatim by this recipe's own note and `diagnose.rs`'s
+/// `check_18_comgr_conflict` evidence, which states the same claim in its own
+/// words at the point the real paths are known. A second statement of one
+/// claim is a second thing to keep correct, and the two had already drifted
+/// apart in wording before they shared this constant.
+pub(crate) const COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED: &str = "Neither option is recommended over the other: which is right depends on which stack you mean to keep, and removing the wrong one breaks a working environment.";
+
 /// Print a failure explanation to stderr, ignoring write failures (closed
 /// stderr, full disk) so an I/O error while explaining a failure can't itself
 /// panic the process.
@@ -692,6 +699,39 @@ const RECIPES: &[FixRecipe] = &[
             "Converting rewrites the distro's filesystem and can take a long time on a large install. Back up anything you cannot lose first.",
         ],
         applies_on: PRINT_ON_WSL,
+        runner: None,
+    },
+    FixRecipe {
+        fix_id: "fix-18-comgr-conflict",
+        title: "Code object manager library does not belong to the active HIP runtime",
+        rationale: "HIP compiles device code at run time through libamd_comgr, and this machine holds more than one copy of it. The copy the loader picks belongs to a different installation than the HIP runtime that loads, so compilation fails with an error that names neither the library nor the second copy. A second copy is not itself a fault -- many correct installations hold one -- so what is reported here is specifically the mismatch.",
+        // No repair, and no recommendation between the two. Removing a stack or
+        // reordering the search path can each break a working Python
+        // environment, and which is right depends on which stack the user means
+        // to keep -- a question only they can answer. `rocm diagnose` fills in
+        // the real paths for this machine; these are the shapes.
+        commands: &[
+            "# Find every copy and which one loads:",
+            "rocm examine --json    # read comgr_paths, comgr_selected, hip_selected",
+            "# Then pick ONE of the following. They are alternatives, not steps.",
+            "# (a) Keep the system installation: remove or uninstall the wheel that",
+            "#     supplies the second copy.",
+            "# (b) Keep the wheel: order the search path so the wheel's own copy of",
+            "#     both libraries is found first, making the wheel the active runtime.",
+            "export LD_LIBRARY_PATH=\"<directory of the wheel's own copy>:$LD_LIBRARY_PATH\"",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"",
+        notes: &[
+            COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED,
+            "This describes the environment outside the CLI's managed runtimes. `rocm serve` puts a managed runtime's libraries first on purpose, so inside one the wheel copy wins by design and that is correct.",
+        ],
+        // Not `PRINT_ON_LINUX`: which copy the loader picks has nothing to do
+        // with the amdgpu module, and the two copies collide on WSL2 just the
+        // same. Print-only on both: neither way out can be chosen for the user.
+        applies_on: PRINT_ON_LINUX_AND_WSL,
         runner: None,
     },
     FixRecipe {
@@ -2109,9 +2149,9 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 17 bare-metal/Windows entries (fix-17 and fix-19 among them) plus the
-        // 7 WSL ones.
-        assert_eq!(count, 24, "expected 24 catalog entries");
+        // 18 bare-metal/Windows entries (fix-17, fix-18 and fix-19 among them)
+        // plus the 7 WSL ones.
+        assert_eq!(count, 25, "expected 25 catalog entries");
     }
 
     /// Restored, not new. This PR made the `wsl` arm of the platform lookup

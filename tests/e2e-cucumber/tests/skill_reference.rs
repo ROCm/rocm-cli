@@ -66,6 +66,123 @@ fn catalog_rows(md: &str) -> Vec<(String, String, String)> {
     rows
 }
 
+fn skill_md_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("skills")
+        .join("rocm-doctor")
+        .join("SKILL.md")
+}
+
+/// How many catalog rows have `yes` in the Auto-fix cell (`cells[4]`, the same
+/// column `catalog_rows` leaves unparsed since the os-scope check only needs
+/// `cells[1]`).
+/// Rows whose marker is anything other than a plain `print-only`, which is the
+/// complement of the set `SKILL.md`'s "the other N are print-only" counts.
+///
+/// Deliberately not a count of "auto-applicable": the two docs do not agree on
+/// what that phrase covers. `reference.md` says three ids are ever
+/// auto-applicable and that `fix-9-igpu-dgpu` is not one of them, while
+/// `SKILL.md` says four -- counting `needs-arg` and the windows-only exception
+/// alongside the two plain `auto` entries. Counting the complement sidesteps
+/// that disagreement and checks the claim `SKILL.md` actually makes, so this
+/// guard does not quietly take a side in it.
+fn catalog_not_print_only_count(md: &str) -> usize {
+    md.lines()
+        .filter(|line| {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                return false;
+            }
+            let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+            cells.len() >= 5
+                && cells[0].trim_matches('`').starts_with("fix-")
+                && cells[4] != "print-only"
+        })
+        .count()
+}
+
+/// Two free-standing counts restate the table in prose rather than in cells a
+/// parser already checks: `reference.md`'s "(N failure modes)" heading, and
+/// `SKILL.md`'s "the other M are print-only" line. `rocm_doctor_skill.feature`
+/// says plainly that these are not parsed and can go stale even while the
+/// table itself stays correct -- which is exactly what happened here (the
+/// catalog grew by one row and both numbers were left behind). This does not
+/// reopen that scope decision; it only adds a floor cheap enough that the next
+/// drift fails a `cargo test` instead of waiting for someone to count rows by
+/// hand.
+#[test]
+fn free_standing_catalog_counts_match_the_table() {
+    let reference_md = std::fs::read_to_string(reference_md_path())
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", reference_md_path().display()));
+    let rows = catalog_rows(&reference_md);
+    assert!(
+        !rows.is_empty(),
+        "no catalog rows found in {}",
+        reference_md_path().display()
+    );
+    let total = rows.len();
+    let not_print_only = catalog_not_print_only_count(&reference_md);
+
+    let heading = reference_md
+        .lines()
+        .find(|line| line.trim_start().starts_with("## Closed catalog ("))
+        .unwrap_or_else(|| {
+            panic!(
+                "no '## Closed catalog (N failure modes)' heading found in {}",
+                reference_md_path().display()
+            )
+        });
+    let heading_count: usize = heading
+        .split('(')
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse the failure-mode count out of {heading:?}"));
+    assert_eq!(
+        heading_count, total,
+        "skills/rocm-doctor/reference.md's '(N failure modes)' heading says {heading_count}, \
+         but the table has {total} rows"
+    );
+
+    let skill_md = std::fs::read_to_string(skill_md_path())
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", skill_md_path().display()));
+    // "The other N" and "are **print-only**" sit on adjacent source lines that
+    // wrap a single sentence, so join the whole doc on whitespace first rather
+    // than matching one line -- a line-scoped search would find the
+    // print-only line without the number on it and fail to parse.
+    let flattened = skill_md.split_whitespace().collect::<Vec<_>>().join(" ");
+    let after_the_other = flattened.split("The other ").nth(1).unwrap_or_else(|| {
+        panic!(
+            "no 'The other N ... print-only' phrase found in {}",
+            skill_md_path().display()
+        )
+    });
+    assert!(
+        after_the_other.starts_with(|c: char| c.is_ascii_digit())
+            && after_the_other.contains("print-only"),
+        "'The other N' in {} is not followed by a number and 'print-only' as expected: {:?}",
+        skill_md_path().display(),
+        after_the_other.chars().take(60).collect::<String>()
+    );
+    let print_only_count: usize = after_the_other
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| {
+            panic!("could not parse the print-only count out of {after_the_other:?}")
+        });
+    assert_eq!(
+        print_only_count,
+        total - not_print_only,
+        "skills/rocm-doctor/SKILL.md says {print_only_count} fixes are print-only, but the \
+         table has {total} rows of which {not_print_only} carry some other marker \
+         ({} expected)",
+        total - not_print_only
+    );
+}
+
 #[test]
 fn catalog_os_scopes_use_the_cli_spellings() {
     // A shorthand such as `both` reads as "every platform" but cannot say
