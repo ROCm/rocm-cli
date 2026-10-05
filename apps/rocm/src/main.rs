@@ -39521,7 +39521,10 @@ mod command_preview_properties {
             plan.notes
         );
         assert!(
-            !plan.notes.iter().any(|note| note.chars().any(char::is_control)),
+            !plan
+                .notes
+                .iter()
+                .any(|note| note.chars().any(char::is_control)),
             "no note may carry a control character into the plan block: {:?}",
             plan.notes
         );
