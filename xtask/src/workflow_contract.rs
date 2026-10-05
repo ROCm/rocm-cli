@@ -2145,6 +2145,41 @@ esac
         );
     }
 
+    /// The hawkeye version CONTRIBUTING.md documents and the version `ci.yml`'s
+    /// `license-headers` job installs must never drift: if they do, a
+    /// contributor's local pre-commit hook can bless a header hawkeye's CI
+    /// build would reject, or vice versa.
+    ///
+    /// The version lives in exactly one place — `ci.yml`'s `license-headers`
+    /// job's `env:` mapping — and is read from there with the extractors this
+    /// file already has fixture tests for (`job_block`, `job_mapping`), rather
+    /// than duplicated into a constant, so a bump only ever needs the two
+    /// edits this test actually guards (ci.yml and CONTRIBUTING.md).
+    #[test]
+    fn hawkeye_pin_matches_ci_workflow() {
+        let ci = read_workflow("ci.yml");
+        let job = job_block(&ci, "license-headers");
+        let env = job_mapping(job, "env");
+        let installed = env
+            .get("HAWKEYE_VERSION")
+            .unwrap_or_else(|| panic!("license-headers job has no HAWKEYE_VERSION entry"));
+        // ci.yml's env var is `v`-prefixed (`v7.0.0`); CONTRIBUTING.md's prose
+        // is not (`hawkeye@7.0.0`).
+        let version = installed
+            .strip_prefix('v')
+            .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{installed}` must be `v`-prefixed"));
+
+        let contributing = repo_root().join("CONTRIBUTING.md");
+        let contributing_text = std::fs::read_to_string(&contributing)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", contributing.display()));
+        let documented = format!("cargo install hawkeye@{version} --locked");
+        assert!(
+            contributing_text.contains(&documented),
+            "CONTRIBUTING.md must instruct `{documented}` to match ci.yml's \
+             license-headers job (HAWKEYE_VERSION: {installed})"
+        );
+    }
+
     // Extractor guards: prove the helpers actually parse multiline forms, so the
     // contract tests above can't silently false-pass on a shape they don't handle.
     #[test]
