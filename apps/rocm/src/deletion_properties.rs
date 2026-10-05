@@ -201,28 +201,22 @@ fn node_name() -> impl Strategy<Value = String> {
     ]
 }
 
-fn node(dangling: bool) -> impl Strategy<Value = Node> {
-    // Built as a list rather than a zero weight: proptest shrinks a union
-    // towards earlier arms regardless of weight, so a weight-0 arm still shows
-    // up in shrunk counterexamples.
-    let mut arms: Vec<(u32, BoxedStrategy<Node>)> = vec![
-        (4, Just(Node::File).boxed()),
-        (1, Just(Node::LinkOutsideDir).boxed()),
-        (1, Just(Node::LinkOutsideFile).boxed()),
-        (1, Just(Node::LinkUpToData).boxed()),
+fn node() -> impl Strategy<Value = Node> {
+    let leaf = prop_oneof![
+        4 => Just(Node::File),
+        1 => Just(Node::LinkOutsideDir),
+        1 => Just(Node::LinkOutsideFile),
+        1 => Just(Node::LinkUpToData),
+        1 => Just(Node::LinkDangling),
     ];
-    if dangling {
-        arms.push((1, Just(Node::LinkDangling).boxed()));
-    }
-    let leaf = proptest::strategy::Union::new_weighted(arms);
     leaf.prop_recursive(3, 24, 4, |inner| {
         prop::collection::vec((node_name(), inner), 0..4).prop_map(Node::Dir)
     })
 }
 
-fn cache_root(dangling: bool) -> impl Strategy<Value = CacheRoot> {
+fn cache_root() -> impl Strategy<Value = CacheRoot> {
     prop_oneof![
-        6 => prop::collection::vec((node_name(), node(dangling)), 0..5).prop_map(CacheRoot::Real),
+        6 => prop::collection::vec((node_name(), node()), 0..5).prop_map(CacheRoot::Real),
         1 => Just(CacheRoot::LinkToOutside),
         1 => Just(CacheRoot::Missing),
         1 => Just(CacheRoot::PlainFile),
@@ -474,17 +468,16 @@ fn downloads_case(
     result
 }
 
-fn run_downloads_property(cases: u32, dangling: bool) -> Result<(), String> {
+fn run_downloads_property(cases: u32) -> Result<(), String> {
     let reach = Mutex::new(Reach::default());
     let mut runner = TestRunner::new(Config {
         cases,
         failure_persistence: None,
         ..Config::default()
     });
-    let outcome = runner.run(
-        &(cache_root(dangling), cache_root(dangling)),
-        |(therock, tools)| downloads_case(&therock, &tools, &reach),
-    );
+    let outcome = runner.run(&(cache_root(), cache_root()), |(therock, tools)| {
+        downloads_case(&therock, &tools, &reach)
+    });
     report_reach("remove-downloads", &reach);
     outcome.map_err(|error| format!("{error}"))
 }
@@ -492,22 +485,11 @@ fn run_downloads_property(cases: u32, dangling: bool) -> Result<(), String> {
 /// Whatever the tree, remove-downloads deletes exactly the entries its review
 /// listed, nothing outside its two cache roots, and changes no surviving entry.
 ///
-/// Dangling links are left out of this generator because they hit the known
-/// shape pinned by the ignored test below; everything else must hold.
+/// "Exactly" includes dangling links: the review lists them and the command
+/// counts them as removed, so they must really be gone afterwards.
 #[test]
 fn remove_downloads_deletes_exactly_its_plan_and_nothing_outside() {
-    if let Err(error) = run_downloads_property(case_count(), false) {
-        panic!("{error}");
-    }
-}
-
-/// Finding: a dangling symlink in the download cache is listed in the review
-/// and counted in "N downloaded file(s) removed", but `remove_path` returns
-/// early on `!path.exists()` (which follows the link), so it is never removed.
-#[test]
-#[ignore = "finding: remove_path skips dangling symlinks the plan lists"]
-fn remove_downloads_removes_the_dangling_links_it_lists() {
-    if let Err(error) = run_downloads_property(case_count(), true) {
+    if let Err(error) = run_downloads_property(case_count()) {
         panic!("{error}");
     }
 }
@@ -537,6 +519,7 @@ enum Target {
 enum Spelling {
     Plain,
     TrailingSlash,
+    TrailingDot,
     DoubleSlash,
     DotSegment,
     DotDotDetour,
@@ -557,6 +540,7 @@ fn spelling() -> impl Strategy<Value = Spelling> {
     prop_oneof![
         Just(Spelling::Plain),
         Just(Spelling::TrailingSlash),
+        Just(Spelling::TrailingDot),
         Just(Spelling::DoubleSlash),
         Just(Spelling::DotSegment),
         Just(Spelling::DotDotDetour),
@@ -569,6 +553,7 @@ fn respell(path: &Path, spelling: Spelling) -> PathBuf {
     PathBuf::from(match spelling {
         Spelling::Plain => text.clone(),
         Spelling::TrailingSlash => format!("{text}/"),
+        Spelling::TrailingDot => format!("{text}/."),
         Spelling::DoubleSlash => format!("{head}//{leaf}"),
         Spelling::DotSegment => format!("{head}/./{leaf}"),
         Spelling::DotDotDetour => format!("{head}/{leaf}/../{leaf}"),
@@ -601,26 +586,11 @@ const fn names_foreign_dir(target: Target) -> bool {
     matches!(target, Target::Home | Target::LinkToHome)
 }
 
-/// The trailing-slash-on-a-link shape pinned by
-/// `remove_path_treats_a_trailing_slash_link_like_the_link`.
-const fn is_trailing_slash_link(target: Target, spelling: Spelling) -> bool {
-    matches!(target, Target::LinkToOwn | Target::LinkToHome)
-        && matches!(spelling, Spelling::TrailingSlash)
-}
-
 fn uninstall_case(
     choices: [(Target, Spelling); 3],
     reach: &Mutex<Reach>,
     require_safety: bool,
-    strict_links: bool,
 ) -> Result<(), TestCaseError> {
-    if !require_safety
-        && choices
-            .iter()
-            .any(|&(target, spelling)| is_trailing_slash_link(target, spelling))
-    {
-        return Err(TestCaseError::reject("known trailing-slash link shape"));
-    }
     let sandbox = fresh_sandbox("uninstall");
     let result = (|| {
         let home = sandbox.join("home");
@@ -662,6 +632,7 @@ fn uninstall_case(
                 reach.hit(match s {
                     Spelling::Plain => "spelling: plain",
                     Spelling::TrailingSlash => "spelling: trailing /",
+                    Spelling::TrailingDot => "spelling: trailing /.",
                     Spelling::DoubleSlash => "spelling: //",
                     Spelling::DotSegment => "spelling: /./",
                     Spelling::DotDotDetour => "spelling: x/../x",
@@ -718,17 +689,7 @@ fn uninstall_case(
                 .collect()
         };
         let extra: BTreeSet<_> = actually_gone.difference(&expected_gone).copied().collect();
-        let mut missed: BTreeSet<_> = expected_gone.difference(&actually_gone).copied().collect();
-        if !strict_links {
-            // Known shape, pinned by `uninstall_removes_a_link_whose_target_an_earlier_step_removed`:
-            // a planned link whose target an earlier step already deleted is
-            // skipped by `remove_path`'s `exists()` check.
-            missed.retain(|id| {
-                before.get(id).is_none_or(|entry| {
-                    !matches!(entry.kind, Kind::Link(_)) || std::fs::metadata(&entry.path).is_ok()
-                })
-            });
-        }
+        let missed: BTreeSet<_> = expected_gone.difference(&actually_gone).copied().collect();
         prop_assert!(
             extra.is_empty(),
             "deleted beyond the plan: {:?}",
@@ -759,11 +720,7 @@ fn uninstall_case(
     result
 }
 
-fn run_uninstall_property(
-    cases: u32,
-    require_safety: bool,
-    strict_links: bool,
-) -> Result<(), String> {
+fn run_uninstall_property(cases: u32, require_safety: bool) -> Result<(), String> {
     let reach = Mutex::new(Reach::default());
     let mut runner = TestRunner::new(Config {
         cases,
@@ -776,7 +733,7 @@ fn run_uninstall_property(
         (target(), spelling()),
     ];
     let outcome = runner.run(&strategy, |choices| {
-        uninstall_case(choices, &reach, require_safety, strict_links)
+        uninstall_case(choices, &reach, require_safety)
     });
     report_reach(
         if require_safety {
@@ -789,11 +746,13 @@ fn run_uninstall_property(
     outcome.map_err(|error| format!("{error}"))
 }
 
-/// Honesty: whatever the three dirs point at and however they are spelled,
-/// `rocm uninstall` removes exactly what its review listed.
+/// Honesty: whatever the three dirs point at and however they are spelled
+/// (a trailing `/` or `/.` on a symlinked root included), `rocm uninstall`
+/// removes exactly what its review listed — no more, and no planned link left
+/// behind because an earlier step made it dangle.
 #[test]
 fn uninstall_removes_exactly_what_the_review_lists() {
-    if let Err(error) = run_uninstall_property(case_count(), false, false) {
+    if let Err(error) = run_uninstall_property(case_count(), false) {
         panic!("{error}");
     }
 }
@@ -805,17 +764,15 @@ fn uninstall_removes_exactly_what_the_review_lists() {
 #[test]
 #[ignore = "finding: rocm uninstall applies no guard to config/data/cache roots"]
 fn uninstall_never_deletes_a_folder_rocm_cli_did_not_create() {
-    if let Err(error) = run_uninstall_property(case_count(), true, false) {
+    if let Err(error) = run_uninstall_property(case_count(), true) {
         panic!("{error}");
     }
 }
 
-/// Finding: a planned link whose target an earlier plan step already deleted
-/// (here: `cache_dir` is a link into `data_dir`) dangles by the time its turn
-/// comes, `remove_path` returns early on `!path.exists()`, and uninstall still
-/// prints "removed cache ...". Same root cause as the dangling-download case.
+/// A planned link whose target an earlier plan step already deleted (here:
+/// `cache_dir` is a link into `data_dir`) dangles by the time its turn comes.
+/// It was listed and reported as "removed cache ...", so it must be gone.
 #[test]
-#[ignore = "finding: remove_path skips a planned link once it dangles"]
 fn uninstall_removes_a_link_whose_target_an_earlier_step_removed() {
     let sandbox = fresh_sandbox("uninstall-link-order");
     let home = sandbox.join("home");
@@ -851,44 +808,89 @@ fn uninstall_removes_a_link_whose_target_an_earlier_step_removed() {
     );
 }
 
+/// A cache root that is already a dangling link is still an entry on disk: the
+/// review lists it (rather than calling it "not present") and removal unlinks it.
 #[test]
-#[ignore = "finding: uninstall honesty with dangling-after-earlier-step links"]
-fn uninstall_removes_exactly_what_the_review_lists_including_links() {
-    if let Err(error) = run_uninstall_property(case_count(), false, true) {
-        panic!("{error}");
+fn uninstall_lists_and_removes_a_dangling_link_root() {
+    let sandbox = fresh_sandbox("uninstall-dangling-root");
+    let link = sandbox.join("rocm-cache");
+    symlink(sandbox.join("does-not-exist"), &link).expect("link");
+    let paths = AppPaths {
+        config_dir: sandbox.join("no-config"),
+        data_dir: sandbox.join("no-data"),
+        cache_dir: link.clone(),
+    };
+    let options = UninstallOptions {
+        yes: true,
+        keep_binaries: true,
+        ..UninstallOptions::default()
+    };
+    let plan = build_uninstall_plan(&paths, &options).expect("plan");
+    let listed = plan.actions.iter().any(|entry| entry.path == link);
+    for entry in &plan.actions {
+        remove_path(&entry.path).expect("remove");
     }
+    let link_left = std::fs::symlink_metadata(&link).is_ok();
+    cleanup(&sandbox);
+    assert!(listed, "a dangling link root must be listed: {plan:?}");
+    assert!(!link_left, "dangling link {} survived", link.display());
 }
 
 // ---------------------------------------------------------------------------
-// remove_path: trailing-slash spelling of a symlinked directory
+// remove_path: trailing-separator spellings of a symlinked directory
 // ---------------------------------------------------------------------------
 
 /// `remove_path` decides "link or directory?" with `symlink_metadata`, but a
-/// trailing `/` makes the kernel resolve the final link, so `link/` stats as
-/// the *target* directory and `remove_dir_all` walks into it. The same folder
-/// spelled `link` has only the link removed. Spelling alone must not change
-/// what is deleted.
+/// trailing `/` or `/.` makes the kernel resolve the final link, so `link/`
+/// would stat as the *target* directory and `remove_dir_all` would walk into
+/// it. Spelling alone must not change what is deleted: only the link goes.
 #[test]
-#[ignore = "finding: remove_path follows a symlinked dir spelled with a trailing slash"]
 fn remove_path_treats_a_trailing_slash_link_like_the_link() {
-    let sandbox = fresh_sandbox("trailing-slash");
-    let target = sandbox.join("relocated-cache");
-    std::fs::create_dir_all(target.join("sub")).expect("target");
-    std::fs::write(target.join("precious.txt"), b"keep").expect("precious");
-    std::fs::write(target.join("sub/more.txt"), b"keep").expect("more");
-    let link = sandbox.join("cache-link");
-    symlink(&target, &link).expect("link");
+    for suffix in ["/", "/.", "//"] {
+        let sandbox = fresh_sandbox("trailing-slash");
+        let target = sandbox.join("relocated-cache");
+        std::fs::create_dir_all(target.join("sub")).expect("target");
+        std::fs::write(target.join("precious.txt"), b"keep").expect("precious");
+        std::fs::write(target.join("sub/more.txt"), b"keep").expect("more");
+        let link = sandbox.join("cache-link");
+        symlink(&target, &link).expect("link");
 
-    let spelled = PathBuf::from(format!("{}/", link.display()));
-    let outcome = remove_path(&spelled);
+        let spelled = PathBuf::from(format!("{}{suffix}", link.display()));
+        let outcome = remove_path(&spelled);
 
-    let survived = target.join("precious.txt").is_file() && target.join("sub/more.txt").is_file();
+        let survived =
+            target.join("precious.txt").is_file() && target.join("sub/more.txt").is_file();
+        let link_left = std::fs::symlink_metadata(&link).is_ok();
+        cleanup(&sandbox);
+        assert!(
+            survived,
+            "remove_path({}) reached through the link and deleted the target's contents \
+             (result: {outcome:?}, link still present: {link_left})",
+            spelled.display()
+        );
+        assert!(
+            outcome.is_ok(),
+            "remove_path({}) failed: {outcome:?}",
+            spelled.display()
+        );
+        assert!(
+            !link_left,
+            "remove_path({}) left the link in place",
+            spelled.display()
+        );
+    }
+}
+
+/// A dangling link is an entry on disk, not an absence: `remove_path` unlinks
+/// it instead of returning early, so callers that report it removed are right.
+#[test]
+fn remove_path_removes_a_dangling_link() {
+    let sandbox = fresh_sandbox("dangling");
+    let link = sandbox.join("archive.tar.gz");
+    symlink(sandbox.join("does-not-exist"), &link).expect("link");
+    let outcome = remove_path(&link);
     let link_left = std::fs::symlink_metadata(&link).is_ok();
     cleanup(&sandbox);
-    assert!(
-        survived,
-        "remove_path({}) reached through the link and deleted the target's contents \
-         (result: {outcome:?}, link still present: {link_left})",
-        spelled.display()
-    );
+    assert!(outcome.is_ok(), "remove_path failed: {outcome:?}");
+    assert!(!link_left, "dangling link {} survived", link.display());
 }

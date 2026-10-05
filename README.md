@@ -816,6 +816,10 @@ rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
 ```
 
+If a config, data, or cache folder is a link to somewhere else (for example a
+cache moved to a bigger disk), `rocm uninstall` removes the link and leaves the
+folder it points to alone, whether or not the setting ends in a `/`.
+
 ### Shell completions
 
 `rocm completions <shell>` prints a completion script for the given shell to
