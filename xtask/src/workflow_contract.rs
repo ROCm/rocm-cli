@@ -994,8 +994,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// Where two line-oriented texts first differ, phrased for a failure
-    /// message; `None` when they are equal.
-    fn first_line_difference(a: &str, b: &str) -> Option<String> {
+    /// message and naming which file each side came from; `None` when they
+    /// are equal.
+    fn first_line_difference(a_name: &str, a: &str, b_name: &str, b: &str) -> Option<String> {
         if a == b {
             return None;
         }
@@ -1004,13 +1005,13 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         Some(
             match a_lines.iter().zip(&b_lines).position(|(x, y)| x != y) {
                 Some(i) => format!(
-                    "first difference at body line {}:\n  {:?}\n  {:?}",
+                    "first difference at body line {}:\n  {a_name}: {:?}\n  {b_name}: {:?}",
                     i + 1,
                     a_lines[i],
                     b_lines[i]
                 ),
                 None if a_lines.len() != b_lines.len() => format!(
-                    "every shared line matches, but one body has {} lines and the other {}",
+                    "every shared line matches, but {a_name} has {} lines and {b_name} has {}",
                     a_lines.len(),
                     b_lines.len()
                 ),
@@ -1181,7 +1182,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
             unreachable!("exactly two lanes are checked above");
         };
-        if let Some(difference) = first_line_difference(first_body, second_body) {
+        if let Some(difference) = first_line_difference(first, first_body, second, second_body) {
             panic!(
                 "the clock-settling step has drifted between {first} and {second} — the \
                  copies are kept in sync by hand until the lanes are deduplicated (#294); \
@@ -1224,11 +1225,14 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{language} APU preflight count differs"
             );
             for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
-                assert_eq!(
-                    a, b,
-                    "{language} APU preflight script #{i} has drifted between \
-                     e2e-selfhosted.yml and nightly.yml"
-                );
+                if let Some(difference) =
+                    first_line_difference("e2e-selfhosted.yml", a, "nightly.yml", b)
+                {
+                    panic!(
+                        "{language} APU preflight script #{i} has drifted between \
+                         e2e-selfhosted.yml and nightly.yml; {difference}"
+                    );
+                }
             }
         }
     }
