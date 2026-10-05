@@ -1391,3 +1391,73 @@ async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
          nothing saying where it came from:\n{execution}"
     );
 }
+
+/// The folder scenario runtime-19 asks for: inside the scenario's own temp
+/// root, and with a lone `'` in its name — the shape the old quoter left bare.
+fn freeform_prefix_with_quote(world: &E2eWorld) -> String {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("it's-here")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[when("the user approves a natural-language SDK install into a folder whose name has a quote")]
+async fn user_approves_freeform_sdk_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = freeform_prefix_with_quote(world);
+    let request = format!("install the latest TheRock nightly for this GPU into {prefix}");
+    // `run_rocm`, not `run_rocm_ok`: the Given guarantees the dispatched install
+    // fails, and the exit code is not what this scenario is about.
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(world, &["--yes", &request]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Read the section's `rocm install sdk` `tool_call:` line back the way a POSIX
+/// shell splits words, and require `--prefix` to be followed by exactly
+/// `prefix`. The install line specifically: the request plan lists a read-only
+/// `rocm examine` step ahead of it.
+fn assert_tool_call_has_prefix_as_one_word(section: &str, which: &str, prefix: &str) {
+    let line = section
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("tool_call: "))
+        .find(|line| line.starts_with("rocm install sdk"))
+        .unwrap_or_else(|| panic!("no install `tool_call:` line in the {which}:\n{section}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the {which} `tool_call:` line does not parse: `{line}`"));
+    let after_prefix = words
+        .iter()
+        .position(|word| word == "--prefix")
+        .and_then(|index| words.get(index + 1))
+        .unwrap_or_else(|| {
+            panic!("the {which} `tool_call:` line has no `--prefix` value: `{line}`")
+        });
+    assert_eq!(
+        after_prefix, prefix,
+        "the {which} `tool_call:` line must name the folder as one argument, got `{line}`"
+    );
+}
+
+#[then("the request plan names that folder as a single argument")]
+async fn assert_freeform_plan_prefix_is_one_word(world: &mut E2eWorld) {
+    let (plan, _) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &plan,
+        "request plan",
+        &freeform_prefix_with_quote(world),
+    );
+}
+
+#[then("the executed command names that folder as a single argument")]
+async fn assert_freeform_execution_prefix_is_one_word(world: &mut E2eWorld) {
+    let (_, execution) = freeform_plan_and_execution(world);
+    assert_tool_call_has_prefix_as_one_word(
+        &execution,
+        "execution section",
+        &freeform_prefix_with_quote(world),
+    );
+}

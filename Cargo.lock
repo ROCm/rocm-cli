@@ -1276,6 +1276,7 @@ dependencies = [
  "rocm-core",
  "serde",
  "serde_json",
+ "shlex",
  "tempfile",
  "tokio",
  "toml",

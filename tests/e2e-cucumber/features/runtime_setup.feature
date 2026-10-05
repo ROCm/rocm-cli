@@ -370,3 +370,25 @@ Feature: Runtime configuration
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # The `tool_call:` lines `rocm <request>` prints are the command the operator
+  # reviews before re-running with `--yes`, and the one that then runs. Their
+  # quoter used to wrap a value only when it held whitespace, so a folder whose
+  # name carries a lone `'` rendered bare and left a line no shell can parse —
+  # the operator was shown something that denotes no argv at all. The
+  # assertion reads each line back through a POSIX word-splitter and demands
+  # `--prefix` followed by exactly the requested folder: what the line has to
+  # mean, rather than one spelling of it. (A space alone does not distinguish
+  # the two quoters on this surface — the old one wrapped whitespace — which is
+  # why the folder name carries a quote.)
+  #
+  # The argv the dispatched install receives is not observable here: the Given
+  # stops it on its first step, as in runtime-15, and for the same reasons —
+  # offline, instant, writes nothing, identical on every lane. The executed
+  # `tool_call:` line is the closest observable account of it.
+  @id:runtime-freeform-prefix-with-quote-is-one-argument
+  Scenario: runtime-19 - A natural-language install into a folder named with a quote keeps the folder one argument
+    Given the CLI cannot reach a usable Python
+    When the user approves a natural-language SDK install into a folder whose name has a quote
+    Then the request plan names that folder as a single argument
+    And the executed command names that folder as a single argument
