@@ -71,8 +71,8 @@ pub use report::{
 use runtime::env_path_override;
 pub use runtime::{
     ProtectedLocation, RUNTIME_LIBRARY_PATH_ENV, RuntimeHost, RuntimePlatform,
-    current_executable_path, default_cache_dir, default_config_dir, default_data_dir,
-    default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
+    canonicalize_for_compare, current_executable_path, default_cache_dir, default_config_dir,
+    default_data_dir, default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
     managed_runtime_cache_dir, managed_runtime_data_root, managed_tools_dir, managed_uv_cache_dir,
     normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
     normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_platform,
@@ -86,7 +86,8 @@ pub use runtime::{
     runtime_protected_location, runtime_protected_location_for_home,
     runtime_python_activation_hint, runtime_python_activation_script, runtime_python_bin_dir_name,
     runtime_python_env_bin_dir, runtime_python_executable_in_env, runtime_python_executable_name,
-    runtime_rocm_library_filename, shell_command_for_host, user_runtime_dir,
+    runtime_rocm_library_filename, shell_command_for_host,
+    uninstall_root_protected_location_for_home, user_runtime_dir,
 };
 pub use uv::{
     DEFAULT_UV_TIMEOUT_SECS, DependencyViolation, UV_CACHE_DIR_ENV, UV_CACHE_DIR_OVERRIDE_ENV,
@@ -1732,7 +1733,98 @@ pub struct AppPaths {
     pub cache_dir: PathBuf,
 }
 
+/// Where one of the [`AppPaths`] folders came from, so a message about it can
+/// name the setting to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppPathSource {
+    /// An environment variable such as `ROCM_CLI_DATA_DIR`.
+    Env(&'static str),
+    /// `setup.therock_venv` in the config file at this path.
+    TheRockVenv(PathBuf),
+    /// The platform default.
+    Default,
+}
+
+impl AppPathSource {
+    /// Phrased to follow "set by" / stand alone in parentheses.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Env(name) => format!("set by {name}"),
+            Self::TheRockVenv(config) => {
+                format!("set by setup.therock_venv in {}", config.display())
+            }
+            Self::Default => "the default location".to_owned(),
+        }
+    }
+
+    /// The setting a user can change to move the folder, if there is one.
+    #[must_use]
+    pub fn setting(&self) -> Option<String> {
+        match self {
+            Self::Env(name) => Some((*name).to_owned()),
+            Self::TheRockVenv(config) => {
+                Some(format!("setup.therock_venv in {}", config.display()))
+            }
+            Self::Default => None,
+        }
+    }
+}
+
+/// Where each of the three [`AppPaths`] folders came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppPathSources {
+    pub config: AppPathSource,
+    pub data: AppPathSource,
+    pub cache: AppPathSource,
+}
+
+impl Default for AppPathSources {
+    fn default() -> Self {
+        Self {
+            config: AppPathSource::Default,
+            data: AppPathSource::Default,
+            cache: AppPathSource::Default,
+        }
+    }
+}
+
 impl AppPaths {
+    /// [`AppPaths::discover`], plus where each folder came from, decided by the
+    /// same rules: an environment variable wins; otherwise `setup.therock_venv`
+    /// moves the data folder, and the cache folder with it unless
+    /// `ROCM_CLI_CACHE_DIR` is set; otherwise the default.
+    pub fn discover_with_sources() -> Result<(Self, AppPathSources)> {
+        let config_overridden = env_path_override("ROCM_CLI_CONFIG_DIR").is_some();
+        let data_overridden = env_path_override("ROCM_CLI_DATA_DIR").is_some();
+        let cache_overridden = env_path_override("ROCM_CLI_CACHE_DIR").is_some();
+        let paths = Self::discover()?;
+        let managed = !data_overridden && configured_managed_root_from_config(&paths).is_some();
+        let from_venv = || AppPathSource::TheRockVenv(paths.config_path());
+        let sources = AppPathSources {
+            config: if config_overridden {
+                AppPathSource::Env("ROCM_CLI_CONFIG_DIR")
+            } else {
+                AppPathSource::Default
+            },
+            data: if data_overridden {
+                AppPathSource::Env("ROCM_CLI_DATA_DIR")
+            } else if managed {
+                from_venv()
+            } else {
+                AppPathSource::Default
+            },
+            cache: if cache_overridden {
+                AppPathSource::Env("ROCM_CLI_CACHE_DIR")
+            } else if managed {
+                from_venv()
+            } else {
+                AppPathSource::Default
+            },
+        };
+        Ok((paths, sources))
+    }
+
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");

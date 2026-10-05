@@ -233,19 +233,21 @@ impl AppState {
                     ));
                 } else {
                     let real = saw_apply;
-                    let argv: Vec<&str> = if real {
-                        vec!["uninstall"]
-                    } else {
-                        vec!["uninstall", "--dry-run"]
-                    };
-                    self.slash_tool = Some(rocm_cmd_request(
-                        &argv,
-                        if real {
-                            "uninstall"
-                        } else {
-                            "uninstall --dry-run"
-                        },
-                    ));
+                    let mut argv: Vec<&str> = vec!["uninstall"];
+                    // The `--keep-*` flags pass through, in both modes: a
+                    // refused uninstall's advice is to re-run with one, and a
+                    // dashboard that dropped it could never follow that advice.
+                    argv.extend(flags.iter().copied().filter(|flag| {
+                        matches!(
+                            *flag,
+                            "--keep-binaries" | "--keep-config" | "--keep-data" | "--keep-cache"
+                        )
+                    }));
+                    if !real {
+                        argv.push("--dry-run");
+                    }
+                    let label = argv.join(" ");
+                    self.slash_tool = Some(rocm_cmd_request(&argv, label));
                 }
             }
             "setup" => {

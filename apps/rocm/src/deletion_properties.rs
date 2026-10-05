@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
-use rocm_core::AppPaths;
+use rocm_core::{AppPathSources, AppPaths};
 
 use crate::{UninstallOptions, build_uninstall_plan, remove_path};
 
@@ -518,6 +518,14 @@ enum Target {
     RegularFile,
     /// A symlink planted in home whose target does not exist.
     DanglingLink,
+    /// `$HOME` spelled relative to the process's working directory — what
+    /// `ROCM_CLI_DATA_DIR=.` run from home amounts to.
+    RelativeHome,
+    /// `<home>/Documents/..` spelled relative to the working directory — `..`
+    /// run from a project folder in home.
+    RelativeHomeViaChild,
+    /// `$HOME` reached through a symlink to its parent (`/home -> var/home`).
+    HomeViaLinkedParent,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -540,6 +548,9 @@ fn target() -> impl Strategy<Value = Target> {
         1 => Just(Target::LinkToHome),
         1 => Just(Target::RegularFile),
         1 => Just(Target::DanglingLink),
+        1 => Just(Target::RelativeHome),
+        1 => Just(Target::RelativeHomeViaChild),
+        1 => Just(Target::HomeViaLinkedParent),
     ]
 }
 
@@ -594,13 +605,42 @@ fn resolve_target(home: &Path, name: &str, target: Target, spelling: Spelling) -
             let _ = symlink(home.join("does-not-exist"), &link);
             link
         }
+        Target::RelativeHome => relative_from_cwd(home),
+        Target::RelativeHomeViaChild => relative_from_cwd(&home.join("Documents")).join(".."),
+        Target::HomeViaLinkedParent => {
+            let sandbox = home.parent().expect("home has a parent");
+            let link = sandbox.join(format!("linked-parent-{name}"));
+            let _ = symlink(sandbox, &link);
+            link.join(home.file_name().expect("home has a name"))
+        }
     };
     respell(&raw, spelling)
 }
 
 /// Is `target` one that plainly names somewhere ROCm CLI did not create?
 const fn names_foreign_dir(target: Target) -> bool {
-    matches!(target, Target::Home | Target::LinkToHome)
+    matches!(
+        target,
+        Target::Home
+            | Target::LinkToHome
+            | Target::RelativeHome
+            | Target::RelativeHomeViaChild
+            | Target::HomeViaLinkedParent
+    )
+}
+
+/// `target` spelled relative to this process's working directory with `..`
+/// segments, so a case can use a relative root without changing the
+/// (process-global) working directory.
+fn relative_from_cwd(target: &Path) -> PathBuf {
+    let cwd = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .expect("working directory");
+    let mut relative = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.join(target.strip_prefix("/").expect("absolute target"))
 }
 
 fn uninstall_case(
@@ -647,6 +687,9 @@ fn uninstall_case(
                     Target::LinkToHome => "target: symlink -> $HOME",
                     Target::RegularFile => "target: regular file",
                     Target::DanglingLink => "target: dangling symlink",
+                    Target::RelativeHome => "target: $HOME, relative to cwd",
+                    Target::RelativeHomeViaChild => "target: $HOME/Documents/.., relative",
+                    Target::HomeViaLinkedParent => "target: $HOME via a symlinked parent",
                 });
                 reach.hit(match s {
                     Spelling::Plain => "spelling: plain",
@@ -689,8 +732,13 @@ fn uninstall_case(
             keep_binaries: true,
             ..UninstallOptions::default()
         };
-        let plan = crate::build_uninstall_plan_for_home(&paths, &options, Some(&home))
-            .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
+        let plan = crate::build_uninstall_plan_for_home(
+            &paths,
+            &AppPathSources::default(),
+            &options,
+            Some(&home),
+        )
+        .map_err(|error| TestCaseError::fail(format!("plan failed: {error:#}")))?;
         let notes = crate::shared_cache_notes_for(&plan.actions, &candidates);
         let rendered = crate::render_uninstall_plan(
             &plan,
@@ -916,7 +964,7 @@ fn uninstall_removes_a_link_whose_target_an_earlier_step_removed() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options).expect("plan");
+    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
     let listed = plan.actions.iter().any(|entry| entry.path == link);
     for entry in &plan.actions {
         remove_path(&entry.path).expect("remove");
@@ -951,7 +999,7 @@ fn uninstall_lists_and_removes_a_dangling_link_root() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &options).expect("plan");
+    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
     let listed = plan.actions.iter().any(|entry| entry.path == link);
     for entry in &plan.actions {
         remove_path(&entry.path).expect("remove");
@@ -1044,7 +1092,8 @@ fn a_regular_file_spelled_as_a_directory_is_not_removed() {
             keep_binaries: true,
             ..UninstallOptions::default()
         };
-        let plan = build_uninstall_plan(&paths, &options).expect("plan");
+        let plan =
+            build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
         cleanup(&sandbox);
 
         assert!(

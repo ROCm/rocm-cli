@@ -2654,6 +2654,37 @@ mod tests {
         );
     }
 
+    /// A refused uninstall advises `Re-run with --keep-<kind>`. Both the
+    /// preview and the real run must carry that flag to the CLI, or the advice
+    /// cannot be followed from the dashboard. (That the flag then clears the
+    /// refusal is proven against the CLI: `rocm`'s
+    /// `in_process_uninstall_dry_run_honours_the_advised_keep_flag` and the
+    /// `uninstall-04` E2E scenario.)
+    #[test]
+    fn slash_uninstall_passes_keep_flags_through() {
+        let mut s = st();
+        assert_eq!(
+            s.handle_slash_command("/uninstall --keep-data"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.take().expect("a dry-run request");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["uninstall", "--keep-data", "--dry-run"] })
+        );
+        assert_eq!(req.label, "uninstall --keep-data --dry-run");
+
+        assert_eq!(
+            s.handle_slash_command("/uninstall --apply --keep-data --keep-cache"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.take().expect("a real request");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["uninstall", "--keep-data", "--keep-cache"] })
+        );
+    }
+
     #[test]
     fn slash_uninstall_conflicting_flags_is_guided() {
         let mut s = st();

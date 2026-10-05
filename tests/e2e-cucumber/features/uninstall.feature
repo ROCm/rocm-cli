@@ -34,13 +34,16 @@ Feature: Uninstall
     And the uninstall reports the cache link as removed
     And the cache link is gone
 
-  # Linux-only: on Windows `/` renders as the drive root `\`, so the refused
-  # line reads differently; the refusal itself is covered there by uninstall-04.
+  # Linux-only: on Windows `/` names the current drive's root and renders as
+  # `\`, so this line would read differently. The Windows drive-root refusal is
+  # covered only by rocm-core's `a_windows_drive_root_is_the_filesystem_root`
+  # unit test, not end to end.
   @id:uninstall-filesystem-root-refused @requires-os:linux
   Scenario: uninstall-03 - A data folder set to the top of the filesystem is refused
     Given the data folder is set to the top of the filesystem
     When the user previews an uninstall
     Then the uninstall is refused because the data folder "/" is "the top of the filesystem"
+    And the refusal names ROCM_CLI_DATA_DIR as where the data folder came from
     And the refusal advises re-running with --keep-data
 
   @id:uninstall-home-refused-nothing-removed
@@ -63,3 +66,15 @@ Feature: Uninstall
     When the user previews an uninstall
     Then the review warns that the uv and model caches will be deleted with the cache folder
     And the uv cache is still there after the preview
+
+  # The text of `.` is not the home folder, but the folder it names is. Linux-
+  # only like uninstall-01/-02 in what it claims: the resolution goes through
+  # the same symlink-following call, which nothing verifies on Windows.
+  @id:uninstall-dot-from-home-refused @requires-os:linux
+  Scenario: uninstall-06 - A data folder of `.` run from the home folder is refused and nothing is removed
+    Given the data folder is set to `.`, and the user is in their home folder, which holds their files
+    When the user uninstalls from their home folder
+    Then the refusal says the data folder "." resolves to the home folder
+    And the refusal says nothing was removed
+    And the user's files in the home folder are still there
+    And the config folder is still there

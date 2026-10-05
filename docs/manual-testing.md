@@ -395,9 +395,11 @@ A protected data folder is refused (dry run only):
 ROCM_CLI_DATA_DIR=/ rocm uninstall --dry-run --keep-binaries
 ```
 
-Expected result: the review lists `data: / is the top of the filesystem` under
-"Refused", never under the items to remove, ends with `This uninstall would be
-refused. Re-run with --keep-data ...`, and the command exits non-zero.
+Expected result: the review lists `data: / is the top of the filesystem (set
+by ROCM_CLI_DATA_DIR)` under "Refused", never under the items to remove, ends
+with `This uninstall would be refused. Point ROCM_CLI_DATA_DIR at a folder of
+ROCm CLI's own, or re-run with --keep-data ...`, and the command exits
+non-zero.
 
 The home folder as the data folder is refused for real, and the advised flag
 works:
@@ -408,9 +410,23 @@ ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries --keep-data
 ```
 
 Expected result: the first command exits non-zero with `uninstall refused,
-nothing was removed: the data folder <home> is your home folder ...`, and
-`$HOME/Documents/keep.txt` and the config folder are both still there. The
-second exits 0, removes the config folder, and leaves `keep.txt` alone.
+nothing was removed: the data folder <home> is your home folder (set by
+ROCM_CLI_DATA_DIR) ...`, and `$HOME/Documents/keep.txt` and the config folder
+are both still there. The second exits 0, removes the config folder, and leaves
+`keep.txt` alone.
+
+The same holds when the setting does not spell out the home folder:
+
+```bash
+(cd "$HOME" && ROCM_CLI_DATA_DIR=. rocm uninstall --yes --keep-binaries)
+```
+
+Expected result: exit non-zero with `the data folder . is your home folder
+(set by ROCM_CLI_DATA_DIR; resolves to <home>)`, and `keep.txt` is still there.
+
+In the dashboard, `/uninstall --keep-data` previews and `/uninstall --apply
+--keep-data` runs the uninstall with the data folder left out; with
+`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal.
 
 A shared cache inside the cache folder is named as deleted (dry run):
 

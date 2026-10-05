@@ -21,10 +21,23 @@ use crate::{
 };
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let plan = build_uninstall_plan(&paths, &options)?;
+    let (paths, sources) = AppPaths::discover_with_sources()?;
+    let plan = build_uninstall_plan(&paths, &sources, &options)?;
     print!("{}", render_uninstall_plan(&plan, &options));
+    run_uninstall_plan(&plan, &options, interactive_terminal(), confirm_uninstall)
+}
 
+/// Everything after the review is printed: refuse, preview, confirm, remove.
+///
+/// Whether the terminal is interactive and how to ask are passed in, so tests
+/// can prove the refusal comes before the prompt rather than only before the
+/// first removal.
+pub(crate) fn run_uninstall_plan(
+    plan: &UninstallPlan,
+    options: &UninstallOptions,
+    interactive: bool,
+    confirm: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
     // A refused root stops the whole command, before the prompt and before the
     // first removal: removing the rest and then failing would leave a partial
     // uninstall behind a folder that was never going to be removed. A dry run
@@ -42,16 +55,16 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
     }
 
     if !options.yes {
-        if !interactive_terminal() {
+        if !interactive {
             bail!("uninstall requires --yes outside an interactive terminal");
         }
-        if !confirm_uninstall()? {
+        if !confirm()? {
             println!("uninstall cancelled");
             return Ok(());
         }
     }
 
-    apply_uninstall_plan(&plan)?;
+    apply_uninstall_plan(plan)?;
     println!("uninstall complete");
     Ok(())
 }

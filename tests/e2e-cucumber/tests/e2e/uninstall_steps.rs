@@ -58,6 +58,11 @@ fn set_env(world: &mut E2eWorld, key: &'static str, value: impl Into<OsString>) 
 /// step overrides one through `world.command_env`, which is kept (not
 /// consumed) so a scenario can re-run the command with different flags.
 fn run_uninstall(world: &mut E2eWorld, flags: &[&str]) {
+    run_uninstall_in(world, flags, None);
+}
+
+/// [`run_uninstall`] with the working directory set, for a relative setting.
+fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
     let root = root(world).to_path_buf();
     let home = home(world);
     std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
@@ -84,6 +89,9 @@ fn run_uninstall(world: &mut E2eWorld, flags: &[&str]) {
     let binary = crate::rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(&args);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
     world.isolate_cmd(&mut cmd);
     for (key, value) in env {
         cmd.env(key, value);
@@ -187,11 +195,11 @@ async fn uninstall_with_advised_flag(world: &mut E2eWorld) {
         world.cli_stderr.as_deref().unwrap_or("")
     );
     let flag = message
-        .split("Re-run with ")
+        .split("e-run with ")
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .filter(|word| word.starts_with("--keep-"))
-        .unwrap_or_else(|| panic!("the refusal named no `Re-run with --keep-...`:\n{message}"))
+        .unwrap_or_else(|| panic!("the refusal named no `re-run with --keep-...`:\n{message}"))
         .to_owned();
     run_uninstall(world, &["--yes", &flag]);
 }
@@ -273,9 +281,10 @@ async fn refused_because(world: &mut E2eWorld, folder: String, why: String) {
     );
     // The review lists the root under "Refused", with the reason, and never in
     // the would-be-removed list.
-    let refused_line = format!("  - data: {folder} is {why}");
+    // Followed by where the folder came from, in parentheses.
+    let refused_line = format!("  - data: {folder} is {why} (");
     assert!(
-        stdout.lines().any(|line| line == refused_line),
+        stdout.lines().any(|line| line.starts_with(&refused_line)),
         "expected `{refused_line}` in the review:\n{stdout}"
     );
     let removed_line = format!("  - data: {folder}");
@@ -289,8 +298,7 @@ async fn refused_because(world: &mut E2eWorld, folder: String, why: String) {
 async fn refusal_advises_keep_data(world: &mut E2eWorld) {
     let message = format!("{}{}", output(world), stderr(world));
     assert!(
-        message
-            .contains("Re-run with --keep-data to remove everything else and leave it in place."),
+        message.contains("e-run with --keep-data to remove everything else and leave it in place."),
         "the refusal must say how to proceed:\n{message}"
     );
 }
@@ -391,4 +399,46 @@ async fn uv_cache_intact(world: &mut E2eWorld) {
         "the preview must exit 0:\n{}",
         stderr(world)
     );
+}
+
+#[given(
+    "the data folder is set to `.`, and the user is in their home folder, which holds their files"
+)]
+async fn data_is_dot_in_home(world: &mut E2eWorld) {
+    let file = user_file_in_home(world);
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("failed to create home");
+    std::fs::write(&file, "user data").expect("failed to write user file");
+    std::fs::create_dir_all(root(world).join("config")).expect("failed to create config");
+    set_env(world, "ROCM_CLI_DATA_DIR", ".");
+}
+
+#[when("the user uninstalls from their home folder")]
+async fn uninstall_from_home(world: &mut E2eWorld) {
+    let home = home(world);
+    run_uninstall_in(world, &["--yes"], Some(&home));
+}
+
+#[then(expr = "the refusal names {word} as where the data folder came from")]
+async fn refusal_names_source(world: &mut E2eWorld, setting: String) {
+    let message = format!("{}{}", output(world), stderr(world));
+    assert!(
+        message.contains(&format!("(set by {setting}"))
+            && message.contains(&format!("Point {setting} at a folder of ROCm CLI's own")),
+        "the refusal must name {setting} and say to change it:\n{message}"
+    );
+}
+
+#[then(expr = "the refusal says the data folder {string} resolves to the home folder")]
+async fn refusal_says_resolves_to_home(world: &mut E2eWorld, folder: String) {
+    let stdout = output(world);
+    let home = home(world).canonicalize().expect("home exists");
+    let line = format!(
+        "  - data: {folder} is your home folder (set by ROCM_CLI_DATA_DIR; resolves to {})",
+        home.display()
+    );
+    assert!(
+        stdout.lines().any(|l| l == line),
+        "expected `{line}` in the review:\n{stdout}"
+    );
+    assert!(rc(world) != 0, "a refused uninstall must fail:\n{stdout}");
 }

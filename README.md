@@ -820,13 +820,21 @@ example a cache moved to a bigger disk), `rocm uninstall` removes the link and
 leaves the folder it points to alone, whether or not the setting ends in a `/`.
 
 `rocm uninstall` never removes `/`, your home folder, a folder that contains
-it, or a protected system location such as `/usr` or `C:\Windows` — the same
-rule `rocm runtimes uninstall` and `rocm storage remove-old-installs` apply. If
-the config, data, or cache folder is one of those (for example
+it, or a system location itself such as `/usr`, `/var`, `/opt` or
+`C:\Windows`. A folder of its own inside one, such as `/opt/rocm-cli` or
+`/var/cache/rocm-cli`, is removed as usual. The check looks at where a folder
+really is as well as how it is written, so `ROCM_CLI_DATA_DIR=.` run from your
+home folder, or a home reached through a linked parent folder, is caught too.
+If the config, data, or cache folder is one of those (for example
 `ROCM_CLI_DATA_DIR=/`, or an SDK installed with `--prefix ~`), the review lists
-it under "Refused", the command exits with an error, and nothing is removed.
-Re-run with the `--keep-config`, `--keep-data`, or `--keep-cache` flag the
-message names to remove everything else and leave that folder in place.
+it under "Refused" with the setting it came from, the command exits with an
+error, and nothing is removed. Point that setting somewhere else, or re-run
+with the `--keep-config`, `--keep-data`, or `--keep-cache` flag the message
+names to remove everything else and leave that folder in place. The same flags
+work in the dashboard's `/uninstall` and in the assistant's preview.
+`rocm runtimes uninstall` and `rocm storage remove-old-installs` apply a
+stricter rule to runtime folders: they also leave anything inside a system
+location in place.
 
 The review also names the shared uv and Hugging Face caches. Normally they are
 left in place; if one sits inside a folder being removed (for example
