@@ -478,8 +478,20 @@ impl RuntimeLine {
 /// suffix. So the digits-only comparison only ever fires for an exact 8-digit
 /// run (the one shape a recovered build date has) and only matches a run in
 /// the key that isn't itself a piece of a longer digit sequence.
+///
+/// A pin that is *already* bare digits (e.g. `--build-date 20260605`) skips
+/// the plain substring check below entirely and goes straight through that
+/// same guarded comparison — otherwise it would match unguarded against any
+/// fingerprint that happens to contain the same digits. The substring check
+/// itself is delimiter-bounded for the same reason: an unanchored `contains`
+/// would let a short pin (`7.1` -> `7-1`) match as a sub-span of a longer
+/// version (`7-13-0`), or a bare `7` match almost any key.
 fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
-    if runtime_key.contains(pin) || runtime_key.contains(&pin.replace('.', "-")) {
+    let pin_is_all_digits = !pin.is_empty() && pin.bytes().all(|b| b.is_ascii_digit());
+    if !pin_is_all_digits
+        && (key_contains_delimited_token(runtime_key, pin)
+            || key_contains_delimited_token(runtime_key, &pin.replace('.', "-")))
+    {
         return true;
     }
     let digits_only: String = pin.chars().filter(char::is_ascii_digit).collect();
@@ -505,16 +517,39 @@ fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
 }
 
 /// Whether `key` contains `run` (a fixed-length digit string) as a maximal
-/// digit run — i.e. not immediately preceded or followed by another digit,
-/// so it can't be a sub-span of some longer, unrelated digit sequence (such
-/// as a fingerprint suffix that happens to contain the same digits).
+/// digit run — not immediately preceded by another digit, so it can't be a
+/// sub-span of some longer digit sequence, and not immediately followed by
+/// another digit *or letter*, so it can't be glued to a longer alphanumeric
+/// run such as a hex fingerprint suffix (which uses `0`-`9` and `a`-`f`
+/// both — a digit-only check on that side would wave a fingerprint-embedded
+/// match through). The leading side stays digit-only because a real build
+/// date is always preceded by the version string's own `a`/`b`/`rc` marker
+/// (e.g. `0a20260605`), which must not itself count as a delimiter break.
 fn key_contains_delimited_digit_run(key: &str, run: &str) -> bool {
     let bytes = key.as_bytes();
     key.match_indices(run).any(|(start, _)| {
         let before_is_digit = start > 0 && bytes[start - 1].is_ascii_digit();
         let end = start + run.len();
-        let after_is_digit = end < bytes.len() && bytes[end].is_ascii_digit();
-        !before_is_digit && !after_is_digit
+        let after_is_alnum = end < bytes.len() && bytes[end].is_ascii_alphanumeric();
+        !before_is_digit && !after_is_alnum
+    })
+}
+
+/// Whether `key` contains `token` as a delimiter-bounded span: not
+/// immediately preceded or followed by another alphanumeric character, so a
+/// short pin can't match as a sub-span of a longer dash-joined segment (pin
+/// `7.1` -> `7-1` must not match inside version segment `7-13-0`) or a bare
+/// digit/letter pin can't match inside an unrelated hex fingerprint.
+fn key_contains_delimited_token(key: &str, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    let bytes = key.as_bytes();
+    key.match_indices(token).any(|(start, _)| {
+        let before_is_alnum = start > 0 && bytes[start - 1].is_ascii_alphanumeric();
+        let end = start + token.len();
+        let after_is_alnum = end < bytes.len() && bytes[end].is_ascii_alphanumeric();
+        !before_is_alnum && !after_is_alnum
     })
 }
 
@@ -1417,6 +1452,28 @@ runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release st
     }
 
     #[test]
+    fn bare_digit_build_date_pin_does_not_match_an_unrelated_digit_run() {
+        // A bare (undashed) build-date pin used to skip the digit-run guard
+        // entirely via the plain substring fast path, so it could match
+        // inside an unrelated, longer digit sequence.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-120260605abcde",
+            "20260605"
+        ));
+    }
+
+    #[test]
+    fn build_date_pin_does_not_match_a_hex_fingerprint_fragment() {
+        // The digit run is bounded by 'a' before (the version's own alpha
+        // marker, expected) but by hex letters 'd'/'e' after — a digit-only
+        // boundary check on the trailing side let this through.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-9-0-aa20260605ddeeff",
+            "2026-06-05"
+        ));
+    }
+
+    #[test]
     fn version_pin_digits_do_not_match_an_unrelated_fingerprint_fragment() {
         // digits_only("7.13.0") is "7130", which appears verbatim inside this
         // other runtime's 16-hex fingerprint suffix. It must not match: this
@@ -1432,6 +1489,26 @@ runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release st
         let key = "nightly-wheel-multi-arch-7-13-0a20260605-0123456789abcdef";
         assert!(key_matches_pin(key, "2026-06-05"));
         assert!(key_matches_pin(key, "06-05-2026"));
+    }
+
+    #[test]
+    fn short_version_pin_does_not_match_as_a_sub_span_of_a_longer_version() {
+        // "7.1" -> "7-1" used to match unanchored inside "7-13-0" because the
+        // plain substring check had no delimiter guard at all.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            "7.1"
+        ));
+    }
+
+    #[test]
+    fn bare_major_version_pin_does_not_match_inside_a_fingerprint() {
+        // A single-digit pin used to match "essentially everything" via the
+        // same unanchored substring check.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-9-0-0-aa7130bbccddeeff",
+            "7"
+        ));
     }
 
     #[test]
