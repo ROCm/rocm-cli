@@ -10,6 +10,8 @@ mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
+#[cfg(all(test, unix))]
+mod deletion_properties;
 mod endpoint_keys;
 mod logging;
 mod provider_keys;

@@ -58,3 +58,8 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+[dev-dependencies]
+# Property tests for the recursive-deletion paths (`deletion_properties`).
+# Same spec as rocm-core's, so the workspace resolves one proptest build.
+proptest = { version = "1", default-features = false, features = ["std"] }
