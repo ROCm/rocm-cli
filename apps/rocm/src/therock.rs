@@ -2633,14 +2633,13 @@ fn host_version_newer_than(host_version: Option<String>, resolved_version: &str)
     // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
     // the third char), inventing a host-newer note that misleads the user.
     //
-    // Each side is read with the parser for where it came from, because the two
-    // sources spell `-` differently. `parse_host_version` normalises what a
-    // legacy ROCm reports — a packaging build number (`7.2.4-98` -> 7.2.4) and
-    // a two-component report (`7.4` -> 7.4.0). `resolved_version` is not a host
-    // string: it is the version resolved from the index or the tarball
-    // catalogue, where `-` is a PEP 440 pre-release separator, so reading it
-    // with the host parser would strip `-rc1` and compare a release candidate
-    // as though it were the final release.
+    // Each side is read with the parser for where it came from.
+    // `parse_host_version` additionally drops the packaging build number a
+    // legacy ROCm reports (`7.2.4-98` -> 7.2.4); a two-component report
+    // (`7.4` -> 7.4.0) and a `-rc1` pre-release are read the same way by both.
+    // `resolved_version` is not a host string: it is the version resolved from
+    // the index or the tarball catalogue, so it is read exactly as the
+    // comparator that picked it reads it.
     let host_parsed = parse_host_version(&host_version)?;
     let resolved_parsed = parse_version_for_ordering(resolved_version)?;
     (host_parsed > resolved_parsed).then_some(host_version)

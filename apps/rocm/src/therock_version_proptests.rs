@@ -812,6 +812,59 @@ fn runtime_freshness_treats_equal_spellings_as_one_version() {
     }
 }
 
+/// The other two callers that ask "is this a different build?" answer it the
+/// same way as the update verdict.
+///
+/// Both print a line to the user: the install approval names the displaced
+/// default as an "upgrade"/"downgrade"/"reinstall", and the no-wheels warning
+/// says a newer version exists but "installing X instead". A spelling
+/// difference must read as a reinstall and must not produce a warning naming
+/// one version on both sides; a version that cannot be identified must not
+/// produce a warning either.
+#[test]
+fn install_messages_treat_equal_spellings_as_one_version() {
+    let active = manifest(
+        "nightly-wheel-gfx120X-all-7-0-0-rc1".to_owned(),
+        "nightly".to_owned(),
+        "wheel".to_owned(),
+        "gfx120X-all".to_owned(),
+        "7.0.0-rc1".to_owned(),
+        false,
+        1_000,
+    );
+    let text = super::active_default_relation_text(
+        &active,
+        super::TheRockChannel::Nightly,
+        "gfx120X-all",
+        "7.0.0rc1",
+    );
+    assert!(
+        text.starts_with("reinstall from installed"),
+        "a respelling of the installed version is not an upgrade: {text}"
+    );
+    // A genuinely newer version still reads as one.
+    let text = super::active_default_relation_text(
+        &active,
+        super::TheRockChannel::Nightly,
+        "gfx120X-all",
+        "7.0.0",
+    );
+    assert!(text.starts_with("upgrade from installed"), "{text}");
+
+    assert_eq!(
+        super::repo_version_without_wheels(Some("7.0.0rc1"), "7.0.0-rc1"),
+        None
+    );
+    assert_eq!(
+        super::repo_version_without_wheels(Some("7.14.0"), "custom-build"),
+        None
+    );
+    assert_eq!(
+        super::repo_version_without_wheels(Some("7.14.0"), "7.13.0").as_deref(),
+        Some("7.14.0")
+    );
+}
+
 /// A four-component release is a real shape — ROCm's own packages are named
 /// `7.2.4.70204` — and it must order by its numbers, not sink below everything.
 ///
@@ -832,6 +885,14 @@ fn compare_version_strings_orders_four_component_releases() {
     assert_eq!(
         compare_version_strings("7.2.4.70204", "7.2.5"),
         Ordering::Less
+    );
+    // And as versions, not only as strings: the comparator's string tiebreak
+    // would still order these two if the fourth component were dropped, but
+    // the update verdict would then call `7.2.4` up to date against an index
+    // offering `7.2.4.70204`.
+    assert_eq!(
+        super::version_relation("7.2.4.70204", "7.2.4"),
+        Some(Ordering::Greater)
     );
     // Trailing zeros do not make a new release: PEP 440 pads the shorter side.
     assert_eq!(oracle("7.2.4.0", "7.2.4"), Some(Ordering::Equal));
