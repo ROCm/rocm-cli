@@ -35,6 +35,7 @@ mod serve_cmd;
 mod serve_summary;
 mod service_hints;
 mod service_launch;
+mod shell_quote;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -82,6 +83,7 @@ use crate::service_launch::{
     managed_service_process_command,
 };
 use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
+use crate::shell_quote::{has_terminal_control_character, shell_quote};
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
@@ -9164,7 +9166,10 @@ fn provider_planner_response_to_plan(
         response
             .notes
             .into_iter()
-            .filter(|note| !note.trim().is_empty()),
+            // Same reason as the argv above: a note is printed verbatim into the
+            // plan block, so a control character in one lets the planner redraw
+            // the lines around it.
+            .filter(|note| !note.trim().is_empty() && !has_terminal_control_character(note)),
     );
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
@@ -9211,12 +9216,18 @@ fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result
     if call.args.is_empty() {
         bail!("provider planner returned an empty tool call");
     }
+    // Control characters, not just NUL. These args are rendered straight into
+    // the `request plan` block `rocm <request>` prints to a terminal, and that
+    // block is the only thing the operator reads before re-running with
+    // `--yes`. A `\r` or a CSI sequence in an argument lets the planner's
+    // response decide what that block looks like, independently of the argv it
+    // would run. See `reject_control_characters_in_tool_arguments`.
     if call
         .args
         .iter()
-        .any(|arg| arg.trim().is_empty() || arg.contains('\0'))
+        .any(|arg| arg.trim().is_empty() || has_terminal_control_character(arg))
     {
-        bail!("provider planner returned an invalid empty or NUL argument");
+        bail!("provider planner returned an empty argument or one carrying a control character");
     }
     let argv = std::iter::once("rocm".to_owned())
         .chain(call.args.iter().cloned())
@@ -9463,19 +9474,24 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
+/// Render an argv as the command line a human is shown for it.
+///
+/// This is the only thing an operator sees before approving a mutating tool
+/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
+/// line) is offered to be copied and run. So it has to denote the argv it was
+/// built from: quoted with [`shell_quote`], every argument splits back to
+/// itself under a shell's own word-splitting, and nothing inside a value can
+/// read as a second command.
+///
+/// Values carrying terminal control characters never get here — they are
+/// refused at validation ([`shell_quote::has_terminal_control_character`]),
+/// because no amount of quoting stops a `\r` from rewriting the line the
+/// operator is reading.
 fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
-}
-
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -14119,7 +14135,9 @@ pub(crate) mod tests {
 
         assert!(action.has_placeholders);
         assert!(error.contains("placeholder values"));
-        assert!(error.contains("rocm serve <model>"));
+        // Quoted: `<` and `>` are redirects, so an unquoted placeholder would
+        // read as a redirect rather than as the value the operator must supply.
+        assert!(error.contains("rocm serve '<model>'"), "{error}");
     }
 
     #[test]
@@ -14169,7 +14187,7 @@ pub(crate) mod tests {
         assert_eq!(
             format_structured_tool_call("rocm", &action.args),
             "rocm install sdk --channel nightly --format wheel --prefix \
-             D:\\ROCm\\therock_venvs --approve-replacing-active-default"
+             'D:\\ROCm\\therock_venvs' --approve-replacing-active-default"
         );
         // The narrow flag, never `--yes`: this surface has no terminal promise to
         // make about a sudo password prompt for system packages.
