@@ -869,6 +869,11 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "`rocm tools: enabled` status row",
     ),
     (
+        "crates/rocm-core/src/model_readiness.rs",
+        "rocm diagnose --model {}: {}",
+        "heading of the model-readiness report, `<command>: <verdict>`, naming what was run",
+    ),
+    (
         "apps/rocm/src/main.rs",
         "rocm install folder",
         "natural-language phrase the planner matches in a request",
