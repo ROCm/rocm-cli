@@ -280,11 +280,13 @@ rocm-cli decides what hardware it is running on by reading fixed host paths:
 the DRM cards under `/sys/class/drm`, `/sys/module/amdgpu`, `/proc/version`,
 `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`, `/proc/modules`,
 `/proc/1/cgroup`, the container markers `/.dockerenv` and `/run/.containerenv`,
-`/etc/os-release`, the modprobe configuration directories, the WSL plumbing
-under `/usr/lib/wsl`, and the WSL ROCDXG capability check, which looks for
-`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm`. The E2E
-suite can point those reads at a directory it populated with a simulated host
-instead, but only in builds compiled with the `e2e-test-hooks` Cargo feature:
+the `/etc/os-release` behind the distro name `rocm examine` reports, the
+modprobe configuration directories, the WSL plumbing under `/usr/lib/wsl`, and
+the WSL ROCDXG capability check, which looks for `lib/librocdxg.so` and
+`share/rocdxg/dids.conf` under `/opt/rocm` and under each discovered ROCm
+install. The E2E suite can point those reads at a directory it populated with a
+simulated host instead, but only in builds compiled with the `e2e-test-hooks`
+Cargo feature:
 
 ```text
 ROCM_CLI_TEST_HOST_ROOT
@@ -298,13 +300,17 @@ path (`/dev/kfd`) when it reports a device.
 
 Some reads stay on the real machine even in a hook build:
 
-- ROCm install discovery. The installs `rocm examine` reports, with their
-  paths and versions, are always the real ones: the CLI prints those paths and
-  can write them into a shell rc file. Only the ROCDXG file check above is
-  re-rooted.
+- ROCm install discovery itself. Which installs exist, and the paths and
+  versions `rocm examine` reports for them, always come from the real host: the
+  CLI prints those paths and can write them into a shell rc file. The one
+  re-rooted read under them is the ROCDXG file check above, which looks for its
+  two files under each discovered install's path inside the simulated root.
 - The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
   the probes execute, such as `ldconfig`.
-- The package-manager install hints, which read the real `/etc/os-release`.
+- Every package-manager plan, which reads the real `/etc/os-release`: the
+  OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
+  `rocm` runs before serving. Their commands run against the real machine, so a
+  simulated host must not pick the distro they are built for.
 
 One check is routed but keeps the real device as a veto: the `rocm dash`
 pre-flight that decides whether to start `amd-smi`. Because it gates a real

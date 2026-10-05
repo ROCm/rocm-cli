@@ -6,21 +6,27 @@
 //!
 //! The probes that decide what GPU, driver and platform the CLI is running on —
 //! device nodes under `/dev`, the KFD topology and DRM cards in `sysfs`,
-//! `/proc/version`, `/proc/cpuinfo`, `/etc/os-release`, the WSL plumbing under
-//! `/usr/lib/wsl`, the container markers (`/.dockerenv`, `/run/.containerenv`,
-//! `/proc/1/cgroup`) — resolve their path through [`host_path`] instead of
-//! naming the absolute path directly.
+//! `/proc/version`, `/proc/cpuinfo`, the `/etc/os-release` behind the reported
+//! distro name, the WSL plumbing under `/usr/lib/wsl`, the WSL ROCDXG check
+//! (`lib/librocdxg.so` and `share/rocdxg/dids.conf`, looked for under
+//! `/opt/rocm` and under each discovered ROCm install), the container markers
+//! (`/.dockerenv`, `/run/.containerenv`, `/proc/1/cgroup`) — resolve their path
+//! through [`host_path`] instead of naming the absolute path directly.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
-//! to describe the machine. ROCm install discovery under `/opt` and
-//! `/usr/local` reports paths the CLI prints and writes into shell rc files, and
-//! the `/usr/lib/wsl/lib` loader entry goes into a real engine's
-//! `LD_LIBRARY_PATH`; re-rooting either would put the simulated directory in
-//! front of a user or a real loader. Programs the probes execute, such as
-//! `ldconfig`, stay on the real host too: a simulated root holds no binary to
-//! run. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are about
-//! this process's environment, not the hardware. The package-manager install
-//! hints in `openmpi.rs` still read the real `/etc/os-release`.
+//! to describe the machine. ROCm install discovery itself — which installs
+//! exist under `/opt` and `/usr/local`, their paths and versions — reads the
+//! real host, because the CLI prints those paths and writes them into shell rc
+//! files; only the ROCDXG existence check above looks under them through the
+//! root. The `/usr/lib/wsl/lib` loader entry goes into a real engine's
+//! `LD_LIBRARY_PATH`; re-rooting it would put the simulated directory in front
+//! of a real loader. Programs the probes execute, such as `ldconfig`, stay on
+//! the real host too: a simulated root holds no binary to run. Every
+//! package-manager plan reads the real `/etc/os-release` — the install hints in
+//! `openmpi.rs`, and the driver, OpenMPI and runtime-library installs in the
+//! `rocm` binary — because the commands it builds run against the real
+//! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
+//! about this process's environment, not the hardware.
 //!
 //! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
 //! pre-flight. It decides whether a real `amd-smi` process may start, so
@@ -80,7 +86,8 @@ const fn hardware_root() -> Option<PathBuf> {
 /// `path` must not contain `..`: [`Path::join`] does not normalise, so a `..`
 /// after the leading `/` would walk back out of the root. This is a documented
 /// precondition rather than a check: callers pass fixed literals, apart from
-/// the discovered ROCm install paths `rocm_relative_file_exists` probes under.
+/// the ROCDXG check in `rocm_relative_file_exists`, which re-roots each
+/// discovered ROCm install path (a `$ROCM_PATH` is taken verbatim there).
 fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     match (root, path.strip_prefix("/")) {
         (Some(root), Ok(relative)) => root.join(relative),
