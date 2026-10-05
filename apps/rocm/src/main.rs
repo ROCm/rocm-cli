@@ -21042,9 +21042,8 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         // the entry that is actually removed, and `dir/` and `dir` dedup to one
         // line. Existence is the entry's own, not its target's: a dangling link
         // is listed and then really removed, instead of reported as absent.
-        let path = entry_path(&path);
-        if fs::symlink_metadata(&path).is_ok() {
-            plan.actions.push(UninstallPlanEntry { kind, path });
+        if let Ok(Some((entry, _))) = existing_entry(&path) {
+            plan.actions.push(UninstallPlanEntry { kind, path: entry });
         } else {
             plan.skipped
                 .push(format!("{kind} path not present: {}", path.display()));
@@ -21298,6 +21297,41 @@ fn entry_path(path: &Path) -> PathBuf {
     path.components().collect()
 }
 
+/// Does `path`'s text end in a separator or a final `.` (`x/`, `x/.`)? The
+/// kernel only lets such a spelling name a directory, so `notes.txt/` names
+/// nothing even though `notes.txt` exists.
+fn spelled_as_directory(path: &Path) -> bool {
+    let text = path.as_os_str().as_encoded_bytes();
+    let is_separator = |byte: u8| std::path::is_separator(char::from(byte));
+    match text {
+        [.., last] if is_separator(*last) => true,
+        [.., before, b'.'] => is_separator(*before),
+        _ => false,
+    }
+}
+
+/// The entry `path` names, as [`entry_path`] spells it, with its own
+/// (link-not-followed) metadata — or `None` when nothing is there.
+///
+/// A spelling that can only name a directory (see [`spelled_as_directory`])
+/// names nothing when the entry is a regular file, so that counts as absent
+/// rather than letting the respelling turn `notes.txt/` into `notes.txt`. A
+/// symlink is still the entry: it is what [`remove_path`] unlinks.
+fn existing_entry(path: &Path) -> io::Result<Option<(PathBuf, fs::Metadata)>> {
+    let entry = entry_path(path);
+    // Not `path.exists()`: that follows links, so a dangling link would read as
+    // already gone, be skipped, and still be reported as removed by the caller.
+    let metadata = match fs::symlink_metadata(&entry) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if spelled_as_directory(path) && !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    Ok(Some((entry, metadata)))
+}
+
 /// Remove the entry `path` names: a file or symlink is unlinked (never
 /// followed, however `path` is spelled), a real directory is removed
 /// recursively, and an entry that is already gone is a no-op.
@@ -21306,17 +21340,12 @@ fn entry_path(path: &Path) -> PathBuf {
 /// `rocm uninstall` and `rocm storage remove-downloads` — whatever spelling
 /// their plan carries.
 fn remove_path(path: &Path) -> Result<()> {
-    let path = entry_path(path);
-    let path = path.as_path();
-    // Not `path.exists()`: that follows links, so a dangling link would read as
-    // already gone, be skipped, and still be reported as removed by the caller.
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to stat {}", path.display()));
-        }
+    let Some((path, metadata)) =
+        existing_entry(path).with_context(|| format!("failed to stat {}", path.display()))?
+    else {
+        return Ok(());
     };
+    let path = path.as_path();
     if metadata.file_type().is_symlink() || metadata.is_file() {
         fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {

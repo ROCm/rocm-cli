@@ -513,6 +513,11 @@ enum Target {
     LinkToOwn,
     /// A symlink planted in home that points at home itself.
     LinkToHome,
+    /// A regular file (`home/.rocm/<name>.txt`), which only a spelling with no
+    /// trailing `/` or `/.` can name.
+    RegularFile,
+    /// A symlink planted in home whose target does not exist.
+    DanglingLink,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -533,6 +538,8 @@ fn target() -> impl Strategy<Value = Target> {
         1 => Just(Target::PrefixSibling),
         1 => Just(Target::LinkToOwn),
         1 => Just(Target::LinkToHome),
+        1 => Just(Target::RegularFile),
+        1 => Just(Target::DanglingLink),
     ]
 }
 
@@ -575,6 +582,16 @@ fn resolve_target(home: &Path, name: &str, target: Target, spelling: Spelling) -
         Target::LinkToHome => {
             let link = home.join(format!("link-home-{name}"));
             let _ = symlink(home, &link);
+            link
+        }
+        Target::RegularFile => {
+            let file = rocm.join(format!("{name}.txt"));
+            let _ = std::fs::write(&file, name.as_bytes());
+            file
+        }
+        Target::DanglingLink => {
+            let link = home.join(format!("dangling-{name}"));
+            let _ = symlink(home.join("does-not-exist"), &link);
             link
         }
     };
@@ -628,6 +645,8 @@ fn uninstall_case(
                     Target::PrefixSibling => "target: prefix sibling",
                     Target::LinkToOwn => "target: symlink -> own dir",
                     Target::LinkToHome => "target: symlink -> $HOME",
+                    Target::RegularFile => "target: regular file",
+                    Target::DanglingLink => "target: dangling symlink",
                 });
                 reach.hit(match s {
                     Spelling::Plain => "spelling: plain",
@@ -688,6 +707,50 @@ fn uninstall_case(
                 .map(|e| e.path.display().to_string())
                 .collect()
         };
+        // A regular file written as `file/` or `file/.` names nothing to the
+        // kernel, so it is neither planned nor removed — unless another root
+        // that does name it (or a folder above it) is.
+        for ((target, spelling), root) in
+            choices
+                .iter()
+                .zip([&paths.config_dir, &paths.data_dir, &paths.cache_dir])
+        {
+            if matches!(target, Target::RegularFile)
+                && matches!(spelling, Spelling::TrailingSlash | Spelling::TrailingDot)
+            {
+                reach
+                    .lock()
+                    .expect("reach lock")
+                    .hit("case: regular file spelled as a dir");
+                let file = PathBuf::from(
+                    root.display()
+                        .to_string()
+                        .trim_end_matches('.')
+                        .trim_end_matches('/'),
+                );
+                // Each kind's file has its own name, so only this root could
+                // have planned it.
+                prop_assert!(
+                    !planned.contains(&file)
+                        && rendered.contains(&format!("path not present: {}\n", root.display())),
+                    "{} names no directory but was planned:\n{}",
+                    root.display(),
+                    rendered
+                );
+                let named_elsewhere = before
+                    .iter()
+                    .find_map(|(id, entry)| (entry.path == file).then_some(*id))
+                    .is_some_and(|id| expected_gone.contains(&id));
+                if !named_elsewhere {
+                    prop_assert!(
+                        file.is_file(),
+                        "{} was deleted through the spelling {}",
+                        file.display(),
+                        root.display()
+                    );
+                }
+            }
+        }
         let extra: BTreeSet<_> = actually_gone.difference(&expected_gone).copied().collect();
         let missed: BTreeSet<_> = expected_gone.difference(&actually_gone).copied().collect();
         prop_assert!(
@@ -893,4 +956,75 @@ fn remove_path_removes_a_dangling_link() {
     cleanup(&sandbox);
     assert!(outcome.is_ok(), "remove_path failed: {outcome:?}");
     assert!(!link_left, "dangling link {} survived", link.display());
+}
+
+/// A regular file written as `notes.txt/` or `notes.txt/.` names nothing to the
+/// kernel. Respelling it to `notes.txt` must not turn it into something to
+/// delete: `remove_path` leaves it, and the uninstall plan calls it not present.
+#[test]
+fn a_regular_file_spelled_as_a_directory_is_not_removed() {
+    for suffix in ["/", "/."] {
+        let sandbox = fresh_sandbox("file-as-dir");
+        let file = sandbox.join("notes.txt");
+        std::fs::write(&file, b"keep").expect("file");
+        let spelled = PathBuf::from(format!("{}{suffix}", file.display()));
+
+        let outcome = remove_path(&spelled);
+        let removed_by_remove_path = !file.is_file();
+
+        let paths = AppPaths {
+            config_dir: sandbox.join("no-config"),
+            data_dir: sandbox.join("no-data"),
+            cache_dir: spelled.clone(),
+        };
+        let options = UninstallOptions {
+            keep_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let plan = build_uninstall_plan(&paths, &options).expect("plan");
+        cleanup(&sandbox);
+
+        assert!(
+            outcome.is_ok(),
+            "remove_path({}) failed: {outcome:?}",
+            spelled.display()
+        );
+        assert!(
+            !removed_by_remove_path,
+            "remove_path({}) deleted the file",
+            spelled.display()
+        );
+        assert!(
+            plan.actions.is_empty(),
+            "{} was planned: {plan:?}",
+            spelled.display()
+        );
+        assert!(
+            plan.skipped
+                .iter()
+                .any(|line| line == &format!("cache path not present: {}", spelled.display())),
+            "{plan:?}"
+        );
+    }
+}
+
+/// The control for the test above: the same spellings of a real directory
+/// still name it, and it is removed.
+#[test]
+fn a_directory_spelled_with_a_trailing_separator_is_removed() {
+    for suffix in ["/", "/."] {
+        let sandbox = fresh_sandbox("dir-as-dir");
+        let dir = sandbox.join("cache");
+        std::fs::create_dir_all(dir.join("sub")).expect("dir");
+        let spelled = PathBuf::from(format!("{}{suffix}", dir.display()));
+        let outcome = remove_path(&spelled);
+        let left = std::fs::symlink_metadata(&dir).is_ok();
+        cleanup(&sandbox);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(
+            !left,
+            "remove_path({}) left the directory",
+            spelled.display()
+        );
+    }
 }
