@@ -68,37 +68,21 @@ pub(crate) fn identity_probe_record(
     )
 }
 
-thread_local! {
-    static FORCED_TERMINATION_OUTCOME: std::cell::Cell<Option<rocm_core::TerminationOutcome>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The outcome `terminate_recorded_pid` reports in place of a real
-/// termination, when a test on this thread has forced one.
-pub(crate) fn forced_termination_outcome() -> Option<rocm_core::TerminationOutcome> {
-    FORCED_TERMINATION_OUTCOME.with(std::cell::Cell::get)
-}
-
-/// Makes every recorded-PID termination on the current thread report a fixed
-/// outcome, without signalling anything, until dropped.
+/// Stop `service_id` with every recorded-PID termination reporting
+/// `outcome`, without signalling anything.
 ///
 /// An unconfirmed stop needs a process that survives `SIGKILL`, or a live
 /// one whose start-time cannot be read; a test can create neither on demand.
-/// Everything downstream of the termination — the verdict, the manifest
-/// write, the key cleanup and the report — still runs for real.
-pub(crate) struct ForcedTerminationOutcome;
-
-impl ForcedTerminationOutcome {
-    pub(crate) fn set(outcome: rocm_core::TerminationOutcome) -> Self {
-        FORCED_TERMINATION_OUTCOME.with(|cell| cell.set(Some(outcome)));
-        Self
-    }
-}
-
-impl Drop for ForcedTerminationOutcome {
-    fn drop(&mut self) {
-        FORCED_TERMINATION_OUTCOME.with(|cell| cell.set(None));
-    }
+/// This stands in for the identity check *and* the signalling — the whole of
+/// `terminate_recorded_pid` — so it proves nothing about either. What it
+/// does exercise for real is everything around them: the PID list, the
+/// verdict, the manifest writes, the key cleanup and the report.
+pub(crate) fn stop_with_outcome(
+    paths: &AppPaths,
+    service_id: &str,
+    outcome: rocm_core::TerminationOutcome,
+) -> Result<serde_json::Value> {
+    crate::service::stop_managed_service_with(paths, service_id, |_| outcome)
 }
 
 /// The recorded PID for the unconfirmed-stop tests. Never signalled: those

@@ -25,8 +25,9 @@ const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::sandbox_stop_server_value;
     use crate::test_support::{
-        ForcedTerminationOutcome, assert_unconfirmed_stop_kept_the_service, seed_keyed_service,
+        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths,
     };
     use crate::watchers::load_service_record;
@@ -92,17 +93,15 @@ mod tests {
         let service_id = "svc-sandbox-stop-unconfirmed";
         let key_path = seed_keyed_service(&paths, service_id, 11448)?;
 
-        let result = {
-            let _forced = ForcedTerminationOutcome::set(rocm_core::TerminationOutcome::Unverified);
-            crate::sandbox::run_sandbox_tool(
-                &paths,
-                crate::cli::SandboxToolArg::StopServer,
-                Some(service_id.to_owned()),
-                None,
-                None,
-                crate::cli::SandboxToolPolicy::default(),
-            )
-        };
+        // The tool is `stop_managed_service` feeding `sandbox_stop_server_value`;
+        // `sandbox_tool_stop_server_updates_manifest_and_skips_current_pid`
+        // drives that whole tool for real.
+        let result = stop_with_outcome(
+            &paths,
+            service_id,
+            rocm_core::TerminationOutcome::Unverified,
+        )
+        .map(sandbox_stop_server_value);
         let key_kept = key_path.exists();
         let reloaded = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();

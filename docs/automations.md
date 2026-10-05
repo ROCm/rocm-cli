@@ -47,7 +47,8 @@ Accepted fields:
   `update.available`, or `schedule.tick`.
 - `service_id`: required for `server-recover` events. The service must still
   currently look recoverable before a restart review or contained restart can
-  run.
+  run. A service someone asked to stop never does, even when that stop is still
+  running or could not confirm its processes exited.
 - `payload.artifact_ref`: required for `cache-warm` events. Use
   `<model-ref>#<artifact-id>` from the model recipe registry.
 - `payload.component`: must be `driver` for `driver-upgrade` events.

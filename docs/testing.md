@@ -800,6 +800,9 @@ cargo test -p rocmd sandbox_tool_stop_server_updates_manifest_and_skips_current_
 cargo test -p rocmd sandbox_tool_stop_server_reports_an_unconfirmed_stop
 cargo test -p rocmd mcp_stop_server_reports_an_unconfirmed_stop_as_an_error
 cargo test -p rocmd mcp_stop_server_reports_a_confirmed_stop_as_success
+cargo test -p rocmd the_stop_request_is_recorded_before_any_process_is_signalled
+cargo test -p rocmd a_stop_keeps_what_another_writer_persisted_while_it_ran
+cargo test -p rocmd a_stop_does_not_clear_processes_recorded_while_it_ran
 cargo test -p rocmd sandbox_tool_notify_user_is_read_only
 cargo test -p rocmd sandbox_runner_native_fallback_records_audit
 ```
@@ -814,7 +817,11 @@ bubblewrap isolation must still execute only this internal tool API and record
 a sandbox audit event. `stop_server` — the sandbox tool and the MCP tool alike —
 reports a stop only once every recorded process is confirmed gone: otherwise
 the sandbox tool reports `status: stop_unconfirmed`, the MCP tool answers with
-`isError: true`, and the manifest keeps its PIDs and endpoint key.
+`isError: true`, and the manifest keeps its PIDs and endpoint key. The stop
+records the request in the manifest before it signals anything, and applies its
+result to the manifest as it is once the stop ends, so a write made meanwhile is
+kept — and a restart that recorded new processes meanwhile makes the stop
+unconfirmed rather than having its PIDs cleared.
 
 Manual restricted-tool smoke:
 
@@ -1122,7 +1129,15 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_collector_emits_endpoint_recoverable_service_event
 cargo test -p rocmd server_recover_local_webhook_does_not_restart_healthy_service
 cargo test -p rocmd recovery_reason_display_avoids_raw_status_tokens
+cargo test -p rocmd recovery_does_not_restart_a_service_whose_stop_is_unconfirmed
+cargo test -p rocmd recovery_skips_a_failed_service_only_while_its_stop_request_stands
+cargo test -p rocmd restart_managed_service_drops_the_replaced_runs_engine_pid
 ```
+
+Server recovery never restarts a service with a standing stop request
+(`stop_requested_unix_ms`): one whose stop is in flight, or could not be
+confirmed. Without that, an unconfirmed stop — which leaves the status at
+`ready` — would be undone by the `server-recover` watcher.
 
 Automation GPU-metrics event tests:
 
