@@ -9,6 +9,8 @@ use crate::{
     examine, managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
     unix_time_millis,
 };
+#[cfg(windows)]
+use crate::{WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT, WINDOWS_SYSTEM_INVENTORY_SCRIPT};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;

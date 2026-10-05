@@ -16,8 +16,6 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(windows)]
-use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
@@ -65,10 +63,11 @@ pub use host_gpu::{
     is_wsl_host, known_therock_families, normalize_therock_family,
     preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
+#[cfg(any(target_os = "linux", test))]
+use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
 use host_gpu::{
-    KfdGpuNode, detect_linux_sysfs_gfx_target, detect_local_windows_host_driver,
-    detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, kfd_gpu_nodes_in,
-    ldconfig_lists_librocdxg,
+    detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
+    detect_wsl_summary, is_wsl1_kernel, ldconfig_lists_librocdxg,
 };
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
