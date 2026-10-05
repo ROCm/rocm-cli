@@ -3606,12 +3606,6 @@ fn install(target: InstallTarget) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct ServeEngineSelection {
-    engine: String,
-    source: &'static str,
-}
-
 /// GPU/device warnings folded into the interactive deployment summary. Mirrors the
 /// inline warnings printed in the plain serve plan, in the same order.
 #[allow(clippy::too_many_arguments)]
@@ -21802,50 +21796,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    pub(crate) fn test_examine(os: &str, wsl: bool) -> ExamineSummary {
-        ExamineSummary {
-            os: os.to_owned(),
-            arch: "x86_64".to_owned(),
-            kernel: Some("6.8.0-test".to_owned()),
-            distro: Some("test distro".to_owned()),
-            cpu: Some("AMD Ryzen".to_owned()),
-            system_ram_gib: Some(64.0),
-            interactive_terminal: false,
-            default_engine: "vllm".to_owned(),
-            detected_gfx_target: Some("gfx1201".to_owned()),
-            compatible_therock_family: Some("gfx120X-all".to_owned()),
-            detected_therock_family: None,
-            driver: rocm_core::DriverSummary {
-                policy: "linux_official_amd_dkms_wrapper".to_owned(),
-                status: "amdgpu_missing".to_owned(),
-                detail: Some("/dev/kfd missing".to_owned()),
-            },
-            legacy_rocm: rocm_core::LegacyRocmSummary {
-                status: "not_detected".to_owned(),
-                paths: Vec::new(),
-                detail: None,
-                version: None,
-            },
-            wsl: wsl.then_some(rocm_core::WslSummary {
-                is_wsl: true,
-                dxg_device: true,
-                dxcore: true,
-                librocdxg: false,
-                rocdxg_dids: false,
-                ldconfig_librocdxg: false,
-                rocminfo: false,
-                cargo: false,
-                detail: Some("missing librocdxg".to_owned()),
-            }),
-            managed_runtime_count: 0,
-            managed_service_count: 0,
-            model_cache_entries: 0,
-            config_dir: PathBuf::from("/tmp/config"),
-            data_dir: PathBuf::from("/tmp/data"),
-            cache_dir: PathBuf::from("/tmp/cache"),
-        }
-    }
-
     fn test_app_paths() -> AppPaths {
         AppPaths {
             config_dir: PathBuf::from("C:/Users/test/.rocm"),
@@ -29065,29 +29015,6 @@ install therock";
         assert!(vram_capacity_is_meaningful(None, 1));
     }
 
-    /// Every distro whose plan actually emits privileged commands, so the
-    /// escalation tests below sweep all of them rather than whichever one was
-    /// remembered. Adding a distro to the planner without adding it here would
-    /// leave its commands unswept.
-    pub(crate) fn dkms_planning_os_releases() -> Vec<(&'static str, &'static str)> {
-        vec![
-            (
-                "ubuntu",
-                "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\n",
-            ),
-            ("debian", "ID=debian\nVERSION_ID=\"12\"\n"),
-            ("rhel", "ID=rhel\nVERSION_ID=\"9.7\"\n"),
-            ("rhel-8", "ID=rhel\nVERSION_ID=\"8.10\"\n"),
-            ("oracle", "ID=ol\nVERSION_ID=\"9.7\"\n"),
-            ("rocky", "ID=rocky\nVERSION_ID=\"9.4\"\n"),
-            ("sles", "ID=sles\nVERSION_ID=\"15.7\"\n"),
-            (
-                "almalinux-via-id-like",
-                "ID=almalinux\nVERSION_ID=\"9.4\"\nID_LIKE=\"rhel centos fedora\"\n",
-            ),
-        ]
-    }
-
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
     /// trips the serve-plan low-VRAM warning on a non-APU (vLLM-lane) host, and
     /// stay inert when the var is unset. This is what the `@requires-gpu`
@@ -31736,29 +31663,6 @@ install therock";
         assert_eq!(sdk_torch_build_from_manifest(&manifest), None);
     }
 
-    /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
-    ///
-    /// They differ in `runtime_key`, `version` and install root, and share one
-    /// `runtime_id` — that is what the field means, so this is not a corrupt
-    /// registry.
-    pub(crate) fn side_by_side_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
-        let mut older = test_runtime_manifest_for_update(
-            "release-wheel-gfx94x-dcgpu-7-13-0",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.13.0",
-        );
-        older.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0");
-        let mut newer = test_runtime_manifest_for_update(
-            "release-wheel-gfx94x-dcgpu-7-14-0",
-            "therock-release:gfx94X-dcgpu",
-            "gfx94X-dcgpu",
-            "7.14.0",
-        );
-        newer.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
-        vec![older, newer]
-    }
-
     /// A torch the user installed themselves is kept, and named as kept.
     ///
     /// The Python does not exist and an index is supplied, so an alignment that
@@ -33427,35 +33331,6 @@ install therock";
         fs::write(&path, "not-a-pid").expect("write garbage");
         assert_eq!(read_autostart_claim(&path), None);
         let _ = fs::remove_dir_all(&root);
-    }
-
-    /// Persist a live-looking managed record claiming `gpu` — the same shape a
-    /// real launch writes, with the current process id as the supervisor so the
-    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
-    /// counted by `busy_gpu_indices`).
-    pub(crate) fn write_claiming_record(
-        paths: &AppPaths,
-        service_id: &str,
-        port: u16,
-        gpu: &[u32],
-    ) {
-        let mut record = ManagedServiceRecord::new(
-            paths,
-            service_id,
-            "vllm",
-            "qwen",
-            "Qwen/Qwen3.5",
-            "127.0.0.1",
-            port,
-            "managed",
-            std::process::id(),
-            Some("therock-release".to_owned()),
-            None,
-            Some("gpu_required".to_owned()),
-        );
-        record.status = "starting".to_owned();
-        record.gpu_indices = gpu.to_vec();
-        record.write().expect("write claiming record");
     }
 
     fn main_rs_source() -> String {

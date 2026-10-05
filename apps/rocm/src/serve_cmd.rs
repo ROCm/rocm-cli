@@ -31,7 +31,7 @@ use crate::endpoint_keys;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::serve_summary;
 use crate::{
-    ServeEngineSelection, cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name,
+    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name,
     drop_orphaned_endpoint_key_on_already_running, engine_request,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported, gpu_vram_usage,
     parse_device_policy, parse_gpu_selection, print_managed_launch_plain, resolve_endpoint_auth,
@@ -39,6 +39,12 @@ use crate::{
     serve_gpu_low_memory_warning, start_managed_service, validate_bind_host,
     validate_engine_selection_runtime, validate_pinned_gpu_index,
 };
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ServeEngineSelection {
+    engine: String,
+    source: &'static str,
+}
 
 fn select_serve_engine(
     explicit_engine: Option<&str>,
@@ -946,13 +952,37 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use rocm_core::resolve_builtin_model_recipe;
+    use rocm_core::{ManagedServiceRecord, resolve_builtin_model_recipe};
 
-    use crate::tests::{test_paths, write_claiming_record};
+    use crate::tests::test_paths;
     use crate::{
         DEFAULT_ENGINE_MARKER, append_examine_engine_inventory, build_freeform_plan_with_recipes,
         render_engine_inventory_text_with_paths,
     };
+
+    /// Persist a live-looking managed record claiming `gpu` — the same shape a
+    /// real launch writes, with the current process id as the supervisor so the
+    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
+    /// counted by `busy_gpu_indices`).
+    fn write_claiming_record(paths: &AppPaths, service_id: &str, port: u16, gpu: &[u32]) {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "starting".to_owned();
+        record.gpu_indices = gpu.to_vec();
+        record.write().expect("write claiming record");
+    }
 
     #[test]
     fn hybrid_planner_bakes_the_host_engine_into_the_generated_serve_command() {

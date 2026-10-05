@@ -692,9 +692,30 @@ fn load_engine_env_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{
-        side_by_side_runtimes, test_paths, test_runtime_manifest_for_update, write_test_pip_runtime,
-    };
+    use crate::tests::{test_paths, test_runtime_manifest_for_update, write_test_pip_runtime};
+
+    /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
+    ///
+    /// They differ in `runtime_key`, `version` and install root, and share one
+    /// `runtime_id` — that is what the field means, so this is not a corrupt
+    /// registry.
+    fn side_by_side_runtimes() -> Vec<therock::InstalledRuntimeManifest> {
+        let mut older = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-13-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.13.0",
+        );
+        older.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-13-0");
+        let mut newer = test_runtime_manifest_for_update(
+            "release-wheel-gfx94x-dcgpu-7-14-0",
+            "therock-release:gfx94X-dcgpu",
+            "gfx94X-dcgpu",
+            "7.14.0",
+        );
+        newer.install_root = PathBuf::from("/runtimes/release-wheel-gfx94x-dcgpu-7-14-0");
+        vec![older, newer]
+    }
 
     #[test]
     fn engine_install_runtime_selection_requires_configured_runtime() -> Result<()> {
