@@ -36,6 +36,7 @@ const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
 const MERGE_QUEUE_TAG: &str = "merge-queue";
+const GPU_SMOKE_TAG: &str = "gpu-smoke";
 
 // `@serial` deliberately has no entry here, and `from_tags` below silently
 // ignores it like any other unrecognized tag: it isn't an expectation-
@@ -210,6 +211,10 @@ pub struct ScenarioDecl {
     /// `E2E_MERGE_QUEUE`. Keeps the PR feedback loop short while still exercising
     /// the full serve matrix before a change lands.
     pub merge_queue: bool,
+    /// `@gpu-smoke`: one of the cheap per-engine real-GPU canaries that still
+    /// run on a pull request and in the merge queue, where a GPU lane runs no
+    /// other real-GPU scenario (`E2E_GPU_SMOKE_ONLY`, see [`restrict_to_smoke`]).
+    pub gpu_smoke: bool,
 }
 
 impl ScenarioDecl {
@@ -231,6 +236,7 @@ impl ScenarioDecl {
         let mut nightly = false;
         let mut lifecycle = false;
         let mut merge_queue = false;
+        let mut gpu_smoke = false;
         for tag in tags {
             let tag = tag
                 .as_ref()
@@ -269,6 +275,8 @@ impl ScenarioDecl {
                 lifecycle = true;
             } else if tag == MERGE_QUEUE_TAG {
                 merge_queue = true;
+            } else if tag == GPU_SMOKE_TAG {
+                gpu_smoke = true;
             }
         }
         Self {
@@ -287,6 +295,7 @@ impl ScenarioDecl {
             nightly,
             lifecycle,
             merge_queue,
+            gpu_smoke,
         }
     }
 
@@ -667,6 +676,62 @@ pub fn resolve(
 
     // (3) default.
     Expectation::ExpectPass
+}
+
+/// Which part of the suite a lane runs, beyond what the host can run at all.
+///
+/// Both default to `false`: a lane runs everything its host can.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaneSelection {
+    /// `E2E_GPU_ONLY`: a self-hosted GPU lane runs only the scenarios that need
+    /// the real hardware it has. Everything else runs on the GitHub-hosted
+    /// Linux and Windows lanes, where a GPU runner's time is not spent on it.
+    pub gpu_only: bool,
+    /// `E2E_GPU_SMOKE_ONLY`: on a pull request and in the merge queue, a GPU
+    /// lane's real-GPU scenarios narrow further to the `@gpu-smoke` canaries
+    /// (and, in the queue, the `@merge-queue` serves).
+    pub smoke_only: bool,
+}
+
+/// Whether a scenario needs the real GPU of the machine it runs on — a usable
+/// device, or a detected chip name — as opposed to running anywhere, simulated
+/// machines included.
+const fn needs_real_gpu(decl: &ScenarioDecl) -> bool {
+    decl.requires_gpu || decl.requires_gfx_target
+}
+
+/// Narrow a scenario's resolution to what this lane runs (see [`LaneSelection`]).
+///
+/// A scenario outside the lane's share resolves to `Skip` with the reason
+/// recorded, so the report shows it as not applicable on that lane rather than
+/// as a result that never arrived. An expectation that already resolved to
+/// `Skip` keeps its own, more precise reason.
+#[must_use]
+pub fn restrict_to_lane(
+    decl: &ScenarioDecl,
+    expectation: Expectation,
+    lane: LaneSelection,
+) -> Expectation {
+    if matches!(expectation, Expectation::Skip { .. }) {
+        return expectation;
+    }
+    let real_gpu = needs_real_gpu(decl);
+    if lane.gpu_only && !real_gpu {
+        return Expectation::Skip {
+            reason: "this GPU lane runs only scenarios that need its GPU (E2E_GPU_ONLY); \
+                     the rest run on the GitHub-hosted Linux and Windows lanes"
+                .to_owned(),
+        };
+    }
+    if lane.smoke_only && real_gpu && !decl.gpu_smoke && !decl.merge_queue {
+        return Expectation::Skip {
+            reason: "this GPU lane runs only the @gpu-smoke real-GPU canaries on a pull \
+                     request (E2E_GPU_SMOKE_ONLY); the full GPU suite runs nightly and on \
+                     pushes"
+                .to_owned(),
+        };
+    }
+    expectation
 }
 
 /// Tiny glob: `*` matches any run of chars. Used only for `therock_family`.
@@ -1978,5 +2043,79 @@ flaky = true
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_gpu_lane_runs_only_its_gpu_scenarios_narrowed_to_the_smoke_test_on_prs() {
+        let xfail = || Expectation::ExpectXfail {
+            bug: "B-1".to_owned(),
+            reason: "known".to_owned(),
+            flaky: false,
+        };
+        let canary = decl(&["id:serve-vllm", "requires-real-gpu", "gpu-smoke"]);
+        let queue_serve = decl(&["id:serve-default", "requires-real-gpu", "merge-queue"]);
+        let heavy = decl(&["id:runtime-install", "requires-real-gpu"]);
+        let gfx = decl(&["id:runtime-resolve", "requires-gfx-target"]);
+        let no_gpu = decl(&["id:examine-version"]);
+        let simulated = decl(&["id:examine-detects-wsl", "requires-os:linux"]);
+        let skip_reason = |e: Expectation| match e {
+            Expectation::Skip { reason } => reason,
+            other => panic!("expected skip, got {other:?}"),
+        };
+
+        let gpu_lane = LaneSelection {
+            gpu_only: true,
+            smoke_only: false,
+        };
+        // A GPU lane leaves everything that needs no GPU, simulated machines
+        // included, to the hosted lanes — and says so.
+        for d in [&no_gpu, &simulated] {
+            assert!(
+                skip_reason(restrict_to_lane(d, Expectation::ExpectPass, gpu_lane))
+                    .contains("E2E_GPU_ONLY")
+            );
+        }
+        // It keeps every scenario that needs its hardware, resolution intact.
+        for d in [&canary, &queue_serve, &heavy, &gfx] {
+            assert_eq!(restrict_to_lane(d, xfail(), gpu_lane), xfail());
+        }
+
+        let pr_gpu_lane = LaneSelection {
+            gpu_only: true,
+            smoke_only: true,
+        };
+        // On a pull request only the canaries and the queue serves remain.
+        assert_eq!(restrict_to_lane(&canary, xfail(), pr_gpu_lane), xfail());
+        assert_eq!(
+            restrict_to_lane(&queue_serve, Expectation::ExpectPass, pr_gpu_lane),
+            Expectation::ExpectPass
+        );
+        for d in [&heavy, &gfx] {
+            assert!(
+                skip_reason(restrict_to_lane(d, xfail(), pr_gpu_lane))
+                    .contains("E2E_GPU_SMOKE_ONLY")
+            );
+        }
+
+        // A lane without a GPU (the WSL lane sets only the smoke switch) keeps
+        // its non-GPU scenarios.
+        let smoke_only = LaneSelection {
+            gpu_only: false,
+            smoke_only: true,
+        };
+        assert_eq!(
+            restrict_to_lane(&no_gpu, Expectation::ExpectPass, smoke_only),
+            Expectation::ExpectPass
+        );
+        // A skip that already happened keeps its own, more precise reason.
+        let skip = Expectation::Skip {
+            reason: "requires os 'linux'".to_owned(),
+        };
+        assert_eq!(restrict_to_lane(&no_gpu, skip.clone(), pr_gpu_lane), skip);
+        // A lane with no selection changes nothing.
+        assert_eq!(
+            restrict_to_lane(&heavy, Expectation::ExpectPass, LaneSelection::default()),
+            Expectation::ExpectPass
+        );
     }
 }

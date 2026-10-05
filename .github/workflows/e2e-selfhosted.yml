@@ -181,14 +181,25 @@ jobs:
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Opt-in @merge-queue serves: the heavy real serves (default-engine +
-      # readiness) run only in the merge queue, where a cheaper per-engine canary
-      # (scenarios 5 vLLM / 7 lemonade) has already guarded the PR. This keeps the
-      # per-PR GPU run short while still exercising the full serve matrix before a
-      # change lands. Only set on the `merge_group` event.
+      # readiness) run only in the merge queue, where the cheaper per-engine
+      # `@gpu-smoke` canaries have already guarded the PR. Only set on the
+      # `merge_group` event.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # On a pull request and in the merge queue, of the scenarios that need a
+      # real GPU only the `@gpu-smoke` canaries (and, in the queue, the
+      # @merge-queue serves) run. Every GPU scenario that only needs the CLI to
+      # see a GPU runs on a simulated machine on the hosted `E2E tests` lane. The
+      # full real-GPU suite runs on pushes to main/release, on dispatch, and
+      # nightly. Keeps the GPU lanes, which set merge latency, short.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # A real GPU lane: run the `@requires-real-gpu` scenarios that a simulated
       # host cannot stand in for. See HardwareMode in src/expectation.rs.
       E2E_HARDWARE: real
+      # ...and ONLY those, on every event: everything that needs no GPU runs on
+      # the GitHub-hosted Linux and Windows lanes in ci.yml (`E2E tests`,
+      # `E2E tests (Windows)`), so a GPU runner's time is not spent on it. See
+      # restrict_to_lane in src/expectation.rs.
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -421,8 +432,11 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -676,8 +690,11 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -964,6 +981,8 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
       # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
@@ -1364,7 +1383,7 @@ jobs:
           # Forward the job-level E2E_* env vars into the guest: `wsl.exe`
           # does not share the calling process's environment unless a
           # variable is named in WSLENV.
-          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:E2E_HARDWARE:ROCM_CLI_RELEASE_REF'
+          $env:WSLENV = 'E2E_SERVE_TIMEOUT_SECS:E2E_TUI_TIMEOUT_SECS:E2E_INCLUDE_NIGHTLY:E2E_MERGE_QUEUE:E2E_GPU_SMOKE_ONLY:E2E_HARDWARE:ROCM_CLI_RELEASE_REF'
           & "$env:GITHUB_WORKSPACE\.github\scripts\Invoke-WslBash.ps1" -PipeFail -Script @'
           export PATH="$HOME/.cargo/bin:$PATH"
           cd /root/work/rocm-cli
@@ -1489,8 +1508,11 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Full serve matrix at the merge-queue gate, like every other lane (see e2e-gpu).
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1619,8 +1641,11 @@ jobs:
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
       # Full serve matrix at the merge-queue gate, like every other lane (see e2e-gpu).
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
+      # GPU smoke test only on pull requests and in the merge queue; see the e2e-gpu lane.
+      E2E_GPU_SMOKE_ONLY: "${{ (github.event_name == 'merge_group' || github.event_name == 'pull_request') && '1' || '' }}"
       # See the e2e-gpu lane.
       E2E_HARDWARE: real
+      E2E_GPU_ONLY: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

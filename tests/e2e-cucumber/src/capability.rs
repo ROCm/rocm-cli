@@ -640,7 +640,12 @@ fn derive_platform_slug(
         };
     }
     if !has_amd_gpu {
-        return "mock".to_owned();
+        // The hosted Windows lane has no GPU either; give it its own column.
+        return if os_normalized(os_family) == "windows" {
+            "mock-windows".to_owned()
+        } else {
+            "mock".to_owned()
+        };
     }
     match gfx_target {
         Some(t) => {
@@ -950,6 +955,11 @@ Local model engines
     #[test]
     fn platform_slug_derivation() {
         assert_eq!(derive_platform_slug(false, None, "other", false), "mock");
+        // The hosted Windows lane must not collide with the hosted Linux one.
+        assert_eq!(
+            derive_platform_slug(false, None, "windows", false),
+            "mock-windows"
+        );
         // gfx950 normalizes to a `-dcgpu` family like gfx94x does, but it is a
         // different part with its own lane and report column — it must not be
         // slugged as mi300x.
