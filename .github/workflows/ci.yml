@@ -621,19 +621,30 @@ jobs:
       #
       # Runs before the build so a lint failure costs seconds rather than the
       # full build/test/package cycle, matching why this job `needs: clippy`.
+      #
+      # One cargo command per step, here and in Build below: `shell: pwsh` does
+      # not stop on a failing native command, and the step's result is only the
+      # LAST command's exit code — so a second command that passes would turn a
+      # failing first one green.
       - name: Clippy (Windows targets)
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          cargo clippy --locked --workspace --all-targets -- -D warnings
-          cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Clippy (Windows, e2e harness + steps)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo clippy --locked -p e2e-cucumber --test e2e -- -D warnings
 
       - name: Build
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          cargo build --workspace --all-targets
-          cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
+        run: cargo build --workspace --all-targets
+
+      - name: Build (release)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: cargo build --release -p rocm -p rocmd -p rocm-engine-lemonade -p rocm-engine-vllm -p xtask
 
       - name: Test
         if: needs.changes.outputs.heavy == 'true'
