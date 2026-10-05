@@ -1468,7 +1468,7 @@ pub(crate) fn restart_managed_service(
     // that write can land after the child's. Clearing here keeps the invariant
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
-    crate::service::record_supervisor_identity(record, std::process::id());
+    record.record_supervisor_identity(std::process::id());
     // The engine PID belonged to the run being replaced, and nothing here
     // starts an engine: the supervisor spawned below records its own, together
     // with its token. Carried forward, the old PID would sit beside a
@@ -1489,7 +1489,7 @@ pub(crate) fn restart_managed_service(
         .spawn()
         .context("failed to spawn recovery supervisor")?;
 
-    crate::service::record_supervisor_identity(record, child.id());
+    record.record_supervisor_identity(child.id());
     record.write()?;
 
     thread::sleep(Duration::from_millis(200));

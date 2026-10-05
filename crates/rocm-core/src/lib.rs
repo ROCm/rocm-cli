@@ -4150,6 +4150,26 @@ impl ManagedServiceRecord {
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
 
+    /// Record `pid` as the supervisor, together with its start-time token.
+    ///
+    /// Call it while the process is known to be alive — just after spawning
+    /// it. A stop verifies a recorded PID against its token before signalling
+    /// it, and [`crate::identity_state`] treats a PID recorded *without* one as
+    /// a match, so a PID written on its own is signalled on trust alone once it
+    /// has been recycled. Writing the two together is what keeps that from
+    /// happening at whichever site records a PID next.
+    pub fn record_supervisor_identity(&mut self, pid: u32) {
+        self.supervisor_pid = pid;
+        self.supervisor_start_ticks = crate::process_start_ticks(pid);
+    }
+
+    /// Record `pid` as the engine, together with its start-time token. See
+    /// [`Self::record_supervisor_identity`].
+    pub fn record_engine_identity(&mut self, pid: u32) {
+        self.engine_pid = Some(pid);
+        self.engine_start_ticks = crate::process_start_ticks(pid);
+    }
+
     pub fn normalize_paths_for_host(&mut self) {
         self.manifest_path = normalize_runtime_path_for_host(&self.manifest_path);
         self.log_path = normalize_runtime_path_for_host(&self.log_path);
@@ -6052,6 +6072,35 @@ mod tests {
         );
         assert_eq!(record.restart_count, 3);
         assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    /// Each role is written with its own PID's token, so a stop can verify it.
+    /// A role recorded without one is signalled on trust alone once its PID has
+    /// been recycled. One live process stands in for both roles, as it does for
+    /// a `rocm serve --background` launch.
+    ///
+    /// Linux-only: `process_start_ticks` reads `/proc`, and is `None` elsewhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_a_process_identity_writes_the_pid_with_its_own_token() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let expected = crate::process_start_ticks(pid);
+        let mut record = probe_test_record(11436);
+
+        record.record_supervisor_identity(pid);
+        record.record_engine_identity(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(expected.is_some(), "precondition: a live child has a token");
+        assert_eq!(record.supervisor_pid, pid);
+        assert_eq!(record.supervisor_start_ticks, expected);
+        assert_eq!(record.engine_pid, Some(pid));
+        assert_eq!(record.engine_start_ticks, expected);
     }
 
     #[test]

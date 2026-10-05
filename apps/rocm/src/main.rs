@@ -7357,11 +7357,13 @@ fn spawn_managed_engine_child(
         }
         child_pid
     };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // The child is both roles until the engine state file names a separate
+    // server process. Each role gets its own token, captured while the child is
+    // alive: a stop pairs every recorded PID with its own token, and the two
+    // PIDs diverge as soon as `rocmd` restarts the service — at which point an
+    // engine PID recorded without one could only be signalled blind.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -18872,10 +18874,10 @@ fn restart_internal_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
     record.status = "running".to_owned();
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Refresh the identity token in lockstep with the restarted child's PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // Both roles move to the restarted child, each with its own token — see
+    // `spawn_managed_engine_child`.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     // Counts the restart and drops the previous run's inference verification —
     // the new child has an unloaded model, so the old verdict says nothing about
     // it.
