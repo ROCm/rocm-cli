@@ -1076,17 +1076,15 @@ enum Origin {
 }
 
 fn origin(item: &Advice) -> Origin {
-    let file = item.source.rsplit_once(':').map_or("", |(file, _)| file);
     if item.source.starts_with('`') {
-        Origin::Help
-    } else if file.ends_with(".rs") {
-        Origin::Rust
-    } else if file.ends_with(".md") {
-        Origin::Markdown
-    } else if file.ends_with(".tape") {
-        Origin::Tape
-    } else {
-        panic!("advice from an unknown source: {}", item.source)
+        return Origin::Help;
+    }
+    let file = item.source.rsplit_once(':').map_or("", |(file, _)| file);
+    match Path::new(file).extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => Origin::Rust,
+        Some("md") => Origin::Markdown,
+        Some("tape") => Origin::Tape,
+        _ => panic!("advice from an unknown source: {}", item.source),
     }
 }
 
