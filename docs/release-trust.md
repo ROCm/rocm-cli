@@ -250,10 +250,12 @@ rocm-cli decides what hardware it is running on by reading fixed host paths:
 `/dev/kfd`, `/dev/dri`, `/dev/dxg`, the KFD topology under `/sys/class/kfd`,
 the DRM cards under `/sys/class/drm`, `/sys/module/amdgpu`, `/proc/version`,
 `/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`, `/proc/modules`,
-`/etc/os-release`, the modprobe configuration directories, and the WSL plumbing
-under `/usr/lib/wsl` and `/opt/rocm`. The E2E suite can point those reads at a
-directory it populated with a simulated host instead, but only in builds
-compiled with the `e2e-test-hooks` Cargo feature:
+`/proc/1/cgroup`, the container markers `/.dockerenv` and `/run/.containerenv`,
+`/etc/os-release`, the modprobe configuration directories, the WSL plumbing
+under `/usr/lib/wsl`, and the WSL ROCDXG capability check, which looks for
+`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm`. The E2E
+suite can point those reads at a directory it populated with a simulated host
+instead, but only in builds compiled with the `e2e-test-hooks` Cargo feature:
 
 ```text
 ROCM_CLI_TEST_HOST_ROOT
@@ -263,10 +265,17 @@ Same model as the ComfyUI override above: in a build without
 `e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
 reads the environment, so a release build always probes the real machine. The
 re-rooting changes only where the probes read; the CLI still names the logical
-path (`/dev/kfd`) when it reports a device. Paths a real process acts on are
-never re-rooted: discovered ROCm installs, which the CLI prints and can write
-into a shell rc file, and the `/usr/lib/wsl/lib` loader entry an engine is
-launched with.
+path (`/dev/kfd`) when it reports a device.
+
+Some reads stay on the real machine even in a hook build:
+
+- ROCm install discovery. The installs `rocm examine` reports, with their
+  paths and versions, are always the real ones: the CLI prints those paths and
+  can write them into a shell rc file. Only the ROCDXG file check above is
+  re-rooted.
+- The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
+  the probes execute, such as `ldconfig`.
+- The package-manager install hints, which read the real `/etc/os-release`.
 
 ## Remaining Owner Step
 
