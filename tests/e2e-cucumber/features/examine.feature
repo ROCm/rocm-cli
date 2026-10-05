@@ -291,10 +291,14 @@ Feature: GPU detection and system inspection
   #
   # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
   # occur naturally, which would strand this on a lane that does not run per-PR.
-  # A stub `amd-smi` on `PATH` reaches the same code because the isolated
-  # `<data>/runtimes` registry is empty by design (see `E2eWorld::default`), so
-  # `resolve_amd_smi_binary` falls through its managed-SDK lookups to the bare
-  # `PATH` name. Linux-only because the stub is a shell script.
+  # A stub `amd-smi` on `PATH` reaches the same code, but only because the step
+  # also points `HOME` at the isolated root. `resolve_amd_smi_binary` tries
+  # `default_data_dir()/runtimes/registry` and then the home fallbacks, and both
+  # resolve through `runtime_home_dir()` -- the real `$HOME`, not
+  # `ROCM_CLI_DATA_DIR`, which `isolate_env` does not override. Without that
+  # `HOME`, a host with a managed SDK under `~/.rocm` would run the real
+  # `amd-smi` and this scenario would fail for an unrelated reason.
+  # Linux-only because the stub is a shell script.
   @id:examine-telemetry-survives-large-amd-smi-output @requires-os:linux
   Scenario: examine-20 - GPU telemetry survives an amd-smi that outruns the pipe buffer
     Given amd-smi reports more output than a pipe buffer holds

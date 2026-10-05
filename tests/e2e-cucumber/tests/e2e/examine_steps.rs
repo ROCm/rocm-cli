@@ -1357,9 +1357,28 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     command.arg("bridge-snapshot");
     world.isolate_cmd(&mut command);
 
-    // The stub wins because the isolated `<data>/runtimes` registry is empty and
-    // `HOME` is isolated too, so `resolve_amd_smi_binary` exhausts its
-    // managed-SDK lookups and falls through to the bare `PATH` name.
+    // `resolve_amd_smi_binary` looks in two places before `PATH`, and NEITHER is
+    // covered by `isolate_env`: `default_data_dir()/runtimes/registry` and the
+    // home fallbacks both resolve through `runtime_home_dir()`, which reads the
+    // real `$HOME` (`BaseDirs::new()`) rather than `ROCM_CLI_DATA_DIR`. On a host
+    // carrying a managed SDK under `~/.rocm`, the real `amd-smi` would therefore
+    // win and the stub would never run -- the scenario would fail on the size
+    // assertion and blame the pipe-drain defect for an environment problem.
+    //
+    // So point `HOME` at the isolated root for this invocation only. Scoped here
+    // rather than added to `isolate_env`, because other scenarios deliberately
+    // inherit the real HOME/XDG environment (see `isolate_env`'s note on PTY
+    // defaults) and would change behaviour if it moved.
+    let isolated_home = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    command.env("HOME", &isolated_home);
+
+    // With both managed-SDK lookups now rooted in an empty isolated tree,
+    // `resolve_amd_smi_binary` falls through to the bare `PATH` name below.
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
         std::iter::once(stub_bin_dir(world)).chain(std::env::split_paths(&inherited)),
