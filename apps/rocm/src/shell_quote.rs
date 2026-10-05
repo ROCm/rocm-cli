@@ -121,8 +121,9 @@ mod tests {
     use proptest::prelude::*;
 
     /// Render an argv the way every display site does, then split it back the
-    /// way a shell would. `shlex` is the oracle: it is a POSIX word-splitter,
-    /// which is precisely the reader the rendered line is written for.
+    /// way a shell would. `shlex` is a POSIX word-splitter, so it checks word
+    /// boundaries and quote removal; it does not expand anything, which is why
+    /// `a_real_shell_reads_a_rendered_argv_back_unchanged` exists beside it.
     fn render_and_split(argv: &[String]) -> Option<Vec<String>> {
         let rendered = argv
             .iter()
@@ -164,6 +165,68 @@ mod tests {
         fn an_argument_can_never_add_a_word(argv in hostile_argv()) {
             let split = render_and_split(&argv).expect("rendered line must parse");
             prop_assert_eq!(split.len(), argv.len());
+        }
+    }
+
+    /// Hand `line` to a real `sh` as the operands of `printf` and return the
+    /// words it received.
+    ///
+    /// `shlex` only splits words and removes quotes; it performs no expansion,
+    /// so it hands back `$HOME`, `~`, `?` and `` `id` `` unchanged and calls a
+    /// line that leaves them bare a clean round-trip. Only a shell can say
+    /// whether a value would be expanded on paste. The shell runs in a
+    /// directory holding files `a` and `1`, so an unquoted `?` or `*` really
+    /// globs, and with `HOME` pointed at a sentinel, so an unquoted `~` really
+    /// changes.
+    #[cfg(unix)]
+    fn words_a_real_shell_reads(line: &str) -> Vec<String> {
+        static GLOB_BAIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let dir = GLOB_BAIT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "rocm-shell-quote-glob-bait-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create glob-bait dir");
+            for name in ["a", "1"] {
+                std::fs::write(dir.join(name), b"").expect("create glob-bait file");
+            }
+            dir
+        });
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {line}"))
+            .current_dir(dir)
+            .env("HOME", "/nonexistent/rocm-shell-quote-home")
+            .output()
+            .expect("sh should run");
+        let mut words: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .map(str::to_owned)
+            .collect();
+        // `printf` terminates every word, so the final piece is always empty.
+        words.pop();
+        words
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        /// The round-trip again, with a real shell as the reader instead of a
+        /// word-splitter: no generated value is split, expanded, globbed or
+        /// executed. This is the check that fails if a character with meaning to
+        /// a shell (`$`, `~`, `?`, `*`, a backtick) is ever treated as inert.
+        #[test]
+        fn a_real_shell_reads_a_rendered_argv_back_unchanged(argv in hostile_argv()) {
+            let rendered = argv
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            prop_assert_eq!(
+                words_a_real_shell_reads(&rendered),
+                argv,
+                "rendered = {:?}",
+                rendered
+            );
         }
     }
 
