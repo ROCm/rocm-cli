@@ -1,0 +1,58 @@
+# Grades skills/rocm-doctor with skillscope, the same harness amd/skills runs
+# against its catalog. The AMD Skills intake requires these to pass here, in the
+# product repo, before a federation PR is opened there -- so this file is what
+# makes this repo the source of truth for whether the skill is shippable.
+#
+# Scoped to `skills/rocm-doctor` rather than `skills/*` on purpose:
+# `skills/rocm-cli-assistant` carries no evals/ and no skill-card.md, so grading
+# it would fail structurally on something the intake is not asking for. Add it
+# here once it has both.
+name: AMD Skills Checks
+
+on:
+  pull_request:
+    paths:
+      - "skills/rocm-doctor/**"
+      - ".github/workflows/skill-evals.yml"
+  workflow_dispatch:
+    inputs:
+      structural:
+        description: Structural tests (no model calls)
+        type: boolean
+        default: true
+      routing:
+        description: Routing tests (needs a model key)
+        type: boolean
+        default: false
+      behavioral:
+        description: Behavioral tests (needs a model key)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    name: AMD Skills Checks
+    uses: amd/skillscope/.github/workflows/reusable.yml@v0.1.3
+    # Mapped by name rather than `secrets: inherit` so the called workflow is
+    # handed one secret and never sees the rest of this repo's.
+    secrets:
+      api_key: ${{ secrets.ORCHESTR_API_KEY }}
+    with:
+      skills: skills/rocm-doctor
+      # Structural needs no model and gates every PR. Routing and behavioral are
+      # dispatch-only until ORCHESTR_API_KEY exists on this repo: without a key
+      # they cannot run, and a leg that always fails teaches reviewers to ignore
+      # a red check. Flip both to `required` on `pull_request` once the secret
+      # is in place -- the intake counts them as required.
+      structural: ${{ github.event_name != 'workflow_dispatch' && 'required' || inputs.structural && 'required' || 'off' }}
+      routing: ${{ github.event_name == 'workflow_dispatch' && inputs.routing && 'required' || 'off' }}
+      behavioral: ${{ github.event_name == 'workflow_dispatch' && inputs.behavioral && 'required' || 'off' }}
+      # AMD's internal gateway, matching what amd/skills itself uses. `$API_KEY`
+      # is substituted by the called workflow, so the key stays a secret here.
+      api_base_url: https://llm-api.amd.com/Anthropic
+      api_custom_headers: |
+        Ocp-Apim-Subscription-Key: $API_KEY
+        user: a1_ucicd
