@@ -31,6 +31,7 @@ pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod runtime;
@@ -38,7 +39,7 @@ pub mod runtime;
 mod test_env;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
 pub use disk_space::{

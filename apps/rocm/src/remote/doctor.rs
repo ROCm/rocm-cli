@@ -338,6 +338,11 @@ mod tests {
                 url: "https://example.invalid/issues".to_owned(),
             },
             out_of_scope: None,
+            // These fixtures exercise the remote renderer, which prints the
+            // environment half of a report. A model verdict rides on top of
+            // that half rather than replacing it, so there is nothing for these
+            // to say about one.
+            model: None,
         }
     }
 
