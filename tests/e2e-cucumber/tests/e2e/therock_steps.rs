@@ -712,6 +712,56 @@ async fn preview_pinned_tarball_install_with_group_family(world: &mut E2eWorld) 
     );
 }
 
+/// The install folder therock-next-11 asks for: inside the scenario's root, with
+/// a lone `'` in its name — the shape the old dry-run quoter left bare.
+const QUOTED_FOLDER_NAME: &str = "it's-here";
+
+#[when(
+    "the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote"
+)]
+async fn preview_unpinned_wheel_install_into_quoted_folder(world: &mut E2eWorld) {
+    let prefix = root(world)
+        .join(QUOTED_FOLDER_NAME)
+        .to_string_lossy()
+        .into_owned();
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--prefix",
+            &prefix,
+            "--dry-run",
+        ],
+    );
+}
+
+#[then("the dry-run command line names that folder as a single argument")]
+async fn assert_dry_run_command_keeps_quoted_folder_whole(world: &mut E2eWorld) {
+    let output = stdout(world);
+    let line = output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("command: "))
+        .unwrap_or_else(|| panic!("no `command:` line in the dry-run preview:\n{output}"));
+    let words = shlex::split(line)
+        .unwrap_or_else(|| panic!("the dry-run `command:` line does not parse: `{line}`"));
+    // By file name rather than the full path: the CLI resolves the prefix
+    // through symlinks, so the folder's parent may be spelled differently from
+    // the one this step built. What must hold is that one whole word names it.
+    assert!(
+        words.iter().any(|word| {
+            Path::new(word).file_name() == Some(std::ffi::OsStr::new(QUOTED_FOLDER_NAME))
+        }),
+        "the dry-run `command:` line must name the install folder as one argument, got `{line}`"
+    );
+}
+
 fn stdout(world: &E2eWorld) -> &str {
     world.cli_output.as_deref().unwrap_or_default()
 }

@@ -173,3 +173,17 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
     Then the preview resolves the ROCm 10 pip index
     And the preview requests the gfx1200 device extras with the toolchain
+
+  # The dry-run's `command: uv … && uv …` line is offered as the command the
+  # install would run, so it has to be one a shell reads back as that argv. Its
+  # quoter used to wrap only on whitespace and a short metacharacter list, so a
+  # folder whose name carries a lone `'` rendered bare and left a line no shell
+  # can parse. The assertion reads the line back through a POSIX word-splitter
+  # and requires the install folder to come back as one word. Reuses the
+  # loopback fixture from therock-next-01, so it resolves without live network
+  # or GPU and needs no gate.
+  @id:therock-next-11-dry-run-command-keeps-a-quoted-folder-whole
+  Scenario: therock-next-11 - The dry-run command line keeps an install folder named with a quote as one argument
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    When the user previews a wheel SDK install for arch gfx1200 into a folder whose name has a quote
+    Then the dry-run command line names that folder as a single argument
