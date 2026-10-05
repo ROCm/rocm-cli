@@ -33,6 +33,7 @@ pub mod examine;
 pub mod fix;
 pub mod host_gpu;
 pub mod managed_runtime;
+pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
 pub mod rocm_install;
@@ -43,7 +44,7 @@ mod test_env;
 mod test_support;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
+    DiagnoseReport, Diagnosis, Fix, Route, diagnose as run_diagnose,
     render_report_text as render_diagnose_text,
 };
 pub use disk_space::{
