@@ -9967,6 +9967,47 @@ mod tests {
     }
 
     #[test]
+    fn resolve_amd_smi_binary_in_registry_breaks_install_time_ties_on_the_runtime_key() -> Result<()>
+    {
+        // Same shape as the active-runtime fallback test: both pairings of file
+        // name and runtime key, so a read-order pick is wrong in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-amd-smi-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let bin = temp_root.join(key).join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(bin.join("amd-smi"), b"#!/bin/sh\nexit 0\n")?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": { "import_ok": true, "bin_path": bin },
+                    }))?,
+                )?;
+            }
+
+            let resolved = resolve_amd_smi_binary_in_registry(&registry_dir);
+            let expected = temp_root.join("aaa").join("bin").join("amd-smi");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                resolved,
+                Some(expected.into_os_string()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn default_engine_is_always_usable_on_windows() {
         if cfg!(windows) {
             assert_eq!(default_engine_for_platform(), "lemonade");
@@ -10783,8 +10824,16 @@ Class Name:                Display
         // Same millisecond, both read orders: the smaller key comes first, as
         // in `rocm`'s registry load, so the fallback cannot depend on `read_dir`.
         for mut records in [
-            vec![record("bbb", 2_000), record("aaa", 2_000), record("old", 1_000)],
-            vec![record("aaa", 2_000), record("bbb", 2_000), record("old", 1_000)],
+            vec![
+                record("bbb", 2_000),
+                record("aaa", 2_000),
+                record("old", 1_000),
+            ],
+            vec![
+                record("aaa", 2_000),
+                record("bbb", 2_000),
+                record("old", 1_000),
+            ],
         ] {
             sort_records_newest_install_first(&mut records);
             assert_eq!(keys(&records), ["aaa", "bbb", "old"]);
@@ -10794,6 +10843,42 @@ Class Name:                Display
         let mut records = vec![record("aaa", 1_000), record("zzz", 2_000)];
         sort_records_newest_install_first(&mut records);
         assert_eq!(keys(&records), ["zzz", "aaa"]);
+    }
+
+    #[test]
+    fn active_managed_therock_fallback_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Two runtimes installed in the same millisecond, written under both
+        // pairings of file name and runtime key. Whichever file `read_dir`
+        // returns first holds `bbb` in one of the two pairings, so a fallback
+        // that kept the read order picks the wrong runtime in that one.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = temp_app_paths("active-therock-tie");
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-release:gfx120X-all",
+                        "family": "gfx120X-all",
+                        "channel": "release",
+                        "version": format!("version-of-{key}"),
+                        "installed_at_unix_ms": 2_000,
+                        "rocm_sdk": { "import_ok": true }
+                    }))?,
+                )?;
+            }
+
+            let config = RocmCliConfig::default();
+            assert_eq!(
+                active_managed_therock_version(&paths, &config)?,
+                Some("version-of-aaa".to_owned()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+        Ok(())
     }
 
     #[test]
