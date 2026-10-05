@@ -39042,7 +39042,7 @@ ID_LIKE="suse opensuse"
     /// a record carrying none is NOT evidence of a pre-upgrade record — it is
     /// just what every record looks like here. Treating it as pre-upgrade would
     /// abort every uninstall that finds a live daemon on Windows and macOS.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     #[test]
     fn without_readable_start_times_a_bare_record_is_not_a_legacy_record() {
         assert!(
@@ -39055,10 +39055,10 @@ ID_LIKE="suse opensuse"
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_record_without_a_start_time_is_a_legacy_record_where_start_times_are_readable() {
-        // The Linux half of the predicate's contract, and no more than that.
+        // The readable-start-time half of the predicate's contract (Linux, Windows), and no more than that.
         //
         // What actually prevents the conflation this predicate exists for —
         // answering "can this platform report a start-time?" by reading the PID
