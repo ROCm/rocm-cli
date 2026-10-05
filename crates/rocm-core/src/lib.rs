@@ -4013,8 +4013,30 @@ fn select_active_managed_therock_record(
         return Some(record.clone());
     }
 
-    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    sort_records_newest_install_first(&mut records);
     records.into_iter().next().map(|(_, record)| record)
+}
+
+/// Order registry records newest install first, breaking ties on the runtime
+/// key and then on the record's path.
+///
+/// Without a tiebreak the order of records that share an
+/// `installed_at_unix_ms` is whatever `read_dir` returned, so "the most recently
+/// installed runtime" would be chosen by the filesystem. Ties are ordinary: a
+/// `--devel` install and its plain sibling land in the same millisecond, and a
+/// record written before the field existed reads as `0`. `rocm`'s own registry
+/// load breaks the same tie on the runtime key, ascending; using the same rule
+/// here keeps the runtime this crate falls back to the same one the CLI's
+/// startup update check reports on.
+fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
+    records.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
 }
 
 pub fn prepend_runtime_paths(
@@ -8178,7 +8200,7 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
 /// `PATH`, so the home-directory fallbacks below never find it.
 fn resolve_amd_smi_binary_in_registry(registry_dir: &Path) -> Option<OsString> {
     let mut records = managed_therock_environment_records(registry_dir);
-    records.sort_by_key(|(_, record)| std::cmp::Reverse(record.installed_at_unix_ms.unwrap_or(0)));
+    sort_records_newest_install_first(&mut records);
     records.into_iter().find_map(|(_, record)| {
         amd_smi_bin_dirs_for_record(&record)
             .iter()
@@ -10737,6 +10759,41 @@ Class Name:                Display
         assert_eq!(active_managed_therock_channel(&paths, &config)?, None);
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    #[test]
+    fn registry_records_tie_on_install_time_is_broken_on_the_runtime_key() {
+        let record = |key: &str, installed_at: u128| {
+            (
+                PathBuf::from(format!("{key}.json")),
+                serde_json::from_value::<TheRockFamilyManifest>(serde_json::json!({
+                    "runtime_key": key,
+                    "installed_at_unix_ms": installed_at,
+                }))
+                .expect("record"),
+            )
+        };
+        let keys = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(_, record)| record.runtime_key.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+
+        // Same millisecond, both read orders: the smaller key comes first, as
+        // in `rocm`'s registry load, so the fallback cannot depend on `read_dir`.
+        for mut records in [
+            vec![record("bbb", 2_000), record("aaa", 2_000), record("old", 1_000)],
+            vec![record("aaa", 2_000), record("bbb", 2_000), record("old", 1_000)],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(keys(&records), ["aaa", "bbb", "old"]);
+        }
+
+        // The install time still decides first.
+        let mut records = vec![record("aaa", 1_000), record("zzz", 2_000)];
+        sort_records_newest_install_first(&mut records);
+        assert_eq!(keys(&records), ["zzz", "aaa"]);
     }
 
     #[test]
