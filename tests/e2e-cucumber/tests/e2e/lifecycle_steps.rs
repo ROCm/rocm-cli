@@ -1334,6 +1334,12 @@ async fn then_xdg_kept(world: &mut E2eWorld) {
         "refused uninstall removed {}",
         record.display()
     );
+    for dir in [&st.smoke_config, &st.smoke_data, &st.smoke_cache]
+        .into_iter()
+        .flatten()
+    {
+        assert!(dir.exists(), "refused uninstall removed {}", dir.display());
+    }
 }
 
 #[then("the local server this machine manages is no longer running")]

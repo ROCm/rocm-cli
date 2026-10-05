@@ -222,12 +222,12 @@ pub(crate) const fn daemon_identity_outcome(
 /// inherited it. This is the same inactive contract `background_helper_already_running`
 /// spawns on, and off Linux it is the only one that applies.
 ///
-/// On a platform without `/proc` no start-time exists to record or compare, so
-/// this degrades to the same best-effort match the managed-service kills already
-/// use there rather than making uninstall unusable whenever the daemon is up.
-/// Read that as the *permanent* state on Windows and macOS, not an occasional
-/// one: there, every identity check takes the best-effort arm, so `running` and
-/// a live-pid check are the whole of the protection. Whether this platform can
+/// Linux (`/proc`) and Windows (`GetProcessTimes` creation time) can record and
+/// compare a start-time, so a recycled pid is told apart there. On a platform
+/// with neither (macOS) no start-time exists, so this degrades to the same
+/// best-effort match the managed-service kills already use there rather than
+/// making uninstall unusable whenever the daemon is up: `running` and a live-pid
+/// check are the whole of the protection. Whether this platform can
 /// read a start-time at all is asked of a process known to be alive — this one —
 /// so a failed reading of the daemon's pid is never mistaken for a platform that
 /// cannot read them.
@@ -239,9 +239,8 @@ pub(crate) const fn daemon_identity_outcome(
 /// never-started case, and there is no pid to verify or signal without it — but
 /// it does mean the gate is only as good as the state file. An unreadable one is
 /// the case that aborts; an absent one is the case that proceeds. Second, on
-/// Windows and macOS a pid recycled while `running` was still true (a crash, not
-/// a clean exit) cannot be told from the daemon itself; `GetProcessTimes` is the
-/// fix for the Windows half and is not attempted here.
+/// macOS a pid recycled while `running` was still true (a crash, not a clean
+/// exit) cannot be told from the daemon itself.
 pub(crate) fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -278,9 +277,8 @@ pub(crate) fn stop_background_helper_before_uninstall(
     // started without `--automations-enabled` returns before its first state
     // write — so a false flag means the recorded pid belongs to a daemon that
     // already exited, and anything alive under it now inherited the number.
-    // Without this, Windows cannot catch that: `process_start_ticks` is always
-    // `None` there, so `identity_state_with_observed` falls back to the legacy
-    // `Matches` verdict and the force tree-kill below lands on a stranger.
+    // Where no start-time can be read (macOS) this flag is the only guard against
+    // a force-kill landing on a stranger.
     if !state.running || state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
         return;
     }
@@ -301,7 +299,7 @@ pub(crate) fn stop_background_helper_before_uninstall(
     // treat it as unverifiable, leave the process alone, and abort. Being told
     // to kill a PID is recoverable; killing an unrelated process tree is not.
     //
-    // Only where no start-time can ever be read (no `/proc`: macOS, Windows) does
+    // Only where no start-time can ever be read (macOS) does
     // this fall back to the best-effort match the managed-service kills already
     // use there — otherwise uninstall could never stop a live daemon on those
     // platforms. That residual gap is documented on `daemon_start_ticks`.

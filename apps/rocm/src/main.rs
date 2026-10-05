@@ -39953,6 +39953,60 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_that_returns_ok_but_not_stopped_is_a_failure() {
+        let (root, paths) = test_paths("uninstall-stop-ok-not-stopped");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a live managed server"),
+        );
+        let pid = child.0.id();
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_with(&paths, |_, _| Ok(serde_json::json!({ "status": "ready" })))
+                .expect("the pass itself succeeds");
+
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::StopTheService);
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert!(uninstall_removal_gate(&report).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_endpoint_sentence_follows_the_failure_class() {
+        let sentence = "may still be serving";
+        for (remedy, expected) in [
+            (StopFailureRemedy::StopTheService, true),
+            (StopFailureRemedy::StopWhatHoldsThePort, true),
+            (StopFailureRemedy::StopTheDaemon, false),
+            (StopFailureRemedy::RepairTheDaemonState, false),
+            (StopFailureRemedy::RepairTheRecord, false),
+        ] {
+            let report = ManagedServiceStopReport {
+                stopped: Vec::new(),
+                failed: vec![FailedManagedServiceStop {
+                    service_id: "x".to_owned(),
+                    reason: "r".to_owned(),
+                    remedy,
+                }],
+                warnings: Vec::new(),
+            };
+            let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+            assert_eq!(
+                message.contains(sentence),
+                expected,
+                "{remedy:?}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn the_abort_only_claims_endpoints_may_serve_when_a_service_failed() {
         let repair_only = ManagedServiceStopReport {

@@ -396,8 +396,8 @@ fn send_signal(pid: u32, signal: Signal, _tree: bool) -> bool {
 
 /// Read the kernel start-time (field 22 of `/proc/<pid>/stat`) for `pid`.
 ///
-/// Returns `None` when the value cannot be read, including on non-Linux
-/// platforms, where identity verification degrades to best-effort.
+/// Returns `None` when the value cannot be read, including on platforms other
+/// than Linux and Windows, where identity verification degrades to best-effort.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn process_start_ticks(pid: u32) -> Option<u64> {
@@ -405,7 +405,38 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
     parse_start_ticks(&stat)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// On Windows the start-time is the process creation `FILETIME` (100 ns ticks
+/// since 1601). It is opaque to the identity comparison, which only checks
+/// equality, and it is what lets a recycled PID be told from the recorded one.
+#[cfg(windows)]
+#[must_use]
+#[allow(unsafe_code)] // Win32 FFI
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 #[must_use]
 pub fn process_start_ticks(_pid: u32) -> Option<u64> {
     None
