@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+//! Unmanaged ("legacy") ROCm install discovery.
+//!
+//! `LegacyRocmSummary`, the `discover_rocm_installs*` resolver family, the
+//! Linux-siblings/Windows-children layout search, and version ranking.
+
 use crate::examine::extract_rocm_version;
 use crate::runtime_is_windows;
 use serde::{Deserialize, Serialize};

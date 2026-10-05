@@ -2,15 +2,25 @@
 //
 // SPDX-License-Identifier: MIT
 
+//! GPU/host hardware detection.
+//!
+//! `ExamineSummary`'s `HostGpuSummary`/`DriverSummary`/`WslSummary` aggregation,
+//! Windows WMI/pnputil inventory parsing, kernel/distro/CPU/RAM detection, and
+//! gfx-target detection (PCI-device-ID, marketing-name, KFD, DRM-ip-discovery,
+//! and sysfs). Also holds the TheRock-managed-SDK gfx-target probe
+//! (`detect_managed_therock_sdk_gfx_target`) rather than `managed_runtime`,
+//! since its only caller is this module's own gfx-target fallback chain.
+//!
+//! `examine.rs` and `fix.rs` still reach several items here through `lib.rs`'s
+//! flat `crate::` re-export paths rather than `crate::host_gpu::` — a
+//! deliberate transitional step from the zero-diff extraction, not an
+//! oversight.
+
 use crate::{
-    AppPaths, LegacyRocmSummary, OPTIONAL_COMMAND_TIMEOUT, TheRockFamilyManifest,
-    WINDOWS_INVENTORY_QUERY_TIMEOUT, WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
-    detect_legacy_rocm_summary, detect_managed_therock_family, discover_rocm_installs, env_flag,
-    examine, managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
-    unix_time_millis,
+    AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
+    detect_managed_therock_family, discover_rocm_installs, env_flag, examine,
+    managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
-#[cfg(windows)]
-use crate::{WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT, WINDOWS_SYSTEM_INVENTORY_SCRIPT};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -21,12 +31,20 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+const OPTIONAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1_500);
+const WINDOWS_INVENTORY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT: &str = r#"$gpus = Get-CimInstance -ClassName Win32_VideoController -Property Name,DriverVersion,PNPDeviceID,AdapterCompatibility | Where-Object { $_.PNPDeviceID -match 'VEN_1002' -or $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t$($gpu.DriverVersion)`t$($gpu.PNPDeviceID)" }"#;
+#[cfg(windows)]
+const WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT: &str = r#"$displayGuid = '{4d36e968-e325-11ce-bfc1-08002be10318}'; $gpus = Get-CimInstance -ClassName Win32_PnPEntity -Property Name,DeviceID,PNPClass,ClassGuid,Manufacturer | Where-Object { (($_.PNPClass -eq 'Display' -or $_.ClassGuid -eq $displayGuid) -and ($_.DeviceID -match 'VEN_1002' -or $_.Name -match 'AMD|Radeon|Instinct|Graphics' -or $_.Manufacturer -match 'AMD|Advanced Micro Devices')) -or ($_.DeviceID -match 'PCI\\VEN_1002' -and $_.Name -match 'Radeon|Instinct|Graphics') }; foreach ($gpu in $gpus) { "GPU`t$($gpu.Name)`t`t$($gpu.DeviceID)" }"#;
+#[cfg(windows)]
+const WINDOWS_SYSTEM_INVENTORY_SCRIPT: &str = r#"$cpu = Get-CimInstance -ClassName Win32_Processor -Property Name | Select-Object -First 1 -ExpandProperty Name; if ($cpu) { "CPU`t$cpu" }; $ram = Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory | Select-Object -First 1 -ExpandProperty TotalPhysicalMemory; if ($ram) { "RAM`t$ram" }"#;
+
 pub fn detect_host_gfx_target() -> Option<String> {
     let paths = AppPaths::discover().ok();
     detect_host_gpu_summary_fast(paths.as_ref()).gfx_target
 }
 
-pub(crate) fn detect_examine_gfx_target_fast(
+fn detect_examine_gfx_target_fast(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
     if runtime_is_windows() {
@@ -41,7 +59,7 @@ pub(crate) fn detect_examine_gfx_target_fast(
 }
 
 #[allow(dead_code)]
-pub(crate) fn detect_host_gfx_target_with_context(
+fn detect_host_gfx_target_with_context(
     windows_inventory: Option<&WindowsExamineInventory>,
     wsl: Option<&WslSummary>,
     paths: Option<&AppPaths>,
@@ -160,11 +178,11 @@ pub const fn known_therock_families() -> &'static [&'static str] {
     ]
 }
 
-pub(crate) fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
+fn capture_optional_command(program: &str, args: &[&str]) -> Option<String> {
     capture_optional_command_with_timeout(program, args, OPTIONAL_COMMAND_TIMEOUT)
 }
 
-pub(crate) fn capture_optional_command_with_timeout(
+fn capture_optional_command_with_timeout(
     program: &str,
     args: &[&str],
     timeout: Duration,
@@ -254,7 +272,7 @@ fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
     );
 }
 
-pub(crate) fn capture_optional_path_command_with_env(
+fn capture_optional_path_command_with_env(
     program: &Path,
     args: &[&str],
     envs: &[(&str, OsString)],
@@ -305,7 +323,7 @@ pub(crate) fn capture_optional_path_command_with_env(
     }
 }
 
-pub(crate) fn tool_on_path(program: &str) -> bool {
+fn tool_on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| {
             tool_path_candidates(program)
@@ -315,7 +333,7 @@ pub(crate) fn tool_on_path(program: &str) -> bool {
     })
 }
 
-pub(crate) fn tool_path_candidates(program: &str) -> Vec<String> {
+fn tool_path_candidates(program: &str) -> Vec<String> {
     let path = Path::new(program);
     if path.extension().is_some() || !runtime_is_windows() {
         return vec![program.to_owned()];
@@ -382,7 +400,7 @@ const fn detect_windows_display_gfx_target() -> Option<String> {
     None
 }
 
-pub(crate) fn detect_windows_display_gfx_target_with_inventory(
+fn detect_windows_display_gfx_target_with_inventory(
     windows_inventory: Option<&WindowsExamineInventory>,
 ) -> Option<String> {
     if runtime_is_windows() {
@@ -414,7 +432,7 @@ fn detect_wsl_windows_display_gfx_target_fast() -> Option<String> {
         .and_then(parse_windows_display_gfx_target)
 }
 
-pub(crate) fn detect_wsl_windows_display_name(wsl: Option<&WslSummary>) -> Option<String> {
+fn detect_wsl_windows_display_name(wsl: Option<&WslSummary>) -> Option<String> {
     if !runtime_is_linux() || !wsl.is_some_and(|summary| summary.is_wsl) {
         return None;
     }
@@ -501,7 +519,7 @@ pub(crate) fn detect_wsl_host_driver() -> WslHostDriverProbe {
         })
 }
 
-pub(crate) fn detect_wsl_windows_display_probe_text() -> Option<String> {
+fn detect_wsl_windows_display_probe_text() -> Option<String> {
     if !is_wsl_host() {
         return None;
     }
@@ -527,7 +545,7 @@ pub(crate) fn detect_wsl_windows_display_probe_text() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn detect_linux_primary_gpu_name() -> Option<String> {
+fn detect_linux_primary_gpu_name() -> Option<String> {
     if !runtime_is_linux() {
         return None;
     }
@@ -557,11 +575,11 @@ pub(crate) fn detect_linux_primary_gpu_name() -> Option<String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) const fn detect_linux_primary_gpu_name() -> Option<String> {
+const fn detect_linux_primary_gpu_name() -> Option<String> {
     None
 }
 
-pub(crate) fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
+fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     let mut name_fallback = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let (name, pnp_id) = line.split_once('\t').unwrap_or((line, ""));
@@ -577,7 +595,7 @@ pub(crate) fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     name_fallback
 }
 
-pub(crate) fn parse_windows_display_name(text: &str) -> Option<String> {
+fn parse_windows_display_name(text: &str) -> Option<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -588,7 +606,7 @@ pub(crate) fn parse_windows_display_name(text: &str) -> Option<String> {
         })
 }
 
-pub(crate) fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
+fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
     let upper = pnp_id.to_ascii_uppercase();
     if !upper.contains("VEN_1002") {
         return None;
@@ -606,7 +624,7 @@ pub(crate) fn amd_pci_device_id_from_pnp_id(pnp_id: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
+fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
     match device_id.to_ascii_lowercase().as_str() {
         // Navi 21 / 22 / 23 / 24: Radeon RX 6000 desktop and mobile ASICs.
         "73a0" | "73a1" | "73a2" | "73a3" | "73a5" | "73a8" | "73a9" | "73ab" | "73ac" | "73ad"
@@ -629,7 +647,7 @@ pub(crate) fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'sta
     }
 }
 
-pub(crate) fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
+fn gfx_target_from_amd_marketing_name(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     let normalized = normalize_marketing_name_for_match(&lower);
     for entry in AMD_MARKETING_GFX_TARGETS {
@@ -1518,7 +1536,7 @@ pub struct HostGpuSummary {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct WindowsExamineInventory {
+struct WindowsExamineInventory {
     cpu_model: Option<String>,
     system_ram_gib: Option<f64>,
     displays: Vec<WindowsDisplayAdapter>,
@@ -2939,7 +2957,7 @@ fn detect_host_gpu_name_with_context(
         .or_else(|| detect_wsl_windows_display_name(wsl))
 }
 
-pub(crate) fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
+fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
     managed_therock_sdk_probe_candidates(&paths.data_dir.join("runtimes").join("registry"))
         .into_iter()
         .find_map(|candidate| {

@@ -2,6 +2,13 @@
 //
 // SPDX-License-Identifier: MIT
 
+//! The TheRock managed-runtime-environment surface.
+//!
+//! `ManagedRuntimeEnvironment`/`FrameworkInterpreter`, `active_managed_therock_*`,
+//! `prepend_runtime_paths`, and the registry-manifest probing behind them.
+//! amd-smi binary resolution (`resolve_amd_smi_binary*`) still reads those
+//! same registry records from `lib.rs` — a distinct, not-yet-scoped concern.
+
 use crate::{
     AppPaths, RocmCliConfig, normalize_runtime_path_for_host, normalize_therock_family,
     runtime_is_linux, runtime_is_windows, runtime_python_executable_in_env,
