@@ -8548,6 +8548,7 @@ echo Python 3.12.10
     }
 
     /// A config.json `load` rejects, holding settings that must survive.
+    #[cfg(unix)]
     fn plant_unreadable_config(paths: &AppPaths) -> Result<Vec<u8>> {
         fs::create_dir_all(&paths.config_dir)?;
         let damaged = br#"{"active_runtime_key": "kept-runtime", "onboarding_dismissed": "yes"}"#;

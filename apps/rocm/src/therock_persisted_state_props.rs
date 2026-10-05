@@ -357,6 +357,8 @@ enum RootName {
 }
 
 fn root_name() -> BoxedStrategy<RootName> {
+    // Only unix adds the non-UTF-8 option below.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut options = vec![
         "[a-z0-9_.-]{1,12}".prop_map(RootName::Ascii).boxed(),
         Just(RootName::Unicode).boxed(),
