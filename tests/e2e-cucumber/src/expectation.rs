@@ -31,6 +31,7 @@ const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
 const REQUIRES_BARE_METAL_TAG: &str = "requires-bare-metal";
 const REQUIRES_WSL_TAG: &str = "requires-wsl";
+const REQUIRES_CASE_SENSITIVE_FS_TAG: &str = "requires-case-sensitive-fs";
 const SERVE_TIMEOUT_PREFIX: &str = "serve-timeout:";
 const NIGHTLY_TAG: &str = "nightly";
 const LIFECYCLE_TAG: &str = "lifecycle";
@@ -126,6 +127,16 @@ pub struct ScenarioDecl {
     /// host, so it is skipped on native Linux, native Windows and everything
     /// else. Same reason `@requires-os:linux` cannot stand in for it.
     pub requires_wsl: bool,
+    /// `@requires-case-sensitive-fs`: the scenario's premise is two files whose
+    /// names differ only in letter case (e.g. two runtime registry entries), so
+    /// it is skipped where the scenarios' temp root folds case and the second
+    /// write would land on the first file.
+    ///
+    /// `@requires-os:linux` cannot express this either: the isolated roots
+    /// follow `$TMPDIR`, which on Linux — WSL2 included — can sit on a casefolded
+    /// directory or a mounted Windows drive. The answer comes from the capability
+    /// probe's `case_sensitive_fs`, measured on that same temp root.
+    pub requires_case_sensitive_fs: bool,
     /// Engine the scenario pins via `@requires-engine:<e>` (if any).
     pub requires_engine: Option<String>,
     /// OS the scenario requires via `@requires-os:<os>` (e.g. "linux"), if any —
@@ -173,6 +184,7 @@ impl ScenarioDecl {
         let mut requires_no_gpu = false;
         let mut requires_bare_metal = false;
         let mut requires_wsl = false;
+        let mut requires_case_sensitive_fs = false;
         let mut requires_engine = None;
         let mut requires_os = None;
         let mut serve_timeout_secs = None;
@@ -206,6 +218,8 @@ impl ScenarioDecl {
                 requires_bare_metal = true;
             } else if tag == REQUIRES_WSL_TAG {
                 requires_wsl = true;
+            } else if tag == REQUIRES_CASE_SENSITIVE_FS_TAG {
+                requires_case_sensitive_fs = true;
             } else if tag == NIGHTLY_TAG {
                 nightly = true;
             } else if tag == LIFECYCLE_TAG {
@@ -222,6 +236,7 @@ impl ScenarioDecl {
             requires_no_gpu,
             requires_bare_metal,
             requires_wsl,
+            requires_case_sensitive_fs,
             requires_engine,
             requires_os,
             serve_timeout_secs,
@@ -480,7 +495,8 @@ pub struct Included {
 ///    scenario without a usable container runtime, a `@requires-gpu` scenario on
 ///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
 ///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
-///    `@requires-os:<os>` scenario on a different OS, or a scenario whose
+///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
+///    a `@requires-os:<os>` scenario on a different OS, or a scenario whose
 ///    effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
@@ -558,6 +574,13 @@ pub fn resolve(
     if decl.requires_wsl && !cap.is_wsl {
         return Expectation::Skip {
             reason: "requires WSL; this host is not running under WSL".to_owned(),
+        };
+    }
+    if decl.requires_case_sensitive_fs && !cap.case_sensitive_fs {
+        return Expectation::Skip {
+            reason: "requires a case-sensitive filesystem; the temp root ($TMPDIR) here folds \
+                     letter case"
+                .to_owned(),
         };
     }
     if let Some(os) = &decl.requires_os
@@ -646,6 +669,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "vllm".into(),
                 platform_slug: "mi300x".into(),
+                case_sensitive_fs: true,
             },
             "strix-ubuntu" => HostCapability {
                 os_family: "linux".into(),
@@ -656,6 +680,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                case_sensitive_fs: true,
             },
             "strix-windows" => HostCapability {
                 os_family: "windows".into(),
@@ -666,6 +691,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo".into(),
+                case_sensitive_fs: false,
             },
             // A WSL2 dev box with the ROCm passthrough in place: `os_family` is
             // `linux` and a GPU is usable, so nothing but `is_wsl` distinguishes
@@ -685,6 +711,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                case_sensitive_fs: true,
             },
             // The same box without the passthrough: the gfx target is reported
             // by the Windows-side driver but ROCm cannot reach it, so the probe
@@ -698,6 +725,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "wsl".into(),
+                case_sensitive_fs: true,
             },
             // The hosted WSL runner before the ROCm passthrough is complete:
             // Windows still reports the gfx target, but the CLI cannot use it.
@@ -710,6 +738,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "strix-halo-wsl".into(),
+                case_sensitive_fs: true,
             },
             _ => HostCapability {
                 os_family: "other".into(),
@@ -720,6 +749,7 @@ mod tests {
                 available_engines: vec!["lemonade".into(), "vllm".into()],
                 effective_serve_engine: "lemonade".into(),
                 platform_slug: "mock".into(),
+                case_sensitive_fs: true,
             },
         }
     }
@@ -1397,6 +1427,85 @@ serve_timeout_secs = 90
                 Expectation::Skip { .. }
             ));
         }
+    }
+
+    #[test]
+    fn case_sensitive_fs_tag_parses_in_both_shapes() {
+        assert!(decl(&["id:x", "requires-case-sensitive-fs"]).requires_case_sensitive_fs);
+        assert!(decl(&["@id:x", "@requires-case-sensitive-fs"]).requires_case_sensitive_fs);
+        // Absent by default, so no existing scenario changes meaning.
+        assert!(!decl(&["id:x", "requires-os:linux"]).requires_case_sensitive_fs);
+    }
+
+    #[test]
+    fn requires_case_sensitive_fs_skips_where_the_temp_root_folds_case() {
+        let m = Expectations::default();
+        let none = Included::default();
+        let d = decl(&[
+            "id:runtime-lifecycle-case-twin-selector-refused",
+            "requires-case-sensitive-fs",
+        ]);
+        for platform in ["mock", "mi300x", "strix-ubuntu", "wsl2"] {
+            assert_eq!(
+                resolve(&d, &cap(platform), &m, none),
+                Expectation::ExpectPass,
+                "{platform} keeps case twins apart, so the scenario runs"
+            );
+        }
+        // The case the gate exists for: a Linux host — WSL2 here — whose
+        // `$TMPDIR` sits on a case-folding mount. `os_family` is still `linux`,
+        // so `@requires-os:linux` alone would have let the scenario run.
+        let folded = HostCapability {
+            case_sensitive_fs: false,
+            ..cap("wsl2")
+        };
+        let both = decl(&[
+            "id:runtime-lifecycle-case-twin-selector-refused",
+            "requires-os:linux",
+            "requires-case-sensitive-fs",
+        ]);
+        for scenario in [&d, &both] {
+            match resolve(scenario, &folded, &m, none) {
+                Expectation::Skip { reason } => assert!(
+                    reason.contains("case-sensitive filesystem"),
+                    "the skip must name the missing premise: {reason}"
+                ),
+                other => panic!("a case-folding temp root must skip, got {other:?}"),
+            }
+        }
+        // Without the tag the same host still runs it: the probe answer only
+        // matters to scenarios that declare the premise.
+        assert_eq!(
+            resolve(&decl(&["id:x", "requires-os:linux"]), &folded, &m, none),
+            Expectation::ExpectPass
+        );
+    }
+
+    #[test]
+    fn case_folding_skip_is_not_recorded_as_a_known_bug() {
+        // A host that cannot hold the premise is not-applicable, not a defect, so
+        // an xfail row for the same id must not turn the skip into an xfail.
+        let m = Expectations::parse(
+            r#"
+[["runtime-lifecycle-case-twin-selector-refused"]]
+when = {}
+bug = "EAI-0000"
+reason = "unrelated open bug"
+"#,
+        )
+        .unwrap();
+        let d = decl(&[
+            "id:runtime-lifecycle-case-twin-selector-refused",
+            "requires-case-sensitive-fs",
+        ]);
+        let folded = HostCapability {
+            case_sensitive_fs: false,
+            ..cap("strix-ubuntu")
+        };
+        assert!(matches!(
+            resolve(&d, &folded, &m, Included::default()),
+            Expectation::Skip { .. }
+        ));
     }
 
     #[test]

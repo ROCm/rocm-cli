@@ -28,7 +28,7 @@ const FIRST_KEY: &str = "release-tarball-gfx942";
 const SECOND_KEY: &str = "release-tarball-gfx1100";
 /// Two keys that differ only in letter case. Each is its own `<key>.json` in the
 /// registry, so the pair can only coexist on a case-sensitive filesystem — which
-/// is why the scenario using them is Linux-only.
+/// is why the scenario using them carries `@requires-case-sensitive-fs`.
 const LOWER_TWIN_KEY: &str = "release-tarball-gfx942";
 const UPPER_TWIN_KEY: &str = "RELEASE-TARBALL-GFX942";
 /// Matches neither twin exactly and both case-insensitively — the shape the
@@ -51,12 +51,26 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
     std::fs::write(install_root.join("payload.txt"), "payload")
         .expect("failed to write runtime payload");
 
-    let registry = root.path().join("data").join("runtimes").join("registry");
+    let registry = registry_dir(world);
     std::fs::create_dir_all(&registry).expect("failed to create registry dir");
     let manifest = runtime_manifest_json(key, family, &install_root);
     std::fs::write(registry.join(format!("{key}.json")), manifest)
         .expect("failed to write runtime manifest");
     install_root
+}
+
+/// The runtime registry under the scenario's isolated data dir — where the CLI
+/// reads `<key>.json` manifests from. One definition, so a layout change cannot
+/// leave the planting and the counting looking in different places.
+fn registry_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
 }
 
 /// A minimal valid read-only tarball runtime manifest (matches the CLI's on-disk
@@ -121,28 +135,25 @@ async fn two_case_twin_runtimes(world: &mut E2eWorld) {
     plant_runtime(world, LOWER_TWIN_KEY, "gfx942");
     plant_runtime(world, UPPER_TWIN_KEY, "gfx1100");
 
-    // The two keys are two registry files only on a case-sensitive filesystem,
-    // and `@requires-os:linux` does not guarantee one: the isolated root follows
-    // `$TMPDIR`, which can sit on a casefolded or mounted case-insensitive
-    // directory. There the second write overwrites the first, the selector has a
-    // single case-insensitive match, activation succeeds, and the refusal step
+    // The two keys are two registry files only on a case-sensitive filesystem.
+    // `@requires-case-sensitive-fs` skips hosts whose temp root folds case, so
+    // this guard should never fire — except that cucumber's own `-n`/`--tags`
+    // selection replaces the suite's filter and with it every gate. Should the
+    // twins collapse anyway, the second write overwrote the first, activation
+    // would succeed on a single case-insensitive match, and the refusal step
     // would blame the resolver for a fixture that never existed. Counting the
     // entries proves the premise; testing for the lower-case file would not,
     // because on such a filesystem that path resolves to the upper-case one.
-    let registry = world
-        .isolated_root
-        .as_ref()
-        .expect("no isolated root")
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry");
-    let planted = std::fs::read_dir(&registry).expect("registry dir").count();
+    let registry = registry_dir(world);
+    let planted = std::fs::read_dir(&registry)
+        .unwrap_or_else(|err| panic!("cannot read the registry at {}: {err}", registry.display()))
+        .count();
     assert_eq!(
         planted,
         2,
         "the case twins collapsed into one registry entry in {}: this filesystem is \
-         case-insensitive, so the scenario has no premise on this host",
+         case-insensitive, so the @requires-case-sensitive-fs gate should have skipped \
+         this scenario on this host (cucumber's -n/--tags selection bypasses the gates)",
         registry.display()
     );
 }
