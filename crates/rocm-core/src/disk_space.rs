@@ -286,7 +286,12 @@ pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
+    // Promote while the value AS PRINTED would reach 1024, not merely while the
+    // raw value does. 1_048_525 divides to 1023.95…, which stops a `>= 1024.0`
+    // loop one unit early and then renders as "1024.0 KiB" once `:.1` rounds it
+    // — a size shown in a unit it has outgrown, in the user-facing out-of-space
+    // message. Comparing the rounded tenths closes that gap at every boundary.
+    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
         value /= 1024.0;
         unit += 1;
     }
@@ -423,6 +428,23 @@ mod tests {
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
     }
 
+    /// Just below a unit boundary the value rounds up to a full 1024 of the
+    /// SMALLER unit, which has to be reported as 1.0 of the larger one. These
+    /// are the minimal failing inputs
+    /// [`format_bytes_never_renders_a_saturated_unit`] shrank to; they are
+    /// pinned as examples too so the specific defect stays named even if the
+    /// generator is retuned.
+    #[test]
+    fn format_bytes_promotes_a_value_that_rounds_up_to_a_full_unit() {
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+        assert_eq!(format_bytes(1_099_511_627_775), "1.0 TiB");
+        // The value just below the rounding band still belongs to the smaller
+        // unit — promotion must not reach down and swallow it.
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
+    }
+
     #[test]
     fn extracted_size_uses_conservative_multiplier() {
         assert_eq!(estimated_extracted_size(1_000), 4_000);
@@ -487,6 +509,190 @@ mod tests {
         assert_eq!(cache, install);
         let other = select_mount(Path::new("/mnt/data/rocm"), &mounts).map(|(m, _)| m);
         assert_ne!(cache, other);
+    }
+
+    // ── Properties ─────────────────────────────────────────────────
+    //
+    // The examples above pin the values somebody thought to write down. These
+    // state the contracts that must hold for EVERY input, and let proptest look
+    // for the inputs that break them. All pure and in-process: no subprocess,
+    // no filesystem, no GPU — the whole module runs in milliseconds as part of
+    // the ordinary unit-test lane.
+
+    /// Split a rendered size into its numeric part and its unit.
+    fn split_rendered(rendered: &str) -> (f64, String) {
+        let mut parts = rendered.split_whitespace();
+        let value = parts
+            .next()
+            .expect("rendered size has a numeric part")
+            .parse()
+            .expect("numeric part parses");
+        let unit = parts.next().expect("rendered size has a unit").to_owned();
+        (value, unit)
+    }
+
+    proptest::proptest! {
+        /// A size is never rendered in a unit it has outgrown. `1024.0 KiB`
+        /// means the scaling loop stopped one unit too early: it exits while
+        /// the value is below 1024, but the `:.1` rounding can then push the
+        /// printed mantissa back up to 1024.0. Only the largest unit may carry
+        /// a mantissa that big, because there is nothing to promote it to.
+        #[test]
+        fn format_bytes_never_renders_a_saturated_unit(bytes in byte_count_strategy()) {
+            let rendered = format_bytes(bytes);
+            let (value, unit) = split_rendered(&rendered);
+            if unit != "TiB" {
+                proptest::prop_assert!(
+                    value < 1024.0,
+                    "{bytes} rendered as {rendered}, which should have been \
+                     promoted to the next unit",
+                );
+            }
+        }
+
+        /// The margin only ever adds. A requirement that came out smaller than
+        /// the payload would let an install start that cannot finish.
+        #[test]
+        fn with_margin_never_shrinks_the_requirement(bytes: u64) {
+            proptest::prop_assert!(with_margin(bytes) >= bytes);
+        }
+
+        /// The extracted-size estimate is deliberately conservative, so it can
+        /// never come out below the archive it is estimating for.
+        #[test]
+        fn extracted_size_never_underestimates(archive: u64) {
+            proptest::prop_assert!(estimated_extracted_size(archive) >= archive);
+        }
+
+        /// `classify_space` is a total decision with no third reading: with a
+        /// known figure it says Sufficient exactly when the space is there.
+        #[test]
+        fn classify_space_agrees_with_the_comparison(required: u64, available: u64) {
+            let check = classify_space(required, Some(available));
+            proptest::prop_assert_eq!(
+                matches!(check, SpaceCheck::Sufficient { .. }),
+                available >= required,
+            );
+            proptest::prop_assert_eq!(check.is_insufficient(), available < required);
+        }
+
+        /// Soundness: a mount is only ever selected for a path it actually
+        /// contains. Picking a mount that is not a prefix would report an
+        /// unrelated filesystem's free space.
+        #[test]
+        fn selected_mount_is_always_a_prefix_of_the_path(
+            path in path_strategy(),
+            mounts in mounts_strategy(),
+        ) {
+            if let Some((selected, _)) = select_mount(&path, &mounts) {
+                proptest::prop_assert!(
+                    path_starts_with(
+                        &strip_verbatim_prefix(&path),
+                        &strip_verbatim_prefix(&selected),
+                    ),
+                    "selected {} for {}", selected.display(), path.display(),
+                );
+            }
+        }
+
+        /// Maximality: the documented rule is longest-prefix-wins, so no other
+        /// matching mount may be deeper than the one chosen. A shallower pick
+        /// would quote the enclosing filesystem instead of the real one.
+        #[test]
+        fn selected_mount_is_the_deepest_match(
+            path in path_strategy(),
+            mounts in mounts_strategy(),
+        ) {
+            let stripped = strip_verbatim_prefix(&path);
+            let deepest_match = mounts
+                .iter()
+                .filter(|(mount, _)| {
+                    path_starts_with(&stripped, &strip_verbatim_prefix(mount))
+                })
+                .map(|(mount, _)| mount.components().count())
+                .max();
+            let selected_depth =
+                select_mount(&path, &mounts).map(|(mount, _)| mount.components().count());
+            proptest::prop_assert_eq!(selected_depth, deepest_match);
+        }
+
+        /// Irrelevance: a mount that does not contain the path must not change
+        /// the answer. This is what keeps an unrelated entry appearing in the
+        /// platform's mount list from perturbing the result.
+        #[test]
+        fn a_non_matching_mount_does_not_change_the_result(
+            path in path_strategy(),
+            mounts in mounts_strategy(),
+            extra in mount_point_strategy(),
+            extra_bytes: u64,
+        ) {
+            let before = select_mount(&path, &mounts);
+            let matches = path_starts_with(
+                &strip_verbatim_prefix(&path),
+                &strip_verbatim_prefix(&extra),
+            );
+            proptest::prop_assume!(!matches);
+            let mut widened = mounts;
+            widened.push((extra, extra_bytes));
+            proptest::prop_assert_eq!(select_mount(&path, &widened), before);
+        }
+    }
+
+    /// Byte counts that actually visit the interesting region.
+    ///
+    /// A uniform `u64` is useless here: almost every value drawn sits in the
+    /// exabyte range, so the unit-boundary behaviour — the only place the
+    /// scaling loop can go wrong — is never sampled. The naive version of this
+    /// generator passed against a defect that was definitely present.
+    ///
+    /// So also draw from a window just below each `1024^k` boundary. The window
+    /// has to SCALE with the boundary, because the band where `:.1` rounding
+    /// pushes the mantissa up to 1024.0 is itself proportional: it spans the
+    /// top `boundary / 20480` or so. A fixed-width window finds the defect at
+    /// the KiB boundary and misses it at TiB. `/ 16384` keeps the band a large
+    /// fraction of every window, so the default case count is enough.
+    ///
+    /// The generator is part of the specification; a careless one buys nothing
+    /// but false confidence.
+    fn byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<u64>(),
+            (1u32..=4).prop_flat_map(|exponent| {
+                let boundary = 1024u64.pow(exponent);
+                (boundary - boundary / 16384)..=(boundary + 1)
+            }),
+        ]
+    }
+
+    /// Absolute paths built from a small component alphabet, so prefixes
+    /// collide often enough to actually exercise mount selection. A wide
+    /// alphabet would make every generated mount irrelevant to every path.
+    fn path_strategy() -> impl proptest::strategy::Strategy<Value = PathBuf> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            proptest::sample::select(vec!["home", "user", "data", "mnt", "var", "database"]),
+            0..5,
+        )
+        .prop_map(|components| {
+            let mut path = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+            for component in components {
+                path.push(component);
+            }
+            path
+        })
+        .boxed()
+    }
+
+    fn mount_point_strategy() -> impl proptest::strategy::Strategy<Value = PathBuf> {
+        path_strategy()
+    }
+
+    fn mounts_strategy() -> impl proptest::strategy::Strategy<Value = Vec<(PathBuf, u64)>> {
+        proptest::collection::vec(
+            (mount_point_strategy(), proptest::prelude::any::<u64>()),
+            0..5,
+        )
     }
 
     #[test]
