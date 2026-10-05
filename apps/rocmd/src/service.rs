@@ -116,6 +116,23 @@ pub(crate) fn stop_report_confirmed(report: &Value) -> bool {
 /// the same records.
 const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// Record `pid` as the service's supervisor together with its start-time token.
+///
+/// The PID and its token are written together, so a stop can tell this process
+/// from an unrelated one that later inherits the PID. A PID recorded without its
+/// token is signalled on trust alone; see [`terminate_recorded_service_pids`].
+pub(crate) fn record_supervisor_identity(record: &mut ManagedServiceRecord, pid: u32) {
+    record.supervisor_pid = pid;
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+}
+
+/// Record `pid` as the service's engine together with its start-time token.
+/// See [`record_supervisor_identity`].
+fn record_engine_identity(record: &mut ManagedServiceRecord, pid: u32) {
+    record.engine_pid = Some(pid);
+    record.engine_start_ticks = rocm_core::process_start_ticks(pid);
+}
+
 /// What a stop did about one PID recorded in a service manifest.
 struct RecordedPidStop {
     pid: u32,
@@ -562,10 +579,8 @@ pub(crate) fn supervise_service(
         env_id.clone(),
         Some(device_policy.clone()),
     );
-    // Pair the recorded supervisor PID with the kernel's start-time for it.
-    // Without that token a later stop has no way to tell this process from an
-    // unrelated one that inherited the PID, and falls back to signalling blind.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(std::process::id());
+    // `new` recorded this PID; this pairs it with its start-time token.
+    record_supervisor_identity(&mut record, std::process::id());
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
     // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts
@@ -652,10 +667,9 @@ pub(crate) fn supervise_service(
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
 
-    record.engine_pid = Some(child.id());
     // Captured while the child is known alive, so a later stop verifies this
     // exact process instead of whatever has since inherited its PID.
-    record.engine_start_ticks = rocm_core::process_start_ticks(child.id());
+    record_engine_identity(&mut record, child.id());
     record.status = "running".to_owned();
     record.write()?;
 
