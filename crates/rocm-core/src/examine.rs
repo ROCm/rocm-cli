@@ -3965,3 +3965,9 @@ mod tests {
         }
     }
 }
+
+/// Property tests for the driver-side text readers above; a child module so it
+/// can reach them while they stay private.
+#[cfg(test)]
+#[path = "examine_driver_proptests.rs"]
+mod driver_proptests;
