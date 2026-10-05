@@ -374,6 +374,13 @@ fn install_root_under(base: &Path, name: &RootName) -> PathBuf {
         RootName::Ascii(name) if name != "." && name != ".." => base.join(name),
         RootName::Ascii(_) => base.join("dot"),
         RootName::Unicode => base.join("ROCm-é-日本"),
+        // Windows strips a trailing space from a folder name when it creates
+        // it, so a root that ends in one cannot round-trip there; keep the
+        // inner and leading spaces, which it does store. Tracked separately:
+        // the stored install_root and pip_cache_dir then disagree.
+        #[cfg(windows)]
+        RootName::Spaced => base.join(" ROCm venvs"),
+        #[cfg(not(windows))]
         RootName::Spaced => base.join(" ROCm venvs "),
         #[cfg(unix)]
         RootName::NonUtf8 => {
