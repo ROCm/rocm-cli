@@ -115,9 +115,9 @@ all of which the scan reports nothing for:
 
 ### Advised commands must parse
 
-`apps/rocm/src/advised_commands.rs` holds every command the CLI or its docs tell
-a user to run to the real parser. It collects the `rocm`/`rocmd` invocations
-named in four places:
+`apps/rocm/src/advised_commands.rs` checks every command that the CLI or its
+docs tell a user to run against the real parser. It collects the
+`rocm`/`rocmd` invocations named in four places:
 
 - the `--help` of every visible command
 - production Rust string literals: backtick spans, literals that start with a
@@ -126,9 +126,21 @@ named in four places:
 - the VHS tapes
 
 It fills in placeholders such as `<model>`, `{}` and `[--flag]` groups, then
-routes each command the way `rocm` itself does. A command that clap rejects
-fails the test. So does a single word that ends up at the natural-language
-planner, because that means the advised subcommand does not exist.
+routes each command the way `rocm` itself does. These fail the test:
+
+- a command that clap rejects
+- a single word that ends up at the natural-language planner, because that
+  means the advised subcommand does not exist
+- a command that leaves out a required argument or subcommand, when it is a
+  line meant to be run as written: a fenced code line, a string literal that
+  starts with a command, a labelled `next step:`/`Try:` line, or a help
+  EXAMPLES row
+
+Only an inline backtick span in prose (``pass `rocm serve --engine` ``) may name
+a command without its values, or a command that marks the gap with `…`.
+
+`every_source_is_scanned` requires each source to still yield a known command
+and a minimum count, so a broken extractor cannot pass silently.
 
 When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
 a reason, only when the text starts with `rocm` but is not advice to run
