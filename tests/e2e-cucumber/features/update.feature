@@ -74,3 +74,19 @@ Feature: Update report
     When the user checks for updates against that catalog
     Then the report offers no update for the runtime that is ahead of the catalog
     And the report offers an update for the runtime that is behind the catalog
+
+  # The other half of the same comparison: a catalog that publishes nothing
+  # newer must not be read as an update. Two shapes it has to get right. The
+  # catalog may spell the installed version differently — an index serves the
+  # normalised `7.0.0rc1` while an older manifest recorded `7.0.0-rc1`, which
+  # PEP 440 calls one version — and an offer there re-downloads a runtime the
+  # machine already has. And a four-component release (`7.2.4.70204`, the shape
+  # ROCm's own packages are named with) is newer than a catalog's `6.4.3`, so
+  # `--apply` must not install ROCm 6 over it. Same loopback nightly tarball
+  # catalog as update-07: metadata-only, no GPU, no network. Mock lane.
+  @id:update-report-offers-nothing-when-the-catalog-is-not-newer
+  Scenario: update-08 - The update report offers nothing when the catalog has no newer version
+    Given a nightly tarball catalog that has no newer version for either registered runtime
+    When the user checks for updates against that catalog
+    Then the report calls the runtime the catalog spells differently up to date
+    And the report offers no update for the four-component runtime that is ahead of the catalog

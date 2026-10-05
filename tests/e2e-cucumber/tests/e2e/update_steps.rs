@@ -207,23 +207,35 @@ async fn nightly_catalog_straddling_two_runtimes(world: &mut E2eWorld) {
         .path()
         .to_path_buf();
 
+    plant_nightly_tarball_runtime(&root, AHEAD_RUNTIME_KEY, "gfx120X-all", "7.10.0", 2_000);
+    plant_nightly_tarball_runtime(&root, BEHIND_RUNTIME_KEY, "gfx110X-all", "7.9", 1_000);
+    serve_nightly_tarball_catalog(
+        world,
+        &root,
+        &[("gfx120X-all", "7.9"), ("gfx110X-all", "7.10.0")],
+    );
+}
+
+/// Serves a nightly tarball catalog publishing one `(family, version)` file per
+/// entry, and points the CLI at it.
+fn serve_nightly_tarball_catalog(
+    world: &mut E2eWorld,
+    root: &std::path::Path,
+    published: &[(&str, &str)],
+) {
     // `platform_tarball_token` picks this from the host, so the fixture has to
     // match or the prefix filter finds nothing on the Windows lane.
     let platform = if cfg!(windows) { "windows" } else { "linux" };
-    let entries = [
-        (
-            format!("therock-dist-{platform}-gfx120X-all-7.9.tar.gz"),
-            1_787_000_000.0_f64,
-        ),
-        (
-            format!("therock-dist-{platform}-gfx110X-all-7.10.0.tar.gz"),
-            1_787_000_000.0_f64,
-        ),
-    ]
-    .iter()
-    .map(|(name, mtime)| format!("{{\"name\": \"{name}\", \"mtime\": {mtime:?}}}"))
-    .collect::<Vec<_>>()
-    .join(", ");
+    let entries = published
+        .iter()
+        .map(|(family, version)| {
+            format!(
+                "{{\"name\": \"therock-dist-{platform}-{family}-{version}.tar.gz\", \"mtime\": {:?}}}",
+                1_787_000_000.0_f64
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let served = root.join("nightly-tarball-catalog");
     let catalog_dir = served.join("tarball-nightly");
     std::fs::create_dir_all(&catalog_dir).expect("failed to create catalog dir");
@@ -232,9 +244,6 @@ async fn nightly_catalog_straddling_two_runtimes(world: &mut E2eWorld) {
         format!("<html><body><script>const files = [{entries}];</script></body></html>"),
     )
     .expect("failed to write tarball catalog");
-
-    plant_nightly_tarball_runtime(&root, AHEAD_RUNTIME_KEY, "gfx120X-all", "7.10.0", 2_000);
-    plant_nightly_tarball_runtime(&root, BEHIND_RUNTIME_KEY, "gfx110X-all", "7.9", 1_000);
 
     let server = LoopbackServer::start(&served);
     let base = format!("{}/tarball-nightly/", server.base_url());
@@ -318,6 +327,72 @@ async fn update_offered_for_behind_runtime(world: &mut E2eWorld) {
         out.contains(&offer),
         "the report did not offer the newer catalog version to a runtime a \
          release behind it; expected {offer:?} in:\n{out}"
+    );
+}
+
+// ── update-08: a catalog with nothing newer offers nothing ─────────
+
+/// Installed as `7.0.0-rc1`; the catalog publishes the normalised `7.0.0rc1`.
+const RESPELLED_RUNTIME_KEY: &str = "nightly-tarball-gfx120x-all-7-0-0-rc1";
+/// Installed as a four-component release; the catalog publishes `6.4.3`.
+const FOUR_COMPONENT_RUNTIME_KEY: &str = "nightly-tarball-gfx110x-all-7-2-4-70204";
+
+/// Serves a nightly tarball catalog that has nothing newer for either
+/// registered runtime: one it publishes under a different spelling of the same
+/// version, and one it is a major release behind.
+#[given("a nightly tarball catalog that has no newer version for either registered runtime")]
+async fn nightly_catalog_with_nothing_newer(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .to_path_buf();
+
+    plant_nightly_tarball_runtime(
+        &root,
+        RESPELLED_RUNTIME_KEY,
+        "gfx120X-all",
+        "7.0.0-rc1",
+        2_000,
+    );
+    plant_nightly_tarball_runtime(
+        &root,
+        FOUR_COMPONENT_RUNTIME_KEY,
+        "gfx110X-all",
+        "7.2.4.70204",
+        1_000,
+    );
+    serve_nightly_tarball_catalog(
+        world,
+        &root,
+        &[("gfx120X-all", "7.0.0rc1"), ("gfx110X-all", "6.4.3")],
+    );
+}
+
+#[then("the report calls the runtime the catalog spells differently up to date")]
+async fn respelled_runtime_is_up_to_date(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_runtime_status(&out, RESPELLED_RUNTIME_KEY, "up_to_date");
+    // The status and its consequence together: an `update_available` verdict
+    // prints this offer, and following it re-downloads the installed runtime.
+    let offer = format!("run `rocm update --apply --runtime {RESPELLED_RUNTIME_KEY}`");
+    assert!(
+        !out.contains(&offer),
+        "the report offered to reinstall the version already installed, spelled \
+         differently by the catalog:\n{out}"
+    );
+}
+
+#[then("the report offers no update for the four-component runtime that is ahead of the catalog")]
+async fn no_update_for_four_component_runtime(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert_runtime_status(&out, FOUR_COMPONENT_RUNTIME_KEY, "ahead_of_index");
+    let offer = format!("run `rocm update --apply --runtime {FOUR_COMPONENT_RUNTIME_KEY}`");
+    assert!(
+        !out.contains(&offer),
+        "the report offered to install the catalog's 6.4.3 over an installed \
+         7.2.4.70204:\n{out}"
     );
 }
 
