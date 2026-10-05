@@ -3664,6 +3664,7 @@ dependencies = [
  "flate2",
  "keyring-core",
  "libc",
+ "proptest",
  "rocm-core",
  "rocm-dash-core",
  "rocm-dash-daemon",

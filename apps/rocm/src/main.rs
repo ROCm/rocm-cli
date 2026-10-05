@@ -11,6 +11,8 @@ mod comfyui;
 mod dash;
 mod dash_seam;
 mod endpoint_keys;
+#[cfg(test)]
+mod gpu_selection_proptests;
 mod logging;
 mod provider_keys;
 mod providers;
