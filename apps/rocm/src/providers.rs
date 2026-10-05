@@ -2876,14 +2876,8 @@ mod tests {
                 api_key: None,
                 notes: Vec::new(),
             });
-        assert!(
-            rendered.contains("time to first token  n/a"),
-            "summary: {rendered}"
-        );
-        assert!(
-            rendered.contains("throughput (approx)  n/a"),
-            "summary: {rendered}"
-        );
+        assert!(rendered.contains("time to first token  n/a"));
+        assert!(rendered.contains("throughput (approx)  n/a"));
         Ok(())
     }
 
