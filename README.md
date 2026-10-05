@@ -740,8 +740,13 @@ step, so an interrupted save leaves the previous file rather than a truncated
 one. If the file exists but cannot be read — a bad hand edit, for example —
 rocm-cli reports it and does not save over it, so the settings in it are never
 replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
-where runtimes are kept; when it is too damaged to read even that, commands
-stop until it is repaired or moved aside.
+where runtimes are kept; when it is too damaged to read even that, commands stop
+and say how to recover (`rocm diagnose` still runs). Repairing the file
+restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
+when the file still shows it) lets commands find their runtimes meanwhile, but
+commands that read settings keep failing until the file is repaired. Moving
+the file aside resets every setting to its default, and runtimes in a custom
+folder then need `ROCM_CLI_DATA_DIR`.
 
 ### Setup
 
