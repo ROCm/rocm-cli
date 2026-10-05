@@ -3,18 +3,17 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    AppPaths, OPTIONAL_COMMAND_TIMEOUT, WINDOWS_INVENTORY_QUERY_TIMEOUT,
-    WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT, WindowsExamineInventory, WslSummary,
-    detect_host_gpu_summary_fast, detect_managed_therock_sdk_gfx_target,
-    detect_windows_examine_inventory, detect_wsl_summary, env_flag, is_wsl_host,
-    parse_windows_examine_inventory, runtime_is_linux, runtime_is_windows, unix_time_millis,
+    AppPaths, LegacyRocmSummary, OPTIONAL_COMMAND_TIMEOUT, WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT, detect_legacy_rocm_summary,
+    detect_managed_therock_family, detect_managed_therock_sdk_gfx_target, discover_rocm_installs,
+    env_flag, examine, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
-#[cfg(test)]
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
-use std::path::Path;
+use std::io::{IsTerminal, Read, stdin, stdout};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1454,6 +1453,1489 @@ fn gfx_target_from_gc_version(major: u32, minor: u32, revision: u32) -> Option<S
     Some(format!("gfx{major}{minor:x}{revision:x}"))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExamineSummary {
+    pub os: String,
+    pub arch: String,
+    pub kernel: Option<String>,
+    pub distro: Option<String>,
+    pub cpu: Option<String>,
+    pub system_ram_gib: Option<f64>,
+    /// Whether *this* `rocm` process was given a terminal — not a property of
+    /// the machine, unlike every other field here.
+    ///
+    /// False whenever stdout is captured, which includes the dashboard running
+    /// `rocm examine` as a child process. That is why the same machine reports
+    /// `true` from a shell and `false` from the dashboard: both are correct.
+    /// See [`interactive_terminal`] for what it gates.
+    pub interactive_terminal: bool,
+    pub default_engine: String,
+    pub detected_gfx_target: Option<String>,
+    #[serde(default)]
+    pub compatible_therock_family: Option<String>,
+    #[serde(default)]
+    pub detected_therock_family: Option<String>,
+    pub driver: DriverSummary,
+    pub legacy_rocm: LegacyRocmSummary,
+    #[serde(default)]
+    pub wsl: Option<WslSummary>,
+    pub managed_runtime_count: usize,
+    pub managed_service_count: usize,
+    pub model_cache_entries: usize,
+    pub config_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriverSummary {
+    pub policy: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WslSummary {
+    pub is_wsl: bool,
+    pub dxg_device: bool,
+    pub dxcore: bool,
+    pub librocdxg: bool,
+    pub rocdxg_dids: bool,
+    pub ldconfig_librocdxg: bool,
+    pub rocminfo: bool,
+    pub cargo: bool,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostGpuSummary {
+    pub name: Option<String>,
+    pub gfx_target: Option<String>,
+    pub therock_family: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WindowsExamineInventory {
+    cpu_model: Option<String>,
+    system_ram_gib: Option<f64>,
+    displays: Vec<WindowsDisplayAdapter>,
+}
+
+#[derive(Debug, Clone)]
+struct WindowsDisplayAdapter {
+    name: String,
+    driver_version: Option<String>,
+    pnp_device_id: Option<String>,
+}
+
+impl WindowsExamineInventory {
+    #[cfg(windows)]
+    fn is_empty(&self) -> bool {
+        self.cpu_model.is_none() && self.system_ram_gib.is_none() && self.displays.is_empty()
+    }
+
+    #[cfg(windows)]
+    fn merge_missing_from(&mut self, mut other: WindowsExamineInventory) {
+        if self.cpu_model.is_none() {
+            self.cpu_model = other.cpu_model.take();
+        }
+        if self.system_ram_gib.is_none() {
+            self.system_ram_gib = other.system_ram_gib.take();
+        }
+        for display in other.displays {
+            let duplicate = self.displays.iter_mut().find(|existing| {
+                match (
+                    existing.pnp_device_id.as_deref(),
+                    display.pnp_device_id.as_deref(),
+                ) {
+                    (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+                    _ => {
+                        !existing.name.trim().is_empty()
+                            && !display.name.trim().is_empty()
+                            && existing.name.eq_ignore_ascii_case(&display.name)
+                    }
+                }
+            });
+            if let Some(existing) = duplicate {
+                if existing.name.trim().is_empty() && !display.name.trim().is_empty() {
+                    existing.name = display.name;
+                }
+                if existing.driver_version.is_none() {
+                    existing.driver_version = display.driver_version;
+                }
+                if existing.pnp_device_id.is_none() {
+                    existing.pnp_device_id = display.pnp_device_id;
+                }
+            } else {
+                self.displays.push(display);
+            }
+        }
+    }
+
+    fn amd_display_driver_detail(&self) -> Option<String> {
+        let display = self.preferred_amd_display()?;
+        let name = display.name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let detail = format!(
+            "{name} driver {}",
+            display.driver_version.as_deref().unwrap_or("")
+        );
+        Some(detail.trim().to_owned())
+    }
+
+    fn amd_display_name(&self) -> Option<String> {
+        self.preferred_amd_display()
+            .map(|display| display.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn preferred_amd_display(&self) -> Option<&WindowsDisplayAdapter> {
+        self.displays
+            .iter()
+            .find(|display| {
+                display
+                    .pnp_device_id
+                    .as_deref()
+                    .and_then(amd_pci_device_id_from_pnp_id)
+                    .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id))
+                    .is_some()
+            })
+            .or_else(|| {
+                self.displays
+                    .iter()
+                    .find(|display| gfx_target_from_amd_marketing_name(&display.name).is_some())
+            })
+            .or_else(|| {
+                self.displays
+                    .iter()
+                    .find(|display| !display.name.trim().is_empty())
+            })
+    }
+
+    fn display_gfx_target(&self) -> Option<String> {
+        parse_windows_display_gfx_target(&self.display_gfx_probe_text())
+    }
+
+    fn display_gfx_probe_text(&self) -> String {
+        self.displays
+            .iter()
+            .map(|display| {
+                format!(
+                    "{}\t{}",
+                    display.name,
+                    display.pnp_device_id.as_deref().unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+impl ExamineSummary {
+    pub fn gather() -> Result<Self> {
+        let paths = AppPaths::discover()?;
+        let windows_inventory = detect_windows_examine_inventory();
+        let wsl = detect_wsl_summary();
+        let detected_gfx_target = detect_examine_gfx_target_fast(windows_inventory.as_ref());
+        let compatible_therock_family = detected_gfx_target
+            .as_deref()
+            .and_then(normalize_therock_family);
+        let detected_therock_family = detect_managed_therock_family(&paths);
+        // Report the engine this GPU actually serves on, not the platform
+        // constant. `compatible_therock_family` is the right input: it is
+        // normalised from the real GPU, whereas `detected_therock_family`
+        // describes the installed managed runtime and is absent before one
+        // exists — which would silently downgrade the answer to the constant on
+        // a fresh machine.
+        let host_gpu = HostGpuSummary {
+            name: None,
+            gfx_target: detected_gfx_target.clone(),
+            therock_family: compatible_therock_family.clone(),
+        };
+        Ok(Self {
+            os: runtime_os_name().to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            kernel: detect_kernel_version(),
+            distro: detect_distro_name(),
+            cpu: detect_cpu_model_with_windows_inventory(windows_inventory.as_ref()),
+            system_ram_gib: detect_system_ram_gib_with_windows_inventory(
+                windows_inventory.as_ref(),
+            ),
+            interactive_terminal: interactive_terminal(),
+            default_engine: default_engine_for_host(&host_gpu).to_owned(),
+            detected_gfx_target,
+            compatible_therock_family,
+            detected_therock_family,
+            driver: detect_driver_summary_with_windows_inventory(
+                windows_inventory.as_ref(),
+                wsl.as_ref(),
+            ),
+            legacy_rocm: detect_legacy_rocm_summary(),
+            wsl,
+            managed_runtime_count: count_json_files(
+                &paths.data_dir.join("runtimes").join("registry"),
+            ),
+            managed_service_count: count_json_files(&paths.services_dir()),
+            model_cache_entries: count_dir_entries(&paths.data_dir.join("models")),
+            config_dir: paths.config_dir,
+            data_dir: paths.data_dir,
+            cache_dir: paths.cache_dir,
+        })
+    }
+
+    pub fn render_text(&self) -> String {
+        let legacy_paths = if self.legacy_rocm.paths.is_empty() {
+            "<none>".to_owned()
+        } else {
+            self.legacy_rocm
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let wsl = self.wsl.as_ref();
+        // Every other field here describes the MACHINE; this one describes the
+        // invocation, which is what made it ambiguous -- `true` from a terminal
+        // and `false` under the dashboard both look like claims about the host.
+        // Say which it is on the line itself, so pasted output explains itself.
+        let interactive_terminal = if self.interactive_terminal {
+            "true (this run has a terminal; the CLI may prompt)"
+        } else {
+            "false (this run's output is captured, so the CLI will not prompt)"
+        };
+        format!(
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            self.os,
+            self.arch,
+            self.kernel.as_deref().unwrap_or("<unknown>"),
+            self.distro.as_deref().unwrap_or("<unknown>"),
+            self.cpu.as_deref().unwrap_or("<unknown>"),
+            self.system_ram_gib
+                .map_or_else(|| "<unknown>".to_owned(), format_gib_value),
+            interactive_terminal,
+            self.default_engine,
+            self.detected_gfx_target.as_deref().unwrap_or("<unknown>"),
+            self.compatible_therock_family
+                .as_deref()
+                .unwrap_or("<unknown>"),
+            self.detected_therock_family
+                .as_deref()
+                .unwrap_or("<not detected>"),
+            self.driver.policy,
+            self.driver.status,
+            self.driver.detail.as_deref().unwrap_or("<unknown>"),
+            self.legacy_rocm.status,
+            legacy_paths,
+            self.legacy_rocm.version.as_deref().unwrap_or("<unknown>"),
+            self.legacy_rocm.detail.as_deref().unwrap_or("<unknown>"),
+            self.legacy_rocm_guidance(),
+            wsl.is_some_and(|summary| summary.is_wsl),
+            wsl.is_some_and(|summary| summary.dxg_device),
+            wsl.is_some_and(|summary| summary.dxcore),
+            wsl.is_some_and(|summary| summary.librocdxg),
+            wsl.is_some_and(|summary| summary.rocdxg_dids),
+            wsl.is_some_and(|summary| summary.ldconfig_librocdxg),
+            wsl.is_some_and(|summary| summary.rocminfo),
+            wsl.is_some_and(|summary| summary.cargo),
+            wsl.and_then(|summary| summary.detail.as_deref())
+                .unwrap_or("<not WSL>"),
+            self.managed_runtime_count,
+            self.managed_service_count,
+            self.model_cache_entries,
+            self.config_dir.display(),
+            self.data_dir.display(),
+            self.cache_dir.display(),
+        )
+    }
+
+    const fn legacy_rocm_guidance(&self) -> &'static str {
+        if self.legacy_rocm.paths.is_empty() {
+            return "none";
+        }
+        if self.managed_runtime_count == 0 {
+            return "legacy ROCm detected; install a managed TheRock runtime with `rocm install sdk --channel release --format wheel` and keep legacy ROCm unmanaged";
+        }
+        "legacy ROCm detected; keep it side-by-side and use rocm-cli managed TheRock runtimes for local engines"
+    }
+}
+
+/// Whether this process can hold an interactive exchange with a user.
+///
+/// Both streams must be a terminal: stdin so an answer can be read, stdout so
+/// the question is seen. Anything that captures either — a pipe, a CI step, the
+/// dashboard spawning `rocm` as a child — makes this false, and callers then
+/// skip the prompt rather than block on input nobody can supply.
+///
+/// A property of the invocation, not of the host. `rocm examine` reports it so a
+/// pasted report explains why prompts were skipped.
+pub fn interactive_terminal() -> bool {
+    stdin().is_terminal() && stdout().is_terminal()
+}
+
+pub const fn default_engine_for_platform() -> &'static str {
+    "lemonade"
+}
+
+/// The engine this host serves on by default, absent an explicit choice.
+///
+/// [`default_engine_for_platform`] alone answers "what does this OS fall back
+/// to", which is not the same question: on Instinct data-center parts serving
+/// goes through vLLM, and reporting the platform constant there contradicts what
+/// `serve` actually selects. Use this wherever the CLI *tells the user* what the
+/// default engine is; `default_engine_for_platform` remains correct as the
+/// last-resort fallback once GPU and recipe preferences have been exhausted.
+///
+/// A value the user configured still outranks this — callers that have a
+/// configured engine must prefer it, mirroring `select_serve_engine`.
+#[must_use]
+pub fn default_engine_for_host(summary: &HostGpuSummary) -> &'static str {
+    preferred_serve_engine_for_host_gpu_summary(summary).unwrap_or_else(default_engine_for_platform)
+}
+
+const VLLM_PREFERRED_THEROCK_FAMILIES: &[&str] = &["gfx906", "gfx908", "gfx90a"];
+
+pub fn preferred_serve_engine_for_host_gpu_summary(
+    summary: &HostGpuSummary,
+) -> Option<&'static str> {
+    // The vLLM engine adapter bails out on native Windows builds, so never prefer it
+    // there. WSL builds as a Linux target and therefore remains eligible.
+    if cfg!(windows) {
+        return None;
+    }
+    preferred_serve_engine_for_therock_family(
+        summary
+            .therock_family
+            .as_deref()
+            .or(summary.gfx_target.as_deref()),
+    )
+}
+
+fn preferred_serve_engine_for_therock_family(family: Option<&str>) -> Option<&'static str> {
+    let family = family?.trim();
+    if family.is_empty() {
+        return None;
+    }
+
+    let family = normalize_therock_family(family)
+        .as_deref()
+        .unwrap_or(family)
+        .to_ascii_lowercase();
+    if family.ends_with("-dcgpu")
+        || VLLM_PREFERRED_THEROCK_FAMILIES
+            .iter()
+            .any(|candidate| *candidate == family)
+    {
+        Some("vllm")
+    } else {
+        None
+    }
+}
+
+fn detect_kernel_version() -> Option<String> {
+    if runtime_is_windows() {
+        capture_optional_command("cmd", &["/C", "ver"])
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    } else {
+        capture_optional_command("uname", &["-r"])
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    }
+}
+
+fn detect_distro_name() -> Option<String> {
+    if runtime_is_windows() {
+        return Some("Windows".to_owned());
+    }
+
+    if runtime_is_linux() {
+        return parse_os_release_pretty_name(&fs::read_to_string("/etc/os-release").ok()?)
+            .or_else(|| Some("Linux".to_owned()));
+    }
+
+    None
+}
+
+fn parse_os_release_pretty_name(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix("PRETTY_NAME=")?.trim();
+        let value = value.trim_matches('"').trim_matches('\'').trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+fn detect_cpu_model_with_windows_inventory(
+    windows_inventory: Option<&WindowsExamineInventory>,
+) -> Option<String> {
+    if runtime_is_windows()
+        && let Some(inventory) = windows_inventory
+    {
+        return inventory.cpu_model.clone();
+    }
+
+    detect_cpu_model()
+}
+
+fn detect_cpu_model() -> Option<String> {
+    if runtime_is_windows() {
+        let script =
+            "Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name";
+        return capture_optional_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-Command", script],
+            OPTIONAL_COMMAND_TIMEOUT,
+        )
+        .map(|value| normalize_cpu_model(&value))
+        .filter(|value| !value.is_empty());
+    }
+
+    if runtime_is_linux()
+        && let Some(model) = fs::read_to_string("/proc/cpuinfo").ok().and_then(|text| {
+            text.lines().find_map(|line| {
+                let value = line
+                    .strip_prefix("model name")
+                    .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
+                    .or_else(|| {
+                        line.strip_prefix("Hardware")
+                            .and_then(|rest| rest.split_once(':').map(|(_, value)| value))
+                    })?;
+                let value = normalize_cpu_model(value);
+                (!value.is_empty()).then_some(value)
+            })
+        })
+    {
+        return Some(model);
+    }
+
+    None
+}
+
+fn detect_system_ram_gib_with_windows_inventory(
+    windows_inventory: Option<&WindowsExamineInventory>,
+) -> Option<f64> {
+    if runtime_is_windows()
+        && let Some(inventory) = windows_inventory
+    {
+        return inventory.system_ram_gib;
+    }
+
+    detect_system_ram_gib()
+}
+
+pub fn detect_system_ram_gib() -> Option<f64> {
+    if runtime_is_windows() {
+        let script = "(Get-CimInstance -ClassName Win32_ComputerSystem -Property TotalPhysicalMemory).TotalPhysicalMemory";
+        return capture_optional_command_with_timeout(
+            "powershell",
+            &["-NoProfile", "-Command", script],
+            OPTIONAL_COMMAND_TIMEOUT,
+        )
+        .and_then(|value| bytes_text_to_gib(&value));
+    }
+
+    if runtime_is_linux()
+        && let Some(kib) = fs::read_to_string("/proc/meminfo").ok().and_then(|text| {
+            text.lines().find_map(|line| {
+                let value = line.strip_prefix("MemTotal:")?.trim();
+                let number = value.split_whitespace().next()?.parse::<f64>().ok()?;
+                Some(number)
+            })
+        })
+    {
+        return Some(kib / 1024.0 / 1024.0);
+    }
+
+    if cfg!(target_os = "macos") {
+        return capture_optional_command("sysctl", &["-n", "hw.memsize"])
+            .and_then(|value| bytes_text_to_gib(&value));
+    }
+
+    None
+}
+
+fn bytes_text_to_gib(value: &str) -> Option<f64> {
+    let bytes = value.trim().parse::<f64>().ok()?;
+    (bytes > 0.0).then_some(bytes / 1024.0 / 1024.0 / 1024.0)
+}
+
+fn format_gib_value(value: f64) -> String {
+    if value >= 10.0 {
+        format!("{value:.0} GiB")
+    } else {
+        format!("{value:.1} GiB")
+    }
+}
+
+fn normalize_cpu_model(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether this host is WSL2 — the one answer, for every caller.
+///
+/// There were three of these, and they disagreed. The install summary asked for
+/// `/dev/dxg` or `microsoft` in `/proc/version`; the JSON probe asked for
+/// `microsoft` or `wsl` in `/proc/version`, or `$WSL_DISTRO_NAME`. So a host
+/// with `/dev/dxg` but a kernel string naming neither was WSL to one and not the
+/// other, and the same command could contradict itself between its two output
+/// forms. Worse, the e2e harness derives `is_wsl` for its whole expectation
+/// matrix by reading one of them.
+///
+/// `/dev/dxg` is trusted on its own, and so is the kernel's own build string in
+/// `/proc/version` — nothing else stamps a kernel `-microsoft-standard-WSL2` or
+/// `-Microsoft`. `$WSL_DISTRO_NAME` is not trusted at all: it is an ordinary
+/// environment variable that can survive into a shell that merely inherited it
+/// (over `ssh`, in a `systemd` unit, under `sudo` without `-E`, under `env -i` or
+/// cron) without corroborating anything. See [`wsl_signals_indicate_wsl`] for why
+/// a false positive is no longer cheap.
+#[must_use]
+pub fn is_wsl_host() -> bool {
+    runtime_is_linux()
+        && wsl_signals_indicate_wsl(
+            Path::new("/dev/dxg").exists(),
+            &fs::read_to_string("/proc/version").unwrap_or_default(),
+        )
+}
+
+/// Whether the host runs WSL 1 rather than WSL 2.
+///
+/// WSL 1 translates syscalls instead of running a real kernel, so it has no
+/// `/dev/dxg` and no GPU path at all. Without this the catalog would tell a WSL 1
+/// user to update a Windows driver that could never help them.
+///
+/// WSL 1 reports a kernel ending in `-Microsoft`, as in `4.4.0-19041-Microsoft`.
+/// WSL 2 builds all carry `microsoft-standard`, with the `-WSL2` suffix added
+/// later — `4.19.104-microsoft-standard` was the original and has no `WSL2` in
+/// it at all.
+///
+/// So the test is the `standard` marker and the trailing position, not the
+/// absence of `WSL2`. Keying on `WSL2` alone called every early WSL 2 kernel
+/// "WSL 1", which is the asymmetric error [`crate::examine::WslFacts::version`]
+/// documents as the one to avoid: it tells the user to convert a distribution
+/// that is already converted, at high confidence, while suppressing every other
+/// check. Anything unrecognised is read as WSL 2 for the same reason.
+#[must_use]
+pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
+    let kernel = kernel_release.trim().to_ascii_lowercase();
+    kernel.ends_with("-microsoft") && !kernel.contains("standard")
+}
+
+/// The dynamic linker cache, or `None` when `ldconfig` could not be run.
+///
+/// `ldconfig` lives in `/sbin`, which is not on a non-root user's `PATH` on
+/// Debian and derivatives. Looking it up by bare name there yields nothing, and
+/// an empty cache is indistinguishable from a cache that does not list the
+/// library — so a correctly installed ROCDXG read as "not registered with the
+/// linker" and the catalog told the user to run `ldconfig` on a working install.
+///
+/// Search the conventional locations, and report "could not ask" as `None`
+/// rather than as an empty answer.
+fn ldconfig_cache() -> Option<String> {
+    for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
+        if let Some(text) = capture_optional_command(program, &["-p"]) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Whether the linker cache lists ROCDXG, or `None` if it could not be read.
+pub(crate) fn ldconfig_lists_librocdxg() -> Option<bool> {
+    ldconfig_cache().map(|text| text.contains("librocdxg.so"))
+}
+
+/// Whether `relative` exists under any ROCm install on this host.
+///
+/// The WSL probe used to hardcode `/opt/rocm`, so a versioned install at
+/// `/opt/rocm-7.x` reported ROCDXG missing and the catalog would then blame a
+/// package that was in fact installed. Ask the same resolver the rest of the CLI
+/// uses, and keep the conventional root as a fallback for the case where
+/// discovery finds nothing.
+fn rocm_relative_file_exists(relative: &str) -> bool {
+    if Path::new("/opt/rocm").join(relative).exists() {
+        return true;
+    }
+    discover_rocm_installs()
+        .iter()
+        .any(|install| install.path.join(relative).exists())
+}
+
+/// The predicate itself, separated from reading the machine so the union can be
+/// tested — including the two cases that used to split the old implementations.
+///
+/// `/dev/dxg` alone is trusted outright — nothing but WSLg's GPU passthrough
+/// creates that device node. The kernel's own build string in `/proc/version` is
+/// also trusted alone: only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+/// `-Microsoft`, and that string cannot be inherited, forwarded, or left behind
+/// by an unrelated shell the way `$WSL_DISTRO_NAME` can. `$WSL_DISTRO_NAME` plays
+/// no part here at all — an ordinary bare-metal host that merely inherited it
+/// (over `ssh`, from a parent shell, under `sudo` without `-E`) has no
+/// `/proc/version` match to go with it, so it still reads as Linux. A false
+/// positive the other way no longer costs only a route-out note — this catalog
+/// now runs the WSL diagnosis and fix set directly, so a bare-metal host
+/// misread as WSL would have its entire bare-metal catalog silently disabled.
+fn wsl_signals_indicate_wsl(dxg_device: bool, proc_version: &str) -> bool {
+    if dxg_device {
+        return true;
+    }
+    let proc_version = proc_version.to_ascii_lowercase();
+    proc_version.contains("microsoft") || proc_version.contains("wsl")
+}
+
+pub(crate) fn detect_wsl_summary() -> Option<WslSummary> {
+    if !runtime_is_linux() || !is_wsl_host() {
+        return None;
+    }
+
+    let dxg_device = Path::new("/dev/dxg").exists();
+    let is_wsl = true;
+
+    let dxcore = Path::new("/usr/lib/wsl/lib/libdxcore.so").exists();
+    let librocdxg = rocm_relative_file_exists("lib/librocdxg.so");
+    let rocdxg_dids = rocm_relative_file_exists("share/rocdxg/dids.conf");
+    let ldconfig_text = ldconfig_cache();
+    let ldconfig_librocdxg = ldconfig_text
+        .as_deref()
+        .is_some_and(|text| text.contains("librocdxg.so"));
+    let rocminfo = tool_on_path("rocminfo");
+    let cargo = tool_on_path("cargo");
+    let mut missing = Vec::new();
+    if !dxg_device {
+        missing.push("/dev/dxg");
+    }
+    if !dxcore {
+        missing.push("/usr/lib/wsl/lib/libdxcore.so");
+    }
+    if !librocdxg {
+        // Named without a directory: the file is looked up across every ROCm
+        // install, so quoting one root would misreport where it was not found.
+        missing.push("librocdxg.so");
+    }
+    if !ldconfig_librocdxg {
+        missing.push("ldconfig:librocdxg.so");
+    }
+    let detail = if missing.is_empty() {
+        Some("WSL DXCore and ROCDXG plumbing detected".to_owned())
+    } else {
+        Some(format!("missing {}", missing.join(", ")))
+    };
+
+    Some(WslSummary {
+        is_wsl,
+        dxg_device,
+        dxcore,
+        librocdxg,
+        rocdxg_dids,
+        ldconfig_librocdxg,
+        rocminfo,
+        cargo,
+        detail,
+    })
+}
+
+fn detect_driver_summary_with_windows_inventory(
+    windows_inventory: Option<&WindowsExamineInventory>,
+    wsl: Option<&WslSummary>,
+) -> DriverSummary {
+    if runtime_is_windows() {
+        let detail = windows_inventory
+            .and_then(WindowsExamineInventory::amd_display_driver_detail)
+            .or_else(|| {
+                if windows_inventory.is_none() {
+                    detect_windows_amd_display_driver()
+                } else {
+                    None
+                }
+            });
+        return windows_driver_summary(detail);
+    }
+
+    if let Some(wsl) = wsl {
+        return wsl_driver_summary(wsl);
+    }
+
+    detect_driver_summary()
+}
+
+fn detect_driver_summary() -> DriverSummary {
+    if runtime_is_windows() {
+        let detail = detect_windows_amd_display_driver();
+        return windows_driver_summary(detail);
+    }
+
+    if runtime_is_linux() {
+        let module_detected = Path::new("/sys/module/amdgpu").exists();
+        return DriverSummary {
+            policy: "linux_official_amd_dkms_wrapper".to_owned(),
+            status: if module_detected {
+                "amdgpu_available".to_owned()
+            } else {
+                "not_detected".to_owned()
+            },
+            detail: if Path::new("/dev/kfd").exists() {
+                Some("/dev/kfd is present".to_owned())
+            } else if module_detected {
+                Some("amdgpu module metadata is present".to_owned())
+            } else {
+                None
+            },
+        };
+    }
+
+    DriverSummary {
+        policy: "inspection_only".to_owned(),
+        status: "unsupported_platform".to_owned(),
+        detail: None,
+    }
+}
+
+/// The amdgpu kernel module's version on Linux, if it reports one.
+///
+/// Prefers the sysfs attribute (a plain file read, no subprocess) that DKMS
+/// builds of amdgpu expose. Falls back to `modinfo`, which is the only source
+/// for the in-tree kernel module -- it doesn't populate
+/// `/sys/module/amdgpu/version` at all.
+fn detect_linux_amdgpu_driver_version() -> Option<String> {
+    if let Ok(text) = fs::read_to_string("/sys/module/amdgpu/version") {
+        let version = text.trim();
+        if !version.is_empty() {
+            return Some(version.to_owned());
+        }
+    }
+    let (rc, out, _) = examine::run("modinfo", &["amdgpu"], examine::SHORT);
+    if rc != 0 {
+        return None;
+    }
+    out.lines()
+        .find_map(|line| line.strip_prefix("version:"))
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPU driver version for this machine.
+///
+/// Sourced however the current platform exposes it: the amdgpu kernel module
+/// on Linux, the AMD display driver on Windows, or -- inside WSL -- the
+/// Windows host's display driver, since that's the driver a WSL guest's GPU
+/// workloads actually depend on, not its own (driver-less) amdgpu module.
+pub fn detect_gpu_driver_version() -> Option<String> {
+    if is_wsl_host() {
+        return match detect_wsl_host_driver() {
+            WslHostDriverProbe::Version(version) => Some(version),
+            WslHostDriverProbe::Unreachable | WslHostDriverProbe::NoAmdDisplay => None,
+        };
+    }
+    if runtime_is_windows() {
+        return detect_windows_amd_display_driver();
+    }
+    if runtime_is_linux() {
+        return detect_linux_amdgpu_driver_version();
+    }
+    None
+}
+
+impl WslSummary {
+    /// Whether the ROCDXG plumbing a GPU workload needs is actually in place.
+    ///
+    /// Extracted so `serve` can act on the same answer `examine` prints, rather
+    /// than reaching its own conclusion from a different source. That split is
+    /// what let `examine` report `wsl_rocdxg_ready` while `serve` refused on the
+    /// same machine for want of a GPU.
+    #[must_use]
+    pub const fn rocdxg_ready(&self) -> bool {
+        self.dxg_device && self.dxcore && self.librocdxg && self.ldconfig_librocdxg
+    }
+}
+
+fn wsl_driver_summary(wsl: &WslSummary) -> DriverSummary {
+    let ready = wsl.rocdxg_ready();
+    let status = if ready {
+        "wsl_rocdxg_ready"
+    } else if wsl.dxg_device && wsl.dxcore {
+        "wsl_rocdxg_missing"
+    } else {
+        "wsl_gpu_plumbing_missing"
+    };
+    DriverSummary {
+        policy: "wsl_rocdxg".to_owned(),
+        status: status.to_owned(),
+        detail: wsl.detail.clone(),
+    }
+}
+
+fn windows_driver_summary(detail: Option<String>) -> DriverSummary {
+    DriverSummary {
+        policy: "windows_validate_only".to_owned(),
+        status: if detail.is_some() {
+            "amd_display_driver_detected".to_owned()
+        } else {
+            "not_detected".to_owned()
+        },
+        detail,
+    }
+}
+
+#[cfg(windows)]
+fn detect_windows_amd_display_driver() -> Option<String> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    let script = "$gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices' -or $_.Name -match 'AMD|Radeon|Instinct' } | Select-Object -First 1 -Property Name,DriverVersion; if ($gpu) { \"$($gpu.Name) driver $($gpu.DriverVersion)\" }";
+    capture_optional_command("powershell", &["-NoProfile", "-Command", script])
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(windows))]
+const fn detect_windows_amd_display_driver() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    let mut inventory = WindowsExamineInventory::default();
+    if let Some(pnp_util) = detect_windows_examine_inventory_from_pnputil() {
+        inventory.merge_missing_from(pnp_util);
+    }
+    if inventory.displays.is_empty()
+        && let Some(video) = detect_windows_examine_inventory_from_video_controller()
+    {
+        inventory.merge_missing_from(video);
+    }
+    if inventory.displays.is_empty()
+        && let Some(pnp) = detect_windows_examine_inventory_from_pnp_entity()
+    {
+        inventory.merge_missing_from(pnp);
+    }
+    if (inventory.cpu_model.is_none() || inventory.system_ram_gib.is_none())
+        && let Some(system) = detect_windows_system_inventory_from_cim()
+    {
+        inventory.merge_missing_from(system);
+    }
+
+    (!inventory.is_empty()).then_some(inventory)
+}
+
+#[cfg(windows)]
+fn detect_windows_examine_inventory_from_pnputil() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
+        "pnputil",
+        &["/enum-devices", "/class", "Display"],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_pnputil_display_inventory(&output))
+}
+
+#[cfg(windows)]
+fn detect_windows_examine_inventory_from_video_controller() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_examine_inventory(&output))
+}
+
+#[cfg(windows)]
+fn detect_windows_system_inventory_from_cim() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_SYSTEM_INVENTORY_SCRIPT,
+        ],
+        OPTIONAL_COMMAND_TIMEOUT,
+    )
+    .map(|output| parse_windows_examine_inventory(&output))
+}
+
+#[cfg(windows)]
+fn detect_windows_examine_inventory_from_pnp_entity() -> Option<WindowsExamineInventory> {
+    if !runtime_is_windows() {
+        return None;
+    }
+    capture_optional_command_with_timeout(
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+    )
+    .map(|output| parse_windows_examine_inventory(&output))
+}
+
+#[cfg(not(windows))]
+const fn detect_windows_examine_inventory() -> Option<WindowsExamineInventory> {
+    None
+}
+
+#[cfg(any(windows, test))]
+fn clean_windows_display_name(value: &str) -> String {
+    let value = value.trim();
+    let value = value.rsplit_once(';').map_or(value, |(_, name)| name);
+    value.trim().to_owned()
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_windows_examine_inventory(text: &str) -> WindowsExamineInventory {
+    let mut inventory = WindowsExamineInventory::default();
+
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut fields = line.split('\t');
+        match fields.next() {
+            Some("CPU") => {
+                let cpu_model = fields.collect::<Vec<_>>().join("\t");
+                let cpu_model = normalize_cpu_model(&cpu_model);
+                if !cpu_model.is_empty() {
+                    inventory.cpu_model = Some(cpu_model);
+                }
+            }
+            Some("RAM") => {
+                let bytes = fields.next().unwrap_or("").trim();
+                inventory.system_ram_gib = bytes_text_to_gib(bytes);
+            }
+            Some("GPU") => {
+                let name = fields.next().unwrap_or("").trim().to_owned();
+                let driver_version = fields
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                let pnp_device_id = fields
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                if !name.is_empty() || driver_version.is_some() || pnp_device_id.is_some() {
+                    inventory.displays.push(WindowsDisplayAdapter {
+                        name,
+                        driver_version,
+                        pnp_device_id,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    inventory
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_pnputil_display_inventory(text: &str) -> WindowsExamineInventory {
+    let mut inventory = WindowsExamineInventory::default();
+    let mut name: Option<String> = None;
+    let mut instance_id: Option<String> = None;
+    let mut driver_version: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            push_windows_pnputil_display(
+                &mut inventory,
+                &mut name,
+                &mut instance_id,
+                &mut driver_version,
+            );
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "instance id" | "device instance id" => {
+                instance_id = Some(value.to_owned());
+            }
+            "device description" | "friendly name" | "name" => {
+                name = Some(clean_windows_display_name(value));
+            }
+            "driver version" => {
+                driver_version = Some(value.to_owned());
+            }
+            _ => {}
+        }
+    }
+    push_windows_pnputil_display(
+        &mut inventory,
+        &mut name,
+        &mut instance_id,
+        &mut driver_version,
+    );
+
+    inventory
+}
+
+#[cfg(any(windows, test))]
+fn push_windows_pnputil_display(
+    inventory: &mut WindowsExamineInventory,
+    name: &mut Option<String>,
+    instance_id: &mut Option<String>,
+    driver_version: &mut Option<String>,
+) {
+    let pnp = instance_id.take();
+    let display_name = name.take().unwrap_or_default();
+    let driver = driver_version.take();
+    let has_amd_id = pnp
+        .as_deref()
+        .is_some_and(|value| value.to_ascii_uppercase().contains("VEN_1002"));
+    let has_amd_name = display_name
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .any(|token| matches!(token, "amd" | "radeon" | "instinct"));
+    if !has_amd_id && !has_amd_name {
+        return;
+    }
+    inventory.displays.push(WindowsDisplayAdapter {
+        name: display_name,
+        driver_version: driver,
+        pnp_device_id: pnp,
+    });
+}
+
+pub fn detect_host_gpu_diagnostics() -> String {
+    use std::fmt::Write as _;
+    let mut output = String::new();
+    let _ = writeln!(output, "GPU detection diagnostics");
+    let _ = writeln!(output, "  runtime_os: {}", runtime_os_name());
+    let summary = detect_host_gpu_summary(None);
+    let _ = writeln!(
+        output,
+        "  detected_name: {}",
+        summary.name.as_deref().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(
+        output,
+        "  detected_gfx_target: {}",
+        summary.gfx_target.as_deref().unwrap_or("<unknown>")
+    );
+    let _ = writeln!(
+        output,
+        "  detected_therock_family: {}",
+        summary.therock_family.as_deref().unwrap_or("<unknown>")
+    );
+
+    if runtime_is_windows() {
+        append_windows_gpu_probe_diagnostics(&mut output);
+    } else if runtime_is_linux() {
+        let _ = writeln!(
+            output,
+            "  linux_sysfs_gfx_target: {}",
+            detect_linux_sysfs_gfx_target()
+                .as_deref()
+                .unwrap_or("<not found>")
+        );
+        let _ = writeln!(
+            output,
+            "  linux_primary_gpu_name: {}",
+            detect_linux_primary_gpu_name()
+                .as_deref()
+                .unwrap_or("<not found>")
+        );
+        if is_wsl_host() {
+            let wsl_probe = detect_wsl_windows_display_probe_text().unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  wsl_windows_display_probe_lines: {}",
+                wsl_probe.lines().count()
+            );
+            for line in wsl_probe.lines().take(8) {
+                let _ = writeln!(output, "    {line}");
+            }
+        }
+    }
+
+    output
+}
+
+#[cfg(windows)]
+fn append_windows_gpu_probe_diagnostics(output: &mut String) {
+    append_windows_probe_diagnostics(
+        output,
+        "pnputil display devices",
+        "pnputil",
+        &["/enum-devices", "/class", "Display"],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_pnputil_display_inventory,
+    );
+    append_windows_probe_diagnostics(
+        output,
+        "Win32_VideoController",
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_examine_inventory,
+    );
+    append_windows_probe_diagnostics(
+        output,
+        "Win32_PnPEntity",
+        "powershell",
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_PNP_ENTITY_INVENTORY_SCRIPT,
+        ],
+        WINDOWS_INVENTORY_QUERY_TIMEOUT,
+        parse_windows_examine_inventory,
+    );
+}
+
+#[cfg(not(windows))]
+const fn append_windows_gpu_probe_diagnostics(_output: &mut String) {}
+
+#[cfg(windows)]
+fn append_windows_probe_diagnostics(
+    output: &mut String,
+    label: &str,
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+    parse: fn(&str) -> WindowsExamineInventory,
+) {
+    use std::fmt::Write as _;
+    let result = capture_diagnostic_command(program, args, timeout);
+    let _ = writeln!(output, "  probe: {label}");
+    let _ = writeln!(
+        output,
+        "    command: {} {}",
+        result
+            .program
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| program.to_owned()),
+        args.join(" ")
+    );
+    if let Some(error) = result.error.as_deref() {
+        let _ = writeln!(output, "    error: {error}");
+    }
+    if result.timed_out {
+        let _ = writeln!(output, "    error: timed out");
+    }
+    if let Some(status) = result.status.as_deref() {
+        let _ = writeln!(output, "    status: {status}");
+    }
+
+    let inventory = parse(&result.stdout);
+    let _ = writeln!(output, "    display_count: {}", inventory.displays.len());
+    for display in inventory.displays.iter().take(8) {
+        let gfx = display
+            .pnp_device_id
+            .as_deref()
+            .and_then(amd_pci_device_id_from_pnp_id)
+            .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id).map(str::to_owned))
+            .or_else(|| gfx_target_from_amd_marketing_name(&display.name).map(str::to_owned))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let _ = writeln!(
+            output,
+            "      gpu: name={} pnp={} driver={} gfx={}",
+            empty_as_unknown(&display.name),
+            display.pnp_device_id.as_deref().unwrap_or("<unknown>"),
+            display.driver_version.as_deref().unwrap_or("<unknown>"),
+            gfx
+        );
+    }
+    append_diagnostic_stream(output, "stdout", &result.stdout);
+    append_diagnostic_stream(output, "stderr", &result.stderr);
+}
+
+#[cfg(windows)]
+fn empty_as_unknown(value: &str) -> &str {
+    let value = value.trim();
+    if value.is_empty() { "<unknown>" } else { value }
+}
+
+#[derive(Debug)]
+#[cfg(windows)]
+struct DiagnosticCommandResult {
+    program: Option<PathBuf>,
+    status: Option<String>,
+    stdout: String,
+    stderr: String,
+    error: Option<String>,
+    timed_out: bool,
+}
+
+#[cfg(windows)]
+fn capture_diagnostic_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> DiagnosticCommandResult {
+    let candidates = tool_path_candidates(program);
+    let mut last_error = None;
+    for candidate in candidates {
+        let path = PathBuf::from(&candidate);
+        let mut child = match Command::new(&path)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                last_error = Some(format!("failed to launch {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stdout.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stderr.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = stdout_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: Some(status.to_string()),
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        error: None,
+                        timed_out: false,
+                    };
+                }
+                Ok(None) if start.elapsed() < timeout => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stdout = stdout_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    let stderr = stderr_reader
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: None,
+                        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                        error: None,
+                        timed_out: true,
+                    };
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return DiagnosticCommandResult {
+                        program: Some(path),
+                        status: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        error: Some(format!("failed to wait: {error}")),
+                        timed_out: false,
+                    };
+                }
+            }
+        }
+    }
+
+    DiagnosticCommandResult {
+        program: None,
+        status: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: last_error.or_else(|| Some(format!("{program} was not found"))),
+        timed_out: false,
+    }
+}
+
+#[cfg(windows)]
+fn append_diagnostic_stream(output: &mut String, name: &str, text: &str) {
+    use std::fmt::Write as _;
+    let mut lines = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    if lines.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(output, "    {name}:");
+    for line in lines.take(12) {
+        let _ = writeln!(
+            output,
+            "      {}",
+            truncate_diagnostic_line(line.trim(), 220)
+        );
+    }
+}
+
+#[cfg(windows)]
+fn truncate_diagnostic_line(line: &str, max_chars: usize) -> String {
+    let mut chars = line.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn count_json_files(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|value| value.to_str()) == Some("json"))
+        .count()
+}
+
+fn count_dir_entries(dir: &Path) -> usize {
+    fs::read_dir(dir).map_or(0, |entries| entries.flatten().count())
+}
+
+pub fn detect_host_gpu_summary(paths: Option<&AppPaths>) -> HostGpuSummary {
+    detect_host_gpu_summary_fast(paths)
+}
+
+#[cfg(windows)]
+fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
+    let windows_inventory = detect_windows_examine_inventory();
+    let gfx_target = detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
+    let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
+    let name = windows_inventory
+        .as_ref()
+        .and_then(WindowsExamineInventory::amd_display_name);
+    HostGpuSummary {
+        name,
+        gfx_target,
+        therock_family,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
+    if runtime_is_windows() {
+        let windows_inventory = detect_windows_examine_inventory();
+        let gfx_target =
+            detect_windows_display_gfx_target_with_inventory(windows_inventory.as_ref());
+        let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
+        let name = windows_inventory
+            .as_ref()
+            .and_then(WindowsExamineInventory::amd_display_name);
+        return HostGpuSummary {
+            name,
+            gfx_target,
+            therock_family,
+        };
+    }
+
+    let linux_gfx_target = detect_linux_sysfs_gfx_target();
+    let linux_name = detect_linux_primary_gpu_name();
+    let wsl_display_probe = if linux_gfx_target.is_none() || linux_name.is_none() {
+        detect_wsl_windows_display_probe_text()
+    } else {
+        None
+    };
+    let gfx_target = linux_gfx_target.or_else(|| {
+        wsl_display_probe
+            .as_deref()
+            .and_then(parse_windows_display_gfx_target)
+    });
+    let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
+    let name = linux_name.or_else(|| {
+        wsl_display_probe
+            .as_deref()
+            .and_then(parse_windows_display_name)
+    });
+    HostGpuSummary {
+        name,
+        gfx_target,
+        therock_family,
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn detect_host_gpu_summary_fast(_paths: Option<&AppPaths>) -> HostGpuSummary {
+    HostGpuSummary::default()
+}
+
+#[allow(dead_code)]
+fn detect_host_gpu_summary_full(paths: Option<&AppPaths>) -> HostGpuSummary {
+    let windows_inventory = detect_windows_examine_inventory();
+    let wsl = detect_wsl_summary();
+    let gfx_target =
+        detect_host_gfx_target_with_context(windows_inventory.as_ref(), wsl.as_ref(), paths);
+    let therock_family = gfx_target.as_deref().and_then(normalize_therock_family);
+    let name = detect_host_gpu_name_with_context(windows_inventory.as_ref(), wsl.as_ref());
+    HostGpuSummary {
+        name,
+        gfx_target,
+        therock_family,
+    }
+}
+
+fn detect_host_gpu_name_with_context(
+    windows_inventory: Option<&WindowsExamineInventory>,
+    wsl: Option<&WslSummary>,
+) -> Option<String> {
+    windows_inventory
+        .and_then(WindowsExamineInventory::amd_display_name)
+        .or_else(detect_linux_primary_gpu_name)
+        .or_else(|| detect_wsl_windows_display_name(wsl))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,5 +3764,569 @@ mod tests {
             usable_amd_gpu_indices_from(2, rocr_then_hip_mask("5", "0")),
             None
         );
+    }
+    #[test]
+    fn default_engine_is_always_usable_on_windows() {
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_platform(), "lemonade");
+        }
+    }
+
+    #[test]
+    fn instinct_dcgpu_family_prefers_vllm() {
+        // On Instinct data-center GPUs (TheRock `*-dcgpu` families, e.g. the
+        // MI300X's gfx94X-dcgpu) the default serving engine is vLLM. This is the
+        // GPU-family preference the serve engine selection honors before falling
+        // back to a recipe's own preferred engine. vLLM is Linux-only, so the
+        // preference does not apply on native Windows.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        let preferred = preferred_serve_engine_for_host_gpu_summary(&summary);
+        if cfg!(windows) {
+            assert_eq!(preferred, None, "vLLM is not preferred on native Windows");
+        } else {
+            assert_eq!(preferred, Some("vllm"));
+        }
+    }
+
+    #[test]
+    fn host_default_engine_is_vllm_on_instinct() {
+        // What `rocm examine` and `rocm engines list` report on an MI300X. The
+        // platform constant said "lemonade" here while serve picked vLLM, so the
+        // reported default contradicted the actual behaviour.
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        if cfg!(windows) {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        } else {
+            assert_eq!(default_engine_for_host(&summary), "vllm");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_covers_every_vllm_preferred_family() {
+        // Guards the whole preferred set, not just the dcgpu branch, so adding a
+        // family to VLLM_PREFERRED_THEROCK_FAMILIES cannot leave the reported
+        // default behind.
+        for family in VLLM_PREFERRED_THEROCK_FAMILIES {
+            let summary = HostGpuSummary {
+                name: None,
+                gfx_target: Some((*family).to_owned()),
+                therock_family: Some((*family).to_owned()),
+            };
+            let expected = if cfg!(windows) { "lemonade" } else { "vllm" };
+            assert_eq!(
+                default_engine_for_host(&summary),
+                expected,
+                "unexpected default for {family}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_default_engine_is_lemonade_without_a_vllm_preference() {
+        // Strix Halo (gfx1151), a consumer family, and a machine whose GPU has not
+        // been identified at all must all keep the platform default.
+        for summary in [
+            HostGpuSummary {
+                name: Some("AMD Radeon 8060S".to_owned()),
+                gfx_target: Some("gfx1151".to_owned()),
+                therock_family: Some("gfx1151".to_owned()),
+            },
+            HostGpuSummary {
+                name: Some("AMD Radeon".to_owned()),
+                gfx_target: Some("gfx1100".to_owned()),
+                therock_family: Some("gfx110X-all".to_owned()),
+            },
+            HostGpuSummary::default(),
+        ] {
+            assert_eq!(default_engine_for_host(&summary), "lemonade");
+        }
+    }
+
+    #[test]
+    fn host_default_engine_never_reports_vllm_on_native_windows() {
+        // The vLLM adapter bails on native Windows, so no GPU may talk the
+        // reported default into vLLM there — including an Instinct part.
+        if !cfg!(windows) {
+            return;
+        }
+        let summary = HostGpuSummary {
+            name: Some("AMD Instinct MI300X".to_owned()),
+            gfx_target: Some("gfx942".to_owned()),
+            therock_family: Some("gfx94X-dcgpu".to_owned()),
+        };
+        assert_eq!(default_engine_for_host(&summary), "lemonade");
+    }
+
+    #[test]
+    fn consumer_gpu_family_has_no_vllm_preference() {
+        // A non-dcgpu consumer family (e.g. gfx110X-all) has no GPU-level vLLM
+        // preference, so serve selection falls through to the recipe/platform
+        // default rather than forcing vLLM.
+        let summary = HostGpuSummary {
+            name: Some("AMD Radeon".to_owned()),
+            gfx_target: Some("gfx1100".to_owned()),
+            therock_family: Some("gfx110X-all".to_owned()),
+        };
+        assert_eq!(preferred_serve_engine_for_host_gpu_summary(&summary), None);
+    }
+
+    #[test]
+    fn preferred_serve_engine_uses_vllm_for_supported_therock_families() {
+        assert_eq!(
+            preferred_serve_engine_for_therock_family(Some("gfx90a")),
+            Some("vllm")
+        );
+        assert_eq!(
+            preferred_serve_engine_for_therock_family(Some("gfx950")),
+            Some("vllm")
+        );
+        assert_eq!(
+            preferred_serve_engine_for_therock_family(Some("gfx999-dcgpu")),
+            Some("vllm")
+        );
+        assert_eq!(preferred_serve_engine_for_therock_family(None), None);
+    }
+
+    #[test]
+    fn preferred_serve_engine_host_summary_respects_platform_and_fields() {
+        // `gfx_target` is consulted as a fallback when `therock_family` is absent.
+        let summary = HostGpuSummary {
+            gfx_target: Some("gfx950".to_owned()),
+            ..HostGpuSummary::default()
+        };
+        // The vLLM adapter is unsupported on native Windows, so the preference is
+        // gated off there while remaining active on Linux/WSL builds.
+        let expected = if cfg!(windows) { None } else { Some("vllm") };
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&summary),
+            expected
+        );
+
+        // No GPU information never resolves to a vLLM preference on any platform.
+        assert_eq!(
+            preferred_serve_engine_for_host_gpu_summary(&HostGpuSummary::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_display_name_cleaner_removes_inf_resource_prefix() {
+        assert_eq!(
+            clean_windows_display_name("@oem40.inf,%amd7550.23%;AMD Radeon RX 9070 XT"),
+            "AMD Radeon RX 9070 XT"
+        );
+        assert_eq!(
+            clean_windows_display_name("AMD Radeon RX 9070 XT"),
+            "AMD Radeon RX 9070 XT"
+        );
+    }
+
+    #[test]
+    fn windows_examine_inventory_parser_feeds_cpu_driver_and_gfx_detection() {
+        let inventory = parse_windows_examine_inventory(
+            "CPU\t  AMD Ryzen 9 9950X  16-Core Processor  \nRAM\t68719476736\nGPU\tAMD Radeon RX 9070 XT\t32.0.13031.9001\tPCI\\VEN_1002&DEV_7550&SUBSYS_2435148C&REV_C0\n",
+        );
+
+        assert_eq!(
+            inventory.cpu_model.as_deref(),
+            Some("AMD Ryzen 9 9950X 16-Core Processor")
+        );
+        assert_eq!(inventory.system_ram_gib, Some(64.0));
+        assert_eq!(
+            inventory.amd_display_driver_detail().as_deref(),
+            Some("AMD Radeon RX 9070 XT driver 32.0.13031.9001")
+        );
+        assert_eq!(inventory.display_gfx_target(), Some("gfx1201".to_owned()));
+    }
+
+    #[test]
+    fn windows_pnputil_inventory_parser_detects_780m_device_id() {
+        let inventory = parse_windows_pnputil_display_inventory(
+            "\
+Instance ID:                PCI\\VEN_1002&DEV_15BF&SUBSYS_15021025&REV_C1\\4&2F6D7E4A&0&0041
+Device Description:        AMD Radeon 780M Graphics
+Class Name:                Display
+Class GUID:                {4d36e968-e325-11ce-bfc1-08002be10318}
+Manufacturer Name:         Advanced Micro Devices, Inc.
+Status:                    Started
+Driver Name:               oem42.inf
+",
+        );
+
+        assert_eq!(
+            inventory.amd_display_name().as_deref(),
+            Some("AMD Radeon 780M Graphics")
+        );
+        assert_eq!(inventory.display_gfx_target(), Some("gfx1103".to_owned()));
+    }
+
+    #[test]
+    fn windows_pnputil_inventory_parser_ignores_non_amd_display() {
+        let inventory = parse_windows_pnputil_display_inventory(
+            "\
+Instance ID:                PCI\\VEN_8086&DEV_9A49&SUBSYS_00000000
+Device Description:        Intel UHD Graphics
+Class Name:                Display
+",
+        );
+
+        assert!(inventory.displays.is_empty());
+    }
+
+    #[test]
+    fn windows_examine_inventory_prefers_real_gpu_over_noisy_amd_pnp_entries() {
+        let inventory = parse_windows_examine_inventory(
+            "GPU\tAMD Bluetooth Capture Audio Device\t\t{2101C4C0-2C15-4035-A0D0-EEC3C2277B11}\\CAPTURE&CP_111215637\nGPU\tAMD-OpenGL User Mode Driver\t\tSWD\\DRIVERENUM\\AMDOGL&5&BAA66E4&0\nGPU\tAMD Radeon 780M Graphics\t\tPCI\\VEN_1002&DEV_1900&SUBSYS_50EE17AA&REV_D0\\4&EB5E2B6&0&0041\n",
+        );
+
+        assert_eq!(
+            inventory.amd_display_name().as_deref(),
+            Some("AMD Radeon 780M Graphics")
+        );
+        assert_eq!(inventory.display_gfx_target(), Some("gfx1103".to_owned()));
+    }
+
+    #[test]
+    fn counts_json_files_and_model_cache_entries_for_examine() -> Result<()> {
+        let (root, paths) = temp_app_paths("examine-counts");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let models = paths.data_dir.join("models");
+        fs::create_dir_all(&registry)?;
+        fs::create_dir_all(&models)?;
+        fs::write(registry.join("runtime-a.json"), "{}")?;
+        fs::write(registry.join("runtime-b.json"), "{}")?;
+        fs::write(registry.join("notes.txt"), "skip")?;
+        fs::create_dir_all(models.join("hf"))?;
+        fs::write(models.join("local.bin"), "model")?;
+
+        assert_eq!(count_json_files(&registry), 2);
+        assert_eq!(count_dir_entries(&models), 2);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn examine_render_includes_driver_and_state_counts() {
+        let summary = ExamineSummary {
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: Some("10.0.26100".to_owned()),
+            distro: Some("Windows".to_owned()),
+            cpu: Some("AMD Ryzen".to_owned()),
+            system_ram_gib: Some(64.0),
+            interactive_terminal: false,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: Some("gfx120X-all".to_owned()),
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "windows_validate_only".to_owned(),
+                status: "amd_display_driver_detected".to_owned(),
+                detail: Some("AMD Radeon driver 1.2.3".to_owned()),
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "detected_unmanaged".to_owned(),
+                paths: vec![PathBuf::from("C:\\Program Files\\AMD\\ROCm")],
+                detail: Some("legacy install".to_owned()),
+                version: Some("6.4.1".to_owned()),
+            },
+            wsl: None,
+            managed_runtime_count: 2,
+            managed_service_count: 1,
+            model_cache_entries: 3,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let rendered = summary.render_text();
+        assert!(rendered.contains("distro: Windows"));
+        assert!(rendered.contains("cpu: AMD Ryzen"));
+        assert!(rendered.contains("system_ram: 64 GiB"));
+        assert!(rendered.contains("compatible_therock_family: gfx120X-all"));
+        assert!(rendered.contains("detected_therock_family: <not detected>"));
+        assert!(rendered.contains("driver_policy: windows_validate_only"));
+        assert!(rendered.contains("driver_status: amd_display_driver_detected"));
+        assert!(rendered.contains("legacy_rocm_status: detected_unmanaged"));
+        assert!(rendered.contains("legacy_rocm_paths: C:\\Program Files\\AMD\\ROCm"));
+        assert!(
+            rendered.contains("legacy_rocm_guidance: legacy ROCm detected; keep it side-by-side")
+        );
+        assert!(rendered.contains("wsl: false"));
+        assert!(rendered.contains("managed_runtimes: 2"));
+        assert!(rendered.contains("managed_services: 1"));
+        assert!(rendered.contains("model_cache_entries: 3"));
+    }
+
+    #[test]
+    fn examine_render_explains_what_interactive_terminal_means() {
+        // The same machine reports `true` from a shell and `false` under the
+        // dashboard, because the field describes the invocation rather than the
+        // host. Both are correct, and the line has to say so on its own — a
+        // pasted report is usually all a reader gets.
+        let mut summary = ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: true,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let interactive = summary.render_text();
+        assert!(
+            interactive.contains("interactive_terminal: true (this run has a terminal"),
+            "the true case must say it is about this run:\n{interactive}"
+        );
+
+        summary.interactive_terminal = false;
+        let captured = summary.render_text();
+        assert!(
+            captured.contains("interactive_terminal: false (this run's output is captured"),
+            "the false case must explain why, not just report it:\n{captured}"
+        );
+        // The reason it matters to the reader: it is why they saw no prompt.
+        assert!(
+            captured.contains("will not prompt"),
+            "the false case must connect to the visible consequence:\n{captured}"
+        );
+    }
+
+    #[test]
+    fn examine_render_guides_managed_runtime_install_when_only_legacy_rocm_exists() {
+        let summary = ExamineSummary {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "vllm".to_owned(),
+            detected_gfx_target: None,
+            compatible_therock_family: None,
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "linux_official_amd_dkms_wrapper".to_owned(),
+                status: "amdgpu_available".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "detected_unmanaged".to_owned(),
+                paths: vec![PathBuf::from("/opt/rocm")],
+                detail: Some("legacy install".to_owned()),
+                version: Some("7.14.0".to_owned()),
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        };
+
+        let rendered = summary.render_text();
+
+        assert!(rendered.contains(
+            "legacy_rocm_guidance: legacy ROCm detected; install a managed TheRock runtime"
+        ));
+        assert!(rendered.contains("rocm install sdk --channel release --format wheel"));
+    }
+
+    #[test]
+    fn wsl_driver_summary_reports_missing_rocdxg_without_amdgpu_fallback() {
+        let summary = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: false,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: false,
+            rocminfo: false,
+            cargo: true,
+            detail: Some("missing /opt/rocm/lib/librocdxg.so".to_owned()),
+        };
+
+        let driver = wsl_driver_summary(&summary);
+
+        assert_eq!(driver.policy, "wsl_rocdxg");
+        assert_eq!(driver.status, "wsl_rocdxg_missing");
+        assert!(
+            driver
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("librocdxg"))
+        );
+    }
+
+    #[test]
+    fn parses_os_release_pretty_name() {
+        assert_eq!(
+            parse_os_release_pretty_name("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
+            Some("Ubuntu 24.04.2 LTS".to_owned())
+        );
+    }
+
+    #[test]
+    fn dev_dxg_is_believed_on_its_own() {
+        // Nothing but WSLg's GPU passthrough creates this device node, so it is
+        // trusted without corroboration.
+        assert!(wsl_signals_indicate_wsl(true, ""), "/dev/dxg");
+        assert!(
+            wsl_signals_indicate_wsl(true, "Linux version 6.8.0-51-generic"),
+            "/dev/dxg overrides an otherwise ordinary kernel string"
+        );
+    }
+
+    #[test]
+    fn proc_version_alone_is_believed() {
+        // Only a WSL kernel is built `-microsoft-standard[-WSL2]` or
+        // `-Microsoft` -- unlike $WSL_DISTRO_NAME, that string cannot be
+        // inherited or forwarded into an unrelated shell, so it needs no
+        // corroboration. This is also what makes a WSL2 container correctly
+        // read as WSL even when it was not started with /dev/dxg passed in:
+        // it shares the host kernel, so /proc/version still carries the
+        // marker even though the container has no $WSL_DISTRO_NAME of its own.
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 6.6.87.2-microsoft-standard-WSL2"),
+            "microsoft in /proc/version is enough on its own"
+        );
+        assert!(
+            wsl_signals_indicate_wsl(false, "Linux version 5.15.0 wsl2"),
+            "wsl in /proc/version is enough on its own"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_kernel_with_no_signals_is_not_wsl() {
+        assert!(
+            !wsl_signals_indicate_wsl(false, "Linux version 6.8.0-51-generic"),
+            "an ordinary kernel is not WSL"
+        );
+        assert!(
+            !wsl_signals_indicate_wsl(false, ""),
+            "no device and no /proc/version to read is not WSL"
+        );
+    }
+
+    #[test]
+    fn real_wsl2_and_wsl1_hosts_are_recognised_by_proc_version_alone() {
+        // Its own doc comment above records that WSL 1 kernels always end in
+        // "-microsoft" and WSL 2 kernels always carry "microsoft-standard" --
+        // so every real WSL host is recognised without needing $WSL_DISTRO_NAME
+        // or /dev/dxg at all.
+        let wsl2 = "Linux version 5.15.167.4-microsoft-standard-WSL2";
+        let wsl2_early = "Linux version 4.19.104-microsoft-standard";
+        let wsl1 = "Linux version 4.4.0-19041-Microsoft";
+        for proc_version in [wsl2, wsl2_early, wsl1] {
+            assert!(
+                wsl_signals_indicate_wsl(false, proc_version),
+                "a real WSL host was not recognised: {proc_version:?}"
+            );
+        }
+        // WSL 2 with GPU passthrough enabled also has /dev/dxg, which is
+        // believed regardless of /proc/version.
+        assert!(wsl_signals_indicate_wsl(true, wsl2));
+    }
+
+    #[test]
+    fn wsl_case_folding_does_not_depend_on_the_kernel_string_casing() {
+        assert!(wsl_signals_indicate_wsl(false, "MICROSOFT-STANDARD-WSL2"));
+    }
+
+    #[test]
+    fn wsl1_is_told_apart_from_wsl2_by_the_kernel_release() {
+        // The two are the same string family, distinguished only by the WSL2
+        // marker. Getting this backwards would send a WSL 1 user chasing a
+        // Windows driver update that can never give them a GPU, or hide the
+        // conversion advice from the one platform that needs it.
+        for wsl1 in [
+            "4.4.0-19041-Microsoft",
+            "4.4.0-18362-MICROSOFT",
+            "4.4.0-17763-microsoft",
+        ] {
+            assert!(is_wsl1_kernel(wsl1), "{wsl1} is a WSL 1 kernel");
+        }
+        for wsl2 in [
+            "6.6.87.2-microsoft-standard-WSL2",
+            "5.15.167.4-microsoft-standard-WSL2",
+            "6.18.33.2-MICROSOFT-STANDARD-WSL2",
+            // The `-WSL2` suffix is not the marker. These are the earlier WSL 2
+            // kernels, which carry `microsoft-standard` and no `WSL2` at all --
+            // testing for the absence of `WSL2` called every one of them WSL 1.
+            "4.19.104-microsoft-standard",
+            "4.19.128-microsoft-standard",
+            "5.10.16.3-microsoft-standard",
+        ] {
+            assert!(!is_wsl1_kernel(wsl2), "{wsl2} is a WSL 2 kernel");
+        }
+        // A bare-metal kernel is neither, and must not read as WSL 1 -- the
+        // caller only asks on a host already known to be WSL, but answering
+        // "yes" here would be wrong if that ever changed.
+        assert!(!is_wsl1_kernel("6.8.0-51-generic"));
+        assert!(!is_wsl1_kernel(""));
+    }
+
+    #[test]
+    fn rocdxg_is_ready_only_when_the_whole_chain_is_present() {
+        let ready = WslSummary {
+            is_wsl: true,
+            dxg_device: true,
+            dxcore: true,
+            librocdxg: true,
+            rocdxg_dids: false,
+            ldconfig_librocdxg: true,
+            rocminfo: false,
+            cargo: false,
+            detail: None,
+        };
+        assert!(ready.rocdxg_ready());
+        // Each link is load-bearing: drop any one and a GPU launch cannot work,
+        // so `serve` must not be told it can.
+        for break_one in 0..4 {
+            let mut partial = ready.clone();
+            match break_one {
+                0 => partial.dxg_device = false,
+                1 => partial.dxcore = false,
+                2 => partial.librocdxg = false,
+                _ => partial.ldconfig_librocdxg = false,
+            }
+            assert!(
+                !partial.rocdxg_ready(),
+                "a broken link at {break_one} must not read as ready"
+            );
+        }
     }
 }
