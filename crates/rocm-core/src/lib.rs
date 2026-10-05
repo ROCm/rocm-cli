@@ -656,6 +656,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn resolve_amd_smi_binary_in_registry_breaks_install_time_ties_on_the_runtime_key() -> Result<()>
+    {
+        // Same shape as the active-runtime fallback test: both pairings of file
+        // name and runtime key, so a read-order pick is wrong in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-amd-smi-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let bin = temp_root.join(key).join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(bin.join("amd-smi"), b"#!/bin/sh\nexit 0\n")?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": { "import_ok": true, "bin_path": bin },
+                    }))?,
+                )?;
+            }
+
+            let resolved = resolve_amd_smi_binary_in_registry(&registry_dir);
+            let expected = temp_root.join("aaa").join("bin").join("amd-smi");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                resolved,
+                Some(expected.into_os_string()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
     fn test_exit_status() -> std::process::ExitStatus {
         std::process::ExitStatus::default()
     }

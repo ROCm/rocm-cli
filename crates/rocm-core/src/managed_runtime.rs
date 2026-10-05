@@ -579,6 +579,42 @@ mod tests {
     }
 
     #[test]
+    fn active_managed_therock_fallback_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Two runtimes installed in the same millisecond, written under both
+        // pairings of file name and runtime key. Whichever file `read_dir`
+        // returns first holds `bbb` in one of the two pairings, so a fallback
+        // that kept the read order picks the wrong runtime in that one.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = temp_app_paths("active-therock-tie");
+            let registry = paths.data_dir.join("runtimes").join("registry");
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-release:gfx120X-all",
+                        "family": "gfx120X-all",
+                        "channel": "release",
+                        "version": format!("version-of-{key}"),
+                        "installed_at_unix_ms": 2_000,
+                        "rocm_sdk": { "import_ok": true }
+                    }))?,
+                )?;
+            }
+
+            let config = RocmCliConfig::default();
+            assert_eq!(
+                active_managed_therock_version(&paths, &config)?,
+                Some("version-of-aaa".to_owned()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+            fs::remove_dir_all(root).ok();
+        }
+        Ok(())
+    }
+
+    #[test]
     fn active_managed_therock_channel_falls_back_to_most_recent() -> Result<()> {
         let (root, paths) = temp_app_paths("active-therock-channel-recent");
         let registry = paths.data_dir.join("runtimes").join("registry");
