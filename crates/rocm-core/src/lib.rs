@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
@@ -34,6 +35,8 @@ pub mod fix;
 pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod report;
+pub mod report_delivery;
 pub mod runtime;
 #[cfg(test)]
 mod test_env;
@@ -55,6 +58,11 @@ pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
+};
+pub use report::{
+    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
+    Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    refusal_envelope,
 };
 use runtime::env_path_override;
 pub use runtime::{

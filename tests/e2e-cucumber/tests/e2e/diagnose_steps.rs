@@ -1909,6 +1909,13 @@ async fn user_diagnoses_with_model_and_distro(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user asks the CLI what a report would carry")]
+async fn user_asks_what_a_report_would_carry(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
 #[then("the CLI refuses and says --model answers for this machine, not the one --distro names")]
 async fn assert_model_with_distro_refused(world: &mut E2eWorld) {
     let output = world.cli_output.clone().unwrap_or_default();
@@ -1948,4 +1955,196 @@ async fn assert_no_model_verdict_on_refusal(world: &mut E2eWorld) {
         !output.contains(&verdict_marker),
         "a refused request must not also report a model verdict for the wrong machine:\n{output}"
     );
+}
+
+#[when("the user asks the CLI what a report would carry in machine-readable form")]
+async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI either shows the whole report or says why it will not prepare one")]
+async fn report_is_shown_or_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let shown = out.contains("a report would carry");
+    let refused = out.contains("no report was prepared") || out.contains("No report was prepared");
+    assert!(
+        shown || refused,
+        "asking for a report produced neither a report nor a stated refusal, which leaves a \
+         user unable to tell what would be published:\n{out}"
+    );
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "a refusal is this command working, not failing, so both branches exit 0:\n{out}"
+    );
+}
+
+#[then("the CLI states that nothing has been sent")]
+async fn nothing_has_been_sent(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Only the prepared-report branch makes the promise; a refusal prepared
+    // nothing to send, so requiring the sentence there would assert about a
+    // report that does not exist.
+    if out.contains("a report would carry") {
+        assert!(
+            out.contains("Nothing has been sent"),
+            "the report was shown without saying it stayed here, which is the one thing a user \
+             needs to know before reading it:\n{out}"
+        );
+    }
+}
+
+#[then("the answer names no user, no host, and no file path")]
+async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal envelope (`{"schema","refused","explanation"}`) trivially
+    // contains none of the markers swept below, so on a lane whose hardware is
+    // not on the allowlist -- the common case, since most lanes have no AMD
+    // GPU at all -- every sweep would pass without a report ever having
+    // existed to sweep. Branch on the outcome, the same way the sibling step
+    // `nothing_has_been_sent` already does.
+    //
+    // `cli_version` is the discriminator, not `architecture`: the
+    // `ArchitectureUnreadable` refusal's own explanation text ("No AMD GPU
+    // *architecture* could be read here...") contains the word "architecture",
+    // so keying off that field name would make this same vacuous pass survive
+    // under a different guise on exactly the refusal this sandbox reaches.
+    // `cli_version` is a field `Report` carries and no refusal explanation
+    // does.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains("architecture"),
+            "a genuine report is missing the architecture field it is supposed to carry:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+        return;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    if !user.is_empty() && user.len() > 2 {
+        assert!(
+            !out.contains(&user),
+            "the user name reached what a report would publish:\n{out}"
+        );
+    }
+    let host = hostname_of_this_machine();
+    if !host.is_empty() && host.len() > 2 {
+        assert!(
+            !out.contains(&host),
+            "the host name reached what a report would publish:\n{out}"
+        );
+    }
+    for path_marker in ["/opt/rocm", "/home/", "C:\\", "/usr/"] {
+        assert!(
+            !out.contains(path_marker),
+            "a file path ({path_marker}) reached what a report would publish:\n{out}"
+        );
+    }
+}
+
+/// The mailbox `--send` offers to prefill, mirrored from
+/// `rocm_core::report_delivery::DESTINATION`. Kept as a literal rather than a
+/// dependency on `rocm-core`: this crate only runs the built binary, it does
+/// not link the library behind it.
+const REPORT_DESTINATION: &str = "ROCmCLI@amd.com";
+
+#[when("the user asks the CLI for a way to send a report, without asking to see the report first")]
+async fn user_asks_to_send_without_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--send"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and explains that the report must be requested too")]
+async fn assert_send_without_report_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "asking for a way to send a report without asking to see it first is an argument \
+         mistake, caught before anything is examined, so it exits the way any other bad \
+         argument combination does:\n{out}"
+    );
+    assert!(
+        out.contains("--report"),
+        "the refusal does not name the flag the user needed to add first:\n{out}"
+    );
+}
+
+/// Forces the headless branch deterministically: no display of any kind, no
+/// SSH-forwarded display, and no override asking for a browser regardless.
+/// Linux-only in effect, because the CLI under test only reads these on
+/// Linux — but the scenario that uses this is the one tagged
+/// `@requires-os:linux`, not this helper, so nothing here needs to branch on
+/// host.
+#[when("the user asks the CLI for a way to send a report, with no desktop available to open it on")]
+async fn user_asks_to_send_on_a_headless_machine(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["diagnose", "--report", "--send"],
+        &[
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("SSH_CONNECTION", ""),
+            ("SSH_CLIENT", ""),
+            ("SSH_TTY", ""),
+            ("ROCM_NO_BROWSER", ""),
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI prints the address to mail and a link, and starts nothing")]
+async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Same discriminator as `answer_names_nothing_identifying`: a refusal
+    // envelope has no `cli_version` field, so branch on its presence rather
+    // than asserting a shape that only a genuine report has.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(REPORT_DESTINATION),
+            "a headless machine was not given the address to mail by hand:\n{out}"
+        );
+        assert!(
+            out.contains("mailto:"),
+            "a headless machine was not given a link, only the sentence around it:\n{out}"
+        );
+        assert!(
+            !out.contains("was opened"),
+            "a mail client was reported opened on a machine with no desktop to open it on:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+/// This machine's host name, or empty when it cannot be read.
+///
+/// Read here rather than from the CLI: the assertion is that the name never
+/// appears in a report, so taking it from the thing under test would compare
+/// the report against itself.
+fn hostname_of_this_machine() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
 }

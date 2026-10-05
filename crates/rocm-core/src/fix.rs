@@ -874,6 +874,17 @@ pub(crate) fn torch_rocm_indexes_named_in<'a>(
         .collect()
 }
 
+/// Whether `fix_id` names an entry in the catalog.
+///
+/// A predicate rather than the lookup itself, because the caller that needs it
+/// is deciding whether a caller-supplied string may be published, not reading a
+/// recipe. Handing back the recipe would also make a private type reachable
+/// from outside this module.
+#[must_use]
+pub(crate) fn is_catalog_id(fix_id: &str) -> bool {
+    find_recipe(fix_id).is_some()
+}
+
 /// What the catalog says `rocm fix <fix_id>` does on `os`.
 ///
 /// `None` when the id is not in the catalog, or when it is but does not apply

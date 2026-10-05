@@ -6,6 +6,7 @@ use crate::cli_progress::AnimatedSpinner;
 use crate::{format_structured_tool_call, runtime_usability_status, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
+use rocm_core::browser::{Opener, SystemOpener};
 use rocm_core::{
     AppPaths, RocmCliConfig, download_file_to_path_with_progress, ensure_uv_binary,
     format_http_base_url, runtime_is_linux, runtime_is_windows, runtime_path_for_windows_child,
@@ -474,7 +475,7 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
     let browser_status = if options.no_open_browser {
         "not opened (--no-open-browser)".to_owned()
     } else {
-        match open_browser(&url) {
+        match SystemOpener.open(&url) {
             Ok(()) => "opened".to_owned(),
             Err(error) => format!("not opened ({error})"),
         }
@@ -1935,37 +1936,6 @@ fn child_path_string(path: &Path) -> String {
         runtime_path_for_windows_child(path)
     } else {
         path.display().to_string()
-    }
-}
-
-fn open_browser(url: &str) -> Result<()> {
-    let status = if runtime_is_windows() {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else if cfg!(target_os = "macos") && !runtime_is_linux() {
-        Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    } else {
-        Command::new("xdg-open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-    }
-    .context("failed to open browser")?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("browser opener exited with status {status}")
     }
 }
 
