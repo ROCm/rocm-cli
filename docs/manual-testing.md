@@ -318,6 +318,33 @@ Expected result:
 - Status shows the local URL and current state.
 - Stop shuts down the saved process.
 
+Reinstall over a used install. Put a file in the folder `rocm comfyui
+models-path` prints, save a workflow in the UI, generate one image, stop
+ComfyUI, then:
+
+```powershell
+rocm comfyui install --reinstall --dry-run
+rocm comfyui install --reinstall
+```
+
+Expected result:
+
+- The dry run prints `reinstall: replaces the ComfyUI code in <folder>` and
+  `keeps: models, user, output, input, custom_nodes, extra_model_paths.yaml`,
+  and its `install command:` ends in `--reinstall`. The ComfyUI folder is not
+  changed.
+- The reinstall prints `kept:` naming the folders the install already had,
+  and the model file, the saved workflow and the image are all still there
+  afterwards, unchanged.
+- With the network disconnected (and no archive cached under the ComfyUI
+  folder's `downloads/`), the reinstall fails and the existing install and
+  your files are untouched.
+- With ComfyUI started (`rocm comfyui start`), the reinstall is refused and
+  names `rocm comfyui stop`; after running that, the reinstall goes ahead.
+
+Interrupting the code swap itself is hard to time by hand; the unit test
+`interrupted_swap_converges_when_run_again` stops it at every step instead.
+
 For the stricter developer GPU test:
 
 ```powershell

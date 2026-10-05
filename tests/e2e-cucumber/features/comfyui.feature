@@ -86,3 +86,56 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the terminal shows an intermediate ComfyUI download progress frame
     And the ComfyUI install exits cleanly
     And the final terminal screen shows no ComfyUI download spinner line
+
+  # `--reinstall` used to delete ComfyUI's whole `source/` folder before it
+  # downloaded anything. That folder is where ComfyUI keeps the user's models
+  # (the `models path:` the CLI prints), saved workflows (`user/`), generated
+  # images (`output/`), uploads (`input/`), installed custom nodes and an
+  # `extra_model_paths.yaml`, because `rocm comfyui start` runs ComfyUI from it
+  # without redirecting any of them. A reinstall now replaces only the code
+  # around those. These scenarios plant a used install, then reinstall from a
+  # loopback archive server: the success path, the path where the download
+  # fails, the dry run, and a reinstall attempted while ComfyUI runs. Each
+  # asserts what the CLI prints together with what is actually on disk
+  # afterwards. Linux-only because the planted runtime uses `.so` names and a
+  # POSIX-shell Python stand-in.
+  @id:comfyui-reinstall-keeps-user-data @requires-os:linux
+  Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+
+  @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
+  Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the ComfyUI release download fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails
+    And the existing ComfyUI code and the user's files are untouched
+
+  @id:comfyui-reinstall-dry-run-names-kept-folders @requires-os:linux
+  Scenario: comfyui-07 - A ComfyUI reinstall dry run says what it replaces and keeps
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    When the user previews reinstalling ComfyUI
+    Then the preview says the ComfyUI code is replaced and names the kept folders
+    And the preview's install command includes --reinstall
+    And the existing ComfyUI code and the user's files are untouched
+
+  # The running ComfyUI keeps the old code loaded and keeps writing into the
+  # folder a reinstall changes, so the reinstall is refused until it is
+  # stopped. The refusal names `rocm comfyui stop`; the scenario runs exactly
+  # that and proves the same reinstall then goes through.
+  @id:comfyui-reinstall-refused-while-running @requires-os:linux
+  Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the ComfyUI that rocm-cli started is running from that install
+    When the user reinstalls ComfyUI
+    Then the reinstall is refused and names rocm comfyui stop
+    And the existing ComfyUI code and the user's files are untouched
+    When the user stops ComfyUI
+    And the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release

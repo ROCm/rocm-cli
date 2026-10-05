@@ -398,6 +398,29 @@ That command copies `config.json` and `runtimes/` into a temporary
 ComfyUI in that temporary app state, then removes the temporary state after it
 stops the process it started.
 
+`rocm comfyui install --reinstall` replaces only ComfyUI's code in its
+`source/` folder and leaves the user's content there (`models/`, `user/`,
+`output/`, `input/`, `custom_nodes/`, `extra_model_paths.yaml`) in place. It
+leaves the install untouched when the new source cannot be obtained, and a
+re-run finishes a swap that was interrupted. The swap itself is unit-tested
+directly, without a fake Python, so it also runs on Windows; the tests stop it
+before each filesystem change in turn and check that a re-run converges, and
+on Unix also cover symlinked model folders and that the user's files keep
+their inode and ctime:
+
+```bash
+cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::tests::reinstall
+```
+
+The e2e scenarios `comfyui-05` to `comfyui-08` (`comfyui.feature`, Linux, no
+GPU) cover the same through the built binary, including a failed download and
+a reinstall refused while ComfyUI runs:
+
+```bash
+cargo xtask e2e -- -n "comfyui-0[5678]"
+```
+
 To reuse an already installed ComfyUI app without reinstalling dependencies:
 
 ```bash
