@@ -1954,3 +1954,251 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Shared archive generator and filesystem oracle; see the module docs.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
+
+/// Property tests for the in-process Lemonade extractor, judged on the
+/// filesystem by `archive_props` rather than by re-deriving the extractor's
+/// own path checks.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use std::io::Write as _;
+
+    use proptest::prelude::*;
+    use sha2::{Digest as _, Sha256};
+
+    use super::archive_props::{
+        Entry, Expect, Kind, benign_entries, entries, run_case, run_property, tar_gz_bytes,
+    };
+    use super::{
+        AppPaths, extract_tar_gz, extract_zip, installed_runtime_version, lemonade_path_in,
+        lemonade_root, lemond_path_in, prepare_embeddable_with, runtime_dir_in,
+    };
+
+    /// The in-process extractor rejects every link kind and masks modes, so it
+    /// promises the whole contract, not just "no escape".
+    const FULL: Expect = Expect {
+        safe_modes: true,
+        no_outward_links: true,
+    };
+
+    #[test]
+    fn tar_extraction_keeps_every_entry_inside_the_root() {
+        run_property(
+            "lemonade-tar",
+            512,
+            entries(),
+            Some(5),
+            |layout, entries| {
+                run_case(
+                    layout,
+                    "embeddable.tar.gz",
+                    &tar_gz_bytes(entries),
+                    &[&layout.dest],
+                    &layout.dest,
+                    |layout, archive| extract_tar_gz(archive, &layout.dest),
+                )
+                .judge(FULL)
+            },
+        )
+        .unwrap();
+    }
+
+    /// Zip names are strings, so non-UTF-8 names are carried lossily; hard
+    /// links do not exist in zip and are written as regular files.
+    fn zip_bytes(entries: &[Entry]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for entry in entries {
+            let name = String::from_utf8_lossy(&entry.name).into_owned();
+            let options = zip::write::SimpleFileOptions::default().unix_permissions(entry.mode);
+            // The writer refuses a few names (and duplicates); a refused entry
+            // is simply left out of the archive.
+            match &entry.kind {
+                Kind::File(data) | Kind::Hardlink(data) => {
+                    if writer.start_file(name, options).is_ok() {
+                        writer.write_all(data).unwrap();
+                    }
+                }
+                Kind::Dir => {
+                    let _ = writer.add_directory(name, options);
+                }
+                Kind::Symlink(target) => {
+                    let _ = writer.add_symlink(
+                        name,
+                        String::from_utf8_lossy(target).into_owned(),
+                        options,
+                    );
+                }
+            }
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_extraction_keeps_every_entry_inside_the_root() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Reach is measured on what the zip writer actually stored, since it
+        // may drop or normalise some generated names.
+        let (cases, traversal, symlink) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        run_property("lemonade-zip", 512, entries(), None, |layout, entries| {
+            let bytes = zip_bytes(entries);
+            let mut stored = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+            cases.fetch_add(1, Ordering::Relaxed);
+            let (mut has_traversal, mut has_symlink) = (false, false);
+            for index in 0..stored.len() {
+                let entry = stored.by_index_raw(index).unwrap();
+                let name = entry.name();
+                has_traversal |=
+                    name.starts_with('/') || name.split(['/', '\\']).any(|part| part == "..");
+                has_symlink |= entry.is_symlink();
+            }
+            if has_traversal {
+                traversal.fetch_add(1, Ordering::Relaxed);
+            }
+            if has_symlink {
+                symlink.fetch_add(1, Ordering::Relaxed);
+            }
+            run_case(
+                layout,
+                "embeddable.zip",
+                &bytes,
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| extract_zip(archive, &layout.dest),
+            )
+            .judge(FULL)
+        })
+        .unwrap();
+        let cases = cases.into_inner().max(1);
+        let (traversal, symlink) = (traversal.into_inner(), symlink.into_inner());
+        eprintln!(
+            "[lemonade-zip] stored traversal/absolute names in {}%, symlinks in {}% of {cases} archives",
+            traversal * 100 / cases,
+            symlink * 100 / cases
+        );
+        assert!(traversal * 100 / cases >= 5 && symlink * 100 / cases >= 5);
+    }
+
+    /// Hostile entries — or benign names carrying hostile modes, which the
+    /// extractor accepts — sometimes alongside a well-formed embeddable root,
+    /// so the search-and-copy half of the install is reached too. Fully
+    /// hostile archives alone almost never get past extraction (the extractor
+    /// fails closed on the first bad entry), which would leave the copy step
+    /// untested.
+    fn install_entries() -> impl Strategy<Value = Vec<Entry>> {
+        let modes = prop::sample::select(vec![0o644, 0o755, 0o4755, 0o2775, 0o777, 0o666]);
+        let benign = (benign_entries(), modes).prop_map(|(mut entries, mode)| {
+            for entry in &mut entries {
+                entry.mode = mode;
+            }
+            entries
+        });
+        let body = prop_oneof![entries(), benign];
+        (body, any::<bool>(), any::<bool>()).prop_map(|(mut entries, with_root, first)| {
+            if with_root {
+                let root = [
+                    Entry {
+                        name: b"e/lemond".to_vec(),
+                        kind: Kind::File(b"lemond".to_vec()),
+                        mode: 0o755,
+                    },
+                    Entry {
+                        name: b"e/lemonade".to_vec(),
+                        kind: Kind::File(b"lemonade".to_vec()),
+                        mode: 0o755,
+                    },
+                ];
+                if first {
+                    entries.splice(0..0, root);
+                } else {
+                    entries.extend(root);
+                }
+            }
+            entries
+        })
+    }
+
+    /// The whole `prepare_embeddable` path — digest check, extract, root
+    /// search, copy into the runtime tree, version marker — over hostile
+    /// archives. Beyond "nothing outside the engine root changes", a failed
+    /// install must never leave the version marker that tells the next run the
+    /// runtime is complete.
+    #[test]
+    fn install_never_escapes_and_never_marks_a_failed_install_complete() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Reach of the install half: a property over installs that all fail
+        // at extraction would say nothing about the copy step.
+        let (cases, installed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        run_property(
+            "lemonade-install",
+            256,
+            install_entries(),
+            None,
+            |layout, entries| {
+                cases.fetch_add(1, Ordering::Relaxed);
+                let bytes = tar_gz_bytes(entries);
+                let digest = format!("{:x}", Sha256::digest(&bytes));
+                let paths = AppPaths {
+                    config_dir: layout.dest.join("config"),
+                    data_dir: layout.dest.join("data"),
+                    cache_dir: layout.dest.join("cache"),
+                };
+                let mut install_result = None;
+                let outcome = run_case(
+                    layout,
+                    "staged.tar.gz",
+                    &bytes,
+                    &[&layout.dest],
+                    &layout.dest,
+                    |layout, archive| {
+                        let result = prepare_embeddable_with(
+                            &paths,
+                            Some(&layout.dest),
+                            false,
+                            "9.9.9",
+                            &digest,
+                            |_, destination| {
+                                std::fs::copy(archive, destination)?;
+                                Ok(())
+                            },
+                        );
+                        install_result = Some(result.is_ok());
+                        if result.is_ok() {
+                            installed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        result.map(|_| ())
+                    },
+                );
+                outcome.judge(FULL)?;
+                let runtime_dir = runtime_dir_in(&lemonade_root(&paths, Some(&layout.dest)));
+                let marker = installed_runtime_version(&runtime_dir);
+                if install_result == Some(false) && marker.is_some() {
+                    return Err(format!(
+                        "failed install left version marker {marker:?}: {outcome:#?}"
+                    ));
+                }
+                if marker.is_some()
+                    && !(lemond_path_in(&runtime_dir).is_file()
+                        && lemonade_path_in(&runtime_dir).is_file())
+                {
+                    return Err(format!("marker without binaries: {outcome:#?}"));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let (cases, installed) = (cases.into_inner(), installed.into_inner());
+        eprintln!("[lemonade-install] {installed}/{cases} hostile archives installed successfully");
+        assert!(
+            installed * 100 / cases.max(1) >= 5,
+            "install reach too low: {installed}/{cases} reached a completed install"
+        );
+    }
+}

@@ -11173,3 +11173,34 @@ exit 1
         );
     }
 }
+
+/// Property tests for the SDK tarball unpack, judged on the filesystem by
+/// `crate::archive_props`. Extraction is the system `tar` resolved from
+/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
+/// guarantees through `extract_tarball_and_discard_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use super::extract_tarball_and_discard_archive;
+    use crate::archive_props::{Expect, entries, run_case, run_property, tar_gz_bytes};
+
+    #[test]
+    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        run_property("therock", 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "sdk.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| {
+                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
+                },
+            )
+            .judge(Expect {
+                safe_modes: true,
+                no_outward_links: false,
+            })
+        })
+        .unwrap();
+    }
+}

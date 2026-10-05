@@ -36,6 +36,11 @@ ureq = { version = "2.12", features = ["native-certs"] }
 # happened to work, while `/etc/` and `$HOME/../../etc` sailed through.
 # Test-only, so it adds nothing to any shipped binary.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Archive-extraction property tests (`src/archive_props.rs`) build hostile
+# archives byte-by-byte and judge the result on the filesystem.
+flate2 = "1"
+tar = "0.4"
+tempfile = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading"] }
