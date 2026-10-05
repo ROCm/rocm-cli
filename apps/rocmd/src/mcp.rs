@@ -742,24 +742,7 @@ pub(crate) fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<V
                 .and_then(Value::as_str)
                 .context("stop_server requires `service_id`")?;
             let stopped = crate::service::stop_managed_service(paths, service_id)?;
-            if crate::service::stop_report_confirmed(&stopped) {
-                Ok(tool_success(
-                    format!("Stopped managed service `{service_id}`."),
-                    stopped,
-                ))
-            } else {
-                // Not a success: a recorded process may still be running and
-                // holding the device. `stop_managed_service` keeps the record's
-                // PIDs and the endpoint key for exactly that case, and
-                // `pid_outcomes` in the structured result names the PID that
-                // could not be confirmed.
-                Ok(tool_error(
-                    format!(
-                        "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its recorded PIDs and any endpoint key were kept so a later stop can still reach it; see `pid_outcomes`."
-                    ),
-                    stopped,
-                ))
-            }
+            Ok(mcp_stop_server_reply(service_id, stopped))
         }
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
@@ -807,6 +790,24 @@ fn tool_success(text: String, structured: Value) -> Value {
         "structuredContent": structured,
         "isError": false,
     })
+}
+
+/// The `stop_server` MCP tool's answer for a [`crate::service::stop_managed_service`] report.
+fn mcp_stop_server_reply(service_id: &str, stopped: Value) -> Value {
+    if crate::service::stop_report_confirmed(&stopped) {
+        tool_success(format!("Stopped managed service `{service_id}`."), stopped)
+    } else {
+        // Not a success: a recorded process may still be running and holding
+        // the device. `stop_managed_service` keeps the record's PIDs and the
+        // endpoint key for exactly that case, and `pid_outcomes` in the
+        // structured result names the PID that could not be confirmed.
+        tool_error(
+            format!(
+                "Could not confirm that managed service `{service_id}` stopped; a recorded process may still be running. Its recorded PIDs and any endpoint key were kept so a later stop can still reach it; see `pid_outcomes`."
+            ),
+            stopped,
+        )
+    }
 }
 
 fn tool_error(text: String, structured: Value) -> Value {
@@ -1156,7 +1157,7 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::test_support::{
-        ForcedTerminationOutcome, assert_unconfirmed_stop_kept_the_service, seed_keyed_service,
+        assert_unconfirmed_stop_kept_the_service, seed_keyed_service, stop_with_outcome,
         temp_app_paths, workspace_test_artifact_dir,
     };
     use crate::watchers::load_service_record;
@@ -1595,10 +1596,10 @@ mod tests {
         let service_id = "svc-mcp-stop-unconfirmed";
         let key_path = seed_keyed_service(&paths, service_id, 11446)?;
 
-        let result = {
-            let _forced = ForcedTerminationOutcome::set(rocm_core::TerminationOutcome::TimedOut);
-            mcp_stop_server(&paths, service_id)
-        };
+        // The handler is `stop_managed_service` feeding `mcp_stop_server_reply`;
+        // the confirmed-stop test below drives that whole handler for real.
+        let result = stop_with_outcome(&paths, service_id, rocm_core::TerminationOutcome::TimedOut)
+            .map(|stopped| mcp_stop_server_reply(service_id, stopped));
         let key_kept = key_path.exists();
         let reloaded = load_service_record(&paths, service_id);
         fs::remove_dir_all(root).ok();

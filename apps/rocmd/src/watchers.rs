@@ -1180,6 +1180,11 @@ fn service_record_matches_recovery_event(
     record: &ManagedServiceRecord,
     event: &AutomationTriggerEvent,
 ) -> bool {
+    // Re-checked here as well as in the scan: a stop can be requested between
+    // the event being raised and it being handled.
+    if stop_requested(record) {
+        return false;
+    }
     match event.kind.as_str() {
         "service.manifest_recoverable" => {
             manifest_service_recovery_reason(record, unix_time_millis()).is_some()
@@ -1348,7 +1353,7 @@ const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPo
 fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRecord, String)>> {
     let now = unix_time_millis();
     for record in crate::persistence::load_managed_services(paths)? {
-        if record.mode != "managed" {
+        if record.mode != "managed" || stop_requested(&record) {
             continue;
         }
         if let Some(reason) = manifest_service_recovery_reason(&record, now) {
@@ -1377,6 +1382,20 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
         }
     }
     Ok(None)
+}
+
+/// Whether an operator asked for this service to stop and that stop is still
+/// standing.
+///
+/// Such a service is never a recovery candidate, whatever its status says. A
+/// stop that could not confirm every recorded process gone deliberately leaves
+/// the status at `ready`/`running` — it did not happen, so it must not be
+/// claimed — and a stop still in flight has not reached its verdict yet. Either
+/// way the endpoint has stopped answering, which on its own is exactly what
+/// recovery restarts. `stop_requested_unix_ms` is what tells the operator's
+/// stop apart from a crash; a confirmed stop, and any fresh launch, clear it.
+pub(crate) fn stop_requested(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some()
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
@@ -1450,6 +1469,16 @@ pub(crate) fn restart_managed_service(
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
     crate::service::record_supervisor_identity(record, std::process::id());
+    // The engine PID belonged to the run being replaced, and nothing here
+    // starts an engine: the supervisor spawned below records its own, together
+    // with its token. Carried forward, the old PID would sit beside a
+    // supervisor it no longer matches — and on a record `rocm` wrote, with no
+    // token at all, so the next stop could only signal it blind.
+    record.engine_pid = None;
+    record.engine_start_ticks = None;
+    // Restarting is a request to run, so it supersedes any earlier stop request,
+    // as `rocm services restart` treats it too.
+    record.stop_requested_unix_ms = None;
     record.write()?;
 
     let mut child = detached_rocmd_command(&rocmd_binary)
@@ -1606,7 +1635,9 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::test_support::identity_probe_record;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::{
+        UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
+    };
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
 
     fn test_watcher_snapshot(
@@ -3175,6 +3206,145 @@ mod tests {
         assert!(
             persisted?.supervisor_start_ticks.is_some(),
             "restart_managed_service must persist the supervisor's start-time token beside its PID"
+        );
+        Ok(())
+    }
+
+    /// An unconfirmed stop leaves the status at `ready` on purpose, which is
+    /// exactly what the daemon's recovery scan looks for. The stop request it
+    /// records is the only thing telling it apart from a crash, so recovery
+    /// must honour it — otherwise the `server-recover` watcher, which acts by
+    /// default, restarts the service the operator just asked to stop.
+    #[test]
+    fn recovery_does_not_restart_a_service_whose_stop_is_unconfirmed() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-skips-unconfirmed-stop");
+        paths.ensure()?;
+        let service_id = "svc-recover-skips-unconfirmed-stop";
+        seed_keyed_service(&paths, service_id, 11450)?;
+
+        let stopped =
+            stop_with_outcome(&paths, service_id, rocm_core::TerminationOutcome::TimedOut);
+        let found = find_recoverable_service(&paths);
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            stopped?.get("stopped").and_then(Value::as_bool),
+            Some(false),
+            "precondition: the stop must be unconfirmed"
+        );
+        let reloaded = reloaded?;
+        assert_eq!(
+            reloaded.status, "ready",
+            "precondition: status left as it was"
+        );
+        assert!(
+            found?.is_none(),
+            "a service with a standing stop request must not be recovered"
+        );
+        Ok(())
+    }
+
+    /// The same gate on a record recovery would otherwise pick up from its
+    /// status alone, without any endpoint probe: with a stop request it is
+    /// skipped, and the identical record without one is still recovered.
+    #[test]
+    fn recovery_skips_a_failed_service_only_while_its_stop_request_stands() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-honours-stop-request");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-recover-honours-stop-request",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11451,
+            "managed",
+            UNCONFIRMED_STOP_PID,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+        let event = AutomationTriggerEvent {
+            at_unix_ms: unix_time_millis(),
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+        let with_request = find_recoverable_service(&paths);
+        let event_with_request = service_record_matches_recovery_event(&paths, &record, &event);
+
+        record.stop_requested_unix_ms = None;
+        record.write()?;
+        let without_request = find_recoverable_service(&paths);
+        let event_without_request = service_record_matches_recovery_event(&paths, &record, &event);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            with_request?.is_none(),
+            "a standing stop request must block recovery"
+        );
+        assert!(
+            !event_with_request,
+            "a queued recovery event must not act on a service since asked to stop"
+        );
+        assert_eq!(
+            without_request?.map(|(found, reason)| (found.service_id, reason)),
+            Some((
+                "svc-recover-honours-stop-request".to_owned(),
+                "manifest_status_failed".to_owned()
+            )),
+            "without a stop request the same record must still be recovered"
+        );
+        assert!(event_without_request);
+        Ok(())
+    }
+
+    /// A restart moves the supervisor PID; the engine PID it carried belonged
+    /// to the run being replaced. On a record `rocm serve --background` wrote,
+    /// that PID has no token, so carrying it past the point where the two PIDs
+    /// diverge leaves the next stop an entry it can only signal blind.
+    ///
+    /// Linux-only for the same reason as the test above: the restart re-execs
+    /// the test binary, which is only known to reject those arguments there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_managed_service_drops_the_replaced_runs_engine_pid() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-drops-engine-pid");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-drops-engine-pid";
+        let mut record = identity_probe_record(&paths, service_id, 11455);
+        // The shape `rocm serve --background` writes: one PID in both roles.
+        record.supervisor_pid = UNCONFIRMED_STOP_PID;
+        record.engine_pid = Some(UNCONFIRMED_STOP_PID);
+        record.engine_start_ticks = None;
+        record.stop_requested_unix_ms = Some(1);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let _ = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_ne!(persisted.supervisor_pid, UNCONFIRMED_STOP_PID);
+        assert_eq!(
+            persisted.engine_pid, None,
+            "the replaced run's engine PID must not outlive the restart"
+        );
+        assert_eq!(persisted.engine_start_ticks, None);
+        assert_eq!(
+            persisted.stop_requested_unix_ms, None,
+            "a restart supersedes an earlier stop request"
         );
         Ok(())
     }
