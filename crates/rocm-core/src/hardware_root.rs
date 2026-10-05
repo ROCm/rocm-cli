@@ -7,16 +7,20 @@
 //! The probes that decide what GPU, driver and platform the CLI is running on —
 //! device nodes under `/dev`, the KFD topology and DRM cards in `sysfs`,
 //! `/proc/version`, `/proc/cpuinfo`, `/etc/os-release`, the WSL plumbing under
-//! `/usr/lib/wsl` — resolve their path through [`host_path`] instead of naming
-//! the absolute path directly.
+//! `/usr/lib/wsl`, the container markers (`/.dockerenv`, `/run/.containerenv`,
+//! `/proc/1/cgroup`) — resolve their path through [`host_path`] instead of
+//! naming the absolute path directly.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
 //! to describe the machine. ROCm install discovery under `/opt` and
 //! `/usr/local` reports paths the CLI prints and writes into shell rc files, and
 //! the `/usr/lib/wsl/lib` loader entry goes into a real engine's
 //! `LD_LIBRARY_PATH`; re-rooting either would put the simulated directory in
-//! front of a user or a real loader. Process liveness under `/proc/<pid>` and
-//! `/dev/shm` sizing are about this process's environment, not the hardware.
+//! front of a user or a real loader. Programs the probes execute, such as
+//! `ldconfig`, stay on the real host too: a simulated root holds no binary to
+//! run. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are about
+//! this process's environment, not the hardware. The package-manager install
+//! hints in `openmpi.rs` still read the real `/etc/os-release`.
 //!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the

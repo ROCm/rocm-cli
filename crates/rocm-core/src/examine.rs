@@ -1872,7 +1872,7 @@ fn probe_rocm_install(e: &mut Examination) {
         .unwrap_or_default();
 
     for marker in AMDGPU_INSTALL_MARKERS {
-        if Path::new(marker).exists() {
+        if crate::host_path(marker).exists() {
             e.rocm_install_method = "amdgpu-install".to_owned();
             e.rocm_repos_seen.push((*marker).to_owned());
         }
@@ -2843,13 +2843,13 @@ fn filesystem_size(_path: &str) -> Option<(u64, u64)> {
 
 fn probe_container(e: &mut Examination) {
     for (marker, kind) in [("/.dockerenv", "docker"), ("/run/.containerenv", "podman")] {
-        if Path::new(marker).exists() {
+        if crate::host_path(marker).exists() {
             e.in_container = true;
             e.container_kind = kind.to_owned();
             return;
         }
     }
-    let cg = read_text("/proc/1/cgroup");
+    let cg = read_host_text("/proc/1/cgroup");
     if !cg.is_empty()
         && ["docker", "containerd", "lxc", "kubepods", "podman"]
             .iter()
