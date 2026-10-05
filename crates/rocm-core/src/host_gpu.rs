@@ -3,10 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 use crate::{
-    AppPaths, LegacyRocmSummary, OPTIONAL_COMMAND_TIMEOUT, WINDOWS_INVENTORY_QUERY_TIMEOUT,
-    WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT, detect_legacy_rocm_summary,
-    detect_managed_therock_family, detect_managed_therock_sdk_gfx_target, discover_rocm_installs,
-    env_flag, examine, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
+    AppPaths, LegacyRocmSummary, OPTIONAL_COMMAND_TIMEOUT, TheRockFamilyManifest,
+    WINDOWS_INVENTORY_QUERY_TIMEOUT, WINDOWS_VIDEO_CONTROLLER_INVENTORY_SCRIPT,
+    detect_legacy_rocm_summary, detect_managed_therock_family, discover_rocm_installs, env_flag,
+    examine, managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name,
+    unix_time_millis,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -2936,32 +2937,198 @@ fn detect_host_gpu_name_with_context(
         .or_else(|| detect_wsl_windows_display_name(wsl))
 }
 
+pub(crate) fn detect_managed_therock_sdk_gfx_target(paths: &AppPaths) -> Option<String> {
+    managed_therock_sdk_probe_candidates(&paths.data_dir.join("runtimes").join("registry"))
+        .into_iter()
+        .find_map(|candidate| {
+            let tool = managed_sdk_tool_path(&candidate.bin_path, "rocm_agent_enumerator")?;
+            let mut envs = Vec::new();
+            if let Some(ld_library_path) = managed_sdk_ld_library_path(&candidate) {
+                envs.push(("LD_LIBRARY_PATH", ld_library_path));
+            }
+            capture_optional_path_command_with_env(&tool, &[], &envs, OPTIONAL_COMMAND_TIMEOUT)
+                .and_then(|output| extract_first_gfx_token(&output))
+        })
+}
+
+fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkProbeCandidate> {
+    let Ok(entries) = fs::read_dir(registry_dir) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(record) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<TheRockFamilyManifest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if !record.looks_like_therock() {
+            continue;
+        }
+        let Some(sdk) = record.rocm_sdk else {
+            continue;
+        };
+        if !sdk.import_ok {
+            continue;
+        }
+        let Some(root_path) = sdk.root_path else {
+            continue;
+        };
+        let Some(bin_path) = sdk.bin_path else {
+            continue;
+        };
+        candidates.push(TheRockSdkProbeCandidate {
+            installed_at_unix_ms: record.installed_at_unix_ms.unwrap_or(0),
+            site_packages: sdk.site_packages,
+            root_path,
+            bin_path,
+        });
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.installed_at_unix_ms));
+    candidates
+}
+
+fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<OsString> {
+    let mut paths = Vec::new();
+    collect_sdk_library_paths(&candidate.root_path, &mut paths);
+    if let Some(site_packages) = candidate.site_packages.as_deref()
+        && let Ok(entries) = fs::read_dir(site_packages)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if name.starts_with("_rocm_sdk_") {
+                collect_sdk_library_paths(&path, &mut paths);
+            }
+        }
+    }
+    let wsl_lib = PathBuf::from("/usr/lib/wsl/lib");
+    if wsl_lib.is_dir() {
+        paths.push(wsl_lib);
+    }
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH")
+        && !existing.is_empty()
+    {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        std::env::join_paths(paths).ok()
+    }
+}
+
+fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+    for path in [
+        root.join("bin"),
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ] {
+        if path.is_dir() {
+            paths.push(path);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TheRockSdkProbeCandidate {
+    installed_at_unix_ms: u128,
+    site_packages: Option<PathBuf>,
+    root_path: PathBuf,
+    bin_path: PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{temp_app_paths, workspace_test_artifact_dir};
     use std::path::PathBuf;
 
-    fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = workspace_test_artifact_dir().join(format!(
-            "rocm-core-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
+    fn write_fake_rocm_agent_enumerator(bin_dir: &Path, target: &str) -> Result<()> {
+        if cfg!(windows) {
+            let path = bin_dir.join("rocm_agent_enumerator.cmd");
+            fs::write(path, format!("@echo off\r\necho {target}\r\n"))?;
+        } else {
+            let path = bin_dir.join("rocm_agent_enumerator");
+            fs::write(&path, format!("#!/bin/sh\necho {target}\n"))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        Ok(())
     }
 
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("core")
+    #[test]
+    fn managed_sdk_probe_detects_gfx_from_therock_tool() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-gfx");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        fs::create_dir_all(&sdk_bin)?;
+        write_fake_rocm_agent_enumerator(&sdk_bin, "gfx1201")?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin
+                }
+            }))?,
+        )?;
+
+        assert_eq!(
+            detect_managed_therock_sdk_gfx_target(&paths),
+            Some("gfx1201".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn managed_sdk_probe_skips_non_therock_manifests() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-skip-non-therock");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        fs::create_dir_all(&sdk_bin)?;
+        write_fake_rocm_agent_enumerator(&sdk_bin, "gfx9999")?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "external-runtime",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin
+                }
+            }))?,
+        )?;
+
+        assert_eq!(detect_managed_therock_sdk_gfx_target(&paths), None);
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]

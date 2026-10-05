@@ -41,6 +41,8 @@ pub mod rocm_install;
 pub mod runtime;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_support;
 pub mod uv;
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, diagnose as run_diagnose,
@@ -59,9 +61,9 @@ pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
     detect_host_gfx_target, detect_host_gpu_diagnostics, detect_host_gpu_summary,
-    extract_first_gfx_token, has_usable_amd_gpu, interactive_terminal, is_wsl_host,
-    known_therock_families, normalize_therock_family, preferred_serve_engine_for_host_gpu_summary,
-    usable_amd_gpu_indices,
+    detect_system_ram_gib, extract_first_gfx_token, has_usable_amd_gpu, interactive_terminal,
+    is_wsl_host, known_therock_families, normalize_therock_family,
+    preferred_serve_engine_for_host_gpu_summary, usable_amd_gpu_indices,
 };
 use host_gpu::{
     KfdGpuNode, detect_linux_sysfs_gfx_target, detect_local_windows_host_driver,
@@ -74,8 +76,7 @@ pub use managed_runtime::{
     active_managed_therock_version, detect_managed_therock_family, prepend_runtime_paths,
 };
 use managed_runtime::{
-    TheRockFamilyManifest, detect_managed_therock_sdk_gfx_target, managed_sdk_tool_path,
-    managed_therock_environment_records,
+    TheRockFamilyManifest, managed_sdk_tool_path, managed_therock_environment_records,
 };
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
@@ -4516,6 +4517,7 @@ pub fn unix_time_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{temp_app_paths, workspace_test_artifact_dir};
 
     use std::fs;
     use std::path::Path;
@@ -7308,29 +7310,6 @@ mod tests {
         assert_eq!(format_host_port("::1", 11435), "[::1]:11435");
         assert_eq!(format_http_base_url("::1", 11435), "http://[::1]:11435");
         assert_eq!(format_host_port("[::1]", 11435), "[::1]:11435");
-    }
-
-    fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = workspace_test_artifact_dir().join(format!(
-            "rocm-core-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("core")
     }
 
     // ===== Dashboard sub-config + migration =====

@@ -338,30 +338,8 @@ fn legacy_rocm_candidate_exists(candidate: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_app_paths;
     use anyhow::Result;
-
-    fn temp_app_paths(name: &str) -> (PathBuf, crate::AppPaths) {
-        let root = workspace_test_artifact_dir().join(format!(
-            "rocm-core-{name}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
-        ));
-        let paths = crate::AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("core")
-    }
 
     #[test]
     fn linux_legacy_rocm_detection_ignores_rocdxg_only_directory() -> Result<()> {
