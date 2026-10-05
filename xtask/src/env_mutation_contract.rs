@@ -111,7 +111,18 @@ mod tests {
     /// which is the opposite of what their comments told the next contributor.
     /// Listing the helper keeps the escape hatch narrow: it is still the lock
     /// that is required, the wrapper just stops hiding the requirement.
-    const MUTATIONS: [&str; 3] = ["set_var(", "remove_var(", "RestoredEnvVar::set("];
+    ///
+    /// `UnsetKeyOnExit` (`crates/rocm-core/src/test_env.rs`) is here for the
+    /// same reason, from the other side: it is a unit struct whose `Drop`
+    /// removes a variable, so the mutation happens in an impl the scan never
+    /// enters and the test body only ever NAMES the type. It carries no `(`
+    /// because constructing a unit struct has none.
+    const MUTATIONS: [&str; 4] = [
+        "set_var(",
+        "remove_var(",
+        "RestoredEnvVar::set(",
+        "UnsetKeyOnExit",
+    ];
 
     /// Named helpers that serialize env mutation for their whole scope.
     ///
@@ -728,6 +739,14 @@ mod tests {
         format!("let _restore = crate::test_env::{path}(\"KEY\", &value);")
     }
 
+    /// A guard whose `Drop` mutates, held by a test that only names the type.
+    ///
+    /// Assembled rather than written out for the same reason as
+    /// [`mutation_call`].
+    fn held_mutating_guard(name: &str) -> String {
+        format!("let _held = {name};")
+    }
+
     fn unguarded_test(body: &str) -> String {
         format!(
             "#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        {body}\n    }}\n}}\n"
@@ -761,9 +780,10 @@ mod tests {
     fn every_mutating_call_is_flagged_inside_an_unguarded_test() {
         let kinds = ["set_var", "remove_var"];
         let delegated = ["RestoredEnvVar::set"];
+        let held = ["UnsetKeyOnExit"];
         assert_eq!(
             MUTATIONS.len(),
-            kinds.len() + delegated.len(),
+            kinds.len() + delegated.len() + held.len(),
             "a call was added to MUTATIONS without a case here"
         );
         for kind in kinds {
@@ -780,6 +800,14 @@ mod tests {
                 env_mutations_in_unserialized_tests(&source).len(),
                 1,
                 "an unguarded {path} inside a #[test] must be flagged"
+            );
+        }
+        for name in held {
+            let source = unguarded_test(&held_mutating_guard(name));
+            assert_eq!(
+                env_mutations_in_unserialized_tests(&source).len(),
+                1,
+                "a test holding an unguarded {name} must be flagged"
             );
         }
     }

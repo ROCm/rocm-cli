@@ -62,6 +62,7 @@ impl Drop for RestoredEnvVar {
 #[cfg(test)]
 mod tests {
     use super::RestoredEnvVar;
+    use std::ffi::OsString;
     use std::path::Path;
 
     /// Serializes the env mutation below, as the contract guard requires.
@@ -75,6 +76,10 @@ mod tests {
     /// Declare it after the lock so it drops while the lock is still held. A
     /// test about not leaking environment state should not leak the probe when
     /// it fails, which is exactly when someone would be looking at it.
+    ///
+    /// Holding one mutates the environment from a `Drop` impl the contract
+    /// guard cannot see, so `UnsetKeyOnExit` is named in its `MUTATIONS` list:
+    /// a test that holds one without the lock is flagged like a direct call.
     struct UnsetKeyOnExit;
 
     impl Drop for UnsetKeyOnExit {
@@ -139,6 +144,13 @@ mod tests {
     /// The panic is raised with [`std::panic::resume_unwind`], which unwinds
     /// without calling the panic hook, so a passing run prints no panic message
     /// and no process-wide hook has to be swapped while other tests run.
+    ///
+    /// The payload carries the value observed just before the panic. Without
+    /// it, `catch_unwind` would accept any panic — including one raised by
+    /// `set` itself before it planted anything — and a `set` that planted
+    /// nothing would leave `"before"` in place for the final assertion to
+    /// pass on. An assertion inside the closure would not help: `catch_unwind`
+    /// swallows it and the result is still an `Err`.
     #[test]
     #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn unwinding_past_the_guard_restores_the_previous_state() {
@@ -151,10 +163,14 @@ mod tests {
         unsafe { std::env::set_var(KEY, "before") };
         let unwound = std::panic::catch_unwind(|| {
             let _restore = RestoredEnvVar::set(KEY, Path::new("planted"));
-            std::panic::resume_unwind(Box::new("a test failing mid-way"));
+            std::panic::resume_unwind(Box::new(std::env::var_os(KEY)));
         });
 
-        assert!(unwound.is_err(), "the closure must have unwound");
+        assert_eq!(
+            unwound.unwrap_err().downcast_ref::<Option<OsString>>(),
+            Some(&Some(OsString::from("planted"))),
+            "the closure must have unwound, with the guard's value in place"
+        );
         assert_eq!(
             std::env::var_os(KEY).as_deref(),
             Some(std::ffi::OsStr::new("before")),
