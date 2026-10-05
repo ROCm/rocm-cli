@@ -289,12 +289,104 @@ Feature: Diagnosing failures and listing fixes
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
     And the preview states that the CLI can run it automatically
+  # `--model` answers the question that comes before the other two: given this
+  # machine and that model, will it run. The point is that it answers in seconds
+  # and fetches nothing, so the user is not told by a download that failed.
+  #
+  # Host-agnostic in the same way diagnose-10 is, and for the same reason. The
+  # verdict depends on what this machine can measure of its own GPU, which
+  # differs per lane, so the scenario asks the CLI what it measured and then
+  # holds it to the matching half of the contract. Each half can fail, which is
+  # the bar an assertion has to clear: a lane that could not measure its GPU --
+  # whether because there is no GPU at all, an engine this platform's gate
+  # rules out, or a GPU whose memory the CLI cannot read -- exercises the
+  # "told why, not that the model is incompatible" half, the GPU lanes the
+  # "measured and it does not fit" half. What holds everywhere is that a model
+  # no machine could serve is never called ready, and that asking costs no
+  # download.
+  @id:diagnose-model-too-large-is-refused-with-something-that-fits
+  Scenario: diagnose-21 - A model this machine cannot serve is refused before anything is downloaded
+    Given a user asking about a model no single machine could serve
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the model is never reported as ready
+    And a machine that measured its GPU is told the model will not run, and what would
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+    And the human-readable answer names what would run instead
+    And no model weights were fetched
+
+  # The other half of the verdict, and the one a user acts on: a model that does
+  # fit has to say which engine would serve it, because that is what `rocm serve`
+  # will pick and the user has no other way to know before starting it.
+  @id:diagnose-model-that-fits-is-ready-and-names-the-engine
+  Scenario: diagnose-22 - A model this machine can serve is reported ready, with the engine that would serve it
+    Given a user asking about the smallest curated model
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then a machine with enough measured GPU memory is told the model is ready
+    And the answer names the engine that would serve it
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+
+  # The failure this guards is not an error, it is a WRONG ANSWER that reads like
+  # a real one. If a recipe catalog that cannot be read is scored as though it
+  # had been, the user is told their machine cannot run a model when the truth is
+  # that the CLI never found out what the model needs — and they go looking for
+  # hardware they may already have. Deterministic on every lane: the catalog
+  # source is pointed at a path that does not exist.
+  @id:diagnose-model-unreachable-catalog-is-not-an-incompatible-model
+  Scenario: diagnose-23 - A recipe catalog that cannot be read is not reported as an incompatible model
+    Given a machine that cannot reach the model recipe catalog
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is the unreachable catalog, not the model
+    And nothing is claimed about whether the model fits this machine
+
+  # A model outside the curated catalog is not a model this CLI has judged
+  # incompatible -- it is one the CLI never had the metadata to judge at all.
+  # Folding the two together would tell a user "this will not run" about a
+  # model that might run fine, on the strength of nothing. Deterministic on
+  # every lane: the catalog is read successfully, it simply carries no recipe
+  # by this name.
+  @id:diagnose-model-not-curated-is-undetermined-not-blocked
+  Scenario: diagnose-24 - A model outside the curated catalog is undetermined, not blocked
+    Given a user asking about a model the curated catalog does not carry
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then the CLI reports that it could not determine the answer
+    And the reason given is that the model is not curated, not that it does not fit
+    And nothing is claimed about whether the model fits this machine
+
+  # `degraded` exists so a model that runs, but below what the recipe
+  # recommends, is never folded into the same answer as one that will not run
+  # at all -- a user who is about to accept slower loading deserves a different
+  # word than one being turned away. The fixture recipe needs almost no GPU
+  # memory (so it clears the fit check on any lane that measured a GPU) but
+  # recommends more system RAM than any real test host has, so the RAM
+  # softening is the only thing left to trigger. A machine with no GPU still
+  # cannot serve it at all, so that half is asserted the same way diagnose-21
+  # and diagnose-22 already do.
+  @id:diagnose-model-below-recommended-ram-is-degraded-not-blocked
+  Scenario: diagnose-25 - A model that runs below its recommended system RAM is degraded, not blocked
+    Given a user asking about a model that recommends far more system RAM than this host has
+    When the user asks the CLI whether that model would run, in machine-readable form
+    Then a machine with enough measured GPU memory to run it is told the model is degraded
+    And a machine that could not measure its GPU is told why, rather than that the model is incompatible
+
+  # `--model` and `--distro` together used to be refused only when the probe
+  # happened to come back looking remote, so the refusal tracked a derived
+  # examination property rather than the flag itself. Keyed on the flag now:
+  # the refusal fires before any probe runs at all, so this holds even with no
+  # `wsl.exe` on PATH and no distribution installed -- every lane proves it,
+  # not only a WSL host.
+  @id:diagnose-model-with-distro-is-refused-not-answered-for-the-local-host
+  Scenario: diagnose-26 - Asking --model with --distro is refused before answering for the wrong machine
+    Given a user who asks --model together with --distro
+    When the user asks the CLI to diagnose with both flags
+    Then the CLI refuses and says --model answers for this machine, not the one --distro names
+    And no model verdict is reported
 
   # vLLM runs on Linux and WSL, but not native Windows. This scenario is
   # GPU-independent: it supplies the captured startup error as symptom text and
   # proves the public diagnosis output preserves both branches of the remedy.
   @id:diagnose-vllm-oom-is-conditional @requires-os:linux
-  Scenario: diagnose-21 - A vLLM startup OOM receives conditional remediation
+  Scenario: diagnose-27 - A vLLM startup OOM receives conditional remediation
     Given a user whose vLLM server ran out of GPU memory
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then the diagnosis identifies the vLLM startup OOM
@@ -317,7 +409,7 @@ Feature: Diagnosing failures and listing fixes
   # engine's error text back as the evidence for it. A confidently wrong cause is
   # worse than no cause, so this is pinned at the level the user sees it.
   @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
-  Scenario: diagnose-22 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+  Scenario: diagnose-28 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
     Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then no vLLM startup OOM is reported
