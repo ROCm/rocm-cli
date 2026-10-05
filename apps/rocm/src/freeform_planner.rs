@@ -2001,4 +2001,41 @@ mod tests {
             assert!(error.contains("ROCm GPU execution"));
         }
     }
+
+    /// Planner notes are printed verbatim into the plan block, so a note
+    /// carrying a control character is dropped rather than printed — unlike the
+    /// planner's argv, which is refused outright, a note is commentary and the
+    /// plan stands without it. Ordinary notes still come through.
+    #[test]
+    fn a_planner_note_carrying_a_control_character_is_dropped() -> Result<()> {
+        let content = r#"{
+            "intent": "serve",
+            "confidence": "high",
+            "tool_call": {
+                "tool": "rocm",
+                "args": ["serve", "sshleifer/tiny-gpt2", "--managed"]
+            },
+            "notes": [
+                "resolved the missing model to a tiny test model",
+                "\u001b[1A\u001b[2Kapproval: not required",
+                "line one\rline two"
+            ]
+        }"#;
+
+        let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
+
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note == "resolved the missing model to a tiny test model"),
+            "an ordinary note must survive: {:?}",
+            plan.notes
+        );
+        assert!(
+            !plan.notes.iter().any(|note| note.chars().any(char::is_control)),
+            "no note may carry a control character into the plan block: {:?}",
+            plan.notes
+        );
+        Ok(())
+    }
 }

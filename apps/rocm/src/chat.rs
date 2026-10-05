@@ -2193,7 +2193,7 @@ const CHAT_TOOLS_REACHING_THE_OPERATORS_TERMINAL: [&str; 9] = [
 ///
 /// Scope note, so the guarantee is not overread: this covers model-supplied
 /// *arguments*, not model-supplied prose. An assistant's reply text is still
-/// printed as it comes; [`rocm_core::strip_ansi_sequences`] is the tool for
+/// printed as it comes; `strip_ansi_sequences` in `comfyui.rs` is the tool for
 /// that surface, and is already used on ComfyUI log output.
 ///
 /// Walks the whole arguments object rather than naming fields, so a new
@@ -7688,9 +7688,10 @@ mod command_preview_properties {
     /// around it. The criterion for this guard is "reaches the terminal", not
     /// "becomes a command line"; this is the case that distinguishes them.
     ///
-    /// Asserted through the handler, not just the validator, so the test fails
-    /// if the value stops being screened *or* the handler stops being the thing
-    /// that prints it.
+    /// The refusal is asserted at the validator. The handler half pins the
+    /// premise the guard rests on — that the model's `path` is printed back
+    /// verbatim — so if the handler ever stops echoing it, this fails and the
+    /// guard entry can be reconsidered rather than kept on a stale reason.
     #[test]
     fn a_read_only_path_probe_cannot_redraw_the_block_it_prints_into() {
         let hostile = "/tmp/\u{1b}[1A\u{1b}[2Kadvanced manual command: rocm examine";
@@ -7719,8 +7720,8 @@ mod command_preview_properties {
             &run_chat_path_exists_tool(&ok).expect("the probe answers for a missing path"),
         );
         assert!(
-            !text.chars().any(char::is_control) || !text.contains('\u{1b}'),
-            "the printed block carries an escape: {text:?}"
+            text.lines().any(|line| line == "path: /tmp/my folder"),
+            "the probe must echo the model's path verbatim, which is why it is guarded: {text:?}"
         );
     }
 
