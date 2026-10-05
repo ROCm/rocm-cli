@@ -1310,6 +1310,14 @@ fn generator_reach_report() {
         "generator never produces a version the ordering parser cannot read, so \
          the comparator's unreadable arms go unexercised"
     );
+    // Two spellings of one version are where the sort order and the update
+    // verdict must answer differently, and the verdict property's `Equal` arm
+    // asserts nothing unless the generator produces such a pair.
+    assert!(
+        pair_oracle_equal_strings_differ > SAMPLES / 200,
+        "generator rarely produces two spellings of one version, so the update \
+         verdict's equal-version arm goes unexercised"
+    );
     assert!(
         set_with_timestamp_tie > SAMPLES / 20,
         "generator rarely produces equal install timestamps"

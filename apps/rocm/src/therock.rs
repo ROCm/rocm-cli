@@ -2587,8 +2587,10 @@ fn active_default_relation_text(
     if active.family == family && active.channel == channel.as_str() {
         // "reinstall" is a claim about versions, not strings: `7.0.0-rc1` and
         // `7.0.0rc1` are one version and must not read as an upgrade. When
-        // neither can be identified there is no better word available here, so
-        // the total order still decides rather than inventing a fourth one.
+        // either side cannot be identified (`version_relation` is `None`) there
+        // is no better word available here, so the total order still decides
+        // rather than inventing a fourth one; an unreadable version sorts below
+        // every readable one, so it reads as the older side.
         let relation = match version_relation(resolved_version, &active.version)
             .unwrap_or_else(|| compare_version_strings(resolved_version, &active.version))
         {
