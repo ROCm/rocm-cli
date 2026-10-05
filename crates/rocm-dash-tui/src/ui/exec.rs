@@ -302,7 +302,11 @@ mod tests {
             "--prefix".to_owned(),
             "C:\\Program Files\\ROCm".to_owned(),
         ];
-        let preview = format!("{} {}", exe_label("C:\\tools\\rocm.exe"), display_args(&argv));
+        let preview = format!(
+            "{} {}",
+            exe_label("C:\\tools\\rocm.exe"),
+            display_args(&argv)
+        );
         assert_eq!(
             shlex::split(&preview),
             Some(vec![
