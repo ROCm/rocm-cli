@@ -32,7 +32,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::modal::{centered_rect, draw_popup_frame};
@@ -294,7 +294,7 @@ fn stage_approval(r: &mut RuntimeManagerState, action: RuntimeAction, args: Vec<
     let request = ApprovalRequest::new(
         action.title().to_string(),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             action.explanation().to_string(),
         ],
