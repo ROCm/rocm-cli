@@ -2252,16 +2252,20 @@ fn wheel_composition_device_target(composition: Option<&WheelRuntimeComposition>
     })
 }
 
+/// Quote one argument of the `command:` line the dry-run preview prints.
+///
+/// That line is offered as the command — `uv <venv args> && uv <install args>`
+/// — so it has to be one a shell reads back as the argv it previews. It used to
+/// quote only on whitespace and a short metacharacter list, with `"`, which
+/// left `` ` `` and `'` unquoted and kept `$(…)` live *inside* the quotes; the
+/// install root comes from a `--prefix` the local assistant can choose
+/// (`install_sdk_dry_run` is a model-callable tool), so that was a model-chosen
+/// value in a line a user is invited to run.
+///
+/// [`crate::shell_quote::shell_quote`] is the same quoter the remote command
+/// line and the approval previews use.
 fn quote_display_arg(value: &str) -> String {
-    if value.is_empty()
-        || value
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '[' | ']' | '(' | ')' | '&' | ';' | '|'))
-    {
-        format!("\"{}\"", value.replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
+    crate::shell_quote::shell_quote(value)
 }
 
 /// Describe the managed runtime this install would displace as the active
@@ -8951,11 +8955,49 @@ echo Python 3.12.10
 
     #[test]
     fn display_command_quotes_package_extras() {
-        assert_eq!(quote_display_arg("package[extra]"), "\"package[extra]\"");
+        assert_eq!(quote_display_arg("package[extra]"), "'package[extra]'");
         assert_eq!(
             quote_display_arg("C:\\Program Files\\Python\\python.exe"),
-            "\"C:\\Program Files\\Python\\python.exe\""
+            "'C:\\Program Files\\Python\\python.exe'"
         );
+    }
+
+    /// The `command:` line is printed as the command to run, and the install
+    /// root in it comes from a `--prefix` the local assistant can choose
+    /// (`install_sdk_dry_run` is model-callable). The old quoter returned
+    /// `` /tmp/`id` `` completely bare — no trigger character in it — and wrapped
+    /// `/tmp/$(id)` in double quotes, where substitution still fires. Both ran
+    /// on paste.
+    ///
+    /// Asked of a real `sh`, not of a word-splitter. That distinction is the
+    /// whole test: `shlex` is a *splitter*, so it hands back
+    /// `` /tmp/`id` `` unchanged and reports a clean round-trip for precisely
+    /// the value that executes. Only a shell models expansion, so only a shell
+    /// can answer "would this run something". Written with `shlex` first, this
+    /// test passed against the defect it exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_run_command_line_cannot_run_a_second_command_on_paste() {
+        for hostile in [
+            "/tmp/`id`",
+            "/tmp/$(id)",
+            "/tmp/a'; id; echo '",
+            "/tmp/my folder",
+            "/tmp/$HOME",
+            "",
+        ] {
+            let quoted = quote_display_arg(hostile);
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {quoted}"))
+                .output()
+                .expect("sh should run");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                hostile,
+                "{hostile:?} rendered as {quoted:?}, which a shell did not read back literally"
+            );
+        }
     }
 
     #[test]

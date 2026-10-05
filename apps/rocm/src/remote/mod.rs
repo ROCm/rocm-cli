@@ -31,6 +31,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use rocm_core::{AppPaths, ManagedServiceRecord};
 
+use crate::shell_quote::shell_quote;
 use session::RemoteSessionRecord;
 use transport::{SshTransport, Transport};
 
@@ -1234,21 +1235,13 @@ fn render_stopped(
     output
 }
 
-/// Quote a value for a POSIX remote shell.
-///
-/// Model names and engine flags are user-supplied values being placed into a
-/// command line that a shell on another machine will interpret. Anything not
-/// obviously inert gets single-quoted, with embedded single quotes closed and
-/// re-opened, so no input can end the quoting and start a new command.
-fn shell_quote(value: &str) -> String {
-    let inert = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
-    };
-    if !value.is_empty() && value.chars().all(inert) {
-        return value.to_owned();
-    }
-    format!("'{}'", value.replace('\'', r"'\''"))
-}
+// `shell_quote` used to be defined here. It now lives in `crate::shell_quote`,
+// because the command *previews* a user approves need the same guarantee —
+// this value is one word and nothing else — and giving them a quoter of their
+// own is how they ended up with one that left `$`, a backtick and a lone `"`
+// unescaped. Model names and engine flags still reach a shell on another
+// machine through it; see that module for the tests, including the one that
+// asks a real `sh`.
 
 #[cfg(test)]
 mod tests {
@@ -1427,35 +1420,10 @@ mod tests {
         assert!(command.contains("--gpu 1"), "{command}");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn hostile_values_survive_a_real_shell_as_one_literal_argument() {
-        // The property that matters is not the shape of the quoting but what a
-        // shell does with it. Ask one: each value must come back byte-identical,
-        // proving it was neither expanded nor split nor able to start a second
-        // command.
-        for value in [
-            "x'; rm -rf ~; echo '",
-            "$(id)",
-            "`id`",
-            "a b",
-            "it's",
-            "*",
-            "--not-a-flag",
-            "qwen2.5-7b-instruct",
-        ] {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("printf %s {}", shell_quote(value)))
-                .output()
-                .expect("sh should run");
-            assert_eq!(
-                String::from_utf8_lossy(&output.stdout),
-                value,
-                "shell mangled {value:?}"
-            );
-        }
-    }
+    // The quoter's own tests — including the one that asks a real `sh` whether
+    // a hostile value survives as a single literal argument — moved with it to
+    // `crate::shell_quote`. What stays here is what is specific to this module:
+    // that the remote command actually uses it.
 
     #[test]
     fn a_hostile_model_name_is_quoted_into_the_remote_command() {
@@ -1471,16 +1439,6 @@ mod tests {
         assert!(command.contains(r"'\''"), "{command}");
         // And the flags we control still follow it as real flags.
         assert!(command.contains("--require-api-key"), "{command}");
-    }
-
-    #[test]
-    fn shell_quoting_leaves_ordinary_values_alone_and_wraps_the_rest() {
-        for inert in ["qwen2.5-7b-instruct", "vllm", "/models/a.gguf", "auto"] {
-            assert_eq!(shell_quote(inert), inert);
-        }
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]

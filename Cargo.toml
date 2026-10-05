@@ -48,6 +48,11 @@ semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = { version = "0.10", features = ["oid"] }
+# Test-only. The oracle the command-preview property tests check against: it
+# splits a rendered command line the way a POSIX shell word-splitter does, so
+# "the preview denotes the argv that runs" becomes a mechanically checkable
+# round-trip rather than a human reading.
+shlex = "2"
 # `linux-tmpfs` makes tmpfs mounts visible to the free-space preflight, so a
 # cache or install root under a tmpfs `/tmp` (the Fedora and Arch default)
 # reports its real size instead of being invisible. `linux-netdevs` is
