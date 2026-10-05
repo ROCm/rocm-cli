@@ -5434,8 +5434,11 @@ mod tests {
     /// The container is planted twice — first by Podman's marker, then by the
     /// cgroup alone with no marker — so a probe reading the real host's markers
     /// or cgroup answers differently whether the test runs bare, under Docker
-    /// or under Podman. The GPU is a gfx1101, and `/proc/version` names no WSL
-    /// kernel.
+    /// or under Podman. The GPU is a gfx1101. WSL is checked in both
+    /// directions: first a non-WSL `/proc/version`, then a WSL kernel, then a
+    /// `/dev/dxg` alone. The positive answers are the ones a bare-metal runner
+    /// cannot give, so they catch an unrouted WSL read anywhere but on a real
+    /// WSL host.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn converted_probes_read_the_simulated_host_root() {
@@ -5489,15 +5492,40 @@ mod tests {
             let mut cgroup_only = Examination::default();
             probe_container(&mut cgroup_only);
 
-            (gpu_nodes, gfx_target, kfd, wsl, podman, cgroup_only)
+            // Now make the same root read as WSL, one signal at a time. "Not
+            // WSL" is what a bare-metal runner answers anyway, so only these
+            // positive answers fail when a WSL read misses the root.
+            plant(
+                "proc/version",
+                "Linux version 5.15.167.4-microsoft-standard-WSL2 (root@build)\n",
+            );
+            let wsl_by_kernel = crate::is_wsl_host();
+            plant(
+                "proc/version",
+                "Linux version 6.8.0-generic (buildd@lcy02)\n",
+            );
+            plant("dev/dxg", "");
+            let wsl_by_dxg = crate::is_wsl_host();
+
+            (
+                gpu_nodes,
+                gfx_target,
+                kfd,
+                (wsl, wsl_by_kernel, wsl_by_dxg),
+                podman,
+                cgroup_only,
+            )
         };
         std::fs::remove_dir_all(&root).ok();
+        let (wsl, wsl_by_kernel, wsl_by_dxg) = wsl;
 
         assert_eq!(gpu_nodes, Some(1), "one GPU node in the planted topology");
         assert_eq!(gfx_target.as_deref(), Some("gfx1101"));
         assert!(kfd.exists, "the planted /dev/kfd is found");
         assert_eq!(kfd.path, "/dev/kfd", "the logical path is reported");
         assert!(!wsl, "the planted host is bare metal, not WSL");
+        assert!(wsl_by_kernel, "a planted WSL kernel reads as WSL");
+        assert!(wsl_by_dxg, "a planted /dev/dxg reads as WSL");
         assert!(podman.in_container);
         assert_eq!(podman.container_kind, "podman");
         assert!(cgroup_only.in_container);

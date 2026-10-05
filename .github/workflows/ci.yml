@@ -509,6 +509,25 @@ jobs:
         # entries. The values are crate names from our own tool, not user input.
         run: cargo nextest run ${{ steps.sel.outputs.sel }}
 
+      - name: Test rocm-core with e2e-test-hooks
+        # The simulated-host-root tests (`hardware_root.rs`, and the planted-root
+        # probe test in `examine.rs`) only exist with this feature, which no
+        # other unit-test, nextest or clippy invocation enables. Without this
+        # step they are not even compiled in CI, so a probe reverted to a raw
+        # path would pass everything automated. Runs only when rocm-core is in
+        # the affected selection (or the whole workspace is), since nothing
+        # outside the crate can change these results.
+        #
+        # nextest, like the step above, so each test is its own process: the
+        # planted-root test sets the root for the whole process while it runs,
+        # and under a threaded `cargo test` any other test probing the host in
+        # that window would read the simulated machine.
+        if: >-
+          needs.changes.outputs.rust == 'true'
+          && (steps.sel.outputs.sel == '--workspace'
+              || contains(format('{0} ', steps.sel.outputs.sel), '-p rocm-core '))
+        run: cargo nextest run --locked -p rocm-core --lib --features e2e-test-hooks
+
   windows-build-and-test:
     runs-on: windows-latest
     timeout-minutes: 45
