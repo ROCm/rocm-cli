@@ -187,6 +187,54 @@ mod tests {
         );
     }
 
+    fn runs_label(action: KeyAction) -> &'static str {
+        VERBS
+            .iter()
+            .find(|verb| verb.action == action)
+            .unwrap_or_else(|| panic!("no ROCm verb opens {action:?}"))
+            .cmd
+    }
+
+    /// The detail pane prints `Runs: <cmd>`. A label that parses is not a
+    /// label that is true: each must name what its manager actually spawns,
+    /// so a user who copies it to a shell gets the same command.
+    #[test]
+    fn rocm_runs_labels_name_what_each_manager_spawns() {
+        use crate::ui::examine_manager::EXAMINE_ARGS;
+        use crate::ui::install_manager::InstallManagerState;
+        use crate::ui::update_manager::UpdateAction;
+
+        assert_eq!(
+            runs_label(KeyAction::OpenUpdate),
+            format!("rocm {}", UpdateAction::Check.args().join(" ")),
+            "the Update row's label must be the command its first action runs"
+        );
+        assert_eq!(
+            runs_label(KeyAction::OpenExamine),
+            format!("rocm {}", EXAMINE_ARGS.join(" ")),
+            "the doctor row's label must be the command the examine screen runs"
+        );
+
+        // Install takes user-chosen values, so its label shows `…` for them:
+        // it must still name the same subcommand and the same value flags.
+        let install = runs_label(KeyAction::OpenInstall);
+        let args = InstallManagerState::default()
+            .build_args()
+            .expect("the default install form builds an argv");
+        let command = format!("rocm {}", args[..2].join(" "));
+        assert!(
+            install.starts_with(&format!("{command} ")),
+            "Install label {install:?} must start with {command:?}"
+        );
+        for flag in ["--channel", "--format"] {
+            assert!(args.iter().any(|arg| arg == flag), "argv lost {flag}");
+            assert!(
+                install.split_whitespace().any(|word| word == flag),
+                "Install label {install:?} must name {flag}"
+            );
+        }
+    }
+
     #[test]
     fn rocm_verb_action_maps_selection_to_seam() {
         assert_eq!(verb_action(0), KeyAction::OpenInstall);
