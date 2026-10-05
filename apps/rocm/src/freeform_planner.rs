@@ -44,6 +44,7 @@ use serde::Deserialize;
 use std::fmt::Write as _;
 
 use crate::service_launch::is_loopback_host;
+use crate::shell_quote::{has_terminal_control_character, shell_quote};
 use crate::{Cli, chat, providers};
 
 /// Builds the freeform plan once and renders it. Kept for the render-only test
@@ -887,9 +888,9 @@ struct ProviderPlannerResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProviderPlannerToolCall {
-    tool: String,
-    args: Vec<String>,
+pub(crate) struct ProviderPlannerToolCall {
+    pub(crate) tool: String,
+    pub(crate) args: Vec<String>,
 }
 
 pub(crate) fn provider_planner_response_to_plan(
@@ -924,7 +925,10 @@ pub(crate) fn provider_planner_response_to_plan(
         response
             .notes
             .into_iter()
-            .filter(|note| !note.trim().is_empty()),
+            // Same reason as the argv above: a note is printed verbatim into the
+            // plan block, so a control character in one lets the planner redraw
+            // the lines around it.
+            .filter(|note| !note.trim().is_empty() && !has_terminal_control_character(note)),
     );
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
@@ -964,19 +968,25 @@ fn strip_json_fence(content: &str) -> &str {
     trimmed
 }
 
-fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
+pub(crate) fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
     if call.tool != "rocm" {
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
     if call.args.is_empty() {
         bail!("provider planner returned an empty tool call");
     }
+    // Control characters, not just NUL. These args are rendered straight into
+    // the `request plan` block `rocm <request>` prints to a terminal, and that
+    // block is the only thing the operator reads before re-running with
+    // `--yes`. A `\r` or a CSI sequence in an argument lets the planner's
+    // response decide what that block looks like, independently of the argv it
+    // would run. See `reject_control_characters_in_tool_arguments`.
     if call
         .args
         .iter()
-        .any(|arg| arg.trim().is_empty() || arg.contains('\0'))
+        .any(|arg| arg.trim().is_empty() || has_terminal_control_character(arg))
     {
-        bail!("provider planner returned an invalid empty or NUL argument");
+        bail!("provider planner returned an empty argument or one carrying a control character");
     }
     let argv = std::iter::once("rocm".to_owned())
         .chain(call.args.iter().cloned())
@@ -1273,22 +1283,24 @@ fn infer_device_policy_from_request(lower: &str) -> Option<&'static str> {
     }
 }
 
+/// Render an argv as the command line a human is shown for it.
+///
+/// This is the only thing an operator sees before approving a mutating tool
+/// call, and some of its output (`rocm chat --prompt …`, the `install command:`
+/// line) is offered to be copied and run. So it has to denote the argv it was
+/// built from: quoted with [`shell_quote`], every argument splits back to
+/// itself under a shell's own word-splitting, and nothing inside a value can
+/// read as a second command.
+///
+/// Values carrying terminal control characters never get here — they are
+/// refused at validation ([`has_terminal_control_character`]), because no
+/// amount of quoting stops a `\r` from rewriting the line the operator is
+/// reading.
 pub(crate) fn format_structured_tool_call(tool: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(tool.to_owned());
-    parts.extend(args.iter().map(|arg| quote_tool_arg(arg)));
+    parts.extend(args.iter().map(|arg| shell_quote(arg)));
     parts.join(" ")
-}
-
-/// Quotes `value` for rendered plan text and LLM prompt text only -- never
-/// executed directly. Deliberately kept separate from `rocm_core::quoting`
-/// (ROCMAI-727); see that module's doc comment for why.
-fn quote_tool_arg(value: &str) -> String {
-    if value.is_empty() || value.chars().any(char::is_whitespace) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.to_owned()
-    }
 }
 
 #[cfg(test)]
