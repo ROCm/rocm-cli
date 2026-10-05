@@ -21,11 +21,14 @@ Feature: GPU detection and system inspection
   # from the KFD topology in sysfs, while `examine` reaches its answer through the
   # CLI's own probe. Detection used to look for `gfx_target_version` as a standalone
   # file, which no kernel exposes, and silently fell back to decoding a GC IP
-  # version -- naming an MI300X `gfx943` instead of `gfx942`. Only the GPU lane can
-  # exercise this; there is no KFD topology to read on the mock lane.
-  @id:examine-detects-gpu-and-driver @requires-gpu
+  # version -- naming an MI300X `gfx943` instead of `gfx942`. The machine is
+  # simulated, with the KFD topology laid out as the kernel lays it out, so this
+  # runs on every Linux lane rather than only where an Instinct GPU is installed.
+  # The same cross-check against a real kernel is examine-18, and examine-19
+  # holds the simulated layout against a real one.
+  @id:examine-detects-gpu-and-driver @requires-os:linux
   Scenario: examine-04 - System inspection detects the GPU and driver
-    Given a machine with an AMD GPU
+    Given a machine with an AMD Instinct GPU
     When the user inspects the system
     Then the inspection reports which GPU is installed
     And the inspection names the GPU target that the kernel reports
@@ -102,19 +105,20 @@ Feature: GPU detection and system inspection
   # stays "unknown" there whatever the flag says. That the probe gives up that
   # early is its own defect, tracked separately; this scenario is about whether
   # the choice is reachable, and it cannot answer that where no choice is acted
-  # on at all.
-  @id:examine-can-skip-framework-probing @requires-bare-metal
+  # on at all. The bare-metal machine is simulated, so a WSL2 lane runs this too.
+  @id:examine-can-skip-framework-probing @requires-os:linux
   Scenario: examine-10 - The user can leave the frameworks out of the inspection
+    Given a bare-metal Linux machine with an AMD GPU
     When the user inspects the system without probing frameworks
     Then the inspection reports that it skipped the frameworks
     And it still states a verdict for this machine
 
-  # The inverse of `@requires-bare-metal`: WSL2 reports an os_family of `linux`,
-  # so `@requires-os:linux` cannot express "only where the host really is WSL".
-  # Runs only on the WSL lane; everywhere else the premise does not exist.
-  @id:examine-detects-wsl @requires-wsl
+  # The CLI recognises WSL by `/dev/dxg` and the kernel's own build string, never
+  # by `$WSL_DISTRO_NAME`. The WSL2 machine is simulated with exactly those, so
+  # this runs on every Linux lane instead of only the WSL one.
+  @id:examine-detects-wsl @requires-os:linux
   Scenario: examine-11 - System inspection recognizes a WSL host
-    Given the CLI is running in WSL
+    Given a WSL machine with an AMD GPU passed through
     When the user inspects the system
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
@@ -163,13 +167,13 @@ Feature: GPU detection and system inspection
   # it the world's `<data>/runtimes` stays isolated and empty by design (see
   # `E2eWorld::default`), no interpreter resolves, and any assertion would land
   # on the `PATH` fallback — holding whether the fix is present or reverted.
-  # That precondition is also why this is `@requires-gpu`: the step installs the
-  # SDK, so only a GPU lane exercises it.
+  # That precondition is also why this is `@requires-real-gpu`: the step installs
+  # the SDK, so only a real GPU lane exercises it.
   #
   # `framework_source` is what check_8 reads to decide whether comparing this
   # torch against the *system* ROCm means anything, so it is the field worth
   # pinning rather than the versions themselves.
-  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  @id:examine-framework-names-the-interpreter-that-answered @requires-real-gpu
   Scenario: examine-15 - The framework report describes the runtime the engines will use
     Given a managed runtime is active
     When the user inspects the system both for reading and for scripting
@@ -217,8 +221,46 @@ Feature: GPU detection and system inspection
   # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
   # target -- because on such a host the answer it would otherwise flag is the
   # correct one.
-  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
+  #
+  # The eight-GPU machine is simulated (the MI300X topology this was found on),
+  # so the step's premises always hold and it runs on every Linux lane.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-os:linux
   Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
-    Given a machine with an AMD GPU
+    Given a machine with eight AMD Instinct GPUs
     When the user inspects the system both for reading and for scripting
     Then it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target
+
+  # examine-04 on the machine the suite is running on rather than a simulated
+  # one: the same assertions, held against this host's own GPU and driver. It is
+  # what keeps detection covered where no filesystem can be simulated — the
+  # Windows lane, which asks the registry — and on a real Linux kernel.
+  # Read-only, so it is cheap on any GPU lane.
+  @id:examine-detects-this-machines-gpu-and-driver @requires-real-gpu
+  Scenario: examine-18 - System inspection detects this machine's own GPU and driver
+    Given this machine has an AMD GPU
+    When the user inspects the system
+    Then the inspection reports which GPU is installed
+    And the inspection names the GPU target that the kernel reports
+    And the inspection reports that the driver is available
+
+  # The GPU scenarios above run on simulated machines, which are only worth
+  # trusting while they are laid out the way the kernel lays out a real one. If a
+  # kernel moved a property, every simulated scenario would keep passing while the
+  # CLI failed on hardware -- the shape of the bug examine-04 pins, where the
+  # target was read from a file no kernel has. So on a real GPU host, every
+  # fixture assumption is held against the live /dev, /sys and `lspci`. Nightly,
+  # because kernels change on the scale of runner reimages, not pull requests.
+  @id:examine-simulated-machine-matches-the-kernel @requires-real-gpu @requires-bare-metal @requires-os:linux @nightly
+  Scenario: examine-19 - The simulated GPU machine is laid out like a real GPU host
+    When the simulated GPU machine is compared with this machine's kernel
+    Then the simulated machine is laid out the same way
+
+  # The WSL2 counterpart: the device node, dxcore runtime and kernel string the
+  # simulated WSL machine relies on, held against a real WSL2 distribution.
+  # `@requires-wsl` alone, not `@requires-real-gpu`: the check reads only what
+  # WSL itself mounts, and the WSL lane deliberately runs without ROCm
+  # passthrough, so a GPU gate would keep it from ever running there.
+  @id:examine-simulated-wsl-machine-matches-wsl @requires-wsl @nightly
+  Scenario: examine-20 - The simulated WSL machine is laid out like a real WSL2 host
+    When the simulated WSL machine is compared with this machine
+    Then the simulated machine is laid out the same way

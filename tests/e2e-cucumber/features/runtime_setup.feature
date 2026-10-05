@@ -10,7 +10,7 @@ Feature: Runtime configuration
   # disagree: what the install recorded, and what the diagnostic tells the user
   # it recorded. The toolchain is now something a user can end up without, so
   # `rocm examine` staying silent about it is its own defect.
-  @id:runtime-install-sdk-active @requires-gpu @nightly
+  @id:runtime-install-sdk-active @requires-real-gpu @nightly
   Scenario: runtime-01 - Installing the SDK makes it the active runtime
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK
@@ -25,7 +25,7 @@ Feature: Runtime configuration
   # path that bloats paths and breaks `services/*.log` globs. Assert the active
   # runtime's folder path has no such recursive segment. GPU-gated (needs a real
   # install so the folder path is populated).
-  @id:runtime-path-not-nested @requires-gpu
+  @id:runtime-path-not-nested @requires-real-gpu
   Scenario: runtime-02 - The managed runtime path is not nested inside another runtime
     Given a managed runtime is active
     When the user inspects the system
@@ -50,7 +50,7 @@ Feature: Runtime configuration
   # It reads the block's verdict rather than one string, because a torch that has
   # already run a GPU kernel with this SDK is kept instead of rewritten and reports
   # a `retained_*` verdict — settled, with nothing installed.
-  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-sdk-reinstall-keeps-engine-consistent @requires-real-gpu @requires-engine:vllm @nightly
   Scenario: runtime-03 - Reinstalling the SDK leaves the installed engine able to use the GPU
     Given a managed runtime with an inference engine already installed
     When the user installs the SDK again
@@ -82,7 +82,7 @@ Feature: Runtime configuration
   # Same lane as scenario 4 and for the same reasons: a real SDK install and a
   # real engine, on the serialized nightly GPU runners. `@requires-engine:vllm`
   # because only vLLM shares the runtime environment the alignment writes into.
-  @id:runtime-torch-alignment-opt-out @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-torch-alignment-opt-out @requires-real-gpu @requires-engine:vllm @nightly
   Scenario: runtime-04 - Opting out of the torch alignment keeps the torch the user installed
     Given a managed runtime with an inference engine already installed
     And the user has opted out of realigning torch
@@ -100,7 +100,7 @@ Feature: Runtime configuration
   # an xtask test. Cheap enough for the per-PR lanes: one CLI call against the
   # already-installed shared runtime. `status=error` is an ACCEPTED outcome, so an
   # offline runner reports honestly instead of flaking.
-  @id:runtime-update-reports-freshness @requires-gpu
+  @id:runtime-update-reports-freshness @requires-real-gpu
   Scenario: runtime-05 - The update check reports the active runtime's freshness
     Given a managed runtime is active
     When the user checks for runtime updates
@@ -183,7 +183,7 @@ Feature: Runtime configuration
   # ready, while mock hosts with no target skip it.
   @id:runtime-resolve-canonical-release @requires-gfx-target
   Scenario: runtime-09 - Previewing a release SDK install resolves the canonical aggregate for this GPU
-    Given a machine with an AMD GPU
+    Given this machine has an AMD GPU
     When the user dry-runs a release SDK install for this host
     Then the SDK preview reports canonical release provenance
     And the SDK preview requests the device payload for this host's GPU
@@ -211,7 +211,7 @@ Feature: Runtime configuration
   # index read is cached — but on a cold host the launcher step can still fetch.
   # What the refusal does bail before is the SDK and torch download and any
   # change on disk.
-  @id:runtime-install-sdk-overwrite-requires-yes @requires-gpu
+  @id:runtime-install-sdk-overwrite-requires-yes @requires-real-gpu
   Scenario: runtime-11 - Reinstalling the SDK over an existing runtime without consent is refused
     Given a managed runtime is active
     When the user reinstalls the SDK without confirming
@@ -224,7 +224,7 @@ Feature: Runtime configuration
   # The registered/active Thens hold from the Given alone, so the approval Then
   # is what actually distinguishes this from a no-op: it fails if --yes ever
   # regresses to a refusal or silently takes the fresh-install path.
-  @id:runtime-install-sdk-overwrite-with-yes @requires-gpu @nightly
+  @id:runtime-install-sdk-overwrite-with-yes @requires-real-gpu @nightly
   Scenario: runtime-12 - Reinstalling the SDK over an existing runtime with --yes proceeds
     Given a managed runtime is active
     When the user reinstalls the SDK with --yes
@@ -256,7 +256,7 @@ Feature: Runtime configuration
   # never comes up. The tarball path takes the family it is given, consults no
   # host target, and reaches the same gate. What is lost on Windows is this
   # cross-family case only: Scenario runtime-11 still covers the refusal there.
-  @id:runtime-install-sdk-other-family-requires-yes @requires-gpu @requires-os:linux
+  @id:runtime-install-sdk-other-family-requires-yes @requires-real-gpu @requires-os:linux
   Scenario: runtime-13 - Installing a different GPU family while a runtime is active is refused without consent
     Given a managed runtime is active
     When the user installs a different GPU family without confirming
@@ -333,7 +333,7 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
-  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  @id:runtime-lemonade-backend-alignment-reported @requires-real-gpu @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
     When the user reinstalls the lemonade engine
@@ -350,7 +350,7 @@ Feature: Runtime configuration
   # Then only proves the CLI read the variable and named it, which is a weaker
   # claim on its own. Same lane as scenario 16 and for the same reason -- a real
   # managed SDK and a real backend, on the serialized nightly GPU runners.
-  @id:runtime-lemonade-backend-alignment-opt-out @requires-gpu @requires-engine:lemonade @nightly
+  @id:runtime-lemonade-backend-alignment-opt-out @requires-real-gpu @requires-engine:lemonade @nightly
   Scenario: runtime-17 - Opting out of the Lemonade backend alignment keeps the packaged pin
     Given a managed runtime is active
     And the user has opted out of realigning Lemonade's backend
@@ -361,7 +361,7 @@ Feature: Runtime configuration
   # The other half: that a runtime installed without the toolchain can actually
   # serve. vLLM compiles Triton kernels at runtime, which is the case most
   # likely to need `devel`, so it is the one worth proving end to end.
-  @id:runtime-install-sdk-serves-without-toolchain @requires-gpu @requires-engine:vllm @nightly
+  @id:runtime-install-sdk-serves-without-toolchain @requires-real-gpu @requires-engine:vllm @nightly
   Scenario: runtime-18 - A runtime-only SDK install serves vLLM inference
     Given a machine with no CLI-managed runtimes
     When the user installs the SDK

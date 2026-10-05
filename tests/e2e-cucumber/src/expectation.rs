@@ -26,6 +26,7 @@ const REQUIRES_ENGINE_PREFIX: &str = "requires-engine:";
 const REQUIRES_OS_PREFIX: &str = "requires-os:";
 const REQUIRES_DOCKER_TAG: &str = "requires-docker";
 const REQUIRES_GPU_TAG: &str = "requires-gpu";
+const REQUIRES_REAL_GPU_TAG: &str = "requires-real-gpu";
 const REQUIRES_MULTI_GPU_TAG: &str = "requires-multi-gpu";
 const REQUIRES_GFX_TARGET_TAG: &str = "requires-gfx-target";
 const REQUIRES_NO_GPU_TAG: &str = "requires-no-gpu";
@@ -78,11 +79,61 @@ fn docker_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Which hardware a run exercises — the `E2E_HARDWARE` switch.
+///
+/// `simulated` (the default) is the per-PR shape: a scenario that needs a GPU
+/// describes the host it wants itself, by planting a simulated one, so it runs
+/// identically on a GitHub-hosted runner and on a GPU box. Scenarios whose
+/// premise cannot be simulated — a model generating tokens on a device, a
+/// runtime really installed for it — are tagged `@requires-real-gpu` and only
+/// run when a lane on real hardware opts in with `E2E_HARDWARE=real`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HardwareMode {
+    #[default]
+    Simulated,
+    Real,
+}
+
+impl HardwareMode {
+    /// The environment variable a lane sets to choose the mode.
+    pub const ENV: &'static str = "E2E_HARDWARE";
+
+    /// Parse the variable's value; unset or empty means simulated.
+    ///
+    /// Anything else is an error rather than a fallback: a lane that misspells
+    /// `real` would otherwise skip every real-GPU scenario and still go green.
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("" | "simulated") => Ok(Self::Simulated),
+            Some("real") => Ok(Self::Real),
+            Some(other) => Err(format!(
+                "{}={other:?} is not a hardware mode; use `simulated` or `real`",
+                Self::ENV
+            )),
+        }
+    }
+
+    /// Stable lowercase name, as accepted by [`HardwareMode::parse`].
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Simulated => "simulated",
+            Self::Real => "real",
+        }
+    }
+}
+
 /// Facts extracted from a scenario's tags.
 #[derive(Debug, Clone)]
 pub struct ScenarioDecl {
     pub id: Option<String>,
     pub requires_gpu: bool,
+    /// `@requires-real-gpu`: the scenario needs a physical AMD GPU, not a
+    /// simulated host — it serves a model on it, installs a runtime for it,
+    /// inspects the real machine, or checks the simulation against the real
+    /// kernel. Implies `@requires-gpu`, and additionally skips unless the
+    /// run opted into real hardware with `E2E_HARDWARE=real` (see
+    /// [`HardwareMode`]).
+    pub requires_real_gpu: bool,
     /// `@requires-multi-gpu`: the scenario's premise is a host with MORE THAN ONE
     /// AMD GPU present, so a single-GPU host is not a weaker version of it — it
     /// is a different situation in which the assertion does not hold. Skipped
@@ -168,6 +219,7 @@ impl ScenarioDecl {
         let mut id = None;
         let mut requires_docker = false;
         let mut requires_gpu = false;
+        let mut requires_real_gpu = false;
         let mut requires_multi_gpu = false;
         let mut requires_gfx_target = false;
         let mut requires_no_gpu = false;
@@ -196,6 +248,11 @@ impl ScenarioDecl {
                 requires_docker = true;
             } else if tag == REQUIRES_GPU_TAG {
                 requires_gpu = true;
+            } else if tag == REQUIRES_REAL_GPU_TAG {
+                // Implies `@requires-gpu`, so every gate that applies to a GPU
+                // scenario (usable device, startable engine) applies here too.
+                requires_gpu = true;
+                requires_real_gpu = true;
             } else if tag == REQUIRES_MULTI_GPU_TAG {
                 requires_multi_gpu = true;
             } else if tag == REQUIRES_GFX_TARGET_TAG {
@@ -217,6 +274,7 @@ impl ScenarioDecl {
         Self {
             id,
             requires_gpu,
+            requires_real_gpu,
             requires_multi_gpu,
             requires_gfx_target,
             requires_no_gpu,
@@ -465,19 +523,24 @@ pub struct PlatformManifest<'a> {
 /// - `merge_queue` — set only in the merge queue (via `E2E_MERGE_QUEUE`). Per-PR
 ///   runs leave it false so heavy `@merge-queue` serves stay off the PR path (a
 ///   cheaper per-engine canary covers them) and run once before the change lands.
+/// - `hardware` — [`HardwareMode::Real`] only on a lane running on a GPU host
+///   that opted in (via `E2E_HARDWARE=real`); otherwise `@requires-real-gpu`
+///   scenarios are skipped.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Included {
     pub nightly: bool,
     pub lifecycle: bool,
     pub docker: bool,
     pub merge_queue: bool,
+    pub hardware: HardwareMode,
 }
 
 /// Resolve a scenario's expectation on this host.
 ///
 /// 1. Not-applicable → `Skip`: a `@nightly` scenario when nightly isn't included,
 ///    a `@merge-queue` scenario outside the merge queue, a `@requires-docker`
-///    scenario without a usable container runtime, a `@requires-gpu` scenario on
+///    scenario without a usable container runtime, a `@requires-real-gpu`
+///    scenario outside `E2E_HARDWARE=real`, a `@requires-gpu` scenario on
 ///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
 ///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
 ///    `@requires-os:<os>` scenario on a different OS, or a scenario whose
@@ -498,6 +561,7 @@ pub fn resolve(
         lifecycle: include_lifecycle,
         docker: include_docker,
         merge_queue: include_merge_queue,
+        hardware,
     } = included;
     // (1) Applicability / skip.
     if decl.nightly && !include_nightly {
@@ -520,6 +584,14 @@ pub fn resolve(
             reason: "needs a second machine in a container; set E2E_INCLUDE_DOCKER=1 on a \
                      runner that can build the fixture image"
                 .to_owned(),
+        };
+    }
+    if decl.requires_real_gpu && hardware != HardwareMode::Real {
+        return Expectation::Skip {
+            reason: format!(
+                "needs real GPU hardware; set {}=real on a GPU host to run",
+                HardwareMode::ENV
+            ),
         };
     }
     if decl.requires_gpu && !cap.has_amd_gpu {
@@ -819,7 +891,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -833,7 +906,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -849,7 +923,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -876,7 +951,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -890,7 +966,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: true,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -905,7 +982,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: true,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -938,6 +1016,7 @@ serve_timeout_secs = 90
                     lifecycle: true,
                     merge_queue: true,
                     docker: false,
+                    hardware: HardwareMode::Simulated,
                 }
             ),
             Expectation::Skip { .. }
@@ -964,7 +1043,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -978,7 +1058,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: true
+                    merge_queue: true,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -994,7 +1075,8 @@ serve_timeout_secs = 90
                     nightly: true,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1009,7 +1091,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: true
+                    merge_queue: true,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1044,7 +1127,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -1059,7 +1143,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1074,7 +1159,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1094,7 +1180,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1168,46 +1255,59 @@ serve_timeout_secs = 90
             .collect()
     }
 
-    /// The gate is only worth anything if the scenario in the file actually
-    /// carries it, so resolve the REAL tag line rather than a hand-written copy:
-    /// dropping `@requires-multi-gpu` from the feature file has to fail a test,
-    /// not silently restore the single-GPU failure this was added to fix.
-    ///
-    /// The sibling `serve-19` is asserted in the same breath to stay UNGATED: its
-    /// `HIP_VISIBLE_DEVICES=0` mask names a device every GPU host has, so its
-    /// visible set resolves on one GPU and the refusal holds there. Gating it too
-    /// would retire live coverage on the Strix lanes for no reason.
+    /// The scenario body of a real `.feature` file, by `@id:` slug: the lines
+    /// after its tag line, up to the next tag line.
+    fn feature_body(feature_text: &'static str, id: &str) -> String {
+        let mut lines = feature_text.lines().map(str::trim);
+        lines
+            .by_ref()
+            .find(|line| {
+                line.starts_with('@')
+                    && line
+                        .split_whitespace()
+                        .any(|tag| tag == format!("@id:{id}").as_str())
+            })
+            .unwrap_or_else(|| panic!("no tag line for @id:{id}"));
+        // The scenario's own lines end where the next one's comment or tags
+        // begin, so its neighbour's commentary is never read as its steps.
+        lines
+            .take_while(|line| !line.starts_with('@') && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// serve-20's premise is a host with MORE THAN ONE GPU: on one GPU its mask
+    /// names a device that is not there and the refusal stops following from the
+    /// mask (see the scenario's comment). It used to hold that premise with
+    /// `@requires-multi-gpu`, which left it running only on multi-GPU lanes. It
+    /// now plants a simulated two-GPU machine instead, so the premise holds on
+    /// every Linux lane. Read from the REAL feature file, so dropping the second
+    /// simulated GPU fails here rather than quietly reinstating the single-GPU
+    /// failure the gate was added for. Its sibling serve-19 is held the same way.
     #[test]
-    fn the_rocr_reindexed_scenario_is_gated_on_multi_gpu_and_its_sibling_is_not() {
+    fn the_rocr_reindexed_scenarios_plant_their_own_second_gpu() {
         let feature = include_str!("../features/model_serving.feature");
         let m = Expectations::default();
-
-        let rocr = ScenarioDecl::from_tags(&feature_tags(
-            feature,
+        for id in [
             "serve-rocr-reindexed-gpu-index-rejected",
-        ));
-        assert!(rocr.requires_multi_gpu, "serve-20 must carry the gate");
-        assert!(matches!(
-            resolve(&rocr, &cap("strix-ubuntu"), &m, Included::default()),
-            Expectation::Skip { .. }
-        ));
-        assert_eq!(
-            resolve(&rocr, &cap("mi300x"), &m, Included::default()),
-            Expectation::ExpectPass
-        );
-
-        let masked =
-            ScenarioDecl::from_tags(&feature_tags(feature, "serve-masked-gpu-index-rejected"));
-        assert!(
-            !masked.requires_multi_gpu,
-            "serve-19 holds on a single GPU and must keep running there"
-        );
-        for host in ["strix-ubuntu", "mi300x"] {
-            assert_eq!(
-                resolve(&masked, &cap(host), &m, Included::default()),
-                Expectation::ExpectPass,
-                "{host} must still run serve-19"
+            "serve-masked-gpu-index-rejected",
+        ] {
+            assert!(
+                feature_body(feature, id).contains("Given a machine with two AMD Instinct GPUs"),
+                "{id} must describe a two-GPU machine"
             );
+            let decl = ScenarioDecl::from_tags(&feature_tags(feature, id));
+            assert!(
+                !decl.requires_gpu && !decl.requires_multi_gpu,
+                "{id} brings its own GPUs, so it must not wait for a lane that has them"
+            );
+            for host in ["strix-ubuntu", "mi300x", "wsl2"] {
+                assert_eq!(
+                    resolve(&decl, &cap(host), &m, Included::default()),
+                    Expectation::ExpectPass,
+                    "{id} must run on {host}"
+                );
+            }
         }
     }
 
@@ -1243,7 +1343,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1258,7 +1359,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1272,7 +1374,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1293,7 +1396,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::Skip { .. }
@@ -1311,7 +1415,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::ExpectPass,
@@ -1375,7 +1480,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::ExpectPass
@@ -1391,7 +1497,8 @@ serve_timeout_secs = 90
                         nightly: false,
                         lifecycle: false,
                         docker: false,
-                        merge_queue: false
+                        merge_queue: false,
+                        ..Included::default()
                     }
                 ),
                 Expectation::Skip { .. }
@@ -1415,7 +1522,8 @@ serve_timeout_secs = 90
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1446,7 +1554,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1472,7 +1581,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1487,7 +1597,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1511,7 +1622,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1525,7 +1637,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1539,7 +1652,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::Skip { .. }
@@ -1559,7 +1673,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1573,7 +1688,8 @@ reason = "unrelated open bug"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1602,7 +1718,8 @@ reason = "short-name not surfaced"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -1616,7 +1733,8 @@ reason = "short-name not surfaced"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -1649,7 +1767,8 @@ reason = "lemonade vulkan fallback"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectXfail { .. }
@@ -1664,7 +1783,8 @@ reason = "lemonade vulkan fallback"
                     nightly: false,
                     lifecycle: false,
                     docker: false,
-                    merge_queue: false
+                    merge_queue: false,
+                    ..Included::default()
                 }
             ),
             Expectation::ExpectPass
@@ -1783,5 +1903,80 @@ flaky = true
         assert!(glob_match("*dcgpu", "gfx94X-dcgpu"));
         assert!(!glob_match("gfx94*", "gfx1151"));
         assert!(glob_match("gfx1151", "gfx1151"));
+    }
+
+    #[test]
+    fn hardware_mode_defaults_to_simulated_and_rejects_typos() {
+        assert_eq!(HardwareMode::parse(None), Ok(HardwareMode::Simulated));
+        assert_eq!(HardwareMode::parse(Some("")), Ok(HardwareMode::Simulated));
+        assert_eq!(
+            HardwareMode::parse(Some("simulated")),
+            Ok(HardwareMode::Simulated)
+        );
+        assert_eq!(HardwareMode::parse(Some("real")), Ok(HardwareMode::Real));
+        // A misspelt `real` must not quietly fall back to simulated, which would
+        // skip every real-GPU scenario on that lane and still report green.
+        let err = HardwareMode::parse(Some("Real ")).unwrap_err();
+        assert!(err.contains("E2E_HARDWARE"), "{err}");
+        assert!(HardwareMode::parse(Some("gpu")).is_err());
+    }
+
+    #[test]
+    fn requires_real_gpu_implies_requires_gpu() {
+        let d = decl(&["@id:x", "@requires-real-gpu"]);
+        assert!(d.requires_real_gpu);
+        assert!(d.requires_gpu);
+        assert!(!decl(&["id:x", "requires-gpu"]).requires_real_gpu);
+    }
+
+    #[test]
+    fn requires_real_gpu_runs_only_on_real_hardware_with_a_gpu() {
+        let m = Expectations::default();
+        let d = decl(&["id:x", "requires-real-gpu"]);
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+
+        // Simulated (the default) skips it even on a GPU host, naming the switch.
+        match resolve(&d, &cap("mi300x"), &m, Included::default()) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("E2E_HARDWARE=real"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+        // Real hardware with a GPU runs it.
+        assert_eq!(
+            resolve(&d, &cap("mi300x"), &m, real),
+            Expectation::ExpectPass
+        );
+        // Real mode does not conjure a GPU: the ordinary GPU gate still applies.
+        match resolve(&d, &cap("mock"), &m, real) {
+            Expectation::Skip { reason } => {
+                assert!(reason.contains("requires an AMD GPU"), "{reason}");
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    /// The switch only gates `@requires-real-gpu`: an ordinary scenario, and a
+    /// `@requires-gpu` one, resolve the same in either mode.
+    #[test]
+    fn hardware_mode_leaves_other_scenarios_alone() {
+        let m = Expectations::default();
+        let real = Included {
+            hardware: HardwareMode::Real,
+            ..Included::default()
+        };
+        for tags in [&["id:plain"][..], &["id:gpu", "requires-gpu"][..]] {
+            let d = decl(tags);
+            for host in ["mock", "mi300x"] {
+                assert_eq!(
+                    resolve(&d, &cap(host), &m, Included::default()),
+                    resolve(&d, &cap(host), &m, real),
+                    "{tags:?} on {host}"
+                );
+            }
+        }
     }
 }
