@@ -41,11 +41,26 @@ use super::{
     Cli, cli_command, command_invocation_error, parse_freeform_invocation, should_treat_as_freeform,
 };
 
+/// What kind of text an invocation was found in. It decides whether leaving
+/// out a required value is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Surface {
+    /// An inline backtick span in prose, which may name a command or flag
+    /// without its values ("pass `rocm serve --engine`").
+    InlineProse,
+    /// A line the user is meant to run as written: a fenced code line, a
+    /// string literal that starts with a command (RECIPES `commands`/`verify`,
+    /// a dashboard `cmd`, a tape `Type`), a labelled `next step:`/`Try:`/
+    /// `apply with:` line, or a help EXAMPLES row.
+    CommandLine,
+}
+
 /// One advised invocation and where it came from.
 #[derive(Debug, Clone)]
 pub(crate) struct Advice {
     pub source: String,
     pub raw: String,
+    pub surface: Surface,
 }
 
 /// How the real entry points treat an advised argv.
@@ -218,10 +233,13 @@ fn extract_rust(path: &Path, rel: &str, out: &mut Vec<Advice>) {
     let text = std::fs::read_to_string(path).expect("read Rust source");
     for (line_no, line) in rust_production_lines(&text) {
         let mut seen: Vec<String> = Vec::new();
-        for raw in backtick_spans(&line)
+        let spans = backtick_spans(&line)
             .into_iter()
-            .chain(command_literals(&line))
-        {
+            .map(|raw| (raw, Surface::InlineProse));
+        let literals = command_literals(&line)
+            .into_iter()
+            .map(|raw| (raw, Surface::CommandLine));
+        for (raw, surface) in spans.chain(literals) {
             if seen.contains(&raw) {
                 continue;
             }
@@ -229,6 +247,7 @@ fn extract_rust(path: &Path, rel: &str, out: &mut Vec<Advice>) {
             out.push(Advice {
                 source: format!("{rel}:{line_no}"),
                 raw,
+                surface,
             });
         }
     }
@@ -260,6 +279,7 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
                     out.push(Advice {
                         source: format!("{rel}:{start}"),
                         raw: joined,
+                        surface: Surface::CommandLine,
                     });
                 }
                 continue;
@@ -275,6 +295,7 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
                     out.push(Advice {
                         source: format!("{rel}:{line_no}"),
                         raw: command.to_owned(),
+                        surface: Surface::CommandLine,
                     });
                 }
             }
@@ -298,6 +319,7 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
             out.push(Advice {
                 source: format!("{rel}:{start}"),
                 raw,
+                surface: Surface::InlineProse,
             });
         }
     }
@@ -379,6 +401,7 @@ pub(crate) fn source_advice() -> Vec<Advice> {
                 advice.push(Advice {
                     source: format!("{}:{}", rel(&path), index + 1),
                     raw,
+                    surface: Surface::CommandLine,
                 });
             }
         }
@@ -398,18 +421,22 @@ pub(crate) fn help_text_advice() -> Vec<Advice> {
                 out.push(Advice {
                     source: source.clone(),
                     raw: trimmed.to_owned(),
+                    surface: Surface::CommandLine,
                 });
             }
             for raw in backtick_spans(line) {
                 out.push(Advice {
                     source: source.clone(),
                     raw,
+                    surface: Surface::InlineProse,
                 });
             }
         }
+        // clap's generated `help` subcommand renders the same help again; one
+        // bad line would be reported once per nesting level.
         let names: Vec<String> = command
             .get_subcommands()
-            .filter(|sub| !sub.is_hide_set())
+            .filter(|sub| !sub.is_hide_set() && sub.get_name() != "help")
             .map(|sub| sub.get_name().to_owned())
             .collect();
         for name in names {
@@ -910,6 +937,16 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     ),
     (
         "apps/rocm/src/main.rs",
+        "rocm config",
+        "heading of the `rocm config` report (`writeln!(output, \"rocm config\")`)",
+    ),
+    (
+        "crates/rocm-dash-collectors/src/bench_load.rs",
+        "rocm bench load (local smoke)",
+        "`launcher` label recorded in a benchmark result, not advice",
+    ),
+    (
+        "apps/rocm/src/main.rs",
         "rocm services {} {service_id} --yes",
         "the verb is a format argument; every value it takes is checked against the \
          real message by `service_action_retry_advice_parses_for_generated_ids`",
@@ -965,6 +1002,19 @@ fn is_excluded(item: &Advice) -> bool {
         .any(|(file, raw, _)| *raw == item.raw && item.source.starts_with(&format!("{file}:")))
 }
 
+/// Whether advice may name a command without its required values. Only inline
+/// prose may ("pass `rocm serve --engine`"), or text that marks the omission
+/// itself with an ellipsis (`rocm runtimes …`). A command line meant to be run
+/// as written may not: if `rocm examine` grew a required argument, every bare
+/// `rocm examine` in a RECIPE, a `next step:` line or a fenced example would
+/// fail for the user who ran it.
+fn may_omit_required_values(item: &Advice) -> bool {
+    item.surface == Surface::InlineProse
+        || split_words(&command_part(&item.raw))
+            .iter()
+            .any(|word| word.trim_matches(['[', ']']).ends_with('…') || word.ends_with("..."))
+}
+
 pub(crate) fn findings(advice: &[Advice]) -> Vec<Finding> {
     let mut out = Vec::new();
     for item in advice {
@@ -973,7 +1023,11 @@ pub(crate) fn findings(advice: &[Advice]) -> Vec<Finding> {
         }
         for argv in argv_variants(&item.raw) {
             let reason = match verdict(&argv) {
-                Verdict::Parses | Verdict::IncompleteReference => continue,
+                Verdict::Parses => continue,
+                Verdict::IncompleteReference if may_omit_required_values(item) => continue,
+                Verdict::IncompleteReference => "a required argument or subcommand is missing: \
+                                                 this line is meant to be run as written"
+                    .to_owned(),
                 Verdict::Freeform if is_deliberate_natural_language(&argv) => continue,
                 Verdict::Freeform => "not a subcommand: `rocm` sends it to the natural-language \
                                       planner instead of running a command"
@@ -1012,15 +1066,92 @@ fn all_advice() -> Vec<Advice> {
     advice
 }
 
+/// Where an advised invocation was found, for the per-source floors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Help,
+    Rust,
+    Markdown,
+    Tape,
+}
+
+fn origin(item: &Advice) -> Origin {
+    let file = item.source.rsplit_once(':').map_or("", |(file, _)| file);
+    if item.source.starts_with('`') {
+        Origin::Help
+    } else if file.ends_with(".rs") {
+        Origin::Rust
+    } else if file.ends_with(".md") {
+        Origin::Markdown
+    } else if file.ends_with(".tape") {
+        Origin::Tape
+    } else {
+        panic!("advice from an unknown source: {}", item.source)
+    }
+}
+
+/// Guards the scanner itself, source by source: a broken extractor would make
+/// `every_advised_command_parses` pass vacuously for everything it feeds. Each
+/// extractor must still find a known advised command and a floor of entries
+/// (set well below today's counts so ordinary doc edits do not trip it).
+#[test]
+fn every_source_is_scanned() {
+    let advice = all_advice();
+    let count = |wanted: Origin, surface: Surface| {
+        advice
+            .iter()
+            .filter(|item| origin(item) == wanted && item.surface == surface)
+            .count()
+    };
+    let has = |source_prefix: &str, raw: &str, surface: Surface| {
+        advice.iter().any(|item| {
+            item.source.starts_with(source_prefix)
+                && item.raw.starts_with(raw)
+                && item.surface == surface
+        })
+    };
+
+    // Help: the top-level EXAMPLES row and inline spans.
+    assert!(
+        has("`rocm --help`", "rocm examine", Surface::CommandLine),
+        "help EXAMPLES row `rocm examine` not found: help extraction is broken"
+    );
+    assert!(count(Origin::Help, Surface::CommandLine) >= 20);
+    assert!(count(Origin::Help, Surface::InlineProse) >= 20);
+    // Rust: a dashboard `cmd` literal, labelled lines, and inline spans.
+    assert!(
+        has(
+            "crates/rocm-dash-tui/src/ui/tabs/rocm.rs:",
+            "rocm update",
+            Surface::CommandLine
+        ),
+        "dashboard `cmd: \"rocm update\"` not found: Rust literal extraction is broken"
+    );
+    assert!(
+        has(
+            "apps/rocm/src/main.rs:",
+            "rocm services stop",
+            Surface::CommandLine
+        ),
+        "labelled `stop: rocm services stop …` line not found"
+    );
+    assert!(count(Origin::Rust, Surface::CommandLine) >= 90);
+    assert!(count(Origin::Rust, Surface::InlineProse) >= 130);
+    // Markdown: fenced lines and inline spans.
+    assert!(count(Origin::Markdown, Surface::CommandLine) >= 100);
+    assert!(count(Origin::Markdown, Surface::InlineProse) >= 120);
+    assert!(
+        count(Origin::Markdown, Surface::CommandLine)
+            + count(Origin::Markdown, Surface::InlineProse)
+            >= 300
+    );
+    // Tapes.
+    assert!(count(Origin::Tape, Surface::CommandLine) >= 5);
+}
+
 #[test]
 fn every_advised_command_parses() {
     let advice = all_advice();
-    // Guard the scanner itself: a broken walk would make this pass vacuously.
-    assert!(
-        advice.len() > 400,
-        "only {} advised invocations found; the extractor or the repo root is wrong",
-        advice.len()
-    );
     let found = findings(&advice);
     assert!(
         found.is_empty(),
@@ -1083,6 +1214,24 @@ fn checker_rejects_what_users_would_hit() {
     assert!(is_deliberate_natural_language(&argv(
         "rocm --yes \"start a local model\""
     )));
+}
+
+#[test]
+fn only_prose_or_an_ellipsis_may_leave_required_values_out() {
+    let advice = |raw: &str, surface| Advice {
+        source: "fixture.md:1".to_owned(),
+        raw: raw.to_owned(),
+        surface,
+    };
+    // `runtimes activate` requires a runtime key.
+    assert!(findings(&[advice("rocm runtimes activate", Surface::InlineProse)]).is_empty());
+    assert_eq!(
+        findings(&[advice("rocm runtimes activate", Surface::CommandLine)]).len(),
+        1,
+        "a command line missing a required value is a violation"
+    );
+    assert!(findings(&[advice("rocm runtimes …", Surface::CommandLine)]).is_empty());
+    assert!(findings(&[advice("rocm serve --managed ...", Surface::CommandLine)]).is_empty());
 }
 
 #[test]
@@ -1180,12 +1329,22 @@ fn dump_advised_invocations() {
     for item in &advice {
         for argv in argv_variants(&item.raw) {
             println!(
-                "{}\t{}\t{:?}\t{:?}",
+                "{}\t{}\t{:?}\t{:?}\t{:?}",
                 item.source,
                 item.raw,
                 argv,
-                verdict(&argv)
+                verdict(&argv),
+                item.surface
             );
+        }
+    }
+    for wanted in [Origin::Help, Origin::Rust, Origin::Markdown, Origin::Tape] {
+        for surface in [Surface::CommandLine, Surface::InlineProse] {
+            let count = advice
+                .iter()
+                .filter(|item| origin(item) == wanted && item.surface == surface)
+                .count();
+            println!("COUNT\t{wanted:?}\t{surface:?}\t{count}");
         }
     }
     println!("TOTAL\t{}", advice.len());
