@@ -461,8 +461,7 @@ mod tests {
     fn a_dead_process_is_never_read_for_a_start_time() {
         // The ordering this module's safety rests on, pinned rather than
         // inspected. If the reading is ever hoisted back into argument
-        // position — which reads as a harmless inlining, and was exactly the
-        // regression a review caught here — it happens before the liveness
+        // position — which reads as a harmless inlining — it happens before the liveness
         // check, and a PID that exits and is recycled in between comes back
         // `Matches`: the one verdict that authorises a kill, for a process that
         // is no longer the recorded one.

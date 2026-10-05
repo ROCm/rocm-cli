@@ -761,7 +761,8 @@ rocm uninstall [--yes] [--dry-run]
 removes anything. If a server cannot be stopped (or its service record cannot
 be read), the command exits non-zero, leaves every file in place, and says what
 to repair or stop by hand, so the tooling needed to stop it is never deleted
-out from under a running server.
+out from under a running server. A run that keeps the binaries and data
+(`--keep-binaries --keep-data`) leaves running servers alone.
 
 ### Shell completions
 

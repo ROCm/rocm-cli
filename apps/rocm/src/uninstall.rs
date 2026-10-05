@@ -13,10 +13,12 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
+use crate::uninstall_gate::{
+    ManagedServiceStopReport, stop_managed_services_before_uninstall, uninstall_removal_gate,
+};
 use crate::{
-    ManagedServiceStopReport, UninstallOptions, UninstallPlan, build_uninstall_plan,
-    confirm_uninstall, plan_removes_recovery_tooling, remove_path, render_uninstall_plan,
-    stop_managed_services_before_uninstall, uninstall_removal_gate,
+    UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
+    plan_removes_recovery_tooling, remove_path, render_uninstall_plan,
 };
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
@@ -106,10 +108,10 @@ mod tests {
     use anyhow::bail;
 
     use super::stop_managed_services_then_remove;
-    use crate::{
-        FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy, UninstallPlan,
-        UninstallPlanEntry,
+    use crate::uninstall_gate::{
+        FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy,
     };
+    use crate::{UninstallPlan, UninstallPlanEntry};
 
     /// A port nothing can ever be serving on.
     ///
@@ -440,7 +442,7 @@ mod tests {
         record.write().expect("failed to write the service record");
 
         stop_managed_services_then_remove(&plan, || {
-            crate::stop_managed_services_before_uninstall(&paths)
+            crate::uninstall_gate::stop_managed_services_before_uninstall(&paths)
         })
         .expect("a server that stops must not block uninstall");
 
