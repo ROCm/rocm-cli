@@ -6573,8 +6573,11 @@ impl RocmCliConfig {
             {
                 bail!(
                     "legacy config {} sets daemon.{key} = {secs}, which is not a valid tick \
-                     ({error}); set it to a finite, non-negative number of seconds to migrate the file",
-                    legacy.display()
+                     ({error}); set it to a finite, non-negative number of seconds to migrate the file. \
+                     Migration only runs while {} does not exist, so fix it before any rocm command \
+                     saves settings, or re-enter the dashboard settings by hand afterwards",
+                    legacy.display(),
+                    paths.config_path().display()
                 );
             }
         }
@@ -13426,7 +13429,9 @@ last_installed_runtime_id = "therock-release"
     /// A tick that is not a valid duration is refused, naming the key, and the
     /// refusal writes nothing: no `config.json` appears and the TOML is
     /// unchanged, so the startup notice "skipped legacy dashboard config
-    /// migration" is true and fixing the value lets the next run migrate.
+    /// migration" is true and fixing the value lets the next run migrate —
+    /// provided nothing has created `config.json` meanwhile, which the refusal
+    /// itself warns about.
     #[test]
     fn migrate_legacy_dashboard_toml_refuses_an_invalid_tick_and_writes_nothing() -> Result<()> {
         for (value, rendered) in [
@@ -13457,6 +13462,39 @@ last_installed_runtime_id = "therock-release"
             assert!(!config_written, "{value}: config.json was written");
             assert_eq!(legacy_after, text, "{value}: the legacy TOML was modified");
         }
+
+        // The refusal warns that the window closes once config.json exists —
+        // and it does: after any save, the still-broken legacy file is skipped
+        // without a word, and fixing it later no longer migrates it either.
+        let (root, paths) = temp_app_paths("migrate-dash-window-closes");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = nan\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+            .expect_err("an invalid tick must not migrate");
+        let message = format!("{error:#}");
+        RocmCliConfig::default().save(&paths)?;
+        let while_broken = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = 1.0\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let once_fixed = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let theme = RocmCliConfig::load(&paths)?.dashboard.tui.theme;
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            message.contains(&format!(
+                "Migration only runs while {} does not exist",
+                paths.config_path().display()
+            )) && message.contains("re-enter the dashboard settings by hand"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(while_broken, None);
+        assert_eq!(once_fixed, None);
+        assert_ne!(theme, "nord", "the legacy theme was migrated after all");
 
         // Zero is a valid duration for rocm-dash too, so it still migrates.
         let (root, paths) = temp_app_paths("migrate-dash-zero-tick");
