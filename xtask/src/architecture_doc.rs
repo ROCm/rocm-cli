@@ -1640,6 +1640,40 @@ Intro. `rocm-dash-tui`'s old thing was split into `agent/mod.rs`.
     }
 
     #[test]
+    fn extract_path_citations_does_not_leak_an_owner_past_a_sentence_boundary_hidden_by_a_discarded_hyphenated_span()
+     {
+        // Regression: a bare hyphenated word that turns out not to be a
+        // possessive owner (no `'s` follows it) is discarded as prose, and
+        // that discard clears `inter_text` the same way the type-name aside
+        // does — but, like the aside, must NOT reset `sentence_boundary_seen`
+        // (see the comment on that clear). If it did, a sentence boundary
+        // seen just before the discarded hyphenated word would be forgotten,
+        // and the next scoped citation would wrongly keep narrowing to the
+        // earlier sentence's owner instead of falling back to the heading's
+        // full list.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `a.rs` is done. See `rocm-dash-daemon` docs and `b.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        let citation = citations
+            .iter()
+            .find(|c| c.text == "b.rs")
+            .expect("expected a b.rs citation");
+        assert_eq!(
+            citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-daemon".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "b.rs must not inherit rocm-dash-tui through the discarded \
+             rocm-dash-daemon span, since a sentence already ended before it"
+        );
+    }
+
+    #[test]
     fn an_abbreviation_does_not_end_a_possessive_clause() {
         // Regression: `e.g.`/`i.e.`/`etc.` each end in a period followed by
         // whitespace, matching the plain "sentence boundary" pattern even
