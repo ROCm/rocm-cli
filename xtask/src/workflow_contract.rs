@@ -955,7 +955,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// The whole step whose `- name:` line is `lines[at]`: that line and every
-    /// line below it until one is indented no deeper than it.
+    /// line below it until a non-blank one is indented no deeper than it.
+    ///
+    /// Blank lines never end a block, however they are indented — a `run: |`
+    /// body can contain them — so the blank separator before the next step is
+    /// carried along too. `run_block` drops it again.
     fn step_block(lines: &[&str], at: usize) -> String {
         let step_indent = indent_of(lines[at]);
         let mut step = format!("{}\n", lines[at]);
@@ -970,16 +974,48 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Trailing blank lines are dropped: they are the separator `step_block`
+    /// lets through, not part of the script, and keeping them would make two
+    /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
         let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
         let run_indent = indent_of(lines[run_at]);
+        let mut body: Vec<&str> = lines[run_at + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+            .copied()
+            .collect();
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        Some(body)
+    }
+
+    /// Where two line-oriented texts first differ, phrased for a failure
+    /// message; `None` when they are equal.
+    fn first_line_difference(a: &str, b: &str) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let a_lines: Vec<&str> = a.lines().collect();
+        let b_lines: Vec<&str> = b.lines().collect();
         Some(
-            lines[run_at + 1..]
-                .iter()
-                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
-                .copied()
-                .collect(),
+            match a_lines.iter().zip(&b_lines).position(|(x, y)| x != y) {
+                Some(i) => format!(
+                    "first difference at body line {}:\n  {:?}\n  {:?}",
+                    i + 1,
+                    a_lines[i],
+                    b_lines[i]
+                ),
+                None if a_lines.len() != b_lines.len() => format!(
+                    "every shared line matches, but one body has {} lines and the other {}",
+                    a_lines.len(),
+                    b_lines.len()
+                ),
+                None => "the bodies differ only in line endings".to_string(),
+            },
         )
     }
 
@@ -1100,6 +1136,8 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// dedenting. They are kept in sync by hand until the lanes are deduplicated
     /// (#294), and presence and order say nothing about what each copy runs —
     /// the same drift `apu_preflight_twins_do_not_drift` once caught too late.
+    /// Equality pins only that the two lanes agree, not that either body still
+    /// does the work: both gutted to an identical `echo hi` would pass.
     #[test]
     fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
         const STEP: &str = "      - name: Settle the clock before anything times a scenario";
@@ -1143,11 +1181,13 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
             unreachable!("exactly two lanes are checked above");
         };
-        assert_eq!(
-            first_body, second_body,
-            "the clock-settling step has drifted between {first} and {second} — the \
-             copies are kept in sync by hand until the lanes are deduplicated (#294)"
-        );
+        if let Some(difference) = first_line_difference(first_body, second_body) {
+            panic!(
+                "the clock-settling step has drifted between {first} and {second} — the \
+                 copies are kept in sync by hand until the lanes are deduplicated (#294); \
+                 {difference}"
+            );
+        }
     }
 
     #[test]
