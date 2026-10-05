@@ -15,7 +15,13 @@ ROCm CLI ships as a single prebuilt binary. Platform support:
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](../getting-started.md#interactive-interfaces)). vLLM
-serving is Linux or WSL2 only (see `docs/vllm.md`).
+serving is Linux or WSL2 only (see
+[vLLM adapter](../engines/vllm.md)).
+
+```{include} ../../../README.md
+:start-after: "only (see [docs/vllm.md](docs/vllm.md))."
+:end-before: "> [!IMPORTANT]"
+```
 
 ```{include} ../../../README.md
 :start-after: "## Installation"

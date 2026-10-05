@@ -1085,6 +1085,53 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         );
     }
 
+    /// Both WSL2 lanes must settle the clock before anything times a scenario.
+    ///
+    /// cucumber measures scenario durations by subtracting `SystemTime` stamps, so
+    /// a guest whose clock steps backwards mid-run kills the suite (#455 makes that
+    /// survivable; this keeps the durations real). The hazard is invisible: the
+    /// step's absence breaks nothing that any other test here observes, and on the
+    /// nightly lane job-level `continue-on-error: true` means a regression would
+    /// not even turn the run red.
+    ///
+    /// Matching the step NAME rather than a substring of the job is deliberate —
+    /// the surrounding comments discuss the clock at length, so a bare substring
+    /// would stay satisfied by prose after the step itself was deleted, which is
+    /// exactly the failure this pins.
+    #[test]
+    fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
+        const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        for (workflow, job, suite_step) in [
+            (
+                "e2e-selfhosted.yml",
+                "  e2e-wsl:",
+                "      - name: Run E2E tests on Strix Halo WSL2",
+            ),
+            (
+                "nightly.yml",
+                "  e2e-wsl-nightly:",
+                "      - name: Run E2E tests on Strix Halo WSL2 (incl. nightly-only)",
+            ),
+        ] {
+            let job_block = nested_block(&read_workflow(workflow), job);
+            let settle = job_block.find(STEP).unwrap_or_else(|| {
+                panic!(
+                    "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
+                     steps its clock backwards mid-run and cucumber subtracts SystemTime \
+                     stamps, so the durations that lane reports become fiction"
+                )
+            });
+            let suite = job_block
+                .find(suite_step)
+                .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
+            assert!(
+                settle < suite,
+                "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
+                 correction has to land while nothing is being timed"
+            );
+        }
+    }
+
     #[test]
     fn apu_preflight_twins_do_not_drift() {
         // The nightly lanes are copies of their per-PR twins. One was left on the
@@ -1676,19 +1723,33 @@ esac
                 )
             })
             .filter(|name| !name.starts_with("e2e-consolidated-report"))
+            .map(|name| crate::e2e_report::without_channel_matrix_segment(&name))
             .collect();
         declared_artifacts.sort();
         declared_artifacts.dedup();
         let mut documented_artifacts = backticked_list_between(
             &docs,
             "The lane artifacts are named canonically (",
-            ") in every workflow",
+            ") in `ci.yml` and",
         );
         // Sorted, not deduplicated: a name listed twice must still fail.
         documented_artifacts.sort();
         assert_eq!(
             documented_artifacts, declared_artifacts,
             "the canonical artifact list must enumerate every uploaded report artifact exactly once"
+        );
+
+        // ponytail: brittle literal-text match, not a YAML matrix parse — it exists only
+        // to keep this hardcoded literal in sync with `consolidated::parse_descriptor`'s
+        // hardcoded "release"/"nightly" suffixes. If nightly.yml's channel matrix ever
+        // changes, update both it and `parse_descriptor` together.
+        let nightly = std::fs::read_to_string(repo_root().join(".github/workflows/nightly.yml"))
+            .expect("read nightly.yml");
+        assert!(
+            nightly.contains("channel: [release, nightly]"),
+            "nightly.yml's channel matrix must declare exactly the channel values \
+             `consolidated::parse_descriptor` strips as artifact-name suffixes; if this \
+             literal ever changes, `parse_descriptor` must change with it"
         );
 
         let platform_input = nested_block(
@@ -2139,5 +2200,393 @@ permissions:
     fn job_mapping_extractor_rejects_malformed_non_comment_rows() {
         let block = "    env:\n      VALID: one\n      MALFORMED\n    steps:\n";
         let _ = job_mapping(block, "env");
+    }
+
+    /// The E2E-owned roots declared in `scripts/reclaim-gpu.sh`.
+    ///
+    /// Parsed rather than duplicated: a copy here would drift the same way the
+    /// PowerShell mirrors can, which is the defect this test exists to prevent.
+    fn reclaim_script_roots() -> Vec<String> {
+        let p = repo_root().join("scripts/reclaim-gpu.sh");
+        let text = std::fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+            .replace("\r\n", "\n");
+        parse_e2e_roots(&text, &p.display().to_string())
+    }
+
+    /// The parsing half of [`reclaim_script_roots`], split out so every spelling
+    /// it must cope with is a standing test rather than a mutation somebody has
+    /// to remember to run by hand against the tracked script.
+    ///
+    /// That split is the point. The previous version of this parser could only
+    /// be exercised by editing `scripts/reclaim-gpu.sh` itself, so three legal
+    /// spellings of the same array reached review unnoticed — and the failure
+    /// they produced blamed the PowerShell mirrors, advising a maintainer to
+    /// delete a real root from Windows.
+    fn parse_e2e_roots(text: &str, origin: &str) -> Vec<String> {
+        // Comments come off BEFORE anything is located — before the array's
+        // START as well as its closing `)`. Two distinct mis-parses, one fix:
+        //
+        //   - an inline comment containing a `)` — `'/tmp/rocm-e2e'  # see docs
+        //     (section 3)` — closes the array at that paren, so every root below
+        //     it vanishes from the parse. The test then fails in the
+        //     mirror->script direction naming a root that is plainly still in
+        //     the script, and a maintainer who follows that message deletes a
+        //     real root from both PowerShell mirrors. Measured: that spelling
+        //     made this test demand the deletion of `e2e-prewarm`, the root this
+        //     whole change exists to add.
+        //   - a comment ABOVE the array that merely quotes the literal text
+        //     `E2E_ROOTS=(` would otherwise anchor the search inside that
+        //     sentence rather than at the declaration. This file already quotes
+        //     bash array syntax in prose (`E2E_ROOTS+=(` appears in a comment),
+        //     so that is a spelling a future header edit can reach.
+        let decommented = text
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with('#') {
+                    ""
+                } else {
+                    strip_comment(l)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = decommented
+            .split_once("E2E_ROOTS=(")
+            .unwrap_or_else(|| panic!("{origin} must declare E2E_ROOTS=("))
+            .1
+            .split_once(')')
+            .unwrap_or_else(|| panic!("{origin} has an unterminated E2E_ROOTS array"))
+            .0;
+
+        // Every non-empty line inside the array must parse into exactly one
+        // root. This is the load-bearing half: without it an unrecognised
+        // spelling is silently DROPPED, and a dropped root is indistinguishable
+        // from mirror drift downstream — so the failure arrives as a confident
+        // wrong remedy rather than as "this parser did not understand the
+        // array". A checker that converts a formatting change into advice that
+        // removes Windows coverage is worse than no checker on that axis.
+        //
+        // Deliberately NOT tokenised on whitespace: that would silently split a
+        // future root containing a space into two bogus roots, which is this
+        // same defect class in a new place.
+        let mut roots: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Both bash quotings are accepted. A quoted root can never contain
+            // its OWN delimiter, so requiring that is what rejects the whole
+            // array folded onto one line — `E2E_ROOTS=('a' 'b')` parses as the
+            // single bogus root `a' 'b` under a prefix/suffix strip alone, and
+            // then fails script->mirror naming a root nobody wrote.
+            let parsed = ['\'', '"'].into_iter().find_map(|q| {
+                line.strip_prefix(q)
+                    .and_then(|l| l.strip_suffix(q))
+                    .filter(|inner| !inner.contains(q))
+            });
+            let Some(root) = parsed else {
+                // `strip_comment` splits on a literal " #" with no quote
+                // awareness, so a root whose VALUE contains that sequence —
+                // `'/tmp/e2e root #2'`, which bash itself accepts, since `#` is
+                // inert inside single quotes — arrives here already truncated
+                // and unterminated. Named in the message rather than fixed:
+                // this lands as a loud false failure, never a silent miss, and
+                // making the shared helper quote-aware for a spelling no root
+                // uses would be untested code on a path every other caller
+                // depends on.
+                panic!(
+                    "{origin}: E2E_ROOTS line `{line}` is not a single quoted root. This \
+                     test's parser did not understand it — that is NOT drift against the \
+                     PowerShell mirrors, so do not remove anything from them. Restore one \
+                     quoted root per line, or teach this parser the new spelling. Note the \
+                     line is shown after comment-stripping, so a root whose value contains \
+                     \" #\" appears truncated here (EAI-8751)"
+                );
+            };
+            roots.push(root.to_owned());
+        }
+        assert!(
+            !roots.is_empty(),
+            "{origin} declared no E2E_ROOTS entries — the parser or the array shape changed"
+        );
+        roots
+    }
+
+    /// An `E2E_ROOTS` array spelled the way the script spells it today, with
+    /// enough surrounding file to exercise the comment handling.
+    #[cfg(test)]
+    fn roots_fixture(body: &str) -> String {
+        format!(
+            "#!/usr/bin/env bash\n# a header comment\nset -euo pipefail\nE2E_ROOTS=(\n{body})\nENGINE_MARKERS=(\n  'llama-server'\n)\n"
+        )
+    }
+
+    /// Every spelling this parser must cope with, as a test rather than as a
+    /// mutation of the tracked script. Each of these was found by editing
+    /// `scripts/reclaim-gpu.sh` by hand during review; none of them could fail
+    /// CI afterwards, which is the gap this closes.
+    #[test]
+    fn e2e_roots_parser_accepts_legal_respellings_of_the_same_array() {
+        let canonical = vec!["/tmp/rocm-e2e".to_owned(), "e2e-shared".to_owned()];
+
+        // As written today.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // An inline comment containing a `)`. This closed the array early and
+        // made the test demand the deletion of a real root from Windows.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'  # see docs (section 3)\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // Double quotes, and a mix of both. Silently dropped the entry before.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  \"/tmp/rocm-e2e\"\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A full-line comment inside the array, indented or at column 0, and a
+        // blank line. All three are skipped rather than failing completeness.
+        assert_eq!(
+            parse_e2e_roots(
+                &roots_fixture("  '/tmp/rocm-e2e'\n# flush left\n  # indented\n\n  'e2e-shared'\n"),
+                "fixture"
+            ),
+            canonical
+        );
+
+        // A comment ABOVE the array quoting the declaration's own text. The
+        // anchor must find the declaration, not the sentence about it.
+        let text = "#!/usr/bin/env bash\n# see how E2E_ROOTS=( is declared below\nE2E_ROOTS=(\n  '/tmp/rocm-e2e'\n  'e2e-shared'\n)\n";
+        assert_eq!(parse_e2e_roots(text, "fixture"), canonical);
+
+        // A root containing a space is preserved whole, which is what rules out
+        // tokenising the body on whitespace.
+        assert_eq!(
+            parse_e2e_roots(&roots_fixture("  '/tmp/rocm e2e'\n"), "fixture"),
+            vec!["/tmp/rocm e2e".to_owned()]
+        );
+    }
+
+    /// The other half: spellings the parser must REJECT, and reject as its own
+    /// misunderstanding rather than as drift against the PowerShell mirrors —
+    /// because the mirror-drift message tells a maintainer to delete a root
+    /// from Windows, and following it on a false positive is what makes this
+    /// worse than having no checker.
+    #[test]
+    fn e2e_roots_parser_rejects_unparsable_lines_without_blaming_the_mirrors() {
+        for (label, body) in [
+            (
+                "array folded onto one line",
+                "  '/tmp/rocm-e2e' 'e2e-shared'\n",
+            ),
+            ("unquoted entry", "  e2e-shared\n"),
+            ("unterminated quote", "  '/tmp/rocm-e2e\n"),
+            // `strip_comment` is not quote-aware, so this arrives truncated.
+            // Rejected loudly, never silently dropped.
+            ("value containing \" #\"", "  '/tmp/rocm e2e #2'\n"),
+        ] {
+            let text = roots_fixture(body);
+            let err = std::panic::catch_unwind(|| parse_e2e_roots(&text, "fixture"))
+                .expect_err(&format!("{label} must not parse"));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("");
+            assert!(
+                msg.contains("did not understand"),
+                "{label} failed with the wrong message — it must not read as mirror drift: {msg}"
+            );
+            assert!(
+                msg.contains("do not remove anything from them"),
+                "{label} must tell the reader NOT to edit the mirrors: {msg}"
+            );
+        }
+    }
+
+    /// An empty array is a parser/shape change, not zero roots — and must not
+    /// sail through as "no roots declared, nothing to compare".
+    #[test]
+    fn e2e_roots_parser_rejects_an_empty_array() {
+        let err = std::panic::catch_unwind(|| parse_e2e_roots(&roots_fixture(""), "fixture"))
+            .expect_err("an empty E2E_ROOTS must not parse as success");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(msg.contains("declared no E2E_ROOTS entries"), "got: {msg}");
+    }
+
+    /// The root half of each PowerShell reclaim: the FIRST `-match '…'`
+    /// alternation on the `Where-Object` line.
+    ///
+    /// This cannot tell the reclaim's own matcher from any other
+    /// `Where-Object … -match` line. Each of these workflows has exactly one
+    /// today, so every alternation returned IS a reclaim matcher; add a second,
+    /// unrelated one and the caller's assertions would be applied to it too.
+    ///
+    /// Extracted rather than substring-matched against the whole file for the
+    /// reason this module's header gives: every root ALSO appears in these
+    /// workflows as an env var and in prose, so a `text.contains(root)` check
+    /// passes even when the alternation itself has lost that root. Confirmed by
+    /// mutation — deleting `e2e-prewarm` from the alternation left the
+    /// whole-file form of this test green.
+    fn powershell_reclaim_root_alternations(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| l.contains("Where-Object") && l.contains("-match"))
+            .map(|l| {
+                let after = l.split_once("-match").expect("filtered on -match").1;
+                let body = after
+                    .split_once('\'')
+                    .unwrap_or_else(|| panic!("no opening quote in matcher line: {l}"))
+                    .1;
+                body.split_once('\'')
+                    .unwrap_or_else(|| panic!("unterminated matcher literal: {l}"))
+                    .0
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// EAI-8751: native Windows has no bash, so the two PowerShell reclaim steps
+    /// restate the bash rule instead of sharing it. Nothing else in CI compares
+    /// the two, so a root added to the script — as `e2e-prewarm` was, to fix a
+    /// leak that held the card for 16 consecutive jobs — can silently miss the
+    /// Windows lanes.
+    ///
+    /// Only the ROOT half is pinned. The engine half is knowingly divergent on
+    /// Windows (EAI-8815), so asserting parity there would fail on a difference
+    /// that is recorded rather than accidental.
+    #[test]
+    fn reclaim_roots_are_mirrored_in_the_powershell_reclaims() {
+        let roots = reclaim_script_roots();
+        for workflow in ["e2e-selfhosted.yml", "nightly.yml"] {
+            let text = read_workflow(workflow);
+            assert!(
+                text.contains("Get-CimInstance Win32_Process"),
+                "{workflow} must keep a PowerShell reclaim step (EAI-8751)"
+            );
+            let alternations = powershell_reclaim_root_alternations(&text);
+            assert!(
+                !alternations.is_empty(),
+                "{workflow} has a PowerShell reclaim but no parsable `-match` alternation \
+                 — the step's shape changed and this guard went blind (EAI-8751)"
+            );
+            // The scenario root is compared on its portable segment, and that
+            // asymmetry is deliberate rather than cosmetic.
+            //
+            // bash anchors it to an absolute path (`/tmp/rocm-e2e`, plus a
+            // TMPDIR-derived form appended at run time) because its roots are
+            // matched as unanchored substrings of a whole command line: the
+            // bare segment would also match an ARGUMENT naming it, and kill a
+            // hand-run serve the script promises to spare. The PowerShell
+            // mirrors carry the bare segment and so do have that exposure —
+            // pre-existing, and not something this test can fix by failing.
+            //
+            // That anchoring gap is NOT what EAI-8815 tracks. That ticket is
+            // scoped to the engine-marker divergence (`rocm.exe daemon`
+            // unmatched; `__engine-serve-http` sitting in the root alternation
+            // rather than the engine one), and closing it would leave the
+            // substring exposure untouched. The anchoring gap is untracked on
+            // the Windows side — said plainly here, so that closing EAI-8815
+            // cannot be misread as closing this as well.
+            //
+            // What it still pins is the part that matters here: that every root
+            // the script knows about is named in both mirrors, so a root added
+            // to one side cannot silently miss the Windows lanes.
+            //
+            // CAVEAT: the `/tmp/` prefix below is the only absolute prefix this
+            // mapping knows. A future root anchored under any other one — say
+            // `/var/tmp/rocm-e2e` — would be compared to the mirrors verbatim,
+            // fail against their bare segment, and need this line edited by
+            // hand: the manual sync this test exists to remove, reappearing one
+            // level up. Named rather than generalised, because there is exactly
+            // one anchored root today and a speculative prefix list would be
+            // untested code.
+            let expected: Vec<&str> = roots
+                .iter()
+                .map(|r| r.strip_prefix("/tmp/").unwrap_or(r))
+                .collect();
+
+            // Pinned at one, which is what lets the exemption below be tracked
+            // per WORKFLOW rather than per alternation. Requiring EVERY
+            // alternation to name the exempted marker would fail spuriously the
+            // moment an unrelated `Where-Object … -match` line appeared — the
+            // case `powershell_reclaim_root_alternations` warns it cannot
+            // distinguish — but relaxing it to "some alternation" would stop
+            // catching a second matcher that copies every root and drops the
+            // marker. While there is exactly one, the two readings coincide;
+            // this assertion is what keeps that true, and fails loudly with
+            // something to decide if a second one is ever added.
+            assert_eq!(
+                alternations.len(),
+                1,
+                "{workflow} now has {} PowerShell reclaim matcher alternations; the \
+                 divergence-exemption check below assumes exactly one, and must be \
+                 re-read per alternation before this count changes (EAI-8751)",
+                alternations.len()
+            );
+            let mut divergence_seen = false;
+            for alternation in &alternations {
+                let present: Vec<&str> = alternation.split('|').collect();
+
+                // Script -> mirror: a root added to the script must reach Windows.
+                for needle in &expected {
+                    assert!(
+                        present.contains(needle),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` does not name \
+                         the E2E root `{needle}` declared in scripts/reclaim-gpu.sh (EAI-8751)"
+                    );
+                }
+
+                // Mirror -> script: and a root REMOVED from the script must not be
+                // left behind here. Without this direction the guard is one-way,
+                // which is how the lists drifted in the first place.
+                for token in &present {
+                    // Known divergence, not drift: `__engine-serve-http` is an
+                    // ENGINE marker that sits in this root alternation, so on
+                    // Windows it over-matches. Tracked in EAI-8815 — when that is
+                    // fixed, delete this arm and the assertion below will hold.
+                    if *token == "__engine-serve-http" {
+                        divergence_seen = true;
+                        continue;
+                    }
+                    assert!(
+                        expected.contains(token),
+                        "{workflow}'s PowerShell reclaim matcher `{alternation}` names `{token}`, \
+                         which is not an E2E root in scripts/reclaim-gpu.sh — remove it here too, \
+                         or add it there (EAI-8751)"
+                    );
+                }
+            }
+
+            // An exemption nothing asserts is an exemption that rots: once
+            // EAI-8815 moves `__engine-serve-http` out of the root alternation,
+            // the arm above stops firing and would sit here forever as dead
+            // code exempting nothing. Fail instead, so the fix is told to
+            // finish the job.
+            assert!(
+                divergence_seen,
+                "no PowerShell reclaim matcher in {workflow} names `__engine-serve-http`, so the \
+                 EAI-8815 divergence looks fixed — delete the exemption arm in this test, which \
+                 is now dead code (EAI-8751)"
+            );
+        }
     }
 }
