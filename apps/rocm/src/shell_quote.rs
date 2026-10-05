@@ -36,9 +36,11 @@
 //!
 //! Platform note: this is POSIX quoting on every platform. The previous
 //! double-quoted form happened to paste cleanly into `cmd.exe`; `'…'` does not.
-//! It is correct in bash, WSL and PowerShell, and on Windows it is still
-//! unambiguous to a *reader* — which is what an approval gate needs — where the
-//! old form was ambiguous everywhere.
+//! It is correct in any POSIX shell (bash, sh, WSL). PowerShell also reads
+//! `'…'` literally, but escapes an embedded `'` as `''` rather than `'\''`, so a
+//! value containing a single quote is the one case that does not paste cleanly
+//! there. On Windows it is still unambiguous to a *reader* — which is what an
+//! approval gate needs — where the old form was ambiguous everywhere.
 
 /// Quote `value` so a POSIX shell reads it back as exactly one word equal to
 /// `value`.
