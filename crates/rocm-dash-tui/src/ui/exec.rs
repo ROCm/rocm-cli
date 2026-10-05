@@ -42,7 +42,10 @@ pub fn exe_label(cmd: &str) -> &str {
 /// a second copy: `xtask`'s crate-edge contract forbids
 /// `rocm-dash-tui -> rocm-core` (`xtask/src/crate_edges.rs`), and `apps/rocm`
 /// is the crate that owns `rocm-core`, so there is nowhere both can reach
-/// without breaking that.
+/// without breaking that. Nothing ties the two copies to each other: each is
+/// held to the same contract by its own tests, including a real `sh` reading
+/// the rendered line back, so either one *breaking* fails its own suite. They
+/// may still differ harmlessly in which values they leave bare.
 pub fn quote_display_arg(value: &str) -> String {
     let inert = |character: char| {
         character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
@@ -137,7 +140,7 @@ mod tests {
     /// by `the_generator_reaches_the_shapes_that_break_quoting`.
     const HOSTILE_ALPHABET: &[char] = &[
         ' ', '\t', '"', '\'', '\\', '$', '`', ';', '|', '&', '*', '?', '(', ')', '<', '>', '#',
-        '-', '/', 'a', '1',
+        '=', '-', '~', '!', 'a', '1', '/', 'é',
     ];
 
     fn hostile_arg() -> impl Strategy<Value = String> {
@@ -186,6 +189,67 @@ mod tests {
             let once = quote_display_arg(&arg);
             let twice = quote_display_arg(&once);
             prop_assert_eq!(shlex::split(&twice), Some(vec![once]));
+        }
+    }
+
+    /// Hand `line` to a real `sh` as the operands of `printf` and return the
+    /// words it received.
+    ///
+    /// `shlex` only splits words and removes quotes; it performs no expansion,
+    /// so it hands back `$HOME`, `~`, `?` and `` `id` `` unchanged and calls a
+    /// line that leaves them bare a clean round-trip. Only a shell can say
+    /// whether a value would be expanded on paste. The shell runs in a
+    /// directory holding files `a` and `1`, so an unquoted `?` or `*` really
+    /// globs, and with `HOME` pointed at a sentinel, so an unquoted `~` really
+    /// changes.
+    #[cfg(unix)]
+    fn words_a_real_shell_reads(line: &str) -> Vec<String> {
+        static GLOB_BAIT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let dir = GLOB_BAIT.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "rocm-dash-quote-glob-bait-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create glob-bait dir");
+            for name in ["a", "1"] {
+                std::fs::write(dir.join(name), b"").expect("create glob-bait file");
+            }
+            dir
+        });
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {line}"))
+            .current_dir(dir)
+            .env("HOME", "/nonexistent/rocm-dash-quote-home")
+            .output()
+            .expect("sh should run");
+        let mut words: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .map(str::to_owned)
+            .collect();
+        // `printf` terminates every word, so the final piece is always empty.
+        words.pop();
+        words
+    }
+
+    #[cfg(unix)]
+    proptest! {
+        /// The preview round-trip with a real shell as the reader rather than a
+        /// word-splitter: no argument is split, expanded, globbed or executed.
+        /// This is the check that fails if a character with meaning to a shell
+        /// (`$`, `~`, `?`, `*`, a backtick) is ever treated as inert.
+        #[test]
+        fn a_real_shell_reads_the_preview_back_as_the_argv(argv in hostile_argv()) {
+            let preview = format!("{} {}", exe_label("/usr/local/bin/rocm"), display_args(&argv));
+            let expected: Vec<String> = std::iter::once("rocm".to_owned())
+                .chain(argv.into_iter())
+                .collect();
+            prop_assert_eq!(
+                words_a_real_shell_reads(&preview),
+                expected,
+                "preview = {:?}",
+                preview
+            );
         }
     }
 
