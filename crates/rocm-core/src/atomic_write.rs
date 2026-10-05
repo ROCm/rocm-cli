@@ -3,13 +3,22 @@
 // SPDX-License-Identifier: MIT
 
 //! Write a file so a reader sees either the old contents or the new ones,
-//! never a truncated mix.
+//! never a truncated mix — including after a crash or power loss.
 //!
-//! The bytes go to a uniquely named sibling first and are then renamed over
-//! the destination (`ReplaceFileW` on Windows, where a plain rename cannot
-//! replace an existing file). A failure while writing — a full disk is the
-//! common one, reported through [`crate::disk_space::map_write_error`] — leaves
-//! the destination untouched and removes the temporary file.
+//! The bytes go to a uniquely named sibling first, are flushed to disk, and
+//! the sibling is then renamed over the destination (`ReplaceFileW` on
+//! Windows, where a plain rename cannot replace an existing file). On Unix the
+//! directory is flushed after the rename too, so the new name survives a
+//! crash. A failure while writing — a full disk is the common one, reported
+//! through [`crate::disk_space::map_write_error`] — leaves the destination
+//! untouched and removes the temporary file.
+//!
+//! Replacing a file this way must not quietly change what the user set up:
+//!
+//! - on Unix the new file keeps the old one's permission bits (on Windows,
+//!   `ReplaceFileW` keeps the replaced file's attributes and ACL itself);
+//! - a destination that is a symbolic link — a dotfiles checkout linking
+//!   `config.json`, say — has its *target* replaced, so the link survives.
 //!
 //! Use this for any file whose loss costs the user something: a plain
 //! `fs::write` truncates first, so an interrupted write leaves an empty or
@@ -25,6 +34,10 @@ use anyhow::{Context, Result, bail};
 use crate::{disk_space, unix_time_millis};
 
 const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
+
+/// How many symbolic links [`write_file_atomically`] follows before giving up,
+/// matching the usual kernel limit (`MAXSYMLINKS` on Linux).
+const MAX_SYMLINK_HOPS: usize = 40;
 
 /// A unique temp path next to `path`.
 ///
@@ -94,9 +107,38 @@ where
     P: FnOnce(),
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
-    let tmp = stage_file_for_atomic_publish_with(path, bytes, suffix_for_attempt)?;
+    let path = resolve_symlink_target(path)?;
+    let tmp = stage_file_for_atomic_publish_with(&path, bytes, suffix_for_attempt)?;
     before_publish();
-    publish_staged_file_with(&tmp, path, publish)
+    publish_staged_file_with(&tmp, &path, publish)
+}
+
+/// The file a write to `path` should replace: `path` itself, or — when it is
+/// a symbolic link — the file the link chain ends at, so the link survives.
+/// A dangling link resolves to where its target would be, which is created.
+fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = fs::read_link(&current)
+                    .with_context(|| format!("failed to read link {}", current.display()))?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .context("link path has no parent directory")?
+                        .join(target)
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    bail!(
+        "too many levels of symbolic links resolving {}",
+        path.display()
+    )
 }
 
 /// Write `bytes` to a fresh temp sibling of `path` and return it, for a caller
@@ -146,13 +188,41 @@ where
         );
     };
 
-    if let Err(error) = file.write_all(bytes) {
+    // Flushed before it can be published: a rename that reaches the disk
+    // before the data would leave an empty file under the real name after a
+    // crash. A full disk can surface here rather than in `write_all`.
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(&tmp);
         return Err(disk_space::map_write_error(error, &tmp));
     }
     drop(file);
+    if let Err(error) = keep_existing_permissions(path, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
     Ok(tmp)
+}
+
+/// Give the staged file the permission bits of the file it will replace, so a
+/// `0600` file is not republished as `0644`. Nothing to keep for a new file.
+#[cfg(unix)]
+fn keep_existing_permissions(path: &Path, tmp: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(existing) => fs::set_permissions(tmp, existing.permissions())
+            .with_context(|| format!("failed to copy the permissions of {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to read the permissions of {}", path.display())),
+    }
+}
+
+/// `ReplaceFileW` already carries the replaced file's attributes and ACL over
+/// to the replacement, so there is nothing to copy by hand.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn keep_existing_permissions(_path: &Path, _tmp: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Publish a staged file over `path`, removing the temp file if publishing
@@ -165,8 +235,30 @@ where
         .inspect_err(|_| {
             let _ = fs::remove_file(tmp);
         })
-        .with_context(|| format!("failed to publish {}", path.display()))
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    sync_parent_dir(path);
+    Ok(())
 }
+
+/// Flush the directory entry the rename just changed, so the new name — not
+/// the old file, or no file — is what a crash leaves behind.
+///
+/// Best-effort: the file is already published, and some filesystems refuse to
+/// sync a directory. Reporting failure here would claim the write failed when
+/// it did not.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Windows has no directory handle to flush; `ReplaceFileW` and `MoveFileExW`
+/// update the directory through the journaling filesystem.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
 
 /// Rename `tmp` over `path`, replacing an existing file.
 #[cfg(not(windows))]
@@ -209,6 +301,8 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
     // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
     // remain alive for the duration of the synchronous Windows API call. The
     // optional backup, exclude, and reserved pointers are intentionally null.
+    // No flags: REPLACEFILE_WRITE_THROUGH is documented as unsupported, and the
+    // replacement's data was already flushed with `sync_all` when it was staged.
     let replaced = unsafe {
         ReplaceFileW(
             path_wide.as_ptr(),
@@ -462,5 +556,93 @@ mod tests {
             );
         }
         assert!(!destination_exists);
+    }
+
+    /// Replacing a file keeps its permission bits: a `0600` file must not be
+    /// republished as `0644`, and an unusual mode survives as set.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_keeps_the_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch_dir("permissions");
+        let destination = root.join("config.json");
+        for mode in [0o600, 0o640, 0o604] {
+            fs::write(&destination, b"old").unwrap();
+            fs::set_permissions(&destination, fs::Permissions::from_mode(mode)).unwrap();
+
+            write_file_atomically(&destination, b"new").unwrap();
+
+            let after = fs::metadata(&destination).unwrap().permissions().mode() & 0o777;
+            assert_eq!(after, mode, "mode {mode:o} was not kept");
+            assert_eq!(fs::read(&destination).unwrap(), b"new");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A destination that is a symbolic link keeps being one: the file it
+    /// points at is replaced, through a chain of links and a relative link
+    /// alike, and nothing is left next to either end.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_replaces_a_symlinks_target_and_keeps_the_link() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = scratch_dir("symlink");
+        let dotfiles = root.join("dotfiles");
+        let config_dir = root.join("config");
+        fs::create_dir_all(&dotfiles).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+        let target = dotfiles.join("rocm-config.json");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        // config/config.json -> config/hop.json -> ../dotfiles/rocm-config.json
+        let hop = config_dir.join("hop.json");
+        symlink(Path::new("../dotfiles/rocm-config.json"), &hop).unwrap();
+        let link = config_dir.join("config.json");
+        symlink(&hop, &link).unwrap();
+
+        write_file_atomically(&link, b"new").unwrap();
+
+        let link_kept = fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let hop_kept = fs::symlink_metadata(&hop).unwrap().file_type().is_symlink();
+        let through_link = fs::read(&link).unwrap();
+        let target_contents = fs::read(&target).unwrap();
+        let target_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        let config_names = names_in(&config_dir);
+        let dotfiles_names = names_in(&dotfiles);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(link_kept && hop_kept, "a link was replaced by a file");
+        assert_eq!(through_link, b"new");
+        assert_eq!(target_contents, b"new");
+        assert_eq!(target_mode, 0o600);
+        assert_eq!(config_names, ["config.json", "hop.json"]);
+        assert_eq!(dotfiles_names, ["rocm-config.json"]);
+    }
+
+    /// A link loop is an error, not a hang, and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_atomically_refuses_a_symlink_loop() {
+        use std::os::unix::fs::symlink;
+
+        let root = scratch_dir("symlink-loop");
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        symlink(&b, &a).unwrap();
+        symlink(&a, &b).unwrap();
+
+        let error = write_file_atomically(&a, b"x").expect_err("a link loop must fail");
+        let names = names_in(&root);
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            format!("{error:#}").contains("too many levels of symbolic links"),
+            "{error:#}"
+        );
+        assert_eq!(names, ["a.json", "b.json"]);
     }
 }
