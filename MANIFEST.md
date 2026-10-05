@@ -353,6 +353,7 @@ repository.
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.106 | MIT OR Apache-2.0 |
 | proc-macro2-diagnostics | 0.10.1 | MIT/Apache-2.0 |
+| proptest | 1.11.0 | MIT OR Apache-2.0 |
 | pulldown-cmark | 0.12.2 | MIT |
 | quick-xml | 0.39.4 | MIT |
 | quinn | 0.11.11 | MIT OR Apache-2.0 |
@@ -367,6 +368,7 @@ repository.
 | rand_chacha | 0.9.0 | MIT OR Apache-2.0 |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |
 | rand_core | 0.9.5 | MIT OR Apache-2.0 |
+| rand_xorshift | 0.4.0 | MIT OR Apache-2.0 |
 | ratatui | 0.30.2 | MIT |
 | ratatui-core | 0.1.2 | MIT |
 | ratatui-crossterm | 0.1.2 | MIT |
@@ -513,6 +515,7 @@ repository.
 | typenum | 1.20.1 | MIT OR Apache-2.0 |
 | ucd-trie | 0.1.7 | MIT OR Apache-2.0 |
 | uds_windows | 1.2.1 | MIT |
+| unarray | 0.1.4 | MIT OR Apache-2.0 |
 | unicase | 2.9.0 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | unicode-linebreak | 0.1.5 | Apache-2.0 |
