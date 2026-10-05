@@ -38,8 +38,7 @@ use clap::FromArgMatches;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 
 use super::{
-    Cli, cli_command, command_invocation_error, parse_freeform_invocation,
-    should_treat_as_freeform,
+    Cli, cli_command, command_invocation_error, parse_freeform_invocation, should_treat_as_freeform,
 };
 
 /// One advised invocation and where it came from.
@@ -961,9 +960,9 @@ pub(crate) struct Finding {
 }
 
 fn is_excluded(item: &Advice) -> bool {
-    NOT_INVOCATIONS.iter().any(|(file, raw, _)| {
-        *raw == item.raw && item.source.starts_with(&format!("{file}:"))
-    })
+    NOT_INVOCATIONS
+        .iter()
+        .any(|(file, raw, _)| *raw == item.raw && item.source.starts_with(&format!("{file}:")))
 }
 
 pub(crate) fn findings(advice: &[Advice]) -> Vec<Finding> {
@@ -1073,8 +1072,14 @@ fn checker_rejects_what_users_would_hit() {
         verdict(&argv("rocm install sdk --family <FAMILY>")),
         Verdict::Parses
     );
-    assert_eq!(verdict(&argv("rocm serve --engine")), Verdict::IncompleteReference);
-    assert_eq!(verdict(&argv("rocmd run --automations-enabled")), Verdict::Parses);
+    assert_eq!(
+        verdict(&argv("rocm serve --engine")),
+        Verdict::IncompleteReference
+    );
+    assert_eq!(
+        verdict(&argv("rocmd run --automations-enabled")),
+        Verdict::Parses
+    );
     assert!(is_deliberate_natural_language(&argv(
         "rocm --yes \"start a local model\""
     )));
