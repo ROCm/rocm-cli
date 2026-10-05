@@ -71,6 +71,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// By absolute path, not `"sh"`: a `PATH` lookup at spawn time races any
+    /// test in this binary that narrows the process-global `PATH`, and the
+    /// failure would be about the harness, not about quoting.
+    #[cfg(unix)]
+    const TEST_SH: &str = "/bin/sh";
+
     #[test]
     fn exe_label_strips_unix_and_windows_paths() {
         assert_eq!(exe_label("/usr/local/bin/rocm"), "rocm");
@@ -214,7 +220,7 @@ mod tests {
             }
             dir
         });
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new(TEST_SH)
             .arg("-c")
             .arg(format!("printf '%s\\0' {line}"))
             .current_dir(dir)

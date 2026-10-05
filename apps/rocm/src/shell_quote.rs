@@ -116,6 +116,17 @@ pub(crate) mod hostile {
     }
 }
 
+/// The shell the real-`sh` tests ask, by absolute path.
+///
+/// Not `"sh"`: that is looked up on `PATH` at spawn time, and other tests in
+/// this binary narrow the process-global `PATH` to a stub directory while they
+/// run (`render_update_json` in `therock.rs`, for one). Under `cargo test`,
+/// which runs every test in one process, a spawn landing in that window fails
+/// with "No such file or directory" — a failure about the test harness, not
+/// about quoting. `/bin/sh` is where POSIX systems put it.
+#[cfg(all(test, unix))]
+pub(crate) const TEST_SH: &str = "/bin/sh";
+
 #[cfg(test)]
 mod tests {
     use super::hostile::{arg as hostile_arg, argv as hostile_argv};
@@ -192,7 +203,7 @@ mod tests {
             }
             dir
         });
-        let output = std::process::Command::new("sh")
+        let output = std::process::Command::new(TEST_SH)
             .arg("-c")
             .arg(format!("printf '%s\\0' {line}"))
             .current_dir(dir)
@@ -321,7 +332,7 @@ mod tests {
             "qwen2.5-7b-instruct",
             "/mnt/my folder",
         ] {
-            let output = std::process::Command::new("sh")
+            let output = std::process::Command::new(TEST_SH)
                 .arg("-c")
                 .arg(format!("printf %s {}", shell_quote(value)))
                 .output()
