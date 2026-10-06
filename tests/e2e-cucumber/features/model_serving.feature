@@ -298,8 +298,11 @@ Feature: Model serving
 
   # A managed engine is spawned detached, so if it dies on the way up there is no
   # terminal for it to report to: the child's own service log is the only account
-  # of why. Without a startup check the CLI reported such a launch as a success
-  # and left the user waiting on a server that would never come up. The engine is
+  # of why. The startup check that catches such a death used to exist only on
+  # Unix; on Windows the launch was reported as a success and left the user
+  # waiting on a server that would never come up. This pins the Windows check
+  # alongside the Unix one, plus the retirement of the failed launch's record
+  # that both now share. The engine is
   # scripted to die at startup in test builds (`rocm/e2e-test-hooks`), which also
   # waives the no-GPU pre-flight and engine preparation so this reaches a real
   # spawn without GPU hardware or a runtime download — the death itself is real,
