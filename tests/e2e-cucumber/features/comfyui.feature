@@ -106,6 +106,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     When the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
+    And the reinstall lists the code it replaced
 
   @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
   Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
@@ -158,3 +159,17 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then ComfyUI status no longer reports an interrupted reinstall
     And ComfyUI's code is the newer release
     And the user's own files are untouched
+
+  # A newer release can start shipping a name the user already uses at the top
+  # of `source/`. The install recorded what its release shipped, so the
+  # reinstall knows that entry is the user's: it renames it and says where,
+  # instead of deleting it as old code.
+  @id:comfyui-reinstall-sets-aside-colliding-entry @requires-os:linux
+  Scenario: comfyui-10 - Reinstalling ComfyUI renames a folder of the user's that the new release also ships
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the user keeps an app folder there that the installed ComfyUI release did not ship
+    And a newer ComfyUI release that ships an app folder is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And the reinstall reports the user's app folder as set aside and it still holds the user's files
+    And ComfyUI's code is the newer release

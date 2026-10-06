@@ -398,18 +398,24 @@ That command copies `config.json` and `runtimes/` into a temporary
 ComfyUI in that temporary app state, then removes the temporary state after it
 stops the process it started.
 
-`rocm comfyui install --reinstall` deletes only the top-level entries a
-ComfyUI release shipped in its `source/` folder, keeps the preserved ones
-(`models/`, `user/`, `output/`, `input/`, `custom_nodes/`, `datasets/`,
-`extra_model_paths.yaml`) and leaves anything else in place. It leaves the
-install untouched when the new source cannot be obtained, `start` refuses a
-folder whose swap was interrupted, and a re-run finishes it. The swap is
+`rocm comfyui install --reinstall` deletes only the top-level entries the
+installed ComfyUI release shipped in its `source/` folder (as recorded when it
+was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
+`input/`, `custom_nodes/`, `datasets/`, `extra_model_paths.yaml`), renames an
+entry of the user's that the new release starts shipping (`set aside:`) and
+leaves anything else in place. An install from before that record replaces
+the entries named like the new release's code and lists them (`replaced:`).
+It leaves the install untouched when the new source cannot be obtained,
+`start` refuses a folder whose swap was interrupted or stopped by a file it
+could not remove, and the command it names finishes it. The swap is
 unit-tested directly, without a fake Python. Most of those tests also run on
 Windows: stopping the swap before each filesystem change in turn and checking
-that a re-run converges, unknown entries and `datasets/` left in place, and
-`main.py` removed first and moved in last. The symlink tests (symlinked model
-folders, links inside them, loops, dangling links, the copy fallback) and the
-inode/ctime test are Unix-only:
+that a re-run converges (with and without an entry to set aside), unknown
+entries and `datasets/` left in place, an unreadable or malformed release
+record, and `main.py` removed first and moved in last. The symlink tests
+(symlinked model folders, links inside them, loops, dangling links, the copy
+fallback), the inode/ctime test and the entry that cannot be removed are
+Unix-only; the retry while another program holds a file is Windows-only:
 
 ```bash
 cargo test -p rocm --bin rocm comfyui::source_swap
@@ -417,16 +423,20 @@ cargo test -p rocm --bin rocm comfyui::tests
 ```
 
 The second filter covers the install-level tests: `reinstall_*`,
-`install_after_an_interrupted_reinstall_finishes_it` and
-`start_refuses_an_interrupted_reinstall_until_install_finishes_it`.
+`install_after_an_interrupted_reinstall_finishes_it`,
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
+`a_reinstall_that_cannot_remove_an_entry_names_the_install_that_finishes_it`
+and `chat_status_answer_names_the_install_that_finishes_an_interrupted_reinstall`.
 
-The e2e scenarios `comfyui-05` to `comfyui-09` (`comfyui.feature`, Linux, no
-GPU) cover the same through the built binary: what is kept and left in place,
-a failed download, the dry run, a reinstall refused while ComfyUI runs, and
-`start` refusing a half-replaced folder until the command it names is run:
+The e2e scenarios `comfyui-05` to `comfyui-10` (`comfyui.feature`, Linux, no
+GPU) cover the same through the built binary: what is kept, replaced and left
+in place, a failed download, the dry run, a reinstall refused while ComfyUI
+runs, `start` refusing a half-replaced folder until the command it names is
+run, and a folder of the user's set aside when the new release ships one of
+the same name:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-0[56789]"
+cargo xtask e2e -- -n "comfyui-(0[5-9]|10)"
 ```
 
 To reuse an already installed ComfyUI app without reinstalling dependencies:

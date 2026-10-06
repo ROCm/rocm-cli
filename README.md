@@ -729,24 +729,38 @@ has no effect.
 folder that contains the `models path:` it prints):
 
 - **Deleted and replaced:** the top-level files and folders the installed
-  ComfyUI release shipped (for an install made before rocm-cli recorded them,
-  the ones the new release ships), plus `__pycache__/`.
+  ComfyUI release shipped, which rocm-cli records when it installs one, plus
+  `__pycache__/`.
 - **Kept:** `models/` (the folder `models-path` prints), `user/` (saved
   workflows and settings), `output/`, `input/`, `custom_nodes/`, `datasets/`
   and `extra_model_paths.yaml`. They are never moved, copied or deleted. Files
   a new release adds inside them are added alongside yours; where both have a
   file of the same name, yours is kept, and a folder you replaced with a
   symlink is not written into.
-- **Left in place:** anything else no ComfyUI release shipped, such as `.git/`,
-  a `venv/`, `styles.csv`, logs or `temp/`. The reinstall lists these.
+- **Set aside:** an entry of yours whose name the new release starts shipping
+  (an `app/` of yours when a release adds `app/`, say) is renamed to
+  `<name>.rocm-cli-kept-<time>` rather than deleted. The reinstall lists it
+  under `set aside:` with its new name.
+- **Left in place:** anything else, such as `.git/`, a `venv/`, `styles.csv`,
+  logs or `temp/`. The reinstall lists these.
+
+An install made before rocm-cli recorded what its release shipped has nothing
+to tell release code from your entries. There, the entries with the names the
+new release ships are deleted and replaced instead, including one of yours of
+the same name, and the reinstall lists them under `replaced:`; everything else
+is left in place.
 
 The new copy is unpacked before the existing one is touched, so a failed
-download leaves the install as it was. `--reinstall --dry-run` lists what
-would be replaced and kept. A reinstall is refused while the ComfyUI that
-`rocm comfyui start` launched is running; stop it with `rocm comfyui stop`
-first. If a reinstall is interrupted part-way, `start` refuses to launch the
-half-replaced folder and names the `rocm comfyui install` command that
-finishes it.
+download leaves the install as it was. `--reinstall --dry-run` names the folder
+whose code would be replaced, which of the kept folders it holds, and whether
+an entry of yours named like the new release's code would be set aside or
+replaced; which entries those are is only known once the new release is
+downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
+launched is running; stop it with `rocm comfyui stop` first. If a reinstall is
+interrupted part-way, or stops because a file it must delete is in use, `start`
+refuses to launch the half-replaced folder, and `start`, `status` and the
+failed reinstall name the `rocm comfyui install --runtime-id <key>` command
+that finishes it.
 
 ### Automations
 

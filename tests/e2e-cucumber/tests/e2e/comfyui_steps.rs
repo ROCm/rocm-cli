@@ -672,7 +672,7 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
 /// Serves a small release archive. Its `requirements.txt` names only the
 /// torch stack, so the dependency install is filtered down to nothing and
 /// skipped — this scenario is about the swap, not the `uv` step.
-async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str) {
+async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str, extra: &[(&str, &str)]) {
     let build_dir = root(world).join("comfyui-fixture").join("release-build");
     let release = build_dir.join("ComfyUI-master");
     for (relative, contents) in [
@@ -682,7 +682,10 @@ async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str) {
         ("output/_output_images_will_be_put_here", ""),
         ("custom_nodes/websocket_image_save.py", "new release"),
         ("comfy/added_upstream.py", "new release"),
-    ] {
+    ]
+    .iter()
+    .chain(extra)
+    {
         write_fixture(&release.join(relative), contents);
     }
     let contents = build_gzip_tarball(&build_dir, "comfyui-release.tar.gz", "ComfyUI-master").await;
@@ -708,14 +711,14 @@ async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str) {
 
 #[given("a newer ComfyUI release is available to download")]
 async fn newer_comfyui_release(world: &mut E2eWorld) {
-    serve_comfyui_release(world, "archive/comfyui-release.tar.gz").await;
+    serve_comfyui_release(world, "archive/comfyui-release.tar.gz", &[]).await;
 }
 
 #[given("the ComfyUI release download fails")]
 async fn comfyui_release_download_fails(world: &mut E2eWorld) {
     // The server is up but the archive is not at this path: a 404, which the
     // downloader does not retry.
-    serve_comfyui_release(world, "archive/missing.tar.gz").await;
+    serve_comfyui_release(world, "archive/missing.tar.gz", &[]).await;
 }
 
 #[when("the user reinstalls ComfyUI")]
@@ -772,6 +775,86 @@ async fn comfyui_code_is_newer_release(world: &mut E2eWorld) {
         leftovers.is_empty(),
         "the previous code must be removed once the swap is done: {leftovers:?}"
     );
+}
+
+/// What the release the planted install came from shipped, as rocm-cli
+/// records it when it installs one.
+const INSTALLED_RELEASE_RECORD: &str = "comfy\nmain.py\nrequirements.txt";
+
+#[given("the user keeps an app folder there that the installed ComfyUI release did not ship")]
+async fn user_app_folder(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    write_fixture(&source.join("app/settings.json"), "user app");
+    write_fixture(
+        &source.join(".rocm-cli-release-entries"),
+        INSTALLED_RELEASE_RECORD,
+    );
+}
+
+#[given("a newer ComfyUI release that ships an app folder is available to download")]
+async fn newer_comfyui_release_with_app(world: &mut E2eWorld) {
+    serve_comfyui_release(
+        world,
+        "archive/comfyui-release.tar.gz",
+        &[("app/__init__.py", "new release")],
+    )
+    .await;
+}
+
+#[then(
+    "the reinstall reports the user's app folder as set aside and it still holds the user's files"
+)]
+async fn reinstall_reports_set_aside(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let renamed = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  set aside: app (now "))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("the reinstall must say where the user's app/ went:\n{stdout}"));
+    assert!(
+        renamed.starts_with("app.rocm-cli-kept-") && !renamed.contains('/'),
+        "unexpected set-aside name {renamed:?}"
+    );
+    // The claim and the state it describes, asserted together.
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join(renamed).join("settings.json"))
+            .ok()
+            .as_deref(),
+        Some("user app"),
+        "the folder the reinstall names must hold the user's files"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("app/__init__.py"))
+            .ok()
+            .as_deref(),
+        Some("new release"),
+        "the new release's app/ is installed under its own name"
+    );
+    assert!(
+        !source.join("app/settings.json").exists(),
+        "the release's app/ must not be mixed with the user's"
+    );
+}
+
+#[then("the reinstall lists the code it replaced")]
+async fn reinstall_lists_replaced(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    // The planted install predates the release record, so the entries named
+    // like the new release's code are replaced, and listed.
+    assert!(
+        stdout.contains("  replaced: comfy, main.py, requirements.txt\n"),
+        "the reinstall must list what it replaced, got:\n{stdout}"
+    );
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("requirements.txt"))
+            .ok()
+            .as_deref(),
+        Some("torch==2.4.0\n"),
+        "requirements.txt is listed as replaced, so it is the new release's"
+    );
+    assert!(!source.join("comfy/dropped_upstream.py").exists());
 }
 
 #[then("the reinstall fails")]
