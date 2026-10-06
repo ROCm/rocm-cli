@@ -234,13 +234,18 @@ impl AppState {
                 } else {
                     let real = saw_apply;
                     let mut argv: Vec<&str> = vec!["uninstall"];
-                    // The `--keep-*` flags pass through, in both modes: a
+                    // The `--keep-*` flags (and `--force-dev-binaries`) pass
+                    // through, in both modes: a
                     // refused uninstall's advice is to re-run with one, and a
                     // dashboard that dropped it could never follow that advice.
                     argv.extend(flags.iter().copied().filter(|flag| {
                         matches!(
                             *flag,
-                            "--keep-binaries" | "--keep-config" | "--keep-data" | "--keep-cache"
+                            "--keep-binaries"
+                                | "--keep-config"
+                                | "--keep-data"
+                                | "--keep-cache"
+                                | "--force-dev-binaries"
                         )
                     }));
                     if !real {

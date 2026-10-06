@@ -38,13 +38,34 @@ fn link_target(world: &E2eWorld) -> PathBuf {
     root(world).join("relocated-cache")
 }
 
+/// The scenario's config folder (absent until a step or the CLI creates it).
+fn config_dir(world: &E2eWorld) -> PathBuf {
+    config_dir_at(root(world))
+}
+
+fn config_dir_at(root: &Path) -> PathBuf {
+    root.join("rocm").join("config")
+}
+
 /// The scenario's own HOME.
 fn home(world: &E2eWorld) -> PathBuf {
-    root(world).join("home")
+    // One level down, so the scenario's config/data/cache folders are not
+    // siblings of HOME (which `rocm uninstall` treats as other users' homes).
+    root(world).join("users").join("home")
 }
 
 fn user_file_in_home(world: &E2eWorld) -> PathBuf {
     home(world).join("Documents").join(USER_FILE)
+}
+
+/// The scenario's config folder, as ROCm CLI would have left it: created by
+/// the CLI and so carrying the marker that lets `rocm uninstall` remove a
+/// folder outside the home folder.
+fn plant_config_rocm_cli_created(world: &E2eWorld) {
+    let config = config_dir(world);
+    std::fs::create_dir_all(&config).expect("failed to create config");
+    std::fs::write(config.join(".rocm-cli-root"), "created by ROCm CLI\n")
+        .expect("failed to mark config");
 }
 
 fn set_env(world: &mut E2eWorld, key: &'static str, value: impl Into<OsString>) {
@@ -63,6 +84,13 @@ fn run_uninstall(world: &mut E2eWorld, flags: &[&str]) {
 
 /// [`run_uninstall`] with the working directory set, for a relative setting.
 fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
+    let mut args = vec!["uninstall", "--keep-binaries"];
+    args.extend_from_slice(flags);
+    run_command_in(world, &args, cwd);
+}
+
+/// Run `rocm <args>` confined to the scenario root (see [`run_uninstall`]).
+fn run_command_in(world: &mut E2eWorld, args: &[&str], cwd: Option<&Path>) {
     let root = root(world).to_path_buf();
     let home = home(world);
     std::fs::create_dir_all(&home).expect("failed to create isolated HOME");
@@ -70,8 +98,15 @@ fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
         ("HOME", home.clone().into_os_string()),
         // Windows reads the home folder from USERPROFILE first.
         ("USERPROFILE", home.into_os_string()),
-        // Not the world's cache folder: on CI that can be a cache shared across
-        // scenarios, and an uninstall removes the cache folder.
+        // Not the world's folders: the harness pre-creates those (so they are
+        // not ones ROCm CLI created, and carry no marker), and on CI its cache
+        // can be shared across scenarios, while an uninstall removes the cache
+        // folder. These start absent, as on a machine before ROCm CLI ran.
+        ("ROCM_CLI_CONFIG_DIR", config_dir_at(&root).into_os_string()),
+        (
+            "ROCM_CLI_DATA_DIR",
+            root.join("rocm").join("data").into_os_string(),
+        ),
         (
             "ROCM_CLI_CACHE_DIR",
             root.join("cache-local").into_os_string(),
@@ -84,11 +119,9 @@ fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
         env.push((key, value.clone()));
     }
 
-    let mut args = vec!["uninstall", "--keep-binaries"];
-    args.extend_from_slice(flags);
     let binary = crate::rocm_binary();
     let mut cmd = std::process::Command::new(&binary);
-    cmd.args(&args);
+    cmd.args(args);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -101,7 +134,7 @@ fn run_uninstall_in(world: &mut E2eWorld, flags: &[&str], cwd: Option<&Path>) {
         .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
     let rc = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    crate::record_command(world.current_scenario.as_deref(), &args, rc, &stdout);
+    crate::record_command(world.current_scenario.as_deref(), args, rc, &stdout);
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(String::from_utf8_lossy(&output.stderr).to_string());
     world.cli_rc = Some(rc);
@@ -139,7 +172,7 @@ async fn data_is_home(world: &mut E2eWorld) {
     std::fs::write(&file, "user data").expect("failed to write user file");
     // The config folder exists too, so a refusal that still removed the other
     // roots would show.
-    std::fs::create_dir_all(root(world).join("config")).expect("failed to create config");
+    plant_config_rocm_cli_created(world);
     let home = home(world);
     set_env(world, "ROCM_CLI_DATA_DIR", home);
 }
@@ -298,7 +331,7 @@ async fn refused_because(world: &mut E2eWorld, folder: String, why: String) {
 async fn refusal_advises_keep_data(world: &mut E2eWorld) {
     let message = format!("{}{}", output(world), stderr(world));
     assert!(
-        message.contains("e-run with --keep-data to remove everything else and leave it in place."),
+        message.contains("e-run with --keep-data to leave it in place."),
         "the refusal must say how to proceed:\n{message}"
     );
 }
@@ -328,7 +361,7 @@ async fn home_files_intact(world: &mut E2eWorld) {
 
 #[then("the config folder is still there")]
 async fn config_intact(world: &mut E2eWorld) {
-    let config = root(world).join("config");
+    let config = config_dir(world);
     assert!(
         config.is_dir(),
         "a refused uninstall removed {}:\n{}",
@@ -339,7 +372,7 @@ async fn config_intact(world: &mut E2eWorld) {
 
 #[then("the config folder is gone")]
 async fn config_gone(world: &mut E2eWorld) {
-    let config = root(world).join("config");
+    let config = config_dir(world);
     assert!(
         !config.exists(),
         "the uninstall did not remove {}:\n{}",
@@ -408,7 +441,7 @@ async fn data_is_dot_in_home(world: &mut E2eWorld) {
     let file = user_file_in_home(world);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("failed to create home");
     std::fs::write(&file, "user data").expect("failed to write user file");
-    std::fs::create_dir_all(root(world).join("config")).expect("failed to create config");
+    plant_config_rocm_cli_created(world);
     set_env(world, "ROCM_CLI_DATA_DIR", ".");
 }
 
@@ -441,4 +474,124 @@ async fn refusal_says_resolves_to_home(world: &mut E2eWorld, folder: String) {
         "expected `{line}` in the review:\n{stdout}"
     );
     assert!(rc(world) != 0, "a refused uninstall must fail:\n{stdout}");
+}
+
+// ── The marker, and the dashboard's path ───────────────────────────
+
+/// A data folder outside the home folder that ROCm CLI did not mark.
+fn unmarked_data(world: &E2eWorld) -> PathBuf {
+    root(world).join("srv").join("rocm")
+}
+
+#[given("the data folder is a folder outside the home folder without ROCm CLI's marker")]
+async fn data_is_unmarked(world: &mut E2eWorld) {
+    let data = unmarked_data(world);
+    std::fs::create_dir_all(&data).expect("failed to create data folder");
+    std::fs::write(data.join("keep.txt"), "user data").expect("failed to write");
+    set_env(world, "ROCM_CLI_DATA_DIR", data);
+}
+
+#[then("the refusal advises creating the marker if the folder is ROCm CLI's")]
+async fn advises_marker(world: &mut E2eWorld) {
+    let stdout = output(world);
+    let marker = unmarked_data(world)
+        .canonicalize()
+        .expect("data exists")
+        .join(".rocm-cli-root");
+    assert!(rc(world) != 0, "a refused preview must fail:\n{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "if this folder belongs to ROCm CLI, create {}",
+            marker.display()
+        )),
+        "the refusal must name the marker to create:\n{stdout}"
+    );
+}
+
+#[when("the user creates the marker the refusal named")]
+async fn create_advised_marker(world: &mut E2eWorld) {
+    // The marker the refusal names for the data folder, taken from the
+    // message itself, so this follows the advice the user reads.
+    let stdout = output(world).to_owned();
+    let data = unmarked_data(world).canonicalize().expect("data exists");
+    let marker = stdout
+        .split("create ")
+        .skip(1)
+        .filter_map(|rest| rest.split(", or").next())
+        .map(str::trim)
+        .find(|path| Path::new(path).parent() == Some(data.as_path()))
+        .unwrap_or_else(|| panic!("no marker path for {} in:\n{stdout}", data.display()))
+        .to_owned();
+    std::fs::write(&marker, "").unwrap_or_else(|e| panic!("cannot create {marker}: {e}"));
+}
+
+#[then("the preview plans to remove the data folder")]
+async fn preview_plans_data(world: &mut E2eWorld) {
+    let stdout = output(world);
+    assert!(
+        rc(world) == 0,
+        "the preview must succeed now:\n{stdout}\n{}",
+        stderr(world)
+    );
+    let line = format!("  - data: {}", unmarked_data(world).display());
+    assert!(
+        stdout.lines().any(|l| l == line),
+        "expected `{line}` in the review:\n{stdout}"
+    );
+    assert!(!stdout.contains("Refused"), "{stdout}");
+}
+
+#[given("setup.therock_venv points at the user's home folder, which holds their files")]
+async fn venv_is_home(world: &mut E2eWorld) {
+    let file = user_file_in_home(world);
+    std::fs::create_dir_all(file.parent().expect("parent")).expect("failed to create home");
+    std::fs::write(&file, "user data").expect("failed to write user file");
+    let config = config_dir(world);
+    plant_config_rocm_cli_created(world);
+    std::fs::write(
+        config.join("config.json"),
+        serde_json::to_vec(&serde_json::json!({ "setup": { "therock_venv": home(world) } }))
+            .expect("json"),
+    )
+    .expect("failed to write config.json");
+    // An empty value is "unset" to ROCm CLI, so discovery falls back to
+    // `setup.therock_venv` as it would for a user who never set the variable.
+    set_env(world, "ROCM_CLI_DATA_DIR", "");
+}
+
+#[when("the dashboard runs an approved uninstall")]
+async fn dashboard_uninstall(world: &mut E2eWorld) {
+    // The same entry point the dashboard and the assistant use for an approved
+    // `rocm_command`: it starts a `rocm` child with the folders pinned.
+    let arguments = r#"{"args":["uninstall","--keep-binaries","--keep-cache"]}"#;
+    run_command_in(
+        world,
+        &[
+            "mcp-call",
+            "rocm_command",
+            "--allow-mutation",
+            "--arguments-json",
+            arguments,
+        ],
+        None,
+    );
+}
+
+#[then(
+    "the refusal names setup.therock_venv and advises --keep-data, not a variable the user never set"
+)]
+async fn dashboard_refusal_names_venv(world: &mut E2eWorld) {
+    let stdout = output(world);
+    assert!(
+        stdout.contains("set by setup.therock_venv"),
+        "the refusal must name setup.therock_venv:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Re-run with --keep-data to leave it in place."),
+        "the refusal must advise --keep-data:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("ROCM_CLI_DATA_DIR"),
+        "the refusal named a variable the user never set:\n{stdout}"
+    );
 }

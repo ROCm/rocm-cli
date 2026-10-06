@@ -78,7 +78,37 @@ pub(crate) fn apply_uninstall_plan(plan: &UninstallPlan) -> Result<()> {
         bail!(error);
     }
     for entry in &plan.actions {
-        remove_path(&entry.path)
+        // Check, then act on what was checked. The review judged where a real
+        // directory resolved to when it was made; a parent swapped for a
+        // symlink while the prompt was open would point the same spelling at
+        // a different folder. Resolve again, refuse if it moved, and remove
+        // the resolved location rather than re-walking the spelling.
+        let target = match &entry.resolved {
+            None => entry.path.clone(),
+            Some(planned) => match rocm_core::canonicalize_for_compare(&entry.path) {
+                Ok(now) if &now == planned => now,
+                Ok(now) => bail!(
+                    "stopped before removing the {} folder {}: it now resolves to {}, not {} as \
+                     the review showed. Anything reported as removed above is gone; nothing \
+                     after it was touched. Check the folder and run the uninstall again.",
+                    entry.kind,
+                    entry.path.display(),
+                    now.display(),
+                    planned.display()
+                ),
+                // Already gone, e.g. inside a folder removed earlier in the plan.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to resolve {} before removing it",
+                            entry.path.display()
+                        )
+                    });
+                }
+            },
+        };
+        remove_path(&target)
             .with_context(|| format!("failed to remove {}", entry.path.display()))?;
         println!("removed {} {}", entry.kind, entry.path.display());
     }

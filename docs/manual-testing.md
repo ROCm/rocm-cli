@@ -383,8 +383,8 @@ only with `--dry-run` where the step says so. Each block starts a fresh sandbox:
 
 ```bash
 export SANDBOX=$(mktemp -d)
-export HOME=$SANDBOX/home ROCM_CLI_CONFIG_DIR=$SANDBOX/config \
-  ROCM_CLI_DATA_DIR=$SANDBOX/data ROCM_CLI_CACHE_DIR=$SANDBOX/cache
+export HOME=$SANDBOX/users/home ROCM_CLI_CONFIG_DIR=$SANDBOX/users/home/.rocm/config \
+  ROCM_CLI_DATA_DIR=$SANDBOX/users/home/.rocm/data ROCM_CLI_CACHE_DIR=$SANDBOX/users/home/.rocm/cache
 mkdir -p "$HOME/Documents" "$ROCM_CLI_CONFIG_DIR"
 echo keep > "$HOME/Documents/keep.txt"
 ```
@@ -426,7 +426,25 @@ Expected result: exit non-zero with `the data folder . is your home folder
 
 In the dashboard, `/uninstall --keep-data` previews and `/uninstall --apply
 --keep-data` runs the uninstall with the data folder left out; with
-`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal.
+`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal. With
+`setup.therock_venv` pointing at the home folder instead (and
+`ROCM_CLI_DATA_DIR` unset), the dashboard's refusal names
+`setup.therock_venv`, not `ROCM_CLI_DATA_DIR`, and leads with `--keep-data`.
+
+A folder outside the home folder needs ROCm CLI's marker:
+
+```bash
+mkdir -p "$SANDBOX/srv/rocm"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+touch "$SANDBOX/srv/rocm/.rocm-cli-root"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the first preview refuses the data folder as `outside your
+home folder and not marked as ROCm CLI's own` and names the
+`.rocm-cli-root` file to create; after creating it, the second lists the data
+folder for removal. A system folder such as `/usr/local` is refused in a dry
+run whatever is in it.
 
 A shared cache inside the cache folder is named as deleted (dry run):
 

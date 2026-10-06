@@ -451,6 +451,11 @@ fn seed_isolated_dirs(world: &mut E2eWorld) {
     let cache = root.join("smoke-cache");
     for dir in [&config, &data, &cache] {
         std::fs::create_dir_all(dir).expect("failed to create isolated smoke dir");
+        // These stand for folders ROCm CLI created, so they carry the marker
+        // it writes into the roots it creates: they sit outside the home
+        // folder, where `rocm uninstall` removes only a marked folder.
+        std::fs::write(dir.join(".rocm-cli-root"), "created by ROCm CLI\n")
+            .expect("failed to mark isolated smoke dir");
     }
     let st = state_mut(world);
     st.smoke_config = Some(config);

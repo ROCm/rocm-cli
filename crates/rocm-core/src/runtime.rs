@@ -658,8 +658,9 @@ fn strip_managed_runtime_leaf(path: &Path) -> Option<PathBuf> {
 
 /// Why a folder must never be recursively deleted by ROCm CLI.
 ///
-/// Returned by [`runtime_protected_location`] so a caller that refuses can say
-/// *why* from the same value it decided on, instead of restating the rule.
+/// Returned by [`runtime_protected_location`] and [`uninstall_root_verdict`]
+/// so a caller that refuses can say *why* from the same value it decided on,
+/// instead of restating the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedLocation {
     /// The top of a filesystem: `/`, or a drive root such as `C:\` on Windows.
@@ -668,8 +669,16 @@ pub enum ProtectedLocation {
     Home,
     /// A folder that contains the user's home folder, such as `/home`.
     ContainsHome,
-    /// A system location such as `/usr` or `C:\Windows`, or a folder inside one.
+    /// A system location (`/usr`, `/etc`, `C:\Windows`, ...). For runtime
+    /// folders this includes anything inside one of
+    /// [`runtime_protected_location`]'s roots; for `rocm uninstall`'s roots it
+    /// includes anything inside one of [`uninstall_root_verdict`]'s.
     System,
+    /// Another user's home folder, or something inside one.
+    OtherUsersHome,
+    /// A real directory outside the user's home that does not carry the
+    /// [`ROCM_CLI_ROOT_MARKER`] ROCm CLI writes into the roots it creates.
+    NotMarked,
     /// A real directory whose location could not be resolved, so it cannot be
     /// shown not to be one of the above. Only `rocm uninstall` reports this.
     Unresolvable,
@@ -684,8 +693,86 @@ impl ProtectedLocation {
             Self::Home => "your home folder",
             Self::ContainsHome => "a folder that contains your home folder",
             Self::System => "a protected system location",
+            Self::OtherUsersHome => "another user's home folder",
+            Self::NotMarked => "outside your home folder and not marked as ROCm CLI's own",
             Self::Unresolvable => "a folder whose real location could not be resolved",
         }
+    }
+}
+
+/// The file ROCm CLI writes into the roots it creates.
+///
+/// Config, data and cache roots (and an SDK `--prefix`) get it, so
+/// `rocm uninstall` can tell a folder of its own outside the home folder from
+/// one that merely happens to be named.
+pub const ROCM_CLI_ROOT_MARKER: &str = ".rocm-cli-root";
+
+/// Create `dir` (and its parents), marking it if this call created it.
+///
+/// The mark is [`ROCM_CLI_ROOT_MARKER`]. A folder that already existed is not
+/// marked: ROCm CLI did not create it, so it has no claim to remove it.
+pub fn create_marked_root(dir: &Path) -> Result<()> {
+    let existed = dir.exists();
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    if !existed {
+        mark_root(dir)?;
+    }
+    Ok(())
+}
+
+/// Write [`ROCM_CLI_ROOT_MARKER`] into `dir`.
+pub fn mark_root(dir: &Path) -> Result<()> {
+    let marker = dir.join(ROCM_CLI_ROOT_MARKER);
+    std::fs::write(
+        &marker,
+        "This folder was created by ROCm CLI; `rocm uninstall` may remove it.\n",
+    )
+    .with_context(|| format!("failed to write {}", marker.display()))
+}
+
+/// The roots that did not exist when a `rocm` process started.
+///
+/// Whichever of them the process goes on to create gets
+/// [`ROCM_CLI_ROOT_MARKER`] — not only through [`create_marked_root`], but also
+/// when logging, a download, or any other `create_dir_all` under a root is what
+/// brought it into being.
+///
+/// [`RootClaims::mark_created`] marks them; it also runs on drop, so the
+/// marker is written however the process's main function returns.
+#[derive(Debug)]
+pub struct RootClaims {
+    absent: Vec<PathBuf>,
+}
+
+impl RootClaims {
+    /// Note which of `roots` do not exist yet.
+    #[must_use]
+    pub fn record<'a>(roots: impl IntoIterator<Item = &'a Path>) -> Self {
+        Self {
+            absent: roots
+                .into_iter()
+                .filter(|root| std::fs::symlink_metadata(root).is_err())
+                .map(Path::to_path_buf)
+                .collect(),
+        }
+    }
+
+    /// Mark every recorded root that is now a real directory without the
+    /// marker. Best effort: a root that cannot be marked stays unmarked, which
+    /// only means `rocm uninstall` will ask for the marker before removing it.
+    pub fn mark_created(&self) {
+        for root in &self.absent {
+            let is_dir = std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_dir());
+            if is_dir && !root.join(ROCM_CLI_ROOT_MARKER).exists() {
+                let _ = mark_root(root);
+            }
+        }
+    }
+}
+
+impl Drop for RootClaims {
+    fn drop(&mut self) {
+        self.mark_created();
     }
 }
 
@@ -693,8 +780,8 @@ impl ProtectedLocation {
 ///
 /// The predicate `rocm runtimes uninstall`, `rocm storage remove-old-installs`
 /// and the local assistant's install-folder check share. See
-/// [`runtime_protected_location`]; `rocm uninstall`'s own roots use the
-/// narrower [`uninstall_root_protected_location_for_home`].
+/// [`runtime_protected_location`]; `rocm uninstall`'s own roots use
+/// [`uninstall_root_verdict`].
 pub fn runtime_install_root_is_protected(path: &Path) -> bool {
     runtime_protected_location(path).is_some()
 }
@@ -718,37 +805,7 @@ pub fn runtime_protected_location_for_home(
     path: &Path,
     home: Option<&Path>,
 ) -> Option<ProtectedLocation> {
-    protected_location_on(
-        path,
-        home,
-        RuntimePlatform::current(),
-        SystemRule::AndInside,
-    )
-}
-
-/// Why `rocm uninstall` must refuse to remove its config, data or cache root
-/// `path`, if it must, judged against `home`.
-///
-/// The same rule as [`runtime_protected_location_for_home`] except for system
-/// locations: only the location ITSELF (`/var`, `/opt`, `C:\Windows`, ...) is
-/// refused, not a folder inside one. A dedicated `/var/cache/rocm-cli` or
-/// `/opt/rocm-cli` is a normal place to point these roots, and removing it is
-/// exactly what the user asked for — the same reason a folder inside home is
-/// allowed.
-pub fn uninstall_root_protected_location_for_home(
-    path: &Path,
-    home: Option<&Path>,
-) -> Option<ProtectedLocation> {
-    protected_location_on(path, home, RuntimePlatform::current(), SystemRule::Itself)
-}
-
-/// How a system location protects the folders under it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SystemRule {
-    /// The location and everything inside it.
-    AndInside,
-    /// Only the location itself.
-    Itself,
+    protected_location_on(path, home, RuntimePlatform::current())
 }
 
 const fn system_roots(platform: RuntimePlatform) -> &'static [&'static str] {
@@ -762,36 +819,186 @@ const fn system_roots(platform: RuntimePlatform) -> &'static [&'static str] {
     }
 }
 
+/// What the user's own home folder says about a path, when it says anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeDecision {
+    /// Inside the home folder: removable.
+    Inside,
+    /// The home folder itself, or a folder containing it.
+    Refused(ProtectedLocation),
+}
+
+/// The home-folder part of both rules: `None` when home does not decide.
+fn own_home_decides_on(
+    path: &Path,
+    home: Option<&Path>,
+    platform: RuntimePlatform,
+) -> Option<HomeDecision> {
+    let home = home.filter(|home| !is_filesystem_root_on(home, platform))?;
+    if runtime_paths_equivalent_on(path, home, platform) {
+        return Some(HomeDecision::Refused(ProtectedLocation::Home));
+    }
+    if runtime_path_is_same_or_inside_on(path, home, platform) {
+        return Some(HomeDecision::Inside);
+    }
+    if runtime_path_is_same_or_inside_on(home, path, platform) {
+        return Some(HomeDecision::Refused(ProtectedLocation::ContainsHome));
+    }
+    None
+}
+
 fn protected_location_on(
     path: &Path,
     home: Option<&Path>,
     platform: RuntimePlatform,
-    system_rule: SystemRule,
 ) -> Option<ProtectedLocation> {
     if is_filesystem_root_on(path, platform) {
         return Some(ProtectedLocation::FilesystemRoot);
     }
-
-    if let Some(home) = home.filter(|home| !is_filesystem_root_on(home, platform)) {
-        if runtime_paths_equivalent_on(path, home, platform) {
-            return Some(ProtectedLocation::Home);
-        }
-        if runtime_path_is_same_or_inside_on(path, home, platform) {
-            return None;
-        }
-        if runtime_path_is_same_or_inside_on(home, path, platform) {
-            return Some(ProtectedLocation::ContainsHome);
-        }
+    match own_home_decides_on(path, home, platform) {
+        Some(HomeDecision::Inside) => return None,
+        Some(HomeDecision::Refused(why)) => return Some(why),
+        None => {}
     }
-
     system_roots(platform)
         .iter()
         .map(Path::new)
-        .any(|root| match system_rule {
-            SystemRule::AndInside => runtime_path_is_same_or_inside_on(path, root, platform),
-            SystemRule::Itself => runtime_paths_equivalent_on(path, root, platform),
-        })
+        .any(|root| runtime_path_is_same_or_inside_on(path, root, platform))
         .then_some(ProtectedLocation::System)
+}
+
+/// What `rocm uninstall` may do with one of its config, data or cache roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UninstallRootVerdict {
+    /// Removable as it is: inside the user's own home.
+    Allowed,
+    /// Never removable.
+    Refused(ProtectedLocation),
+    /// Removable only if it carries [`ROCM_CLI_ROOT_MARKER`]: somewhere outside
+    /// the user's home that is none of the refused places (`/opt`, `/var`,
+    /// `/srv`, a second disk, ...).
+    NeedsMarker,
+}
+
+/// The drive Windows is installed on (`C:` unless `SystemDrive` or `windir`
+/// says otherwise).
+#[must_use]
+pub fn windows_system_drive() -> String {
+    let from_env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.get(..2).map(str::to_owned))
+            .filter(|drive| drive.as_bytes()[0].is_ascii_alphabetic() && drive.ends_with(':'))
+    };
+    from_env("SystemDrive")
+        .or_else(|| from_env("windir"))
+        .unwrap_or_else(|| "C:".to_owned())
+}
+
+/// The locations `rocm uninstall` refuses at AND inside, as written.
+#[must_use]
+pub fn uninstall_system_roots() -> Vec<PathBuf> {
+    uninstall_system_roots_on(RuntimePlatform::current(), &windows_system_drive())
+}
+
+fn uninstall_system_roots_on(platform: RuntimePlatform, system_drive: &str) -> Vec<PathBuf> {
+    if platform.is_windows() {
+        [
+            "Windows",
+            "Program Files",
+            "Program Files (x86)",
+            "ProgramData",
+        ]
+        .iter()
+        .map(|name| PathBuf::from(format!("{system_drive}/{name}")))
+        .collect()
+    } else {
+        [
+            "/usr", "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+            "/sys", "/proc", "/dev", "/run", "/mnt", "/media", "/snap",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+}
+
+/// Folders whose children are users' homes: `/home`, `/Users`, the system
+/// drive's `Users`, and the folder the user's own home sits in (unless that is
+/// a filesystem root, which would make every folder a "sibling").
+fn homes_parents_on(
+    home: Option<&Path>,
+    platform: RuntimePlatform,
+    system_drive: &str,
+) -> Vec<PathBuf> {
+    let mut parents = if platform.is_windows() {
+        vec![PathBuf::from(format!("{system_drive}/Users"))]
+    } else {
+        vec![PathBuf::from("/home"), PathBuf::from("/Users")]
+    };
+    if let Some(parent) = home
+        .filter(|home| !is_filesystem_root_on(home, platform))
+        .and_then(Path::parent)
+        .filter(|parent| !is_filesystem_root_on(parent, platform))
+    {
+        parents.push(parent.to_path_buf());
+    }
+    parents
+}
+
+/// What `rocm uninstall` may do with the root `path`, judged against `home`.
+///
+/// In order: `/` (or a drive root) is refused; the user's own home is refused,
+/// as is any folder containing it, while anything inside it is allowed; the
+/// [`uninstall_system_roots`] and anything inside them are refused, as are
+/// `extra_system_roots` (the caller passes their resolved spellings, so
+/// `/lib -> usr/lib` and `/usr/lib` are judged alike); another user's home or
+/// anything inside one is refused; anything else needs the marker.
+pub fn uninstall_root_verdict(
+    path: &Path,
+    home: Option<&Path>,
+    extra_system_roots: &[PathBuf],
+) -> UninstallRootVerdict {
+    uninstall_root_verdict_on(
+        path,
+        home,
+        extra_system_roots,
+        RuntimePlatform::current(),
+        &windows_system_drive(),
+    )
+}
+
+fn uninstall_root_verdict_on(
+    path: &Path,
+    home: Option<&Path>,
+    extra_system_roots: &[PathBuf],
+    platform: RuntimePlatform,
+    system_drive: &str,
+) -> UninstallRootVerdict {
+    use UninstallRootVerdict::{Allowed, NeedsMarker, Refused};
+    if is_filesystem_root_on(path, platform) {
+        return Refused(ProtectedLocation::FilesystemRoot);
+    }
+    match own_home_decides_on(path, home, platform) {
+        Some(HomeDecision::Inside) => return Allowed,
+        Some(HomeDecision::Refused(why)) => return Refused(why),
+        None => {}
+    }
+    let system = uninstall_system_roots_on(platform, system_drive);
+    if system
+        .iter()
+        .chain(extra_system_roots)
+        .any(|root| runtime_path_is_same_or_inside_on(path, root, platform))
+    {
+        return Refused(ProtectedLocation::System);
+    }
+    if homes_parents_on(home, platform, system_drive)
+        .iter()
+        .any(|parent| runtime_path_is_same_or_inside_on(path, parent, platform))
+    {
+        return Refused(ProtectedLocation::OtherUsersHome);
+    }
+    NeedsMarker
 }
 
 /// `/`, a Windows drive root such as `C:/`, or a UNC share root: anchored,
@@ -933,6 +1140,15 @@ pub fn normalize_runtime_path_text_for_host(value: &str) -> String {
     normalize_runtime_path_text(value)
 }
 
+/// `fs::canonicalize`, minus the verbatim `\\?\` prefix Windows adds.
+///
+/// So the result compares with ordinary paths. For a path that exists; unlike
+/// [`resolve_path_through_symlinks`] it resolves `..` through the filesystem.
+pub fn canonicalize_for_compare(path: &Path) -> std::io::Result<PathBuf> {
+    path.canonicalize()
+        .map(|resolved| crate::disk_space::strip_verbatim_prefix(&resolved))
+}
+
 /// Resolve `path` to the real location on disk, keeping any trailing components
 /// that do not exist yet.
 ///
@@ -962,14 +1178,6 @@ pub fn normalize_runtime_path_text_for_host(value: &str) -> String {
 /// On Windows this also strips the verbatim `\\?\` prefix that `canonicalize`
 /// returns, since a stored path is later compared against ordinary ones. Windows
 /// directory junctions resolve through the same call, so no separate branch.
-/// `fs::canonicalize`, minus the verbatim `\\?\` prefix it adds on Windows, so
-/// the result compares with ordinary paths. For a path that exists; unlike
-/// [`resolve_path_through_symlinks`] it resolves `..` through the filesystem.
-pub fn canonicalize_for_compare(path: &Path) -> std::io::Result<PathBuf> {
-    path.canonicalize()
-        .map(|resolved| crate::disk_space::strip_verbatim_prefix(&resolved))
-}
-
 pub fn resolve_path_through_symlinks(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1932,43 +2140,66 @@ mod tests {
                 );
             }
 
-            /// Both protected-location rules against an oracle restated from the
-            /// policy, never from the code: `/` is the filesystem root; home is
-            /// home; anything strictly inside home is free; a folder containing
-            /// home protects it; otherwise the system list decides — the
-            /// locations AND what is inside them for runtime folders, only the
-            /// locations themselves for `rocm uninstall`'s roots. Home is drawn
-            /// too, including `/` (which must exempt nothing) and `/root`.
+            /// The runtime-folder rule against an oracle restated from its
+            /// policy: `/` is the filesystem root; home is home; anything
+            /// strictly inside home is free; a folder containing home protects
+            /// it; otherwise the system list and everything inside it decides.
+            /// Home is drawn too, including `/` (which must exempt nothing).
             #[test]
-            fn both_rules_agree_with_the_policy_for_any_home(
+            fn the_runtime_rule_agrees_with_its_policy_for_any_home(
                 text in path_text(proptest::sample::select(policy_seeds())),
-                home in proptest::sample::select(vec![
-                    FIXED_HOME.to_owned(),
-                    "/".to_owned(),
-                    "/root".to_owned(),
-                ]),
+                home in proptest::sample::select(policy_homes()),
             ) {
                 let resolved = lexically_resolved(&text);
-                let path = Path::new(&text);
-                let home_path = Some(Path::new(home.as_str()));
                 prop_assert_eq!(
-                    runtime_protected_location_for_home(path, home_path),
-                    policy_location(&resolved, &home, true),
-                    "runtime rule: {} resolves to {}, home {}", text, resolved, home
+                    runtime_protected_location_for_home(Path::new(&text), Some(Path::new(&home))),
+                    runtime_policy(&resolved, &home),
+                    "{} resolves to {}, home {}", text, resolved, home
                 );
+            }
+
+            /// `rocm uninstall`'s rule against an oracle restated from its
+            /// policy (see [`uninstall_policy`]), over seeds that include other
+            /// users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper
+            /// system descendants, for several homes.
+            #[test]
+            fn the_uninstall_rule_agrees_with_its_policy_for_any_home(
+                text in path_text(proptest::sample::select(policy_seeds())),
+                home in proptest::sample::select(policy_homes()),
+            ) {
+                let resolved = lexically_resolved(&text);
                 prop_assert_eq!(
-                    uninstall_root_protected_location_for_home(path, home_path),
-                    policy_location(&resolved, &home, false),
-                    "uninstall rule: {} resolves to {}, home {}", text, resolved, home
+                    uninstall_root_verdict_on(
+                        Path::new(&text),
+                        Some(Path::new(&home)),
+                        &[],
+                        RuntimePlatform::Linux,
+                        "C:",
+                    ),
+                    uninstall_policy(&resolved, &home),
+                    "{} resolves to {}, home {}", text, resolved, home
                 );
             }
         }
 
         const FIXED_HOME: &str = "/home/alice";
 
+        /// Restated from the policy, not imported from the code under test.
+        const UNINSTALL_SYSTEM: [&str; 16] = [
+            "/usr", "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+            "/sys", "/proc", "/dev", "/run", "/mnt", "/media", "/snap",
+        ];
+
+        fn policy_homes() -> Vec<String> {
+            [FIXED_HOME, "/", "/root", "/var/lib/svc"]
+                .map(str::to_owned)
+                .to_vec()
+        }
+
         fn policy_seeds() -> Vec<String> {
             let mut seeds: Vec<String> = PROTECTED_ROOTS
                 .iter()
+                .chain(UNINSTALL_SYSTEM.iter())
                 .map(|root| (*root).to_owned())
                 .collect();
             seeds.extend(
@@ -1978,49 +2209,158 @@ mod tests {
                     FIXED_HOME,
                     "/home/alice/.rocm",
                     "/home/alicex",
-                    "/tmp",
-                    "/var/cache",
+                    "/home/bob",
+                    "/Users/carol",
+                    "/mnt/c",
+                    "/usr/local",
+                    "/usr/lib/x86_64-linux-gnu",
+                    "/etc/ssl/certs",
+                    "/var/lib",
+                    "/var/lib/svc/.rocm",
+                    "/var/lib/postgres",
+                    "/var/cache/rocm-cli",
                     "/opt/rocm-cli",
+                    "/srv/rocm",
+                    "/tmp",
                 ]
                 .map(str::to_owned),
             );
             seeds
         }
 
-        /// The policy, for an already-resolved absolute path.
-        fn policy_location(
-            resolved: &str,
-            home: &str,
-            and_inside: bool,
-        ) -> Option<ProtectedLocation> {
+        /// The home-folder part of both policies, for resolved absolute text.
+        /// `None`: home does not decide. `Some(Ok(()))`: inside home, allowed.
+        /// `Some(Err(why))`: refused because of home.
+        fn home_policy(resolved: &str, home: &str) -> Option<Result<(), ProtectedLocation>> {
+            if home == "/" {
+                return None;
+            }
+            if resolved == home {
+                return Some(Err(ProtectedLocation::Home));
+            }
+            if lexically_same_or_inside(resolved, home) {
+                return Some(Ok(()));
+            }
+            if home.starts_with(&format!("{resolved}/")) {
+                return Some(Err(ProtectedLocation::ContainsHome));
+            }
+            None
+        }
+
+        fn runtime_policy(resolved: &str, home: &str) -> Option<ProtectedLocation> {
             if resolved == "/" {
                 return Some(ProtectedLocation::FilesystemRoot);
             }
+            if let Some(verdict) = home_policy(resolved, home) {
+                return verdict.err();
+            }
+            PROTECTED_ROOTS
+                .iter()
+                .any(|root| lexically_same_or_inside(resolved, root))
+                .then_some(ProtectedLocation::System)
+        }
+
+        /// `/` and its spellings are refused; your home and anything holding
+        /// it are refused, anything inside it is allowed; the system list is
+        /// refused at and inside; other users' homes (under `/home`, `/Users`,
+        /// or beside your own) are refused; anything else needs the marker.
+        fn uninstall_policy(resolved: &str, home: &str) -> UninstallRootVerdict {
+            if resolved == "/" {
+                return UninstallRootVerdict::Refused(ProtectedLocation::FilesystemRoot);
+            }
+            if let Some(verdict) = home_policy(resolved, home) {
+                return verdict.map_or_else(UninstallRootVerdict::Refused, |()| {
+                    UninstallRootVerdict::Allowed
+                });
+            }
+            if UNINSTALL_SYSTEM
+                .iter()
+                .any(|root| lexically_same_or_inside(resolved, root))
+            {
+                return UninstallRootVerdict::Refused(ProtectedLocation::System);
+            }
+            let mut homes_parents = vec!["/home".to_owned(), "/Users".to_owned()];
             if home != "/" {
-                if resolved == home {
-                    return Some(ProtectedLocation::Home);
-                }
-                if lexically_same_or_inside(resolved, home) {
-                    return None;
-                }
-                if home.starts_with(&format!("{resolved}/")) {
-                    return Some(ProtectedLocation::ContainsHome);
+                let parent = home.rsplit_once('/').map_or("/", |(parent, _)| parent);
+                if !parent.is_empty() && parent != "/" {
+                    homes_parents.push(parent.to_owned());
                 }
             }
-            let system = if and_inside {
-                PROTECTED_ROOTS
-                    .iter()
-                    .any(|root| lexically_same_or_inside(resolved, root))
-            } else {
-                PROTECTED_ROOTS.contains(&resolved)
-            };
-            system.then_some(ProtectedLocation::System)
+            if homes_parents
+                .iter()
+                .any(|parent| lexically_same_or_inside(resolved, parent))
+            {
+                return UninstallRootVerdict::Refused(ProtectedLocation::OtherUsersHome);
+            }
+            UninstallRootVerdict::NeedsMarker
+        }
+
+        /// One example per class, so each stays named even if the generator
+        /// is retuned.
+        #[test]
+        fn each_uninstall_class_is_decided_as_the_policy_says() {
+            use UninstallRootVerdict::{Allowed, NeedsMarker, Refused};
+            let home = Some(Path::new(FIXED_HOME));
+            for (path, expected) in [
+                ("/", Refused(ProtectedLocation::FilesystemRoot)),
+                ("/home/alice", Refused(ProtectedLocation::Home)),
+                ("/home", Refused(ProtectedLocation::ContainsHome)),
+                ("/home/alice/.rocm/data", Allowed),
+                ("/usr/local", Refused(ProtectedLocation::System)),
+                ("/etc/ssl", Refused(ProtectedLocation::System)),
+                ("/usr/lib", Refused(ProtectedLocation::System)),
+                ("/mnt/c/Users", Refused(ProtectedLocation::System)),
+                ("/run/user/1000", Refused(ProtectedLocation::System)),
+                ("/home/bob", Refused(ProtectedLocation::OtherUsersHome)),
+                ("/Users/carol/x", Refused(ProtectedLocation::OtherUsersHome)),
+                ("/var/lib", NeedsMarker),
+                ("/opt/rocm-cli", NeedsMarker),
+                ("/srv", NeedsMarker),
+            ] {
+                assert_eq!(
+                    uninstall_root_verdict_on(
+                        Path::new(path),
+                        home,
+                        &[],
+                        RuntimePlatform::Linux,
+                        "C:"
+                    ),
+                    expected,
+                    "{path}"
+                );
+            }
+            // Beside a home that is not under /home: still another user's.
+            assert_eq!(
+                uninstall_root_verdict_on(
+                    Path::new("/srv/users/bob"),
+                    Some(Path::new("/srv/users/alice")),
+                    &[],
+                    RuntimePlatform::Linux,
+                    "C:"
+                ),
+                Refused(ProtectedLocation::OtherUsersHome)
+            );
+            // A resolved spelling of a system root the caller passes in is
+            // refused like the root itself (`/opt -> var/opt` on Silverblue
+            // makes `/var/opt` the real `/opt`; `/lib -> usr/lib` likewise).
+            assert_eq!(
+                uninstall_root_verdict_on(
+                    Path::new("/var/usr-real/lib"),
+                    home,
+                    &[PathBuf::from("/var/usr-real")],
+                    RuntimePlatform::Linux,
+                    "C:"
+                ),
+                Refused(ProtectedLocation::System)
+            );
         }
 
         /// The drive root is the filesystem root on Windows, judged from any
-        /// host, in every spelling; on Linux `C:/` is an ordinary relative name.
+        /// host, in every spelling; on Linux `C:/` is an ordinary relative
+        /// name. The system drive comes from the environment, not a fixed `C:`.
         #[test]
-        fn a_windows_drive_root_is_the_filesystem_root() {
+        fn windows_roots_follow_the_system_drive() {
+            use UninstallRootVerdict::{Allowed, NeedsMarker, Refused};
             let windows = RuntimePlatform::Windows;
             for root in ["C:/", "C:\\", "c:/", "C:/Windows/..", "//server/share/"] {
                 assert!(is_filesystem_root_on(Path::new(root), windows), "{root}");
@@ -2035,23 +2375,26 @@ mod tests {
                 Path::new("C:/"),
                 RuntimePlatform::Linux
             ));
-            assert_eq!(
-                protected_location_on(Path::new("C:\\"), None, windows, SystemRule::Itself),
-                Some(ProtectedLocation::FilesystemRoot)
-            );
-            assert_eq!(
-                protected_location_on(
-                    Path::new("C:/Program Files/rocm-cli"),
-                    None,
-                    windows,
-                    SystemRule::Itself
+            let home = Some(Path::new("D:/Users/alice"));
+            for (path, expected) in [
+                ("C:\\", Refused(ProtectedLocation::FilesystemRoot)),
+                ("D:/Windows/System32", Refused(ProtectedLocation::System)),
+                (
+                    "d:/program files (x86)/x",
+                    Refused(ProtectedLocation::System),
                 ),
-                None
-            );
-            assert_eq!(
-                protected_location_on(Path::new("C:/Windows/"), None, windows, SystemRule::Itself),
-                Some(ProtectedLocation::System)
-            );
+                ("D:/ProgramData/rocm", Refused(ProtectedLocation::System)),
+                ("D:/Users/bob", Refused(ProtectedLocation::OtherUsersHome)),
+                ("D:/Users/alice/rocm", Allowed),
+                ("C:/Windows/rocm", NeedsMarker),
+                ("E:/rocm-cli", NeedsMarker),
+            ] {
+                assert_eq!(
+                    uninstall_root_verdict_on(Path::new(path), home, &[], windows, "D:"),
+                    expected,
+                    "{path}"
+                );
+            }
         }
 
         /// The cases the issue reported, plus the root-user and root-home

@@ -2683,6 +2683,17 @@ mod tests {
             req.args,
             serde_json::json!({ "args": ["uninstall", "--keep-data", "--keep-cache"] })
         );
+
+        // `--force-dev-binaries` is passed on too, not silently dropped.
+        assert_eq!(
+            s.handle_slash_command("/uninstall --apply --force-dev-binaries"),
+            SlashOutcome::Handled
+        );
+        let req = s.slash_tool.take().expect("a real request");
+        assert_eq!(
+            req.args,
+            serde_json::json!({ "args": ["uninstall", "--force-dev-binaries"] })
+        );
     }
 
     #[test]

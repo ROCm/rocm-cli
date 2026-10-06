@@ -78,3 +78,24 @@ Feature: Uninstall
     And the refusal says nothing was removed
     And the user's files in the home folder are still there
     And the config folder is still there
+
+  # A real folder outside the home folder is only removed when ROCm CLI marked
+  # it as its own. The refusal says how to mark it; doing so clears it.
+  @id:uninstall-unmarked-folder-refused-until-marked
+  Scenario: uninstall-07 - A data folder outside home without ROCm CLI's marker is refused until the advised marker exists
+    Given the data folder is a folder outside the home folder without ROCm CLI's marker
+    When the user previews an uninstall
+    Then the refusal advises creating the marker if the folder is ROCm CLI's
+    When the user creates the marker the refusal named
+    And the user previews an uninstall
+    Then the preview plans to remove the data folder
+
+  # The dashboard and the assistant run an approved `rocm uninstall` as a
+  # child process with the folders pinned. The refusal must still name the
+  # setting the folder really came from.
+  @id:uninstall-dashboard-names-the-real-setting
+  Scenario: uninstall-08 - From the dashboard, a refusal names setup.therock_venv rather than a pinned variable
+    Given setup.therock_venv points at the user's home folder, which holds their files
+    When the dashboard runs an approved uninstall
+    Then the refusal names setup.therock_venv and advises --keep-data, not a variable the user never set
+    And the user's files in the home folder are still there

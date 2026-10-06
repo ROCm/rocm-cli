@@ -539,10 +539,12 @@ ROCm CLI did not create is deleted, and that the review says a shared cache
 WILL BE DELETED exactly when the removal deletes it.
 
 The protected-location rules live in `rocm-core` and are property-tested
-there against an oracle restated from the policy: `/`, the home folder and
-folders containing it are refused everywhere; runtime folders are also refused
-anywhere inside a system location, while `rocm uninstall`'s roots are refused
-only at the system location itself:
+there against oracles restated from each policy, over seeds that include other
+users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper system
+descendants, for several homes (including `/`). Runtime folders are refused
+inside the runtime system list; `rocm uninstall`'s roots are refused inside its
+own list and in other users' homes, and need the `.rocm-cli-root` marker
+anywhere else outside home:
 
 ```bash
 cargo test -p rocm-core --lib runtime::tests::delete_guard_properties

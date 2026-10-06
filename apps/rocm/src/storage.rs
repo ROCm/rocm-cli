@@ -815,7 +815,11 @@ pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
                     stack.push(path);
                 } else {
                     found = true;
-                    plan.actions.push(UninstallPlanEntry { kind, path });
+                    plan.actions.push(UninstallPlanEntry {
+                        kind,
+                        path,
+                        resolved: None,
+                    });
                 }
             }
         }

@@ -964,7 +964,15 @@ fn uninstall_removes_a_link_whose_target_an_earlier_step_removed() {
         keep_binaries: true,
         ..UninstallOptions::default()
     };
-    let plan = build_uninstall_plan(&paths, &AppPathSources::default(), &options).expect("plan");
+    // Judged against the sandbox home, so the data folder inside it is removed
+    // first and the link really dangles by its turn.
+    let plan = crate::build_uninstall_plan_for_home(
+        &paths,
+        &AppPathSources::default(),
+        &options,
+        Some(&home),
+    )
+    .expect("plan");
     let listed = plan.actions.iter().any(|entry| entry.path == link);
     for entry in &plan.actions {
         remove_path(&entry.path).expect("remove");
