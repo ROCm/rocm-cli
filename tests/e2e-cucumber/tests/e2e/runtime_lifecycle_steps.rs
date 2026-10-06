@@ -331,13 +331,7 @@ async fn registry_removed(world: &mut E2eWorld) {
         out.contains("runtime removed") && out.contains("registry_removed:"),
         "expected the registry entry removed, got:\n{out}"
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         !entry.exists(),
         "registry entry still present: {}",
@@ -482,13 +476,7 @@ async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
         "expected a --yes-required error, got:\n{}",
         combined(world)
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         entry.exists(),
         "registry entry must survive a refused uninstall: {}",
@@ -503,13 +491,7 @@ async fn uninstall_dry_run_reports_plan(world: &mut E2eWorld) {
         out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
         "expected a dry-run plan with no changes made, got:\n{out}"
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         entry.exists(),
         "registry entry must survive a dry-run uninstall: {}",
