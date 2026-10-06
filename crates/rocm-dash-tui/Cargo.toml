@@ -52,12 +52,19 @@ rig = { package = "rig-core", version = "=0.38.1", default-features = false, fea
 # reqwest version; `json` for response parsing, `rustls-tls` to match Rig's stack.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
-[dev-dependencies]
-proptest = { version = "1", default-features = false, features = ["std"] }
-shlex.workspace = true
-
 # Test-only, Unix-only: `raise(3)` lets the termination-watcher unit tests drive
 # a real SIGTERM/SIGINT through Tokio's signal registry in-process. Not a runtime
 # dependency — the production signal path goes through `tokio::signal`.
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# Property-based tests for the MiB/GiB/TiB formatters in `ui::format`. "A size
+# is printed in its own unit" has to hold at every unit boundary, and the narrow
+# band where `{:.1}` rounding reaches 1024.0 is exactly the input a hand-picked
+# example misses. Same version and features as rocm-core's, so no new crate or
+# feature enters the lockfile. Test-only, so it adds nothing to any shipped
+# binary.
+# Also used to check that approval previews split back to the argv that runs.
+proptest = { version = "1", default-features = false, features = ["std"] }
+shlex.workspace = true

@@ -1135,6 +1135,29 @@ print(json.dumps({"rocm_sdk": rocm_sdk.__version__, "torch": torch.__version__, 
     );
 }
 
+#[then("the ROCm 10 runtime provisioned a cp314 Python interpreter")]
+async fn assert_next_runtime_provisioned_cp314(world: &mut E2eWorld) {
+    let install_output = stdout(world);
+    let python = install_output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("python_executable: "))
+        .expect("live install did not report its managed Python executable");
+    let result = std::process::Command::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')",
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("failed to launch managed Python {python}: {error}"));
+    assert!(result.status.success(), "failed to read {python}'s tag");
+    let tag = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+    assert_eq!(
+        tag, "cp314",
+        "ROCm 10.x's vLLM/flash-attn/amd-aiter wheels are cp314-only, but the runtime \
+         provisioned {python} as {tag}"
+    );
+}
+
 #[when("the user reinstalls vllm")]
 async fn user_reinstalls_vllm(world: &mut E2eWorld) {
     // `--reinstall` so the adapter's ROCm 10.x discovery route (dry-run

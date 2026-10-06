@@ -26,7 +26,11 @@ path = "src/bin/fake-tailscale.rs"
 axum.workspace = true
 cucumber = { version = "0.23", features = ["output-json", "output-junit"] }
 e2e-report = { path = "../../crates/e2e-report" }
-# Builds the paced download fixture's chunked response body (`stream::unfold`).
+# Two users: it builds the paced download fixture's chunked response body
+# (`stream::unfold`), and it provides `FutureExt::catch_unwind`, which catches a
+# panic escaping the cucumber run (see `src/harness_diagnostics.rs`) — plain
+# `std::panic::catch_unwind` cannot span an `.await`. cucumber already pulls this
+# in, so it adds no crate to the tree.
 futures = "0.3"
 # Drive the interactive dash TUI black-box: spawn the real `rocm` binary under a
 # pseudo-terminal (`portable-pty`, cross-platform openpty/ConPTY) and parse the
@@ -65,6 +69,12 @@ shlex.workspace = true
 # below, nothing under `src/` touches it, and `xtask check-crate-edges` exempts
 # dev edges by design — so keeping it here needs no allowlist entry.
 rocm-core = { path = "../../crates/rocm-core" }
+
+# `fcntl(F_GETFL)` only, to read (never modify) the `O_NONBLOCK` state of the
+# suite's own stdio for the diagnostics log (see `src/harness_diagnostics.rs`).
+# Already a workspace dependency, so this adds no new crate to the tree.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [[test]]
 name = "e2e"

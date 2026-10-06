@@ -30,6 +30,7 @@ use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use rocm_core::browser::Opener;
 use rocm_core::model_readiness::{
     AcceleratorMemory, HostEngineChoice, HostFacts, ModelCatalogSource, ModelReadiness,
 };
@@ -171,6 +172,30 @@ enum Command {
         /// today, and one added now would be ambiguous against `--symptom`.
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
+        /// Show the report this machine would contribute, and send nothing.
+        ///
+        /// Nothing leaves the machine: this prints the exact content so it can
+        /// be read before any of it is shared. Hardware that is not on AMD's
+        /// published compatibility matrix produces no report at all.
+        ///
+        /// Not combinable with `--distro`: a report describes this machine, and
+        /// a WSL distribution reached remotely is not fully examined (see
+        /// `--distro`'s own help), so it cannot back the disclosure guard's
+        /// architecture check.
+        #[arg(long, conflicts_with = "distro")]
+        report: bool,
+        /// Also offer the prefilled issue form, so the report can be filed.
+        ///
+        /// Still sends nothing. This opens the form with the same content
+        /// `--report` printed, already filled in; it reaches the tracker only
+        /// when you submit it yourself. On a machine with no desktop, or one
+        /// reached over SSH, the link is printed instead of opened.
+        ///
+        /// Requires `--report`, so the content is always shown before the
+        /// form is offered. Not combinable with `--json`, which is for
+        /// scripts, and a script is not a person who can read a form.
+        #[arg(long, requires = "report", conflicts_with = "json")]
+        send: bool,
     },
     /// Apply a known fix by id (see `rocm diagnose`); run with no id to list fixes.
     ///
@@ -178,10 +203,14 @@ enum Command {
     /// `#1`/`#2` ranking position, which belongs to one report and is not a name.
     /// With no id it lists the whole catalog.
     ///
-    /// Fixes are marked AUTO or PRINT-ONLY: AUTO means this command carries the
-    /// change out, PRINT-ONLY means it prints the steps for you to run yourself
-    /// (typically because they need sudo or a reboot). Use `--dry-run` to see any
-    /// fix's plan without changing anything.
+    /// Every fix carries a marker saying what happens on the machine in front of
+    /// you: AUTO means this command carries the change out; NEEDS-ARG means it
+    /// will, once told what to act on; PRINT-ONLY means it prints the steps for
+    /// you to run yourself (typically because they need sudo or a reboot); and
+    /// DIAGNOSE-ONLY means no reliable fix exists and nothing will be changed
+    /// (no catalog entry carries this marker today; it is reserved for a
+    /// future detect-but-cannot-repair failure).
+    /// Use `--dry-run` to see any fix's plan without changing anything.
     Fix {
         /// Fix id, e.g. fix-4-render-group. Omit to list available fixes.
         fix_id: Option<String>,
@@ -194,6 +223,9 @@ enum Command {
         /// For fix-9-igpu-dgpu: the discrete GPU index to pin.
         #[arg(long)]
         device_index: Option<i64>,
+        /// Emit the catalog as JSON for tooling. Only valid without a fix id.
+        #[arg(long)]
+        json: bool,
     },
     /// Print the rocm-cli version, release tag or branch, and commit hash,
     /// plus the ROCm SDK and GPU driver this machine would use.
@@ -2096,7 +2128,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             json,
             distro,
             model,
-        }) => diagnose(symptom, top, json, distro, model),
+            report,
+            send,
+        }) => diagnose(symptom, top, json, distro, model, report, send),
         // Keep this error chained rather than discarding it into a fresh
         // `anyhow!(...)` (e.g. via a `.map_err` that restringifies it) -- see
         // `FixExitCode`'s doc comment for why that would silently break its
@@ -2106,7 +2140,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             yes,
             dry_run,
             device_index,
-        }) => fix(fix_id, yes, dry_run, device_index),
+            json,
+        }) => fix(fix_id, yes, dry_run, device_index, json),
         Some(Command::Version) => version(),
         Some(Command::Setup { command }) => setup(command),
         Some(Command::EngineServeHttp {
@@ -2773,6 +2808,8 @@ fn diagnose(
     json: bool,
     distro: Option<String>,
     model: Option<String>,
+    report_requested: bool,
+    send: bool,
 ) -> Result<()> {
     // The model verdict is about THIS machine, always. `--distro` retargets the
     // environment examination at another one, but the GPU memory and engine
@@ -2829,6 +2866,9 @@ fn diagnose(
     let mut report = rocm_core::run_diagnose(&examination, &symptom.unwrap_or_default());
     if let Some(model_ref) = &model {
         report.model = Some(assess_model_on_this_host(model_ref, &examination));
+    }
+    if report_requested {
+        return show_prepared_report(&examination, &report, json, send);
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3079,11 +3119,160 @@ fn unsupported_here_for(engine: &str, ruled_out: bool) -> Option<String> {
         .then(|| format!("{engine} has no adapter on native Windows; serve it from WSL or Linux"))
 }
 
-fn fix(fix_id: Option<String>, yes: bool, dry_run: bool, device_index: Option<i64>) -> Result<()> {
+/// The catalog entry a report should name, and whether a fix was offered for it.
+///
+/// Reads `has_match` rather than taking the head of `matched`. Several checkers
+/// open with a nonzero score for a situation that is merely *potentially*
+/// relevant, so `matched` is rarely empty even on a healthy machine — taking its
+/// head regardless would publish a sub-threshold signal as though it were an
+/// established cause, and the counts built on those reports would be wrong in a
+/// way nothing downstream could detect.
+fn established_entry(report: &rocm_core::DiagnoseReport) -> (Option<&str>, bool) {
+    if !report.has_match {
+        return (None, false);
+    }
+    report.matched.first().map_or((None, false), |top| {
+        (Some(top.id.as_str()), top.fix.is_some())
+    })
+}
+
+/// Act on a delivery decision, and say what happened.
+///
+/// Takes the decision rather than making it, and takes the opener rather than
+/// being one. Both for the same reason: the decision is tested in `rocm-core`
+/// against every environment, and this half has to be tested against an opener
+/// that does not exist, on a machine with no browser. A function that decided
+/// and opened could be verified on neither.
+fn perform_delivery(
+    delivery: &rocm_core::report_delivery::Delivery,
+    opener: &dyn Opener,
+) -> String {
+    use rocm_core::report_delivery::{DESTINATION, Delivery};
+    match delivery {
+        // No mail client is started here on purpose, and the reason is worth
+        // the line: this is the branch for a machine held over SSH, or a
+        // server with no mail client at all, where starting one would open on
+        // somebody else's desktop or fail silently. The address is named as
+        // well as the link, because a machine in this state often cannot act
+        // on a `mailto:` at all and the user has to send the mail by hand.
+        Delivery::Show(url) => format!(
+            "Nothing has been sent. To send this yourself, mail the report above to \
+             {DESTINATION}, or open:\n  {url}"
+        ),
+        Delivery::Open(url) => match opener.open(url) {
+            Ok(()) => format!(
+                "Nothing has been sent yet. A prefilled mail to {DESTINATION} was opened, and \
+                 it is sent only when you send it:\n  {url}"
+            ),
+            // A failed open is not a failed command. The user still has the
+            // address and the link, which is the whole of what this offers.
+            Err(error) => format!(
+                "Nothing has been sent. A mail client could not be started ({error}). To send \
+                 this yourself, mail the report above to {DESTINATION}, or open:\n  {url}"
+            ),
+        },
+    }
+}
+
+/// Print the report this machine would contribute, and send nothing.
+fn show_prepared_report(
+    examination: &rocm_core::Examination,
+    report: &rocm_core::DiagnoseReport,
+    json: bool,
+    send: bool,
+) -> Result<()> {
+    let (entry, fix_offered) = established_entry(report);
+    // Exit 0 either way. A refusal is this command working, not failing: it
+    // decided correctly and said why, and a nonzero code would send a caller
+    // looking for a fault. Anything scripting this reads the outcome from
+    // `--json` rather than from the exit code, exactly as `rocm diagnose` itself
+    // already asks callers to do.
+    match rocm_core::prepare_report(examination, entry, fix_offered) {
+        Ok(prepared) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+            } else {
+                println!("This is the whole of what a report would carry:");
+                println!();
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+                println!();
+                // The content is printed above before this decides anything,
+                // so a report is always read before its form is offered. That
+                // ordering is the promise `--send` makes, and `--send`
+                // requires `--report` so it cannot be skipped.
+                let delivery = rocm_core::report_delivery::deliver(&prepared, send, &|key| {
+                    std::env::var(key).ok()
+                });
+                println!(
+                    "{}",
+                    perform_delivery(&delivery, &rocm_core::browser::SystemOpener)
+                );
+            }
+            Ok(())
+        }
+        Err(refusal) => {
+            let explanation = match refusal {
+                rocm_core::ReportRefusal::UnreleasedHardware => {
+                    // "Doctor" is what the epic calls this capability; the CLI
+                    // has no such command, so a user reading this has nothing
+                    // to run and nothing to look up.
+                    "This machine holds hardware that is not on AMD's published ROCm \
+                     compatibility matrix, so no report was prepared. A report describes only \
+                     hardware the compatibility matrix lists as supported."
+                }
+                rocm_core::ReportRefusal::ArchitectureUnreadable => {
+                    "No AMD GPU architecture could be read here, so nothing confirms this \
+                     hardware is on the ROCm compatibility matrix. No report was prepared."
+                }
+                rocm_core::ReportRefusal::PlatformNotProbed => {
+                    // Says what happened rather than dressing it as a finding
+                    // about the machine. The earlier wording told a healthy WSL
+                    // user their GPU could not be read, when nothing had looked.
+                    "This CLI does not inspect the GPU on WSL yet, so it cannot confirm whether \
+                     this hardware is on the ROCm compatibility matrix. No report was prepared. \
+                     This is a gap in the tool, not a problem with the machine."
+                }
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rocm_core::refusal_envelope(
+                        refusal,
+                        explanation
+                    ))?
+                );
+            } else {
+                println!("{explanation}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn fix(
+    fix_id: Option<String>,
+    yes: bool,
+    dry_run: bool,
+    device_index: Option<i64>,
+    json: bool,
+) -> Result<()> {
     let Some(fix_id) = fix_id else {
-        print!("{}", rocm_core::list_fix_recipes());
+        if json {
+            print!("{}", rocm_core::catalog_manifest_json()?);
+        } else {
+            print!("{}", rocm_core::list_fix_recipes());
+        }
         return Ok(());
     };
+    // Refused rather than ignored. "Apply this fix, as JSON" has no meaning, and
+    // quietly dropping the flag would let a caller believe it had asked for
+    // machine-readable output and got it.
+    if json {
+        anyhow::bail!(
+            "`--json` describes the whole catalog, so it cannot be combined with a fix id. \
+             Run `rocm fix --json` to read the catalog, or `rocm fix {fix_id}` to apply this fix."
+        );
+    }
     let opts = rocm_core::FixOptions {
         yes,
         dry_run,
@@ -6510,6 +6699,9 @@ fn serve(args: ServeArgs) -> Result<()> {
                 host_gpu_summary.as_ref(),
             ) {
                 println!("  {warning}");
+                if engine_serves_vllm {
+                    println!("  note: {}", rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT);
+                }
             }
         }
         if let Some(engine_recipe) = &resolve.engine_recipe {
@@ -6598,6 +6790,7 @@ fn serve(args: ServeArgs) -> Result<()> {
                 gpu_vram.as_deref(),
                 gpu_memory_utilization_note.as_deref(),
                 host_gpu_summary.as_ref(),
+                engine_serves_vllm,
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),
@@ -6637,6 +6830,7 @@ fn serve(args: ServeArgs) -> Result<()> {
 
 /// GPU/device warnings folded into the interactive deployment summary. Mirrors the
 /// inline warnings printed in the plain serve plan, in the same order.
+#[allow(clippy::too_many_arguments)]
 fn collect_serve_notes(
     cpu_only: bool,
     gpu_selection: &GpuSelection,
@@ -6645,6 +6839,7 @@ fn collect_serve_notes(
     gpu_vram: Option<&[GpuVramUsage]>,
     engine_flag_note: Option<&str>,
     host_gpu_summary: Option<&rocm_core::HostGpuSummary>,
+    engine_is_vllm: bool,
 ) -> Vec<String> {
     let mut notes = Vec::new();
     // An engine-scoped flag the selected engine cannot honor must be reported here
@@ -6672,6 +6867,11 @@ fn collect_serve_notes(
         if let Some(warning) = serve_gpu_low_memory_warning(gpu_indices, gpu_vram, host_gpu_summary)
         {
             notes.push(warning);
+            // vLLM's total-VRAM reservation is what turns a busy card into an OOM;
+            // pair the generic warning with the concrete knob that avoids it.
+            if engine_is_vllm {
+                notes.push(rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT.to_owned());
+            }
         }
     }
     notes
@@ -19410,19 +19610,23 @@ fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
 }
 
 fn format_bytes_for_user(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * KB;
-    const GB: f64 = 1024.0 * MB;
-    let bytes = bytes as f64;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes / GB)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes / KB)
-    } else {
-        format!("{} bytes", bytes as u64)
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    // Below 1 KB the count is printed whole, so no rounding can disagree with
+    // the comparison.
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
     }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    // Promote while the value AS PRINTED would reach 1024, not merely while the
+    // raw value does: 1_048_575 bytes is 1023.999… KB, which `{:.1}` renders as
+    // "1024.0 KB". Comparing the rounded tenths, as `rocm_core::format_bytes`
+    // does, keeps every size in the unit it belongs to.
+    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
@@ -21805,6 +22009,20 @@ fn validate_pinned_gpu_index(
     Ok(vec![index])
 }
 
+/// The GPU count to rank `--gpu auto` candidates over. Prefers the `amd-smi`
+/// device count, but only when that count is usable — `None` (amd-smi
+/// unavailable) and `Some(0)` (amd-smi ran and saw no devices) both fall through
+/// to the DRM sysfs VRAM fallback's row count, so auto-selection can still
+/// consider devices amd-smi did not enumerate. Used only to decide whether
+/// `--gpu auto` has anything at all to rank, never as a `--gpu <index>`
+/// validation bound — see [`validate_pinned_gpu_index`]. `None` when neither
+/// source yields a non-zero count.
+fn effective_gpu_count(detected: Option<usize>, vram: Option<&[GpuVramUsage]>) -> Option<usize> {
+    detected
+        .filter(|&count| count > 0)
+        .or_else(|| vram.map(<[GpuVramUsage]>::len).filter(|&count| count > 0))
+}
+
 /// A GPU's local VRAM occupancy as reported by `amd-smi metric --json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GpuVramUsage {
@@ -21838,10 +22056,10 @@ const AUTO_FREE_VRAM_FRACTION: f64 = 0.90;
 /// Pick a GPU ordinal for `--gpu auto`. Prefers the lowest-numbered GPU that is
 /// idle (free VRAM at or above [`AUTO_FREE_VRAM_FRACTION`]) and not pinned by a
 /// running rocm-cli service; otherwise falls back to the non-busy GPU with the
-/// most free VRAM, then to the first non-busy GPU. When the GPU count is unknown
-/// (amd-smi unavailable or zero devices) it returns no selection rather than
-/// assuming device 0 — the engine's device probe then pins the first present GPU
-/// or fails fast under the GPU-required policy.
+/// most free VRAM, then to the first non-busy GPU. When neither the amd-smi
+/// device count nor the DRM sysfs VRAM fallback yields any device it returns no
+/// selection rather than assuming device 0 — the engine's device probe then pins
+/// the first present GPU or fails fast under the GPU-required policy.
 ///
 /// Selection is mask-aware: candidates are restricted to `visible`, the HIP
 /// ordinals still usable after the active visibility mask (see
@@ -21882,30 +22100,102 @@ fn select_auto_gpu_index(
     busy: &[u32],
     vram: Option<&[GpuVramUsage]>,
 ) -> Vec<u32> {
-    // Candidate ordinals: the detected device range, narrowed to those still
-    // visible under the active mask so auto-select never targets a masked-out GPU.
-    // `visible` is in HIP space (a ROCR mask's survivors are re-indexed to `0..N`),
-    // which is the space the selection is exported through, so the retained
-    // ordinals are directly selectable. When the host is unprobeable (`visible` is
-    // `None`) the range is used unrestricted (mask-unaware, as before).
-    let count = detected.unwrap_or(0);
-    let mut all: Vec<u32> = (0..count as u32).collect();
-    if let Some(visible) = visible {
-        all.retain(|index| visible.contains(index));
-    }
-    if all.is_empty() {
-        // No visible device (amd-smi unavailable, genuinely zero devices, or every
-        // detected device masked out). Do not assume device 0 exists: return no
-        // selection and let the engine's device probe pin the first present GPU or
-        // fail fast under the GPU-required policy (no GPU-0 fallback).
+    // The amd-smi `list` device count is the primary source, but on a shared
+    // node without amd-smi it is `None` even though the DRM sysfs fallback probe
+    // may still have populated `vram`. Derive the count from those rows in that
+    // case so `--gpu auto` can rank GPUs by free VRAM instead of returning no
+    // selection and landing on a busy device 0.
+    let count = effective_gpu_count(detected, vram).unwrap_or(0);
+    if count == 0 {
+        // No GPU count from amd-smi and no VRAM telemetry (both unavailable, or
+        // genuinely zero devices). Do not assume device 0 exists: return no
+        // selection and let the engine's device probe pin the first present GPU
+        // or fail fast under the GPU-required policy (no GPU-0 fallback).
         return Vec::new();
     }
-    let candidates = || all.iter().copied().filter(|index| !busy.contains(index));
+    // Ordinals this selection may hand out, lowest first. When VRAM telemetry is
+    // present, drive the scan from the *actual* row indices it reports rather
+    // than a synthetic `0..count` range: amd-smi metric (and the DRM sysfs
+    // fallback) can report non-contiguous ordinals when devices are hidden by a
+    // visibility mask, so `0..count` would look up rows that do not exist and
+    // miss the real ones. Without telemetry, fall back to the dense detected
+    // range so service-state-only selection still has candidates.
+    //
+    // Either way the set is then narrowed to the ordinals still visible under
+    // the active mask, so auto-select never targets a masked-out GPU. `visible`
+    // is in HIP space (a ROCR mask's survivors are re-indexed to `0..N`), which
+    // is the space the selection is exported through, so the retained ordinals
+    // are directly selectable. When the host is unprobeable (`visible` is
+    // `None`) the set is left unrestricted (mask-unaware, as before).
+    //
+    // A short row set is not always a mask, though: `parse_gpu_vram_usage`
+    // drops any device entry missing `/mem_usage/used_vram/value` or
+    // `/mem_usage/total_vram/value`, so a device the lighter `list` enumeration
+    // counts can simply have no row. Taking rows-only there would shrink the
+    // candidate set for a reason that has nothing to do with visibility, and if
+    // every *reported* device is busy the terminal fallback would hand back a
+    // busy GPU while an idle, merely untelemetried one went unconsidered —
+    // exactly the "serve pinned to an occupied GPU" fault this selection exists
+    // to avoid. So the `0..count` range is unioned back in — but only where it
+    // is evidence rather than invention, which is decided by the rows, not by
+    // `visible`:
+    //
+    //   * `detected` must be `Some(n > 0)`, so `count` is the `list` device
+    //     count — an independent source asserting those ordinals exist. When it
+    //     is absent `effective_gpu_count` falls back to `rows.len()`, which is
+    //     only the rows restating their own size and confirms nothing they omit.
+    //   * every row index must be below `count`. A row at or above it is the one
+    //     available proof that the ordinal space is re-indexed or sparse rather
+    //     than dense from 0 (`[2, 3]` with `count == 2`), and that is exactly the
+    //     masked shape the rows-only construction was introduced for, so there
+    //     the rows stay authoritative. Below the count the rows are a subset of a
+    //     dense range the count already asserts, and `0..count` is no stronger an
+    //     assumption than the telemetry-less arm below already makes.
+    //
+    // Gating on `visible.is_some()` instead would have left the bug standing
+    // wherever the mask is unknown, which is not a corner: `usable_amd_gpu_indices`
+    // is `None` unconditionally off Linux, so `visible` is always `None` on
+    // Windows. The retain below still runs on top whenever a mask *is* known, so
+    // no synthesised ordinal survives that the mask contradicts.
+    let mut reported: Vec<u32> = match vram {
+        Some(rows) => {
+            let mut indices: Vec<u32> = rows.iter().map(|row| row.index).collect();
+            let count_is_independently_sourced = detected.is_some_and(|detected| detected > 0);
+            let rows_are_a_dense_range_subset =
+                indices.iter().all(|&index| (index as usize) < count);
+            if count_is_independently_sourced && rows_are_a_dense_range_subset {
+                indices.extend(0..count as u32);
+            }
+            indices
+        }
+        None => (0..count as u32).collect(),
+    };
+    reported.sort_unstable();
+    // The union above can repeat an ordinal that both sources name.
+    reported.dedup();
+    if let Some(visible) = visible {
+        reported.retain(|index| visible.contains(index));
+    }
+    if reported.is_empty() {
+        // Every reported device is masked out (or telemetry reported no rows at
+        // all). Do not assume device 0 exists: return no selection and let the
+        // engine's device probe pin the first present GPU or fail fast under the
+        // GPU-required policy (no GPU-0 fallback).
+        return Vec::new();
+    }
+    // The subset still free to claim. Kept separate from `reported` so the
+    // terminal all-busy fallback below can still name a device that was actually
+    // reported instead of fabricating one.
+    let candidate_indices: Vec<u32> = reported
+        .iter()
+        .copied()
+        .filter(|index| !busy.contains(index))
+        .collect();
     let usage_for = |index: u32| vram.and_then(|rows| rows.iter().find(|row| row.index == index));
 
     if vram.is_some() {
         // Pass 1: lowest-index idle GPU.
-        for index in candidates() {
+        for &index in &candidate_indices {
             if let Some(free) = usage_for(index).and_then(|usage| usage.free_fraction())
                 && free >= AUTO_FREE_VRAM_FRACTION
             {
@@ -21914,36 +22204,93 @@ fn select_auto_gpu_index(
         }
         // Pass 2: the non-busy GPU with the most free VRAM in absolute terms
         // (not free percentage, which can favor a smaller GPU on heterogeneous
-        // VRAM systems).
-        if let Some(index) = candidates().max_by(|left, right| {
-            let left_free = usage_for(*left).map(|usage| usage.free_mb());
-            let right_free = usage_for(*right).map(|usage| usage.free_mb());
+        // VRAM systems). `usage_for` is only *partial* over `candidate_indices` —
+        // the union above puts back ordinals the `list` count confirms but
+        // telemetry never reported — yet no "does this ordinal have a row?" guard
+        // is needed, because the comparator already orders them last: the keys are
+        // `Option<u64>`, and `None` sorts below every `Some`, including `Some(0)`.
+        // So a rowless ordinal can only be the maximum when *no* candidate has a
+        // row; then every key is `None`, every comparison falls through to the
+        // index tie-break, and the winner is the lowest candidate index — which is
+        // precisely what Pass 3 would return from an ascending `reported`. Adding
+        // the guard back would therefore change no outcome, only skip a pass that
+        // already agrees.
+        if let Some(&index) = candidate_indices.iter().max_by(|left, right| {
+            let left_free = usage_for(**left).map(|usage| usage.free_mb());
+            let right_free = usage_for(**right).map(|usage| usage.free_mb());
             left_free
                 .cmp(&right_free)
                 // Break ties toward the lowest index.
                 .then(right.cmp(left))
-        }) && usage_for(index).is_some()
-        {
+        }) {
             return vec![index];
         }
     }
 
     // Pass 3: no VRAM telemetry; first GPU not pinned by a managed service.
-    if let Some(index) = candidates().next() {
+    if let Some(&index) = candidate_indices.first() {
         return vec![index];
     }
-    // Every visible GPU is pinned by a running service. Return the lowest visible
-    // ordinal (no CPU fallback is ever used); the caller surfaces a low-memory
-    // warning so the user can free a device or pick another `--gpu`. Using the
-    // lowest *visible* ordinal rather than a hardcoded 0 keeps this correct when
-    // device 0 is masked out.
-    vec![all[0]]
+    // Every reported, visible GPU is pinned by a running service. Return the
+    // lowest of them (no CPU fallback is ever used); the caller surfaces a
+    // low-memory warning so the user can free a device or pick another `--gpu`.
+    // It must come from `reported`, not a hardcoded 0: once candidates are
+    // sourced from the VRAM rows those ordinals can be sparse (a visibility mask
+    // can leave only `[2, 3]`), so a literal 0 would pin a device nothing ever
+    // reported — exported straight into `HIP_VISIBLE_DEVICES` as a silently
+    // wrong choice. `reported` is non-empty here, guaranteed by the check above.
+    vec![reported[0]]
 }
 
-/// Best-effort per-GPU VRAM occupancy via `amd-smi metric --json`. Returns
-/// `None` when amd-smi is unavailable or its output cannot be parsed (callers
-/// then fall back to service-state-only auto-selection).
+/// Best-effort per-GPU VRAM occupancy. Prefers `amd-smi metric --json`; when
+/// amd-smi is not installed (e.g. a shared node or container that ships no
+/// amd-smi — this never tries `rocm-smi`) it falls back to the amdgpu DRM sysfs
+/// VRAM counters so `--gpu auto` selection and the low-VRAM warning still have
+/// telemetry to work with on a single-GPU host (see
+/// [`read_drm_vram_usage`] for why the sysfs fallback withholds telemetry on a
+/// multi-GPU one). Returns `None` only when neither source is readable
+/// (callers then fall back to service-state-only auto-selection).
 fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(forced) = simulated_low_vram_usage() {
+        return Some(forced);
+    }
+    gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
+}
+
+/// E2E hook: when `ROCM_E2E_FORCE_LOW_VRAM` names a GPU ordinal, report that GPU
+/// as almost entirely occupied, overriding the real telemetry.
+///
+/// The serve-plan low-VRAM OOM warning (and, for vLLM, its
+/// `--gpu-memory-utilization` note) only fires when a *selected* GPU is below
+/// [`AUTO_FREE_VRAM_FRACTION`] free. The GPU lane's real cards are comfortably
+/// free, so without this seam the branch is unreachable in E2E and the note has
+/// no live coverage. Synthesizing one near-full single-GPU reading makes that
+/// path deterministic on the vLLM GPU lane (a non-APU host, so
+/// [`vram_capacity_is_meaningful`] still holds) without touching the device the
+/// engine actually launches on. Compiled only into the `e2e-test-hooks` binary;
+/// production builds never see it.
+#[cfg(feature = "e2e-test-hooks")]
+fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    let index: u32 = std::env::var("ROCM_E2E_FORCE_LOW_VRAM")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // A single 24 GiB device with ~0.5 GiB free is well below the 0.90 free
+    // threshold, so `gpu_low_memory_warning` fires; one GPU keeps
+    // `vram_capacity_is_meaningful` honest on the non-APU vLLM lane.
+    let total_mb = 24 * 1024;
+    Some(vec![GpuVramUsage {
+        index,
+        used_mb: total_mb - 512,
+        total_mb,
+    }])
+}
+
+/// Per-GPU VRAM occupancy via `amd-smi metric --json`. Returns `None` when
+/// amd-smi is unavailable or its output cannot be parsed.
+fn gpu_vram_usage_amd_smi() -> Option<Vec<GpuVramUsage>> {
     let binary = rocm_core::resolve_amd_smi_binary();
     let output = ProcessCommand::new(&binary)
         .arg("metric")
@@ -21959,6 +22306,114 @@ fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     let rows = parse_gpu_vram_usage(&value);
     if rows.is_empty() { None } else { Some(rows) }
+}
+
+/// Fallback per-GPU VRAM occupancy read straight from the amdgpu DRM sysfs
+/// counters (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), used when
+/// amd-smi is not installed. Linux-only; other platforms expose no such
+/// interface and return `None`.
+#[cfg(target_os = "linux")]
+fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
+    let rows = read_drm_vram_usage(Path::new("/sys/class/drm"));
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
+    None
+}
+
+/// Read per-GPU VRAM occupancy from the amdgpu DRM sysfs tree rooted at
+/// `drm_dir`. Enumerates primary `card<N>` nodes (skipping connector sub-nodes
+/// like `card0-DP-1`), keeps only AMD devices exposing readable
+/// `mem_info_vram_{total,used}` counters, and assigns HIP ordinal 0 to the sole
+/// AMD card to mirror HIP device ordering on a standard single-GPU host install.
+///
+/// HIP ordinals come from the KFD *compute* topology, not DRM card numbers, and
+/// the two enumerations are only guaranteed to agree when there is exactly one
+/// AMD DRM card: an APU passes the same AMD filter as a discrete GPU, so a host
+/// pairing an APU with a dGPU can order `card<N>` differently than HIP's node
+/// order, and that ordinal is fed to `HIP_VISIBLE_DEVICES` downstream. Rather
+/// than guess, this returns no rows at all when more than one AMD card is
+/// *found* — counted before the telemetry filters below, so a second AMD card
+/// with an unreadable counter still trips the guard instead of leaving the
+/// survivor mislabelled ordinal 0. Callers then fall back to service-state-only
+/// auto-selection. Split from [`gpu_vram_usage_sysfs`] so it can be tested
+/// against a planted sysfs layout.
+#[cfg(any(target_os = "linux", test))]
+fn read_drm_vram_usage(drm_dir: &Path) -> Vec<GpuVramUsage> {
+    const BYTES_PER_MIB: u64 = 1024 * 1024;
+    let Ok(entries) = fs::read_dir(drm_dir) else {
+        return Vec::new();
+    };
+    // Every AMD card is counted here, *before* the telemetry filters below can
+    // drop it, so the multi-card ordinal-ambiguity guard fires on how many AMD
+    // cards exist rather than on how many produced readable counters.
+    let mut amd_cards_found = 0usize;
+    let mut cards: Vec<GpuVramUsage> = Vec::new();
+    for entry in entries.flatten() {
+        let card_path = entry.path();
+        let Some(name) = card_path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        if name
+            .strip_prefix("card")
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let device_dir = card_path.join("device");
+        if !drm_device_is_amd(&device_dir) {
+            continue;
+        }
+        amd_cards_found += 1;
+        let Some(total_bytes) = read_sysfs_u64(&device_dir.join("mem_info_vram_total")) else {
+            continue;
+        };
+        // An unreadable `used` counter is unknown occupancy, not zero: treating
+        // it as `0` would make the card look 100% free, which is exactly what
+        // `--gpu auto` prefers first. Skip the card instead of guessing.
+        let Some(used_bytes) = read_sysfs_u64(&device_dir.join("mem_info_vram_used")) else {
+            continue;
+        };
+        cards.push(GpuVramUsage {
+            // The sole surviving AMD card is HIP ordinal 0 (guaranteed by the
+            // multi-card guard below).
+            index: 0,
+            used_mb: used_bytes / BYTES_PER_MIB,
+            total_mb: total_bytes / BYTES_PER_MIB,
+        });
+    }
+    // More than one AMD card found: ascending `card<N>` order is not guaranteed
+    // to match HIP's ordinal order (see doc comment above), so do not hand out
+    // ordinals that might feed the wrong device into `HIP_VISIBLE_DEVICES`.
+    if amd_cards_found > 1 {
+        return Vec::new();
+    }
+    cards
+}
+
+/// Read a sysfs file whose entire contents are a single unsigned integer.
+#[cfg(any(target_os = "linux", test))]
+fn read_sysfs_u64(path: &Path) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse::<u64>().ok()
+}
+
+/// Whether a DRM `device` directory belongs to an AMD GPU.
+///
+/// Delegates rather than re-implementing. This probe and `rocm-core`'s KFD/DRM
+/// count authority have to agree on what counts as an AMD card — if this one
+/// recognises fewer, it under-counts and the multi-card ordinal guard it feeds
+/// silently narrows — and a second copy of the test with a comment claiming the
+/// two match is not agreement, it is a promise nothing enforces. Calling the
+/// same function is.
+#[cfg(any(target_os = "linux", test))]
+fn drm_device_is_amd(device_dir: &Path) -> bool {
+    rocm_core::is_amdgpu_device(device_dir)
 }
 
 /// Parse `amd-smi metric --json` output into per-GPU VRAM usage. Accepts both
@@ -22665,6 +23120,173 @@ fn treat_as_natural_language(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
+    use rocm_core::browser::Opener;
+    use rocm_core::report_delivery::Delivery;
+
+    use super::perform_delivery;
+
+    /// An opener that records rather than opens, and can be told to fail.
+    ///
+    /// The whole reason the opener is a trait: the real one spawns a browser
+    /// against whatever desktop exists, so neither "it was opened" nor "it was
+    /// deliberately not opened" can be observed in CI without this.
+    struct RecordingOpener {
+        opened: RefCell<Vec<String>>,
+        fails: bool,
+    }
+
+    impl RecordingOpener {
+        fn working() -> Self {
+            Self {
+                opened: RefCell::new(Vec::new()),
+                fails: false,
+            }
+        }
+        fn broken() -> Self {
+            Self {
+                opened: RefCell::new(Vec::new()),
+                fails: true,
+            }
+        }
+        fn opened(&self) -> Vec<String> {
+            self.opened.borrow().clone()
+        }
+    }
+
+    impl Opener for RecordingOpener {
+        fn open(&self, url: &str) -> anyhow::Result<()> {
+            self.opened.borrow_mut().push(url.to_owned());
+            if self.fails {
+                anyhow::bail!("no browser here");
+            }
+            Ok(())
+        }
+    }
+
+    /// Nothing is opened unless the decision was to open.
+    ///
+    /// The assertion that matters is on the opener, not on the wording. A
+    /// message saying no browser was started is satisfied by any string; an
+    /// opener that recorded nothing is the actual claim.
+    #[test]
+    fn a_delivery_that_is_not_an_open_never_reaches_the_browser() {
+        let delivery = Delivery::Show("mailto:nobody@example.invalid".to_owned());
+        let opener = RecordingOpener::working();
+        let said = perform_delivery(&delivery, &opener);
+
+        assert!(
+            opener.opened().is_empty(),
+            "a mail client was started for {delivery:?}, which is the one thing this path must \
+             not do on a machine the user is holding over SSH"
+        );
+        assert!(
+            said.contains("Nothing has been sent"),
+            "the user has to be told nothing left the machine: {said}"
+        );
+        // A machine in this state often cannot act on a `mailto:` at all, so
+        // the address has to be readable on its own, not only inside the link.
+        assert!(
+            said.contains(rocm_core::report_delivery::DESTINATION),
+            "a user who has to send the mail by hand needs the address: {said}"
+        );
+    }
+
+    /// Opening is what an open decision does, and the user is told it is not
+    /// filed yet.
+    #[test]
+    fn an_open_decision_reaches_the_browser_and_is_still_not_a_send() {
+        let url = "https://example.invalid/new?body=x";
+        let opener = RecordingOpener::working();
+        let said = perform_delivery(&Delivery::Open(url.to_owned()), &opener);
+
+        assert_eq!(
+            opener.opened(),
+            vec![url.to_owned()],
+            "premise failed: an open decision must reach the opener, otherwise the cases above \
+             are satisfied by never opening anything"
+        );
+        assert!(
+            said.contains("only when you send it"),
+            "opening a prefilled mail is not sending it, and the user has to know which one \
+             happened: {said}"
+        );
+    }
+
+    /// A browser that will not start still leaves the user the link.
+    #[test]
+    fn a_browser_that_fails_to_start_still_hands_the_user_the_link() {
+        let url = "https://example.invalid/new?body=x";
+        let said = perform_delivery(&Delivery::Open(url.to_owned()), &RecordingOpener::broken());
+
+        assert!(
+            said.contains(url),
+            "the link is the whole of what this offers, so a failed browser must not lose it: \
+             {said}"
+        );
+        assert!(said.contains("Nothing has been sent"));
+    }
+
+    /// A diagnosis report holding exactly one finding.
+    ///
+    /// `has_match` is passed independently of the score on purpose: the point
+    /// under test is that the two are read together, so a fixture that derived
+    /// one from the other could not express the case being guarded against.
+    fn report_of(
+        has_match: bool,
+        id: &str,
+        score: i32,
+        fix: Option<rocm_core::Fix>,
+    ) -> rocm_core::DiagnoseReport {
+        rocm_core::DiagnoseReport {
+            has_match,
+            matched: vec![rocm_core::Diagnosis {
+                id: id.to_owned(),
+                title: "under test".to_owned(),
+                score,
+                evidence: Vec::new(),
+                fix,
+            }],
+            min_score_for_match: 50,
+            high_confidence_threshold: 80,
+            route_when_no_match: rocm_core::diagnose::Route {
+                target: String::new(),
+                url: String::new(),
+            },
+            out_of_scope: None,
+            model: None,
+        }
+    }
+
+    /// The entry a report names is one the diagnosis established, not merely
+    /// the strongest signal it saw.
+    ///
+    /// This is a wiring test, not a logic one. `established_entry` is correct in
+    /// itself; what it could get wrong is being handed `matched.first()`
+    /// unconditionally. Several checkers open with a nonzero score for a
+    /// situation that is only potentially relevant, so a healthy machine
+    /// produces a `matched` list full of sub-threshold entries — and a report
+    /// naming one of those would look like an established cause to every
+    /// counter downstream, with nothing able to tell the difference afterwards.
+    #[test]
+    fn a_report_names_an_established_cause_and_not_the_loudest_weak_signal() {
+        let weak_only = report_of(false, "fix-10-container", 25, None);
+        assert_eq!(
+            established_entry(&weak_only),
+            (None, false),
+            "nothing cleared the bar, so the report has no entry to name"
+        );
+
+        // Non-vacuity: an established cause must come through, or the assertion
+        // above is satisfied by never naming anything.
+        let established = report_of(true, "fix-6-path", 90, Some(rocm_core::Fix::default()));
+        assert_eq!(
+            established_entry(&established),
+            (Some("fix-6-path"), true),
+            "an established cause with a fix is exactly what a report is for"
+        );
+    }
     use std::process::ExitCode;
 
     /// `Ok(())` must map to a clean exit so `rocm`'s successful commands don't
@@ -22759,6 +23381,7 @@ mod tests {
                 yes: true,
                 dry_run: false,
                 device_index: None,
+                json: false,
             }),
         };
         let result = super::dispatch(cli);
@@ -26371,6 +26994,107 @@ model recipes
         assert_eq!(format_bytes(1_048_575), "1.0 MiB");
         assert_eq!(format_bytes(1_048_576), "1.0 MiB");
         assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+    }
+
+    /// Just below a unit boundary the value rounds up to a full 1024 of the
+    /// SMALLER unit, which has to be reported as 1.0 of the larger one — the
+    /// same defect `rocm_core::format_bytes` had. Each pair is the last input
+    /// that still belongs to the smaller unit and the first that `{:.1}` rounds
+    /// up to 1024.0 of it; the second used to print "1024.0 KB" / "1024.0 MB".
+    #[test]
+    fn format_bytes_for_user_promotes_a_value_that_rounds_up_to_a_full_unit() {
+        assert_eq!(format_bytes_for_user(1023), "1023 bytes");
+        assert_eq!(format_bytes_for_user(1024), "1.0 KB");
+        assert_eq!(format_bytes_for_user(1_048_524), "1023.9 KB");
+        assert_eq!(format_bytes_for_user(1_048_525), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_048_575), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_073_689_395), "1023.9 MB");
+        assert_eq!(format_bytes_for_user(1_073_689_396), "1.0 GB");
+        assert_eq!(format_bytes_for_user(1_073_741_823), "1.0 GB");
+        // GB is the top unit: nothing to promote to, so 1024 GB stays in it.
+        assert_eq!(format_bytes_for_user(1_099_511_627_776), "1024.0 GB");
+    }
+
+    /// The units `format_bytes_for_user` prints, smallest first.
+    const USER_BYTE_UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+
+    /// Byte counts that actually visit the unit boundaries. A uniform `u64`
+    /// almost always lands far above the top unit, so on its own it never
+    /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
+    /// draw uniformly within one unit's range, and from a window just below
+    /// each rounded boundary (KB→MB, MB→GB) that scales with the boundary, as
+    /// the band does — see `rocm_core::disk_space`'s generator for the full
+    /// reasoning.
+    fn user_byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<u64>(),
+            (0u32..=3).prop_flat_map(|exponent| {
+                let low = if exponent == 0 {
+                    0
+                } else {
+                    1024u64.pow(exponent)
+                };
+                low..1024u64.pow(exponent + 1)
+            }),
+            (2u32..=3).prop_flat_map(|exponent| {
+                let boundary = 1024u64.pow(exponent);
+                (boundary - boundary / 16384)..=(boundary + 1)
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// A size is rendered in the unit it belongs to, which has two edges.
+        ///
+        /// Upper: below the top unit, the printed mantissa is under 1024.0 —
+        /// otherwise the size is shown in a unit it has outgrown.
+        ///
+        /// Lower: above `bytes`, the printed mantissa is at least 1.0, and the
+        /// next smaller unit would have printed 1024.0 or more — otherwise the
+        /// size was promoted before it reached a whole unit.
+        ///
+        /// Both edges compare the mantissa as printed, in tenths: that is the
+        /// quantity a reader sees, so it is the one the scaling has to decide on.
+        #[test]
+        fn format_bytes_for_user_renders_a_size_in_its_own_unit(
+            bytes in user_byte_count_strategy(),
+        ) {
+            let rendered = format_bytes_for_user(bytes);
+            let (value, unit) = rendered
+                .split_once(' ')
+                .expect("rendered size is `<number> <unit>`");
+            let value: f64 = value.parse().expect("numeric part parses");
+            let tenths = (value * 10.0).round();
+            let exponent = USER_BYTE_UNITS
+                .iter()
+                .position(|name| *name == unit)
+                .expect("rendered unit is one of the known units");
+            if exponent + 1 < USER_BYTE_UNITS.len() {
+                proptest::prop_assert!(
+                    tenths < 10_240.0,
+                    "{bytes} rendered as {rendered}, which should have been \
+                     promoted to the next unit",
+                );
+            }
+            if exponent > 0 {
+                proptest::prop_assert!(
+                    tenths >= 10.0,
+                    "{bytes} rendered as {rendered}, which was promoted before \
+                     it reached a whole unit",
+                );
+                // Dividing by a power of two is exact, so this is the value the
+                // smaller unit would have printed, not an approximation of it.
+                let smaller = (1..exponent).fold(bytes as f64, |value, _| value / 1024.0);
+                proptest::prop_assert!(
+                    (smaller * 10.0).round() >= 10_240.0,
+                    "{bytes} rendered as {rendered}, but still fits the smaller \
+                     unit as {smaller:.1} {}",
+                    USER_BYTE_UNITS[exponent - 1],
+                );
+            }
+        }
     }
 
     #[test]
@@ -31427,13 +32151,23 @@ install therock";
             None,
             Some(note),
             None,
+            false,
         );
         assert!(
             notes.iter().any(|entry| entry == note),
             "the ignored-flag note must reach the summary: {notes:?}"
         );
 
-        let quiet = collect_serve_notes(false, &GpuSelection::Auto, false, &[0], None, None, None);
+        let quiet = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            None,
+            None,
+            None,
+            false,
+        );
         assert!(
             !quiet
                 .iter()
@@ -31610,6 +32344,75 @@ install therock";
     }
 
     #[test]
+    fn serve_notes_pair_low_vram_with_the_vllm_utilization_hint() {
+        // A busy discrete card that trips the low-VRAM warning: on vLLM the note
+        // must also carry the concrete `--gpu-memory-utilization` workaround, so
+        // the interactive summary tells the user how to avoid the OOM.
+        let busy = [vram(0, 182_000, 192_000)];
+        let notes = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            true,
+        );
+        assert!(
+            notes.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning must be present: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "vLLM low-VRAM notes must hint the utilization workaround: {notes:?}"
+        );
+
+        // The literal fragments the GPU-lane scenario
+        // `@id:serve-vllm-low-vram-oom-guidance` matches on. That scenario runs
+        // only where a real card exists, so pin the wording here too: a rename
+        // then fails on every lane rather than silently on the one lane that can
+        // observe it. `GPU 0 has only` is what makes the warning provably about
+        // the *pinned* device; `vLLM reserves ~90%` is what distinguishes the
+        // pre-launch hint from any other line that merely names the flag.
+        assert!(
+            notes.iter().any(|entry| entry.contains("GPU 0 has only")),
+            "the warning must name the selected GPU: {notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|entry| entry.contains("vLLM reserves ~90%")),
+            "the hint must explain vLLM's total-VRAM reservation: {notes:?}"
+        );
+
+        // The same busy card on a non-vLLM engine keeps the warning but omits the
+        // vLLM-only knob, which that engine cannot honor.
+        let lemonade = collect_serve_notes(
+            false,
+            &GpuSelection::Auto,
+            false,
+            &[0],
+            Some(&busy),
+            None,
+            Some(&host_gpu("gfx1100")),
+            false,
+        );
+        assert!(
+            lemonade.iter().any(|entry| entry.contains("has only")),
+            "the low-VRAM warning still fires for other engines: {lemonade:?}"
+        );
+        assert!(
+            !lemonade
+                .iter()
+                .any(|entry| entry.contains("--gpu-memory-utilization")),
+            "non-vLLM engines must not be told to pass a vLLM-only flag: {lemonade:?}"
+        );
+    }
+
+    #[test]
     fn engine_recipe_enables_tool_choice_reflects_flags() {
         assert!(!engine_recipe_enables_tool_choice(None));
         let without = EngineRecipeHint {
@@ -31736,6 +32539,188 @@ install therock";
     }
 
     #[test]
+    fn auto_selection_uses_vram_row_count_when_amd_smi_count_is_unknown() {
+        // `detect_gpu_count()` is `None` while VRAM telemetry is present. With
+        // *several* rows that is the amd-smi shape of the state -- `metric`
+        // answered while `list` did not -- not the DRM sysfs fallback, which
+        // withholds telemetry entirely once a second AMD card is found and so
+        // can never produce more than one row (`read_drm_vram_usage`). Either
+        // way auto-selection must derive the count from the rows and skip the
+        // busy GPU 0 rather than returning no selection (which would land the
+        // engine on GPU 0).
+        let usage = [
+            vram(0, 182_000, 192_000),
+            vram(1, 1_000, 192_000),
+            vram(2, 500, 192_000),
+        ];
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], Some(&usage)),
+            vec![1],
+            "with no amd-smi count, rank the reported VRAM rows and pick the first idle GPU"
+        );
+        // The state the DRM sysfs fallback can actually reach: exactly one row.
+        // It is still ranked (and still selected) rather than discarded for
+        // being a single device.
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], Some(&[vram(0, 1_000, 192_000)])),
+            vec![0],
+            "the single row the sysfs fallback can emit must still be selectable"
+        );
+        // Still nothing to go on when neither the count nor telemetry is present.
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], Some(&[])),
+            Vec::<u32>::new()
+        );
+    }
+
+    #[test]
+    fn auto_selection_ranks_the_actual_reported_row_indices() {
+        // A visibility mask hides GPUs 0 and 1, so amd-smi metric reports only
+        // the surviving devices with their absolute, non-contiguous ordinals
+        // [2, 3] -- there is no row at index 0 or 1. Auto-selection must scan
+        // those real indices, not a synthetic `0..count` range (which would
+        // look up absent rows and fall through to a bogus GPU 0).
+        let usage = [vram(2, 182_000, 192_000), vram(3, 1_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[], Some(&usage)),
+            vec![3],
+            "should skip the busy GPU 2 and pick the idle GPU 3 by its real ordinal"
+        );
+        // With GPU 3 also pinned by a managed service, pass 3 still returns a
+        // real reported ordinal (GPU 2), never a fabricated index 0.
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[3], Some(&usage)),
+            vec![2],
+            "the sole non-busy reported GPU must be selected by its real ordinal"
+        );
+    }
+
+    #[test]
+    fn auto_selection_all_reported_busy_falls_back_to_a_reported_ordinal() {
+        // Same sparse-ordinal host as above ([2, 3] reported, nothing at 0 or 1)
+        // but now BOTH reported GPUs are pinned by a running service, so every
+        // pass falls through to the terminal "all busy, pick one anyway"
+        // fallback. That fallback used to hand back a hardcoded `0` — safe only
+        // while candidates were a dense `0..count`, and simply wrong once they
+        // come from the reported rows: index 0 is a device nothing reported, yet
+        // it would be exported verbatim as `HIP_VISIBLE_DEVICES`. It must return
+        // the lowest ordinal that was actually reported instead.
+        let usage = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[2, 3], Some(&usage)),
+            vec![2],
+            "the all-busy fallback must name a reported GPU, never a fabricated index 0"
+        );
+        // "Lowest reported" has to mean lowest by ordinal, not first in the
+        // rows: `amd-smi` orders its output by enumeration, not by index, so
+        // feed the same two rows in descending order. Varying the *busy* slice's
+        // order instead would prove nothing — it is only ever read through
+        // `.contains()`, so that assertion was a duplicate of the one above.
+        let descending = [vram(3, 190_000, 192_000), vram(2, 182_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(None, None, &[2, 3], Some(&descending)),
+            vec![2],
+            "the fallback must take the lowest reported ordinal, not the first row"
+        );
+    }
+
+    #[test]
+    fn auto_selection_considers_a_detected_gpu_that_reported_no_vram_row() {
+        // A short row set is not always a visibility mask. `parse_gpu_vram_usage`
+        // drops any device entry missing its `used_vram`/`total_vram` pointers, so
+        // here `list` counts two GPUs, both are visible, but only GPU 0 produced a
+        // row — and GPU 0 is pinned by a managed service. Driving candidates from
+        // the rows alone leaves `[0]`, the busy filter empties it, every pass
+        // iterates nothing and the terminal fallback hands back GPU 0: `serve`
+        // pinned to an already-occupied GPU, the exact failure this selection
+        // exists to prevent. The untelemetried GPU 1 is confirmed by both the
+        // count and the visible set, so it must be a candidate and must win.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 182_000, 192_000)])
+            ),
+            vec![1],
+            "a detected, visible GPU with no VRAM row must be preferred over a busy reported one"
+        );
+        // The same shape without telemetry for the busy device being conclusive:
+        // GPU 1 is still the only non-busy ordinal either source confirms.
+        assert_eq!(
+            select_auto_gpu_index(
+                Some(2),
+                Some(&[0, 1]),
+                &[0],
+                Some(&[vram(0, 1_000, 192_000)])
+            ),
+            vec![1],
+            "an idle-looking but service-pinned GPU 0 must still lose to the free GPU 1"
+        );
+        // The masking behaviour this rows-only construction was introduced for is
+        // untouched: rows `[2, 3]` against `count == 2` put a row index at or above
+        // the count, which is the proof the ordinal space is re-indexed, so the
+        // union never happens and the rows stand alone. (The visible retain would
+        // also have dropped `0`/`1` here — this pins the row-index rule itself, so
+        // the masked case survives on a host where the mask is unknown too.)
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), Some(&[2, 3]), &[2, 3], Some(&masked)),
+            vec![2],
+            "a masked host must not gain candidates 0/1 from the detected count"
+        );
+    }
+
+    #[test]
+    fn auto_selection_considers_an_untelemetried_gpu_when_the_visible_set_is_unknown() {
+        // Same shape as the test above, but `visible` is `None`. That is not an
+        // exotic host: `probe_usable_amd_gpu_indices` returns `None`
+        // *unconditionally* off Linux, and `serve` threads that straight into
+        // `visible`, so every Windows run takes this path — as does any Linux host
+        // whose KFD topology and DRM cards are both unreadable. Gating the
+        // `0..count` union on `visible.is_some()` therefore left the whole bug
+        // standing on a supported platform.
+        //
+        // Nothing about the mask is needed to justify GPU 1 here: the amd-smi
+        // `list` count asserts two devices and the rows name only ordinals below
+        // that count, so the rows are a subset of a dense range, not a re-indexed
+        // one. GPU 0 is pinned by a managed service, so the untelemetried GPU 1 is
+        // the only free ordinal and must win over the busy reported fallback.
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[0], Some(&[vram(0, 182_000, 192_000)])),
+            vec![1],
+            "an unprobeable host must still consider a counted GPU that reported no VRAM row"
+        );
+        // A row index at or above the count is the only evidence available that the
+        // ordinal space is *not* a dense `0..count`, so there the rows stay
+        // authoritative even with no mask to retain against — otherwise an
+        // unprobeable masked host would have `[0, 1]` invented for it.
+        let masked = [vram(2, 182_000, 192_000), vram(3, 190_000, 192_000)];
+        assert_eq!(
+            select_auto_gpu_index(Some(2), None, &[2, 3], Some(&masked)),
+            vec![2],
+            "re-indexed rows must not gain unconfirmed candidates 0/1 from the detected count"
+        );
+        // The count must come from the `list` enumeration to confirm anything.
+        // With `detected` absent it is `rows.len()`, i.e. the rows restating their
+        // own size, and `parse_gpu_vram_usage` can repeat an ordinal: it falls back
+        // to the array position only when an entry has no `gpu` field, so a payload
+        // naming `"gpu": 0` twice yields two index-0 rows. That makes `rows.len()`
+        // 2 with every index below it, and dropping the `detected` half of the
+        // condition would invent a GPU 1 nothing ever enumerated.
+        assert_eq!(
+            select_auto_gpu_index(
+                None,
+                None,
+                &[0],
+                Some(&[vram(0, 182_000, 192_000), vram(0, 182_000, 192_000)])
+            ),
+            vec![0],
+            "a row-derived count must not synthesise an ordinal no source reported"
+        );
+    }
+
+    #[test]
     fn validate_pinned_gpu_index_rejects_out_of_range() {
         // Index equal to or beyond the detected count is rejected.
         let error = validate_pinned_gpu_index(4, Some(4), None, false)
@@ -31760,6 +32745,27 @@ install therock";
             validate_pinned_gpu_index(7, None, None, false).unwrap(),
             vec![7]
         );
+    }
+
+    #[test]
+    fn effective_gpu_count_prefers_amd_smi_then_falls_back_to_vram_rows() {
+        let usage = [vram(0, 1_000, 192_000), vram(1, 1_000, 192_000)];
+        // amd-smi's count wins when it is known, even over a differing row count.
+        assert_eq!(effective_gpu_count(Some(4), Some(&usage)), Some(4));
+        // amd-smi unavailable (`None`): the sysfs VRAM fallback row count stands in.
+        assert_eq!(effective_gpu_count(None, Some(&usage)), Some(2));
+        // The second, previously untested fallback trigger: amd-smi ran and
+        // reported zero devices. `Some(0)` must fall through to the VRAM rows
+        // just as `None` does, or a host amd-smi cannot enumerate but sysfs can
+        // would have nothing for `--gpu auto` to rank. Dropping the
+        // `filter(|&count| count > 0)` on `detected` turns this line red.
+        assert_eq!(effective_gpu_count(Some(0), Some(&usage)), Some(2));
+        // Neither source available.
+        assert_eq!(effective_gpu_count(None, None), None);
+        assert_eq!(effective_gpu_count(None, Some(&[])), None);
+        // Both present but both empty: still nothing to rank.
+        assert_eq!(effective_gpu_count(Some(0), Some(&[])), None);
+        assert_eq!(effective_gpu_count(Some(0), None), None);
     }
 
     #[test]
@@ -31849,6 +32855,126 @@ install therock";
         assert_eq!(rows[0].used_mb, 1000);
         assert_eq!(rows[1].index, 1);
         assert!((rows[1].free_fraction().unwrap() - (142_000.0 / 192_000.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn read_drm_vram_usage_reads_a_single_amdgpu_card_and_assigns_ordinal_zero() {
+        // Plant a minimal `/sys/class/drm`-shaped tree: one AMD card, a connector
+        // sub-node that must be skipped, and a non-AMD card that must be ignored.
+        let root = std::env::temp_dir().join(format!("rocm-drm-vram-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plant_amd = |card: &str, total: u64, used: u64| {
+            let device = root.join(card).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("vendor"), "0x1002\n").unwrap();
+            fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
+            fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
+        };
+        // 192 GiB total, mostly free (values in bytes).
+        plant_amd("card0", 206_158_430_208, 1_073_741_824);
+        // A connector sub-node under card0 — must be skipped, not parsed as a card.
+        fs::create_dir_all(root.join("card0-DP-1")).unwrap();
+        // A non-AMD primary card — different vendor, must be ignored.
+        let intel = root.join("card1").join("device");
+        fs::create_dir_all(&intel).unwrap();
+        fs::write(intel.join("vendor"), "0x8086\n").unwrap();
+        fs::write(intel.join("mem_info_vram_total"), "1000000\n").unwrap();
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(rows.len(), 1, "only the one AMD card counts: {rows:?}");
+        assert_eq!(rows[0].index, 0);
+        // 206_158_430_208 bytes / 1 MiB == 196_608 MiB.
+        assert_eq!(rows[0].total_mb, 196_608);
+        assert!(rows[0].free_fraction().unwrap() > AUTO_FREE_VRAM_FRACTION);
+    }
+
+    #[test]
+    fn read_drm_vram_usage_withholds_telemetry_when_multiple_amd_cards_are_present() {
+        // Ascending `card<N>` order is not guaranteed to match HIP's compute
+        // ordinal once more than one AMD card exists (e.g. an APU alongside a
+        // dGPU), so the fallback must not hand out ordinals it cannot vouch for.
+        let root = std::env::temp_dir().join(format!("rocm-drm-vram-multi-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let plant_amd = |card: &str, total: u64, used: u64| {
+            let device = root.join(card).join("device");
+            fs::create_dir_all(&device).unwrap();
+            fs::write(device.join("vendor"), "0x1002\n").unwrap();
+            fs::write(device.join("mem_info_vram_total"), format!("{total}\n")).unwrap();
+            fs::write(device.join("mem_info_vram_used"), format!("{used}\n")).unwrap();
+        };
+        plant_amd("card0", 206_158_430_208, 1_073_741_824);
+        plant_amd("card1", 206_158_430_208, 189_284_651_008);
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rows.is_empty(),
+            "multi-card sysfs telemetry must be withheld: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn read_drm_vram_usage_withholds_telemetry_when_a_second_amd_card_has_no_counter() {
+        // The guard must count AMD cards *found*, not surviving rows: a genuine
+        // two-AMD-card host where the second card's `used` counter is unreadable
+        // would otherwise slip past a `rows.len() > 1` check and mislabel the
+        // survivor ordinal 0 — the exact APU+dGPU misattribution the guard exists
+        // to prevent.
+        let root =
+            std::env::temp_dir().join(format!("rocm-drm-vram-partial-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // card0: fully readable.
+        let card0 = root.join("card0").join("device");
+        fs::create_dir_all(&card0).unwrap();
+        fs::write(card0.join("vendor"), "0x1002\n").unwrap();
+        fs::write(card0.join("mem_info_vram_total"), "206158430208\n").unwrap();
+        fs::write(card0.join("mem_info_vram_used"), "1073741824\n").unwrap();
+        // card1: AMD, but its `used` counter cannot be read.
+        let card1 = root.join("card1").join("device");
+        fs::create_dir_all(&card1).unwrap();
+        fs::write(card1.join("vendor"), "0x1002\n").unwrap();
+        fs::write(card1.join("mem_info_vram_total"), "206158430208\n").unwrap();
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rows.is_empty(),
+            "a second AMD card must trip the guard even without readable counters: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn read_drm_vram_usage_skips_a_card_with_an_unreadable_used_counter() {
+        // A card whose `mem_info_vram_used` cannot be read must not be treated as
+        // 0 bytes used (100% free) — that would make a broken counter look like
+        // the ideal `--gpu auto` pick. It should be skipped entirely instead.
+        let root =
+            std::env::temp_dir().join(format!("rocm-drm-vram-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let device = root.join("card0").join("device");
+        fs::create_dir_all(&device).unwrap();
+        fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        fs::write(device.join("mem_info_vram_total"), "206158430208\n").unwrap();
+        // No `mem_info_vram_used` file written at all.
+
+        let rows = read_drm_vram_usage(&root);
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rows.is_empty(),
+            "a card with no readable used counter must be skipped: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn read_drm_vram_usage_is_empty_without_a_drm_tree() {
+        let missing = std::env::temp_dir().join("rocm-drm-vram-absent-98765");
+        let _ = fs::remove_dir_all(&missing);
+        assert!(read_drm_vram_usage(&missing).is_empty());
     }
 
     #[test]
@@ -32093,6 +33219,44 @@ install therock";
                 "{label}: a non-root plan still depends on a sudo binary"
             );
         }
+    }
+
+    /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
+    /// trips the serve-plan low-VRAM warning on a non-APU (vLLM-lane) host, and
+    /// stay inert when the var is unset. This is what the `@requires-gpu`
+    /// `serve-vllm-low-vram-oom-guidance` scenario relies on to fire the note
+    /// deterministically on cards that are really free.
+    #[cfg(feature = "e2e-test-hooks")]
+    #[test]
+    fn forced_low_vram_hook_trips_the_serve_plan_warning() {
+        let mut env = ScopedTestEnv::new();
+
+        // Unset: the hook contributes nothing and real telemetry is consulted.
+        env.clear("ROCM_E2E_FORCE_LOW_VRAM");
+        assert!(
+            simulated_low_vram_usage().is_none(),
+            "no override without the env var"
+        );
+
+        // Set to ordinal 0: a single near-full device that the serve-plan wrapper
+        // reports on a discrete (non-APU) host but that stays honest there.
+        env.set("ROCM_E2E_FORCE_LOW_VRAM", "0");
+        let forced = simulated_low_vram_usage().expect("override present when the var is set");
+        assert_eq!(
+            forced.len(),
+            1,
+            "single synthetic GPU keeps the APU guard honest"
+        );
+        assert_eq!(forced[0].index, 0);
+        assert!(
+            forced[0]
+                .free_fraction()
+                .is_some_and(|f| f < AUTO_FREE_VRAM_FRACTION),
+            "the synthetic reading must be below the free-VRAM bar so the warning fires"
+        );
+        let warning = serve_gpu_low_memory_warning(&[0], Some(&forced), Some(&host_gpu("gfx1100")))
+            .expect("a near-full discrete card warrants the serve-plan warning");
+        assert!(warning.contains("GPU 0"));
     }
 
     #[test]
@@ -36910,7 +38074,10 @@ ID_LIKE="suse opensuse"
                 arguments: serde_json::json!({
                     "artifact_ref": "tiny/model#gguf",
                     "allow_artifact_download": true,
-                    "artifact_max_bytes": 1_048_576
+                    // One byte under 1 MiB: `{:.1}` rounds it up to a full
+                    // 1024 KB, so the approved cap must read as "1.0 MB", not
+                    // "1024.0 KB".
+                    "artifact_max_bytes": 1_048_575
                 }),
                 reviewed_at_unix_ms: None,
             },
