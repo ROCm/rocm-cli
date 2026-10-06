@@ -29,9 +29,10 @@ const ABOUT_CONFIG: &str = "about.toml";
 /// cargo-about version the committed notices are reproducible with. Different
 /// versions format the output differently, so regenerating with anything else
 /// produces a file that fails the byte-for-byte `--check` gate in CI. Kept in
-/// sync with the workflows and CONTRIBUTING.md by
-/// `pinned_version_matches_workflows_and_docs` below.
-const ABOUT_VERSION: &str = "0.9.1";
+/// sync with the workflows, CONTRIBUTING.md and MANIFEST.md by
+/// `pinned_tool_versions_match_across_docs_and_workflows` in
+/// `workflow_contract.rs`, which needs crate visibility to read this.
+pub(crate) const ABOUT_VERSION: &str = "0.9.1";
 
 /// What to do with freshly generated notices relative to what is on disk.
 #[derive(Debug, PartialEq, Eq)]
@@ -257,66 +258,5 @@ mod tests {
         assert_eq!(parse_about_version("cargo-about"), None);
         assert_eq!(parse_about_version("cargo-deny 0.9.1"), None);
         assert_eq!(parse_about_version(""), None);
-    }
-
-    /// The pinned constant and the version CI installs, and the version
-    /// CONTRIBUTING.md tells contributors to install locally, must never drift:
-    /// a workflow mismatch makes the hook regenerate notices that fail the
-    /// byte-for-byte gate (CI); a CONTRIBUTING.md mismatch sends a contributor
-    /// to install a version `classify_generator` rejects, so the hook silently
-    /// no-ops and CI remains the only gate.
-    #[test]
-    fn pinned_version_matches_workflows_and_docs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("xtask crate has a parent directory")
-            .to_path_buf();
-        // Anchored on a trailing space so a suffixed version (`0.9.10`) can't
-        // satisfy a check meant for `0.9.1`, mirroring the hawkeye pin guard
-        // in workflow_contract.rs.
-        let expected = format!("cargo-about@{ABOUT_VERSION} ");
-        for workflow in ["ci.yml", "dependabot-manifests.yml"] {
-            let path = root.join(".github/workflows").join(workflow);
-            let yaml = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-            // Check every `cargo-about@` line, not just that the correct one
-            // is present: a stale duplicate left behind by a previous bump
-            // would otherwise still satisfy a plain `contains`.
-            let pins: Vec<&str> = yaml
-                .lines()
-                .filter(|line| line.contains("cargo-about@"))
-                .collect();
-            assert!(
-                !pins.is_empty(),
-                "{workflow} must install cargo-about@{ABOUT_VERSION} to match ABOUT_VERSION in tpn.rs"
-            );
-            for pin in pins {
-                assert!(
-                    pin.contains(&expected),
-                    "{workflow} has a stale cargo-about pin that does not match \
-                     ABOUT_VERSION in tpn.rs ({ABOUT_VERSION}):\n{pin}"
-                );
-            }
-        }
-
-        let contributing = root.join("CONTRIBUTING.md");
-        let text = std::fs::read_to_string(&contributing)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", contributing.display()));
-        let pins: Vec<&str> = text
-            .lines()
-            .filter(|line| line.contains("cargo-about@"))
-            .collect();
-        assert!(
-            !pins.is_empty(),
-            "CONTRIBUTING.md must instruct `cargo install cargo-about@{ABOUT_VERSION} \
-             --locked --features cli` to match ABOUT_VERSION in tpn.rs"
-        );
-        for pin in pins {
-            assert!(
-                pin.contains(&expected),
-                "CONTRIBUTING.md has a stale cargo-about pin that does not match \
-                 ABOUT_VERSION in tpn.rs ({ABOUT_VERSION}):\n{pin}"
-            );
-        }
     }
 }

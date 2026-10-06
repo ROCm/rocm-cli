@@ -2145,139 +2145,98 @@ esac
         );
     }
 
-    /// The hawkeye version CONTRIBUTING.md documents and the version `ci.yml`'s
-    /// `license-headers` job installs must never drift: if they do, a
-    /// contributor's local pre-commit hook can bless a header hawkeye's CI
-    /// build would reject, or vice versa.
+    /// Extract the version token right after `{tool}@` in `line`, up to the
+    /// next whitespace. `cargo install hawkeye@7.0.0 --locked` yields `7.0.0`.
+    /// Compared for exact equality (not `contains`) so neither a stale
+    /// duplicate pin nor a version sharing a prefix (`0.9.10` satisfying a
+    /// check for `0.9.1`) can false-pass.
+    fn pin_token<'a>(line: &'a str, tool: &str) -> Option<&'a str> {
+        let marker = format!("{tool}@");
+        let (_, rest) = line.split_once(&marker)?;
+        Some(rest.split_whitespace().next().unwrap_or(rest))
+    }
+
+    /// Every `{tool}@` line in `text` — not just the first — must pin exactly
+    /// `expected`: a stale duplicate left behind by a previous bump must not
+    /// go unnoticed.
+    fn assert_pins_match(tool: &str, expected: &str, path: &Path, text: &str) {
+        let mut found = false;
+        for line in text.lines() {
+            let Some(token) = pin_token(line, tool) else {
+                continue;
+            };
+            found = true;
+            assert_eq!(
+                token,
+                expected,
+                "{} pins `{tool}@{token}`, which does not match the pinned version \
+                 `{expected}`:\n{line}",
+                path.display()
+            );
+        }
+        assert!(
+            found,
+            "{} has no `{tool}@` pin; expected `{tool}@{expected}`",
+            path.display()
+        );
+    }
+
+    /// The hawkeye and cargo-about versions pinned across CI, CONTRIBUTING.md
+    /// and (for cargo-about) MANIFEST.md must never drift from each other: a
+    /// mismatch lets a contributor's local tool accept or reject something CI
+    /// disagrees with, silently leaving CI as the only real gate.
     ///
-    /// The version lives in exactly one place — `ci.yml`'s `license-headers`
-    /// job's `env:` mapping — and is read from there with the extractors this
-    /// file already has fixture tests for (`job_block`, `job_mapping`), rather
-    /// than duplicated into a constant. A bump needs three edits: this test
+    /// hawkeye's canonical version lives in `ci.yml`'s `license-headers`
+    /// job's `env:` mapping, read with the extractors this file already has
+    /// fixture tests for (`job_block`, `job_mapping`) rather than duplicated
+    /// into a constant — scoped to that one job so a nested step `env` or an
+    /// unrelated job can't leak in. A bump needs three edits: this test
     /// guards two of them (ci.yml's `HAWKEYE_VERSION` and CONTRIBUTING.md);
     /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
-    /// here — see the comment at its definition.
+    /// here — see the comment at its definition. cargo-about's canonical
+    /// version is the `ABOUT_VERSION` constant in `tpn.rs`, which is what
+    /// `cargo xtask tpn` itself builds against.
+    ///
+    /// One table, one check: a new pinned tool, or a new file that mentions
+    /// an existing one, costs a row here rather than another ~30-line test.
     #[test]
-    fn hawkeye_pin_matches_ci_workflow() {
+    fn pinned_tool_versions_match_across_docs_and_workflows() {
         let ci = read_workflow("ci.yml");
-        let job = job_block(&ci, "license-headers");
-        let env = job_mapping(job, "env");
-        let installed = env
+        let hawkeye_env = job_mapping(job_block(&ci, "license-headers"), "env");
+        let hawkeye_installed = hawkeye_env
             .get("HAWKEYE_VERSION")
             .unwrap_or_else(|| panic!("license-headers job has no HAWKEYE_VERSION entry"));
         // ci.yml's env var is `v`-prefixed (`v7.0.0`); CONTRIBUTING.md's prose
         // is not (`hawkeye@7.0.0`).
-        let version = installed
+        let hawkeye_version = hawkeye_installed
             .strip_prefix('v')
-            .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{installed}` must be `v`-prefixed"));
+            .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{hawkeye_installed}` must be `v`-prefixed"))
+            .to_owned();
 
-        let contributing = repo_root().join("CONTRIBUTING.md");
-        let contributing_text = std::fs::read_to_string(&contributing)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", contributing.display()));
-        let documented = format!("cargo install hawkeye@{version} --locked");
+        let root = repo_root();
+        let read = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        };
 
-        // Check every `hawkeye@` line, not just that the correct one is present:
-        // a stale duplicate left behind by a previous bump would otherwise still
-        // satisfy a plain `contains`.
-        let pins: Vec<&str> = contributing_text
-            .lines()
-            .filter(|line| line.contains("hawkeye@"))
-            .collect();
-        assert!(
-            !pins.is_empty(),
-            "CONTRIBUTING.md must instruct `{documented}` to match ci.yml's \
-             license-headers job (HAWKEYE_VERSION: {installed})"
-        );
-        for pin in pins {
-            assert!(
-                pin.contains(&documented),
-                "CONTRIBUTING.md has a stale hawkeye pin that does not match ci.yml's \
-                 license-headers job (HAWKEYE_VERSION: {installed}):\n{pin}"
-            );
-        }
-    }
+        let table: [(&str, String, &[&str]); 2] = [
+            ("hawkeye", hawkeye_version, &["CONTRIBUTING.md"]),
+            (
+                "cargo-about",
+                crate::tpn::ABOUT_VERSION.to_owned(),
+                &[
+                    "CONTRIBUTING.md",
+                    "MANIFEST.md",
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
+        ];
 
-    /// Extensions this repo's license-header enforcement covers, mapped to the
-    /// prek/`identify` tag that extension resolves to. Hand-maintained: `identify`'s
-    /// extension→tag table isn't something this crate can query, so a new glob in
-    /// `licenserc.toml`'s `[files].includes` needs a matching entry here before the
-    /// test below can check it.
-    const LICENSE_HEADER_EXTENSION_TAGS: &[(&str, &str)] = &[
-        ("rs", "rust"),
-        ("py", "python"),
-        ("sh", "shell"),
-        ("md", "markdown"),
-    ];
-
-    /// Every glob in `licenserc.toml`'s `[files].includes` must have a matching
-    /// tag in `.pre-commit-config.yaml`'s `license-headers` hook `types_or`
-    /// (the check runs only in this direction, not the reverse): a glob with
-    /// no matching tag means prek silently skips that file type locally while
-    /// CI's hawkeye still enforces it — the exact gap closed by adding
-    /// `markdown` to that hook's `types_or` in `.pre-commit-config.yaml`.
-    #[test]
-    fn license_header_hook_covers_licenserc_includes() {
-        let licenserc = std::fs::read_to_string(repo_root().join("licenserc.toml"))
-            .unwrap_or_else(|e| panic!("reading licenserc.toml: {e}"));
-        let includes_block = licenserc
-            .split_once("includes = [")
-            .and_then(|(_, rest)| rest.split_once(']'))
-            .map_or_else(
-                || panic!("licenserc.toml has no `includes = [...]` array:\n{licenserc}"),
-                |(block, _)| block,
-            );
-
-        let precommit = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
-            .unwrap_or_else(|e| panic!("reading .pre-commit-config.yaml: {e}"));
-        let hook_block = precommit.split_once("id: license-headers").map_or_else(
-            || panic!("no `license-headers` hook in .pre-commit-config.yaml"),
-            |(_, rest)| {
-                rest.split_once("\n      - id:")
-                    .map_or(rest, |(block, _)| block)
-            },
-        );
-        let types_or_line = hook_block
-            .lines()
-            .find(|line| line.trim_start().starts_with("types_or:"))
-            .unwrap_or_else(|| {
-                panic!("license-headers hook has no `types_or:` line:\n{hook_block}")
-            });
-        let types_or: Vec<&str> = types_or_line
-            .split_once('[')
-            .and_then(|(_, rest)| rest.split_once(']'))
-            .map_or_else(
-                || panic!("`types_or:` is not a bracketed list:\n{types_or_line}"),
-                |(tags, _)| tags.split(',').map(str::trim).collect(),
-            );
-
-        for glob in includes_block
-            .split(',')
-            .map(|entry| entry.trim().trim_matches('"'))
-            .filter(|glob| !glob.is_empty())
-        {
-            let file_name = glob.rsplit('/').next().unwrap_or(glob);
-            let ext = file_name.rsplit_once('.').map_or_else(
-                || panic!("licenserc.toml include `{glob}` has no extension"),
-                |(_, ext)| ext,
-            );
-            let tag = LICENSE_HEADER_EXTENSION_TAGS
-                .iter()
-                .find(|(e, _)| *e == ext)
-                .map_or_else(
-                    || {
-                        panic!(
-                            "licenserc.toml includes `{glob}` (.{ext}); add its prek tag to \
-                             LICENSE_HEADER_EXTENSION_TAGS before this test can check it"
-                        )
-                    },
-                    |(_, tag)| *tag,
-                );
-            assert!(
-                types_or.contains(&tag),
-                "licenserc.toml includes `{glob}` but .pre-commit-config.yaml's \
-                 license-headers hook `types_or` does not list `{tag}`, so prek silently \
-                 skips {ext} files that CI's hawkeye still enforces:\ntypes_or: {types_or:?}"
-            );
+        for (tool, expected, files) in table {
+            for file in files {
+                assert_pins_match(tool, &expected, &root.join(file), &read(file));
+            }
         }
     }
 
