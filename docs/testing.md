@@ -1143,7 +1143,11 @@ cargo test -p rocmd supervisor_exit_write_keeps_a_standing_stop_marker
 cargo test -p rocmd supervisor_exit_write_leaves_a_record_it_no_longer_owns
 cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
 cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
+cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
+cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
 cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
+cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
+cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
 ```
 
 Server recovery never restarts a service with a standing stop request
@@ -1152,7 +1156,9 @@ confirmed. Without that, an unconfirmed stop — which leaves the status at
 `ready` — would be undone by the `server-recover` watcher. So both stops
 (`rocmd`'s and `rocm services stop`) persist the marker before signalling
 anything, and the supervisor's and a restart's later writes re-read the
-record and never clear it.
+record and never clear it. Each stop also re-reads the record before its own
+final write, and confirms the stop only if that record still names the
+processes it handled.
 
 Automation GPU-metrics event tests:
 
