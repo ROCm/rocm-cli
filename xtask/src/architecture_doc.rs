@@ -252,6 +252,54 @@ fn is_directory_shaped(span: &str) -> bool {
     is_directory_path || is_hyphenated_bare_word(span)
 }
 
+/// Whether `inter_text` — the raw prose accumulated since a possessive
+/// clause's owner was last confirmed — continues that clause rather than
+/// ending it, for the continuation step (the initial `'s` owner-establishing
+/// step is a separate, exact-match check and unaffected by this).
+///
+/// A real split's prose connects its files with free English — "was split
+/// into", "a mechanical relocation, since ..." — not just `/`/`and`/`,`,
+/// and interleaves explanatory asides (type names, identifiers) between
+/// them. Requiring a literal connector token directly before every citation
+/// (the original, stricter design) rejects exactly this ordinary writing: a
+/// doc edit this mundane should not need unusual phrasing just to keep CI
+/// green. So the clause continues through *any* text, with one
+/// unconditional exception: a sentence-ending `.` always ends it, no matter
+/// what else is in `inter_text`. That's the safety net against the masking
+/// risk the module doc warns about — without it, a later sentence naming an
+/// unrelated file from a *different* crate in the same heading, with no new
+/// possessive clause of its own, would silently inherit an earlier owner
+/// instead of falling back to the heading's full (and correctly checked)
+/// crate list. A single sentence is a safe enough unit to trust: shifting to
+/// a different crate's file without starting a new clause or sentence would
+/// be confusing prose on its own merits, not just a gap in this checker.
+///
+/// A sentence-ending `.` means one followed by whitespace (or nothing, at
+/// the end of `inter_text`) — not a bare `.` glued to surrounding
+/// characters. This doc itself now de-backticks the removed `agent.rs`
+/// filename right inside a clause this function must keep alive ("old
+/// agent.rs was split into ..."); a naive "any `.`" check would wrongly
+/// treat that file extension's dot as a sentence end.
+fn continues_possessive_clause(inter_text: &str) -> bool {
+    !ends_with_a_sentence_boundary(inter_text)
+}
+
+/// Whether `text` contains a period that ends a sentence, as opposed to one
+/// embedded in ordinary prose (a filename like `agent.rs`, a version like
+/// `v1.0`) — see [`continues_possessive_clause`] for why that distinction
+/// matters here. A period counts as sentence-ending only when followed by
+/// whitespace or nothing (the end of `text`); one directly glued to the next
+/// character on both sides never does.
+fn ends_with_a_sentence_boundary(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'.'
+            && bytes
+                .get(i + 1)
+                .is_none_or(|&next| next.is_ascii_whitespace())
+    })
+}
+
 /// Extract every backtick-quoted path citation from the doc's markdown
 /// source, paired with its section context. Powered by `pulldown-cmark`,
 /// which handles fenced code blocks (backtick and tilde), indented code
@@ -266,9 +314,9 @@ fn is_directory_shaped(span: &str) -> bool {
 /// each independently make the same claim. A citation that instead names one
 /// specific crate from a multi-crate heading (`` `rocm-dash-tui`\'s
 /// `agent.rs` ``) is narrowed to just that crate via the possessive-connector
-/// check: `'s` starts a possessive clause, `/` and `and` continue one.
-/// Only `.rs` citations are narrowed this way; the logic lives inline in
-/// the `Event::Code` arm below.
+/// check: `'s` starts a possessive clause; [`continues_possessive_clause`]
+/// decides what continues one. Only `.rs` citations are narrowed this way;
+/// the logic lives inline in the `Event::Code` arm below.
 fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
@@ -382,7 +430,16 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                 }
 
                 if !is_path_candidate(span) {
-                    reset_inline!();
+                    // Unlike a block/heading/paragraph boundary, a stray
+                    // non-path span (a type name, an identifier) inside a
+                    // possessive clause's explanatory aside is transparent to
+                    // the chain, not a hard break: only the immediately
+                    // preceding prose is cleared (so it can't be misread as a
+                    // connector by the next citation), but the active owner
+                    // and last code span survive — see
+                    // `continues_possessive_clause`'s doc comment for why
+                    // this is still safe.
+                    inter_text.clear();
                     continue;
                 }
 
@@ -394,9 +451,11 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                     continue;
                 }
 
-                // Resolve the possessive owner for this span — the three
-                // connectors the doc uses: 's starts a clause, / and `and`
-                // continue one.  Only scoped (.rs) citations are narrowed.
+                // Resolve the possessive owner for this span — the clause
+                // starts with 's, and continues via / or `and`, optionally
+                // wrapped in ordinary list punctuation (see
+                // `continues_possessive_clause`). Only scoped (.rs) citations
+                // are narrowed.
                 let trimmed = inter_text.trim();
                 let new_owner: Option<String> = if is_scoped_extension(span) {
                     if trimmed == "'s" {
@@ -404,7 +463,7 @@ fn extract_path_citations(markdown: &str) -> BTreeSet<Citation> {
                             .as_deref()
                             .filter(|s| is_directory_shaped(s))
                             .map(str::to_string)
-                    } else if matches!(trimmed, "/" | "and") {
+                    } else if continues_possessive_clause(trimmed) {
                         possessive_owner.clone()
                     } else {
                         None
@@ -1213,6 +1272,92 @@ Every listed crate's `mod.rs` is a placeholder example, not real doc prose.
         assert_eq!(
             agent_citation.section_dirs,
             vec!["crates/rocm-dash-tui".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_path_citations_keeps_an_owner_through_an_unrelated_aside() {
+        // Regression: the real doc's `rocm-dash-tui` paragraph interleaves
+        // type names (`AgentClient`, `rig`) between the files a possessive
+        // clause names — each one a non-path Code span that used to fully
+        // reset the chain (`reset_inline!()`), losing the owner for every
+        // citation after the first. The aside must be transparent instead.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs` (the `AgentClient` seam) and `agent/snapshot.rs` (no `rig` dependency).
+";
+        let citations = extract_path_citations(markdown);
+        for text in ["agent/mod.rs", "agent/snapshot.rs"] {
+            let citation = citations
+                .iter()
+                .find(|c| c.text == text)
+                .unwrap_or_else(|| panic!("expected a {text} citation"));
+            assert_eq!(
+                citation.section_dirs,
+                vec!["rocm-dash-tui".to_string()],
+                "{text} should stay narrowed to rocm-dash-tui through the aside"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_path_citations_narrows_a_natural_comma_and_list() {
+        // Regression: a contributor listing split files the way ordinary
+        // English lists things ("X, Y, Z, and W") rather than joining them
+        // with literal slashes must not lose narrowing on the middle items —
+        // only the last pair uses the word `and`; the rest are plain commas.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs`, `agent/snapshot.rs`, `agent/tools.rs`, and `agent/clients.rs`.
+";
+        let citations = extract_path_citations(markdown);
+        for text in [
+            "agent/mod.rs",
+            "agent/snapshot.rs",
+            "agent/tools.rs",
+            "agent/clients.rs",
+        ] {
+            let citation = citations
+                .iter()
+                .find(|c| c.text == text)
+                .unwrap_or_else(|| panic!("expected a {text} citation"));
+            assert_eq!(
+                citation.section_dirs,
+                vec!["rocm-dash-tui".to_string()],
+                "{text} should be narrowed to rocm-dash-tui via the comma list"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_path_citations_does_not_leak_an_owner_across_a_sentence_boundary() {
+        // The relaxations above must not regress into the rejected "sticky
+        // for the rest of the heading" design: a new sentence naming a file
+        // that belongs to a *different* crate the heading also lists, with
+        // no possessive clause of its own, must NOT inherit the previous
+        // sentence's owner — it should fall back to the heading's full
+        // (and correctly checked) crate list instead.
+        let markdown = "\
+### `crates/rocm-dash-core`, `rocm-dash-collectors`, `rocm-dash-daemon`, `rocm-dash-tui` — dashboard/telemetry
+
+`rocm-dash-tui`'s `agent.rs` was split into `agent/mod.rs` and `agent/snapshot.rs`. Elsewhere, `metrics.rs` tracks collector throughput.
+";
+        let citations = extract_path_citations(markdown);
+        let metrics_citation = citations
+            .iter()
+            .find(|c| c.text == "metrics.rs")
+            .expect("expected a metrics.rs citation");
+        assert_eq!(
+            metrics_citation.section_dirs,
+            vec![
+                "crates/rocm-dash-core".to_string(),
+                "rocm-dash-collectors".to_string(),
+                "rocm-dash-daemon".to_string(),
+                "rocm-dash-tui".to_string(),
+            ],
+            "metrics.rs must not inherit rocm-dash-tui from the earlier sentence"
         );
     }
 
