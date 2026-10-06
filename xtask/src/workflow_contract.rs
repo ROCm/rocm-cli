@@ -6445,7 +6445,7 @@ fi
             (
                 "windows-debug",
                 "Local no-fallback smoke",
-                &["smoke_local.py --skip-build"],
+                &["cargo xtask smoke --skip-build"],
                 &[],
                 HEAVY,
             ),

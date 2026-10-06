@@ -359,13 +359,13 @@ cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ig
 Run the cross-platform smoke test:
 
 ```bash
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 If the workspace is already built:
 
 ```bash
-python scripts/smoke_local.py --skip-build
+cargo xtask smoke --skip-build
 ```
 
 ### Property tests
