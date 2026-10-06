@@ -23,6 +23,7 @@ use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
+use crate::{empty_as_unknown, parse_os_release_field, read_os_release};
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
@@ -1584,23 +1585,6 @@ const fn driver_plan_approval_label(
     }
 }
 
-pub(crate) const fn empty_as_unknown(value: &str) -> &str {
-    if value.is_empty() { "<unknown>" } else { value }
-}
-
-pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let Some((name, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        if name != key {
-            continue;
-        }
-        return Some(raw_value.trim().trim_matches('"').to_owned());
-    }
-    None
-}
-
 fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
     match (os_id, version_id) {
         ("ubuntu", "22.04") => Some("jammy"),
@@ -1609,10 +1593,6 @@ fn codename_for_version(os_id: &str, version_id: &str) -> Option<&'static str> {
         ("debian", "13") => Some("noble"),
         _ => None,
     }
-}
-
-pub(crate) fn read_os_release() -> Result<String> {
-    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
 }
 
 fn run_driver_shell_command(command: &str) -> Result<()> {
@@ -1633,25 +1613,6 @@ fn run_shell_command_with_stdin(command: &str, stdin: Stdio) -> Result<()> {
         .with_context(|| format!("failed to launch `{command}`"))?;
     if !status.success() {
         bail!("`{command}` exited with {status}");
-    }
-    Ok(())
-}
-
-/// Run a command given as an argv vector directly, without going through a shell.
-///
-/// Used for [`run_system_package_install_plan`], whose commands are modeled as
-/// argv vectors so no shell quoting or `sudo`-prefix string handling is needed.
-pub(crate) fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
-    let (program, args) = argv
-        .split_first()
-        .context("install command has no program to run")?;
-    let status = ProcessCommand::new(program)
-        .args(args)
-        .stdin(stdin)
-        .status()
-        .with_context(|| format!("failed to launch `{}`", argv.join(" ")))?;
-    if !status.success() {
-        bail!("`{}` exited with {status}", argv.join(" "));
     }
     Ok(())
 }

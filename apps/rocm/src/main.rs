@@ -23,19 +23,18 @@ mod storage;
 mod therock;
 mod uninstall;
 
-// Per-command handler fns mechanically relocated into modules.
+// Per-command handlers mechanically relocated into modules — fns, plus the
+// types (e.g. `ServeArgs`, driver-plan types) and command-local selection
+// types (e.g. `select_serve_engine`) that moved with their cluster.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
-// mergeability); only the fn definitions moved out of main.rs.
+// mergeability).
 use crate::automations::automations;
-use crate::driver_install::{
-    empty_as_unknown, install_driver, parse_os_release_field, read_os_release,
-    reconcile_driver_install, run_argv_with_stdin,
-};
+use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{
     engine_manages_own_runtime, engines, env_root_for_engine_install, env_root_for_service,
     runtime_key_for_python, runtime_manifest_for_selector,
 };
-use crate::serve_cmd::{ServeArgs, serve};
+use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
@@ -52,16 +51,15 @@ use rocm_core::{
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
     builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    detect_host_gfx_target, engine_binary_path, engine_plugin_dirs, format_host_port,
-    format_http_base_url, interactive_terminal, load_model_recipe_registry,
+    detect_host_gfx_target, detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs,
+    format_host_port, format_http_base_url, interactive_terminal, load_model_recipe_registry,
     load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
     managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
     model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
     normalize_therock_family, platform_matches_gfx_family,
     preferred_serve_engine_for_host_gpu_summary, process_is_running, read_http_response_bounded,
     resolve_builtin_model_recipe, runtime_install_root_is_protected,
-    runtime_path_is_same_or_inside, runtime_python_executable_in_env, uv_cache_source,
-    write_all_tcp_stream,
+    runtime_python_executable_in_env, uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -6628,13 +6626,7 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     rocm_core::runtime_paths_equivalent(&left, &right)
 }
 
-fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
-    let path = normalize_path_for_compare(path);
-    let base = normalize_path_for_compare(base);
-    runtime_path_is_same_or_inside(&path, &base)
-}
-
-fn normalize_path_for_compare(path: &Path) -> PathBuf {
+pub(crate) fn normalize_path_for_compare(path: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
     }
@@ -6785,6 +6777,46 @@ const fn system_package_install_action(
         },
         escalate_failure: approved,
     }
+}
+
+pub(crate) const fn empty_as_unknown(value: &str) -> &str {
+    if value.is_empty() { "<unknown>" } else { value }
+}
+
+pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let Some((name, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        if name != key {
+            continue;
+        }
+        return Some(raw_value.trim().trim_matches('"').to_owned());
+    }
+    None
+}
+
+pub(crate) fn read_os_release() -> Result<String> {
+    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
+}
+
+/// Run a command given as an argv vector directly, without going through a shell.
+///
+/// Used for [`run_system_package_install_plan`], whose commands are modeled as
+/// argv vectors so no shell quoting or `sudo`-prefix string handling is needed.
+pub(crate) fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
+    let (program, args) = argv
+        .split_first()
+        .context("install command has no program to run")?;
+    let status = ProcessCommand::new(program)
+        .args(args)
+        .stdin(stdin)
+        .status()
+        .with_context(|| format!("failed to launch `{}`", argv.join(" ")))?;
+    if !status.success() {
+        bail!("`{}` exited with {status}", argv.join(" "));
+    }
+    Ok(())
 }
 
 /// Ensure the OpenMPI runtime that vLLM requires is present before the vLLM wheel
@@ -13528,11 +13560,6 @@ fn render_examine_plain_header(summary: &ExamineSummary) -> String {
 
 fn plain_status_label(status: &str) -> String {
     status.replace('_', " ")
-}
-
-pub(crate) fn render_engine_inventory_text() -> String {
-    let paths = AppPaths::discover().ok();
-    render_engine_inventory_text_with_paths(paths.as_ref())
 }
 
 /// Marker shown beside the engine `serve`/CLI commands default to. Every
@@ -31994,6 +32021,70 @@ install therock";
     }
 
     #[test]
+    fn render_engine_inventory_text_honors_configured_default_engine() {
+        // Regression: this renderer used to mark only `default_engine_for_host`,
+        // ignoring a configured `default_engine` — the same host-vs-configured
+        // precedence `select_serve_engine` and `append_examine_engine_inventory`
+        // already honor. Pick whichever engine the host does NOT prefer so the
+        // configured value is guaranteed to actually change the marked engine.
+        let (root, paths) = test_paths("engine-inventory-configured-default");
+        let host_default =
+            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
+        let configured = if host_default == "vllm" {
+            "lemonade"
+        } else {
+            "vllm"
+        };
+        let config = RocmCliConfig {
+            default_engine: Some(configured.to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths).expect("save config");
+
+        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
+            "configured default engine {configured} must be marked; got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
+            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn examine_treats_a_blank_configured_engine_as_unset() {
+        // Mirrors `select_serve_engine`'s guard: a config file with
+        // `default_engine = ""` must fall back to the host preference rather
+        // than reporting an empty engine name as "effective" and marking none
+        // of the real ones.
+        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
+        let config = RocmCliConfig {
+            default_engine: Some(String::new()),
+            ..RocmCliConfig::default()
+        };
+        let mut output = String::new();
+
+        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+
+        assert!(
+            output.contains("configured_default_engine: <platform default>"),
+            "a blank configured value must read as unset:\n{output}"
+        );
+        assert!(
+            output.contains("effective_default_engine: vllm"),
+            "a blank configured value must fall back to the host default:\n{output}"
+        );
+        assert!(
+            output.contains("  * vllm "),
+            "the '*' marker must land on the host's default, not an empty name:\n{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn friendly_engine_detect_notes_hide_probe_and_path_noise() {
         let lemonade = friendly_engine_detect_notes(
             "lemonade",
@@ -33333,6 +33424,13 @@ install therock";
         let _ = fs::remove_dir_all(&root);
     }
 
+    // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----
+    //
+    // The interactive branches require a real TTY (`interactive_terminal()`),
+    // which is unavailable in CI, and the dash visuals are trust-prior. These
+    // tests instead PROVE the dispatch TARGET changed: the two interactive
+    // handlers now call `dash::run_chat` and no longer call `tui::run`. We read
+    // this source file at test time and assert on the handler bodies.
     fn main_rs_source() -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("src")

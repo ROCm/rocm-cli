@@ -18,7 +18,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, RocmCliConfig, default_interactive_shell_program, interactive_terminal,
-    prepend_runtime_path, runtime_python_activation_hint, runtime_python_env_bin_dir,
+    prepend_runtime_path, runtime_path_is_same_or_inside, runtime_python_activation_hint,
+    runtime_python_env_bin_dir,
 };
 use rocm_engine_protocol::{
     DetectRequest, DetectResponse, EngineMethod, InstallRequest, InstallResponse,
@@ -29,12 +30,23 @@ use crate::EnginesCommand;
 use crate::therock;
 use crate::{
     apply_app_path_env, engine_request, engine_request_with_env_root, ensure_libatomic_for_torch,
-    ensure_libnuma_for_torch, ensure_openmpi_for_vllm, path_is_same_or_inside,
-    record_cli_audit_event, recover_setup_runtime_registration, render_engine_inventory_text,
-    resolve_engine_selection, resolve_runtime_selector_to_exact_key, select_runtime_manifest,
-    settle_engine_install, validate_engine_selection_runtime,
-    validate_runtime_manifest_for_activation,
+    ensure_libnuma_for_torch, ensure_openmpi_for_vllm, normalize_path_for_compare,
+    record_cli_audit_event, recover_setup_runtime_registration,
+    render_engine_inventory_text_with_paths, resolve_engine_selection,
+    resolve_runtime_selector_to_exact_key, select_runtime_manifest, settle_engine_install,
+    validate_engine_selection_runtime, validate_runtime_manifest_for_activation,
 };
+
+pub(crate) fn render_engine_inventory_text() -> String {
+    let paths = AppPaths::discover().ok();
+    render_engine_inventory_text_with_paths(paths.as_ref())
+}
+
+fn path_is_same_or_inside(path: &Path, base: &Path) -> bool {
+    let path = normalize_path_for_compare(path);
+    let base = normalize_path_for_compare(base);
+    runtime_path_is_same_or_inside(&path, &base)
+}
 
 pub(crate) fn engines(command: EnginesCommand) -> Result<()> {
     match command {

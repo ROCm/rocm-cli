@@ -9,8 +9,12 @@
 //! re-imported via `use crate::serve_cmd::{serve, ServeArgs};`). `Cli`
 //! remains at the crate root, as does `DevicePolicyArg` (part of the clap
 //! arg tree). The managed-service-spawning tail (`start_managed_service`,
-//! `run_attached_service`, etc.) stays in `main.rs` since it's shared with
-//! the background-service runner outside this cluster.
+//! `run_attached_service`, `spawn_managed_engine_child`) stays in `main.rs`,
+//! re-imported here — not because anything outside this cluster calls it
+//! (it doesn't), but because it is entangled with other still-crate-root
+//! launch helpers (`stream_attached_logs`, `record_cli_audit_event`, and
+//! friends) that have not been relocated yet. Moving the spawning tail alone
+//! would just relocate the `use` statements, not reduce the coupling.
 
 use std::fmt::Write as _;
 
@@ -41,12 +45,12 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct ServeEngineSelection {
-    engine: String,
-    source: &'static str,
+pub(crate) struct ServeEngineSelection {
+    pub(crate) engine: String,
+    pub(crate) source: &'static str,
 }
 
-fn select_serve_engine(
+pub(crate) fn select_serve_engine(
     explicit_engine: Option<&str>,
     configured_default: Option<&str>,
     recipe: Option<&ModelRecipeRecord>,
@@ -954,11 +958,8 @@ mod tests {
     use super::*;
     use rocm_core::{ManagedServiceRecord, resolve_builtin_model_recipe};
 
+    use crate::build_freeform_plan_with_recipes;
     use crate::tests::test_paths;
-    use crate::{
-        DEFAULT_ENGINE_MARKER, append_examine_engine_inventory, build_freeform_plan_with_recipes,
-        render_engine_inventory_text_with_paths,
-    };
 
     /// Persist a live-looking managed record claiming `gpu` — the same shape a
     /// real launch writes, with the current process id as the supervisor so the
@@ -1629,70 +1630,6 @@ mod tests {
     }
 
     #[test]
-    fn render_engine_inventory_text_honors_configured_default_engine() {
-        // Regression: this renderer used to mark only `default_engine_for_host`,
-        // ignoring a configured `default_engine` — the same host-vs-configured
-        // precedence `select_serve_engine` and `append_examine_engine_inventory`
-        // already honor. Pick whichever engine the host does NOT prefer so the
-        // configured value is guaranteed to actually change the marked engine.
-        let (root, paths) = test_paths("engine-inventory-configured-default");
-        let host_default =
-            rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(Some(&paths)));
-        let configured = if host_default == "vllm" {
-            "lemonade"
-        } else {
-            "vllm"
-        };
-        let config = RocmCliConfig {
-            default_engine: Some(configured.to_owned()),
-            ..RocmCliConfig::default()
-        };
-        config.save(&paths).expect("save config");
-
-        let rendered = render_engine_inventory_text_with_paths(Some(&paths));
-        let _ = fs::remove_dir_all(root);
-
-        assert!(
-            rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {configured}")),
-            "configured default engine {configured} must be marked; got:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains(&format!("{DEFAULT_ENGINE_MARKER} {host_default}")),
-            "host default {host_default} must not be marked once a different engine is configured; got:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn examine_treats_a_blank_configured_engine_as_unset() {
-        // Mirrors `select_serve_engine`'s guard: a config file with
-        // `default_engine = ""` must fall back to the host preference rather
-        // than reporting an empty engine name as "effective" and marking none
-        // of the real ones.
-        let (root, paths) = test_paths("examine-engine-inventory-blank-configured");
-        let config = RocmCliConfig {
-            default_engine: Some(String::new()),
-            ..RocmCliConfig::default()
-        };
-        let mut output = String::new();
-
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
-
-        assert!(
-            output.contains("configured_default_engine: <platform default>"),
-            "a blank configured value must read as unset:\n{output}"
-        );
-        assert!(
-            output.contains("effective_default_engine: vllm"),
-            "a blank configured value must fall back to the host default:\n{output}"
-        );
-        assert!(
-            output.contains("  * vllm "),
-            "the '*' marker must land on the host's default, not an empty name:\n{output}"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn launch_lock_makes_gpu_select_and_claim_atomic() {
         // Regression for the serve read-select-launch race: the busy-GPU read and
         // the claiming record write must happen under one lock, or two concurrent
@@ -1765,12 +1702,4 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
-
-    // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----
-    //
-    // The interactive branches require a real TTY (`interactive_terminal()`),
-    // which is unavailable in CI, and the dash visuals are trust-prior. These
-    // tests instead PROVE the dispatch TARGET changed: the two interactive
-    // handlers now call `dash::run_chat` and no longer call `tui::run`. We read
-    // this source file at test time and assert on the handler bodies.
 }
