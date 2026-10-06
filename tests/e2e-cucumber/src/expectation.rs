@@ -495,9 +495,9 @@ pub struct Included {
 ///    scenario without a usable container runtime, a `@requires-gpu` scenario on
 ///    a host with no AMD GPU, a `@requires-multi-gpu` scenario on a host that
 ///    does not have more than one, a `@requires-bare-metal` scenario on WSL2, a
+///    `@requires-os:<os>` scenario on a different OS, a
 ///    `@requires-case-sensitive-fs` scenario whose temp root folds letter case,
-///    a `@requires-os:<os>` scenario on a different OS, or a scenario whose
-///    effective engine can't start.
+///    or a scenario whose effective engine can't start.
 /// 2. First matching `expectations.toml` condition → `ExpectXfail`.
 /// 3. Otherwise → `ExpectPass`.
 ///
