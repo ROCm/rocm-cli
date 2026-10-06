@@ -41,7 +41,8 @@ pub(crate) use self::probe::{
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 use self::python::{
-    ensure_uv_venv, managed_python_version, python_requirement, resolve_python_launcher,
+    ensure_uv_venv, folder_has_entries, managed_python_version, python_requirement,
+    resolve_python_launcher, uv_venv_command_args, venv_step_preview,
     wheel_compatibility_for_python,
 };
 use self::resolve::{
@@ -79,7 +80,7 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, detect_host_gpu_diagnostics, detect_legacy_rocm_summary, ensure_uv_binary,
     interactive_terminal, runtime_is_windows, runtime_python_executable_in_env, unix_time_millis,
-    uv_pip_install_base, uv_venv_args,
+    uv_pip_install_base,
 };
 #[cfg(test)]
 use rocm_core::{disk_space, managed_uv_cache_dir, normalize_therock_family};
@@ -538,7 +539,19 @@ fn install_wheel_runtime(
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
-        let venv_args = uv_venv_args(&python_launcher.executable, &install_root);
+        // The same decision and arguments the real install uses, so a folder
+        // it would refuse is reported as refused, and one it would rebuild
+        // shows `--allow-existing`.
+        let venv_args = uv_venv_command_args(
+            &python_launcher.executable,
+            &install_root,
+            folder_has_entries(&install_root).unwrap_or(true),
+        );
+        let _ = writeln!(
+            output,
+            "  python_env: {}",
+            venv_step_preview(paths, &install_root)
+        );
         // This line is offered as the command to run, so it has to be one a
         // shell reads back as the argv it previews. The install root in it
         // comes from a `--prefix` the local assistant can choose
