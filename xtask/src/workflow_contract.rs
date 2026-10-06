@@ -2209,11 +2209,12 @@ esac
         ("md", "markdown"),
     ];
 
-    /// `licenserc.toml`'s `[files].includes` and `.pre-commit-config.yaml`'s
-    /// `license-headers` hook `types_or` must cover the same file types: a glob in
-    /// `includes` with no matching tag in `types_or` means prek silently skips that
-    /// file type locally while CI's hawkeye still enforces it — the exact gap the
-    /// `markdown` tag above was added to close.
+    /// Every glob in `licenserc.toml`'s `[files].includes` must have a matching
+    /// tag in `.pre-commit-config.yaml`'s `license-headers` hook `types_or`
+    /// (the check runs only in this direction, not the reverse): a glob with
+    /// no matching tag means prek silently skips that file type locally while
+    /// CI's hawkeye still enforces it — the exact gap closed by adding
+    /// `markdown` to that hook's `types_or` in `.pre-commit-config.yaml`.
     #[test]
     fn license_header_hook_covers_licenserc_includes() {
         let licenserc = std::fs::read_to_string(repo_root().join("licenserc.toml"))
@@ -2254,10 +2255,11 @@ esac
             .map(|entry| entry.trim().trim_matches('"'))
             .filter(|glob| !glob.is_empty())
         {
-            let ext = glob
-                .rsplit('.')
-                .next()
-                .unwrap_or_else(|| panic!("licenserc.toml include `{glob}` has no extension"));
+            let file_name = glob.rsplit('/').next().unwrap_or(glob);
+            let ext = file_name.rsplit_once('.').map_or_else(
+                || panic!("licenserc.toml include `{glob}` has no extension"),
+                |(_, ext)| ext,
+            );
             let tag = LICENSE_HEADER_EXTENSION_TAGS
                 .iter()
                 .find(|(e, _)| *e == ext)
