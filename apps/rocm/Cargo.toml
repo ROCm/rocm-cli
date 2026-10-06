@@ -60,7 +60,12 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
 
 [dev-dependencies]
-# Property tests for state rocm persists (config.json, the runtime registry,
-# the active-runtime marker). Same spec as rocm-core so the workspace resolves
-# one proptest with one feature set; test-only, so no shipped binary gains it.
+# Property-based tests for the byte-size formatter behind the `download:
+# approved up to …` line. "A size is printed in its own unit" has to hold at
+# every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0
+# is exactly the input a hand-picked example misses. Same version and features
+# as rocm-core's, so no new crate or feature enters the lockfile.
+# Test-only, so it adds nothing to any shipped binary.
+# Also used for properties of the state rocm persists: config.json, the runtime
+# registry and the active-runtime marker.
 proptest = { version = "1", default-features = false, features = ["std"] }

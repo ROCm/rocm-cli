@@ -159,6 +159,42 @@ The atomic writer's out-of-space test is ignored for a different reason: it
 fills `/dev/shm`, which other processes share. Run it alone with
 `cargo test -p rocm-core --lib -- --ignored atomic_write`.
 
+## Coverage floors
+
+Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
+floor in `coverage-floors.toml`. CI fails when a crate drops more than a small tolerance
+below its floor, so deleting a test is a check failure rather than a silent loss.
+
+Check the floors locally. This needs both the instrumentation tooling and the LLVM
+tools the toolchain ships separately — CI installs the same two:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo xtask coverage
+```
+
+After adding tests, ratchet the floors up to the new measurement:
+
+```bash
+cargo xtask coverage --bless
+```
+
+`--bless` rewrites `coverage-floors.toml`; commit the result. Lowering a floor is
+allowed but deliberate — it shows up as a diff a reviewer has to approve, so say in the
+commit why coverage legitimately dropped (a crate shrank, tests moved elsewhere) rather
+than re-blessing to make a red check go away.
+
+Adding a workspace crate fails the check until that crate has a floor, so a new crate
+cannot land outside the gate. A crate that no test binary compiles at all never shows up
+in the coverage report; both the check and `--bless` fail on it by name, and the way out
+is tests or an entry in `EXCLUDED` in `xtask/src/coverage.rs` with the reason — there is
+no measurement to bless a floor from.
+
+These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules as
+covered source. That inflates the numbers and damps the gate — see the module comment in
+`xtask/src/coverage.rs` for what the measurement is and is not good for.
+
 ## Remote control-channel checks
 
 `rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
@@ -1275,3 +1311,101 @@ The install is covered by unit tests over the generated plan (`cargo test -p
 rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
+
+## Model Fit Preflight
+
+`rocm diagnose --model <ref>` answers whether a curated model will run on this
+host before anything downloads. It reports one of four verdicts: `ready`,
+`degraded` (runs, but under the recipe's recommended system RAM),
+`blocked` (will not run here, with alternatives that would), or
+`undetermined` (the CLI could not judge it — an unreachable catalog, an
+unmeasured GPU, or a ref outside the curated set).
+
+```bash
+rocm diagnose --model qwen-smoke --json   # smallest curated recipe
+rocm diagnose --model glm5 --json         # largest curated recipe
+```
+
+On a host with a measured GPU, the smallest recipe should report `ready` (or
+`degraded`, if this host's system RAM is below its recommendation) and name
+the engine `rocm serve` would pick; the largest should report `blocked` with
+at least one alternative that fits. On a host with no GPU visible to ROCm,
+both report `blocked` with no fitting alternative. Either way, the command
+must exit 0 — it is a query, not a check that only passes on a compatible
+host — and must not populate the model-weight cache.
+
+The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
+including the two that need a synthetic signed catalog to trigger
+deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
+produce them on an arbitrary real host.
+
+## Doctor Report Preflight
+
+Preview the content a problem report would carry, without sending anything:
+
+```bash
+rocm diagnose --report
+rocm diagnose --report --json
+```
+
+The command refuses rather than prepares a report on three hosts, and the
+three reasons are not interchangeable. One holds an architecture the ROCm
+compatibility matrix does not list as supported (`unreleased-hardware`). One
+has an AMD GPU architecture that could not be read (`architecture-unreadable`).
+The third is any WSL host (`platform-not-probed`): `examine` returns before
+any GPU probe runs there, so nothing has looked, and saying the architecture
+could not be read would state a finding about hardware nothing inspected. All
+three exit 0 and are told apart by `--json`'s `refused` field, and the refusal
+envelope also carries `architecture_matrix`, the same compatibility-matrix
+snapshot stamp a genuine report carries, so a refusal is just as traceable to
+a matrix revision as a report is.
+
+Offer a prefilled mail carrying that report, which still sends nothing:
+
+```bash
+rocm diagnose --report --send
+```
+
+Two argument rules are worth checking by hand, because both are the kind that
+only break when somebody reorders a declaration. `--send` without `--report`
+must be refused, since showing the content first is the guarantee `--send`
+makes. `--send` with `--json` must also be refused: that combination is for
+scripts, and starting a browser from a scripted invocation is not wanted.
+
+Whether `--send` opens a mail client or prints the address and link depends on
+the machine, and the printed line says which happened. It prints rather than
+opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
+`ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
+configured reaches the same printed form, which is why the address appears on
+its own and not only inside the `mailto:` link. That is the common case on
+servers and in containers. The opt-out is the easiest to check on a desktop:
+
+```bash
+ROCM_NO_BROWSER=1 rocm diagnose --report --send
+```
+
+The destination is `ROCmCLI@amd.com`, fixed in code. A report also carries its
+classification in the mail subject, because a mailbox has no labels: the
+subject names the matched catalog entry, or `unrecognised`, then the
+architecture and the distribution. Check that the subject carries no field the
+report body does not.
+
+On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
+`crates/rocm-core/src/report.rs`), the command prints the full `Report`:
+`schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
+`os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
+`fix_offered`. This path has not been exercised against real hardware in CI;
+verifying it needs a lane whose GPU architecture is on the allowlist.
+
+Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
+answer with a word rather than a value, and the words are not interchangeable.
+`none` means the thing is absent, `unknown` means this build looked and could
+not tell, and `other` means a distribution was named but is not one this build
+recognises. A host with no ROCm installed reports `"rocm": "none"`, while a
+host whose install exists but whose version could not be read reports `"rocm":
+"unknown"` — worth checking by hand on a machine with a partial install, since
+the two are easy to merge by accident and a counter cannot tell them apart
+afterwards. `engine`/`engine_version` carry the same distinction: a host a
+probe found no engine on reports `"engine": "none"`, while a host whose engine
+probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
+since a probe that never ran cannot say an engine is absent.

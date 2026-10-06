@@ -34,10 +34,10 @@ const KNOWN_SYMPTOM: &str = "HSA_STATUS_ERROR_INVALID_ISA";
 /// route is populated either way, which is what the scenario using this checks.
 const UNMATCHED_SYMPTOM: &str = "the office printer keeps jamming on page three";
 
-/// The reference states the auto-applicable set twice: once as `yes` cells in
-/// the catalog table, and once in prose above it. Both are parsed, so a rename
-/// applied to the table and the CLI together still fails if the prose was
-/// missed — and neither side is a constant restated in this file.
+/// The reference states the auto-applicable set twice: once as marker cells in
+/// the catalog table, and once in per-host prose above it. Both are parsed, so
+/// a rename applied to the table and the CLI together still fails if the prose
+/// was missed — and neither side is a constant restated in this file.
 const AUTO_APPLICABLE_PROSE: &str = "auto-applicable";
 
 /// One catalog row, from either side of the comparison.
@@ -47,8 +47,91 @@ struct Remediation {
     /// normalised, so a catalog that invents its own shorthand shows up as a
     /// mismatch instead of being quietly translated into agreement.
     os_scope: String,
-    /// Whether the CLI applies it itself, as opposed to printing a plan.
-    auto: bool,
+    /// The marker word this id carries: `AUTO`, `NEEDS-ARG`, `PRINT-ONLY`, or
+    /// `DIAGNOSE-ONLY` (no catalog entry uses the last one yet, but it is
+    /// recognised rather than silently dropped -- an unrecognised marker drops
+    /// its row from the map, which previously made `NEEDS-ARG` vanish fix-9
+    /// entirely instead of failing on the mismatched marker).
+    marker: String,
+    /// A platform whose marker differs from [`Remediation::marker`], and what
+    /// it is there. `rocm fix`'s listing reports the marker for the machine it
+    /// runs on, never for every machine the id applies to, so an id whose
+    /// behaviour genuinely depends on more than the host needs this to stay
+    /// correct everywhere the suite runs (bare metal Linux, Windows, WSL2).
+    /// `fix-2-unset-override` is the only entry this applies to today:
+    /// PRINT-ONLY is the documented baseline (true on Linux and WSL), AUTO on
+    /// Windows only. Only ever set from the doc side; the CLI side already
+    /// reports the resolved, host-specific marker directly.
+    platform_override: Option<(String, String)>,
+}
+
+impl Remediation {
+    /// The marker this row implies for `platform`, folding in the one
+    /// documented exception and the CLI's own out-of-scope fallback: an id
+    /// `rocm fix` lists but that does not apply on `platform` at all always
+    /// reports PRINT-ONLY there, whatever it is where it does apply (mirrors
+    /// `FixRecipe::class_here`'s `unwrap_or_default` in `crates/rocm-core`).
+    fn expected_marker(&self, platform: &str) -> &str {
+        if !self.os_scope.split('/').any(|p| p == platform) {
+            return "PRINT-ONLY";
+        }
+        match &self.platform_override {
+            Some((override_platform, marker)) if override_platform == platform => marker,
+            _ => &self.marker,
+        }
+    }
+}
+
+/// The `linux`/`windows`/`wsl` family the suite's own host-detection reports
+/// for the machine this scenario is running on right now -- the same value
+/// `crates/rocm-core`'s `current_os()` would compute, from the harness's
+/// existing probe rather than a second one.
+fn current_platform_family() -> String {
+    let cap = e2e_cucumber::capability::host_capability();
+    if cap.is_wsl {
+        "wsl".to_owned()
+    } else {
+        cap.os_family.clone()
+    }
+}
+
+/// Recognise a bare marker word in either casing the two sides use: the table
+/// writes `auto`/`needs-arg`/`print-only`/`diagnose-only`, `rocm fix` prints
+/// `AUTO`/`NEEDS-ARG`/`PRINT-ONLY`/`DIAGNOSE-ONLY`. Returns the CLI's casing,
+/// so both sides compare equal literally once parsed.
+fn normalise_marker(word: &str) -> Option<&'static str> {
+    match word.to_ascii_uppercase().as_str() {
+        "AUTO" => Some("AUTO"),
+        "NEEDS-ARG" => Some("NEEDS-ARG"),
+        "PRINT-ONLY" => Some("PRINT-ONLY"),
+        "DIAGNOSE-ONLY" => Some("DIAGNOSE-ONLY"),
+        _ => None,
+    }
+}
+
+/// Splits a catalog cell into its base marker and an optional per-platform
+/// override. Plain cells are just a marker word (`needs-arg`); a cell for an
+/// id whose marker depends on more than the host also names the exception,
+/// `print-only (auto on windows)`. Returns `None` for neither shape, which the
+/// caller treats as an unrecognised cell.
+fn parse_marker_cell(cell: &str) -> Option<(String, Option<(String, String)>)> {
+    let cell = cell.trim();
+    let Some(paren_start) = cell.find('(') else {
+        return Some((normalise_marker(cell)?.to_owned(), None));
+    };
+    let base = normalise_marker(cell[..paren_start].trim())?;
+    let inside = cell[paren_start + 1..].trim_end_matches(')').trim();
+    let mut words = inside.split_whitespace();
+    let (Some(marker_word), Some("on"), Some(platform)) =
+        (words.next(), words.next(), words.next())
+    else {
+        return None;
+    };
+    let marker = normalise_marker(marker_word)?;
+    Some((
+        base.to_owned(),
+        Some((platform.to_owned(), marker.to_owned())),
+    ))
 }
 
 fn reference_md_path() -> PathBuf {
@@ -64,7 +147,7 @@ fn reference_md_path() -> PathBuf {
 /// Read the closed-catalog table out of the skill's reference doc.
 ///
 /// Rows look like:
-/// `| `fix-1-arch` | linux/windows/wsl | <mode> | <signal> | no |`
+/// `| `fix-1-arch` | linux/windows/wsl | <mode> | <signal> | print-only |`
 /// Only rows whose first cell is a backticked `fix-*` id are taken, which skips
 /// the header, the separator, and the exit-code table further up the file.
 fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
@@ -93,12 +176,19 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
         // An unrecognised cell drops the row rather than aborting the parse, so
         // a reworded table surfaces as the scenario's own set diff — naming the
         // ids that went missing — instead of a panic from inside the reader.
-        let auto = match *cells.last().expect("row has cells") {
-            "yes" => true,
-            "no" => false,
-            _ => continue,
+        let Some((marker, platform_override)) =
+            parse_marker_cell(cells.last().expect("row has cells"))
+        else {
+            continue;
         };
-        out.insert(id.to_owned(), Remediation { os_scope, auto });
+        out.insert(
+            id.to_owned(),
+            Remediation {
+                os_scope,
+                marker,
+                platform_override,
+            },
+        );
     }
     assert!(
         !out.is_empty(),
@@ -108,34 +198,31 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
     out
 }
 
-/// The fix-ids the reference's prose names as auto-applicable.
+/// The fix-ids the reference's prose names as auto-applicable on `platform`.
 ///
-/// The sentence spans two lines and is delimited by em dashes:
-/// `Only four fixes are auto-applicable — `fix-2-…`, `fix-4-…` — and the rest…`
-/// Bounding on the dashes keeps the `rocm fix fix-2-unset-override` example
-/// later in the same paragraph out of the set.
-fn documented_auto_prose(md: &str) -> BTreeSet<String> {
-    let joined = md.replace('\n', " ");
-    let Some((_, after)) = joined.split_once(AUTO_APPLICABLE_PROSE) else {
+/// The per-host bullet list reads:
+/// `- **linux** — auto-applicable: `fix-4-…`, `fix-6-…`.`
+/// one bullet per platform, each ending the ids in backticks on that line.
+fn documented_auto_prose_for(md: &str, platform: &str) -> BTreeSet<String> {
+    let bullet_prefix = format!("- **{platform}**");
+    let Some(line) = md.lines().find(|line| {
+        let line = line.trim();
+        line.starts_with(&bullet_prefix) && line.contains(AUTO_APPLICABLE_PROSE)
+    }) else {
         panic!(
-            "reference.md no longer states which fixes are {AUTO_APPLICABLE_PROSE} in prose; \
-             the catalog table alone cannot catch a rename that missed the prose"
+            "reference.md no longer states which fixes are {AUTO_APPLICABLE_PROSE} on \
+             {platform} in prose; the catalog table alone cannot catch a rename that \
+             missed the prose"
         )
     };
-    let (_, inside) = after
-        .split_once('—')
-        .expect("the auto-applicable sentence no longer opens with an em dash");
-    let (list, _) = inside
-        .split_once('—')
-        .expect("the auto-applicable sentence no longer closes with an em dash");
-    let ids: BTreeSet<String> = backticked(list)
+    let ids: BTreeSet<String> = backticked(line)
         .into_iter()
         .filter(|span| span.starts_with("fix-"))
         .map(str::to_owned)
         .collect();
     assert!(
         !ids.is_empty(),
-        "no fix-ids parsed out of reference.md's auto-applicable sentence: {list:?}"
+        "no fix-ids parsed out of reference.md's {platform} auto-applicable bullet: {line:?}"
     );
     ids
 }
@@ -154,10 +241,13 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
         };
         // As above: a renamed marker drops the row, and the scenario reports it
         // as an id `rocm fix` no longer offers rather than as a parser panic.
-        let auto = match marker.trim() {
-            "AUTO" => true,
-            "PRINT-ONLY" => false,
-            _ => continue,
+        // Every marker the catalog's `FixClass` can print is recognised here --
+        // `NEEDS-ARG` and `DIAGNOSE-ONLY` included -- so a reclassified entry
+        // shows up as a marker mismatch against the doc instead of silently
+        // disappearing from this map and being reported as an id `rocm fix`
+        // no longer offers at all.
+        let Some(marker) = normalise_marker(marker.trim()) else {
+            continue;
         };
         let Some((os_scope, rest)) = rest.trim_start().trim_start_matches('[').split_once(']')
         else {
@@ -171,7 +261,8 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
             id.to_owned(),
             Remediation {
                 os_scope: os_scope.trim().to_owned(),
-                auto,
+                marker: marker.to_owned(),
+                platform_override: None,
             },
         );
     }
@@ -499,31 +590,37 @@ async fn assert_same_ids(world: &mut E2eWorld) {
 #[then("the skill and the CLI agree on which ones the CLI applies without help")]
 async fn assert_same_auto_set(world: &mut E2eWorld) {
     let (doc, cli) = both_sides(world);
+    // `rocm fix`'s listing marks each entry for the machine running it, not for
+    // every machine the id applies to -- `fix-2-unset-override` is AUTO on
+    // Windows and PRINT-ONLY everywhere else it applies, so the host this
+    // scenario runs on has to be part of what "the same set" means here.
+    let platform = current_platform_family();
     for (id, offered) in &cli {
         let documented = doc.get(id).unwrap_or_else(|| {
             panic!(
                 "`rocm fix` offers {id}, which skills/rocm-doctor/reference.md does not document"
             )
         });
+        let expected = documented.expected_marker(&platform);
         assert_eq!(
-            documented.auto, offered.auto,
-            "{id}: reference.md says auto-applicable={}, `rocm fix` says {}",
-            documented.auto, offered.auto
+            expected, offered.marker,
+            "{id} on {platform}: reference.md implies marker {expected}, `rocm fix` says {}",
+            offered.marker
         );
     }
-    // The reference says it twice — `yes` cells above, prose below — and the
-    // loop only checked the cells. A rename applied to the table and the CLI
-    // together would leave the prose stale, and the prose is what an agent
-    // reads before it decides whether to offer to run a fix.
-    let prose = documented_auto_prose(reference(world));
+    // The reference says it twice — marker cells above, per-host prose below —
+    // and the loop only checked the cells. A rename applied to the table and
+    // the CLI together would leave the prose stale, and the prose is what an
+    // agent reads before it decides whether to offer to run a fix.
+    let prose = documented_auto_prose_for(reference(world), &platform);
     let offered: BTreeSet<String> = cli
         .iter()
-        .filter(|(_, r)| r.auto)
+        .filter(|(_, r)| r.marker == "AUTO")
         .map(|(id, _)| id.clone())
         .collect();
     assert_eq!(
         prose, offered,
-        "reference.md's prose names {prose:?} as auto-applicable, `rocm fix` offers {offered:?}"
+        "reference.md's {platform} prose names {prose:?} as auto-applicable, `rocm fix` offers {offered:?}"
     );
 }
 
