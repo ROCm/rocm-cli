@@ -794,7 +794,7 @@ pub(crate) fn supervise_service(
 ///   recorded PIDs, and a restart records its own. Either way the record now
 ///   describes something this supervisor is not, and its view of the service
 ///   (`running`, `failed`, …) would overwrite a truer one.
-fn update_supervised_record(
+pub(crate) fn update_supervised_record(
     paths: &AppPaths,
     supervisor: &ManagedServiceRecord,
     update: impl FnOnce(&mut ManagedServiceRecord),
