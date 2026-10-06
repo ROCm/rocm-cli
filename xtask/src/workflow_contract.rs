@@ -946,36 +946,77 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// Every `GPU preflight` step block in `text`, in file order.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         let lines: Vec<&str> = text.lines().collect();
-        let mut steps = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("- name: GPU preflight") {
-                continue;
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
+            .map(|(i, _)| step_block(&lines, i))
+            .collect()
+    }
+
+    /// The whole step whose `- name:` line is `lines[at]`: that line and every
+    /// line below it until a non-blank one is indented no deeper than it.
+    ///
+    /// Blank lines never end a block, however they are indented — a `run: |`
+    /// body can contain them — so the blank separator before the next step is
+    /// carried along too. `run_block` drops it again.
+    fn step_block(lines: &[&str], at: usize) -> String {
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
             }
-            let step_indent = indent_of(line);
-            let mut step = format!("{line}\n");
-            for body in &lines[i + 1..] {
-                if !body.trim().is_empty() && indent_of(body) <= step_indent {
-                    break;
-                }
-                step.push_str(body);
-                step.push('\n');
-            }
-            steps.push(step);
+            step.push_str(body);
+            step.push('\n');
         }
-        steps
+        step
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Trailing blank lines are dropped: they are the separator `step_block`
+    /// lets through, not part of the script, and keeping them would make two
+    /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
         let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
         let run_indent = indent_of(lines[run_at]);
+        let mut body: Vec<&str> = lines[run_at + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+            .copied()
+            .collect();
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        Some(body)
+    }
+
+    /// Where two line-oriented texts first differ, phrased for a failure
+    /// message and naming which file each side came from; `None` when they
+    /// are equal.
+    fn first_line_difference(a_name: &str, a: &str, b_name: &str, b: &str) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let a_lines: Vec<&str> = a.lines().collect();
+        let b_lines: Vec<&str> = b.lines().collect();
         Some(
-            lines[run_at + 1..]
-                .iter()
-                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
-                .copied()
-                .collect(),
+            match a_lines.iter().zip(&b_lines).position(|(x, y)| x != y) {
+                Some(i) => format!(
+                    "first difference at body line {}:\n  {a_name}: {:?}\n  {b_name}: {:?}",
+                    i + 1,
+                    a_lines[i],
+                    b_lines[i]
+                ),
+                None if a_lines.len() != b_lines.len() => format!(
+                    "every shared line matches, but {a_name} has {} lines and {b_name} has {}",
+                    a_lines.len(),
+                    b_lines.len()
+                ),
+                None => "the bodies differ only in line endings".to_string(),
+            },
         )
     }
 
@@ -1087,13 +1128,21 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// nightly lane job-level `continue-on-error: true` means a regression would
     /// not even turn the run red.
     ///
-    /// Matching the step NAME rather than a substring of the job is deliberate —
-    /// the surrounding comments discuss the clock at length, so a bare substring
-    /// would stay satisfied by prose after the step itself was deleted, which is
-    /// exactly the failure this pins.
+    /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
+    /// surrounding comments discuss the clock at length, and a comment line that
+    /// happened to embed the step's text would otherwise keep this satisfied after
+    /// the step itself was deleted — exactly the failure this pins.
+    ///
+    /// The two copies' `run:` bodies are also compared byte for byte, after
+    /// dedenting. They are kept in sync by hand until the lanes are deduplicated
+    /// (#294), and presence and order say nothing about what each copy runs —
+    /// the same drift `apu_preflight_twins_do_not_drift` once caught too late.
+    /// Equality pins only that the two lanes agree, not that either body still
+    /// does the work: both gutted to an identical `echo hi` would pass.
     #[test]
     fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
         const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        let mut bodies = Vec::new();
         for (workflow, job, suite_step) in [
             (
                 "e2e-selfhosted.yml",
@@ -1107,20 +1156,37 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             ),
         ] {
             let job_block = nested_block(&read_workflow(workflow), job);
-            let settle = job_block.find(STEP).unwrap_or_else(|| {
+            let lines: Vec<&str> = job_block.lines().collect();
+            let settle = lines.iter().position(|l| *l == STEP).unwrap_or_else(|| {
                 panic!(
                     "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
                      steps its clock backwards mid-run and cucumber subtracts SystemTime \
                      stamps, so the durations that lane reports become fiction"
                 )
             });
-            let suite = job_block
-                .find(suite_step)
+            let suite = lines
+                .iter()
+                .position(|l| *l == suite_step)
                 .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
             assert!(
                 settle < suite,
                 "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
                  correction has to land while nothing is being timed"
+            );
+            let step = step_block(&lines, settle);
+            let body = run_block(&step)
+                .and_then(|block| dedent(&block))
+                .unwrap_or_else(|| panic!("{workflow}'s clock-settling step has no `run: |` body"));
+            bodies.push((workflow, body));
+        }
+        let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
+            unreachable!("exactly two lanes are checked above");
+        };
+        if let Some(difference) = first_line_difference(first, first_body, second, second_body) {
+            panic!(
+                "the clock-settling step has drifted between {first} and {second} — the \
+                 copies are kept in sync by hand until the lanes are deduplicated (#294); \
+                 {difference}"
             );
         }
     }
@@ -1159,11 +1225,14 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{language} APU preflight count differs"
             );
             for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
-                assert_eq!(
-                    a, b,
-                    "{language} APU preflight script #{i} has drifted between \
-                     e2e-selfhosted.yml and nightly.yml"
-                );
+                if let Some(difference) =
+                    first_line_difference("e2e-selfhosted.yml", a, "nightly.yml", b)
+                {
+                    panic!(
+                        "{language} APU preflight script #{i} has drifted between \
+                         e2e-selfhosted.yml and nightly.yml; {difference}"
+                    );
+                }
             }
         }
     }
