@@ -4,14 +4,25 @@
 
 //! Where the hardware probes read the host from.
 //!
-//! The probes that decide what GPU, driver and platform the CLI is running on —
-//! device nodes under `/dev`, the KFD topology and DRM cards in `sysfs`,
-//! `/proc/version`, `/proc/cpuinfo`, the `/etc/os-release` behind the reported
-//! distro name, the WSL plumbing under `/usr/lib/wsl`, the WSL ROCDXG check
-//! (`lib/librocdxg.so` and `share/rocdxg/dids.conf`, looked for under
-//! `/opt/rocm` and under each discovered ROCm install), the container markers
-//! (`/.dockerenv`, `/run/.containerenv`, `/proc/1/cgroup`) — resolve their path
-//! through [`host_path`] instead of naming the absolute path directly.
+//! The probes that decide what GPU, driver and platform the CLI is running on
+//! resolve their path through [`host_path`] instead of naming the absolute path
+//! directly. That is every one of these reads, and only these:
+//!
+//! - device nodes: `/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`;
+//! - `sysfs`: the KFD topology under `/sys/class/kfd/kfd/topology/nodes`, the
+//!   DRM cards under `/sys/class/drm`, `/sys/module/amdgpu` and
+//!   `/sys/module/amdgpu/version`;
+//! - `procfs`: `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`,
+//!   `/proc/cmdline`, `/proc/modules` (the fallback when `lsmod` cannot run)
+//!   and `/proc/1/cgroup`;
+//! - the `/etc/os-release` behind the distro name `rocm examine` reports;
+//! - the modprobe configuration directories `/etc/modprobe.d`,
+//!   `/usr/lib/modprobe.d` and `/run/modprobe.d`;
+//! - the WSL plumbing: the `/usr/lib/wsl/lib` directory check and
+//!   `/usr/lib/wsl/lib/libdxcore.so`;
+//! - the WSL ROCDXG check: `lib/librocdxg.so` and `share/rocdxg/dids.conf`,
+//!   looked for under `/opt/rocm` and under each discovered ROCm install;
+//! - the container markers `/.dockerenv` and `/run/.containerenv`.
 //!
 //! Deliberately NOT routed: anything a real process acts on rather than reads
 //! to describe the machine. ROCm install discovery itself — which installs
@@ -87,7 +98,11 @@ const fn hardware_root() -> Option<PathBuf> {
 /// after the leading `/` would walk back out of the root. This is a documented
 /// precondition rather than a check: callers pass fixed literals, apart from
 /// the ROCDXG check in `rocm_relative_file_exists`, which re-roots each
-/// discovered ROCm install path (a `$ROCM_PATH` is taken verbatim there).
+/// discovered ROCm install path (a `$ROCM_PATH` is taken verbatim there, so a
+/// `..` in it escapes the root; a *relative* `$ROCM_PATH` is a different case:
+/// `strip_prefix("/")` fails, it is returned unchanged by the catch-all arm,
+/// and the simulated root silently does not apply — that ROCDXG lookup reads
+/// relative to the working directory instead).
 fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     match (root, path.strip_prefix("/")) {
         (Some(root), Ok(relative)) => root.join(relative),

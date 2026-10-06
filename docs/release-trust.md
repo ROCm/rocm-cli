@@ -276,15 +276,17 @@ is already trusted.
 ## Simulated Host Root
 
 rocm-cli decides what hardware it is running on by reading fixed host paths:
-`/dev/kfd`, `/dev/dri`, `/dev/dxg`, the KFD topology under `/sys/class/kfd`,
-the DRM cards under `/sys/class/drm`, `/sys/module/amdgpu`, `/proc/version`,
-`/proc/cpuinfo`, `/proc/meminfo`, `/proc/cmdline`, `/proc/modules`,
-`/proc/1/cgroup`, the container markers `/.dockerenv` and `/run/.containerenv`,
-the `/etc/os-release` behind the distro name `rocm examine` reports, the
-modprobe configuration directories, the WSL plumbing under `/usr/lib/wsl`, and
-the WSL ROCDXG capability check, which looks for `lib/librocdxg.so` and
-`share/rocdxg/dids.conf` under `/opt/rocm` and under each discovered ROCm
-install. The E2E suite can point those reads at a directory it populated with a
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
+under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
+`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
+`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
+behind the distro name `rocm examine` reports, the modprobe configuration
+directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and `/run/modprobe.d`, the
+WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+`lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
+`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
+discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
 simulated host instead, but only in builds compiled with the `e2e-test-hooks`
 Cargo feature:
 
