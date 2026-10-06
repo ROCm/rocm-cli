@@ -195,6 +195,12 @@ Expected result:
   what was found (for example that the `PATH` Python is not usable) and never
   says a real install would prepare or use a managed Python.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
+- If the `--prefix` folder already holds a venv whose Python no longer runs,
+  rocm-cli rebuilds only that venv's own files, and only when it created the
+  venv (the folder has `pyvenv.cfg` and its `.rocm-cli-runtime.json`). It prints
+  what it kept, and anything else in the folder, such as `apps/comfyui`, is
+  still there afterwards. A folder it did not create, such as your home folder
+  with a broken `~/bin/python`, is refused with nothing changed.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned
