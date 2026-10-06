@@ -215,24 +215,31 @@ mod tests {
             "the doctor row's label must be the command the examine screen runs"
         );
 
-        // Install takes user-chosen values, so its label shows `…` for them:
-        // it must still name the same subcommand and the same value flags.
+        // Install takes user-chosen values, so its label shows `…` for them.
+        // Derive the label from the default form's argv: the subcommand, then
+        // each value flag with its value elided. Mode switches (`--dry-run`,
+        // or the approval flag a real install adds) depend on what the user
+        // picks in the form, so the label leaves them out.
         let install = runs_label(KeyAction::OpenInstall);
         let args = InstallManagerState::default()
             .build_args()
             .expect("the default install form builds an argv");
-        let command = format!("rocm {}", args[..2].join(" "));
-        assert!(
-            install.starts_with(&format!("{command} ")),
-            "Install label {install:?} must start with {command:?}"
-        );
-        for flag in ["--channel", "--format"] {
-            assert!(args.iter().any(|arg| arg == flag), "argv lost {flag}");
-            assert!(
-                install.split_whitespace().any(|word| word == flag),
-                "Install label {install:?} must name {flag}"
-            );
+        let mut expected = vec!["rocm".to_owned()];
+        let mut words = args.iter().peekable();
+        while let Some(word) = words.next() {
+            if !word.starts_with("--") {
+                expected.push(word.clone());
+            } else if words.peek().is_some_and(|next| !next.starts_with("--")) {
+                words.next();
+                expected.push(word.clone());
+                expected.push("…".to_owned());
+            }
         }
+        assert_eq!(
+            install,
+            expected.join(" "),
+            "the Install row's label must name what the form runs, values elided"
+        );
     }
 
     #[test]
