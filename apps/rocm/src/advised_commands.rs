@@ -1573,6 +1573,12 @@ fn a_double_space_does_not_hide_the_rest_of_a_command() {
         examples_row("  rocm serve <model> --engine vllm"),
         Some("rocm serve <model> --engine vllm".to_owned())
     );
+    // An unindented line is not a table row: a string literal or help line
+    // that starts with a command keeps everything after a double space.
+    assert_eq!(
+        examples_row("rocm install sdk --channel release  --bogus-flag"),
+        Some("rocm install sdk --channel release  --bogus-flag".to_owned())
+    );
     assert_eq!(examples_row("Usage: rocm [OPTIONS]"), None);
 }
 
