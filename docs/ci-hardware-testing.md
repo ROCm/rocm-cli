@@ -41,14 +41,15 @@ R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
 rung instead of being removed outright.
 
-The release-candidate rung's `release/**` trigger ships in PR #415; pinning
-the SDK version that rung's pre-warmed runtime resolves to (`cargo xtask
-e2e-prewarm --version <ver>` / `--build-date <date>`, so a release-branch run
-can hold at `n-1`/`n-2` instead of always tracking the latest channel index)
-ships in PR #464, stacked on #415. Neither is merged as of this writing, so
-`e2e-selfhosted.yml` on `main` today still triggers on `push: branches:
-[main]` only. Wiring an actual `sdk_version: [current, n-1, n-2]` matrix axis
-into the release-branch trigger is not part of either PR: nothing in this
+The release-candidate rung's `release/**` trigger merged in PR #415, so
+`e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
+"release/**"]`. Pinning the SDK version that rung's pre-warmed runtime
+resolves to (`cargo xtask e2e-prewarm --version <ver>` / `--build-date
+<date>`, so a release-branch run can hold at `n-1`/`n-2` instead of always
+tracking the latest channel index) ships in PR #464, stacked on #415 and
+still pending as of this writing. Wiring an actual `sdk_version: [current,
+n-1, n-2]` matrix axis into the release-branch trigger is not part of either
+PR: nothing in this
 repo maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
 index-version parsers are private), so the release gate's SDK version is
 whatever `--version`/`--build-date` its caller passes, not an automatic
@@ -348,9 +349,9 @@ Pre-warm then:
 `e2e-prewarm` will also accept mutually exclusive `--version`/`--build-date`
 flags (ROCMAI-430) that pin the SDK build the pre-warm resolves to instead of
 always tracking whatever the channel index currently serves. That flag pair
-ships in PR #464, stacked on #415, neither merged as of this writing (see
-"The three-stage validation ladder" above) — the unpinned invocation above is
-what every lane in this tree runs today.
+ships in PR #464, stacked on #415 (merged — see "The three-stage validation
+ladder" above) and still pending as of this writing — the unpinned invocation
+above is what every lane in this tree runs today.
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
