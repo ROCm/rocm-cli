@@ -23,9 +23,10 @@ use rocm_core::{
     AutomationTriggerEvent, CodexBridgeGpuSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary,
     ManagedServiceRecord, ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode,
     WatcherRuntimeSnapshot, append_audit_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, daemon_binary_path, load_recent_automation_events,
+    builtin_watchers, daemon_binary_path, format_host_port, load_recent_automation_events,
     model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
 };
+use rocm_engine_protocol::HealthcheckResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
@@ -35,6 +36,7 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -1932,7 +1934,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
     match name {
         "examine" => {
             let examine = ExamineSummary::gather()?;
-            let output = common::run_rocm_capture(&["examine"])?;
+            let output = run_rocm_capture(&["examine"])?;
             let text = command_capture_text(&output);
             if output.exit_status == 0 {
                 Ok(tool_success(text, json!(examine)))
@@ -2035,7 +2037,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 .get("request")
                 .and_then(Value::as_str)
                 .context("natural_language_plan requires `request`")?;
-            let output = common::run_rocm_capture(&[request])?;
+            let output = run_rocm_capture(&[request])?;
             Ok(tool_result_from_command(
                 "Ran natural-language planning through `rocm`.",
                 output,
@@ -2046,7 +2048,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             let argv = normalized_rocm_command_args(&arguments)?;
             ensure_rocm_command_is_read_only(&argv)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran read-only `rocm` command.",
                 output,
@@ -2054,7 +2056,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             ))
         }
         "update_check" => {
-            let output = common::run_rocm_capture(&["update"])?;
+            let output = run_rocm_capture(&["update"])?;
             Ok(tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -2064,7 +2066,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_sdk_dry_run" => {
             let argv = build_install_sdk_args(&arguments, true)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -2074,7 +2076,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_sdk" => {
             let argv = build_install_sdk_args(&arguments, false)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk`.",
                 output,
@@ -2084,7 +2086,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_engine" => {
             let argv = build_install_engine_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm engines install`.",
                 output,
@@ -2094,7 +2096,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "launch_server" => {
             let argv = build_launch_server_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm serve --managed`.",
                 output,
@@ -2115,7 +2117,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations enable`.",
                 output,
@@ -2133,7 +2135,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 watcher.to_owned(),
             ];
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = common::run_rocm_capture(&refs)?;
+            let output = run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations disable`.",
                 output,
@@ -2204,6 +2206,11 @@ fn command_capture_text(output: &common::CommandCapture) -> String {
             output.stderr.trim()
         )
     }
+}
+
+fn run_rocm_capture(args: &[&str]) -> Result<common::CommandCapture> {
+    let paths = AppPaths::discover()?;
+    common::run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 fn read_tail_lines(path: &std::path::Path, limit: usize) -> Result<String> {
@@ -4563,6 +4570,13 @@ fn handle_server_recover_event(
     handle_server_recover_event_with_record(paths, mode, state, event, &mut record)
 }
 
+fn healthcheck_response_recoverable(response: &HealthcheckResponse) -> bool {
+    matches!(
+        response.status.as_str(),
+        "failed" | "unreachable" | "exited"
+    )
+}
+
 fn service_record_matches_recovery_event(
     paths: &AppPaths,
     record: &ManagedServiceRecord,
@@ -4575,7 +4589,7 @@ fn service_record_matches_recovery_event(
         "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
         "service.healthcheck_recoverable" => {
             common::engine_healthcheck_response(paths, &record.engine, &record.service_id)
-                .is_ok_and(|healthcheck| common::healthcheck_response_recoverable(&healthcheck))
+                .is_ok_and(|healthcheck| healthcheck_response_recoverable(&healthcheck))
         }
         _ => false,
     }
@@ -4749,7 +4763,7 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
                 }
                 continue;
             };
-            if common::healthcheck_response_recoverable(&healthcheck) {
+            if healthcheck_response_recoverable(&healthcheck) {
                 return Ok(Some((
                     record,
                     format!("healthcheck_status_{}", healthcheck.status),
@@ -4763,8 +4777,24 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
     Ok(None)
 }
 
+fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
+    let address: SocketAddr = match format_host_port(host, port).parse() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    false
+}
+
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
-    (!common::wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
+    (!wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
         .then(|| "endpoint_status_unreachable".to_owned())
 }
 
@@ -4980,6 +5010,74 @@ mod tests {
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    #[test]
+    fn healthcheck_readiness_requires_ready_loaded_model() {
+        let ready = HealthcheckResponse {
+            status: "ready".to_owned(),
+            model_loaded: true,
+            device: "cuda".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(healthcheck_response_ready(&ready));
+
+        let mut loading = ready.clone();
+        loading.status = "loading_model".to_owned();
+        assert!(!healthcheck_response_ready(&loading));
+
+        let mut unloaded = ready;
+        unloaded.model_loaded = false;
+        assert!(!healthcheck_response_ready(&unloaded));
+    }
+
+    #[test]
+    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
+        // What an engine reports once `/v1/models` answers but inference has not:
+        // not ready, so `rocm serve` keeps waiting instead of handing the caller
+        // an endpoint that will hang on its first request.
+        let listing_only = HealthcheckResponse {
+            status: "loading".to_owned(),
+            model_loaded: false,
+            device: "unknown".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(!healthcheck_response_ready(&listing_only));
+    }
+
+    #[test]
+    fn healthcheck_recoverability_tracks_failed_endpoint_state() {
+        let mut response = HealthcheckResponse {
+            status: "ready".to_owned(),
+            model_loaded: true,
+            device: "cuda".to_owned(),
+            uptime_sec: 1,
+            queue_depth: 0,
+            last_error: None,
+            tokens_per_sec: None,
+        };
+        assert!(!healthcheck_response_recoverable(&response));
+
+        response.status = "unreachable".to_owned();
+        assert!(healthcheck_response_recoverable(&response));
+
+        response.status = "failed".to_owned();
+        assert!(healthcheck_response_recoverable(&response));
+
+        response.status = "loading_model".to_owned();
+        assert!(!healthcheck_response_recoverable(&response));
+
+        // The status the engines report for a model that is listed but has not
+        // yet served an inference request. Restarting it would kill a model
+        // mid-load and start the wait over.
+        response.status = "loading".to_owned();
+        assert!(!healthcheck_response_recoverable(&response));
+    }
 
     #[test]
     fn remote_read_only_verbs_are_allowed_and_mutating_ones_are_not() {
@@ -9215,8 +9313,12 @@ fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
     phase
 }
 
+fn healthcheck_response_ready(response: &HealthcheckResponse) -> bool {
+    response.status == "ready" && response.model_loaded
+}
+
 fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
-    Ok(common::healthcheck_response_ready(
+    Ok(healthcheck_response_ready(
         &common::engine_healthcheck_response(paths, engine, service_id)?,
     ))
 }

@@ -6,11 +6,9 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
     CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, daemon_binary_path,
-    default_engine_for_platform, format_host_port, load_recent_automation_events,
-    resolve_amd_smi_binary, unix_time_millis,
+    default_engine_for_platform, load_recent_automation_events, resolve_amd_smi_binary,
+    unix_time_millis,
 };
-#[cfg(test)]
-use rocm_engine_protocol::EnginePluginDescriptor;
 use rocm_engine_protocol::{
     EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, HealthcheckRequest,
     HealthcheckResponse,
@@ -19,9 +17,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
-#[cfg(test)]
-use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -56,7 +51,7 @@ pub(crate) fn update_check_message(status: &str) -> &'static str {
     }
 }
 
-pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
+fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
     let static_snapshot = match capture_amd_smi_json(&["static", "-a", "-g", "all", "--json"]) {
         Ok(value) => Some(value),
         Err(error) => {
@@ -166,22 +161,6 @@ const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-#[cfg(test)]
-pub(crate) fn find_engine_plugin_binary<I, P>(
-    engine: &str,
-    plugin_dirs: I,
-) -> Result<Option<PathBuf>>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<std::path::Path>,
-{
-    Ok(rocm_engine_protocol::discover_engine_plugins(plugin_dirs)
-        .context("failed to discover engine plugin binaries")?
-        .into_iter()
-        .find(|plugin: &EnginePluginDescriptor| plugin.id == engine)
-        .map(|plugin| plugin.executable_path))
-}
-
 #[derive(Debug)]
 pub(crate) struct CommandCapture {
     pub(crate) argv: Vec<String>,
@@ -190,7 +169,7 @@ pub(crate) struct CommandCapture {
     pub(crate) stderr: String,
 }
 
-pub(crate) fn run_command_with_timeout(
+fn run_command_with_timeout(
     mut command: ProcessCommand,
     timeout: Duration,
 ) -> Result<std::process::Output> {
@@ -227,11 +206,6 @@ pub(crate) fn run_command_with_timeout(
         }
         thread::sleep(Duration::from_millis(50));
     }
-}
-
-pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
-    let paths = AppPaths::discover()?;
-    run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
 }
 
 pub(crate) fn run_rocm_capture_for_paths(
@@ -274,17 +248,6 @@ pub(crate) fn engine_healthcheck_response(
         &HealthcheckRequest {
             service_id: service_id.to_owned(),
         },
-    )
-}
-
-pub(crate) fn healthcheck_response_ready(response: &HealthcheckResponse) -> bool {
-    response.status == "ready" && response.model_loaded
-}
-
-pub(crate) fn healthcheck_response_recoverable(response: &HealthcheckResponse) -> bool {
-    matches!(
-        response.status.as_str(),
-        "failed" | "unreachable" | "exited"
     )
 }
 
@@ -351,7 +314,7 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
     Ok(())
 }
 
-pub(crate) fn engine_request<T, R>(
+fn engine_request<T, R>(
     paths: &AppPaths,
     engine: &str,
     service_id: &str,
@@ -429,28 +392,26 @@ where
     serde_json::from_value(data).context("failed to deserialize engine response data")
 }
 
-pub(crate) fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
-    let address: SocketAddr = match format_host_port(host, port).parse() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
     use rocm_core::engine_plugin_dirs;
+    use rocm_engine_protocol::EnginePluginDescriptor;
     use std::fs;
+    use std::path::PathBuf;
+
+    fn find_engine_plugin_binary<I, P>(engine: &str, plugin_dirs: I) -> Result<Option<PathBuf>>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<std::path::Path>,
+    {
+        Ok(rocm_engine_protocol::discover_engine_plugins(plugin_dirs)
+            .context("failed to discover engine plugin binaries")?
+            .into_iter()
+            .find(|plugin: &EnginePluginDescriptor| plugin.id == engine)
+            .map(|plugin| plugin.executable_path))
+    }
 
     #[test]
     fn recovery_refuses_a_service_that_lost_a_key_it_was_launched_with() {
@@ -537,74 +498,6 @@ mod tests {
                 .all(|(key, _)| key != rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
             "an unusable key file must not be threaded onto the child"
         );
-    }
-
-    #[test]
-    fn healthcheck_readiness_requires_ready_loaded_model() {
-        let ready = HealthcheckResponse {
-            status: "ready".to_owned(),
-            model_loaded: true,
-            device: "cuda".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(healthcheck_response_ready(&ready));
-
-        let mut loading = ready.clone();
-        loading.status = "loading_model".to_owned();
-        assert!(!healthcheck_response_ready(&loading));
-
-        let mut unloaded = ready;
-        unloaded.model_loaded = false;
-        assert!(!healthcheck_response_ready(&unloaded));
-    }
-
-    #[test]
-    fn healthcheck_recoverability_tracks_failed_endpoint_state() {
-        let mut response = HealthcheckResponse {
-            status: "ready".to_owned(),
-            model_loaded: true,
-            device: "cuda".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(!healthcheck_response_recoverable(&response));
-
-        response.status = "unreachable".to_owned();
-        assert!(healthcheck_response_recoverable(&response));
-
-        response.status = "failed".to_owned();
-        assert!(healthcheck_response_recoverable(&response));
-
-        response.status = "loading_model".to_owned();
-        assert!(!healthcheck_response_recoverable(&response));
-
-        // The status the engines report for a model that is listed but has not
-        // yet served an inference request. Restarting it would kill a model
-        // mid-load and start the wait over.
-        response.status = "loading".to_owned();
-        assert!(!healthcheck_response_recoverable(&response));
-    }
-
-    #[test]
-    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
-        // What an engine reports once `/v1/models` answers but inference has not:
-        // not ready, so `rocm serve` keeps waiting instead of handing the caller
-        // an endpoint that will hang on its first request.
-        let listing_only = HealthcheckResponse {
-            status: "loading".to_owned(),
-            model_loaded: false,
-            device: "unknown".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(!healthcheck_response_ready(&listing_only));
     }
 
     #[test]
