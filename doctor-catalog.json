@@ -241,6 +241,23 @@
       "doc_url": "https://aka.ms/vs/17/release/vc_redist.x64.exe"
     },
     {
+      "id": "fix-16-vllm-oom",
+      "title": "vLLM ran the GPU out of memory at startup",
+      "platforms": [
+        {
+          "os": "linux",
+          "class": "print-only"
+        },
+        {
+          "os": "wsl",
+          "class": "print-only"
+        }
+      ],
+      "needs_sudo": false,
+      "needs_reboot": false,
+      "needs_relogin": false
+    },
+    {
       "id": "fix-17-torch-dlpack",
       "title": "Restore the engine's pinned torch (torch-c-dlpack-ext loads the CUDA variant)",
       "platforms": [
