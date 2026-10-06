@@ -58,7 +58,11 @@ pub use disk_space::{
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
-pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use fix::{
+    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
+    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
+    list_recipes as list_fix_recipes,
+};
 #[cfg(all(test, target_os = "linux"))]
 use host_gpu::collect_managed_runtime_library_paths;
 pub use host_gpu::{

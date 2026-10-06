@@ -316,19 +316,32 @@ mod tests {
         let report = report_of(None);
         let subject = subject_for(&report);
 
-        for planted in [
-            machine.user_name.as_str(),
-            machine.rocm_path.as_str(),
-            machine.cpu_model.as_str(),
-            machine.gpus[0].pci_id.as_str(),
-            machine.gpus[0].name.as_str(),
+        // The markers are named literally rather than read back off
+        // `machine`, matching `report.rs`'s `SENTINELS` sweep. Reading a field
+        // here would make this a flow from `user_name` into a printed string,
+        // which a static scanner reports as cleartext logging even though the
+        // value is a constant -- and the fix for that would be to stop
+        // printing the value, which is the one thing this message must keep
+        // doing (see `reportable_machine`). Naming them sidesteps the question.
+        let serialized = serde_json::to_string(&machine).expect("fixture must serialize");
+        for (field, marker) in [
+            ("user_name", "SENTINEL-USER"),
+            ("rocm_path", "SENTINEL-PATH"),
+            ("cpu_model", "SENTINEL-CPU"),
+            ("gpus[0].pci_id", "SENTINEL-PCI"),
+            ("gpus[0].name", "SENTINEL-MARKETING-NAME"),
         ] {
-            if planted.is_empty() {
-                continue;
-            }
+            // Non-vacuity, and a guard against this list drifting from the
+            // fixture: a marker renamed in `reportable_machine` would
+            // otherwise leave this loop sweeping for a string nothing plants,
+            // passing against a subject that does leak the real field.
             assert!(
-                !subject.contains(planted),
-                "'{planted}' reached the subject line: {subject}"
+                serialized.contains(marker),
+                "{field} no longer plants {marker}; this sweep would pass vacuously"
+            );
+            assert!(
+                !subject.contains(marker),
+                "'{marker}' ({field}) reached the subject line: {subject}"
             );
         }
     }
