@@ -91,7 +91,11 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         rocm_sdk_version: "10.1.0",
         python_tag: "cp314",
         vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
-        torch_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/",
+        // Torch stack from `whl-next`, not staging: staging's 10.1 torchaudio
+        // fails to load its native library against staging's torch at serve
+        // time. `whl-next` is the index `rocm install sdk` resolves the 10.1
+        // SDK's own coherent `+rocm10.1.0` torch stack from.
+        torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
         vllm_version_prefix: "0.29",
         flash_attn_version_prefix: "2.8",
         amd_aiter_version_prefix: "0.1",
@@ -1797,10 +1801,13 @@ mod tests {
         );
         Ok(())
     }
-    /// The 10.1 row must reach the staging host for both vLLM and torch; 10.0
-    /// must keep using the production frameworks index and `whl-next`. This is
-    /// the offline half of the 10.1 verification: no ROCm 10.1 SDK is published
-    /// yet, so the live install cannot be exercised.
+    /// The 10.1 row must reach the staging host for vLLM, which is only
+    /// published there, but takes its torch stack from `whl-next` just like
+    /// 10.0: staging's 10.1 torchaudio could not load `libtorchaudio.abi3.so`
+    /// against staging's torch (therock-next-09), while `whl-next` publishes
+    /// the coherent `+rocm10.1.0` torch/torchvision/torchaudio trio the 10.1
+    /// SDK itself installs. 10.0 keeps the production frameworks index for
+    /// vLLM. The live half of this is therock-next-09.
     #[test]
     fn discover_rows_select_their_own_indexes() {
         let ten_zero = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
@@ -1822,7 +1829,7 @@ mod tests {
         );
         assert_eq!(
             ten_one.torch_index_url,
-            "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/"
+            "https://stable.repo.amd.com/rocm/whl-next/"
         );
         assert_eq!(ten_one.vllm_version_prefix, "0.29");
 
