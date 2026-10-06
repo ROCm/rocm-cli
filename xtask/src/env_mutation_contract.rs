@@ -102,7 +102,9 @@ mod tests {
     /// The trailing `(` is what keeps that widening from over-reporting: it
     /// pins the match to a call rather than a prefix, so `env::set_variable(..)`
     /// — an unrelated function whose name merely starts the same way — is not
-    /// an offense. Both directions have fixtures.
+    /// an offense. Both directions have fixtures. That holds for the entries
+    /// that END in `(`; the one bare type name below is matched by a different
+    /// rule, described with it and implemented in [`mutation_column`].
     /// `RestoredEnvVar::set(` is here because the guard matches TEXT, and a
     /// mutation spelled as a method on a restoring wrapper contains neither
     /// direct call. The two tests that use it are the sanctioned exception this
@@ -116,7 +118,17 @@ mod tests {
     /// same reason, from the other side: it is a unit struct whose `Drop`
     /// removes a variable, so the mutation happens in an impl the scan never
     /// enters and the test body only ever NAMES the type. It carries no `(`
-    /// because constructing a unit struct has none.
+    /// because constructing a unit struct has none, so a plain substring match
+    /// would also flag `UnsetKeyOnExitHelper`, `MyUnsetKeyOnExit` and
+    /// `Option<UnsetKeyOnExit>`. A bare name therefore only counts as a whole
+    /// identifier in a position where a value of it is built or reached:
+    /// followed by `;`, `(`, `{` or `::`. That flags `let _g = UnsetKeyOnExit;`
+    /// and rejects all three shapes above — a type mention in `Option<..>` or a
+    /// signature holds nothing. The definition and `impl Drop for .. {` also
+    /// match the rule, but sit outside any test body, where the scan does not
+    /// look. Both directions are pinned by
+    /// [`a_bare_type_entry_matches_only_a_whole_constructed_name`] and
+    /// [`holding_a_mutating_guard_still_needs_the_lock`].
     const MUTATIONS: [&str; 4] = [
         "set_var(",
         "remove_var(",
@@ -194,17 +206,48 @@ mod tests {
     /// else.
     fn lock_name_column(line: &str) -> Option<usize> {
         const SUFFIX: &str = "_TEST_LOCK";
-        let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
         line.match_indices(SUFFIX).find_map(|(at, _)| {
             let ends_word = line[at + SUFFIX.len()..]
                 .chars()
                 .next()
-                .is_none_or(|c| !identifier(c));
+                .is_none_or(|c| !is_identifier_char(c));
             let start = line[..at]
-                .rfind(|c: char| !identifier(c))
+                .rfind(|c: char| !is_identifier_char(c))
                 .map_or(0, |i| i + 1);
             ends_word.then_some(start)
         })
+    }
+
+    fn is_identifier_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_'
+    }
+
+    /// The leftmost [`MUTATIONS`] entry on `line`, with its column.
+    ///
+    /// An entry ending in `(` is a call and is matched as text. A bare type
+    /// name is matched only as a whole identifier that a value is built or
+    /// reached from — the next non-blank character is `;`, `(`, `{` or `::` —
+    /// for the reasons given on [`MUTATIONS`].
+    fn mutation_column(line: &str) -> Option<(usize, &'static str)> {
+        MUTATIONS
+            .iter()
+            .filter_map(|needle| {
+                let at = if needle.ends_with('(') {
+                    line.find(needle)
+                } else {
+                    line.match_indices(needle).map(|(at, _)| at).find(|&at| {
+                        let starts_word = line[..at]
+                            .chars()
+                            .next_back()
+                            .is_none_or(|c| !is_identifier_char(c));
+                        let after = line[at + needle.len()..].trim_start();
+                        starts_word
+                            && (after.starts_with([';', '(', '{']) || after.starts_with("::"))
+                    })
+                };
+                at.map(|at| (at, *needle))
+            })
+            .min()
     }
 
     /// The rest of the statement beginning at `lines[index]`.
@@ -600,11 +643,7 @@ mod tests {
                 {
                     open.serialized_at = Some((index + 1, column));
                 }
-                if let Some((column, found)) = MUTATIONS
-                    .iter()
-                    .filter_map(|needle| code.find(*needle).map(|at| (at, *needle)))
-                    .min()
-                {
+                if let Some((column, found)) = mutation_column(code) {
                     open.hits.push(Offense {
                         line: index + 1,
                         column,
@@ -837,6 +876,53 @@ mod tests {
             env_mutations_in_unserialized_tests(&guarded).is_empty(),
             "the lock above is what makes this shape acceptable"
         );
+    }
+
+    /// A guard whose `Drop` mutates does not exempt the test that holds it.
+    ///
+    /// The mirror of
+    /// [`a_mutation_delegated_to_a_restoring_wrapper_still_needs_the_lock`]
+    /// for the bare type entry: the test body only names the type, so the
+    /// guard enforces the lock only while that name is in [`MUTATIONS`].
+    /// Unguarded is an offense, guarded is not.
+    #[test]
+    fn holding_a_mutating_guard_still_needs_the_lock() {
+        let held = held_mutating_guard("UnsetKeyOnExit");
+
+        let hits = env_mutations_in_unserialized_tests(&unguarded_test(&held));
+        assert_eq!(hits.len(), 1, "holding the guard mutates on drop: {hits:?}");
+        assert_eq!(
+            hits[0].call, "UnsetKeyOnExit",
+            "the offender is named by the type"
+        );
+
+        let guarded = unguarded_test(&format!(
+            "let _guard = SOME_TEST_LOCK.lock().unwrap();\n        {held}"
+        ));
+        assert!(
+            env_mutations_in_unserialized_tests(&guarded).is_empty(),
+            "the lock above is what makes this shape acceptable"
+        );
+    }
+
+    /// A bare type entry is a whole identifier that a value is built from,
+    /// not a substring.
+    ///
+    /// Each shape defeats one half of the rule on its own: the longer name
+    /// fails the check after the match, the prefixed one fails the check
+    /// before it (it is followed by `;`, so only the leading boundary rejects
+    /// it), and the generic argument is a whole identifier that names the type
+    /// without building a value of it.
+    #[test]
+    fn a_bare_type_entry_matches_only_a_whole_constructed_name() {
+        for line in [
+            "let _h = UnsetKeyOnExitHelper;",
+            "let _m = MyUnsetKeyOnExit;",
+            "let _o: Option<UnsetKeyOnExit> = None;",
+        ] {
+            let hits = env_mutations_in_unserialized_tests(&unguarded_test(line));
+            assert!(hits.is_empty(), "`{line}` holds no such guard: {hits:?}");
+        }
     }
 
     /// The qualifier is a matter of how the file imports, not of what the call
