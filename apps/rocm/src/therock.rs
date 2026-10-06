@@ -53,6 +53,9 @@ const THEROCK_NEXT_LAYOUT_GENERATION: &str = "next-v1";
 /// therefore the only thing that selects [`SourceLayout::Next`].
 const THEROCK_NEXT_MIN_MAJOR: u32 = 10;
 const DEFAULT_MANAGED_PYTHON_VERSION: &str = "3.12";
+/// Interpreter `uv` provisions for a [`SourceLayout::Next`] install. See
+/// [`python_requirement`] for why this differs from the canonical default.
+const NEXT_MANAGED_PYTHON_VERSION: &str = "3.14";
 const STARTUP_UPDATE_CHECK_INTERVAL_MS: u128 = 12 * 60 * 60 * 1_000;
 const STARTUP_UPDATE_CHECK_TIMEOUT_SECS: u64 = 2;
 /// Timeout for the best-effort HEAD probe that sizes a download before starting it.
@@ -1482,18 +1485,24 @@ fn resolve_latest_for_manifest(
     let layout = manifest_source_layout(manifest)?;
     match manifest.format.as_str() {
         "wheel" => {
+            // A runtime updated across a layout change needs the new layout's
+            // interpreter, so the recorded one is re-checked rather than trusted
+            // on `is_file()` alone; otherwise a canonical cp312 venv would carry
+            // into a next-layout update and resolve nothing.
+            let requirement = python_requirement(layout);
             let manifest_python = manifest
                 .python_executable
                 .as_deref()
                 .map(PathBuf::from)
                 .filter(|path| path.is_file())
+                .filter(|path| python_launcher_install_ready(path, requirement).is_ok())
                 .map(|executable| PythonLauncher {
                     executable,
                     source: "manifest",
                 });
             let python_executable = match manifest_python {
                 Some(python) => python,
-                None => resolve_python_launcher(paths)?,
+                None => resolve_python_launcher(paths, requirement)?,
             };
             let wheel_compatibility =
                 wheel_compatibility_for_python(&python_executable.executable)?;
@@ -1724,11 +1733,45 @@ fn install_wheel_runtime(
         device_target: device_target_override,
         layout: layout_override,
     } = source_override;
+    // `device_target_override` (an update apply's exact recorded arch) is only
+    // otherwise consulted after `resolve_pip_runtime` returns — too late for the
+    // channel/arch check below, which needs an exact arch before it can run at
+    // all. Recover it into the family override up front, same as `resolve_pip_runtime`
+    // does internally.
+    let recovered_family_override = family_override
+        .map(|family| family_override_or_recovered_arch(family, device_target_override));
+    // Fail fast on a request `resolve_pip_runtime` could only ever reject (wrong
+    // channel, or a grouped family with no exact arch) before paying for Python
+    // provisioning below, which can mean a real download for a layout this host
+    // or channel can never actually use.
+    select_source_layout(
+        channel,
+        &resolve_family(paths, recovered_family_override.as_deref())?,
+        version_selector,
+    )?;
+    // The interpreter has to be picked before `resolve_pip_runtime`, which
+    // selects wheels using that interpreter's own tags. `requested_source_layout`
+    // only answers from the *request*: an explicit stable ROCm 10+ pin already
+    // routes to `Next` and gets `cp314` that way, but a plain auto-select or a
+    // nightly build-date/prerelease pin always reports `Canonical`, even once
+    // the canonical/nightly feed's own "latest" has rotated past that major on
+    // its own, with no `Next` routing involved. `canonical_auto_select_needs_next_python`
+    // peeks the channel's own `rocm` listing to catch that case.
+    let python_requirement = match requested_source_layout(layout_override, version_selector) {
+        SourceLayout::Next => python_requirement(SourceLayout::Next),
+        SourceLayout::Canonical => {
+            if canonical_auto_select_needs_next_python(paths, channel, version_selector)? {
+                python_requirement(SourceLayout::Next)
+            } else {
+                python_requirement(SourceLayout::Canonical)
+            }
+        }
+    };
     progress_line(format!(
         "Checking Python for the ROCm install; if needed, ROCm CLI will prepare Python {}.",
-        managed_python_version()
+        managed_python_version(python_requirement)
     ));
-    let python_launcher = resolve_python_launcher(paths)?;
+    let python_launcher = resolve_python_launcher(paths, python_requirement)?;
     progress_line(match python_launcher.source {
         "path" => format!(
             "Using Python from PATH: {}.",
@@ -1752,12 +1795,6 @@ fn install_wheel_runtime(
         "Checking TheRock {} packages for this AMD GPU...",
         channel.as_str()
     ));
-    // `device_target_override` (an update apply's exact recorded arch) is only
-    // otherwise consulted below, after `resolve_pip_runtime` returns — too late
-    // for the next layout, which needs an exact arch before it can query
-    // package metadata at all. Recover it into the family override up front.
-    let recovered_family_override = family_override
-        .map(|family| family_override_or_recovered_arch(family, device_target_override));
     let resolution = resolve_pip_runtime(
         paths,
         channel,
@@ -4836,19 +4873,29 @@ fn ensure_uv_venv(
 ) -> Result<()> {
     let env_python = venv_python_path(install_root);
     if env_python.is_file() {
-        if run_command(
+        let reusable = run_command(
             &env_python,
             &["--version"],
             "verify existing managed TheRock runtime Python",
         )
         .is_ok()
-        {
+            && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
+                wheel_compatibility_for_python(python_launcher)
+                    .is_ok_and(|required| existing.python_tag == required.python_tag)
+            });
+        if reusable {
             return Ok(());
         }
-        progress_line("Existing Python environment is incomplete; recreating it.");
+        // Same `install_root` can be reused across reinstalls (it's keyed on
+        // resolved version/build date, not on the interpreter), so an existing
+        // venv left over from a lower-tag requirement must not be mistaken for
+        // a compatible one just because it still runs.
+        progress_line(
+            "Existing Python environment does not match the required interpreter; recreating it.",
+        );
         fs::remove_dir_all(install_root).with_context(|| {
             format!(
-                "failed to remove incomplete Python environment at {}",
+                "failed to remove incompatible Python environment at {}",
                 install_root.display()
             )
         })?;
@@ -5699,24 +5746,127 @@ fn managed_python_bootstrap_disabled() -> bool {
         })
 }
 
-fn managed_python_version() -> String {
+/// The interpreter a runtime's wheels require.
+///
+/// ROCm >= [`THEROCK_NEXT_MIN_MAJOR`] publishes its framework wheels (notably
+/// vLLM, flash-attn and amd-aiter) for one CPython version only, and it is not
+/// the one the canonical stream uses. Both fields move together, so they travel
+/// together: `version` is what `uv` provisions, `tag` is what an already-present
+/// interpreter is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PythonRequirement {
+    tag: &'static str,
+    version: &'static str,
+}
+
+/// The interpreter required to install from `layout`.
+///
+/// Keyed on the layout rather than on a resolved ROCm version because the
+/// interpreter has to be chosen *before* resolution: `resolve_pip_runtime` picks
+/// wheels using the interpreter's own tags, so the resolved version is not
+/// available yet. The layout is an honest stand-in only when it was decided
+/// from an explicit stable pin (`next_layout_requested`); a fresh install with
+/// no pin, or a nightly build-date/prerelease pin, needs
+/// [`canonical_auto_select_needs_next_python`] to check whether the channel's
+/// own "latest" has rotated past [`THEROCK_NEXT_MIN_MAJOR`] on its own.
+const fn python_requirement(layout: SourceLayout) -> PythonRequirement {
+    match layout {
+        SourceLayout::Next => PythonRequirement {
+            tag: "cp314",
+            version: NEXT_MANAGED_PYTHON_VERSION,
+        },
+        SourceLayout::Canonical => PythonRequirement {
+            tag: "cp312",
+            version: DEFAULT_MANAGED_PYTHON_VERSION,
+        },
+    }
+}
+
+/// The layout an install or update will read from, as far as is knowable before
+/// an interpreter has been chosen. An update passes its manifest's recorded
+/// layout; a fresh install passes its request and lets the pin decide.
+fn requested_source_layout(
+    layout_override: Option<SourceLayout>,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> SourceLayout {
+    match layout_override {
+        Some(layout) => layout,
+        None if version_selector.is_some_and(next_layout_requested) => SourceLayout::Next,
+        None => SourceLayout::Canonical,
+    }
+}
+
+/// Whether a `Canonical`-layout install (auto-select, or a nightly
+/// build-date/prerelease pin) will actually resolve a ROCm build at major >=
+/// [`THEROCK_NEXT_MIN_MAJOR`], regardless of [`VersionStage`].
+///
+/// `requested_source_layout` only answers from the shape of the request: an
+/// explicit *stable* pin at ROCm >= `THEROCK_NEXT_MIN_MAJOR` routes to `Next`
+/// and gets `cp314` that way, but the canonical/nightly feed can resolve a
+/// ROCm >= `THEROCK_NEXT_MIN_MAJOR` build (stable or prerelease) on its own,
+/// with no `Next` routing involved — and the `cp314` requirement is a property
+/// of the build itself, not of which index served it. Fetching the channel's
+/// own interpreter-agnostic `rocm` listing ahead of interpreter selection is
+/// the only way to know; `resolve_pip_runtime` re-fetches the same URL for the
+/// real resolution afterwards and shares this call's cache entry, so this
+/// costs no extra network round trip.
+fn canonical_auto_select_needs_next_python(
+    paths: &AppPaths,
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> Result<bool> {
+    let source = resolve_source(channel, SourceLayout::Canonical);
+    let rocm_versions = load_simple_index_versions(paths, &source.wheel_index, "rocm", None, None)?;
+    Ok(highest_candidate_needs_next_python(
+        &rocm_versions,
+        channel,
+        version_selector,
+    ))
+}
+
+/// Pure decision core of [`canonical_auto_select_needs_next_python`], split out
+/// so it can be tested without a network fetch.
+fn highest_candidate_needs_next_python(
+    rocm_versions: &[String],
+    channel: TheRockChannel,
+    version_selector: Option<&RuntimeVersionSelector>,
+) -> bool {
+    let mut candidates = channel_rocm_candidates(rocm_versions, channel);
+    if let Some(selector) = version_selector {
+        candidates.retain(|version| selector.matches_version(version));
+    }
+    candidates
+        .last()
+        .and_then(|version| parse_version(version))
+        .is_some_and(|parsed| parsed.major >= THEROCK_NEXT_MIN_MAJOR)
+}
+
+fn managed_python_version(requirement: PythonRequirement) -> String {
     std::env::var("ROCM_CLI_MANAGED_PYTHON_VERSION")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MANAGED_PYTHON_VERSION.to_owned())
+        .unwrap_or_else(|| requirement.version.to_owned())
 }
 
-fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
-    let version = managed_python_version();
+fn ensure_managed_python(
+    paths: &AppPaths,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
+    let version = managed_python_version(requirement);
     progress_line(format!("Preparing Python {version}..."));
 
     let uv = ensure_uv_binary(paths)?;
 
     // Check the manifest first — if the recorded executable is still usable, skip the install.
+    // ponytail: this manifest holds one version at a time, so alternating between a
+    // canonical (3.12) and a `Next` (3.14) install re-runs `uv python install` on every
+    // switch instead of keeping both cached — `uv` itself still short-circuits the
+    // re-download, so this costs a subprocess round trip, not a real reinstall. Upgrade
+    // to a version-keyed manifest if that alternation turns out to be a common pattern.
     if let Ok(Some(manifest)) = load_managed_python_manifest(paths)
         && manifest.version == version
         && manifest.executable.is_file()
-        && python_launcher_install_ready(&manifest.executable).is_ok()
+        && python_launcher_install_ready(&manifest.executable, requirement).is_ok()
     {
         progress_line(format!(
             "Using existing Python {version} at {}.",
@@ -5779,9 +5929,9 @@ fn ensure_managed_python(paths: &AppPaths) -> Result<PythonLauncher> {
         );
     }
 
-    python_launcher_install_ready(&executable).with_context(|| {
+    python_launcher_install_ready(&executable, requirement).with_context(|| {
         format!(
-            "Python {version} at {} could not create a virtual environment",
+            "Python {version} at {} is not usable for this ROCm install",
             executable.display()
         )
     })?;
@@ -5828,13 +5978,20 @@ impl PythonResolverEnv {
     }
 }
 
-fn resolve_python_launcher(paths: &AppPaths) -> Result<PythonLauncher> {
-    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env())
+fn resolve_python_launcher(
+    paths: &AppPaths,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
+    resolve_python_launcher_in(paths, &PythonResolverEnv::from_process_env(), requirement)
 }
 
-fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Result<PythonLauncher> {
+fn resolve_python_launcher_in(
+    paths: &AppPaths,
+    env: &PythonResolverEnv,
+    requirement: PythonRequirement,
+) -> Result<PythonLauncher> {
     if let Some(value) = env.python_override.as_deref() {
-        python_launcher_install_ready(Path::new(value))
+        python_launcher_install_ready(Path::new(value), requirement)
             .with_context(|| format!("ROCM_CLI_PYTHON is not usable for ROCm setup: {value}"))?;
         return Ok(PythonLauncher {
             executable: PathBuf::from(value),
@@ -5844,7 +6001,7 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
 
     let mut skipped_path_python = false;
     for candidate in python_path_candidates(&env.search_dirs) {
-        match python_launcher_install_ready(&candidate) {
+        match python_launcher_install_ready(&candidate, requirement) {
             Ok(()) => {
                 return Ok(PythonLauncher {
                     executable: candidate,
@@ -5857,23 +6014,25 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
         }
     }
     if skipped_path_python {
-        progress_line(
-            "Python from PATH cannot create a virtual environment; using ROCm CLI's managed Python.",
-        );
+        progress_line(format!(
+            "Python from PATH is not usable for this ROCm install ({} is required); using ROCm CLI's managed Python.",
+            requirement.tag
+        ));
     }
 
     if let Some(manifest) = load_managed_python_manifest(paths)?
         && manifest.executable.is_file()
     {
-        if python_launcher_install_ready(&manifest.executable).is_ok() {
+        if python_launcher_install_ready(&manifest.executable, requirement).is_ok() {
             return Ok(PythonLauncher {
                 executable: manifest.executable,
                 source: "managed",
             });
         }
-        progress_line(
-            "Saved managed Python cannot create a virtual environment; preparing Python again.",
-        );
+        progress_line(format!(
+            "Saved managed Python is not usable for this ROCm install ({} is required); preparing Python again.",
+            requirement.tag
+        ));
     }
 
     if managed_python_bootstrap_disabled() {
@@ -5881,7 +6040,7 @@ fn resolve_python_launcher_in(paths: &AppPaths, env: &PythonResolverEnv) -> Resu
             "unable to locate Python, and managed Python bootstrap is disabled by ROCM_CLI_DISABLE_MANAGED_PYTHON_BOOTSTRAP"
         );
     }
-    ensure_managed_python(paths)
+    ensure_managed_python(paths, requirement)
 }
 
 fn python_path_candidates(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
@@ -5930,15 +6089,16 @@ fn program_path_candidates(program: &str) -> Vec<String> {
     names
 }
 
-fn python_launcher_install_ready(program: &Path) -> Result<()> {
+fn python_launcher_install_ready(program: &Path, requirement: PythonRequirement) -> Result<()> {
     let compatibility = wheel_compatibility_for_python(program)?;
-    if compatibility.python_tag != "cp312" {
+    if compatibility.python_tag != requirement.tag {
         bail!(
-            "Python wheel tag {} is not supported; cp312 is required",
-            compatibility.python_tag
+            "Python wheel tag {} is not supported by this ROCm install; {} is required",
+            compatibility.python_tag,
+            requirement.tag
         );
     }
-    verify_python_can_create_venv(program)
+    verify_python_can_create_venv(program).context("Python could not create a virtual environment")
 }
 
 fn verify_python_can_create_venv(program: &Path) -> Result<()> {
@@ -6867,8 +7027,8 @@ mod tests {
         // python is a non-executable stub fails
         // `python_launcher_install_ready`, so `resolve_python_launcher_in`
         // falls back to the managed-Python path and calls
-        // `progress_line("Python from PATH cannot create a virtual
-        // environment; using ROCm CLI's managed Python.")` before bailing out
+        // `progress_line("Python from PATH is not usable for this ROCm
+        // install ...; using ROCm CLI's managed Python.")` before bailing out
         // (managed bootstrap is disabled here, so the whole thing stays
         // network-free). If `render_update_json` stopped installing the
         // guard, that call would land in `PROGRESS_LINE_SINK` instead of
@@ -7482,6 +7642,25 @@ mod tests {
         .expect("future nightly major should resolve");
 
         assert_eq!(selected.rocm, "10.1.0a20260822");
+    }
+
+    #[test]
+    fn auto_select_landing_on_next_major_needs_next_python() {
+        // Same feed as `nightly_accepts_future_prerelease_major_without_cli_changes`:
+        // auto-select reaches ROCm 10.1.0a20260822, which needs cp314, not cp312,
+        // even though it's a prerelease served from the ordinary canonical/nightly
+        // index rather than `Next`'s separately hosted one.
+        assert!(highest_candidate_needs_next_python(
+            &["10.1.0a20260822".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
+
+        assert!(!highest_candidate_needs_next_python(
+            &["7.14.0".to_owned()],
+            TheRockChannel::Nightly,
+            None,
+        ));
     }
 
     #[test]
@@ -8729,6 +8908,73 @@ mod tests {
         assert_eq!(DEFAULT_MANAGED_PYTHON_VERSION, "3.12");
     }
 
+    /// ROCm 10.x framework wheels (vLLM, flash-attn, amd-aiter) are published
+    /// cp314-only, so the next layout must provision 3.14 while everything else
+    /// stays on 3.12.
+    #[test]
+    fn python_requirement_follows_the_source_layout() {
+        let canonical = python_requirement(SourceLayout::Canonical);
+        assert_eq!(canonical.tag, "cp312");
+        assert_eq!(canonical.version, "3.12");
+
+        let next = python_requirement(SourceLayout::Next);
+        assert_eq!(next.tag, "cp314");
+        assert_eq!(next.version, "3.14");
+    }
+
+    /// The requirement is read before `resolve_pip_runtime` runs, so it has to
+    /// be derivable from the request alone. Only an explicit stable ROCm >= 10
+    /// pin reaches the next layout; a build-date pin, an older pin, or no
+    /// selector at all must stay canonical so nothing that installs today
+    /// starts demanding a different interpreter.
+    #[test]
+    fn requested_source_layout_reads_the_request_not_the_resolution() {
+        let next_pin = RuntimeVersionSelector::Version("10.1.0".to_owned());
+        assert_eq!(
+            requested_source_layout(None, Some(&next_pin)),
+            SourceLayout::Next
+        );
+
+        let old_pin = RuntimeVersionSelector::Version("7.2.3".to_owned());
+        assert_eq!(
+            requested_source_layout(None, Some(&old_pin)),
+            SourceLayout::Canonical
+        );
+        assert_eq!(requested_source_layout(None, None), SourceLayout::Canonical);
+
+        // An update supplies its manifest's layout, which wins over the (absent)
+        // selector so the runtime keeps the interpreter its stream needs.
+        assert_eq!(
+            requested_source_layout(Some(SourceLayout::Next), None),
+            SourceLayout::Next
+        );
+    }
+
+    /// A tag mismatch and a broken venv are different failures with different
+    /// fixes, so the gate must not report one as the other.
+    #[cfg(unix)]
+    #[test]
+    fn python_gate_rejects_the_wrong_tag_without_blaming_the_venv() -> Result<()> {
+        let (root, _paths) = test_paths("python-gate-tag-mismatch");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir)?;
+        // A real, working cp312 interpreter: the venv probe would succeed.
+        let python = write_fake_python_with_venv(&bin_dir, "python")?;
+
+        python_launcher_install_ready(&python, python_requirement(SourceLayout::Canonical))
+            .expect("a cp312 python satisfies a canonical install");
+
+        let err = python_launcher_install_ready(&python, python_requirement(SourceLayout::Next))
+            .expect_err("a cp312 python cannot serve a next-layout install");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("cp314"), "{rendered}");
+        assert!(
+            !rendered.contains("virtual environment"),
+            "a tag mismatch must not be reported as a venv failure: {rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn managed_python_manifest_round_trips() -> Result<()> {
         let (root, paths) = test_paths("managed-python-manifest");
@@ -8783,6 +9029,7 @@ mod tests {
                 python_override: None,
                 search_dirs: vec![bin_dir],
             },
+            python_requirement(SourceLayout::Canonical),
         )?;
         assert_eq!(launcher.source, "path");
         assert!(
@@ -8884,6 +9131,7 @@ mod tests {
                 python_override: None,
                 search_dirs: vec![bin_dir],
             },
+            python_requirement(SourceLayout::Canonical),
         )?;
 
         assert_eq!(launcher.source, "path");
@@ -8947,6 +9195,96 @@ echo Python 3.12.10
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_python_reporting(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
+        );
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    fn write_fake_uv_creating_venv(
+        dir: &Path,
+        name: &str,
+        tag: &str,
+        version: &str,
+    ) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  /bin/mkdir -p "$4/bin"
+  /bin/cat > "$4/bin/python" <<PY
+#!/bin/sh
+if [ "\$1" = "-c" ]; then
+  echo {tag}
+  exit 0
+fi
+echo {version}
+PY
+  /bin/chmod +x "$4/bin/python"
+  exit 0
+fi
+exit 1
+"#
+        );
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_recreates_on_interpreter_tag_mismatch() {
+        // `install_root` is keyed on resolved version/build date, not on the
+        // interpreter, so a reinstall that now requires cp314 must not reuse a
+        // stale cp312 venv left over from before this tag check existed.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-ensure-uv-venv-{}-{}",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+
+        let install_root = root.join("install");
+        let stale_bin = install_root.join("bin");
+        fs::create_dir_all(&stale_bin).unwrap();
+        write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
+
+        let python_launcher =
+            write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
+        let uv = write_fake_uv_creating_venv(&root, "uv", "cp314", "Python 3.14.5").unwrap();
+
+        ensure_uv_venv(&paths, &uv, &python_launcher, &install_root).unwrap();
+
+        let env_python = venv_python_path(&install_root);
+        let compat = wheel_compatibility_for_python(&env_python).unwrap();
+        assert_eq!(
+            compat.python_tag, "cp314",
+            "stale cp312 venv must be recreated, not silently reused"
+        );
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

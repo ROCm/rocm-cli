@@ -35,7 +35,25 @@ pub struct Fix {
     pub needs_reboot: bool,
     pub needs_relogin: bool,
     pub fix_id: String,
+    /// Whether `rocm fix <fix_id>`, run with no extra arguments, will change
+    /// the machine.
+    ///
+    /// Kept alongside [`Fix::class`], which it is derived from, because it is
+    /// the field published consumers already read. It is not redundant detail
+    /// so much as a narrower question: `class` says *what* the CLI will do,
+    /// this says only whether the machine is about to change.
     pub auto_applicable: bool,
+    /// What the CLI will do with this entry on the examined machine.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes; the default understates rather than overstates.
+    #[serde(default)]
+    pub class: crate::fix::FixClass,
+    /// The argument this entry is waiting for, when `class` is
+    /// [`crate::fix::FixClass::NeedsArgument`]. Read from the catalog beside
+    /// `class` so the flags line renders identically from `rocm fix` and here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
     pub notes: Vec<String>,
     pub verify: String,
 }
@@ -218,6 +236,28 @@ const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
         "a data-loader worker was killed",
     ),
     ("no space left on device", 20, "the device reported full"),
+];
+
+/// What a shadowed code object manager leaves in the error text.
+///
+/// Every one of these is a *weak* signal on its own — a failed device-code
+/// compilation has many causes, and this entry is established by the state of
+/// the machine rather than by the words. The keywords only raise an already
+/// structural finding; none of them reaches the match threshold alone.
+const KEYWORDS_COMGR_CONFLICT: KeywordTable = &[
+    (r"libamd_comgr", 40, "error mentions libamd_comgr"),
+    ("comgr", 30, "error mentions comgr"),
+    (
+        "code object",
+        25,
+        "error mentions a code object (what comgr produces)",
+    ),
+    (
+        "hiperrornobinaryforgpu",
+        25,
+        "HIP found no binary for the GPU",
+    ),
+    ("device code", 15, "error mentions device code (broad)"),
 ];
 
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
@@ -480,7 +520,6 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx_target>".to_owned(),
         ],
         fix_id: "fix-1-arch".to_owned(),
-        auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
         notes: notes_1_arch(e),
         ..Fix::default()
@@ -564,7 +603,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Or remove via System Properties -> Environment Variables.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','User')\"".to_owned(),
             ..Fix::default()
         }
@@ -576,7 +614,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Also remove it from ~/.bashrc / ~/.zshrc / ~/.profile if persisted.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET; python -c \"import torch; print(torch.cuda.is_available())\"".to_owned(),
             ..Fix::default()
         }
@@ -624,7 +661,6 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
-        auto_applicable: false,
         needs_reboot: true,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 20".to_owned(),
         ..Fix::default()
@@ -682,7 +718,6 @@ fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_relogin: true,
         fix_id: "fix-4-render-group".to_owned(),
-        auto_applicable: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5".to_owned(),
         notes: vec![
             "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
@@ -752,7 +787,6 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
         needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
-        auto_applicable: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5".to_owned(),
         ..Fix::default()
     };
@@ -827,7 +861,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                     .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: format!(
                 "powershell -NoProfile -Command \"& \\\"{bin_dir}\\hipInfo.exe\\\" | Select-Object -First 5\""
             ),
@@ -841,7 +874,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                 format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: "rocminfo | head -n 5 && hipcc --version".to_owned(),
             ..Fix::default()
         }
@@ -891,7 +923,6 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         commands,
         needs_sudo: true,
         fix_id: "fix-7-stale-repos".to_owned(),
-        auto_applicable: false,
         verify: "sudo apt update 2>&1 | tail -n 20".to_owned(),
         ..Fix::default()
     };
@@ -951,7 +982,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -968,7 +998,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -1035,14 +1064,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
-    // Both branches below are marked auto_applicable, but `rocm fix
-    // fix-9-igpu-dgpu` still needs --device-index to actually make the change:
-    // without it, the Linux and the Windows runner alike only print the query
-    // that finds the index and change nothing (see README's --device-index
-    // caveat). Each branch states that once, in its second note.
-    // `render_report_text` prints every note on its own line, so saying it
-    // again here -- appended to the detected-targets note -- would show up as a
-    // second bullet repeating the first.
+    // The catalog classes this NEEDS-ARG, which is what the marker now says:
+    // without --device-index both the Linux and Windows runners only print the
+    // query that finds the index and change nothing. The note used to end
+    // "despite being marked AUTO", which was true of the old flat flag and is
+    // exactly the overstatement this change removes.
+    let note = format!(
+        "{note} Without --device-index, `rocm fix` only prints this query and makes no change."
+    );
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -1054,16 +1083,8 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
-            notes: vec![
-                note,
-                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
-                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
-                 --device-index N. Without it, `rocm fix` just prints the query that \
-                 identifies which index is the discrete GPU."
-                    .to_owned(),
-            ],
+            notes: vec![note],
             ..Fix::default()
         }
     } else {
@@ -1077,22 +1098,8 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
-            // true, runner: run_hip_visible_devices) -- `rocm fix
-            // fix-9-igpu-dgpu --device-index N` really does carry this out on
-            // Linux, so the report must not claim otherwise. An agent branches
-            // on this flag to decide whether to offer to run the fix or only
-            // print it, so a wrong value here costs more than a stale sentence.
-            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![
-                note,
-                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
-                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
-                 --device-index N. Without it, `rocm fix` just prints the query that \
-                 identifies which index is the discrete GPU."
-                    .to_owned(),
-            ],
+            notes: vec![note],
             ..Fix::default()
         }
     };
@@ -1151,7 +1158,6 @@ fn check_10_container_devices(e: &Examination, symptom: &str) -> Diagnosis {
             "# host user is in the render group; podman maps it through.".to_owned(),
         ],
         fix_id: "fix-10-container".to_owned(),
-        auto_applicable: false,
         verify: "rocminfo | head -n 5".to_owned(),
         notes: vec!["Use rocm/pytorch or rocm/dev-ubuntu-22.04 as a known-good image. Mixing host ROCm + container ROCm versions is a separate footgun.".to_owned()],
         ..Fix::default()
@@ -1201,7 +1207,6 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-11-iommu".to_owned(),
-        auto_applicable: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'".to_owned(),
         ..Fix::default()
     };
@@ -1244,7 +1249,6 @@ fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
-        auto_applicable: false,
         verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
         notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
@@ -1301,7 +1305,6 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
         fix_id: "fix-13-hip-sdk-missing".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"& \\\"$env:HIP_PATH\\bin\\hipInfo.exe\\\" | Select-Object -First 5\"".to_owned(),
         notes: vec!["If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.".to_owned()],
         ..Fix::default()
@@ -1359,7 +1362,6 @@ fn check_14_adrenalin_too_old(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_reboot: true,
         fix_id: "fix-14-adrenalin-too-old".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"".to_owned(),
         ..Fix::default()
     };
@@ -1397,7 +1399,6 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
             "# After the install, reopen the shell and re-run your import / hipInfo check.".to_owned(),
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
-        auto_applicable: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
         notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing (the HIP SDK install) rather than this fix.".to_owned()],
         ..Fix::default()
@@ -1409,6 +1410,136 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// A code object manager library that does not belong to the active runtime.
+///
+/// The rule is symmetric, and that is what makes it safe. Rather than asking
+/// "is this the wheel copy?" and then carving out an exception for the managed
+/// runtime, it asks one question of both libraries: **does the copy of
+/// `libamd_comgr` that would load belong to the same installation as the copy of
+/// `libamdhip64` that would load?** If it does, there is nothing wrong, whichever
+/// installation that is.
+///
+/// Every case falls out of that instead of being legislated. A healthy managed
+/// install takes both libraries from the managed runtime, so nothing differs and
+/// nothing is reported -- no special case required. A user who has put a wheel's
+/// library directory on the search path while the runtime still resolves to the
+/// system install takes them from two different places, and that is the failure.
+///
+/// A control written as an exception is a rule that has not been stated
+/// correctly yet.
+fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-18-comgr-conflict";
+    const TITLE: &str = "code object manager library does not belong to the active HIP runtime";
+
+    let (Some(comgr), Some(hip)) = (e.comgr_selected.as_ref(), e.hip_selected.as_ref()) else {
+        // Nothing to compare. A machine with no ROCm at all is not a machine
+        // with a conflict, and saying otherwise would be the worst kind of false
+        // report: confident, and about something that is not there.
+        return zero(ID, TITLE);
+    };
+    // The same rule `probe_comgr` uses to compute `comgr_matches_runtime`. Calling
+    // it here rather than restating the conditions is what keeps `rocm examine
+    // --json` and this finding from disagreeing about one machine: an
+    // unattributed copy, a runtime with no code object manager of its own to
+    // prefer, or the two already agreeing are all `None`/`Some(true)` here and
+    // "nothing to report" below, exactly as they are for that field.
+    if crate::examine::comgr_matches_runtime(&e.comgr_paths, Some(comgr), Some(hip)) != Some(false)
+    {
+        return zero(ID, TITLE);
+    }
+    let Some(matching) = e
+        .comgr_paths
+        .iter()
+        .find(|copy| copy.install_root == hip.install_root)
+    else {
+        // Unreachable: `comgr_matches_runtime` only returns `Some(false)` when
+        // this search succeeds. Kept as a guard rather than an `unwrap` so a
+        // future change to either function fails safely instead of panicking.
+        return zero(ID, TITLE);
+    };
+
+    let mut score = 60;
+    let mut evidence = vec![
+        format!(
+            "the code object manager that would load is {} (from {})",
+            comgr.path, comgr.install_root
+        ),
+        format!(
+            "the HIP runtime that would load is {} (from {})",
+            hip.path, hip.install_root
+        ),
+        format!(
+            "{} also ships a code object manager at {}",
+            hip.install_root, matching.path
+        ),
+    ];
+    if !comgr.version.is_empty() && !matching.version.is_empty() {
+        evidence.push(format!(
+            "versions differ: {} would load, the runtime ships {}",
+            comgr.version, matching.version
+        ));
+    }
+    // Said out loud because the answer depends on which process asks, and
+    // because that answer changes what the `export` below is worth.
+    // `find_library_copies` checks `active-runtime` directories first -- that
+    // is a served child's search order (`rocm serve`/`rocm chat`), not a
+    // plain shell's. When neither selection came from there, the measurement
+    // really is the plain shell the user's own command ran in, and the
+    // `export` is the whole fix. When either did, that half of the
+    // measurement reflects what the active managed runtime (and anything it
+    // serves) loads, not a plain shell -- and a shell `export` is not
+    // guaranteed to reach a served child that prepends its own runtime's
+    // directories ahead of `LD_LIBRARY_PATH`.
+    let active_runtime_involved =
+        comgr.source == "active-runtime" || hip.source == "active-runtime";
+    evidence.push(if active_runtime_involved {
+        "an active managed runtime decided part of this: rocm serve/rocm chat would see this \
+         result, a plain shell might not"
+            .to_owned()
+    } else {
+        "this describes the environment as it stands outside the CLI's managed runtimes".to_owned()
+    });
+
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_COMGR_CONFLICT);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let mut notes = vec![crate::fix::COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED.to_owned()];
+    if active_runtime_involved {
+        notes.push(
+            "rocm serve/rocm chat prepend the active managed runtime's own directories ahead \
+             of LD_LIBRARY_PATH, so the export below may not change what they load; \
+             reinstalling or repairing that runtime so it ships its own code object manager is \
+             the fix that reaches it directly."
+                .to_owned(),
+        );
+    }
+
+    let fix = Fix {
+        summary:
+            "Make the code object manager and the HIP runtime come from the same installation."
+                .to_owned(),
+        commands: vec![
+            format!("# The library that would load: {}", comgr.real_path),
+            format!("# The runtime that would load: {}", hip.real_path),
+            format!("# The runtime's own copy:      {}", matching.real_path),
+            "# Either keep one stack and remove the other, or order the search".to_owned(),
+            "# path so the runtime's own copy is found first:".to_owned(),
+            format!(
+                "export LD_LIBRARY_PATH=\"{}:$LD_LIBRARY_PATH\"",
+                std::path::Path::new(&matching.real_path)
+                    .parent()
+                    .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned())
+            ),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"".to_owned(),
+        notes,
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
 }
 
 /// The vLLM engine-startup import failure (EAI-8012).
@@ -1471,7 +1602,6 @@ fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagno
             "rocm engines install vllm --reinstall".to_owned(),
         ],
         fix_id: "fix-17-torch-dlpack".to_owned(),
-        auto_applicable: false,
         verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts".to_owned(),
         notes: vec![
             "Running vLLM on ROCm is not by itself a reason to apply this. The trigger is narrow: a ROCm build of torch in the 2.4-2.9 range (the versions torch-c-dlpack-ext ships prebuilts for), torch without a native __dlpack_c_exchange_api__, and torch-c-dlpack-ext present -- it arrives as a transitive dependency of tilelang, which vLLM pins.".to_owned(),
@@ -1573,7 +1703,6 @@ fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: ID.to_owned(),
-        auto_applicable: false,
         verify: "df -h /dev/shm".to_owned(),
         notes: vec![
             "A running container cannot have its allowance changed; it has to be started again."
@@ -1708,7 +1837,6 @@ fn check_wsl_1_gpu_not_exposed(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Expose the GPU to the distro: /dev/dxg is how WSL reaches it, and nothing works until it is there.".to_owned(),
         commands,
         fix_id: "fix-wsl-1-gpu-not-exposed".to_owned(),
-        auto_applicable: false,
         verify: "ls -l /dev/dxg".to_owned(),
         notes,
         ..Fix::default()
@@ -1753,7 +1881,6 @@ fn check_wsl_2_dxcore_missing(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-2-dxcore-missing".to_owned(),
-        auto_applicable: false,
         verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore".to_owned(),
         notes: vec![
             "/usr/lib/wsl is mounted by WSL itself, not installed by the distro's package manager, so apt cannot repair it -- the fix is on the Windows side.".to_owned(),
@@ -1798,7 +1925,6 @@ fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
-        auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
             "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the download against a digest pinned for that ROCDXG release.".to_owned(),
@@ -1843,7 +1969,6 @@ fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> Diagnosis {
         commands: vec!["sudo ldconfig".to_owned()],
         needs_sudo: true,
         fix_id: "fix-wsl-4-rocdxg-not-linked".to_owned(),
-        auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
             "If `ldconfig` alone does not fix it, the install went somewhere outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.".to_owned(),
@@ -1880,7 +2005,6 @@ fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --install -d Ubuntu-24.04".to_owned(),
         ],
         fix_id: "fix-wsl-5-distro-too-old".to_owned(),
-        auto_applicable: false,
         verify: "grep VERSION_ID /etc/os-release".to_owned(),
         notes: vec![
             "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
@@ -1979,7 +2103,6 @@ fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) -> Diagnosis 
             "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.".to_owned(),
         ],
         fix_id: "fix-wsl-6-host-driver-too-old".to_owned(),
-        auto_applicable: false,
         verify: "rocminfo | head -n 20".to_owned(),
         notes: vec![
             format!("Driver and ROCm version pairing: {WSL_DOCS_URL}"),
@@ -2012,7 +2135,6 @@ fn check_wsl_7_wsl1(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --set-default-version 2".to_owned(),
         ],
         fix_id: "fix-wsl-7-wsl1".to_owned(),
-        auto_applicable: false,
         verify: "uname -r".to_owned(),
         notes: vec![
             "Converting rewrites the distro's filesystem and can take a while on a large install; back up anything you cannot lose first.".to_owned(),
@@ -2070,11 +2192,16 @@ const CHECKERS: &[Checker] = &[
     (check_wsl_5_distro_too_old, WSL_ONLY),
     (check_wsl_6_host_driver_too_old, WSL_ONLY),
     (check_wsl_7_wsl1, WSL_ONLY),
-    // Both families, opting in explicitly as the platform split requires. The
-    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
-    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
-    // leaving this tagged `linux` alone would silence it on one of the two
-    // platforms most likely to have it.
+    // Both families, opting in explicitly as the platform split requires. Which
+    // copy of a library the loader picks is not a question about the amdgpu
+    // module or the Windows host driver -- a wheel copy and a system copy
+    // collide on WSL2 exactly as they do on bare metal. Windows is deferred
+    // until this has proved the approach.
+    (check_18_comgr_conflict, &["linux", "wsl"]),
+    // Both families, for the same reason. The shortage has nothing to do with
+    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs -- and WSL2 ships the
+    // same 64 MB default a container does, so leaving this tagged `linux` alone
+    // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
 ];
 
@@ -2173,11 +2300,12 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // known misconfiguration", which reads as "your machine looks fine" when the
     // truth is that nothing was ever checked.
     let out_of_scope = uncovered_platform_message(e);
-    let matched = if out_of_scope.is_some() {
+    let mut matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
         run_all_checks(e, symptom)
     };
+    take_applicability_from_the_catalog(&mut matched, platform_family(e));
     DiagnoseReport {
         has_match: any_cleared_threshold(&matched),
         matched,
@@ -2186,6 +2314,35 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
         model: None,
+    }
+}
+
+/// Fill each finding's applicability from the catalog, for the operating system
+/// of the machine that was examined.
+///
+/// One place, deliberately. Every checker used to state `auto_applicable` by
+/// hand, which meant the catalog's answer existed twice in two modules with
+/// nothing comparing them — and they had already drifted: `fix-9-igpu-dgpu` was
+/// auto-applicable in the catalog and, in the Linux arm of its own checker,
+/// not. Deriving it here makes that disagreement unrepresentable rather than
+/// something a test has to go looking for.
+///
+/// Keyed on the examined machine's platform *family*, not the running host and
+/// not `os_family`. WSL reports an `os_family` of `linux` but is its own family
+/// for catalog purposes, so reading `os_family` here would look up every WSL
+/// recipe under the wrong platform and silently report them all as print-only.
+fn take_applicability_from_the_catalog(matched: &mut [Diagnosis], platform_family: &str) {
+    for diagnosis in matched.iter_mut() {
+        let Some(fix) = diagnosis.fix.as_mut() else {
+            continue;
+        };
+        // An entry the catalog does not list for this OS keeps the default:
+        // the CLI will not act on it here, which is exactly what the OS gate in
+        // `fix::apply` would tell the user.
+        let class = crate::fix::class_on(&fix.fix_id, platform_family).unwrap_or_default();
+        fix.class = class;
+        fix.auto_applicable = class.applies_itself();
+        fix.needs = crate::fix::needs_on(&fix.fix_id, platform_family).map(ToOwned::to_owned);
     }
 }
 
@@ -2260,7 +2417,8 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
                 fix.needs_sudo,
                 fix.needs_reboot,
                 fix.needs_relogin,
-                fix.auto_applicable,
+                fix.class,
+                fix.needs.as_deref(),
             );
             let _ = writeln!(out, "   flags: {}", flags.join(", "));
             for n in &fix.notes {
@@ -2383,6 +2541,37 @@ mod tests {
             "this remedy offers an index older than ROCm {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, \
              which this CLI installs. A user who picks that line installs a torch for a major \
              they do not have, and this same check fires again on the result: {stale:?}"
+        );
+    }
+
+    /// `take_applicability_from_the_catalog` is the only place that may fill in
+    /// `Fix::auto_applicable`. Every checker used to set it by hand instead --
+    /// twenty of them were converted to leave it at `Fix::default()` and let the
+    /// catalog fill it in, but the shared-memory and WSL checkers kept the
+    /// inline `auto_applicable: false,` a while longer. It never produced wrong
+    /// output, because the catalog pass overwrites whatever a checker sets --
+    /// which is exactly the problem: a checker disagreeing with the catalog
+    /// again (the way `fix-9-igpu-dgpu` once did) would be silently masked
+    /// rather than caught. A behavioral test can't see this, since the output
+    /// is correct either way; this reads the checkers' own source instead, so a
+    /// hand-set boolean is caught before it can start drifting unnoticed.
+    #[test]
+    fn no_checker_hand_sets_auto_applicable() {
+        let source = include_str!("diagnose.rs");
+        let offenders: Vec<&str> = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("auto_applicable: true")
+                    || trimmed.starts_with("auto_applicable: false")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a Fix literal is hand-setting `auto_applicable` again -- only \
+             `take_applicability_from_the_catalog` may set this field; every checker must \
+             leave it at `Fix::default()` and let the catalog fill it in, or the catalog and \
+             the checker can silently drift the way fix-9-igpu-dgpu once did:\n{offenders:#?}"
         );
     }
 
@@ -2559,6 +2748,85 @@ mod tests {
         }
     }
 
+    /// A library copy belonging to `install_root`, sitting at `path`.
+    fn copy_in(install_root: &str, path: &str, version: &str) -> crate::examine::LibraryCopy {
+        crate::examine::LibraryCopy {
+            path: path.to_owned(),
+            real_path: path.to_owned(),
+            version: version.to_owned(),
+            source: "test".to_owned(),
+            install_root: install_root.to_owned(),
+        }
+    }
+
+    /// Like `copy_in`, but with an explicit loader-search source instead of
+    /// the default `"test"` -- needed to exercise the branches in fix-18 that
+    /// key off which tier a selection came from.
+    fn copy_in_with_source(
+        source: &str,
+        install_root: &str,
+        path: &str,
+        version: &str,
+    ) -> crate::examine::LibraryCopy {
+        crate::examine::LibraryCopy {
+            source: source.to_owned(),
+            ..copy_in(install_root, path, version)
+        }
+    }
+
+    fn comgr_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-18-comgr-conflict")
+    }
+
+    #[test]
+    fn a_code_object_manager_from_another_installation_is_reported() {
+        // The failure this entry exists for: the runtime resolves to the system
+        // install while the library that compiles device code for it comes from
+        // a wheel, and the error the user sees names neither.
+        let mut e = linux_base();
+        let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        e.comgr_selected = Some(wheel.clone());
+        e.comgr_paths = vec![wheel, system];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        let report = diagnose(&e, "");
+        let finding = comgr_finding(&report).expect("the mismatch must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "a mismatch established from machine state alone has to clear the \
+             threshold without help from the symptom text: {}",
+            finding.score
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "both remedies can break a working Python environment, so nothing here \
+             may be applied for the user"
+        );
+        let evidence = finding.evidence.join("\n");
+        for expected in [
+            "/wheel/lib/libamd_comgr.so.2",
+            "/opt/rocm",
+            "2.8.0",
+            "3.0.0",
+        ] {
+            assert!(
+                evidence.contains(expected),
+                "the report has to name each copy, where it came from and its \
+                 version -- `{expected}` is missing:\n{evidence}"
+            );
+        }
+    }
+
     #[test]
     fn a_partly_used_allowance_reports_what_is_left_as_well_as_the_size() {
         // The two numbers answer different questions, and the evidence only
@@ -2603,6 +2871,40 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_managed_installation_raises_no_report() {
+        // The control, and the reason the rule is stated symmetrically. A managed
+        // runtime spreads its libraries across separate `_rocm_sdk_*` packages
+        // that sit *beside* each other under one `site-packages` -- not nested
+        // under the runtime's own root (`_rocm_sdk_devel`) at all -- so the two
+        // copies sit in different directories of ONE installation. Anything
+        // that decided ownership by walking up from the file would call these
+        // two installations and fire on the most common install we ship. (A
+        // fixture nesting `_rocm_sdk_core` under the root, the shape the
+        // installer never produces, would pass by construction without
+        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // `ROCM_SDK_PROBE_SCRIPT` instead.)
+        let mut e = linux_base();
+        let root = "/data/runtimes/therock/_rocm_sdk_devel";
+        let comgr = copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_core/lib/libamd_comgr.so.2",
+            "2.8.0",
+        );
+        e.comgr_selected = Some(comgr.clone());
+        e.comgr_paths = vec![comgr];
+        e.hip_selected = Some(copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_devel/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "both libraries come from one installation, so there is no conflict"
+        );
+    }
+
+    #[test]
     fn an_unmeasured_shared_memory_allowance_is_not_reported() {
         // Unknown is not zero. `None` means the path was absent or the query
         // failed, and a shortage reported on that basis would be a finding about
@@ -2614,6 +2916,31 @@ mod tests {
         assert!(
             shm_finding(&diagnose(&e, "")).is_none(),
             "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn a_second_copy_that_does_not_load_raises_no_report() {
+        // Holding two copies is not a fault. Only the one that loads matters.
+        let mut e = linux_base();
+        let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(winner.clone());
+        e.comgr_paths = vec![winner, loser];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the copy that loads belongs to the runtime, so nothing is wrong"
+        );
+        assert_eq!(
+            e.comgr_paths.len(),
+            2,
+            "the machine report still lists both copies; only the diagnosis stays quiet"
         );
     }
 
@@ -2646,6 +2973,204 @@ mod tests {
             "knowing it is a container makes the cause certain, so it should rank \
              higher there: {inside} vs {outside}"
         );
+    }
+
+    #[test]
+    fn nothing_is_reported_when_there_is_nothing_to_compare() {
+        // A machine with no ROCm is not a machine with a conflict. Reporting one
+        // would be the worst kind of false finding: confident, and about
+        // something that is not there.
+        let cases = [
+            ("neither library found", None, None),
+            (
+                "no runtime to attribute the library to",
+                Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3")),
+                None,
+            ),
+            (
+                "a copy no known installation claims",
+                Some(copy_in("", "/somewhere/libamd_comgr.so.3", "3")),
+                Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                )),
+            ),
+        ];
+        for (case, comgr, hip) in cases {
+            let mut e = linux_base();
+            e.comgr_paths = comgr.iter().cloned().collect();
+            e.comgr_selected = comgr;
+            e.hip_selected = hip;
+            assert!(
+                comgr_finding(&diagnose(&e, "")).is_none(),
+                "{case}: reported a conflict it could not have established"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_with_no_copy_of_its_own_is_not_a_conflict() {
+        // The second half of the rule. Without a copy belonging to the runtime
+        // there is nothing to switch to, so the advice would be empty -- and the
+        // machine is simply one where the only copy lives elsewhere.
+        let mut e = linux_base();
+        let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(only.clone());
+        e.comgr_paths = vec![only];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the runtime ships no code object manager of its own, so there is no \
+             alternative to point the user at"
+        );
+    }
+
+    #[test]
+    fn an_active_runtime_s_own_hip_without_its_own_comgr_notes_the_scope_limit() {
+        // Reachable, not theoretical: a managed runtime can ship its own HIP
+        // runtime while leaning on the system's code object manager. Then
+        // `hip_selected` comes from the `active-runtime` tier -- the order a
+        // served child (`rocm serve`/`rocm chat`) consults, not a plain
+        // shell's -- so the finding must say so instead of claiming the
+        // plain-shell sentence, and the `export` remedy must carry a caveat
+        // that it may not reach that served child.
+        let mut e = linux_base();
+        let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        let runtime_comgr = copy_in(
+            "/data/runtimes/therock",
+            "/data/runtimes/therock/lib/libamd_comgr.so.2",
+            "2.8.0",
+        );
+        e.comgr_selected = Some(system.clone());
+        e.comgr_paths = vec![system, runtime_comgr];
+        e.hip_selected = Some(copy_in_with_source(
+            "active-runtime",
+            "/data/runtimes/therock",
+            "/data/runtimes/therock/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        let report = diagnose(&e, "");
+        let finding = comgr_finding(&report).expect("the mismatch must be reported");
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("active managed runtime decided part of this"),
+            "the evidence must own up to the active-runtime tier rather than claim a \
+             plain shell measured it:\n{evidence}"
+        );
+        assert!(
+            !evidence.contains("outside the CLI's managed runtimes"),
+            "the plain-shell sentence must not be printed when the measurement is \
+             not a plain shell's:\n{evidence}"
+        );
+        let notes = finding
+            .fix
+            .as_ref()
+            .expect("the finding must carry a plan")
+            .notes
+            .join("\n");
+        assert!(
+            notes.contains("may not change what they load"),
+            "the remedy has to say it might not reach a served child:\n{notes}"
+        );
+    }
+
+    #[test]
+    fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
+        // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
+        // fix-18 finding answer the same question about the same machine. Both
+        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // the two surfaces stay in lockstep across every shape the catalog
+        // itself tests -- including the case that used to disagree: a runtime
+        // whose own installation ships no code object manager at all.
+        let cases: Vec<(&str, Examination)> = vec![
+            ("neither library found", linux_base()),
+            {
+                let mut e = linux_base();
+                e.comgr_selected =
+                    Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3"));
+                e.comgr_paths = vec![e.comgr_selected.clone().unwrap()];
+                ("no runtime to attribute the library to", e)
+            },
+            {
+                let mut e = linux_base();
+                let unattributed = copy_in("", "/somewhere/libamd_comgr.so.3", "3");
+                e.comgr_selected = Some(unattributed.clone());
+                e.comgr_paths = vec![unattributed];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a copy no known installation claims", e)
+            },
+            {
+                // The disagreement this test guards against: the runtime's own
+                // install ships no comgr copy of its own to switch to.
+                let mut e = linux_base();
+                let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(only.clone());
+                e.comgr_paths = vec![only];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a runtime with no copy of its own", e)
+            },
+            {
+                let mut e = linux_base();
+                let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(winner.clone());
+                e.comgr_paths = vec![winner, loser];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("the copy that loads already belongs to the runtime", e)
+            },
+            {
+                let mut e = linux_base();
+                let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                e.comgr_selected = Some(wheel.clone());
+                e.comgr_paths = vec![wheel, system];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a genuine conflict", e)
+            },
+        ];
+
+        for (case, e) in cases {
+            let matches_runtime = crate::examine::comgr_matches_runtime(
+                &e.comgr_paths,
+                e.comgr_selected.as_ref(),
+                e.hip_selected.as_ref(),
+            );
+            let diagnosis_fires = comgr_finding(&diagnose(&e, "")).is_some();
+            assert_eq!(
+                matches_runtime == Some(false),
+                diagnosis_fires,
+                "{case}: comgr_matches_runtime={matches_runtime:?} but the \
+                 diagnosis {}",
+                if diagnosis_fires {
+                    "fired"
+                } else {
+                    "did not fire"
+                }
+            );
+        }
     }
 
     #[test]
@@ -3072,9 +3597,11 @@ mod tests {
                     .fix
                     .as_ref()
                     .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
-                let catalog = crate::fix::auto_applicable_for(&fix.fix_id).unwrap_or_else(|| {
-                    panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
-                });
+                let catalog = crate::fix::class_on(&fix.fix_id, os)
+                    .unwrap_or_else(|| {
+                        panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
+                    })
+                    .applies_itself();
                 assert_eq!(
                     fix.auto_applicable, catalog,
                     "{os}/{}: diagnose reports auto_applicable={}, but the fix catalog \
@@ -3171,7 +3698,7 @@ mod tests {
             "note must not repeat the old wrong gfx-number heuristic: {note}"
         );
         assert!(
-            note.contains("--device-index"),
+            note.contains("Without --device-index") && !note.contains("marked AUTO"),
             "note must warn that fix-9 is a no-op without --device-index: {note}"
         );
     }
@@ -3250,15 +3777,20 @@ mod tests {
     }
 
     #[test]
-    fn fix_9_igpu_dgpu_is_auto_applicable_on_linux() {
-        // `check_9_igpu_dgpu_collision`'s Linux/else branch sets
-        // `auto_applicable: true` to match the `fix-9-igpu-dgpu` FixRecipe in
-        // fix.rs (`run_hip_visible_devices` already handles it on Linux). This
-        // is a behavioural change, not text-only: it flips both the `Fix`
-        // struct field that `rocm diagnose --json` serialises and the
-        // `flags:` line `render_report_text` prints. Pin it directly so a
-        // regression back to `false` (the pre-fix value) fails here instead of
-        // only being visible by eyeballing output.
+    fn fix_9_igpu_dgpu_waits_for_an_argument_rather_than_claiming_it_will_act() {
+        // This pinned `auto_applicable: true` until the catalog gained a class.
+        // The claim was wrong: asked plainly, both arms of
+        // `run_hip_visible_devices` print the query that identifies the discrete
+        // GPU and return without touching the machine, so a user -- and an agent
+        // reading the same output -- was told a change was coming that never
+        // came, and given exit 0 to confirm it. The entry is NEEDS-ARG: it acts
+        // only once `--device-index` names a target.
+        //
+        // Kept pinned for the original reason, with the expectation corrected.
+        // It still flips the `Fix` field `rocm diagnose --json` serialises and
+        // the `flags:` line `render_report_text` prints, so a regression back to
+        // an unconditional auto claim fails here rather than needing someone to
+        // eyeball the output.
         let mut e = linux_base();
         e.has_apu = true;
         e.has_discrete_amd = true;
@@ -3284,8 +3816,14 @@ mod tests {
             .expect("iGPU+dGPU collision should be diagnosed");
         let fix = hit.fix.as_ref().unwrap();
         assert!(
-            fix.auto_applicable,
-            "fix-9-igpu-dgpu must be auto_applicable on Linux, matching the fix.rs catalog"
+            !fix.auto_applicable,
+            "fix-9-igpu-dgpu does nothing until it is told which device to pin, so the report \
+             must not say the CLI will carry it out"
+        );
+        assert_eq!(
+            fix.class,
+            crate::fix::FixClass::NeedsArgument,
+            "the report's class has to be the catalog's class for this entry on Linux"
         );
 
         let text = render_report_text(&report, report.matched.len());
@@ -3298,27 +3836,30 @@ mod tests {
             .iter()
             .find(|l| l.trim_start().starts_with("flags:"))
             .expect("fix-9-igpu-dgpu should have a flags: line");
-        // Exact match, not `contains`: fix-9 carries only the auto flag, so a
-        // revert of the `render_report_text` call site to its pre-PR inline
-        // logic would still print a line containing "rocm fix can run it" and
-        // not "manual only" -- `contains` can't tell the two implementations
-        // apart. See `fix_11_iommu_rendered_flags_line_is_exact` for a fix-id
-        // whose optional flags actually differ between old and new wording.
+        // Exact match, not `contains`: fix-9 carries only the class flag, and
+        // the whole point of the class is that "will not run it" has more than
+        // one reason. A `contains` check would pass against the print-only
+        // wording, which would send the user off to run the steps by hand when
+        // the CLI will in fact do it for them once given the argument. The
+        // argument is named rather than described, which is why this text comes
+        // from the catalog and not from a literal here.
         assert_eq!(
             flags_line.trim_start(),
-            "flags: rocm fix can run it",
+            "flags: needs --device-index before `rocm fix` will run it",
             "rendered flags: line for fix-9-igpu-dgpu: {flags_line}"
         );
     }
 
     #[test]
     fn fix_11_iommu_rendered_flags_line_is_exact() {
-        // Companion to `fix_9_igpu_dgpu_is_auto_applicable_on_linux`: that test
-        // only pins a fix-id with just the auto flag set, which an exact-match
-        // assertion can't distinguish from the pre-PR `render_report_text`
-        // inline logic (both print "rocm fix can run it" for it). fix-11-iommu
-        // carries sudo+reboot+manual, so this pins the full comma-joined,
-        // reworded `flags:` line through the real render call site.
+        // Companion to
+        // `fix_9_igpu_dgpu_waits_for_an_argument_rather_than_claiming_it_will_act`:
+        // that test only pins a fix-id with a single class flag and no
+        // sudo/reboot/relogin flags set, which an exact-match assertion can't
+        // distinguish from a render path that drops the comma-joining or
+        // misorders multiple flags. fix-11-iommu carries sudo+reboot+manual, so
+        // this pins the full comma-joined, reworded `flags:` line through the
+        // real render call site.
         let mut e = linux_base();
         e.iommu_kernel_param = "on".to_owned();
         e.gpus = vec![

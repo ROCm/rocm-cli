@@ -391,7 +391,7 @@ pub(crate) struct TheRockSdkProbeManifest {
     #[serde(default)]
     pub(crate) bin_paths: Vec<PathBuf>,
     #[serde(default)]
-    library_paths: Vec<PathBuf>,
+    pub(crate) library_paths: Vec<PathBuf>,
 }
 
 #[cfg(test)]

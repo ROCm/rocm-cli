@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
@@ -36,6 +37,8 @@ pub mod managed_runtime;
 pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod report;
+pub mod report_delivery;
 pub mod rocm_install;
 pub mod runtime;
 #[cfg(test)]
@@ -66,9 +69,12 @@ pub use host_gpu::{
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
+#[cfg(all(test, target_os = "linux"))]
+use host_gpu::collect_managed_runtime_library_paths;
 use host_gpu::{
-    detect_linux_sysfs_gfx_target, detect_local_windows_host_driver, detect_wsl_host_driver,
-    detect_wsl_summary, is_wsl1_kernel, ldconfig_lists_librocdxg,
+    collect_sdk_library_paths, detect_linux_sysfs_gfx_target, detect_local_windows_host_driver,
+    detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, ldconfig_cache,
+    ldconfig_lists_librocdxg, managed_therock_sdk_probe_candidates,
 };
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
@@ -81,6 +87,11 @@ use managed_runtime::{
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
+};
+pub use report::{
+    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
+    Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    refusal_envelope,
 };
 pub use rocm_install::{LegacyRocmSummary, detect_legacy_rocm_sdk, detect_legacy_rocm_summary};
 use rocm_install::{RocmInstall, discover_rocm_installs, rocm_install_version};
