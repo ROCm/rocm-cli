@@ -131,9 +131,15 @@ fn backtick_spans(line: &str) -> Vec<String> {
 fn literal_invocations(content: &str) -> Vec<String> {
     let mut found = Vec::new();
     for segment in content.split("\\n") {
-        let start_stripped = segment.trim_start_matches('#').trim_start();
-        if starts_with_invocation(start_stripped) {
-            found.push(start_stripped.trim_end().to_owned());
+        // A commented-out command (`# rocm …`) keeps no indentation of its own.
+        let uncommented = segment.trim_start_matches('#');
+        let start_stripped = if uncommented.len() == segment.len() {
+            segment
+        } else {
+            uncommented.trim_start()
+        };
+        if let Some(command) = examples_row(start_stripped) {
+            found.push(command);
             continue;
         }
         let mut search = 0;
@@ -409,18 +415,38 @@ pub(crate) fn source_advice() -> Vec<Advice> {
     advice
 }
 
+/// The command on a line that starts with one. An *indented* line is a row of
+/// an EXAMPLES table (`  rocm examine      Check GPU …`): clap renders a
+/// description column after a run of spaces, so the command ends at the first
+/// double space. Only there: on any other line a double space is ordinary
+/// whitespace inside a command, and cutting at it would hide what follows
+/// (`rocm install sdk --channel release  --bogus-flag`).
+///
+/// The rows are found twice, by design: in the rendered `--help`, and in the
+/// `after_help` string literal they are written in.
+fn examples_row(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !starts_with_invocation(trimmed) {
+        return None;
+    }
+    let indented = line.starts_with(char::is_whitespace);
+    let command = match trimmed.split_once("  ") {
+        Some((command, _)) if indented => command,
+        _ => trimmed,
+    };
+    Some(command.trim_end().to_owned())
+}
+
 /// Every invocation named in the long `--help` of every visible command.
 pub(crate) fn help_text_advice() -> Vec<Advice> {
     fn visit(command: &mut clap::Command, path: &str, out: &mut Vec<Advice>) {
         let help = command.render_long_help().to_string();
         for (index, line) in help.lines().enumerate() {
             let source = format!("`{path} --help` line {}", index + 1);
-            let trimmed = line.trim();
-            // EXAMPLES rows: `rocm examine      Check GPU ...`.
-            if starts_with_invocation(trimmed) {
+            if let Some(raw) = examples_row(line) {
                 out.push(Advice {
                     source: source.clone(),
-                    raw: trimmed.to_owned(),
+                    raw,
                     surface: Surface::CommandLine,
                 });
             }
@@ -457,19 +483,93 @@ pub(crate) fn help_text_advice() -> Vec<Advice> {
 // Normalisation: from an advised string to argv variants
 // ---------------------------------------------------------------------------
 
-/// Cut an advised string down to the command itself: drop shell comments,
-/// pipes, redirections, trailing prose, and escaped newlines.
-pub(crate) fn command_part(raw: &str) -> String {
-    let mut text = raw.trim().to_owned();
-    for marker in [
-        "\\n", " # ", "  ", " | ", " && ", " || ", "; ", " >> ", " > ", " < ", " 2>", " (", " —",
-        " –", " → ", " before ", " then ",
-    ] {
+/// Split a shell list into its commands at `&&`, `||`, `;` and `|`. A
+/// separator inside quotes, a `<…>` placeholder, a `[…]` optional group or a
+/// `{…}` template is notation, not a separator, and so is a `|` joined to a
+/// word (`stop|restart`): a pipe stands alone between spaces.
+fn split_shell_list(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut closers: Vec<char> = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        let previous = index.checked_sub(1).map(|i| chars[i]);
+        let next = chars.get(index + 1).copied();
+        let at_word_start = previous.is_none_or(char::is_whitespace);
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            current.push(ch);
+            index += 1;
+            continue;
+        }
+        let separator_len = match (ch, next) {
+            _ if !closers.is_empty() => 0,
+            ('&', Some('&')) | ('|', Some('|')) => 2,
+            (';', _) => 1,
+            ('|', _) if at_word_start && next.is_none_or(char::is_whitespace) => 1,
+            _ => 0,
+        };
+        if separator_len > 0 {
+            commands.push(std::mem::take(&mut current));
+            index += separator_len;
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            // `<` opens a placeholder only at a word start and before a
+            // non-space: ` < file` is a redirection.
+            '<' if at_word_start && next.is_some_and(|c| !c.is_whitespace()) => closers.push('>'),
+            '[' => closers.push(']'),
+            '{' => closers.push('}'),
+            c if closers.last() == Some(&c) => {
+                closers.pop();
+            }
+            _ => {}
+        }
+        current.push(ch);
+        index += 1;
+    }
+    commands.push(current);
+    commands
+}
+
+/// The commands an advised string names, each cut down to the command
+/// itself: a shell comment or escaped newline ends the whole line; each
+/// command of a shell list is kept when it runs `rocm`/`rocmd` (commands for
+/// other tools are not this contract's business) and is then stripped of
+/// redirections and trailing prose.
+pub(crate) fn command_parts(raw: &str) -> Vec<String> {
+    let mut text = raw.trim();
+    for marker in ["\\n", " # "] {
         if let Some(position) = text.find(marker) {
-            text.truncate(position);
+            text = &text[..position];
         }
     }
-    text.trim().trim_end_matches([',', ':']).trim().to_owned()
+    let mut parts = Vec::new();
+    for command in split_shell_list(text) {
+        let command = command.trim();
+        if !(starts_with_invocation(command) || command == "rocm" || command == "rocmd") {
+            continue;
+        }
+        let mut command = command.to_owned();
+        for marker in [
+            " >> ", " > ", " < ", " 2>", " (", " —", " –", " → ", " before ", " then ",
+        ] {
+            if let Some(position) = command.find(marker) {
+                command.truncate(position);
+            }
+        }
+        let command = command.trim().trim_end_matches([',', ':']).trim();
+        if !command.is_empty() {
+            parts.push(command.to_owned());
+        }
+    }
+    parts
 }
 
 /// Shell-like word split honouring single and double quotes. A `<…>`
@@ -636,6 +736,10 @@ fn word_alternatives(word: &str, in_subcommand_position: bool) -> Vec<String> {
         .collect()
 }
 
+/// What `rocm --yes …` stands for: the request form, spelled out the way the
+/// docs do, so it reads as an advised natural-language request.
+const NATURAL_LANGUAGE_REQUEST: &str = "<natural language request>";
+
 /// A synopsis item: a required word (with alternatives) or an optional
 /// `[...]` group (with `|`-separated alternative word lists).
 enum Item {
@@ -684,7 +788,7 @@ fn synopsis_items(words: &[String]) -> Vec<Item> {
         if is_ellipsis(word) {
             // `rocm --yes ...`: the ellipsis stands for the request.
             if index > 0 && words[index - 1] == "--yes" {
-                items.push(Item::Required(vec![placeholder_value("", "--yes")]));
+                items.push(Item::Required(vec![NATURAL_LANGUAGE_REQUEST.to_owned()]));
             }
             continue;
         }
@@ -697,14 +801,21 @@ fn synopsis_items(words: &[String]) -> Vec<Item> {
     items
 }
 
-/// The argv variants an advised string stands for. Synopsis notation is
-/// expanded: each `[...]` optional group is tried on its own (groups may be
-/// mutually exclusive, as in `rocm dash [--demo] [--replay <file>]`), each
-/// `a|b` alternative produces a variant, `…`/`...` are dropped, and
-/// placeholders are substituted.
-pub(crate) fn argv_variants(raw: &str) -> Vec<Vec<String>> {
-    let command = command_part(raw);
-    let mut words = split_words(&command);
+/// One argv word, and the advice word it was filled in from: the same text,
+/// or a placeholder (`<TEXT>`) that [`placeholder_value`] substituted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Word {
+    pub value: String,
+    pub advised: String,
+}
+
+/// The argv variants one command (an item of [`command_parts`]) stands for.
+/// Synopsis notation is expanded: each `[...]` optional group is tried on its
+/// own (groups may be mutually exclusive, as in `rocm dash [--demo] [--replay
+/// <file>]`), each `a|b` alternative produces a variant, `…`/`...` are
+/// dropped, and placeholders are substituted.
+fn command_variants(command: &str) -> Vec<Vec<Word>> {
+    let mut words = split_words(command);
     if words.is_empty() {
         return Vec::new();
     }
@@ -724,9 +835,13 @@ pub(crate) fn argv_variants(raw: &str) -> Vec<Vec<String>> {
         }
     }
 
-    let mut variants: Vec<Vec<String>> = Vec::new();
+    let start = Word {
+        value: program.clone(),
+        advised: program,
+    };
+    let mut variants: Vec<Vec<Word>> = Vec::new();
     for selection in selections {
-        let mut partial: Vec<Vec<String>> = vec![vec![program.clone()]];
+        let mut partial: Vec<Vec<Word>> = vec![vec![start.clone()]];
         let mut group_index = 0;
         for item in &items {
             let choices: Vec<Vec<String>> = match item {
@@ -749,9 +864,12 @@ pub(crate) fn argv_variants(raw: &str) -> Vec<Vec<String>> {
                 for choice in &choices {
                     let mut extended = variant.clone();
                     for word in choice {
-                        let previous = extended.last().map(String::as_str).unwrap_or_default();
+                        let previous = extended.last().map_or("", |w| w.value.as_str());
                         let value = substitute_placeholders(word, previous);
-                        extended.push(value);
+                        extended.push(Word {
+                            value,
+                            advised: word.clone(),
+                        });
                     }
                     next.push(extended);
                 }
@@ -765,6 +883,20 @@ pub(crate) fn argv_variants(raw: &str) -> Vec<Vec<String>> {
         }
     }
     variants
+}
+
+fn values(words: &[Word]) -> Vec<String> {
+    words.iter().map(|word| word.value.clone()).collect()
+}
+
+/// The argv variants an advised string stands for: those of every command it
+/// names (see [`command_parts`] and [`command_variants`]).
+pub(crate) fn argv_variants(raw: &str) -> Vec<Vec<String>> {
+    command_parts(raw)
+        .iter()
+        .flat_map(|command| command_variants(command))
+        .map(|words| values(&words))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -989,9 +1121,19 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
 /// from a structured command that no longer exists. A single word routed to
 /// the planner (`rocm doctor`) means the advised subcommand is not real — the
 /// user gets a request plan instead of the command they were told about.
-fn is_deliberate_natural_language(argv: &[String]) -> bool {
-    let request = parse_freeform_invocation(&argv[1..]).request_args;
-    request.iter().any(|arg| arg.contains(char::is_whitespace))
+///
+/// The words must be multi-word *in the advice*: a quoted request, or a
+/// placeholder that names one (`<natural language request>`). A value
+/// [`placeholder_value`] filled in does not count — `rocm frobnicate <TEXT>`
+/// fills `<TEXT>` with several words, but the advice names a subcommand.
+fn is_deliberate_natural_language(words: &[Word]) -> bool {
+    let args = values(&words[1..]);
+    let request = parse_freeform_invocation(&args).request_args;
+    // The request is a suffix of the arguments (`--yes` is the only prefix).
+    let request_words = &words[words.len() - request.len()..];
+    request_words
+        .iter()
+        .any(|word| word.advised.contains(char::is_whitespace))
 }
 
 pub(crate) struct Finding {
@@ -1013,9 +1155,9 @@ fn is_excluded(item: &Advice) -> bool {
 /// as written may not: if `rocm examine` grew a required argument, every bare
 /// `rocm examine` in a RECIPE, a `next step:` line or a fenced example would
 /// fail for the user who ran it.
-fn may_omit_required_values(item: &Advice) -> bool {
+fn may_omit_required_values(item: &Advice, command: &str) -> bool {
     item.surface == Surface::InlineProse
-        || split_words(&command_part(&item.raw))
+        || split_words(command)
             .iter()
             .any(|word| word.trim_matches(['[', ']']).ends_with('…') || word.ends_with("..."))
 }
@@ -1026,14 +1168,19 @@ pub(crate) fn findings(advice: &[Advice]) -> Vec<Finding> {
         if is_excluded(item) {
             continue;
         }
-        for argv in argv_variants(&item.raw) {
+        for (command, words) in command_parts(&item.raw).iter().flat_map(|command| {
+            command_variants(command)
+                .into_iter()
+                .map(move |words| (command, words))
+        }) {
+            let argv = values(&words);
             let reason = match verdict(&argv) {
                 Verdict::Parses => continue,
-                Verdict::IncompleteReference if may_omit_required_values(item) => continue,
+                Verdict::IncompleteReference if may_omit_required_values(item, command) => continue,
                 Verdict::IncompleteReference => "a required argument or subcommand is missing: \
                                                  this line is meant to be run as written"
                     .to_owned(),
-                Verdict::Freeform if is_deliberate_natural_language(&argv) => continue,
+                Verdict::Freeform if is_deliberate_natural_language(&words) => continue,
                 Verdict::Freeform => "not a subcommand: `rocm` sends it to the natural-language \
                                       planner instead of running a command"
                     .to_owned(),
@@ -1193,7 +1340,8 @@ fn checker_rejects_what_users_would_hit() {
         Verdict::Rejected(_)
     ));
     assert_eq!(verdict(&argv("rocm doctor")), Verdict::Freeform);
-    assert!(!is_deliberate_natural_language(&argv("rocm doctor")));
+    let words = |text: &str| command_variants(text).remove(0);
+    assert!(!is_deliberate_natural_language(&words("rocm doctor")));
     assert!(matches!(
         verdict(&argv("rocm instal sdk")),
         Verdict::Rejected(_)
@@ -1214,7 +1362,7 @@ fn checker_rejects_what_users_would_hit() {
         verdict(&argv("rocmd run --automations-enabled")),
         Verdict::Parses
     );
-    assert!(is_deliberate_natural_language(&argv(
+    assert!(is_deliberate_natural_language(&words(
         "rocm --yes \"start a local model\""
     )));
 }
@@ -1351,4 +1499,97 @@ fn dump_advised_invocations() {
         }
     }
     println!("TOTAL\t{}", advice.len());
+}
+
+#[cfg(test)]
+fn fixture(raw: &str, surface: Surface) -> Advice {
+    Advice {
+        source: "fixture.md:1".to_owned(),
+        raw: raw.to_owned(),
+        surface,
+    }
+}
+
+/// Every command in a shell list is advice, not only the first: a removed
+/// subcommand after `&&`, `||`, `;` or `|` strands the user just the same.
+#[test]
+fn every_command_in_a_shell_list_is_checked() {
+    for raw in [
+        "rocm update && rocm frobnicate --x",
+        "rocm update || rocm frobnicate --x",
+        "rocm update; rocm frobnicate --x",
+        "rocm update | rocm frobnicate --x",
+        "rocm update && rocmd frobnicate",
+    ] {
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert_eq!(found.len(), 1, "{raw}: {}", render_findings(&found));
+        assert!(
+            found[0].argv[1] == "frobnicate",
+            "{raw}: {:?}",
+            found[0].argv
+        );
+    }
+    // Commands for other tools in the list are not this contract's business.
+    for raw in [
+        "rocm examine --json | jq .gpus",
+        "rocm update && echo done",
+        "cd /tmp; rocm examine",
+    ] {
+        assert!(
+            findings(&[fixture(raw, Surface::CommandLine)]).is_empty(),
+            "{raw}"
+        );
+    }
+    // `|` inside a word, a quoted request, a placeholder or an optional group
+    // is notation, not a pipe.
+    assert_eq!(
+        command_parts("rocm services stop|restart <id> --yes"),
+        vec!["rocm services stop|restart <id> --yes"]
+    );
+    assert_eq!(
+        command_parts("rocm \"start a model && check it | twice\""),
+        vec!["rocm \"start a model && check it | twice\""]
+    );
+    assert_eq!(
+        command_parts("rocm serve <a | b> [--x | --y] && rocm examine"),
+        vec!["rocm serve <a | b> [--x | --y]", "rocm examine"]
+    );
+}
+
+/// A double space inside a command is just whitespace; only a help EXAMPLES
+/// row puts a description column after one.
+#[test]
+fn a_double_space_does_not_hide_the_rest_of_a_command() {
+    let found = findings(&[fixture(
+        "rocm install sdk --channel release  --bogus-flag",
+        Surface::CommandLine,
+    )]);
+    assert_eq!(found.len(), 1, "{}", render_findings(&found));
+    assert_eq!(
+        examples_row("  rocm examine      Check GPU, driver and runtime state"),
+        Some("rocm examine".to_owned())
+    );
+    assert_eq!(
+        examples_row("  rocm serve <model> --engine vllm"),
+        Some("rocm serve <model> --engine vllm".to_owned())
+    );
+    assert_eq!(examples_row("Usage: rocm [OPTIONS]"), None);
+}
+
+/// A natural-language request is deliberate only when the advice itself
+/// spells one out. A placeholder filled with a multi-word value does not make
+/// `rocm frobnicate <TEXT>` a request: `frobnicate` is a removed subcommand.
+#[test]
+fn only_advised_text_makes_a_request_deliberate() {
+    let found = findings(&[fixture("rocm frobnicate <TEXT>", Surface::CommandLine)]);
+    assert_eq!(found.len(), 1, "{}", render_findings(&found));
+    for raw in [
+        "rocm \"start a local model\"",
+        "rocm --yes \"start a local model\"",
+        "rocm --yes <natural language request>",
+        "rocm --yes ...",
+    ] {
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert!(found.is_empty(), "{raw}: {}", render_findings(&found));
+    }
 }
