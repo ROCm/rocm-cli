@@ -22096,7 +22096,29 @@ const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`read_drm_vram_usage`] for why the sysfs fallback withholds telemetry on a
 /// multi-GPU one). Returns `None` only when neither source is readable
 /// (callers then fall back to service-state-only auto-selection).
+#[cfg(feature = "e2e-test-hooks")]
+fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    let index: u32 = std::env::var("ROCM_E2E_FORCE_LOW_VRAM")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // A single 24 GiB device with ~0.5 GiB free is well below the 0.90 free
+    // threshold, so `gpu_low_memory_warning` fires; one GPU keeps
+    // `vram_capacity_is_meaningful` honest on the non-APU vLLM lane.
+    let total_mb = 24 * 1024;
+    Some(vec![GpuVramUsage {
+        index,
+        used_mb: total_mb - 512,
+        total_mb,
+    }])
+}
+
 fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(forced) = simulated_low_vram_usage() {
+        return Some(forced);
+    }
     gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
 }
 
