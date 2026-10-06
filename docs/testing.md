@@ -137,8 +137,10 @@ trailing prose starts (` (`, ` —`, ` → `, ` then `). A double space does not
 end it, except on an indented EXAMPLES row, where the description column
 follows one.
 
-It fills in placeholders such as `<model>` and `{}`, tries each `[--flag]` group
-and `a|b` alternative, then routes each command the way `rocm` itself does.
+It fills in placeholders such as `<model>` and `{}`, drops one that stands for
+options described elsewhere (`<case-appropriate options above>`), tries each
+`[--flag]` group and `a|b` alternative, then routes each command the way `rocm`
+itself does.
 These fail the test:
 
 - a command that clap rejects

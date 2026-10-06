@@ -709,6 +709,14 @@ fn substitute_placeholders(word: &str, previous: &str) -> String {
     out
 }
 
+/// Whether a word is a placeholder for options the advice spells out elsewhere
+/// (`<case-appropriate options above>`). It stands for zero or more flags the
+/// reader picks, so it contributes no words: the command around it is still
+/// checked, rather than failing on an invented value for a prose placeholder.
+fn is_options_placeholder(word: &str) -> bool {
+    word.starts_with('<') && word.ends_with('>') && word.to_ascii_lowercase().contains("options")
+}
+
 fn is_ellipsis(word: &str) -> bool {
     word == "…" || word == "..."
 }
@@ -864,6 +872,9 @@ fn command_variants(command: &str) -> Vec<Vec<Word>> {
                 for choice in &choices {
                     let mut extended = variant.clone();
                     for word in choice {
+                        if is_options_placeholder(word) {
+                            continue;
+                        }
                         let previous = extended.last().map_or("", |w| w.value.as_str());
                         let value = substitute_placeholders(word, previous);
                         extended.push(Word {
@@ -985,6 +996,16 @@ pub(crate) fn verdict(argv: &[String]) -> Verdict {
 /// `exclusions_still_match_something`.
 const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
     // Prose that happens to begin with the program name.
+    (
+        "crates/rocm-core/src/diagnose.rs",
+        "rocm serve/rocm chat would see this result, a plain shell might not",
+        "note naming the two commands a managed runtime affects, not advice",
+    ),
+    (
+        "crates/rocm-core/src/diagnose.rs",
+        "rocm serve/rocm chat prepend the active managed runtime's own directories ahead of LD_LIBRARY_PATH, so the export below may not change what they load; reinstalling or repairing that runtime so it ships its own code object manager is the fix that reaches it directly.",
+        "explanation of what the two commands load, not advice",
+    ),
     (
         "apps/rocm/src/dash.rs",
         "rocm bench load supports http:// endpoints only (no TLS backend compiled in)",
@@ -1593,6 +1614,29 @@ fn a_double_space_does_not_hide_the_rest_of_a_command() {
         Some("rocm install sdk --channel release  --bogus-flag".to_owned())
     );
     assert_eq!(examples_row("Usage: rocm [OPTIONS]"), None);
+}
+
+#[test]
+fn an_options_placeholder_stands_for_no_arguments() {
+    // `<case-appropriate options above>` names flags the reader picks from
+    // the advice above it; the command around it must still be checked.
+    assert_eq!(
+        argv_variants("rocm serve <model> <case-appropriate options above>"),
+        vec![vec![
+            "rocm".to_owned(),
+            "serve".to_owned(),
+            "Qwen/Qwen3-0.6B".to_owned(),
+        ]],
+    );
+    // Only a placeholder that names options is dropped.
+    assert_eq!(
+        argv_variants("rocm serve <model>"),
+        vec![vec![
+            "rocm".to_owned(),
+            "serve".to_owned(),
+            "Qwen/Qwen3-0.6B".to_owned(),
+        ]],
+    );
 }
 
 /// A natural-language request is deliberate only when the advice itself
