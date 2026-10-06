@@ -693,7 +693,8 @@ mod tests {
         ///
         /// A drawn mount that does contain the path is pushed one component
         /// below it instead of being discarded, which turns it into a near
-        /// miss — a sibling of one of the path's ancestors — rather than
+        /// miss — a child of one of the path's ancestors (or of the path
+        /// itself) that the path does not pass through — rather than
         /// rejecting roughly a quarter of all cases.
         #[test]
         fn a_non_matching_mount_does_not_change_the_result(
@@ -723,9 +724,11 @@ mod tests {
     ///
     /// So two more arms aim at the two edges of the contract:
     ///
-    /// * Uniform within one unit's range, `[1024^k, 1024^(k+1))`. About half
+    /// * Uniform within one unit's range, `[1024^k, 1024^(k+1))`, except
+    ///   that the `B` range starts at 0 so zero is drawn too. About half
     ///   of each range lies below half of the next unit, so a loop that
-    ///   promotes too early is caught on most draws.
+    ///   promotes too early is caught on about half of this arm's draws,
+    ///   which is within a handful of draws across the whole strategy.
     /// * A window just below each `1024^k` boundary. The window has to SCALE
     ///   with the boundary, because the band where `:.1` rounding pushes the
     ///   mantissa up to 1024.0 is itself proportional: it spans the top
