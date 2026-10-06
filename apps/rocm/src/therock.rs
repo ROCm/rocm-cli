@@ -10302,7 +10302,7 @@ exit 1
             (Leftover,     WheelHere,   true,    Rebuilt),
         ];
         // Never part of a venv, so a rebuild must leave each exactly as it was.
-        const USER_PATHS: [&str; 4] = [
+        let user_paths: [&str; 4] = [
             "Documents/thesis.txt",
             "apps/comfyui/source/models/x",
             "share/notes/todo.txt",
@@ -10337,7 +10337,7 @@ exit 1
                 TarballHere => write_runtime_marker(&install_root, &install_root, "tarball"),
                 WheelHere => write_runtime_marker(&install_root, &install_root, "wheel"),
             }
-            for user_path in USER_PATHS {
+            for user_path in user_paths {
                 let path = install_root.join(user_path);
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(&path, format!("user data: {user_path}")).unwrap();
@@ -10352,7 +10352,7 @@ exit 1
             match expected {
                 Rebuilt => {
                     assert!(result.is_ok(), "{shape}: {result:?}");
-                    for user_path in USER_PATHS {
+                    for user_path in user_paths {
                         assert_eq!(
                             fs::read_to_string(install_root.join(user_path)).ok(),
                             Some(format!("user data: {user_path}")),
