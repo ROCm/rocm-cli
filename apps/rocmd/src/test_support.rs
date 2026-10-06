@@ -45,14 +45,14 @@ pub(crate) fn workspace_test_artifact_dir() -> PathBuf {
 }
 
 /// Build the record a supervisor would construct for `service_id`, to learn
-/// the paths it derives before the real call does.
-#[cfg(target_os = "linux")]
+/// the paths it derives before the real call does. Not platform-gated:
+/// the supervisor exit-write tests use it on every platform.
 pub(crate) fn identity_probe_record(
     paths: &AppPaths,
     service_id: &str,
     port: u16,
-) -> rocm_core::ManagedServiceRecord {
-    rocm_core::ManagedServiceRecord::new(
+) -> ManagedServiceRecord {
+    ManagedServiceRecord::new(
         paths,
         service_id,
         "llamacpp",

@@ -1010,7 +1010,6 @@ fn wait_for_service_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
     use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, temp_app_paths, unique_test_root,
