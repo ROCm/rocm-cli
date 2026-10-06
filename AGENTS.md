@@ -291,6 +291,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 python scripts/smoke_local.py
 ```
 
+Deleting or weakening a test is a change in its own right: every crate has a committed
+coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops
+below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
+the commit why — do not re-bless to clear a red check.
+
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
 - focused Rust test groups for touched modules
