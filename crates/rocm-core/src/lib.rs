@@ -4163,6 +4163,21 @@ impl ManagedServiceRecord {
         self.supervisor_start_ticks = crate::process_start_ticks(pid);
     }
 
+    /// Whether `self` and `other` — two snapshots of one service's record —
+    /// name the same processes, token for token.
+    ///
+    /// A stop reads the record, signals what it names, and only then writes its
+    /// verdict. If the record names different processes by then — a restart
+    /// recorded its new supervisor meanwhile — the verdict does not cover them,
+    /// and both `rocm services stop` and `rocmd`'s stop gate their "stopped"
+    /// claim on this.
+    pub fn names_same_processes(&self, other: &Self) -> bool {
+        self.supervisor_pid == other.supervisor_pid
+            && self.supervisor_start_ticks == other.supervisor_start_ticks
+            && self.engine_pid == other.engine_pid
+            && self.engine_start_ticks == other.engine_start_ticks
+    }
+
     /// Record `pid` as the engine, together with its start-time token. See
     /// [`Self::record_supervisor_identity`].
     pub fn record_engine_identity(&mut self, pid: u32) {

@@ -28,14 +28,6 @@ fn find_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
         .with_context(|| format!("managed service `{service_id}` not found"))
 }
 
-/// Whether two snapshots of a record name the same processes, token for token.
-fn records_name_same_processes(a: &ManagedServiceRecord, b: &ManagedServiceRecord) -> bool {
-    a.supervisor_pid == b.supervisor_pid
-        && a.supervisor_start_ticks == b.supervisor_start_ticks
-        && a.engine_pid == b.engine_pid
-        && a.engine_start_ticks == b.engine_start_ticks
-}
-
 /// [`stop_managed_service`], with the per-PID termination supplied by the
 /// caller. Production passes [`terminate_recorded_pid`]; a test passes a
 /// stand-in for the outcomes it cannot construct on demand. Only the signalling
@@ -95,7 +87,7 @@ pub(crate) fn stop_managed_service_with(
     // service stopped, clearing their PIDs or dropping the key they serve with
     // would each be false.
     let all_stopped =
-        stops.iter().all(|stop| stop.stopped) && records_name_same_processes(&stopping, &record);
+        stops.iter().all(|stop| stop.stopped) && stopping.names_same_processes(&record);
     // Claim a stop only when every recorded process is confirmed gone, and
     // otherwise record that one was *asked for*. `rocm services stop`
     // (`stop_internal_managed_service`) keeps the same contract on these same
