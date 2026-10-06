@@ -41,9 +41,8 @@ pub(crate) use self::probe::{
 };
 use self::process::{extract_tarball_and_discard_archive, progress_line, run_uv_progress_command};
 use self::python::{
-    ensure_uv_venv, folder_has_entries, managed_python_version, python_requirement,
-    resolve_python_launcher, uv_venv_command_args, venv_step_preview,
-    wheel_compatibility_for_python,
+    dry_run_venv_lines, ensure_uv_venv, managed_python_version, python_requirement,
+    resolve_python_launcher, wheel_compatibility_for_python,
 };
 use self::resolve::{
     AggregateDeviceTarget, canonical_auto_select_needs_next_python, resolve_pip_runtime,
@@ -75,6 +74,7 @@ pub(crate) use crate::runtime_registry::{
 use crate::runtime_registry::{
     runtime_manifest_path, save_runtime_manifest, wheel_composition_includes_devel,
 };
+#[cfg(test)]
 use crate::shell_quote::shell_quote;
 use anyhow::{Context, Result, bail};
 use rocm_core::{
@@ -539,40 +539,23 @@ fn install_wheel_runtime(
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
-        // The same decision and arguments the real install uses, so a folder
-        // it would refuse is reported as refused, and one it would rebuild
-        // shows `--allow-existing`.
-        let venv_args = uv_venv_command_args(
+        // The same decisions and arguments the real install uses, so a folder
+        // it would refuse is reported as refused with no command, and one it
+        // would rebuild shows `--allow-existing`. The command line is offered
+        // as the command to run, so `dry_run_venv_lines` shell-quotes every
+        // argument: the install root in it comes from a `--prefix` the local
+        // assistant can choose (`install_sdk_dry_run` is a model-callable
+        // tool), so a bare or double-quoted value would be a model-chosen value
+        // in a line a user is invited to paste.
+        let (python_env, command) = dry_run_venv_lines(
+            paths,
             &python_launcher.executable,
             &install_root,
-            folder_has_entries(&install_root).unwrap_or(true),
+            &install_args,
         );
-        let _ = writeln!(
-            output,
-            "  python_env: {}",
-            venv_step_preview(paths, &install_root)
-        );
-        // This line is offered as the command to run, so it has to be one a
-        // shell reads back as the argv it previews. The install root in it
-        // comes from a `--prefix` the local assistant can choose
-        // (`install_sdk_dry_run` is a model-callable tool), so a bare or
-        // double-quoted value here would be a model-chosen value in a line a
-        // user is invited to paste.
-        let venv_args_display = venv_args
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let install_args_display = install_args
-            .iter()
-            .map(|arg| shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let _ = writeln!(output, "  python_env: {python_env}");
         let _ = writeln!(output, "  mode: dry-run");
-        let _ = writeln!(
-            output,
-            "  command: uv {venv_args_display} && uv {install_args_display}"
-        );
+        let _ = writeln!(output, "  command: {command}");
         let _ = writeln!(
             output,
             "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
