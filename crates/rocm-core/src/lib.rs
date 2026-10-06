@@ -59,6 +59,8 @@ pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
 pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+#[cfg(all(test, target_os = "linux"))]
+use host_gpu::collect_managed_runtime_library_paths;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
@@ -69,8 +71,6 @@ pub use host_gpu::{
 };
 #[cfg(any(target_os = "linux", test))]
 use host_gpu::{KfdGpuNode, kfd_gpu_nodes_in};
-#[cfg(all(test, target_os = "linux"))]
-use host_gpu::collect_managed_runtime_library_paths;
 use host_gpu::{
     collect_sdk_library_paths, detect_linux_sysfs_gfx_target, detect_local_windows_host_driver,
     detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, ldconfig_cache,
