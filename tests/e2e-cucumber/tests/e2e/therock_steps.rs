@@ -1368,6 +1368,15 @@ async fn preview_predicts_home_refusal(world: &mut E2eWorld) {
         )),
         "the preview did not predict the refusal:\n{reported}"
     );
+    // No command for an install that will not run one.
+    assert!(
+        reported.contains("command: none; the install will refuse this folder"),
+        "the preview did not say no command will run:\n{reported}"
+    );
+    assert!(
+        !reported.contains("command: uv venv"),
+        "the preview shows a uv venv command the install will never run:\n{reported}"
+    );
     assert_eq!(
         std::fs::read_to_string(home.join("Documents").join("thesis.txt")).ok(),
         Some("years of work".to_owned()),
@@ -1382,7 +1391,7 @@ async fn preview_shows_rebuild_in_place(world: &mut E2eWorld) {
     let reported = reported(world);
     assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
     assert!(
-        reported.contains("python_env: reuse the Python environment ROCm CLI created here"),
+        reported.contains("python_env: rebuild only the venv files ROCm CLI created here"),
         "the preview did not describe the in-place rebuild:\n{reported}"
     );
     assert!(

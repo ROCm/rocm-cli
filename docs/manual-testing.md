@@ -158,12 +158,13 @@ Expected result:
   active default is: the preview stops before the gate.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
 - If the `--prefix` folder already has anything in it and its venv does not
-  run, rocm-cli rebuilds only that venv's own files, and only in a folder it
-  created (its `.rocm-cli-runtime.json` from a wheel install names the folder).
+  run, rocm-cli rebuilds only that venv's own files, and only in a folder where
+  a wheel install finished (its `.rocm-cli-runtime.json` names the folder).
   It prints what it kept, and anything else in the folder, such as
   `apps/comfyui`, is still there afterwards. A folder it did not create, such
   as your home folder with a broken `~/bin/python`, is refused with nothing
-  changed, and `--dry-run` predicts that refusal in its `python_env:` line.
+  changed, and `--dry-run` predicts that refusal in its `python_env:` line and
+  prints `command: none`.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned

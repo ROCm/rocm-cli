@@ -1937,34 +1937,18 @@ fn install_wheel_runtime(
             install_args.extend(["--prerelease".to_owned(), "allow".to_owned()]);
         }
         install_args.extend(wheel_composition.package_specs.iter().cloned());
-        // The same decision and arguments the real install uses, so a folder
-        // it would refuse is reported as refused, and one it would rebuild
-        // shows `--allow-existing`.
-        let venv_args = uv_venv_command_args(
+        // The same decisions and arguments the real install uses, so a folder
+        // it would refuse is reported as refused with no command, and one it
+        // would rebuild shows `--allow-existing`.
+        let (python_env, command) = dry_run_venv_lines(
+            paths,
             &python_launcher.executable,
             &install_root,
-            folder_has_entries(&install_root).unwrap_or(true),
+            &install_args,
         );
-        let _ = writeln!(
-            output,
-            "  python_env: {}",
-            venv_step_preview(paths, &install_root)
-        );
-        let venv_args_display = venv_args
-            .iter()
-            .map(|arg| quote_display_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let install_args_display = install_args
-            .iter()
-            .map(|arg| quote_display_arg(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let _ = writeln!(output, "  python_env: {python_env}");
         let _ = writeln!(output, "  mode: dry-run");
-        let _ = writeln!(
-            output,
-            "  command: uv {venv_args_display} && uv {install_args_display}"
-        );
+        let _ = writeln!(output, "  command: {command}");
         let _ = writeln!(
             output,
             "  activation: use the managed venv Python; TheRock libraries are resolved from that venv by rocm_sdk.initialize_process"
@@ -4886,24 +4870,12 @@ fn ensure_uv_venv(
     install_root: &Path,
 ) -> Result<()> {
     let env_python = venv_python_path(install_root);
-    if env_python.is_file() {
-        let reusable = run_command(
-            &env_python,
-            &["--version"],
-            "verify existing managed TheRock runtime Python",
-        )
-        .is_ok()
-            && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
-                wheel_compatibility_for_python(python_launcher)
-                    .is_ok_and(|required| existing.python_tag == required.python_tag)
-            });
-        if reusable {
-            return Ok(());
-        }
-        // Same `install_root` can be reused across reinstalls (it's keyed on
-        // resolved version/build date, not on the interpreter), so an existing
-        // venv left over from a lower-tag requirement must not be mistaken for
-        // a compatible one just because it still runs.
+    // Same `install_root` can be reused across reinstalls (it's keyed on
+    // resolved version/build date, not on the interpreter), so an existing
+    // venv left over from a lower-tag requirement must not be mistaken for a
+    // compatible one just because it still runs.
+    if existing_venv_is_reusable(install_root, python_launcher) {
+        return Ok(());
     }
     // Anything already in the folder goes through the ownership-checked
     // rebuild, not only a folder whose Python is present: a venv with no
@@ -4944,6 +4916,37 @@ fn ensure_uv_venv(
     Ok(())
 }
 
+/// Whether the venv already in `install_root` can be used as it is.
+///
+/// A Python that runs and reports the right wheel tag is not enough. On Linux
+/// `bin/python` is a symlink to the base interpreter, and without `pyvenv.cfg`
+/// beside it that is exactly what it runs as: same tag, but `sys.prefix` is the
+/// base install, so `uv pip install --python <root>/bin/python` would write
+/// ROCm and torch into the user's own Python (a pyenv or conda one is
+/// writable) and record the runtime as working. So reuse also needs
+/// `pyvenv.cfg`, and the interpreter's own `sys.prefix` to be this folder.
+fn existing_venv_is_reusable(install_root: &Path, python_launcher: &Path) -> bool {
+    let env_python = venv_python_path(install_root);
+    env_python.is_file()
+        && install_root.join("pyvenv.cfg").is_file()
+        && run_command(
+            &env_python,
+            &["--version"],
+            "verify existing managed TheRock runtime Python",
+        )
+        .is_ok()
+        && capture_python_stdout(
+            &env_python,
+            "import sys; print(sys.prefix)",
+            "inspect existing managed TheRock runtime prefix",
+        )
+        .is_ok_and(|prefix| paths_name_same_folder(Path::new(prefix.trim()), install_root))
+        && wheel_compatibility_for_python(&env_python).is_ok_and(|existing| {
+            wheel_compatibility_for_python(python_launcher)
+                .is_ok_and(|required| existing.python_tag == required.python_tag)
+        })
+}
+
 /// The `uv venv` arguments for an install root, shared by the install and its
 /// `--dry-run` preview so the preview shows the command that will run.
 ///
@@ -4981,17 +4984,17 @@ fn uv_venv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
 /// Windows (`Scripts`, `Lib`, `Include`). Clearing these and nothing else is
 /// what lets a broken venv be rebuilt without taking the rest of its folder.
 ///
-/// `pyvenv.cfg` is first, so a clear that fails part-way (a file it may not
-/// delete, a busy one on Windows) never leaves a folder that still looks like
-/// a venv with nothing behind it. Whatever it does leave, the next run sends
-/// back through [`venv_folder_state`].
+/// The interpreter goes first and `pyvenv.cfg` last. A clear that stops
+/// part-way (a file it may not delete, a busy one on Windows) then leaves no
+/// Python behind, or a Python whose venv is still marked as one; either way the
+/// next run cannot mistake it for a working venv
+/// ([`existing_venv_is_reusable`]) and sends the folder back through
+/// [`venv_folder_state`], which finishes the clear.
 ///
 /// `share` is deliberately absent: packages install data there, but so can a
 /// person, and nothing distinguishes the two. A stale `share` costs nothing,
 /// because the reinstall that follows overwrites what it needs.
 const VENV_OWNED_ENTRIES: &[&str] = &[
-    "pyvenv.cfg",
-    "CACHEDIR.TAG",
     "bin",
     "Scripts",
     "lib",
@@ -4999,6 +5002,8 @@ const VENV_OWNED_ENTRIES: &[&str] = &[
     "Lib",
     "include",
     "Include",
+    "CACHEDIR.TAG",
+    "pyvenv.cfg",
 ];
 
 /// The in-tree runtime manifest `save_runtime_manifest` writes beside every
@@ -5168,7 +5173,9 @@ fn unowned_venv_rebuild_refusal(install_root: &Path, marker: &MarkerFinding) -> 
         "files that are not a Python environment".to_owned()
     }];
     found.push(match marker {
-        MarkerFinding::Missing => "no .rocm-cli-runtime.json from a ROCm CLI install".to_owned(),
+        MarkerFinding::Missing => {
+            "no finished ROCm CLI install recorded here (no .rocm-cli-runtime.json)".to_owned()
+        }
         MarkerFinding::Unreadable => "a .rocm-cli-runtime.json ROCm CLI cannot read".to_owned(),
         MarkerFinding::NamesOtherFolder(other) => format!(
             "a .rocm-cli-runtime.json that belongs to {}",
@@ -5181,7 +5188,7 @@ fn unowned_venv_rebuild_refusal(install_root: &Path, marker: &MarkerFinding) -> 
         MarkerFinding::WheelHere => "a .rocm-cli-runtime.json for this folder".to_owned(),
     });
     format!(
-        "refusing to create the Python environment at {}: the folder is not empty and ROCm CLI cannot show it created it (found {}), so it will not delete or overwrite what is in it. Nothing was changed. Choose an empty folder, or one ROCm CLI created, with --prefix, for example `rocm install sdk --prefix <empty-folder>`",
+        "refusing to create the Python environment at {}: the folder is not empty and ROCm CLI cannot show it holds a ROCm CLI install (found {}), so it will not delete or overwrite what is in it. Nothing was changed. Choose an empty folder, or one where a ROCm CLI install finished, with --prefix, for example `rocm install sdk --prefix <empty-folder>`",
         install_root.display(),
         found.join("; ")
     )
@@ -5222,15 +5229,47 @@ fn venv_rebuild_line(install_root: &Path, had_python: bool, kept: &[String]) -> 
     )
 }
 
-/// The `--dry-run` line for the venv step, from the same decision the
-/// install takes, so the preview predicts a refusal instead of showing a
-/// command that will not run.
-fn venv_step_preview(paths: &AppPaths, install_root: &Path) -> String {
-    match venv_folder_state(paths, install_root) {
-        Ok(VenvFolder::Empty) => "create a new Python environment in an empty folder".to_owned(),
-        Ok(VenvFolder::Owned) => "reuse the Python environment ROCm CLI created here if it runs and matches; otherwise rebuild only its venv files and keep everything else in the folder".to_owned(),
-        Err(error) => format!("the install will refuse this folder: {error}"),
+/// The `--dry-run` lines for the venv step and the install command, from the
+/// same decisions the install takes: reuse, a fresh venv, a rebuild in place
+/// (`--allow-existing`), or a refusal. A refused folder gets no command at
+/// all, since nothing would run. Returns `(python_env, command)`.
+fn dry_run_venv_lines(
+    paths: &AppPaths,
+    python_launcher: &Path,
+    install_root: &Path,
+    install_args: &[String],
+) -> (String, String) {
+    let display = |args: &[String]| {
+        args.iter()
+            .map(|arg| quote_display_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let install = format!("uv {}", display(install_args));
+    if existing_venv_is_reusable(install_root, python_launcher) {
+        return (
+            "reuse the working Python environment already here".to_owned(),
+            install,
+        );
     }
+    let (python_env, rebuilding) = match venv_folder_state(paths, install_root) {
+        Ok(VenvFolder::Empty) => (
+            "create a new Python environment in an empty folder".to_owned(),
+            false,
+        ),
+        Ok(VenvFolder::Owned) => (
+            "rebuild only the venv files ROCm CLI created here and keep everything else in the folder".to_owned(),
+            true,
+        ),
+        Err(error) => {
+            return (
+                format!("the install will refuse this folder: {error}"),
+                "none; the install will refuse this folder".to_owned(),
+            );
+        }
+    };
+    let venv = uv_venv_command_args(python_launcher, install_root, rebuilding);
+    (python_env, format!("uv {} && {install}", display(&venv)))
 }
 
 fn python_venv_args(install_root: &Path) -> Vec<String> {
@@ -9674,7 +9713,8 @@ exit 1
     /// way uv 0.10 does about an existing folder at `$4` (the env root
     /// `uv_venv_args` passes): it refuses one with entries unless
     /// `--allow-existing` is given, and wipes it on `--clear` or an inherited
-    /// `UV_VENV_CLEAR=1`. Then it creates a working interpreter there. So a
+    /// `UV_VENV_CLEAR=1`. Then it creates a working interpreter there, which
+    /// reports `$4` as its `sys.prefix`. So a
     /// code path that leans on uv to cope with an existing folder fails here
     /// the way it would against a real uv.
     #[cfg(unix)]
@@ -9703,7 +9743,14 @@ if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
     fi
   fi
   /bin/mkdir -p "$target/bin"
-  printf '#!/bin/sh\nif [ "$1" = "-c" ]; then echo cp312; exit 0; fi\necho Python 3.12.10\n' > "$target/bin/python"
+  cat > "$target/bin/python" <<PY
+#!/bin/sh
+if [ "\$1" = "-c" ]; then
+  case "\$2" in *sys.prefix*) echo "$target" ;; *) echo cp312 ;; esac
+  exit 0
+fi
+echo Python 3.12.10
+PY
   /bin/chmod +x "$target/bin/python"
   echo "home = /usr/bin" > "$target/pyvenv.cfg"
   exit 0
@@ -9809,7 +9856,7 @@ exit 1
         let error = ensure_uv_venv(&paths, &uv, &launcher, &refused)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("Choose an empty folder, or one ROCm CLI created"));
+        assert!(error.contains("Choose an empty folder, or one where a ROCm CLI install finished"));
         let refused_before = tree_snapshot(&refused);
 
         let empty = root.join("empty-folder");
@@ -9928,10 +9975,10 @@ exit 1
 
     /// A rebuild that fails part-way must not leave a folder the next run
     /// treats as fresh. Here a read-only directory inside `lib` stops the
-    /// clear after `pyvenv.cfg` and `bin` are gone; the next run, with the
-    /// directory deletable again, has no Python to test, and must still go
-    /// through the ownership-checked rebuild and `--allow-existing` rather
-    /// than a plain `uv venv`, which uv 0.7 answers by deleting the folder.
+    /// clear after `bin` is gone; the next run, with the directory deletable
+    /// again, has no Python to test, and must still go through the
+    /// ownership-checked rebuild and `--allow-existing` rather than a plain
+    /// `uv venv`, which uv 0.7 answers by deleting the folder.
     #[test]
     #[cfg(unix)]
     fn a_rebuild_that_fails_part_way_is_finished_by_the_next_run_keeping_comfyui_data() {
@@ -9949,7 +9996,6 @@ exit 1
             b"weights",
             "the failed first run must not touch ComfyUI data"
         );
-        assert!(!install_root.join("pyvenv.cfg").exists());
         assert!(!venv_python_path(&install_root).exists());
         fs::remove_file(&uv_log).ok();
 
@@ -10006,9 +10052,8 @@ exit 1
         use std::os::unix::fs::PermissionsExt;
         let locked = install_root.join("lib").join("locked");
         if first_run_succeeded {
-            for name in ["bin", "pyvenv.cfg"] {
-                let _ = remove_venv_entry(&install_root.join(name));
-            }
+            let _ = remove_venv_entry(&install_root.join("bin"));
+            fs::write(install_root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
             fs::create_dir_all(&locked).unwrap();
             fs::write(locked.join("held.py"), b"held").unwrap();
         } else {
@@ -10019,7 +10064,9 @@ exit 1
     /// The same partial-clear sequence against real uv releases, which differ
     /// in exactly the way that matters here: given a plain `uv venv` over a
     /// leftover venv, 0.7 deletes the folder, 0.9 builds over it, and 0.10
-    /// refuses. Opt-in, since CI has no pinned uv set:
+    /// refuses. It then drives every `ClearStop` through the real uv, where a
+    /// `bin/python` left without `pyvenv.cfg` really does run as the base
+    /// interpreter. Opt-in, since CI has no pinned uv set:
     /// `ROCM_CLI_TEST_UV_BINARIES=/path/uv-0.7:/path/uv-0.10` plus
     /// `ROCM_CLI_TEST_PYTHON=/usr/bin/python3`.
     #[test]
@@ -10078,6 +10125,7 @@ exit 1
                     .any(|line| line.starts_with("venv ") && line.ends_with(" --allow-existing")),
                 "{label}: {calls}"
             );
+            assert_every_clear_stop_converges(&uv, &log, &python, &label.to_string());
             fs::remove_dir_all(root).ok();
         }
     }
@@ -10186,58 +10234,224 @@ exit 1
         fs::remove_dir_all(root).ok();
     }
 
-    /// The `--dry-run` preview takes the install's own decision: it names the
-    /// refusal for a folder the install would refuse, and shows
-    /// `--allow-existing` for one it would rebuild.
+    /// The `--dry-run` `python_env:` and `command:` lines `install_wheel_runtime`
+    /// prints, for each decision the install can take. A refused folder gets
+    /// no command at all; a rebuild shows `--allow-existing`; a reusable venv
+    /// shows only the package install.
     #[test]
     #[cfg(unix)]
-    fn the_dry_run_preview_predicts_what_the_venv_step_will_do() {
+    fn the_dry_run_lines_predict_what_the_venv_step_will_do() {
         let (root, paths) = venv_rebuild_sandbox("preview");
-        let launcher = root.join("python3");
+        let launcher = cp312_launcher(&root);
+        let install_args = vec!["pip".to_owned(), "install".to_owned(), "rocm".to_owned()];
+        let venv_command = |folder: &Path| {
+            format!(
+                "uv venv --python {} {}",
+                launcher.display(),
+                folder.display()
+            )
+        };
+
         let empty = root.join("missing");
+        let (env, command) = dry_run_venv_lines(&paths, &launcher, &empty, &install_args);
+        assert_eq!(env, "create a new Python environment in an empty folder");
         assert_eq!(
-            venv_step_preview(&paths, &empty),
-            "create a new Python environment in an empty folder"
-        );
-        assert!(
-            !uv_venv_command_args(&launcher, &empty, false)
-                .contains(&"--allow-existing".to_owned())
+            command,
+            format!("{} && uv pip install rocm", venv_command(&empty))
         );
 
         let home = root.join("home");
         plant_failing_venv_python(&home);
-        let preview = venv_step_preview(&paths, &home);
+        let (env, command) = dry_run_venv_lines(&paths, &launcher, &home, &install_args);
         assert!(
-            preview.starts_with("the install will refuse this folder: refusing to create"),
-            "{preview}"
+            env.starts_with("the install will refuse this folder: refusing to create"),
+            "{env}"
         );
+        assert_eq!(command, "none; the install will refuse this folder");
         assert!(home.join("bin").exists(), "a preview changes nothing");
 
         let owned = root.join("owned");
         plant_failing_venv_python(&owned);
         plant_rocm_owned_venv_markers(&owned);
-        assert!(
-            venv_step_preview(&paths, &owned).starts_with("reuse the Python environment"),
-            "{}",
-            venv_step_preview(&paths, &owned)
+        let (env, command) = dry_run_venv_lines(&paths, &launcher, &owned, &install_args);
+        assert!(env.starts_with("rebuild only the venv files"), "{env}");
+        assert_eq!(
+            command,
+            format!(
+                "{} --allow-existing && uv pip install rocm",
+                venv_command(&owned)
+            )
         );
         assert!(
             venv_python_path(&owned).is_file(),
             "a preview changes nothing"
         );
-        assert!(
-            uv_venv_command_args(&launcher, &owned, true)
-                .ends_with(&["--allow-existing".to_owned()])
-        );
+
+        let working = root.join("working");
+        plant_rocm_owned_venv_markers(&working);
+        plant_working_venv_python(&working, &working);
+        let (env, command) = dry_run_venv_lines(&paths, &launcher, &working, &install_args);
+        assert_eq!(env, "reuse the working Python environment already here");
+        assert_eq!(command, "uv pip install rocm");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A venv Python that runs, reports the `cp312` tag, and reports `prefix`
+    /// as its `sys.prefix`, the way a real one does with or without the
+    /// `pyvenv.cfg` that decides what that prefix really is.
+    #[cfg(unix)]
+    fn plant_working_venv_python(install_root: &Path, prefix: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let python = venv_python_path(install_root);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        let _ = fs::remove_file(&python);
+        fs::write(
+            &python,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  case \"$2\" in *sys.prefix*) echo \"{}\" ;; *) echo cp312 ;; esac\n  exit 0\nfi\necho Python 3.12.10\n",
+                prefix.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Points where a clear of an owned venv can stop, as the states they
+    /// leave. Each must converge: the next run ends with a working venv whose
+    /// `pyvenv.cfg` is there and whose `sys.prefix` is the folder, keeps the
+    /// ComfyUI data, and the run after that reuses it without calling uv.
+    #[cfg(unix)]
+    #[derive(Debug, Clone, Copy)]
+    enum ClearStop {
+        /// Only `pyvenv.cfg` gone: on Linux the `bin/python` symlink now runs
+        /// as the base interpreter.
+        CfgRemoved,
+        CfgAndCacheTagRemoved,
+        /// Part of `bin` gone, the interpreter among it.
+        MidBinPythonRemoved,
+        /// Part of `bin` gone, the interpreter still there.
+        MidBinActivateRemoved,
+        BinRemoved,
+    }
+
+    #[cfg(unix)]
+    const CLEAR_STOPS: [ClearStop; 5] = [
+        ClearStop::CfgRemoved,
+        ClearStop::CfgAndCacheTagRemoved,
+        ClearStop::MidBinPythonRemoved,
+        ClearStop::MidBinActivateRemoved,
+        ClearStop::BinRemoved,
+    ];
+
+    #[cfg(unix)]
+    fn apply_clear_stop(install_root: &Path, stop: ClearStop) {
+        let remove = |name: &str| {
+            let _ = remove_venv_entry(&install_root.join(name));
+        };
+        match stop {
+            ClearStop::CfgRemoved => remove("pyvenv.cfg"),
+            ClearStop::CfgAndCacheTagRemoved => {
+                remove("pyvenv.cfg");
+                remove("CACHEDIR.TAG");
+            }
+            ClearStop::MidBinPythonRemoved => {
+                for entry in fs::read_dir(install_root.join("bin")).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("python")
+                    {
+                        let _ = remove_venv_entry(&path);
+                    }
+                }
+            }
+            ClearStop::MidBinActivateRemoved => {
+                let _ = remove_venv_entry(&install_root.join("bin").join("activate"));
+            }
+            ClearStop::BinRemoved => remove("bin"),
+        }
+    }
+
+    /// Drive every [`ClearStop`] through `ensure_uv_venv` with `uv` (which
+    /// appends its arguments to `log`) and assert convergence.
+    #[cfg(unix)]
+    fn assert_every_clear_stop_converges(uv: &Path, log: &Path, launcher: &Path, label: &str) {
+        for stop in CLEAR_STOPS {
+            let what = format!("{label} {stop:?}");
+            let (root, paths) = venv_rebuild_sandbox("stop");
+            let install_root = root.join("prefix");
+            ensure_uv_venv(&paths, uv, launcher, &install_root)
+                .unwrap_or_else(|e| panic!("{what}: initial venv: {e:#}"));
+            write_runtime_marker(&install_root, &install_root, "wheel");
+            fs::write(install_root.join("CACHEDIR.TAG"), b"Signature").unwrap();
+            fs::write(install_root.join("bin").join("activate"), b"# activate").unwrap();
+            let models = install_root.join("apps").join("comfyui").join("models");
+            fs::create_dir_all(&models).unwrap();
+            fs::write(models.join("x.safetensors"), b"weights").unwrap();
+            apply_clear_stop(&install_root, stop);
+
+            fs::remove_file(log).ok();
+            ensure_uv_venv(&paths, uv, launcher, &install_root)
+                .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            assert!(
+                install_root.join("pyvenv.cfg").is_file(),
+                "{what}: no pyvenv.cfg"
+            );
+            let prefix = capture_python_stdout(
+                &venv_python_path(&install_root),
+                "import sys; print(sys.prefix)",
+                "probe",
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e:#}"));
+            assert!(
+                paths_name_same_folder(Path::new(prefix.trim()), &install_root),
+                "{what}: the venv Python runs as {prefix}, not as the venv"
+            );
+            assert_eq!(
+                fs::read(models.join("x.safetensors")).ok().as_deref(),
+                Some(&b"weights"[..]),
+                "{what}: ComfyUI data lost"
+            );
+            if let Ok(calls) = fs::read_to_string(log) {
+                assert!(
+                    calls
+                        .lines()
+                        .filter(|line| line.starts_with("venv "))
+                        .all(|line| line.ends_with(" --allow-existing")),
+                    "{what}: {calls}"
+                );
+            }
+
+            fs::remove_file(log).ok();
+            ensure_uv_venv(&paths, uv, launcher, &install_root)
+                .unwrap_or_else(|e| panic!("{what}: second run: {e:#}"));
+            assert!(
+                !log.exists(),
+                "{what}: the converged venv was not reused: {:?}",
+                fs::read_to_string(log)
+            );
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn every_point_a_clear_can_stop_at_converges_on_the_next_run() {
+        let (root, _) = venv_rebuild_sandbox("stops-fake");
+        let (uv, log) = write_logging_fake_uv(&root);
+        let launcher = cp312_launcher(&root);
+        assert_every_clear_stop_converges(&uv, &log, &launcher, "fake uv");
         fs::remove_dir_all(root).ok();
     }
 
     /// Every shape a folder can have when `ensure_uv_venv` meets it with
     /// entries in it: what is left of a venv, what its runtime marker says,
     /// and whether it sits in the managed runtimes folder. The expected
-    /// outcome of each is written out, not computed, and every case also holds
-    /// user data at paths listed literally here; a rebuild must keep all of
-    /// them and a refusal must change nothing.
+    /// outcome of each is written out, not computed. Every venv-shaped case
+    /// also holds user data at paths listed literally here; a rebuild must keep
+    /// all of them, and a refusal or a reuse must change nothing.
     #[test]
     #[cfg(unix)]
     fn venv_rebuild_deletes_only_venv_files_and_only_from_an_owned_folder() {
@@ -10245,11 +10459,20 @@ exit 1
         enum Venv {
             /// `pyvenv.cfg`, `lib`, and a Python that fails `--version`.
             BrokenPython,
+            /// `lib` and a Python that runs with the right tag, but no
+            /// `pyvenv.cfg`: on Linux that is the base interpreter.
+            PythonWithoutCfg,
+            /// `pyvenv.cfg`, `lib`, and a Python that runs with the right tag
+            /// but whose `sys.prefix` is another folder.
+            ForeignPrefix,
             /// `pyvenv.cfg` and `lib`, no Python.
             NoPython,
-            /// Only `lib`: a clear that removed `pyvenv.cfg` and `bin` and
-            /// then failed.
+            /// Only `lib`: a clear that removed `bin` and then failed.
             Leftover,
+            /// `pyvenv.cfg`, `lib`, and a Python that runs as this venv.
+            Working,
+            /// Nothing but this one entry.
+            Only(&'static str),
         }
         #[derive(Debug, Clone, Copy)]
         enum Marker {
@@ -10263,43 +10486,75 @@ exit 1
         enum Expect {
             Rebuilt,
             Refused,
+            Reused,
         }
-        use Expect::{Rebuilt, Refused};
+        use Expect::{Rebuilt, Refused, Reused};
         use Marker::{Garbage, Missing, OtherFolder, TarballHere, WheelHere};
-        use Venv::{BrokenPython, Leftover, NoPython};
+        use Venv::{
+            BrokenPython, ForeignPrefix, Leftover, NoPython, Only, PythonWithoutCfg, Working,
+        };
         #[rustfmt::skip]
         let table = [
-            // venv shape   marker       managed  expected
-            (BrokenPython, Missing,     false,   Refused),
-            (BrokenPython, Garbage,     false,   Refused),
-            (BrokenPython, OtherFolder, false,   Refused),
-            (BrokenPython, TarballHere, false,   Refused),
-            (BrokenPython, WheelHere,   false,   Rebuilt),
-            (BrokenPython, Missing,     true,    Rebuilt),
-            (BrokenPython, Garbage,     true,    Rebuilt),
-            (BrokenPython, OtherFolder, true,    Rebuilt),
-            (BrokenPython, TarballHere, true,    Rebuilt),
-            (BrokenPython, WheelHere,   true,    Rebuilt),
-            (NoPython,     Missing,     false,   Refused),
-            (NoPython,     Garbage,     false,   Refused),
-            (NoPython,     OtherFolder, false,   Refused),
-            (NoPython,     TarballHere, false,   Refused),
-            (NoPython,     WheelHere,   false,   Rebuilt),
-            (NoPython,     Missing,     true,    Rebuilt),
-            (NoPython,     Garbage,     true,    Rebuilt),
-            (NoPython,     OtherFolder, true,    Rebuilt),
-            (NoPython,     TarballHere, true,    Rebuilt),
-            (NoPython,     WheelHere,   true,    Rebuilt),
-            (Leftover,     Missing,     false,   Refused),
-            (Leftover,     Garbage,     false,   Refused),
-            (Leftover,     OtherFolder, false,   Refused),
-            (Leftover,     TarballHere, false,   Refused),
-            (Leftover,     WheelHere,   false,   Rebuilt),
-            (Leftover,     Missing,     true,    Rebuilt),
-            (Leftover,     Garbage,     true,    Rebuilt),
-            (Leftover,     OtherFolder, true,    Rebuilt),
-            (Leftover,     TarballHere, true,    Rebuilt),
-            (Leftover,     WheelHere,   true,    Rebuilt),
+            // venv shape        marker       managed  expected
+            (BrokenPython,     Missing,     false,   Refused),
+            (BrokenPython,     Garbage,     false,   Refused),
+            (BrokenPython,     OtherFolder, false,   Refused),
+            (BrokenPython,     TarballHere, false,   Refused),
+            (BrokenPython,     WheelHere,   false,   Rebuilt),
+            (BrokenPython,     Missing,     true,    Rebuilt),
+            (BrokenPython,     Garbage,     true,    Rebuilt),
+            (BrokenPython,     OtherFolder, true,    Rebuilt),
+            (BrokenPython,     TarballHere, true,    Rebuilt),
+            (BrokenPython,     WheelHere,   true,    Rebuilt),
+            (PythonWithoutCfg, Missing,     false,   Refused),
+            (PythonWithoutCfg, Garbage,     false,   Refused),
+            (PythonWithoutCfg, OtherFolder, false,   Refused),
+            (PythonWithoutCfg, TarballHere, false,   Refused),
+            (PythonWithoutCfg, WheelHere,   false,   Rebuilt),
+            (PythonWithoutCfg, Missing,     true,    Rebuilt),
+            (PythonWithoutCfg, Garbage,     true,    Rebuilt),
+            (PythonWithoutCfg, OtherFolder, true,    Rebuilt),
+            (PythonWithoutCfg, TarballHere, true,    Rebuilt),
+            (PythonWithoutCfg, WheelHere,   true,    Rebuilt),
+            (ForeignPrefix,    Missing,     false,   Refused),
+            (ForeignPrefix,    Garbage,     false,   Refused),
+            (ForeignPrefix,    OtherFolder, false,   Refused),
+            (ForeignPrefix,    TarballHere, false,   Refused),
+            (ForeignPrefix,    WheelHere,   false,   Rebuilt),
+            (ForeignPrefix,    Missing,     true,    Rebuilt),
+            (ForeignPrefix,    Garbage,     true,    Rebuilt),
+            (ForeignPrefix,    OtherFolder, true,    Rebuilt),
+            (ForeignPrefix,    TarballHere, true,    Rebuilt),
+            (ForeignPrefix,    WheelHere,   true,    Rebuilt),
+            (NoPython,         Missing,     false,   Refused),
+            (NoPython,         Garbage,     false,   Refused),
+            (NoPython,         OtherFolder, false,   Refused),
+            (NoPython,         TarballHere, false,   Refused),
+            (NoPython,         WheelHere,   false,   Rebuilt),
+            (NoPython,         Missing,     true,    Rebuilt),
+            (NoPython,         Garbage,     true,    Rebuilt),
+            (NoPython,         OtherFolder, true,    Rebuilt),
+            (NoPython,         TarballHere, true,    Rebuilt),
+            (NoPython,         WheelHere,   true,    Rebuilt),
+            (Leftover,         Missing,     false,   Refused),
+            (Leftover,         Garbage,     false,   Refused),
+            (Leftover,         OtherFolder, false,   Refused),
+            (Leftover,         TarballHere, false,   Refused),
+            (Leftover,         WheelHere,   false,   Rebuilt),
+            (Leftover,         Missing,     true,    Rebuilt),
+            (Leftover,         Garbage,     true,    Rebuilt),
+            (Leftover,         OtherFolder, true,    Rebuilt),
+            (Leftover,         TarballHere, true,    Rebuilt),
+            (Leftover,         WheelHere,   true,    Rebuilt),
+            // A venv that works is reused wherever it is: nothing is deleted.
+            (Working,          Missing,     false,   Reused),
+            (Working,          WheelHere,   false,   Reused),
+            (Working,          Missing,     true,    Reused),
+            // A folder that holds anything at all, and no proof ROCm CLI
+            // made it, is refused, as `main` refuses it.
+            (Only("README.md"), Missing,    false,   Refused),
+            (Only(".DS_Store"), Missing,    false,   Refused),
+            (Only(".git"),      Missing,    false,   Refused),
         ];
         // Never part of a venv, so a rebuild must leave each exactly as it was.
         let user_paths: [&str; 4] = [
@@ -10308,6 +10563,7 @@ exit 1
             "share/notes/todo.txt",
             "work.py",
         ];
+        let elsewhere = Path::new("/usr/local");
         for (venv, marker, managed, expected) in table {
             let shape = format!("{venv:?} {marker:?} managed={managed}");
             let (root, paths) = venv_rebuild_sandbox("shapes");
@@ -10316,19 +10572,43 @@ exit 1
             } else {
                 root.join("prefix")
             };
-            fs::create_dir_all(install_root.join("lib").join("python3.12")).unwrap();
-            fs::write(
-                install_root.join("lib").join("python3.12").join("stale.py"),
-                b"old",
-            )
-            .unwrap();
+            fs::create_dir_all(&install_root).unwrap();
+            let cfg = || fs::write(install_root.join("pyvenv.cfg"), "home = /x\n").unwrap();
+            if let Only(entry) = venv {
+                if entry == ".git" {
+                    fs::create_dir_all(install_root.join(".git").join("objects")).unwrap();
+                } else {
+                    fs::write(install_root.join(entry), b"not a venv").unwrap();
+                }
+            } else {
+                fs::create_dir_all(install_root.join("lib").join("python3.12")).unwrap();
+                fs::write(
+                    install_root.join("lib").join("python3.12").join("stale.py"),
+                    b"old",
+                )
+                .unwrap();
+                for user_path in user_paths {
+                    let path = install_root.join(user_path);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, format!("user data: {user_path}")).unwrap();
+                }
+            }
             match venv {
                 BrokenPython => {
                     plant_failing_venv_python(&install_root);
-                    fs::write(install_root.join("pyvenv.cfg"), "home = /x\n").unwrap();
+                    cfg();
                 }
-                NoPython => fs::write(install_root.join("pyvenv.cfg"), "home = /x\n").unwrap(),
-                Leftover => {}
+                PythonWithoutCfg => plant_working_venv_python(&install_root, &install_root),
+                ForeignPrefix => {
+                    plant_working_venv_python(&install_root, elsewhere);
+                    cfg();
+                }
+                NoPython => cfg(),
+                Working => {
+                    plant_working_venv_python(&install_root, &install_root);
+                    cfg();
+                }
+                Leftover | Only(_) => {}
             }
             match marker {
                 Missing => {}
@@ -10336,11 +10616,6 @@ exit 1
                 OtherFolder => write_runtime_marker(&install_root, &root.join("other"), "wheel"),
                 TarballHere => write_runtime_marker(&install_root, &install_root, "tarball"),
                 WheelHere => write_runtime_marker(&install_root, &install_root, "wheel"),
-            }
-            for user_path in user_paths {
-                let path = install_root.join(user_path);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(&path, format!("user data: {user_path}")).unwrap();
             }
             let (uv, uv_log) = write_logging_fake_uv(&root);
             let launcher = cp312_launcher(&root);
@@ -10367,16 +10642,17 @@ exit 1
                             .exists(),
                         "{shape}: the old venv was not cleared"
                     );
+                    assert!(install_root.join("pyvenv.cfg").is_file(), "{shape}");
                     assert!(venv_python_path(&install_root).is_file(), "{shape}");
                 }
-                Refused => {
-                    assert!(result.is_err(), "{shape}: rebuilt a folder it does not own");
+                Refused | Reused => {
+                    assert_eq!(result.is_ok(), expected == Reused, "{shape}: {result:?}");
                     assert_eq!(
                         tree_snapshot(&install_root),
                         before,
-                        "{shape}: a refusal changed the folder"
+                        "{shape}: the folder changed"
                     );
-                    assert!(!uv_log.exists(), "{shape}");
+                    assert!(!uv_log.exists(), "{shape}: uv ran");
                 }
             }
             fs::remove_dir_all(root).ok();

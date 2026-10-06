@@ -677,10 +677,10 @@ rocm install sdk --devel")]
         format: InstallFormat,
         /// Full folder path where the ROCm Python environment should be created.
         ///
-        /// Use an empty folder or one ROCm CLI created. In a folder that is
-        /// not empty, ROCm CLI reuses a working environment, or rebuilds only
-        /// its venv files if it can show it created the folder; any other
-        /// non-empty folder is refused with nothing changed.
+        /// Use an empty folder or one where a ROCm CLI install finished. In a
+        /// folder that is not empty, ROCm CLI reuses a working environment, or
+        /// rebuilds only its venv files if a ROCm CLI install was recorded
+        /// there; any other non-empty folder is refused with nothing changed.
         #[arg(long)]
         prefix: Option<std::path::PathBuf>,
         /// Exact TheRock package version to install.

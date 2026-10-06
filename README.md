@@ -398,19 +398,21 @@ version. An upgrade or downgrade keeps the previous install on disk. Only a
 same-version reinstall reuses the same root.
 
 `--prefix` changes this. The folder you name is used as-is for every version, so
-successive installs into one prefix replace each other in place. A venv that
-runs and matches is reused. Otherwise, a folder that is missing or empty gets a
-new venv, and a folder with anything in it is used only if ROCm CLI can show it
-created it: the `.rocm-cli-runtime.json` a wheel install writes, naming that
-folder, or a place inside ROCm CLI's own managed runtimes folder. ROCm CLI then
-removes only the venv's own files (`pyvenv.cfg`, `CACHEDIR.TAG`,
-`bin`/`Scripts`, `lib`/`Lib`, `lib64`, `include`/`Include`), keeps everything
-else in the folder, such as ComfyUI's models, workflows, and outputs under
-`apps/comfyui`, and prints what it kept. If that clearing stops part-way, the
-next install finishes it the same way. Any other non-empty folder, or one in a
-protected system location, is refused with nothing changed; choose an empty
-folder, or one ROCm CLI created, instead. `--dry-run` reports which of these
-will happen.
+successive installs into one prefix replace each other in place. A venv is
+reused when its `pyvenv.cfg` is there and its Python runs as that venv with the
+required version. Otherwise, a folder that is missing or empty gets a new venv,
+and a folder with anything in it is used only if ROCm CLI can show a ROCm CLI
+install was made there: the `.rocm-cli-runtime.json` a finished wheel install
+writes, naming that folder, or a place inside ROCm CLI's own managed runtimes
+folder. ROCm CLI then removes only the venv's own files (`bin`/`Scripts`,
+`lib`/`Lib`, `lib64`, `include`/`Include`, `CACHEDIR.TAG`, `pyvenv.cfg`),
+keeps everything else in the folder, such as ComfyUI's models, workflows, and
+outputs under `apps/comfyui`, and prints what it kept. If that clearing stops
+part-way, the next install sees an incomplete venv and clears it again. Any
+other non-empty folder, or one in a protected system location, is refused with
+nothing changed; choose an empty folder, or one where a ROCm CLI install
+finished, instead. `--dry-run` reports which of these will happen, and prints
+`command: none` for a folder the install would refuse.
 
 ROCm CLI never runs `uv venv` over a folder that has anything in it without
 `--allow-existing`, and sets `UV_VENV_CLEAR=0` for that command, so neither

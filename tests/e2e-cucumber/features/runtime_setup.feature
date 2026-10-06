@@ -377,8 +377,8 @@ Feature: Runtime configuration
   # home folder whose `~/bin/python` fails `--version`. The install now refuses
   # a folder ROCm CLI cannot show it created, and the second half takes the
   # refusal's own advice to prove it is a way forward, not a dead end. The
-  # `--dry-run` preview comes first and has to predict that refusal, not show a
-  # command that will not run.
+  # `--dry-run` preview comes first: it has to predict that refusal and print
+  # `command: none`, since the install will run no command.
   #
   # No GPU or network: the index is a loopback fixture, and the install pins
   # ROCm 10 with an exact arch, the one path whose device payload comes from the
