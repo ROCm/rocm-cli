@@ -3919,6 +3919,17 @@ fn managed_engine_startup_failure_args() -> Vec<String> {
 /// its pid is merely stale, which the liveness refresh would eventually clean
 /// up; retiring it here is what makes the outcome immediate and identical on
 /// both paths.
+///
+/// `"failed"` is also a status `rocmd` acts on, and that is intended: a failed
+/// launch *is* a failure. Its `server-recover` watcher is off until a user
+/// enables it, and enabled in its default `contained` mode it restarts any
+/// managed record whose status is `"failed"` — a launch retired here becomes
+/// eligible on its next tick (subject to the watcher's backoff), where the
+/// pid-0 `"starting"` record it replaces was eligible only after the 5-minute
+/// stale-`"starting"` window. Two consequences follow. A failed *restart* is
+/// restarted again rather than left down. And that recovery can race a user's
+/// own retry: `rocm serve` for the same engine + model mints a new service id,
+/// so both may try to bind the same port, and one of them loses.
 fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
     record.status = "failed".to_owned();
     record.write()
