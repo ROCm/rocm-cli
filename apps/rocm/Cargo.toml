@@ -65,6 +65,6 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0
 # is exactly the input a hand-picked example misses. Same version and features
 # as rocm-core's, so no new crate or feature enters the lockfile.
-# Test-only, so it adds nothing to any shipped binary. Also drives the
-# recursive-deletion property tests (`deletion_properties`).
+# Test-only, so it adds nothing to any shipped binary.
+# Also used for the recursive-deletion paths in deletion_properties.
 proptest = { version = "1", default-features = false, features = ["std"] }
