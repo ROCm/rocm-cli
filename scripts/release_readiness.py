@@ -47,9 +47,10 @@ LINUX_EXECUTABLES = (
     "bin/rocmd",
     "install.sh",
 )
+SIGNING_PUBLIC_KEY_PATH_ENV = "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH"
 SIGNING_PUBLIC_KEY_ENV = "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
 PRODUCTION_TRUST_ENV_NAMES = (
-    "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
+    SIGNING_PUBLIC_KEY_PATH_ENV,
     SIGNING_PUBLIC_KEY_ENV,
     "ROCM_CLI_METADATA_PUBLIC_KEY_PATH",
     "ROCM_CLI_METADATA_PUBLIC_KEY_PEM",
@@ -466,6 +467,12 @@ def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
     ``ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`` itself, so no temporary key file has to
     be materialized here.
 
+    A key file path is preferred over the inline PEM, matching how `install.sh`
+    and `cargo xtask package` resolve their signing keys. A path that does not
+    exist is an error from `verify_signature`, not a reason to fall through to
+    the next source: silently verifying against a different key than the
+    operator named is the failure mode this gate exists to prevent.
+
     Raises when no key resolves. That is the point of this function: GitHub
     expands an unset secret to the empty string, so a missing key is
     indistinguishable from a deliberately absent one. Verification has to fail
@@ -474,11 +481,14 @@ def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
     """
     if explicit is not None:
         return explicit, f"--public-key {explicit}"
+    if (path := env_path(SIGNING_PUBLIC_KEY_PATH_ENV)) is not None:
+        return path, f"${SIGNING_PUBLIC_KEY_PATH_ENV} ({path})"
     if env_text(SIGNING_PUBLIC_KEY_ENV) is not None:
         return None, f"${SIGNING_PUBLIC_KEY_ENV}"
     raise ReadinessError(
         "signature verification requires a release signing public key: pass "
-        f"--public-key or set {SIGNING_PUBLIC_KEY_ENV}"
+        f"--public-key or set {SIGNING_PUBLIC_KEY_PATH_ENV} or "
+        f"{SIGNING_PUBLIC_KEY_ENV}"
     )
 
 
@@ -939,7 +949,7 @@ def run_self_test(root: Path) -> None:
         expect_failure(
             "signature verification with no resolvable key",
             lambda: run_with_env(
-                {SIGNING_PUBLIC_KEY_ENV: None},
+                {SIGNING_PUBLIC_KEY_ENV: None, SIGNING_PUBLIC_KEY_PATH_ENV: None},
                 lambda: resolve_signing_key(None),
             ),
         )
@@ -949,13 +959,14 @@ def run_self_test(root: Path) -> None:
         expect_failure(
             "signature verification with an empty key",
             lambda: run_with_env(
-                {SIGNING_PUBLIC_KEY_ENV: ""},
+                {SIGNING_PUBLIC_KEY_ENV: "", SIGNING_PUBLIC_KEY_PATH_ENV: ""},
                 lambda: resolve_signing_key(None),
             ),
         )
 
+        inline_pem = "-----BEGIN PUBLIC KEY-----\nself-test\n"
         env_key, env_source = run_with_env(
-            {SIGNING_PUBLIC_KEY_ENV: "-----BEGIN PUBLIC KEY-----\nself-test\n"},
+            {SIGNING_PUBLIC_KEY_ENV: inline_pem, SIGNING_PUBLIC_KEY_PATH_ENV: None},
             lambda: resolve_signing_key(None),
         )
         if env_key is not None or SIGNING_PUBLIC_KEY_ENV not in env_source:
@@ -963,9 +974,25 @@ def run_self_test(root: Path) -> None:
                 f"expected the environment key to resolve, got {env_source}"
             )
 
+        # A key file the operator named must be used, not passed over in favour of
+        # the inline PEM — and never ignored in favour of failing, which would tell
+        # them to configure a key they had already configured.
+        key_path = root / "configured-public-key.pem"
+        path_key, path_source = run_with_env(
+            {SIGNING_PUBLIC_KEY_ENV: inline_pem, SIGNING_PUBLIC_KEY_PATH_ENV: key_path},
+            lambda: resolve_signing_key(None),
+        )
+        if path_key != key_path or SIGNING_PUBLIC_KEY_PATH_ENV not in path_source:
+            raise ReadinessError(
+                f"expected the key path to win over the inline PEM, got {path_source}"
+            )
+
         explicit = root / "explicit-public-key.pem"
         explicit_key, explicit_source = run_with_env(
-            {SIGNING_PUBLIC_KEY_ENV: "-----BEGIN PUBLIC KEY-----\nself-test\n"},
+            {
+                SIGNING_PUBLIC_KEY_ENV: inline_pem,
+                SIGNING_PUBLIC_KEY_PATH_ENV: key_path,
+            },
             lambda: resolve_signing_key(explicit),
         )
         if explicit_key != explicit or str(explicit) not in explicit_source:
@@ -999,7 +1026,7 @@ def parse_args() -> argparse.Namespace:
         "--public-key",
         type=Path,
         help="Verify detached signatures with this public key instead of the one "
-        f"in {SIGNING_PUBLIC_KEY_ENV}.",
+        f"named by {SIGNING_PUBLIC_KEY_PATH_ENV} or {SIGNING_PUBLIC_KEY_ENV}.",
     )
     parser.add_argument(
         "--require-production-trust",

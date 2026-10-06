@@ -53,9 +53,11 @@ the archive being published.
 `--require-signatures` requires signatures that *verify*, not merely exist: each
 archive must have a non-empty `.sig` sidecar, and that signature must check out
 against the release signing public key via `cargo xtask verify`. The key is
-taken from `--public-key` when given, otherwise from the inline
+taken from `--public-key` when given, then from the key file named by
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, then from the inline
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
-signing-key secret. If neither resolves, the gate fails. It deliberately does
+signing-key secret — the same path-before-PEM order `install.sh` and
+`cargo xtask package` use. If none resolves, the gate fails. It deliberately does
 not fall back to checking that a `.sig` file is present: a sidecar produced by
 the wrong key, truncated, or corrupted would pass such a check, and because an
 unset GitHub secret expands to the empty string, the fallback would be reached
