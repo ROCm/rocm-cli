@@ -120,14 +120,20 @@ mod tests {
     /// enters and the test body only ever NAMES the type. It carries no `(`
     /// because constructing a unit struct has none, so a plain substring match
     /// would also flag `UnsetKeyOnExitHelper`, `MyUnsetKeyOnExit` and
-    /// `Option<UnsetKeyOnExit>`. A bare name therefore only counts as a whole
-    /// identifier in a position where a value of it is built or reached:
-    /// followed by `;`, `(`, `{` or `::`. That flags `let _g = UnsetKeyOnExit;`
-    /// and rejects all three shapes above — a type mention in `Option<..>` or a
-    /// signature holds nothing. The definition and `impl Drop for .. {` also
-    /// match the rule, but sit outside any test body, where the scan does not
-    /// look. Both directions are pinned by
-    /// [`a_bare_type_entry_matches_only_a_whole_constructed_name`] and
+    /// `Option<UnsetKeyOnExit>`. A bare name therefore counts as any whole
+    /// identifier EXCEPT in a type position: right after `<`, right after a
+    /// type-ascription `:` (not `::`), or right before `>`, blanks between
+    /// ignored. That flags every way a value of it is built — `let _g =
+    /// UnsetKeyOnExit;`, `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`,
+    /// `vec![UnsetKeyOnExit]`, a tuple of them, `g = Some(UnsetKeyOnExit);` —
+    /// and rejects the longer and prefixed names, `Option<..>`/`Vec<..>`
+    /// arguments and `_x: UnsetKeyOnExit` signatures, none of which holds
+    /// anything. It is a deny-list of type positions because a miss here is an
+    /// unguarded mutation, whereas an over-report (say, a `-> UnsetKeyOnExit`
+    /// return type inside a test body) is visible and rewordable. The
+    /// definition and `impl Drop for .. {` also match, but sit outside any test
+    /// body, where the scan does not look. Both directions are pinned by
+    /// [`a_bare_type_entry_matches_a_whole_name_outside_type_positions`] and
     /// [`holding_a_mutating_guard_still_needs_the_lock`].
     const MUTATIONS: [&str; 4] = [
         "set_var(",
@@ -225,9 +231,8 @@ mod tests {
     /// The leftmost [`MUTATIONS`] entry on `line`, with its column.
     ///
     /// An entry ending in `(` is a call and is matched as text. A bare type
-    /// name is matched only as a whole identifier that a value is built or
-    /// reached from — the next non-blank character is `;`, `(`, `{` or `::` —
-    /// for the reasons given on [`MUTATIONS`].
+    /// name is matched by [`names_a_value`], for the reasons given on
+    /// [`MUTATIONS`].
     fn mutation_column(line: &str) -> Option<(usize, &'static str)> {
         MUTATIONS
             .iter()
@@ -235,19 +240,36 @@ mod tests {
                 let at = if needle.ends_with('(') {
                     line.find(needle)
                 } else {
-                    line.match_indices(needle).map(|(at, _)| at).find(|&at| {
-                        let starts_word = line[..at]
-                            .chars()
-                            .next_back()
-                            .is_none_or(|c| !is_identifier_char(c));
-                        let after = line[at + needle.len()..].trim_start();
-                        starts_word
-                            && (after.starts_with([';', '(', '{']) || after.starts_with("::"))
-                    })
+                    line.match_indices(needle)
+                        .map(|(at, _)| at)
+                        .find(|&at| names_a_value(line, at, needle.len()))
                 };
                 at.map(|at| (at, *needle))
             })
             .min()
+    }
+
+    /// Whether the `len`-byte identifier at `line[at..]` can stand for a value.
+    ///
+    /// It must be a whole identifier, and it must not sit in one of the three
+    /// TYPE positions: right after `<` (`Option<T>`), right after a type
+    /// ascription `:` that is not half of a `::` path separator
+    /// (`fn f(_x: T)`, `let g: T`), or right before `>` (`Vec<T>`,
+    /// `HashMap<K, T>`). Blanks between the name and that neighbour are
+    /// skipped, so rustfmt-hostile spellings like `Option< T >` and `_x : T`
+    /// are type positions too. Everything else counts — a deny-list of type
+    /// positions rather than an allow-list of value positions, because a value
+    /// of a unit struct can be built in more places than any allow-list will
+    /// name: `drop(T)`, `Some(T)`, `vec![T]`, `(T, T)`, `mem::forget(T)`,
+    /// `g = Some(T);`. A missed construction is an unguarded mutation; an
+    /// over-report is a type mention the author can see and reword.
+    fn names_a_value(line: &str, at: usize, len: usize) -> bool {
+        let before = line[..at].trim_end();
+        let after = line[at + len..].trim_start();
+        let whole = !line[..at].ends_with(is_identifier_char)
+            && !line[at + len..].starts_with(is_identifier_char);
+        let ascribed = before.ends_with(':') && !before.ends_with("::");
+        whole && !before.ends_with('<') && !ascribed && !after.starts_with('>')
     }
 
     /// The rest of the statement beginning at `lines[index]`.
@@ -905,20 +927,48 @@ mod tests {
         );
     }
 
-    /// A bare type entry is a whole identifier that a value is built from,
-    /// not a substring.
+    /// A bare type entry is a whole identifier outside a type position, not a
+    /// substring and not an allow-list of construction shapes.
     ///
-    /// Each shape defeats one half of the rule on its own: the longer name
-    /// fails the check after the match, the prefixed one fails the check
-    /// before it (it is followed by `;`, so only the leading boundary rejects
-    /// it), and the generic argument is a whole identifier that names the type
-    /// without building a value of it.
+    /// The flagged half are all ways to build a value of the unit struct, and
+    /// each one was missed by the earlier rule that required the next
+    /// character to be `;`, `(`, `{` or `::`. The reassignment is the shape
+    /// that rule hid on BOTH of its lines: the declaration is a type mention,
+    /// and the construction is followed by `)`.
+    ///
+    /// In the other half, each shape defeats one part of the rule on its own:
+    /// the longer name fails the boundary after the match, the prefixed one
+    /// fails the boundary before it, and the rest are whole identifiers in a
+    /// type position — after `<`, before `>`, after an ascription `:` — with
+    /// blanks around them for the spellings rustfmt would normalise away. The
+    /// first and last generic arguments of a multi-argument type sit next to
+    /// only ONE angle bracket, which is what makes each of the `<` and `>`
+    /// carve-outs necessary on its own: `Vec<..>` alone is caught by either.
     #[test]
-    fn a_bare_type_entry_matches_only_a_whole_constructed_name() {
+    fn a_bare_type_entry_matches_a_whole_name_outside_type_positions() {
+        for line in [
+            "drop(UnsetKeyOnExit);",
+            "let _s = Some(UnsetKeyOnExit);",
+            "let _v = vec![UnsetKeyOnExit];",
+            "let _t = (UnsetKeyOnExit, UnsetKeyOnExit);",
+            "std::mem::forget(UnsetKeyOnExit);",
+            "let _p = test_env::UnsetKeyOnExit;",
+            "let mut g: Option<UnsetKeyOnExit> = None;\n        g = Some(UnsetKeyOnExit);",
+        ] {
+            let hits = env_mutations_in_unserialized_tests(&unguarded_test(line));
+            assert_eq!(hits.len(), 1, "`{line}` builds the guard: {hits:?}");
+            assert_eq!(hits[0].call, "UnsetKeyOnExit");
+        }
         for line in [
             "let _h = UnsetKeyOnExitHelper;",
             "let _m = MyUnsetKeyOnExit;",
             "let _o: Option<UnsetKeyOnExit> = None;",
+            "let _o: Option< UnsetKeyOnExit > = None;",
+            "let _v: Vec<UnsetKeyOnExit> = Vec::new();",
+            "let _r: Result<UnsetKeyOnExit, ()> = Err(());",
+            "let _m: BTreeMap<u8, UnsetKeyOnExit> = BTreeMap::new();",
+            "fn f(_x: UnsetKeyOnExit) {}",
+            "fn f(_x : UnsetKeyOnExit) {}",
         ] {
             let hits = env_mutations_in_unserialized_tests(&unguarded_test(line));
             assert!(hits.is_empty(), "`{line}` holds no such guard: {hits:?}");

@@ -111,9 +111,12 @@ all of which the scan reports nothing for:
   helper to that list, or it is outside the guard. A guard type whose `Drop`
   mutates the environment needs its type name listed too, as `UnsetKeyOnExit`
   is, because the test only ever names the type and never calls a `::new(`.
-  A bare name in that list is matched as a whole identifier followed by `;`,
-  `(`, `{` or `::`, so holding one (`let _g = UnsetKeyOnExit;`) is flagged
-  while a longer name or a type mention such as `Option<UnsetKeyOnExit>` is not.
+  A bare name in that list is matched as any whole identifier except in a type
+  position — right after `<`, right after a type-ascription `:` (not `::`), or
+  right before `>` — so every construction (`let _g = UnsetKeyOnExit;`,
+  `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`, `vec![UnsetKeyOnExit]`) is
+  flagged, while a longer name, `Option<UnsetKeyOnExit>` or a parameter typed
+  `_x: UnsetKeyOnExit` is not.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
