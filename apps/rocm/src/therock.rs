@@ -2742,10 +2742,12 @@ fn refuse_non_interactive_message(relation: &str) -> String {
 ///
 /// `--prefix` is the exception and the prompt does not claim otherwise:
 /// `resolved_install_root` uses the given folder verbatim for every version, so
-/// a second install into one prefix does replace the first in place (and
-/// `ensure_uv_venv` will `remove_dir_all` it outright if the existing venv's
-/// python no longer answers `--version`). The gate is unchanged either way —
-/// what is being consented to is the change of active default, not a deletion.
+/// a second install into one prefix does replace the first in place (and if
+/// the existing venv's python no longer answers `--version`, `ensure_uv_venv`
+/// rebuilds the venv's own files, and only when ROCm CLI can show it created
+/// that venv; see `clear_owned_venv_for_rebuild`). The gate is unchanged either
+/// way — what is being consented to is the change of active default, not a
+/// deletion.
 fn confirm_overwrite_existing_sdk(
     channel: TheRockChannel,
     family: &str,
@@ -4872,6 +4874,7 @@ fn ensure_uv_venv(
     install_root: &Path,
 ) -> Result<()> {
     let env_python = venv_python_path(install_root);
+    let mut rebuilding = false;
     if env_python.is_file() {
         let reusable = run_command(
             &env_python,
@@ -4890,24 +4893,30 @@ fn ensure_uv_venv(
         // resolved version/build date, not on the interpreter), so an existing
         // venv left over from a lower-tag requirement must not be mistaken for
         // a compatible one just because it still runs.
-        progress_line(
-            "Existing Python environment does not match the required interpreter; recreating it.",
-        );
-        fs::remove_dir_all(install_root).with_context(|| {
-            format!(
-                "failed to remove incompatible Python environment at {}",
-                install_root.display()
-            )
-        })?;
+        //
+        // The folder itself is never deleted: with `--prefix` it is whatever
+        // the user named, and even a runtime ROCm CLI created holds data that
+        // is not the venv's (ComfyUI keeps its models, workflows and outputs
+        // under `<install_root>/apps/comfyui`). Only the venv's own parts go.
+        let kept = clear_owned_venv_for_rebuild(paths, install_root)?;
+        progress_line(venv_rebuild_line(install_root, &kept));
+        rebuilding = true;
     }
-    let args = uv_venv_args(python_launcher, install_root);
+    let mut args = uv_venv_args(python_launcher, install_root);
+    if rebuilding {
+        // What is left after clearing is not a venv any more, so uv would
+        // refuse it as "a directory already exists". `--allow-existing`
+        // writes the new venv beside it; `--clear` would instead delete the
+        // whole folder, which is exactly what the clearing step avoids.
+        args.push("--allow-existing".to_owned());
+    }
     run_command_with_env(
         uv,
         args.iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
             .as_slice(),
-        &uv_command_env(paths),
+        &uv_venv_command_env(paths),
         "create managed TheRock runtime virtual environment",
     )?;
     if !env_python.is_file() {
@@ -4917,6 +4926,224 @@ fn ensure_uv_venv(
         );
     }
     Ok(())
+}
+
+/// The environment for `uv venv` into an install root.
+///
+/// `UV_VENV_CLEAR=1` inherited from the user's shell makes uv delete an
+/// existing folder before creating the venv, which is the `--clear` this
+/// function's caller deliberately does not pass: the folder may be a `--prefix`
+/// the user named, holding their own files. Pinning it off keeps that decision
+/// here instead of in whatever the shell happened to export.
+fn uv_venv_command_env(paths: &AppPaths) -> Vec<(String, String)> {
+    let mut env = uv_command_env(paths);
+    env.push(("UV_VENV_CLEAR".to_owned(), "0".to_owned()));
+    env
+}
+
+/// The entries a Python virtual environment is made of, as `uv venv` and
+/// `python -m venv` lay one out on Linux (`bin`, `lib`, `lib64`, `include`) and
+/// Windows (`Scripts`, `Lib`, `Include`). Clearing these and nothing else is
+/// what lets a broken venv be rebuilt without taking the rest of its folder.
+///
+/// `share` is deliberately absent: packages install data there, but so can a
+/// person, and nothing distinguishes the two. A stale `share` costs nothing,
+/// because the reinstall that follows overwrites what it needs.
+const VENV_OWNED_ENTRIES: &[&str] = &[
+    "bin",
+    "Scripts",
+    "lib",
+    "lib64",
+    "Lib",
+    "include",
+    "Include",
+    "pyvenv.cfg",
+    "CACHEDIR.TAG",
+];
+
+/// The in-tree runtime manifest `save_runtime_manifest` writes beside every
+/// install. Only the fields ownership needs: an older manifest that no longer
+/// deserializes as a full [`InstalledRuntimeManifest`] still proves who made
+/// the folder.
+#[derive(Debug, Deserialize)]
+struct RuntimeOwnershipMarker {
+    runtime_key: String,
+    install_root: PathBuf,
+}
+
+/// What a folder's own contents say about whether ROCm CLI made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkerFinding {
+    Missing,
+    Unreadable,
+    NamesOtherFolder(PathBuf),
+    Matches,
+}
+
+/// Clear a venv ROCm CLI owns so `uv venv` can rebuild it, keeping everything
+/// in its folder that is not part of the venv. Returns the names that were kept.
+///
+/// Refuses, changing nothing, unless the folder is somewhere ROCm CLI may
+/// delete from AND it can show the venv is its own:
+///
+/// 1. not a protected system location, by its given spelling or by where it
+///    really resolves (`rocm_core::runtime_install_root_is_protected`); and
+/// 2. it has `pyvenv.cfg`, so it is a venv at all, and either ROCm CLI's
+///    in-tree runtime manifest naming this very folder, or it sits inside
+///    ROCm CLI's own managed runtimes folder. The second case covers an
+///    install that failed after creating the venv but before writing its
+///    manifest: nobody else puts a venv there.
+///
+/// A `--prefix` folder is used verbatim, so without these checks a home
+/// directory whose `~/bin/python` fails `--version` was deleted whole.
+fn clear_owned_venv_for_rebuild(paths: &AppPaths, install_root: &Path) -> Result<Vec<String>> {
+    refuse_protected_venv_rebuild(install_root)?;
+
+    let has_pyvenv_cfg = install_root.join("pyvenv.cfg").is_file();
+    let marker = runtime_ownership_marker_finding(install_root);
+    let in_managed_root = install_root_is_in_managed_wheel_root(paths, install_root);
+    let owned = has_pyvenv_cfg && (marker == MarkerFinding::Matches || in_managed_root);
+    if !owned {
+        bail!(unowned_venv_rebuild_refusal(
+            install_root,
+            has_pyvenv_cfg,
+            &marker,
+            in_managed_root
+        ));
+    }
+
+    for name in VENV_OWNED_ENTRIES {
+        remove_venv_entry(&install_root.join(name))?;
+    }
+    let mut kept = fs::read_dir(install_root)
+        .with_context(|| format!("failed to read {}", install_root.display()))?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<io::Result<Vec<_>>>()
+        .with_context(|| format!("failed to read {}", install_root.display()))?;
+    kept.sort();
+    Ok(kept)
+}
+
+/// The protected-location half of [`clear_owned_venv_for_rebuild`], checked on
+/// the path as given and again on where it really resolves: a link inside the
+/// home folder can point into `/usr`, and the lexical check alone answers for
+/// the link, not for what a delete would reach.
+fn refuse_protected_venv_rebuild(install_root: &Path) -> Result<()> {
+    let resolved = install_root.canonicalize().ok();
+    let protected = std::iter::once(install_root)
+        .chain(resolved.as_deref())
+        .find(|candidate| rocm_core::runtime_install_root_is_protected(candidate));
+    if let Some(protected) = protected {
+        bail!(
+            "refusing to rebuild the Python environment at {}: {} is a protected system location. Nothing was changed. Choose an empty folder with --prefix instead, for example `rocm install sdk --prefix <empty-folder>`",
+            install_root.display(),
+            protected.display()
+        );
+    }
+    Ok(())
+}
+
+fn runtime_ownership_marker_finding(install_root: &Path) -> MarkerFinding {
+    let path = install_root.join(".rocm-cli-runtime.json");
+    if !path.is_file() {
+        return MarkerFinding::Missing;
+    }
+    let Some(marker) = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<RuntimeOwnershipMarker>(&bytes).ok())
+        .filter(|marker| !marker.runtime_key.trim().is_empty())
+    else {
+        return MarkerFinding::Unreadable;
+    };
+    let recorded = normalize_manifest_path(marker.install_root);
+    if paths_name_same_folder(&recorded, install_root) {
+        MarkerFinding::Matches
+    } else {
+        MarkerFinding::NamesOtherFolder(recorded)
+    }
+}
+
+fn paths_name_same_folder(left: &Path, right: &Path) -> bool {
+    if rocm_core::runtime_paths_equivalent(left, right) {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => rocm_core::runtime_paths_equivalent(&left, &right),
+        _ => false,
+    }
+}
+
+/// Strictly inside `<data_dir>/runtimes/wheel`, where every folder is one
+/// `install sdk` made for itself.
+fn install_root_is_in_managed_wheel_root(paths: &AppPaths, install_root: &Path) -> bool {
+    let managed =
+        rocm_core::resolve_path_through_symlinks(&paths.data_dir.join("runtimes").join("wheel"));
+    let root = rocm_core::resolve_path_through_symlinks(install_root);
+    rocm_core::runtime_path_is_same_or_inside(&root, &managed)
+        && !rocm_core::runtime_paths_equivalent(&root, &managed)
+}
+
+fn unowned_venv_rebuild_refusal(
+    install_root: &Path,
+    has_pyvenv_cfg: bool,
+    marker: &MarkerFinding,
+    in_managed_root: bool,
+) -> String {
+    let mut found = vec![format!(
+        "a Python at {} that does not run or does not match",
+        venv_python_path(install_root).display()
+    )];
+    if !has_pyvenv_cfg {
+        found.push("no pyvenv.cfg, so it is not a Python virtual environment".to_owned());
+    }
+    match marker {
+        MarkerFinding::Missing if !in_managed_root => {
+            found.push("no .rocm-cli-runtime.json from a ROCm CLI install".to_owned());
+        }
+        MarkerFinding::Unreadable if !in_managed_root => {
+            found.push("a .rocm-cli-runtime.json ROCm CLI cannot read".to_owned());
+        }
+        MarkerFinding::NamesOtherFolder(other) if !in_managed_root => found.push(format!(
+            "a .rocm-cli-runtime.json that belongs to {}",
+            other.display()
+        )),
+        _ => {}
+    }
+    format!(
+        "refusing to rebuild the Python environment at {}: ROCm CLI cannot show it created this folder (found {}), and rebuilding would delete what is in it. Nothing was changed. Choose an empty folder, or one ROCm CLI created, with --prefix, for example `rocm install sdk --prefix <empty-folder>`",
+        install_root.display(),
+        found.join("; ")
+    )
+}
+
+/// Remove one venv entry without following a link out of the folder: `lib64`
+/// is a symlink to `lib` in a uv venv, and a link must go, not its target.
+fn remove_venv_entry(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    let result = if metadata.file_type().is_symlink() {
+        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    result.with_context(|| format!("failed to remove {}", path.display()))
+}
+
+/// The progress line for a rebuild, from the same list the rebuild returned,
+/// so what it says was kept is what is still on disk.
+fn venv_rebuild_line(install_root: &Path, kept: &[String]) -> String {
+    let kept = if kept.is_empty() {
+        "nothing else was in the folder".to_owned()
+    } else {
+        format!("kept: {}", kept.join(", "))
+    };
+    format!(
+        "Existing Python environment at {} no longer runs or does not match the required interpreter; rebuilding only its venv files ({kept}).",
+        install_root.display()
+    )
 }
 
 fn python_venv_args(install_root: &Path) -> Vec<String> {
@@ -9270,6 +9497,9 @@ exit 1
         let stale_bin = install_root.join("bin");
         fs::create_dir_all(&stale_bin).unwrap();
         write_fake_python_reporting(&stale_bin, "python", "cp312", "Python 3.12.10").unwrap();
+        // A venv a previous `install sdk` made: rebuilding is only allowed on
+        // one ROCm CLI can show it created.
+        plant_rocm_owned_venv_markers(&install_root);
 
         let python_launcher =
             write_fake_python_reporting(&root, "python3.14", "cp314", "Python 3.14.5").unwrap();
@@ -9285,6 +9515,496 @@ exit 1
         );
 
         fs::remove_dir_all(root).ok();
+    }
+
+    // ── ensure_uv_venv: rebuilding a broken venv (#533) ─────────────
+    //
+    // Every case plants a `bin/python` that fails `--version`, the trigger for
+    // the rebuild, and a sentinel file beside the install root. The oracle is
+    // the filesystem: a refusal must leave the tree byte-for-byte as it was,
+    // and a rebuild must leave everything that is not part of the venv.
+
+    /// A canonical sandbox with `AppPaths` inside it and a sentinel file
+    /// outside every install root the test will use.
+    #[cfg(unix)]
+    fn venv_rebuild_sandbox(label: &str) -> (PathBuf, AppPaths) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-venv-rebuild-{label}-{}-{}-{}",
+            std::process::id(),
+            unix_time_millis(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("cache")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("sentinel"), b"outside every install root").unwrap();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        (root, paths)
+    }
+
+    #[cfg(unix)]
+    fn plant_failing_venv_python(install_root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let python = venv_python_path(install_root);
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// What `uv venv` and `save_runtime_manifest` leave in a runtime ROCm CLI
+    /// installed: `pyvenv.cfg` plus the in-tree runtime manifest naming the
+    /// folder it sits in.
+    #[cfg(unix)]
+    fn plant_rocm_owned_venv_markers(install_root: &Path) {
+        fs::create_dir_all(install_root).unwrap();
+        fs::write(install_root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        write_runtime_marker(install_root, install_root);
+    }
+
+    #[cfg(unix)]
+    fn write_runtime_marker(install_root: &Path, recorded_root: &Path) {
+        let marker = serde_json::json!({
+            "runtime_key": "release-wheel-gfx120x-7-10-0",
+            "runtime_id": "therock-release:gfx120X-all",
+            "install_root": recorded_root,
+        });
+        fs::write(
+            install_root.join(".rocm-cli-runtime.json"),
+            serde_json::to_vec_pretty(&marker).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A fake `uv` that records every invocation and, for `venv`, creates a
+    /// working interpreter at `$4` (the env root `uv_venv_args` passes).
+    #[cfg(unix)]
+    fn write_logging_fake_uv(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("uv-calls.log");
+        let path = dir.join("uv");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+echo "UV_VENV_CLEAR=${{UV_VENV_CLEAR-unset}}" >> "{log}"
+if [ "$1" = "venv" ] && [ "$2" = "--python" ]; then
+  /bin/mkdir -p "$4/bin"
+  printf '#!/bin/sh\nif [ "$1" = "-c" ]; then echo cp312; exit 0; fi\necho Python 3.12.10\n' > "$4/bin/python"
+  /bin/chmod +x "$4/bin/python"
+  echo "home = /usr/bin" > "$4/pyvenv.cfg"
+  exit 0
+fi
+exit 1
+"#,
+            log = log.display()
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        (path, log)
+    }
+
+    /// Every entry under `root`, with file contents and link targets, without
+    /// following links: equality before and after is "nothing was changed".
+    #[cfg(unix)]
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let what = if meta.file_type().is_symlink() {
+                format!("link -> {}", fs::read_link(&path).unwrap().display())
+            } else if meta.is_dir() {
+                for entry in fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+                "dir".to_owned()
+            } else {
+                format!("file {:?}", fs::read(&path).unwrap())
+            };
+            out.push((path, what));
+        }
+        out.sort();
+        out
+    }
+
+    #[cfg(unix)]
+    fn cp312_launcher(root: &Path) -> PathBuf {
+        write_fake_python_reporting(root, "python3.12", "cp312", "Python 3.12.10").unwrap()
+    }
+
+    /// The reported case: a home-like folder whose `~/bin/python` fails
+    /// `--version` was deleted whole, then the rebuild failed anyway.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_refuses_to_rebuild_a_folder_rocm_cli_did_not_create() {
+        let (root, paths) = venv_rebuild_sandbox("unowned");
+        let home = root.join("home");
+        plant_failing_venv_python(&home);
+        fs::create_dir_all(home.join("Documents")).unwrap();
+        fs::write(home.join("Documents").join("thesis.txt"), b"years of work").unwrap();
+        fs::write(home.join(".bashrc"), b"export PATH=$HOME/bin:$PATH\n").unwrap();
+        let (uv, uv_log) = write_logging_fake_uv(&root);
+        let launcher = cp312_launcher(&root);
+        let before = tree_snapshot(&root);
+
+        let error = ensure_uv_venv(&paths, &uv, &launcher, &home)
+            .expect_err("a folder ROCm CLI did not create must not be rebuilt")
+            .to_string();
+
+        assert_eq!(
+            tree_snapshot(&root),
+            before,
+            "a refusal must change nothing"
+        );
+        assert!(!uv_log.exists(), "uv must not run after a refusal");
+        assert!(error.contains(&home.display().to_string()), "{error}");
+        assert!(error.contains("no pyvenv.cfg"), "{error}");
+        assert!(error.contains("no .rocm-cli-runtime.json"), "{error}");
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(
+            error.contains("rocm install sdk --prefix <empty-folder>"),
+            "{error}"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The refusal tells the user to choose an empty folder, or one ROCm CLI
+    /// created. Both must then actually get past it, or the advice is a dead
+    /// end; and taking it must not touch the folder that was refused.
+    #[test]
+    #[cfg(unix)]
+    fn following_the_refusal_advice_gets_past_it() {
+        let (root, paths) = venv_rebuild_sandbox("advice");
+        let refused = root.join("home");
+        plant_failing_venv_python(&refused);
+        fs::write(refused.join("notes.txt"), b"mine").unwrap();
+        let (uv, uv_log) = write_logging_fake_uv(&root);
+        let launcher = cp312_launcher(&root);
+        let error = ensure_uv_venv(&paths, &uv, &launcher, &refused)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Choose an empty folder, or one ROCm CLI created"));
+        let refused_before = tree_snapshot(&refused);
+
+        let empty = root.join("empty-folder");
+        fs::create_dir_all(&empty).unwrap();
+        ensure_uv_venv(&paths, &uv, &launcher, &empty)
+            .expect("an empty folder is what the refusal recommends");
+        assert!(venv_python_path(&empty).is_file());
+        // A fresh venv into a folder that exists is where an inherited
+        // UV_VENV_CLEAR=1 would make uv delete the folder first.
+        assert!(
+            fs::read_to_string(&uv_log)
+                .unwrap()
+                .lines()
+                .any(|line| line == "UV_VENV_CLEAR=0"),
+            "uv venv must run with UV_VENV_CLEAR pinned off"
+        );
+
+        let created = root.join("created-by-rocm-cli");
+        plant_failing_venv_python(&created);
+        plant_rocm_owned_venv_markers(&created);
+        ensure_uv_venv(&paths, &uv, &launcher, &created)
+            .expect("a folder ROCm CLI created is what the refusal recommends");
+        assert!(venv_python_path(&created).is_file());
+
+        assert_eq!(tree_snapshot(&refused), refused_before);
+        assert!(root.join("sentinel").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// ComfyUI keeps the user's models, workflows and outputs under
+    /// `<install_root>/apps/comfyui`, so even a runtime ROCm CLI made carries
+    /// user data. A rebuild replaces the venv's files and nothing else, and
+    /// the line it prints names what it kept — checked against the disk.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_rebuilds_an_owned_venv_in_place_and_keeps_comfyui_data() {
+        let (root, paths) = venv_rebuild_sandbox("owned");
+        let install_root = root.join("prefix");
+        plant_failing_venv_python(&install_root);
+        plant_rocm_owned_venv_markers(&install_root);
+        let site = install_root
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages");
+        fs::create_dir_all(&site).unwrap();
+        fs::write(site.join("stale.py"), b"old").unwrap();
+        std::os::unix::fs::symlink("lib", install_root.join("lib64")).unwrap();
+        fs::create_dir_all(install_root.join("include")).unwrap();
+        fs::write(install_root.join("CACHEDIR.TAG"), b"Signature").unwrap();
+        let models = install_root
+            .join("apps")
+            .join("comfyui")
+            .join("source")
+            .join("models");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("x.safetensors"), b"weights").unwrap();
+        let marker_before = fs::read(install_root.join(".rocm-cli-runtime.json")).unwrap();
+        let (uv, uv_log) = write_logging_fake_uv(&root);
+
+        PROGRESS_LINE_SINK.with(|sink| sink.borrow_mut().clear());
+        ensure_uv_venv(&paths, &uv, &cp312_launcher(&root), &install_root)
+            .expect("a venv ROCm CLI created is rebuilt");
+        let printed = PROGRESS_LINE_SINK.with(|sink| sink.borrow().clone());
+
+        assert_eq!(
+            fs::read(models.join("x.safetensors")).unwrap(),
+            b"weights",
+            "ComfyUI data must survive a venv rebuild"
+        );
+        assert_eq!(
+            fs::read(install_root.join(".rocm-cli-runtime.json")).unwrap(),
+            marker_before
+        );
+        assert!(!site.join("stale.py").exists(), "the old venv's files go");
+        assert!(fs::symlink_metadata(install_root.join("lib64")).is_err());
+        assert!(!install_root.join("include").exists());
+        assert!(!install_root.join("CACHEDIR.TAG").exists());
+        assert!(
+            venv_python_path(&install_root).is_file(),
+            "and a new venv is built"
+        );
+        assert!(root.join("sentinel").is_file());
+
+        let calls = fs::read_to_string(&uv_log).unwrap();
+        assert!(
+            calls.lines().any(|line| line.starts_with("venv ")
+                && line.ends_with(" --allow-existing")
+                && !line.contains("--clear")),
+            "the rebuild must not let uv clear the folder: {calls}"
+        );
+        assert!(
+            calls
+                .lines()
+                .all(|line| !line.starts_with("UV_VENV_CLEAR=") || line == "UV_VENV_CLEAR=0"),
+            "uv venv must run with UV_VENV_CLEAR pinned off: {calls}"
+        );
+
+        // The printed line and the disk agree on what was kept.
+        let line = printed
+            .iter()
+            .find(|line| line.contains("rebuilding only its venv files"))
+            .unwrap_or_else(|| panic!("no rebuild line in {printed:?}"));
+        assert!(
+            line.contains("kept: .rocm-cli-runtime.json, apps"),
+            "{line}"
+        );
+        for kept in [".rocm-cli-runtime.json", "apps"] {
+            assert!(install_root.join(kept).exists(), "{kept} was reported kept");
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A venv entry that is a link is unlinked, never followed: `lib64` here
+    /// points out of the folder, and what it points at is not the venv's.
+    #[test]
+    #[cfg(unix)]
+    fn venv_rebuild_unlinks_a_linked_venv_entry_without_following_it() {
+        let (root, paths) = venv_rebuild_sandbox("link");
+        let install_root = root.join("prefix");
+        plant_failing_venv_python(&install_root);
+        plant_rocm_owned_venv_markers(&install_root);
+        let outside = root.join("outside-the-prefix");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"not the venv's").unwrap();
+        std::os::unix::fs::symlink(&outside, install_root.join("lib64")).unwrap();
+        let (uv, _) = write_logging_fake_uv(&root);
+
+        ensure_uv_venv(&paths, &uv, &cp312_launcher(&root), &install_root).unwrap();
+
+        assert!(fs::symlink_metadata(install_root.join("lib64")).is_err());
+        assert_eq!(
+            fs::read(outside.join("keep.txt")).unwrap(),
+            b"not the venv's"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A marker copied from another runtime does not make this folder ROCm
+    /// CLI's: it must name the folder it sits in.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_refuses_a_runtime_marker_that_names_another_folder() {
+        let (root, paths) = venv_rebuild_sandbox("other-marker");
+        let install_root = root.join("prefix");
+        plant_failing_venv_python(&install_root);
+        fs::write(install_root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        write_runtime_marker(&install_root, &root.join("elsewhere"));
+        fs::write(install_root.join("work.txt"), b"mine").unwrap();
+        let (uv, uv_log) = write_logging_fake_uv(&root);
+        let before = tree_snapshot(&install_root);
+
+        let error = ensure_uv_venv(&paths, &uv, &cp312_launcher(&root), &install_root)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(tree_snapshot(&install_root), before);
+        assert!(!uv_log.exists());
+        assert!(error.contains("belongs to"), "{error}");
+        assert!(
+            error.contains(&root.join("elsewhere").display().to_string()),
+            "{error}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The managed runtimes folder is ROCm CLI's own, so a venv there without
+    /// a manifest yet (an install that failed after `uv venv`) is still
+    /// rebuilt rather than stranded.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_uv_venv_rebuilds_a_manifestless_venv_in_the_managed_runtimes_folder() {
+        let (root, paths) = venv_rebuild_sandbox("managed");
+        let install_root = managed_runtime_root(&paths, "wheel", "release-wheel-x");
+        plant_failing_venv_python(&install_root);
+        fs::write(install_root.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let (uv, _) = write_logging_fake_uv(&root);
+
+        ensure_uv_venv(&paths, &uv, &cp312_launcher(&root), &install_root)
+            .expect("a venv in the managed runtimes folder is ROCm CLI's");
+        assert!(venv_python_path(&install_root).is_file());
+
+        // The managed folder itself is not a runtime and is never rebuilt.
+        let wheel_root = paths.data_dir.join("runtimes").join("wheel");
+        assert!(!install_root_is_in_managed_wheel_root(&paths, &wheel_root));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The protected-location check runs before ownership is even looked at,
+    /// on the path as given (it need not exist) and on where it resolves (a
+    /// link in a user folder that points into a system one).
+    #[test]
+    #[cfg(unix)]
+    fn venv_rebuild_refuses_a_protected_location_by_spelling_and_by_resolution() {
+        let (root, paths) = venv_rebuild_sandbox("protected");
+
+        let spelled = Path::new("/usr/share/rocm-cli-venv-rebuild-does-not-exist");
+        let error = clear_owned_venv_for_rebuild(&paths, spelled)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "/usr/share/rocm-cli-venv-rebuild-does-not-exist is a protected system location"
+            ),
+            "{error}"
+        );
+
+        let link = root.join("looks-like-mine");
+        std::os::unix::fs::symlink("/usr/share", &link).unwrap();
+        let error = clear_owned_venv_for_rebuild(&paths, &link)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(": /usr/share is a protected system location"),
+            "{error}"
+        );
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(Path::new("/usr/share").is_dir());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Exhaustive over the shapes a folder can have when the rebuild is
+    /// triggered: whether it is a venv, what its runtime marker says, whether
+    /// it sits in the managed runtimes folder, and what non-venv data is in it.
+    /// The properties: the rebuild happens exactly when the folder is a venv
+    /// ROCm CLI can show is its own; a refusal changes nothing at all; and a
+    /// rebuild keeps every planted entry that is not part of the venv.
+    #[test]
+    #[cfg(unix)]
+    fn venv_rebuild_deletes_only_venv_files_and_only_from_an_owned_venv() {
+        #[derive(Debug, Clone, Copy)]
+        enum Marker {
+            Missing,
+            Garbage,
+            OtherFolder,
+            Matching,
+        }
+        let mut cases = 0;
+        for is_venv in [false, true] {
+            for marker in [
+                Marker::Missing,
+                Marker::Garbage,
+                Marker::OtherFolder,
+                Marker::Matching,
+            ] {
+                for managed in [false, true] {
+                    for data in ["Documents/thesis.txt", "apps/comfyui/source/models/x"] {
+                        cases += 1;
+                        let (root, paths) = venv_rebuild_sandbox("shapes");
+                        let install_root = if managed {
+                            managed_runtime_root(&paths, "wheel", "release-wheel-k")
+                        } else {
+                            root.join("prefix")
+                        };
+                        plant_failing_venv_python(&install_root);
+                        if is_venv {
+                            fs::write(install_root.join("pyvenv.cfg"), "home = /x\n").unwrap();
+                            fs::create_dir_all(install_root.join("lib")).unwrap();
+                        }
+                        match marker {
+                            Marker::Missing => {}
+                            Marker::Garbage => {
+                                fs::write(install_root.join(".rocm-cli-runtime.json"), "{}")
+                                    .unwrap();
+                            }
+                            Marker::OtherFolder => {
+                                write_runtime_marker(&install_root, &root.join("other"));
+                            }
+                            Marker::Matching => write_runtime_marker(&install_root, &install_root),
+                        }
+                        let data_path = install_root.join(data);
+                        fs::create_dir_all(data_path.parent().unwrap()).unwrap();
+                        fs::write(&data_path, b"user data").unwrap();
+                        let (uv, uv_log) = write_logging_fake_uv(&root);
+                        let launcher = cp312_launcher(&root);
+                        let before = tree_snapshot(&install_root);
+                        let non_venv_before: Vec<_> = before
+                            .iter()
+                            .filter(|(path, _)| {
+                                let rel = path.strip_prefix(&install_root).unwrap();
+                                rel.components().next().is_some_and(|first| {
+                                    !VENV_OWNED_ENTRIES
+                                        .contains(&first.as_os_str().to_str().unwrap())
+                                })
+                            })
+                            .cloned()
+                            .collect();
+
+                        let result = ensure_uv_venv(&paths, &uv, &launcher, &install_root);
+                        let shape = format!(
+                            "is_venv={is_venv} marker={marker:?} managed={managed} data={data}"
+                        );
+                        let owned = is_venv && (matches!(marker, Marker::Matching) || managed);
+                        let after = tree_snapshot(&install_root);
+                        assert!(root.join("sentinel").is_file(), "{shape}");
+                        if owned {
+                            assert!(result.is_ok(), "{shape}: {result:?}");
+                            let missing: Vec<_> = non_venv_before
+                                .iter()
+                                .filter(|entry| !after.contains(entry))
+                                .collect();
+                            assert!(missing.is_empty(), "{shape}: lost {missing:?}");
+                        } else {
+                            assert!(result.is_err(), "{shape}: rebuilt a folder it does not own");
+                            assert_eq!(after, before, "{shape}: a refusal changed the folder");
+                            assert!(!uv_log.exists(), "{shape}");
+                        }
+                        fs::remove_dir_all(root).ok();
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 32);
     }
 
     #[test]

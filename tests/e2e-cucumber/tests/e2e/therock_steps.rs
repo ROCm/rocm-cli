@@ -1131,3 +1131,285 @@ async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
         "vLLM install against a live ROCm 10.x runtime did not report discovery pins:\n{install_output}"
     );
 }
+
+// ── Rebuilding a broken environment in an install folder (#533) ─────────
+//
+// `install sdk --format wheel --prefix <folder>` reuses the folder it is given.
+// When the Python already there no longer runs, the install used to delete the
+// whole folder and start again, whoever made it. These steps drive that path
+// for real, up to and including the rebuild decision, against the loopback
+// canonical index (so no network) and an exact `--family` (so no GPU).
+//
+// A fake `uv` stands in for the real one: it creates a venv on `uv venv` and
+// fails everything else, so the install stops at the package step right after
+// the decision under test. The fake is a shell script, hence these scenarios
+// are Linux-only.
+
+/// The user's home folder in the reported case: their files beside a
+/// `bin/python` that fails `--version`.
+const USER_HOME_FOLDER: &str = "user-home";
+/// The folder the refusal tells the user to choose instead.
+const EMPTY_INSTALL_FOLDER: &str = "empty-install-folder";
+/// A runtime folder an earlier `install sdk --prefix` created, now holding
+/// ComfyUI's models as well as the venv.
+const ROCM_CLI_MADE_FOLDER: &str = "rocm-cli-made-prefix";
+
+fn install_folder(world: &E2eWorld, name: &str) -> std::path::PathBuf {
+    let folder = root(world).join(name);
+    std::fs::create_dir_all(&folder).expect("failed to create install folder");
+    // Canonical, because that is the spelling the install resolves `--prefix`
+    // to and records in its runtime manifest.
+    folder
+        .canonicalize()
+        .expect("failed to canonicalize install folder")
+}
+
+fn write_executable(path: &Path, body: &str) {
+    write_fixture(path, body);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("failed to chmod {}: {e}", path.display()));
+    }
+}
+
+fn plant_python_that_no_longer_runs(folder: &Path) {
+    write_executable(&folder.join("bin").join("python"), "#!/bin/sh\nexit 1\n");
+}
+
+/// Run a real (not `--dry-run`) wheel install into `folder`.
+///
+/// Pinned to the ROCm 10 layout with an exact arch because that layout takes
+/// its device payload from the arch it is given rather than probing the host
+/// GPU, so it reaches the install step on a machine with no GPU. The fake `uv`
+/// answers the three calls this path makes: `pip compile` (pins the fixture's
+/// versions), `venv` (creates a working interpreter at `$4`), and the package
+/// install, which it fails. The fake launcher reports the `cp314` tag that
+/// layout requires, so the host's Python version does not matter and no managed
+/// Python is bootstrapped over the network.
+///
+/// `HOME` is the user's home folder from runtime-19 throughout, so the CLI sees
+/// the same home the user would.
+fn install_sdk_into(world: &mut E2eWorld, folder: &Path) {
+    let uv = root(world).join("fake-uv").join("uv");
+    write_executable(
+        &uv,
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = pip ] && [ "$2" = compile ]; then
+  cat > /dev/null
+  echo rocm=={NEXT_ROCM_VERSION}
+  echo torch=={NEXT_TORCH_VERSION}
+  echo torchvision=={NEXT_TORCHVISION_VERSION}
+  echo torchaudio=={NEXT_TORCHAUDIO_VERSION}
+  exit 0
+fi
+if [ "$1" = venv ] && [ "$2" = --python ]; then
+  mkdir -p "$4/bin"
+  printf '#!/bin/sh\necho Python 3.14.0\n' > "$4/bin/python"
+  chmod +x "$4/bin/python"
+  echo 'home = /usr/bin' > "$4/pyvenv.cfg"
+  exit 0
+fi
+echo "fake uv: $*" >&2
+exit 1
+"#
+        ),
+    );
+    let launcher = root(world).join("fake-python").join("python3.14");
+    write_executable(
+        &launcher,
+        "#!/bin/sh\nif [ \"$1\" = -c ]; then echo cp314; fi\nexit 0\n",
+    );
+    let home = install_folder(world, USER_HOME_FOLDER);
+    world
+        .command_env
+        .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
+    world
+        .command_env
+        .push(("ROCM_CLI_PYTHON", launcher.into_os_string()));
+    world.command_env.push(("HOME", home.into_os_string()));
+    let prefix = folder.display().to_string();
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--prefix",
+            &prefix,
+        ],
+    );
+}
+
+fn reported(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    )
+}
+
+#[given("the user's home folder holds their files and a Python that no longer runs")]
+async fn home_folder_with_failing_python(world: &mut E2eWorld) {
+    let home = install_folder(world, USER_HOME_FOLDER);
+    plant_python_that_no_longer_runs(&home);
+    write_fixture(&home.join("Documents").join("thesis.txt"), "years of work");
+}
+
+#[given("a folder ROCm CLI installed into holds ComfyUI models and a Python that no longer runs")]
+async fn rocm_cli_folder_with_comfyui_models(world: &mut E2eWorld) {
+    let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
+    plant_python_that_no_longer_runs(&folder);
+    write_fixture(&folder.join("pyvenv.cfg"), "home = /usr/bin\n");
+    write_fixture(
+        &folder
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("stale.py"),
+        "old",
+    );
+    // What `save_runtime_manifest` writes beside every install it completes.
+    let marker = serde_json::to_string_pretty(&serde_json::json!({
+        "runtime_key": "release-wheel-gfx1200-7-10-0",
+        "runtime_id": format!("therock-release:{GROUP_FAMILY}"),
+        "install_root": folder,
+    }))
+    .expect("failed to serialize runtime marker");
+    write_fixture(&folder.join(".rocm-cli-runtime.json"), &marker);
+    write_fixture(
+        &folder
+            .join("apps")
+            .join("comfyui")
+            .join("source")
+            .join("models")
+            .join("checkpoint.safetensors"),
+        "the user's model",
+    );
+}
+
+#[when("the user installs the SDK into their home folder")]
+async fn install_sdk_into_home(world: &mut E2eWorld) {
+    let home = install_folder(world, USER_HOME_FOLDER);
+    install_sdk_into(world, &home);
+}
+
+#[when("the user installs the SDK into an empty folder instead")]
+async fn install_sdk_into_empty_folder(world: &mut E2eWorld) {
+    let empty = install_folder(world, EMPTY_INSTALL_FOLDER);
+    install_sdk_into(world, &empty);
+}
+
+#[when("the user installs the SDK into the folder ROCm CLI installed into")]
+async fn install_sdk_into_rocm_cli_folder(world: &mut E2eWorld) {
+    let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
+    install_sdk_into(world, &folder);
+}
+
+#[then("the install refuses to rebuild the home folder and changes nothing in it")]
+async fn install_refuses_home_folder(world: &mut E2eWorld) {
+    let home = install_folder(world, USER_HOME_FOLDER);
+    let reported = reported(world);
+    assert_ne!(world.cli_rc, Some(0), "the install succeeded:\n{reported}");
+    assert!(
+        reported.contains(&format!(
+            "refusing to rebuild the Python environment at {}",
+            home.display()
+        )),
+        "the refusal did not name the home folder:\n{reported}"
+    );
+    assert!(
+        reported.contains("Nothing was changed"),
+        "the refusal did not say nothing was changed:\n{reported}"
+    );
+    // The claim and the disk, together.
+    assert_eq!(
+        std::fs::read_to_string(home.join("Documents").join("thesis.txt")).ok(),
+        Some("years of work".to_owned()),
+        "the user's file is gone or changed although the install said nothing was changed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("bin").join("python")).ok(),
+        Some("#!/bin/sh\nexit 1\n".to_owned()),
+        "the user's bin/python is gone or changed"
+    );
+    assert!(
+        reported.contains("rocm install sdk --prefix <empty-folder>"),
+        "the refusal did not say what to do instead:\n{reported}"
+    );
+}
+
+#[then("the install gets past the refusal and creates a Python environment in the empty folder")]
+async fn install_proceeds_in_empty_folder(world: &mut E2eWorld) {
+    let empty = install_folder(world, EMPTY_INSTALL_FOLDER);
+    let reported = reported(world);
+    assert!(
+        !reported.contains("refusing to rebuild"),
+        "following the refusal's advice was refused again:\n{reported}"
+    );
+    assert!(
+        empty.join("bin").join("python").is_file(),
+        "no Python environment was created in the empty folder:\n{reported}"
+    );
+    let home = install_folder(world, USER_HOME_FOLDER);
+    assert!(
+        home.join("Documents").join("thesis.txt").is_file(),
+        "installing elsewhere touched the home folder"
+    );
+}
+
+#[then(
+    "the install rebuilds only the environment's own files and reports keeping the ComfyUI data"
+)]
+async fn install_rebuilds_and_keeps_comfyui(world: &mut E2eWorld) {
+    let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
+    let reported = reported(world);
+    let line = format!(
+        "Existing Python environment at {} no longer runs or does not match the required interpreter; rebuilding only its venv files (kept: .rocm-cli-runtime.json, apps).",
+        folder.display()
+    );
+    assert!(
+        reported.contains(&line),
+        "the install did not report a rebuild that kept the ComfyUI data:\n{reported}"
+    );
+    // The line says `apps` was kept; the disk has to agree.
+    assert_eq!(
+        std::fs::read_to_string(
+            folder
+                .join("apps")
+                .join("comfyui")
+                .join("source")
+                .join("models")
+                .join("checkpoint.safetensors")
+        )
+        .ok(),
+        Some("the user's model".to_owned()),
+        "the ComfyUI model is gone although the install reported keeping it:\n{reported}"
+    );
+    assert!(
+        folder.join(".rocm-cli-runtime.json").is_file(),
+        "the runtime manifest is gone although the install reported keeping it"
+    );
+    assert!(
+        !folder
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+            .join("stale.py")
+            .exists(),
+        "the old environment's files were not cleared"
+    );
+    assert!(
+        folder.join("bin").join("python").is_file(),
+        "no new Python environment was created:\n{reported}"
+    );
+}

@@ -399,9 +399,17 @@ same-version reinstall reuses the same root.
 
 `--prefix` changes this. The folder you name is used as-is for every version, so
 successive installs into one prefix replace each other in place. If the venv
-already there no longer runs its own Python, it is removed outright and rebuilt.
-The approval prompt doesn't cover this, because it asks only about changing the
-active default runtime, not about what a named prefix loses.
+already there no longer runs its own Python, ROCm CLI rebuilds it only when it
+can show it created that venv: the folder has `pyvenv.cfg` and either the
+`.rocm-cli-runtime.json` a ROCm CLI install writes, naming that folder, or a
+place inside ROCm CLI's own managed runtimes folder. The rebuild removes only
+the venv's own files (`bin`/`Scripts`, `lib`/`Lib`, `lib64`, `include`,
+`pyvenv.cfg`) and keeps everything else in the folder, such as ComfyUI's models,
+workflows, and outputs under `apps/comfyui`; the install prints what it kept.
+Any other folder, or one in a protected system location, is refused with
+nothing changed; choose an empty folder, or one ROCm CLI created, instead.
+A `UV_VENV_CLEAR` exported in your shell is ignored when ROCm CLI creates the
+venv, so it cannot make uv clear the folder either.
 
 #### Driver installation
 
