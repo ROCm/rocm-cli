@@ -1759,7 +1759,7 @@ unsafe fn observe_early_exit(
         return None;
     }
     let mut exit_code: u32 = 0;
-    if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 {
+    if unsafe { GetExitCodeProcess(process, &raw mut exit_code) } == 0 {
         return None;
     }
     Some(exit_code)
