@@ -288,7 +288,7 @@ Minimum quality gate before upstream-ready status:
 ```bash
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 Deleting or weakening a test is a change in its own right: every crate has a committed

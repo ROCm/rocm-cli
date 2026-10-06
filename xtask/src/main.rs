@@ -25,6 +25,7 @@ mod package;
 mod paths;
 mod powershell;
 mod signing;
+mod smoke;
 mod tpn;
 mod verify_commits;
 mod verify_pinned_keys;
@@ -242,6 +243,26 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
+    /// Run the local no-fallback smoke gate: build the workspace, then drive
+    /// the built `rocm`, `rocmd` and engine binaries against a throwaway state
+    /// root and assert their first-run output.
+    ///
+    /// Replaces the former `scripts/smoke_local.py`, preserving its assertions.
+    /// The gate's reason for existing is the last of them: every GPU-required
+    /// path must fail loudly rather than fall back to CPU.
+    Smoke {
+        /// Build profile whose binaries are smoked.
+        #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
+        profile: smoke::Profile,
+        /// Smoke binaries that are already built instead of building first.
+        #[arg(long)]
+        skip_build: bool,
+        /// Directory holding the profile subdirectory with the built binaries.
+        /// Relative paths resolve against the workspace root. Defaults to the
+        /// active cargo target directory.
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
+    },
     /// Lint PowerShell scripts with PSScriptAnalyzer (parse errors are reported
     /// too, so this also covers syntax).
     PowershellLint {
@@ -316,6 +337,11 @@ fn run() -> Result<()> {
             artifacts_dir,
             html_out,
         } => e2e_report::run(&artifacts_dir, &html_out)?,
+        Command::Smoke {
+            profile,
+            skip_build,
+            target_dir,
+        } => smoke::run(profile, skip_build, target_dir)?,
         Command::PowershellLint { shell, files } => powershell::run(shell, files)?,
     }
     Ok(())

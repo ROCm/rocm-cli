@@ -116,13 +116,13 @@ all of which the scan reports nothing for:
 Run the cross-platform smoke test:
 
 ```bash
-python scripts/smoke_local.py
+cargo xtask smoke
 ```
 
 If the workspace is already built:
 
 ```bash
-python scripts/smoke_local.py --skip-build
+cargo xtask smoke --skip-build
 ```
 
 ## Coverage floors

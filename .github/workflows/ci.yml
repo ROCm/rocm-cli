@@ -120,10 +120,11 @@ jobs:
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
               - '.github/workflows/**'
-            # build-and-test runs cargo AND the python/shell smoke steps plus the
-            # install-lifecycle E2E (`cargo xtask package` + the real installer),
-            # so it depends on the Rust set, the packaging xtask, the lifecycle
-            # feature/steps, and the installer inputs.
+            # build-and-test runs cargo, the smoke gate and the remaining
+            # python/shell self-tests, plus the install-lifecycle E2E (`cargo
+            # xtask package` + the real installer), so it depends on the Rust
+            # set, the packaging xtask, the lifecycle feature/steps, and the
+            # installer inputs.
             heavy:
               - '**/*.rs'
               - '**/Cargo.toml'
@@ -382,7 +383,7 @@ jobs:
 
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
-        run: python scripts/smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
@@ -636,7 +637,7 @@ jobs:
       - name: Local no-fallback smoke
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: python .\scripts\smoke_local.py --skip-build
+        run: cargo xtask smoke --skip-build
 
       - name: Acceptance harness self-tests
         if: needs.changes.outputs.heavy == 'true'
