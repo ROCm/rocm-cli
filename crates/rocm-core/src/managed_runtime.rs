@@ -209,7 +209,9 @@ fn select_active_managed_therock_record(
 /// record written before the field existed reads as `0`. `rocm`'s own registry
 /// load breaks the same tie on the runtime key, ascending; using the same rule
 /// here keeps the runtime this crate falls back to the same one the CLI's
-/// startup update check reports on.
+/// startup update check reports on. Shared by all three registry fallbacks:
+/// the active-runtime fallback, the `amd-smi` binary resolver, and the SDK
+/// probe candidate list.
 pub(crate) fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
     records.sort_by(|(left_path, left), (right_path, right)| {
         right
