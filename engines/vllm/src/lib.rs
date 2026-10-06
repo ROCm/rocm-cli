@@ -22,6 +22,8 @@ mod process;
 mod runtime;
 mod state;
 
+pub use process::ready_timeout;
+
 pub(crate) const ENGINE_NAME: &str = "vllm";
 
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";

@@ -268,3 +268,16 @@ Feature: Model serving
     Given a local server attempt has failed
     When the user lists running services
     Then the list reports the attempt and how to look at it
+
+  # The vLLM adapter and GPU preflight are real, but the server executable is a
+  # short-lived fixture. Deliberately no `@requires-engine:vllm`: that gate asks
+  # whether real vLLM can start on this GPU family, while this scenario overrides
+  # the runtime and would otherwise skip valid adapter coverage on Strix.
+  @id:serve-vllm-engine-exit-reported-failed @requires-gpu @requires-os:linux
+  Scenario: serve-23 - A vLLM server that exits during startup is reported as failed promptly
+    Given a managed runtime is active
+    And a vLLM server will exit during startup
+    When the user launches it as a managed model server
+    Then the managed launch is reported as failed
+    And the failed launch returns promptly
+    And the service state reports the launch as failed
