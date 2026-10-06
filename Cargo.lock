@@ -1270,6 +1270,7 @@ dependencies = [
  "cucumber",
  "e2e-report",
  "futures",
+ "libc",
  "portable-pty",
  "rand 0.9.4",
  "reqwest 0.13.4",
@@ -3782,6 +3783,7 @@ dependencies = [
  "futures",
  "http",
  "libc",
+ "proptest",
  "ratatui",
  "reqwest 0.13.4",
  "rig-core",
@@ -6025,6 +6027,7 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "toml",
  "zip",
 ]
 
