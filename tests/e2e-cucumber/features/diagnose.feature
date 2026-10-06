@@ -503,3 +503,24 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to apply that fix
     Then the CLI explains that it will not make the change itself
     And the CLI offers both options without ranking them
+
+  # The skill that drives this CLI states, in prose, which entries exist and what
+  # the CLI does with each. Every one of those is a copy of something the binary
+  # already knows, and a copy can go stale silently. This is the machine-readable
+  # form that replaces the copying — what a tool reads instead of parsing the
+  # listing meant for people.
+  @id:diagnose-fix-catalog-is-machine-readable
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+    When a tool asks the CLI for its catalog in machine-readable form
+    Then the catalog names every entry and what the CLI does with each
+    And it gives the meaning of every exit code the CLI can return
+
+  # `--json` describes the whole catalog, so pairing it with one entry is a
+  # question with no answer. Refusing beats ignoring the flag: a caller that
+  # asked for machine-readable output and silently got something else has no way
+  # to notice.
+  @id:diagnose-fix-catalog-json-rejects-a-fix-id
+  Scenario: diagnose-35 - Asking to apply one fix in machine-readable form is refused
+    Given a user who has chosen a known fix
+    When the user asks the CLI to apply that fix in machine-readable form
+    Then the CLI refuses and explains that the two cannot be combined
