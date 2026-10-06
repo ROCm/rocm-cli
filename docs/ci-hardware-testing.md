@@ -43,13 +43,13 @@ rung instead of being removed outright.
 
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
-"release/**"]`. Pinning the SDK version that rung's pre-warmed runtime
-resolves to (`cargo xtask e2e-prewarm --version <ver>` / `--build-date
-<date>`, so a release-branch run can hold at `n-1`/`n-2` instead of always
-tracking the latest channel index) ships in PR #464, stacked on #415 and
-still pending as of this writing. Wiring an actual `sdk_version: [current,
-n-1, n-2]` matrix axis into the release-branch trigger is not part of either
-PR: nothing in this
+"release/**"]`. `cargo xtask e2e-prewarm` has no `--version`/`--build-date`
+pin at HEAD (ROCMAI-430 adds mutually exclusive flags for that, so a
+release-branch run can hold at `n-1`/`n-2` instead of always tracking the
+latest channel index — see the pre-warm section below for its current,
+unpinned invocation). Wiring an actual `sdk_version: [current, n-1, n-2]`
+matrix axis into the release-branch trigger is a separate, not-yet-started
+step: nothing in this
 repo maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
 index-version parsers are private), so the release gate's SDK version is
 whatever `--version`/`--build-date` its caller passes, not an automatic
@@ -208,10 +208,13 @@ against it.
 ## Engine is not an independently selectable axis
 
 None of the tables above vary the serve engine as a matrix dimension, because
-the engine is not selectable independent of hardware and OS. `rocm serve`
-picks it via `effective_serve_engine()` in
-`tests/e2e-cucumber/src/capability.rs` (mirroring the product's own
-`preferred_serve_engine_for_host_gpu_summary`):
+no workflow passes an explicit `--engine` or configures a `default_engine`,
+so hardware/OS is what drives the engine the E2E harness expects by default
+(`select_serve_engine` in `apps/rocm/src/main.rs` checks explicit/configured
+overrides first; only when neither is set does it fall back to the GPU-family
+preference). `tests/e2e-cucumber/src/capability.rs`'s `effective_serve_engine()`
+predicts what `rocm serve` would pick with no `--engine` on a given host,
+re-implementing the product's `preferred_serve_engine_for_host_gpu_summary`:
 
 ```rust
 pub fn effective_serve_engine(gfx_target: Option<&str>, os_family: &str) -> String {
@@ -235,8 +238,11 @@ there); otherwise `vllm` is only preferred for the `*-dcgpu` families and
   no matrix value turns a Strix lane into a vLLM lane.
 - `e2e-gpu` (MI300X) is the only per-PR lane where vLLM is the effective
   engine.
-- Adding a vLLM lane means adding hardware from a vLLM-eligible family, not
-  adding an `engine:` value to a workflow matrix.
+- Adding a vLLM lane to the default-engine lanes above means adding hardware
+  from a vLLM-eligible family, not adding an `engine:` value to a workflow
+  matrix. A scenario that needs a specific engine regardless of host pins it
+  instead with `@requires-engine:<vllm|lemonade>`, which skips where that
+  engine can't start.
 
 ## Triggers
 
@@ -346,12 +352,11 @@ Pre-warm then:
 - prunes with `rocm storage remove-old-installs` after any install, update, or
   repair, so the multi-version cache stays bounded.
 
-`e2e-prewarm` will also accept mutually exclusive `--version`/`--build-date`
-flags (ROCMAI-430) that pin the SDK build the pre-warm resolves to instead of
-always tracking whatever the channel index currently serves. That flag pair
-ships in PR #464, stacked on #415 (merged — see "The three-stage validation
-ladder" above) and still pending as of this writing — the unpinned invocation
-above is what every lane in this tree runs today.
+`e2e-prewarm` has no `--version`/`--build-date` pin at HEAD — the unpinned
+invocation above is what every lane in this tree runs today. ROCMAI-430 adds
+mutually exclusive flags for that pin, letting a caller hold the SDK build
+the pre-warm resolves to instead of always tracking whatever the channel
+index currently serves (see "The three-stage validation ladder" above).
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
