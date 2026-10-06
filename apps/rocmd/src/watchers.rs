@@ -1448,7 +1448,7 @@ fn manifest_service_recovery_reason(
 }
 
 pub(crate) fn restart_managed_service(
-    _paths: &AppPaths,
+    paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> Result<()> {
     let rocmd_binary =
@@ -1470,7 +1470,15 @@ pub(crate) fn restart_managed_service(
     // that write can land after the child's. Clearing here keeps the invariant
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
-    record.record_supervisor_identity(std::process::id());
+    // No supervisor exists until the spawn below succeeds, so none is recorded.
+    // Recording this daemon's own PID here, as a stand-in, left the manifest
+    // naming the daemon as the service's supervisor whenever the spawn failed:
+    // a stop run from any other process (`rocmd sandbox-tool stop_server`,
+    // `rocm services stop`) verifies that identity, finds it live, and
+    // terminates the daemon's whole process tree. The spawned supervisor's
+    // identity is recorded right after the spawn.
+    record.supervisor_pid = 0;
+    record.supervisor_start_ticks = None;
     // The engine PID belonged to the run being replaced, and nothing here
     // starts an engine: the supervisor spawned below records its own, together
     // with its token. Carried forward, the old PID would sit beside a
@@ -1500,7 +1508,12 @@ pub(crate) fn restart_managed_service(
         .context("failed to check recovery supervisor startup state")?
     {
         record.status = "failed".to_owned();
-        record.write()?;
+        // Not a write-back of `record`: a stop issued since the spawn has
+        // persisted its marker, and a `failed` record without one is what
+        // recovery restarts. Same discipline as the supervisor's own writes.
+        crate::service::update_supervised_record(paths, record, |current| {
+            current.status = "failed".to_owned();
+        })?;
         anyhow::bail!(
             "recovery supervisor exited immediately with status {status}; inspect {}",
             record.log_path.display()
@@ -3347,6 +3360,67 @@ mod tests {
         assert_eq!(
             persisted.stop_requested_unix_ms, None,
             "a restart supersedes an earlier stop request"
+        );
+        Ok(())
+    }
+
+    /// A stop that lands while a restart waits to see whether its supervisor
+    /// survived startup must outlive the restart's `failed` write: a `failed`
+    /// record without the marker is exactly what recovery restarts.
+    ///
+    /// The restarted supervisor is the test binary, which rejects the
+    /// `supervise` arguments and exits at once, so the restart reaches that
+    /// write. A thread plays the stop: once the restart has recorded the
+    /// spawned supervisor, it persists a marker, as a stop does first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_failure_write_keeps_a_stop_marker_set_meanwhile() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-failure-keeps-marker");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-failure-marker";
+        let mut record = identity_probe_record(&paths, service_id, 11456);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let stop = {
+            let paths = paths.clone();
+            thread::spawn(move || -> Result<bool> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    // `write` is not atomic, so a read can land mid-write and
+                    // see a truncated file; just look again.
+                    let Ok(mut on_disk) = load_service_record(&paths, service_id) else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    if on_disk.supervisor_pid != 0 && on_disk.supervisor_pid != std::process::id() {
+                        on_disk.stop_requested_unix_ms = Some(1);
+                        on_disk.write()?;
+                        return Ok(true);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(false)
+            })
+        };
+        let outcome = restart_managed_service(&paths, &mut record);
+        let stop_landed = stop.join().expect("stop thread");
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            stop_landed?,
+            "precondition: the stop ran during the restart"
+        );
+        assert!(outcome.is_err(), "the test binary is not a supervisor");
+        let persisted = persisted?;
+        assert_eq!(persisted.status, "failed");
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1),
+            "the restart's failure write must not withdraw a stop issued meanwhile"
         );
         Ok(())
     }
