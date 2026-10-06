@@ -576,18 +576,20 @@ pub fn resolve(
             reason: "requires WSL; this host is not running under WSL".to_owned(),
         };
     }
-    if decl.requires_case_sensitive_fs && !cap.case_sensitive_fs {
-        return Expectation::Skip {
-            reason: "requires a case-sensitive filesystem; the temp root ($TMPDIR) here folds \
-                     letter case"
-                .to_owned(),
-        };
-    }
+    // Checked before the filesystem premise: on native Windows both fail, and
+    // the OS is the coarser, more useful reason to report.
     if let Some(os) = &decl.requires_os
         && !os.eq_ignore_ascii_case(&cap.os_family)
     {
         return Expectation::Skip {
             reason: format!("requires os '{os}'; this host is '{}'", cap.os_family),
+        };
+    }
+    if decl.requires_case_sensitive_fs && !cap.case_sensitive_fs {
+        return Expectation::Skip {
+            reason: "requires a case-sensitive filesystem; the temp root ($TMPDIR) here folds \
+                     letter case"
+                .to_owned(),
         };
     }
     let engine = decl.effective_engine(cap);
@@ -1479,6 +1481,27 @@ serve_timeout_secs = 90
             resolve(&decl(&["id:x", "requires-os:linux"]), &folded, &m, none),
             Expectation::ExpectPass
         );
+    }
+
+    #[test]
+    fn os_reason_wins_over_case_folding_reason_on_a_non_matching_os() {
+        // Native Windows fails both premises of the case-twin scenario; the grid
+        // must report the OS, the coarser reason, rather than the filesystem.
+        let m = Expectations::default();
+        let d = decl(&[
+            "id:runtime-lifecycle-case-twin-selector-refused",
+            "requires-os:linux",
+            "requires-case-sensitive-fs",
+        ]);
+        let host = cap("strix-windows");
+        assert!(!host.case_sensitive_fs, "fixture must fail both premises");
+        match resolve(&d, &host, &m, Included::default()) {
+            Expectation::Skip { reason } => assert!(
+                reason.contains("requires os 'linux'"),
+                "the OS reason must win: {reason}"
+            ),
+            other => panic!("native Windows must skip, got {other:?}"),
+        }
     }
 
     #[test]
