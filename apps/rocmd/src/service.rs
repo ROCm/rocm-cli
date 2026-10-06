@@ -97,10 +97,12 @@ pub(crate) fn stop_managed_service_with(
     let all_stopped =
         stops.iter().all(|stop| stop.stopped) && records_name_same_processes(&stopping, &record);
     // Claim a stop only when every recorded process is confirmed gone, and
-    // otherwise record that one was *asked for*. This is the contract
-    // `rocm services stop` already keeps on these same records
-    // (`stop_internal_managed_service`), so the two commands do not leave the
-    // same manifest in two different states.
+    // otherwise record that one was *asked for*. `rocm services stop`
+    // (`stop_internal_managed_service`) keeps the same contract on these same
+    // records — marker persisted before anything is signalled, then status,
+    // marker and key changed only on a confirmed stop — so a daemon watching
+    // either one sees the same thing. Clearing the recorded PIDs below is this
+    // stop's alone.
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
