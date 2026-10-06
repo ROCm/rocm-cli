@@ -14,8 +14,8 @@
 //! characterization in `dash_characterization.rs`.
 //!
 //! Note: the key→action reducer (`handle_key`/`apply_action`) is module-private,
-//! so its keystroke-level tests live in-module (`src/app/mod.rs`); here we drive
-//! the equivalent public state mutations an integration crate can reach.
+//! so its keystroke-level tests live in-module (`src/app/actions.rs`); here we
+//! drive the equivalent public state mutations an integration crate can reach.
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;

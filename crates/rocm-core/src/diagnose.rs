@@ -33,7 +33,25 @@ pub struct Fix {
     pub needs_reboot: bool,
     pub needs_relogin: bool,
     pub fix_id: String,
+    /// Whether `rocm fix <fix_id>`, run with no extra arguments, will change
+    /// the machine.
+    ///
+    /// Kept alongside [`Fix::class`], which it is derived from, because it is
+    /// the field published consumers already read. It is not redundant detail
+    /// so much as a narrower question: `class` says *what* the CLI will do,
+    /// this says only whether the machine is about to change.
     pub auto_applicable: bool,
+    /// What the CLI will do with this entry on the examined machine.
+    ///
+    /// `#[serde(default)]` so a payload written before this field existed still
+    /// deserializes; the default understates rather than overstates.
+    #[serde(default)]
+    pub class: crate::fix::FixClass,
+    /// The argument this entry is waiting for, when `class` is
+    /// [`crate::fix::FixClass::NeedsArgument`]. Read from the catalog beside
+    /// `class` so the flags line renders identically from `rocm fix` and here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
     pub notes: Vec<String>,
     pub verify: String,
 }
@@ -82,11 +100,26 @@ pub struct DiagnoseReport {
     pub min_score_for_match: i32,
     pub high_confidence_threshold: i32,
     pub route_when_no_match: Route,
-    /// Set when the host is out of scope for this catalog (e.g. WSL2). When
-    /// present, `matched` is empty — the catalog is deliberately not run, to
-    /// avoid emitting bare-metal-Linux diagnoses that don't apply.
+    /// Set when the catalog has no entries at all for the running platform, and
+    /// carrying the routing note that says so.
+    ///
+    /// Decided purely by whether the catalog covers the running platform — never
+    /// by a score. When this is `Some`, no checker ran, so `matched` is empty and
+    /// `has_match` is false; a consumer must not wait for sub-threshold rows
+    /// alongside it. Pinned by
+    /// `an_out_of_scope_report_never_carries_matched_entries`.
     #[serde(default)]
     pub out_of_scope: Option<String>,
+    /// The verdict on a model, when `--model` named one.
+    ///
+    /// Attached by the caller after the fact rather than produced by
+    /// [`diagnose`]: answering it needs the host's GPU memory and the engine
+    /// `serve` would select, neither of which an [`Examination`] carries. It
+    /// rides on this report rather than replacing it because the environment
+    /// answer stays true and useful either way — a blocked model on a host whose
+    /// driver is also misconfigured is two findings, not one.
+    #[serde(default)]
+    pub model: Option<crate::model_readiness::ModelReadiness>,
 }
 
 /// Whether any diagnosis cleared [`MIN_SCORE_FOR_MATCH`].
@@ -208,6 +241,28 @@ const KEYWORDS_SHM_TOO_SMALL: KeywordTable = &[
     ("no space left on device", 20, "the device reported full"),
 ];
 
+/// What a shadowed code object manager leaves in the error text.
+///
+/// Every one of these is a *weak* signal on its own — a failed device-code
+/// compilation has many causes, and this entry is established by the state of
+/// the machine rather than by the words. The keywords only raise an already
+/// structural finding; none of them reaches the match threshold alone.
+const KEYWORDS_COMGR_CONFLICT: KeywordTable = &[
+    (r"libamd_comgr", 40, "error mentions libamd_comgr"),
+    ("comgr", 30, "error mentions comgr"),
+    (
+        "code object",
+        25,
+        "error mentions a code object (what comgr produces)",
+    ),
+    (
+        "hiperrornobinaryforgpu",
+        25,
+        "HIP found no binary for the GPU",
+    ),
+    ("device code", 15, "error mentions device code (broad)"),
+];
+
 const KEYWORDS_PATH_MISSING: KeywordTable = &[
     ("rocminfo: command not found", 50, "rocminfo not on PATH"),
     ("command not found.*hipcc", 40, "hipcc not on PATH"),
@@ -314,6 +369,79 @@ const KEYWORDS_PAGE_FAULT: KeywordTable = &[
     ("out_of_registers", 30, "compiler OUT_OF_REGISTERS"),
 ];
 
+// vLLM's startup OOM. The distinctive signature is a torch/HIP allocation
+// failure while the engine is reserving KV-cache VRAM; a bare "out of memory"
+// on its own is deliberately sub-threshold so this only claims the failure mode
+// when the vLLM/HIP shape of the error is present.
+//
+// None of these tokens are vLLM-specific on their own: `torch.OutOfMemoryError:
+// CUDA out of memory` is the identical shape any ROCm PyTorch job emits (ROCm's
+// PyTorch build reports the CUDA-compat name), so this table alone cannot tell
+// vLLM's OOM apart from an arbitrary training script hitting the same
+// allocator error. `check_16_vllm_oom` therefore scores *only* the lines
+// carrying `VLLM_ANCHOR_PATTERN` (see `vllm_anchored_lines`), never the whole
+// pasted log: an OOM on an unanchored line contributes nothing at all.
+//
+// Weighting splits the *allocator message* from the *exception class name*:
+//   - The HIP allocator's own messages (`HIP out of memory`, the
+//     `hipErrorOutOfMemory` status) and the CUDA-compat message ROCm's PyTorch
+//     prints clear `MIN_SCORE_FOR_MATCH` on their own — with the required
+//     anchor already establishing this is vLLM's line, one of those messages is
+//     a genuine OOM signal.
+//   - The bare exception *class* (`torch.OutOfMemoryError`, with or without the
+//     `.cuda.` module path) and a bare `out of memory` stay sub-threshold: any
+//     PyTorch job emits the class name, so it must corroborate rather than
+//     carry the verdict alone (`torch_oom_class_alone_is_not_a_vllm_match`).
+// This table alone is scored through `keyword_score_collapsing_overlaps`, which
+// de-duplicates overlapping spans, so `HIP out of memory` counts once (as the
+// 50-point message), not also as the nested 25-point `out of memory` — one
+// phrase yields one evidence bullet. Every other table keeps the catalog's
+// default "each entry is an independent signal" scoring.
+const KEYWORDS_VLLM_OOM: KeywordTable = &[
+    (
+        "hip out of memory",
+        50,
+        "error mentions 'HIP out of memory'",
+    ),
+    (
+        // ROCm's HIP runtime OOM status code, e.g. `RuntimeError:
+        // hipErrorOutOfMemory`. `\boutofmemory\b` does not match inside it (no
+        // word boundary after `hipError`), so it needs its own entry.
+        r"hiperroroutofmemory",
+        50,
+        "error mentions hipErrorOutOfMemory",
+    ),
+    (
+        r"cuda out of memory",
+        50,
+        "error mentions 'CUDA out of memory' (ROCm reports the CUDA-compat name)",
+    ),
+    (
+        // The exception class name, under either `torch.OutOfMemoryError` or the
+        // `.cuda.` module path ROCm's PyTorch reports it under. Sub-threshold
+        // alone: it is the class every PyTorch OOM raises, not vLLM's signature.
+        r"torch\.(?:cuda\.)?outofmemoryerror",
+        45,
+        "error mentions torch.OutOfMemoryError",
+    ),
+    (
+        r"tried to allocate .*(?:gib|mib)",
+        30,
+        "error names an allocation it could not satisfy",
+    ),
+    (
+        r"\boutofmemory\b",
+        30,
+        "error mentions standalone OutOfMemory",
+    ),
+    ("out of memory", 25, "error mentions 'out of memory'"),
+    (
+        r"gpu[-_]memory[-_]utilization",
+        20,
+        "log mentions gpu_memory_utilization (vLLM VRAM reservation)",
+    ),
+];
+
 /// The vLLM engine-startup import failure: `torch-c-dlpack-ext` picks its CUDA
 /// prebuilt on a ROCm build of torch, and `ctypes.CDLL` aborts the import.
 ///
@@ -343,15 +471,49 @@ const KEYWORDS_TORCH_DLPACK_CUDA_VARIANT: KeywordTable = &[
 ];
 
 /// Score the strongest (top-2) keyword matches in `table` against `symptom`.
+///
+/// Every entry that matches counts as an independent signal. This is the
+/// behaviour every table in the catalog except [`KEYWORDS_VLLM_OOM`] is tuned
+/// for -- see [`keyword_score_collapsing_overlaps`] for why that one differs and
+/// why the difference must not be generalized.
 fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, false)
+}
+
+/// Like [`keyword_score`], but collapses matches whose spans overlap to the
+/// strongest one, so a single phrase cannot masquerade as two independent
+/// signals (e.g. `HIP out of memory` must not also count the `out of memory`
+/// nested inside it).
+///
+/// This is **deliberately not** applied to the rest of the catalog. Several
+/// older tables pair a greedy `.*` pattern with a second, genuinely independent
+/// keyword, and the greedy span swallows it: `api-ms-win-crt-.*\.dll` runs to
+/// the last `.dll` on the line and covers an independent `msvcp140.dll`,
+/// `dkms .*failed` covers an independent `dpkg: error`, and so on. Since
+/// collapsing can only lower a score, applying it there would push real
+/// diagnoses below [`MIN_SCORE_FOR_MATCH`] and make them vanish
+/// (`overlap_dedup_does_not_demote_other_catalog_keyword_tables` pins this).
+/// [`KEYWORDS_VLLM_OOM`] is safe because its overlaps are true nestings of
+/// literal phrases, not artifacts of a greedy wildcard.
+fn keyword_score_collapsing_overlaps(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
+    keyword_score_impl(symptom, table, true)
+}
+
+fn keyword_score_impl(
+    symptom: &str,
+    table: KeywordTable,
+    collapse_overlaps: bool,
+) -> (i32, Vec<String>) {
     if symptom.is_empty() {
         return (0, Vec::new());
     }
     let sym = symptom.to_lowercase();
-    let mut hits: Vec<(i32, &'static str)> = Vec::new();
+    let mut hits: Vec<(i32, &'static str, usize, usize)> = Vec::new();
     for (pattern, weight, label) in table {
-        if Regex::new(pattern).is_ok_and(|re| re.is_match(&sym)) {
-            hits.push((*weight, label));
+        if let Ok(re) = Regex::new(pattern)
+            && let Some(m) = re.find(&sym)
+        {
+            hits.push((*weight, label, m.start(), m.end()));
         }
     }
     if hits.is_empty() {
@@ -359,9 +521,18 @@ fn keyword_score(symptom: &str, table: KeywordTable) -> (i32, Vec<String>) {
     }
     // Mirror diagnose.py's `hits.sort(reverse=True)`: weight desc, then label desc.
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(a.1)));
-    hits.truncate(2);
-    let score = hits.iter().map(|(w, _)| *w).sum();
-    let labels = hits.iter().map(|(_, l)| (*l).to_owned()).collect();
+    // Keep the strongest hit for any overlapping span: the same substring must
+    // not contribute two evidence bullets (nor two weights toward the score).
+    let mut kept: Vec<(i32, &'static str, usize, usize)> = Vec::new();
+    for hit in hits {
+        let overlaps = collapse_overlaps && kept.iter().any(|k| hit.2 < k.3 && k.2 < hit.3);
+        if !overlaps {
+            kept.push(hit);
+        }
+    }
+    kept.truncate(2);
+    let score = kept.iter().map(|(w, ..)| *w).sum();
+    let labels = kept.iter().map(|(_, l, ..)| (*l).to_owned()).collect();
     (score, labels)
 }
 
@@ -468,7 +639,6 @@ fn check_1_arch_not_in_wheel(e: &Examination, symptom: &str) -> Diagnosis {
             "# cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=<gfx_target>".to_owned(),
         ],
         fix_id: "fix-1-arch".to_owned(),
-        auto_applicable: false,
         verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.cuda.get_arch_list())\"".to_owned(),
         notes: notes_1_arch(e),
         ..Fix::default()
@@ -552,7 +722,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Or remove via System Properties -> Environment Variables.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"[Environment]::GetEnvironmentVariable('HSA_OVERRIDE_GFX_VERSION','User')\"".to_owned(),
             ..Fix::default()
         }
@@ -564,7 +733,6 @@ fn check_2_hsa_override_unneeded(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Also remove it from ~/.bashrc / ~/.zshrc / ~/.profile if persisted.".to_owned(),
             ],
             fix_id: "fix-2-unset-override".to_owned(),
-            auto_applicable: true,
             verify: "env | grep HSA_OVERRIDE_GFX_VERSION || echo OK_UNSET; python -c \"import torch; print(torch.cuda.is_available())\"".to_owned(),
             ..Fix::default()
         }
@@ -612,7 +780,6 @@ fn check_3_rocm_kernel_unsupported(e: &Examination, symptom: &str) -> Diagnosis 
             "# kernel that matches ROCm, or rerun amdgpu-install with --no-dkms.".to_owned(),
         ],
         fix_id: "fix-3-rocm-kernel".to_owned(),
-        auto_applicable: false,
         needs_reboot: true,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 20".to_owned(),
         ..Fix::default()
@@ -670,7 +837,6 @@ fn check_4_render_group(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_relogin: true,
         fix_id: "fix-4-render-group".to_owned(),
-        auto_applicable: true,
         verify: "groups | tr ' ' '\\n' | grep -E '^(render|video)$' && ls -l /dev/kfd && rocminfo | head -n 5".to_owned(),
         notes: vec![
             "Group membership only takes effect after a full re-login (or reboot). `newgrp render` will give the current shell access but not other terminals or services.".to_owned(),
@@ -740,7 +906,6 @@ fn check_5_amdgpu_blacklisted(e: &Examination, symptom: &str) -> Diagnosis {
         // the plain no-Secure-Boot sub-case, judged cheaper than the drift it replaces.
         needs_reboot: true,
         fix_id: "fix-5-amdgpu-load".to_owned(),
-        auto_applicable: false,
         verify: "lsmod | grep amdgpu && rocminfo | head -n 5".to_owned(),
         ..Fix::default()
     };
@@ -815,7 +980,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                     .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: format!(
                 "powershell -NoProfile -Command \"& \\\"{bin_dir}\\hipInfo.exe\\\" | Select-Object -First 5\""
             ),
@@ -829,7 +993,6 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                 format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
             ],
             fix_id: "fix-6-path".to_owned(),
-            auto_applicable: true,
             verify: "rocminfo | head -n 5 && hipcc --version".to_owned(),
             ..Fix::default()
         }
@@ -879,7 +1042,6 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         commands,
         needs_sudo: true,
         fix_id: "fix-7-stale-repos".to_owned(),
-        auto_applicable: false,
         verify: "sudo apt update 2>&1 | tail -n 20".to_owned(),
         ..Fix::default()
     };
@@ -939,7 +1101,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -956,7 +1117,6 @@ fn check_8_wheel_rocm_mismatch(e: &Examination, symptom: &str) -> Diagnosis {
                 "python -c \"import torch; print(torch.__version__, torch.version.hip)\"".to_owned(),
             ],
             fix_id: "fix-8-wheel-rocm".to_owned(),
-            auto_applicable: false,
             verify: "python -c \"import torch; print(torch.cuda.is_available(), torch.version.hip)\"".to_owned(),
             ..Fix::default()
         }
@@ -1023,14 +1183,14 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
             "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
-    // Both branches below are marked auto_applicable, but `rocm fix
-    // fix-9-igpu-dgpu` still needs --device-index to actually make the change:
-    // without it, the Linux and the Windows runner alike only print the query
-    // that finds the index and change nothing (see README's --device-index
-    // caveat). Each branch states that once, in its second note.
-    // `render_report_text` prints every note on its own line, so saying it
-    // again here -- appended to the detected-targets note -- would show up as a
-    // second bullet repeating the first.
+    // The catalog classes this NEEDS-ARG, which is what the marker now says:
+    // without --device-index both the Linux and Windows runners only print the
+    // query that finds the index and change nothing. The note used to end
+    // "despite being marked AUTO", which was true of the old flat flag and is
+    // exactly the overstatement this change removes.
+    let note = format!(
+        "{note} Without --device-index, `rocm fix` only prints this query and makes no change."
+    );
     let fix = if e.os_family == "windows" {
         Fix {
             summary: "Pin the HIP runtime to the discrete GPU with HIP_VISIBLE_DEVICES so the iGPU is hidden.".to_owned(),
@@ -1042,16 +1202,8 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# `setx` only takes effect in NEW shells; reopen the terminal.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            auto_applicable: true,
             verify: "powershell -NoProfile -Command \"$env:HIP_VISIBLE_DEVICES=1; python -c \\\"import torch; print(torch.cuda.device_count())\\\"\"".to_owned(),
-            notes: vec![
-                note,
-                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
-                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
-                 --device-index N. Without it, `rocm fix` just prints the query that \
-                 identifies which index is the discrete GPU."
-                    .to_owned(),
-            ],
+            notes: vec![note],
             ..Fix::default()
         }
     } else {
@@ -1065,22 +1217,8 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
                 "# Persist in your shell rc or your launch script.".to_owned(),
             ],
             fix_id: "fix-9-igpu-dgpu".to_owned(),
-            // Matches the `fix-9-igpu-dgpu` FixRecipe in fix.rs (auto_applicable:
-            // true, runner: run_hip_visible_devices) -- `rocm fix
-            // fix-9-igpu-dgpu --device-index N` really does carry this out on
-            // Linux, so the report must not claim otherwise. An agent branches
-            // on this flag to decide whether to offer to run the fix or only
-            // print it, so a wrong value here costs more than a stale sentence.
-            auto_applicable: true,
             verify: "HIP_VISIBLE_DEVICES=1 python -c \"import torch; print(torch.cuda.device_count())\"".to_owned(),
-            notes: vec![
-                note,
-                "auto-applicable here means `rocm fix fix-9-igpu-dgpu` has a runner \
-                 for it — but that runner only pins HIP_VISIBLE_DEVICES when you pass \
-                 --device-index N. Without it, `rocm fix` just prints the query that \
-                 identifies which index is the discrete GPU."
-                    .to_owned(),
-            ],
+            notes: vec![note],
             ..Fix::default()
         }
     };
@@ -1139,7 +1277,6 @@ fn check_10_container_devices(e: &Examination, symptom: &str) -> Diagnosis {
             "# host user is in the render group; podman maps it through.".to_owned(),
         ],
         fix_id: "fix-10-container".to_owned(),
-        auto_applicable: false,
         verify: "rocminfo | head -n 5".to_owned(),
         notes: vec!["Use rocm/pytorch or rocm/dev-ubuntu-22.04 as a known-good image. Mixing host ROCm + container ROCm versions is a separate footgun.".to_owned()],
         ..Fix::default()
@@ -1189,7 +1326,6 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-11-iommu".to_owned(),
-        auto_applicable: false,
         verify: "cat /proc/cmdline | grep -o 'iommu=\\w*'".to_owned(),
         ..Fix::default()
     };
@@ -1232,7 +1368,6 @@ fn check_12_amdgpu_install_broken(e: &Examination, symptom: &str) -> Diagnosis {
         needs_sudo: true,
         needs_reboot: true,
         fix_id: "fix-12-installer".to_owned(),
-        auto_applicable: false,
         verify: "dpkg -l | grep -E 'rocm|amdgpu' | head -n 20 && rocminfo | head -n 5".to_owned(),
         notes: vec!["If `apt autoremove` warns it will remove unrelated packages, stop and resolve those by hand before continuing.".to_owned()],
         ..Fix::default()
@@ -1289,7 +1424,6 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
             "# After install, reopen the shell so HIP_PATH and PATH pick up the new install.".to_owned(),
         ],
         fix_id: "fix-13-hip-sdk-missing".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"& \\\"$env:HIP_PATH\\bin\\hipInfo.exe\\\" | Select-Object -First 5\"".to_owned(),
         notes: vec!["If you only need PyTorch on Windows AMD and don't need the C/C++ HIP toolchain, the TheRock wheels bundle their own HIP runtime and may not require a system HIP SDK install.".to_owned()],
         ..Fix::default()
@@ -1347,7 +1481,6 @@ fn check_14_adrenalin_too_old(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_reboot: true,
         fix_id: "fix-14-adrenalin-too-old".to_owned(),
-        auto_applicable: false,
         verify: "powershell -NoProfile -Command \"(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -like '*AMD*' -or $_.Name -like '*Radeon*' } | Select-Object -First 1).DriverVersion\"".to_owned(),
         ..Fix::default()
     };
@@ -1385,9 +1518,8 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
             "# After the install, reopen the shell and re-run your import / hipInfo check.".to_owned(),
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
-        auto_applicable: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
-        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing (the HIP SDK install) rather than this fix.".to_owned()],
+        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.".to_owned()],
         ..Fix::default()
     };
     finalize(
@@ -1397,6 +1529,316 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         evidence,
         fix,
     )
+}
+
+/// A required anchor before [`KEYWORDS_VLLM_OOM`] is even scored: the word
+/// "vllm" itself, or its distinctive VRAM-reservation flag. Without one of
+/// these, a generic HIP/CUDA/PyTorch OOM string is not evidence of *this*
+/// failure mode -- see the comment on [`KEYWORDS_VLLM_OOM`]. `tensor[-_]parallel`
+/// is deliberately NOT an anchor: it is a Megatron/DeepSpeed term (rocm-cli does
+/// not serve one model across GPUs), so anchoring on it would misattribute those
+/// frameworks' OOMs to vLLM.
+///
+/// `gpu[-_]memory[-_]utilization` is also a (20-point) entry in
+/// [`KEYWORDS_VLLM_OOM`], so a line that only echoes the flag -- a config dump,
+/// or a paste of rocm-cli's own low-VRAM hint, which prints
+/// `--gpu-memory-utilization` -- is both anchored and self-scoring. That is
+/// harmless *because* only anchored lines are scored: such a line is worth 20,
+/// far below [`MIN_SCORE_FOR_MATCH`], so it can surface as a weak signal in
+/// `matched` but can never carry a verdict, and it can no longer lend its anchor
+/// to an OOM elsewhere in the paste. It stays an anchor because the flag is
+/// vLLM-specific, and because a real vLLM OOM often names it on the failing line.
+const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
+
+/// A canonical vLLM-OOM `--symptom` string guaranteed to clear
+/// [`MIN_SCORE_FOR_MATCH`].
+///
+/// It carries two independent signals (the torch exception class *and* the HIP
+/// allocator message) on one anchored line, so it scores even after overlap
+/// de-duplication. The vLLM engine falls back to this when a user's actual
+/// failing line would not itself be diagnosable, so the `rocm diagnose` command
+/// it prints always reports a cause.
+pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
+
+/// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
+/// `gpu_memory_utilization`), joined by newlines — the only text
+/// [`check_16_vllm_oom`] is allowed to score.
+///
+/// Co-occurrence anywhere in a pasted log is too loose -- a stray `vllm` mention
+/// re-enables the very misattribution the anchor exists to prevent (a
+/// `llama.cpp` OOM in a paste that also names vLLM). Returning the anchored
+/// lines rather than a yes/no gate is what makes that true: regex matching
+/// ignores line boundaries, so scoring the whole symptom behind a boolean gate
+/// still counted keyword hits from *unanchored* lines at full weight, and one
+/// benign `gpu_memory_utilization` config echo was enough to hand another
+/// framework's OOM a HIGH_CONFIDENCE vLLM verdict
+/// (`only_the_anchored_lines_are_scored_not_the_whole_paste`).
+///
+/// The join is by `\n` so that no pattern can straddle two lines: the regexes
+/// here are literals or use `.*`, which does not match a newline. Dropping the
+/// unanchored lines therefore cannot fabricate a match across the seam.
+///
+/// The same-line "anchor + OOM token" requirement falls out of this: an anchored
+/// line with no OOM token contributes nothing, so the score is 0 and the checker
+/// returns no diagnosis. The engine's emitted `vllm: <failing line>` keeps the
+/// anchor and the error on one line by construction.
+///
+/// The split is [`crate::terminal::rendered_lines`], not `str::lines()` and not
+/// a set of separator characters. `lines()` splits on `\n` and `\r\n` only, so a
+/// lone `\r` was ordinary text to it — and a bare CR is what every progress bar
+/// in this ecosystem emits to repaint its line (tqdm, pip, huggingface). A raw
+/// terminal capture pasted into `rocm diagnose --symptom '...'` therefore
+/// collapsed into one giant "line", the anchor matched somewhere in it, and
+/// every keyword in the paste scored — exactly the whole-paste scoring this
+/// function exists to prevent, reinstated by one byte
+/// (`any_line_advance_is_a_boundary_not_scoreable_text`).
+///
+/// Adding `\r` to the split fixed that one byte and nothing else, because a
+/// two-character allowlist is not the boundary a terminal renders. Every other
+/// way of starting a new line — `ESC E` (`NEL`), `ESC D` (`IND`), `CSI n B`
+/// (`CUD`), which are terminfo's `nel`/`ind`/`cud1` and ordinary output from
+/// curses- and `rich`-style progress UIs — collapsed the paste just as
+/// completely, as did `\x0b`, `\x0c`, `\u{85}`, `U+2028`/`U+2029` and any stray
+/// control byte. Each one scored a `llama.cpp` OOM at 95 against a `vllm` anchor
+/// from a different rendered line, past a `HIGH_CONFIDENCE` threshold of 75, and
+/// cited the other engine's tokens as its evidence.
+///
+/// What this is *not* is a terminal emulator. The contract is one-sided, and
+/// [`crate::terminal::rendered_lines`] is where to read it — that doc carries
+/// the contract itself and points on to the module section holding the detail
+/// behind it, including the single shape in which two rendered rows still come
+/// back as one segment. It is deliberately not restated here: a second copy is
+/// a stale copy waiting to happen, and this function is where a stale one would
+/// do the damage. What matters at this call site is the direction of the error
+/// that remains: a capture whose cursor addressing that walk does not model
+/// loses a diagnosis rather than inventing one, and the canonical-symptom
+/// fallback already covers that. The misattribution is the failure mode with a
+/// user-visible cost, and this is what narrows it to the one shape that
+/// contract calls out.
+///
+/// Sharing that walk with the vLLM engine's sanitizer is also what keeps the
+/// `SGR` exception right. A colourised logger emits `ESC [ 31 m` *inside* a
+/// line, so a splitter that treats every escape as a boundary cuts a genuine
+/// `vllm: ... torch.OutOfMemoryError` between its anchor and its error token and
+/// silently stops diagnosing it (measured: 95 → 0).
+///
+/// `\r\n` yields an empty segment, which carries no anchor and is dropped.
+fn vllm_anchored_lines(symptom: &str) -> String {
+    let Ok(anchor) = Regex::new(VLLM_ANCHOR_PATTERN) else {
+        return String::new();
+    };
+    crate::terminal::rendered_lines(symptom)
+        .into_iter()
+        .filter(|line| anchor.is_match(&line.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
+/// mode.
+///
+/// The vLLM engine calls this to decide whether the user's actual failing line
+/// is worth routing into a `--symptom` example, or whether to fall back to
+/// [`VLLM_OOM_CANONICAL_SYMPTOM`] so the printed command is guaranteed to report
+/// a cause rather than reading as "the tool checked and found nothing".
+#[must_use]
+pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
+    let e = Examination {
+        os_family: "linux".to_owned(),
+        ..Examination::default()
+    };
+    check_16_vllm_oom(&e, symptom).score >= MIN_SCORE_FOR_MATCH
+}
+
+/// vLLM ran the GPU out of memory. Keyword-only: an [`Examination`] carries no
+/// per-GPU VRAM or tenancy fields, so nothing structural can corroborate this —
+/// the user must pass the error via `--symptom`, or arrive from the serve
+/// failure note that points here. `e` is therefore unused.
+fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
+    // Score the anchored lines only, never the whole paste. The anchor is the
+    // *only* thing separating this failure mode from any other framework's
+    // PyTorch/HIP OOM, so a boolean gate over the whole symptom is not enough:
+    // keyword hits from unanchored lines would still count at full weight. Any
+    // future change here must keep the scored text restricted to anchored lines.
+    let anchored = vllm_anchored_lines(symptom);
+    if anchored.is_empty() {
+        // No vLLM anchor anywhere: don't attribute a bare framework OOM to vLLM.
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    let (score, evidence) = keyword_score_collapsing_overlaps(&anchored, KEYWORDS_VLLM_OOM);
+    if score <= 0 {
+        return zero("fix-16-vllm-oom", "vLLM GPU out of memory");
+    }
+    // Two different faults share this error, and the remediation splits on which
+    // one it is: on a shared/busy GPU vLLM's fixed ~90% reservation collides
+    // with memory already in use, so lowering the reservation is the fix; for a
+    // model that genuinely does not fit, lowering it only trades an earlier OOM
+    // for a later one, so the wording must not present the knob as the answer in
+    // that case.
+    let summary = format!(
+        "{} If instead the model genuinely does not fit in this GPU's VRAM, lowering the \
+         reservation will not help — use a smaller or quantized model (rocm-cli serves one \
+         model on a single GPU; it does not shard a model across GPUs).",
+        crate::VLLM_GPU_MEMORY_UTILIZATION_HINT
+    );
+    let fix = Fix {
+        summary,
+        // Byte-identical to the `fix-16-vllm-oom` catalog recipe's block, and
+        // pinned there by `the_oom_plan_matches_the_catalog_copy`. The two are
+        // one plan in two modules and a user may meet either copy.
+        commands: vec![
+            "# Case 1 -- shared/busy GPU (tenancy collision): lower the reservation,".to_owned(),
+            "# or steer vLLM onto a less-busy device:".to_owned(),
+            "rocm serve <model> --gpu-memory-utilization 0.5".to_owned(),
+            "rocm serve <model> --gpu <index>".to_owned(),
+            "# Case 2 -- the model genuinely does not fit: the reservation is not the".to_owned(),
+            "# problem; pick a smaller or quantized model (single-GPU serving only).".to_owned(),
+        ],
+        fix_id: "fix-16-vllm-oom".to_owned(),
+        verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup".to_owned(),
+        notes: vec![
+            "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.".to_owned(),
+            "This entry is keyword-matched from the error text: `rocm diagnose` cannot see per-GPU VRAM or tenancy, so pass the failure with --symptom (or arrive from the `rocm serve` failure note).".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(
+        "fix-16-vllm-oom",
+        "vLLM ran the GPU out of memory at startup",
+        score,
+        evidence,
+        fix,
+    )
+}
+
+/// A code object manager library that does not belong to the active runtime.
+///
+/// The rule is symmetric, and that is what makes it safe. Rather than asking
+/// "is this the wheel copy?" and then carving out an exception for the managed
+/// runtime, it asks one question of both libraries: **does the copy of
+/// `libamd_comgr` that would load belong to the same installation as the copy of
+/// `libamdhip64` that would load?** If it does, there is nothing wrong, whichever
+/// installation that is.
+///
+/// Every case falls out of that instead of being legislated. A healthy managed
+/// install takes both libraries from the managed runtime, so nothing differs and
+/// nothing is reported -- no special case required. A user who has put a wheel's
+/// library directory on the search path while the runtime still resolves to the
+/// system install takes them from two different places, and that is the failure.
+///
+/// A control written as an exception is a rule that has not been stated
+/// correctly yet.
+fn check_18_comgr_conflict(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-18-comgr-conflict";
+    const TITLE: &str = "code object manager library does not belong to the active HIP runtime";
+
+    let (Some(comgr), Some(hip)) = (e.comgr_selected.as_ref(), e.hip_selected.as_ref()) else {
+        // Nothing to compare. A machine with no ROCm at all is not a machine
+        // with a conflict, and saying otherwise would be the worst kind of false
+        // report: confident, and about something that is not there.
+        return zero(ID, TITLE);
+    };
+    // The same rule `probe_comgr` uses to compute `comgr_matches_runtime`. Calling
+    // it here rather than restating the conditions is what keeps `rocm examine
+    // --json` and this finding from disagreeing about one machine: an
+    // unattributed copy, a runtime with no code object manager of its own to
+    // prefer, or the two already agreeing are all `None`/`Some(true)` here and
+    // "nothing to report" below, exactly as they are for that field.
+    if crate::examine::comgr_matches_runtime(&e.comgr_paths, Some(comgr), Some(hip)) != Some(false)
+    {
+        return zero(ID, TITLE);
+    }
+    let Some(matching) = e
+        .comgr_paths
+        .iter()
+        .find(|copy| copy.install_root == hip.install_root)
+    else {
+        // Unreachable: `comgr_matches_runtime` only returns `Some(false)` when
+        // this search succeeds. Kept as a guard rather than an `unwrap` so a
+        // future change to either function fails safely instead of panicking.
+        return zero(ID, TITLE);
+    };
+
+    let mut score = 60;
+    let mut evidence = vec![
+        format!(
+            "the code object manager that would load is {} (from {})",
+            comgr.path, comgr.install_root
+        ),
+        format!(
+            "the HIP runtime that would load is {} (from {})",
+            hip.path, hip.install_root
+        ),
+        format!(
+            "{} also ships a code object manager at {}",
+            hip.install_root, matching.path
+        ),
+    ];
+    if !comgr.version.is_empty() && !matching.version.is_empty() {
+        evidence.push(format!(
+            "versions differ: {} would load, the runtime ships {}",
+            comgr.version, matching.version
+        ));
+    }
+    // Said out loud because the answer depends on which process asks, and
+    // because that answer changes what the `export` below is worth.
+    // `find_library_copies` checks `active-runtime` directories first -- that
+    // is a served child's search order (`rocm serve`/`rocm chat`), not a
+    // plain shell's. When neither selection came from there, the measurement
+    // really is the plain shell the user's own command ran in, and the
+    // `export` is the whole fix. When either did, that half of the
+    // measurement reflects what the active managed runtime (and anything it
+    // serves) loads, not a plain shell -- and a shell `export` is not
+    // guaranteed to reach a served child that prepends its own runtime's
+    // directories ahead of `LD_LIBRARY_PATH`.
+    let active_runtime_involved =
+        comgr.source == "active-runtime" || hip.source == "active-runtime";
+    evidence.push(if active_runtime_involved {
+        "an active managed runtime decided part of this: rocm serve/rocm chat would see this \
+         result, a plain shell might not"
+            .to_owned()
+    } else {
+        "this describes the environment as it stands outside the CLI's managed runtimes".to_owned()
+    });
+
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_COMGR_CONFLICT);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    let mut notes = vec![crate::fix::COMGR_CONFLICT_NEITHER_OPTION_RECOMMENDED.to_owned()];
+    if active_runtime_involved {
+        notes.push(
+            "rocm serve/rocm chat prepend the active managed runtime's own directories ahead \
+             of LD_LIBRARY_PATH, so the export below may not change what they load; \
+             reinstalling or repairing that runtime so it ships its own code object manager is \
+             the fix that reaches it directly."
+                .to_owned(),
+        );
+    }
+
+    let fix = Fix {
+        summary:
+            "Make the code object manager and the HIP runtime come from the same installation."
+                .to_owned(),
+        commands: vec![
+            format!("# The library that would load: {}", comgr.real_path),
+            format!("# The runtime that would load: {}", hip.real_path),
+            format!("# The runtime's own copy:      {}", matching.real_path),
+            "# Either keep one stack and remove the other, or order the search".to_owned(),
+            "# path so the runtime's own copy is found first:".to_owned(),
+            format!(
+                "export LD_LIBRARY_PATH=\"{}:$LD_LIBRARY_PATH\"",
+                std::path::Path::new(&matching.real_path)
+                    .parent()
+                    .map_or_else(String::new, |dir| dir.to_string_lossy().into_owned())
+            ),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "python -c \"import torch; torch.zeros(1, device='cuda')\"".to_owned(),
+        notes,
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
 }
 
 /// The vLLM engine-startup import failure (EAI-8012).
@@ -1459,7 +1901,6 @@ fn check_17_torch_dlpack_cuda_variant(_e: &Examination, symptom: &str) -> Diagno
             "rocm engines install vllm --reinstall".to_owned(),
         ],
         fix_id: "fix-17-torch-dlpack".to_owned(),
-        auto_applicable: false,
         verify: "rocm serve <model> --engine vllm   # then `rocm services list --all` and `rocm services logs <service-id>` to confirm the import no longer aborts".to_owned(),
         notes: vec![
             "Running vLLM on ROCm is not by itself a reason to apply this. The trigger is narrow: a ROCm build of torch in the 2.4-2.9 range (the versions torch-c-dlpack-ext ships prebuilts for), torch without a native __dlpack_c_exchange_api__, and torch-c-dlpack-ext present -- it arrives as a transitive dependency of tilelang, which vLLM pins.".to_owned(),
@@ -1561,7 +2002,6 @@ fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: ID.to_owned(),
-        auto_applicable: false,
         verify: "df -h /dev/shm".to_owned(),
         notes: vec![
             "A running container cannot have its allowance changed; it has to be started again."
@@ -1696,7 +2136,6 @@ fn check_wsl_1_gpu_not_exposed(e: &Examination, symptom: &str) -> Diagnosis {
         summary: "Expose the GPU to the distro: /dev/dxg is how WSL reaches it, and nothing works until it is there.".to_owned(),
         commands,
         fix_id: "fix-wsl-1-gpu-not-exposed".to_owned(),
-        auto_applicable: false,
         verify: "ls -l /dev/dxg".to_owned(),
         notes,
         ..Fix::default()
@@ -1741,7 +2180,6 @@ fn check_wsl_2_dxcore_missing(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-2-dxcore-missing".to_owned(),
-        auto_applicable: false,
         verify: "ls -l /usr/lib/wsl/lib/libdxcore.so && ldconfig -p | grep libdxcore".to_owned(),
         notes: vec![
             "/usr/lib/wsl is mounted by WSL itself, not installed by the distro's package manager, so apt cannot repair it -- the fix is on the Windows side.".to_owned(),
@@ -1786,7 +2224,6 @@ fn check_wsl_3_rocdxg_missing(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         needs_sudo: true,
         fix_id: "fix-wsl-3-rocdxg-missing".to_owned(),
-        auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
             "This downloads and installs a .deb with sudo, so `rocm fix` prints it rather than running it. `rocm install driver` shows the full plan, and checks the download against a digest pinned for that ROCDXG release.".to_owned(),
@@ -1831,7 +2268,6 @@ fn check_wsl_4_rocdxg_not_linked(e: &Examination, symptom: &str) -> Diagnosis {
         commands: vec!["sudo ldconfig".to_owned()],
         needs_sudo: true,
         fix_id: "fix-wsl-4-rocdxg-not-linked".to_owned(),
-        auto_applicable: false,
         verify: "ldconfig -p | grep librocdxg".to_owned(),
         notes: vec![
             "If `ldconfig` alone does not fix it, the install went somewhere outside the linker's search path: add that directory under /etc/ld.so.conf.d/ and re-run.".to_owned(),
@@ -1868,7 +2304,6 @@ fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --install -d Ubuntu-24.04".to_owned(),
         ],
         fix_id: "fix-wsl-5-distro-too-old".to_owned(),
-        auto_applicable: false,
         verify: "grep VERSION_ID /etc/os-release".to_owned(),
         notes: vec![
             "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
@@ -1967,7 +2402,6 @@ fn check_wsl_6_host_driver_too_old(e: &Examination, symptom: &str) -> Diagnosis 
             "#   install a WSL-capable AMD Adrenalin driver, then `wsl --shutdown`.".to_owned(),
         ],
         fix_id: "fix-wsl-6-host-driver-too-old".to_owned(),
-        auto_applicable: false,
         verify: "rocminfo | head -n 20".to_owned(),
         notes: vec![
             format!("Driver and ROCm version pairing: {WSL_DOCS_URL}"),
@@ -2000,7 +2434,6 @@ fn check_wsl_7_wsl1(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --set-default-version 2".to_owned(),
         ],
         fix_id: "fix-wsl-7-wsl1".to_owned(),
-        auto_applicable: false,
         verify: "uname -r".to_owned(),
         notes: vec![
             "Converting rewrites the distro's filesystem and can take a while on a large install; back up anything you cannot lose first.".to_owned(),
@@ -2046,9 +2479,10 @@ const CHECKERS: &[Checker] = &[
     (check_13_hip_sdk_missing, &["windows"]),
     (check_14_adrenalin_too_old, &["windows"]),
     (check_15_msvc_redist, &["windows"]),
+    (check_16_vllm_oom, &["linux", "wsl"]),
     // Linux-only: `libtorch_cuda.so` is an ELF name, and the vLLM engine is
     // gated off native Windows. 17 rather than 16 because the vLLM
-    // out-of-memory entry reserves 16 on its own branch; the number is a stable
+    // out-of-memory entry above already holds 16; the number is a stable
     // handle, so the two do not get to share one.
     (check_17_torch_dlpack_cuda_variant, &["linux"]),
     (check_wsl_1_gpu_not_exposed, WSL_ONLY),
@@ -2058,11 +2492,16 @@ const CHECKERS: &[Checker] = &[
     (check_wsl_5_distro_too_old, WSL_ONLY),
     (check_wsl_6_host_driver_too_old, WSL_ONLY),
     (check_wsl_7_wsl1, WSL_ONLY),
-    // Both families, opting in explicitly as the platform split requires. The
-    // shortage has nothing to do with `amdgpu` or `/dev/kfd` -- it is the size
-    // of a tmpfs -- and WSL2 ships the same 64 MB default a container does, so
-    // leaving this tagged `linux` alone would silence it on one of the two
-    // platforms most likely to have it.
+    // Both families, opting in explicitly as the platform split requires. Which
+    // copy of a library the loader picks is not a question about the amdgpu
+    // module or the Windows host driver -- a wheel copy and a system copy
+    // collide on WSL2 exactly as they do on bare metal. Windows is deferred
+    // until this has proved the approach.
+    (check_18_comgr_conflict, &["linux", "wsl"]),
+    // Both families, for the same reason. The shortage has nothing to do with
+    // `amdgpu` or `/dev/kfd` -- it is the size of a tmpfs -- and WSL2 ships the
+    // same 64 MB default a container does, so leaving this tagged `linux` alone
+    // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
 ];
 
@@ -2115,6 +2554,20 @@ fn catalog_covers(e: &Examination) -> bool {
         .any(|(_, applicable)| applicable.contains(&family))
 }
 
+/// Where to report something this CLI could not answer.
+///
+/// The one place a `Route` is built, so every command that has to say "I don't
+/// recognise this" sends the user to the same tracker for the same target —
+/// `rocm diagnose --model` has the same problem for a model the catalog does not
+/// carry as `rocm diagnose` has for a symptom it does not recognise.
+#[must_use]
+pub fn upstream_route(target: &str) -> Route {
+    Route {
+        target: target.to_owned(),
+        url: upstream_tracker(target).to_owned(),
+    }
+}
+
 /// Where to send a user when nothing in the catalog matched.
 ///
 /// Keyed off the *host-detected* framework, which `Examination::probe` only
@@ -2132,10 +2585,7 @@ fn route_when_no_match(e: &Examination) -> Route {
         "llama-cpp" => "llama-cpp",
         _ => "rocm-core",
     };
-    Route {
-        target: target.to_owned(),
-        url: upstream_tracker(target).to_owned(),
-    }
+    upstream_route(target)
 }
 
 /// Diagnose an examination against the closed catalog.
@@ -2145,16 +2595,21 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
     // in the catalog now, with its own entries; what keeps the bare-metal checks
     // off it is `platform_family`, not a special case at this level.
     //
+    // `fix-16-vllm-oom` opts into `wsl` in CHECKERS for that reason: it is a
+    // keyword-only check whose failure mode is just as real under WSL2, so it
+    // still answers there alongside the WSL entries.
+    //
     // `out_of_scope` still exists, for the platforms that genuinely have no
     // entries. That case used to fall through to an empty catalog and report "no
     // known misconfiguration", which reads as "your machine looks fine" when the
     // truth is that nothing was ever checked.
     let out_of_scope = uncovered_platform_message(e);
-    let matched = if out_of_scope.is_some() {
+    let mut matched = if out_of_scope.is_some() {
         Vec::new()
     } else {
         run_all_checks(e, symptom)
     };
+    take_applicability_from_the_catalog(&mut matched, platform_family(e));
     DiagnoseReport {
         has_match: any_cleared_threshold(&matched),
         matched,
@@ -2162,6 +2617,36 @@ pub fn diagnose(e: &Examination, symptom: &str) -> DiagnoseReport {
         high_confidence_threshold: HIGH_CONFIDENCE,
         route_when_no_match: route_when_no_match(e),
         out_of_scope,
+        model: None,
+    }
+}
+
+/// Fill each finding's applicability from the catalog, for the operating system
+/// of the machine that was examined.
+///
+/// One place, deliberately. Every checker used to state `auto_applicable` by
+/// hand, which meant the catalog's answer existed twice in two modules with
+/// nothing comparing them — and they had already drifted: `fix-9-igpu-dgpu` was
+/// auto-applicable in the catalog and, in the Linux arm of its own checker,
+/// not. Deriving it here makes that disagreement unrepresentable rather than
+/// something a test has to go looking for.
+///
+/// Keyed on the examined machine's platform *family*, not the running host and
+/// not `os_family`. WSL reports an `os_family` of `linux` but is its own family
+/// for catalog purposes, so reading `os_family` here would look up every WSL
+/// recipe under the wrong platform and silently report them all as print-only.
+fn take_applicability_from_the_catalog(matched: &mut [Diagnosis], platform_family: &str) {
+    for diagnosis in matched.iter_mut() {
+        let Some(fix) = diagnosis.fix.as_mut() else {
+            continue;
+        };
+        // An entry the catalog does not list for this OS keeps the default:
+        // the CLI will not act on it here, which is exactly what the OS gate in
+        // `fix::apply` would tell the user.
+        let class = crate::fix::class_on(&fix.fix_id, platform_family).unwrap_or_default();
+        fix.class = class;
+        fix.auto_applicable = class.applies_itself();
+        fix.needs = crate::fix::needs_on(&fix.fix_id, platform_family).map(ToOwned::to_owned);
     }
 }
 
@@ -2236,7 +2721,8 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
                 fix.needs_sudo,
                 fix.needs_reboot,
                 fix.needs_relogin,
-                fix.auto_applicable,
+                fix.class,
+                fix.needs.as_deref(),
             );
             let _ = writeln!(out, "   flags: {}", flags.join(", "));
             for n in &fix.notes {
@@ -2359,6 +2845,37 @@ mod tests {
             "this remedy offers an index older than ROCm {OLDEST_ROCM_MAJOR_THE_CLI_INSTALLS}, \
              which this CLI installs. A user who picks that line installs a torch for a major \
              they do not have, and this same check fires again on the result: {stale:?}"
+        );
+    }
+
+    /// `take_applicability_from_the_catalog` is the only place that may fill in
+    /// `Fix::auto_applicable`. Every checker used to set it by hand instead --
+    /// twenty of them were converted to leave it at `Fix::default()` and let the
+    /// catalog fill it in, but the shared-memory and WSL checkers kept the
+    /// inline `auto_applicable: false,` a while longer. It never produced wrong
+    /// output, because the catalog pass overwrites whatever a checker sets --
+    /// which is exactly the problem: a checker disagreeing with the catalog
+    /// again (the way `fix-9-igpu-dgpu` once did) would be silently masked
+    /// rather than caught. A behavioral test can't see this, since the output
+    /// is correct either way; this reads the checkers' own source instead, so a
+    /// hand-set boolean is caught before it can start drifting unnoticed.
+    #[test]
+    fn no_checker_hand_sets_auto_applicable() {
+        let source = include_str!("diagnose.rs");
+        let offenders: Vec<&str> = source
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("auto_applicable: true")
+                    || trimmed.starts_with("auto_applicable: false")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a Fix literal is hand-setting `auto_applicable` again -- only \
+             `take_applicability_from_the_catalog` may set this field; every checker must \
+             leave it at `Fix::default()` and let the catalog fill it in, or the catalog and \
+             the checker can silently drift the way fix-9-igpu-dgpu once did:\n{offenders:#?}"
         );
     }
 
@@ -2535,6 +3052,85 @@ mod tests {
         }
     }
 
+    /// A library copy belonging to `install_root`, sitting at `path`.
+    fn copy_in(install_root: &str, path: &str, version: &str) -> crate::examine::LibraryCopy {
+        crate::examine::LibraryCopy {
+            path: path.to_owned(),
+            real_path: path.to_owned(),
+            version: version.to_owned(),
+            source: "test".to_owned(),
+            install_root: install_root.to_owned(),
+        }
+    }
+
+    /// Like `copy_in`, but with an explicit loader-search source instead of
+    /// the default `"test"` -- needed to exercise the branches in fix-18 that
+    /// key off which tier a selection came from.
+    fn copy_in_with_source(
+        source: &str,
+        install_root: &str,
+        path: &str,
+        version: &str,
+    ) -> crate::examine::LibraryCopy {
+        crate::examine::LibraryCopy {
+            source: source.to_owned(),
+            ..copy_in(install_root, path, version)
+        }
+    }
+
+    fn comgr_finding(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-18-comgr-conflict")
+    }
+
+    #[test]
+    fn a_code_object_manager_from_another_installation_is_reported() {
+        // The failure this entry exists for: the runtime resolves to the system
+        // install while the library that compiles device code for it comes from
+        // a wheel, and the error the user sees names neither.
+        let mut e = linux_base();
+        let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        e.comgr_selected = Some(wheel.clone());
+        e.comgr_paths = vec![wheel, system];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        let report = diagnose(&e, "");
+        let finding = comgr_finding(&report).expect("the mismatch must be reported");
+
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "a mismatch established from machine state alone has to clear the \
+             threshold without help from the symptom text: {}",
+            finding.score
+        );
+        let fix = finding.fix.as_ref().expect("the finding must carry a plan");
+        assert!(
+            !fix.auto_applicable,
+            "both remedies can break a working Python environment, so nothing here \
+             may be applied for the user"
+        );
+        let evidence = finding.evidence.join("\n");
+        for expected in [
+            "/wheel/lib/libamd_comgr.so.2",
+            "/opt/rocm",
+            "2.8.0",
+            "3.0.0",
+        ] {
+            assert!(
+                evidence.contains(expected),
+                "the report has to name each copy, where it came from and its \
+                 version -- `{expected}` is missing:\n{evidence}"
+            );
+        }
+    }
+
     #[test]
     fn a_partly_used_allowance_reports_what_is_left_as_well_as_the_size() {
         // The two numbers answer different questions, and the evidence only
@@ -2579,6 +3175,40 @@ mod tests {
     }
 
     #[test]
+    fn a_healthy_managed_installation_raises_no_report() {
+        // The control, and the reason the rule is stated symmetrically. A managed
+        // runtime spreads its libraries across separate `_rocm_sdk_*` packages
+        // that sit *beside* each other under one `site-packages` -- not nested
+        // under the runtime's own root (`_rocm_sdk_devel`) at all -- so the two
+        // copies sit in different directories of ONE installation. Anything
+        // that decided ownership by walking up from the file would call these
+        // two installations and fire on the most common install we ship. (A
+        // fixture nesting `_rocm_sdk_core` under the root, the shape the
+        // installer never produces, would pass by construction without
+        // proving that -- this one matches `apps/rocm/src/therock.rs`'s
+        // `ROCM_SDK_PROBE_SCRIPT` instead.)
+        let mut e = linux_base();
+        let root = "/data/runtimes/therock/_rocm_sdk_devel";
+        let comgr = copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_core/lib/libamd_comgr.so.2",
+            "2.8.0",
+        );
+        e.comgr_selected = Some(comgr.clone());
+        e.comgr_paths = vec![comgr];
+        e.hip_selected = Some(copy_in(
+            root,
+            "/data/runtimes/therock/_rocm_sdk_devel/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "both libraries come from one installation, so there is no conflict"
+        );
+    }
+
+    #[test]
     fn an_unmeasured_shared_memory_allowance_is_not_reported() {
         // Unknown is not zero. `None` means the path was absent or the query
         // failed, and a shortage reported on that basis would be a finding about
@@ -2590,6 +3220,31 @@ mod tests {
         assert!(
             shm_finding(&diagnose(&e, "")).is_none(),
             "a machine that could not be measured is not a machine with a shortage"
+        );
+    }
+
+    #[test]
+    fn a_second_copy_that_does_not_load_raises_no_report() {
+        // Holding two copies is not a fault. Only the one that loads matters.
+        let mut e = linux_base();
+        let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(winner.clone());
+        e.comgr_paths = vec![winner, loser];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the copy that loads belongs to the runtime, so nothing is wrong"
+        );
+        assert_eq!(
+            e.comgr_paths.len(),
+            2,
+            "the machine report still lists both copies; only the diagnosis stays quiet"
         );
     }
 
@@ -2622,6 +3277,204 @@ mod tests {
             "knowing it is a container makes the cause certain, so it should rank \
              higher there: {inside} vs {outside}"
         );
+    }
+
+    #[test]
+    fn nothing_is_reported_when_there_is_nothing_to_compare() {
+        // A machine with no ROCm is not a machine with a conflict. Reporting one
+        // would be the worst kind of false finding: confident, and about
+        // something that is not there.
+        let cases = [
+            ("neither library found", None, None),
+            (
+                "no runtime to attribute the library to",
+                Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3")),
+                None,
+            ),
+            (
+                "a copy no known installation claims",
+                Some(copy_in("", "/somewhere/libamd_comgr.so.3", "3")),
+                Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                )),
+            ),
+        ];
+        for (case, comgr, hip) in cases {
+            let mut e = linux_base();
+            e.comgr_paths = comgr.iter().cloned().collect();
+            e.comgr_selected = comgr;
+            e.hip_selected = hip;
+            assert!(
+                comgr_finding(&diagnose(&e, "")).is_none(),
+                "{case}: reported a conflict it could not have established"
+            );
+        }
+    }
+
+    #[test]
+    fn a_runtime_with_no_copy_of_its_own_is_not_a_conflict() {
+        // The second half of the rule. Without a copy belonging to the runtime
+        // there is nothing to switch to, so the advice would be empty -- and the
+        // machine is simply one where the only copy lives elsewhere.
+        let mut e = linux_base();
+        let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+        e.comgr_selected = Some(only.clone());
+        e.comgr_paths = vec![only];
+        e.hip_selected = Some(copy_in(
+            "/opt/rocm",
+            "/opt/rocm/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        assert!(
+            comgr_finding(&diagnose(&e, "")).is_none(),
+            "the runtime ships no code object manager of its own, so there is no \
+             alternative to point the user at"
+        );
+    }
+
+    #[test]
+    fn an_active_runtime_s_own_hip_without_its_own_comgr_notes_the_scope_limit() {
+        // Reachable, not theoretical: a managed runtime can ship its own HIP
+        // runtime while leaning on the system's code object manager. Then
+        // `hip_selected` comes from the `active-runtime` tier -- the order a
+        // served child (`rocm serve`/`rocm chat`) consults, not a plain
+        // shell's -- so the finding must say so instead of claiming the
+        // plain-shell sentence, and the `export` remedy must carry a caveat
+        // that it may not reach that served child.
+        let mut e = linux_base();
+        let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+        let runtime_comgr = copy_in(
+            "/data/runtimes/therock",
+            "/data/runtimes/therock/lib/libamd_comgr.so.2",
+            "2.8.0",
+        );
+        e.comgr_selected = Some(system.clone());
+        e.comgr_paths = vec![system, runtime_comgr];
+        e.hip_selected = Some(copy_in_with_source(
+            "active-runtime",
+            "/data/runtimes/therock",
+            "/data/runtimes/therock/lib/libamdhip64.so.6",
+            "6.4",
+        ));
+
+        let report = diagnose(&e, "");
+        let finding = comgr_finding(&report).expect("the mismatch must be reported");
+        let evidence = finding.evidence.join("\n");
+        assert!(
+            evidence.contains("active managed runtime decided part of this"),
+            "the evidence must own up to the active-runtime tier rather than claim a \
+             plain shell measured it:\n{evidence}"
+        );
+        assert!(
+            !evidence.contains("outside the CLI's managed runtimes"),
+            "the plain-shell sentence must not be printed when the measurement is \
+             not a plain shell's:\n{evidence}"
+        );
+        let notes = finding
+            .fix
+            .as_ref()
+            .expect("the finding must carry a plan")
+            .notes
+            .join("\n");
+        assert!(
+            notes.contains("may not change what they load"),
+            "the remedy has to say it might not reach a served child:\n{notes}"
+        );
+    }
+
+    #[test]
+    fn comgr_matches_runtime_never_disagrees_with_the_diagnosis() {
+        // `rocm examine --json`'s `comgr_matches_runtime` and `rocm diagnose`'s
+        // fix-18 finding answer the same question about the same machine. Both
+        // are driven by `comgr_matches_runtime` in `examine.rs`, so this checks
+        // the two surfaces stay in lockstep across every shape the catalog
+        // itself tests -- including the case that used to disagree: a runtime
+        // whose own installation ships no code object manager at all.
+        let cases: Vec<(&str, Examination)> = vec![
+            ("neither library found", linux_base()),
+            {
+                let mut e = linux_base();
+                e.comgr_selected =
+                    Some(copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3"));
+                e.comgr_paths = vec![e.comgr_selected.clone().unwrap()];
+                ("no runtime to attribute the library to", e)
+            },
+            {
+                let mut e = linux_base();
+                let unattributed = copy_in("", "/somewhere/libamd_comgr.so.3", "3");
+                e.comgr_selected = Some(unattributed.clone());
+                e.comgr_paths = vec![unattributed];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a copy no known installation claims", e)
+            },
+            {
+                // The disagreement this test guards against: the runtime's own
+                // install ships no comgr copy of its own to switch to.
+                let mut e = linux_base();
+                let only = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(only.clone());
+                e.comgr_paths = vec![only];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a runtime with no copy of its own", e)
+            },
+            {
+                let mut e = linux_base();
+                let winner = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                let loser = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                e.comgr_selected = Some(winner.clone());
+                e.comgr_paths = vec![winner, loser];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("the copy that loads already belongs to the runtime", e)
+            },
+            {
+                let mut e = linux_base();
+                let wheel = copy_in("/wheel", "/wheel/lib/libamd_comgr.so.2", "2.8.0");
+                let system = copy_in("/opt/rocm", "/opt/rocm/lib/libamd_comgr.so.3", "3.0.0");
+                e.comgr_selected = Some(wheel.clone());
+                e.comgr_paths = vec![wheel, system];
+                e.hip_selected = Some(copy_in(
+                    "/opt/rocm",
+                    "/opt/rocm/lib/libamdhip64.so.6",
+                    "6.4",
+                ));
+                ("a genuine conflict", e)
+            },
+        ];
+
+        for (case, e) in cases {
+            let matches_runtime = crate::examine::comgr_matches_runtime(
+                &e.comgr_paths,
+                e.comgr_selected.as_ref(),
+                e.hip_selected.as_ref(),
+            );
+            let diagnosis_fires = comgr_finding(&diagnose(&e, "")).is_some();
+            assert_eq!(
+                matches_runtime == Some(false),
+                diagnosis_fires,
+                "{case}: comgr_matches_runtime={matches_runtime:?} but the \
+                 diagnosis {}",
+                if diagnosis_fires {
+                    "fired"
+                } else {
+                    "did not fire"
+                }
+            );
+        }
     }
 
     #[test]
@@ -2838,6 +3691,28 @@ mod tests {
     }
 
     #[test]
+    fn the_oom_plan_matches_the_catalog_copy() {
+        // Same two-copies-of-one-plan risk as `fix-17-torch-dlpack`, and it had
+        // already opened: the executable lines agreed, so the cross-check over
+        // the fixes shared with the catalog
+        // (`diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids`)
+        // saw nothing -- it filters `#` lines by construction -- while the comments explaining
+        // *which of the two faults each step addresses* had drifted apart. That
+        // prose is the whole point of this entry: the two faults need opposite
+        // responses, so a user meeting the `diagnose` copy and a user meeting
+        // the `rocm fix` copy must be told the same thing.
+        let report = diagnose(&linux_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        let fix = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .and_then(|d| d.fix.as_ref())
+            .expect("the finding must carry a plan");
+        let commands: Vec<&str> = fix.commands.iter().map(String::as_str).collect();
+        crate::fix::assert_plan_matches_the_catalog_copy(&fix.fix_id, &commands);
+    }
+
+    #[test]
     fn the_extension_name_alone_does_not_establish_the_variant_failure() {
         // The extension appearing in a traceback says it is involved, not that
         // it loaded the CUDA variant. Holding this under the threshold is what
@@ -3048,9 +3923,11 @@ mod tests {
                     .fix
                     .as_ref()
                     .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
-                let catalog = crate::fix::auto_applicable_for(&fix.fix_id).unwrap_or_else(|| {
-                    panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
-                });
+                let catalog = crate::fix::class_on(&fix.fix_id, os)
+                    .unwrap_or_else(|| {
+                        panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
+                    })
+                    .applies_itself();
                 assert_eq!(
                     fix.auto_applicable, catalog,
                     "{os}/{}: diagnose reports auto_applicable={}, but the fix catalog \
@@ -3147,7 +4024,7 @@ mod tests {
             "note must not repeat the old wrong gfx-number heuristic: {note}"
         );
         assert!(
-            note.contains("--device-index"),
+            note.contains("Without --device-index") && !note.contains("marked AUTO"),
             "note must warn that fix-9 is a no-op without --device-index: {note}"
         );
     }
@@ -3226,15 +4103,20 @@ mod tests {
     }
 
     #[test]
-    fn fix_9_igpu_dgpu_is_auto_applicable_on_linux() {
-        // `check_9_igpu_dgpu_collision`'s Linux/else branch sets
-        // `auto_applicable: true` to match the `fix-9-igpu-dgpu` FixRecipe in
-        // fix.rs (`run_hip_visible_devices` already handles it on Linux). This
-        // is a behavioural change, not text-only: it flips both the `Fix`
-        // struct field that `rocm diagnose --json` serialises and the
-        // `flags:` line `render_report_text` prints. Pin it directly so a
-        // regression back to `false` (the pre-fix value) fails here instead of
-        // only being visible by eyeballing output.
+    fn fix_9_igpu_dgpu_waits_for_an_argument_rather_than_claiming_it_will_act() {
+        // This pinned `auto_applicable: true` until the catalog gained a class.
+        // The claim was wrong: asked plainly, both arms of
+        // `run_hip_visible_devices` print the query that identifies the discrete
+        // GPU and return without touching the machine, so a user -- and an agent
+        // reading the same output -- was told a change was coming that never
+        // came, and given exit 0 to confirm it. The entry is NEEDS-ARG: it acts
+        // only once `--device-index` names a target.
+        //
+        // Kept pinned for the original reason, with the expectation corrected.
+        // It still flips the `Fix` field `rocm diagnose --json` serialises and
+        // the `flags:` line `render_report_text` prints, so a regression back to
+        // an unconditional auto claim fails here rather than needing someone to
+        // eyeball the output.
         let mut e = linux_base();
         e.has_apu = true;
         e.has_discrete_amd = true;
@@ -3260,8 +4142,14 @@ mod tests {
             .expect("iGPU+dGPU collision should be diagnosed");
         let fix = hit.fix.as_ref().unwrap();
         assert!(
-            fix.auto_applicable,
-            "fix-9-igpu-dgpu must be auto_applicable on Linux, matching the fix.rs catalog"
+            !fix.auto_applicable,
+            "fix-9-igpu-dgpu does nothing until it is told which device to pin, so the report \
+             must not say the CLI will carry it out"
+        );
+        assert_eq!(
+            fix.class,
+            crate::fix::FixClass::NeedsArgument,
+            "the report's class has to be the catalog's class for this entry on Linux"
         );
 
         let text = render_report_text(&report, report.matched.len());
@@ -3274,27 +4162,30 @@ mod tests {
             .iter()
             .find(|l| l.trim_start().starts_with("flags:"))
             .expect("fix-9-igpu-dgpu should have a flags: line");
-        // Exact match, not `contains`: fix-9 carries only the auto flag, so a
-        // revert of the `render_report_text` call site to its pre-PR inline
-        // logic would still print a line containing "rocm fix can run it" and
-        // not "manual only" -- `contains` can't tell the two implementations
-        // apart. See `fix_11_iommu_rendered_flags_line_is_exact` for a fix-id
-        // whose optional flags actually differ between old and new wording.
+        // Exact match, not `contains`: fix-9 carries only the class flag, and
+        // the whole point of the class is that "will not run it" has more than
+        // one reason. A `contains` check would pass against the print-only
+        // wording, which would send the user off to run the steps by hand when
+        // the CLI will in fact do it for them once given the argument. The
+        // argument is named rather than described, which is why this text comes
+        // from the catalog and not from a literal here.
         assert_eq!(
             flags_line.trim_start(),
-            "flags: rocm fix can run it",
+            "flags: needs --device-index before `rocm fix` will run it",
             "rendered flags: line for fix-9-igpu-dgpu: {flags_line}"
         );
     }
 
     #[test]
     fn fix_11_iommu_rendered_flags_line_is_exact() {
-        // Companion to `fix_9_igpu_dgpu_is_auto_applicable_on_linux`: that test
-        // only pins a fix-id with just the auto flag set, which an exact-match
-        // assertion can't distinguish from the pre-PR `render_report_text`
-        // inline logic (both print "rocm fix can run it" for it). fix-11-iommu
-        // carries sudo+reboot+manual, so this pins the full comma-joined,
-        // reworded `flags:` line through the real render call site.
+        // Companion to
+        // `fix_9_igpu_dgpu_waits_for_an_argument_rather_than_claiming_it_will_act`:
+        // that test only pins a fix-id with a single class flag and no
+        // sudo/reboot/relogin flags set, which an exact-match assertion can't
+        // distinguish from a render path that drops the comma-joining or
+        // misorders multiple flags. fix-11-iommu carries sudo+reboot+manual, so
+        // this pins the full comma-joined, reworded `flags:` line through the
+        // real render call site.
         let mut e = linux_base();
         e.iommu_kernel_param = "on".to_owned();
         e.gpus = vec![
@@ -3902,6 +4793,42 @@ mod tests {
     }
 
     #[test]
+    fn an_out_of_scope_report_never_carries_matched_entries() {
+        // The serialized JSON contract on `out_of_scope`: when it is set the
+        // catalog did not run, so `matched` cannot hold anything -- not even a
+        // weak sub-threshold signal. One direction only: a covered platform with
+        // nothing wrong also has an empty `matched`, with `out_of_scope` unset.
+        // Nothing else in the tree pins the pair, which is how the field's own
+        // doc comment came to claim the opposite. Two independent mechanisms
+        // uphold it today -- `diagnose` clears `matched` when `out_of_scope` is
+        // set, and `run_all_checks` filters on the same platform family
+        // `catalog_covers` consults -- so this fails once both are gone, which
+        // is exactly the "a checker somehow ran on an uncovered host" shape the
+        // JSON contract must not develop.
+        let mut uncovered = linux_base();
+        uncovered.os_family = "other".to_owned();
+        let mut windows = linux_base();
+        windows.os_family = "windows".to_owned();
+        for e in [linux_base(), wsl_base(), windows, uncovered] {
+            // A symptom that scores for at least one entry where the catalog
+            // applies, so "matched is empty" is a real consequence of the
+            // platform being uncovered rather than of a silent symptom.
+            let report = diagnose(&e, VLLM_OOM_CANONICAL_SYMPTOM);
+            assert!(
+                report.out_of_scope.is_none() || report.matched.is_empty(),
+                "out_of_scope set with matched entries on {}: {:?}",
+                e.os_family,
+                report.matched.iter().map(|d| &d.id).collect::<Vec<_>>()
+            );
+            assert!(
+                report.out_of_scope.is_none() || !report.has_match(),
+                "out_of_scope set alongside has_match on {}",
+                e.os_family
+            );
+        }
+    }
+
+    #[test]
     fn non_wsl_still_diagnoses_normally() {
         let mut e = linux_base();
         e.in_render_group = Some(false);
@@ -4065,6 +4992,603 @@ mod tests {
         ];
         let report = diagnose(&e, "");
         assert!(report.matched.iter().any(|d| d.id == "fix-11-iommu"));
+    }
+
+    #[test]
+    fn vllm_oom_signature_is_a_high_confidence_match() {
+        // The distinctive vLLM startup OOM: torch/HIP allocation failure, with
+        // the vLLM anchor that tells this apart from an arbitrary PyTorch OOM.
+        let report = diagnose(
+            &linux_base(),
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        let top = &report.matched[0];
+        assert_eq!(top.id, "fix-16-vllm-oom");
+        assert!(top.score >= HIGH_CONFIDENCE, "score was {}", top.score);
+        assert!(report.has_match());
+        // The remediation must stay conditional: the reservation knob is right
+        // for a tenancy collision and wrong for a model that does not fit.
+        let fix = top.fix.as_ref().unwrap();
+        assert!(!fix.auto_applicable, "OOM workaround must be print-only");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+        assert!(
+            fix.summary.contains("does not fit"),
+            "the 'genuinely does not fit' caveat must survive: {}",
+            fix.summary
+        );
+    }
+
+    #[test]
+    fn generic_pytorch_oom_without_a_vllm_signal_does_not_match() {
+        // The reviewed false positive: `torch.OutOfMemoryError: CUDA out of
+        // memory` scores 45+45=90 under the keyword table alone, but nothing
+        // about that string is vLLM-specific -- any ROCm PyTorch job emits the
+        // identical shape (ROCm's PyTorch build reports the CUDA-compat name).
+        // Without an explicit vLLM anchor, this failure mode must not fire.
+        let report = diagnose(&linux_base(), "torch.OutOfMemoryError: CUDA out of memory");
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "a bare framework OOM with no vLLM signal must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn torch_oom_class_alone_is_not_a_vllm_match() {
+        // `outofmemory` is nested inside the exception class name. It must not
+        // count as a second, independent signal and turn one token into a
+        // high-confidence vLLM diagnosis for an arbitrary PyTorch workload.
+        let report = diagnose(&linux_base(), "vllm: torch.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak keyword signal remains visible");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+        assert!(!report.has_match());
+    }
+
+    #[test]
+    fn a_bare_out_of_memory_stays_below_the_match_threshold() {
+        // Without the vLLM/HIP shape, "out of memory" alone must not claim this
+        // failure mode -- it scores (the `vllm` anchor is present and "out of
+        // memory" is a keyword), but stays below MIN_SCORE_FOR_MATCH.
+        let report = diagnose(&linux_base(), "vllm: the process was killed: out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the weak `out of memory` keyword signal must remain visible in `matched`");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare OOM must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn vllm_oom_is_not_available_on_native_windows() {
+        // vLLM is Linux/WSL-only (native Windows is unsupported), so the checker
+        // must not fire on a Windows examination even with the error text.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(&e, "vllm: torch.OutOfMemoryError: HIP out of memory.");
+        assert!(report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn vllm_oom_keyword_diagnosis_is_available_on_wsl() {
+        let mut e = linux_base();
+        e.is_wsl = true;
+        let report = diagnose(
+            &e,
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(report.out_of_scope.is_none());
+        assert!(report.has_match());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn wsl_sub_threshold_vllm_signal_is_preserved_in_matched() {
+        // A weak (sub-threshold) vLLM OOM signal on WSL must still surface in
+        // `matched` per the `DiagnoseReport::matched` contract: `run_all_checks`
+        // drops only zero-score results, so a score-25 mention is reported as a
+        // WEAK row rather than silently discarded.
+        //
+        // This used to also assert that the weak hit did not bury a WSL
+        // out-of-scope routing note. There is no such note any more -- WSL2 is a
+        // covered platform with its own catalog entries -- so what is left to pin
+        // is the half that still has teeth: the entry survives in `matched`, and
+        // it does not promote itself into a match.
+        //
+        // `wsl_base()` (a healthy WSL GPU stack) rather than a default
+        // examination: a default one has no /dev/dxg, so fix-wsl-1 would fire at
+        // 55 and the report would match for reasons that have nothing to do with
+        // the signal under test.
+        let report = diagnose(&wsl_base(), "vllm: out of memory");
+        assert!(!report.has_match());
+        assert!(
+            report.out_of_scope.is_none(),
+            "WSL2 is a covered platform, not an out-of-scope one"
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("a nonzero sub-threshold hit must stay in `matched`, not be dropped");
+        assert!(oom.score < MIN_SCORE_FOR_MATCH, "score was {}", oom.score);
+    }
+
+    #[test]
+    fn a_genuine_vllm_oom_match_on_wsl_is_surfaced_not_routed_out_of_scope() {
+        // The other side of the has_match gate: a real, at-or-above-threshold
+        // vLLM OOM on WSL is surfaced, and ranks top on a host whose own WSL GPU
+        // stack is healthy -- so the verdict is the OOM, not an incidental WSL
+        // finding.
+        let report = diagnose(&wsl_base(), VLLM_OOM_CANONICAL_SYMPTOM);
+        assert!(report.has_match());
+        assert!(report.out_of_scope.is_none());
+        assert_eq!(report.matched[0].id, "fix-16-vllm-oom");
+    }
+
+    #[test]
+    fn hip_error_out_of_memory_status_is_a_match() {
+        // Regression: `RuntimeError: hipErrorOutOfMemory` previously scored 0
+        // (`\boutofmemory\b` has no word boundary after `hipError`), so the
+        // engine printed a diagnose command that reported nothing.
+        let report = diagnose(&linux_base(), "vllm: RuntimeError: hipErrorOutOfMemory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("hipErrorOutOfMemory must now be recognized");
+        assert!(
+            oom.score >= MIN_SCORE_FOR_MATCH,
+            "hipErrorOutOfMemory should clear the threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn torch_cuda_module_path_oom_class_is_recognized() {
+        // Regression: ROCm's PyTorch reports the class under the `.cuda.` module
+        // path (`torch.cuda.OutOfMemoryError`); the class pattern must match it.
+        // It is still the (sub-threshold) class name, not a stronger message.
+        let report = diagnose(&linux_base(), "vllm: torch.cuda.OutOfMemoryError");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the torch.cuda.* class name must be recognized as evidence");
+        assert!(oom.score > 0, "score was {}", oom.score);
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "the bare class name must stay sub-threshold, got {}",
+            oom.score
+        );
+    }
+
+    #[test]
+    fn hip_out_of_memory_yields_a_single_evidence_line() {
+        // Overlap guard: "HIP out of memory" must not be counted both as the
+        // 50-point HIP message and the 25-point `out of memory` nested inside
+        // it. One phrase, one evidence bullet.
+        let report = diagnose(&linux_base(), "vllm: HIP out of memory");
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("HIP out of memory must match");
+        let fix = oom.fix.as_ref().unwrap();
+        let evidence_lines = oom
+            .evidence
+            .iter()
+            .filter(|e| e.to_lowercase().contains("out of memory"))
+            .count();
+        assert_eq!(
+            evidence_lines, 1,
+            "one phrase must yield one evidence line, got {:?}",
+            oom.evidence
+        );
+        assert_eq!(oom.score, 50, "the HIP message carries the match alone");
+        assert!(fix.summary.contains("--gpu-memory-utilization"));
+    }
+
+    #[test]
+    fn overlap_dedup_does_not_demote_other_catalog_keyword_tables() {
+        // The vLLM-OOM table needs overlapping spans collapsed ("out of memory"
+        // nested inside "HIP out of memory"). Other tables must NOT get that
+        // treatment: several of them pair a greedy `.*` pattern with a second,
+        // genuinely independent keyword, and the greedy span swallows the
+        // independent one. Collapsing there silently loses real diagnoses,
+        // because a keyword score can only fall.
+        //
+        // Each case below pins the score these tables produced before the
+        // de-duplication was introduced.
+
+        // `api-ms-win-crt-.*\.dll` (35) runs to the *last* `.dll` on the line,
+        // covering the independent `msvcp140.dll` (30). Two distinct missing
+        // DLLs, two signals -- 65 clears MIN_SCORE_FOR_MATCH, 35 does not.
+        let (score, ev) = keyword_score(
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+            KEYWORDS_MSVC_REDIST,
+        );
+        assert_eq!(
+            score, 65,
+            "two distinct missing DLLs are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `dkms .*failed` (45) spans the whole line, covering `dpkg: error` (25).
+        let (score, ev) = keyword_score(
+            "dkms status: dpkg: error processing amdgpu-dkms, build failed",
+            KEYWORDS_DPKG_BROKEN,
+        );
+        assert_eq!(
+            score, 70,
+            "a DKMS failure and a dpkg error are two signals: {ev:?}"
+        );
+        assert!(score >= MIN_SCORE_FOR_MATCH);
+
+        // `amdhip64.*not found` (50) spans past `could not find hip` (40):
+        // 90 is HIGH confidence, 50 is only a bare match.
+        let (score, ev) = keyword_score(
+            "amdhip64.dll: could not find hip runtime, not found",
+            KEYWORDS_HIP_SDK_MISSING,
+        );
+        assert_eq!(score, 90, "both HIP-SDK signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+
+        // `404.*repo\.radeon\.com` (50) runs to the *last* repo.radeon.com on
+        // the line, covering `unable to locate package rocm` (35).
+        let (score, ev) = keyword_score(
+            "e: failed to fetch https://repo.radeon.com/rocm/apt/jammy/release 404 not found, \
+             unable to locate package rocm, retrying https://repo.radeon.com/rocm/apt",
+            KEYWORDS_REPO_BROKEN,
+        );
+        assert_eq!(score, 85, "both apt-repo signals must count: {ev:?}");
+        assert!(score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn windows_missing_dll_pair_still_reaches_the_msvc_redist_fix() {
+        // The user-visible half of the guard above: with no PATH probe result
+        // (`msvc_redist_present == None`) the keyword score alone decides, so a
+        // demoted table makes fix-15 vanish from the report entirely.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            ..Examination::default()
+        };
+        let report = diagnose(
+            &e,
+            "api-ms-win-crt-runtime-l1-1-0.dll missing and msvcp140.dll not found",
+        );
+        let msvc = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("the MSVC redistributable fix must still be reported");
+        assert!(
+            msvc.score >= MIN_SCORE_FOR_MATCH,
+            "score was {}",
+            msvc.score
+        );
+        assert!(report.has_match());
+    }
+
+    #[test]
+    fn vllm_anchor_must_be_on_the_same_line_as_the_oom_token() {
+        // Co-occurrence anywhere is too loose: a paste that mentions vLLM on one
+        // line and an unrelated framework's OOM on another must not attribute
+        // the OOM to vLLM.
+        let report = diagnose(
+            &linux_base(),
+            "I installed vllm last week.\nToday my llama.cpp run died: CUDA out of memory",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on a different line from the vLLM mention must not match: {:?}",
+            report.matched
+        );
+        // The engine's emitted `vllm: <failing line>` keeps them on one line and
+        // still matches.
+        let anchored = diagnose(&linux_base(), "vllm: CUDA out of memory");
+        assert!(anchored.matched.iter().any(|d| d.id == "fix-16-vllm-oom"));
+    }
+
+    #[test]
+    fn only_the_anchored_lines_are_scored_not_the_whole_paste() {
+        // Regression: the anchor was a boolean *gate*, after which the entire
+        // symptom was scored. Regex matching ignores line boundaries, so a
+        // benign vLLM config echo on one line unlocked full-weight scoring of
+        // another framework's OOM on a different line: `cuda out of memory`
+        // (50) + `torch.outofmemoryerror` (45) do not overlap, so both survived
+        // collapsing for 95 -- above HIGH_CONFIDENCE -- and the user got a
+        // confident "vLLM ran the GPU out of memory" verdict for a llama.cpp
+        // failure. Only the anchored lines may be scored.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the anchored config line is still a (weak) vLLM signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "an unanchored framework's OOM must not score for vLLM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+        assert!(
+            oom.evidence
+                .iter()
+                .all(|e| !e.to_lowercase().contains("out of memory")),
+            "evidence must come from the anchored line only: {:?}",
+            oom.evidence
+        );
+
+        // Same shape with the anchored line carrying no OOM token at all: the
+        // unanchored OOM must not be borrowed to reach a verdict either.
+        let report = diagnose(
+            &linux_base(),
+            "starting vllm serve on gpu 0\n\
+             llama.cpp: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.21 GiB.",
+        );
+        assert!(
+            report.matched.iter().all(|d| d.id != "fix-16-vllm-oom"),
+            "an OOM on an unanchored line must not be attributed to vLLM: {:?}",
+            report.matched
+        );
+
+        // The control: once the OOM is on the anchored line, it still matches at
+        // full strength, so the scoping did not simply disable the checker.
+        let report = diagnose(
+            &linux_base(),
+            "vllm config: gpu_memory_utilization=0.9\n\
+             vllm: torch.OutOfMemoryError: CUDA out of memory",
+        );
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("an anchored OOM line must still match");
+        assert!(oom.score >= HIGH_CONFIDENCE, "score was {}", oom.score);
+    }
+
+    /// The `fix-16-vllm-oom` score for `symptom`, or 0 when it did not match.
+    fn vllm_oom_score(symptom: &str) -> i32 {
+        diagnose(&linux_base(), symptom)
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .map_or(0, |d| d.score)
+    }
+
+    #[test]
+    fn any_line_advance_is_a_boundary_not_scoreable_text() {
+        // Regression, in two rounds.
+        //
+        // The filter first used `str::lines()`, which splits on `\n` and `\r\n`
+        // only -- a lone `\r` is ordinary text to it. Every progress bar in this
+        // ecosystem (tqdm, pip, huggingface) repaints with a bare CR, and a
+        // pasted terminal capture is the expected way to use `--symptom`, so the
+        // whole capture collapsed into one "line": the vLLM anchor matched
+        // somewhere in it and another framework's OOM elsewhere in it scored at
+        // full weight. That is
+        // `only_the_anchored_lines_are_scored_not_the_whole_paste` defeated by
+        // one byte, and neither existing guard saw it because both use `\n`-only
+        // fixtures.
+        //
+        // Adding `\r` to the split fixed that byte and left the hole open for
+        // every other one. Measured on the round that did so: each separator
+        // below put the anchor and a llama.cpp OOM on genuinely separate
+        // rendered lines, and each scored 95 -- past a HIGH_CONFIDENCE of 75,
+        // citing the llama.cpp line's tokens as the evidence for a vLLM verdict.
+        // Hence a table rather than one test per byte: the property is "a line
+        // advance is a line advance", and enumerating it is what stops the next
+        // separator from reopening this.
+        for (label, sep) in [
+            ("LF", "\n"),
+            ("CR", "\r"),
+            ("CRLF", "\r\n"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("ESC D (IND)", "\u{1b}D"),
+            ("CSI 1 B (CUD)", "\u{1b}[1B"),
+            ("CSI H (CUP)", "\u{1b}[2;1H"),
+            ("VT", "\u{b}"),
+            ("FF", "\u{c}"),
+            ("C1 NEL", "\u{85}"),
+            ("U+2028 LINE SEPARATOR", "\u{2028}"),
+            ("U+2029 PARAGRAPH SEPARATOR", "\u{2029}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  10%{sep}vllm serve starting up{sep}\
+                 Downloading shards:  90%{sep}\
+                 llama.cpp: torch.OutOfMemoryError: CUDA out of memory. \
+                 Tried to allocate 7.21 GiB.{sep}"
+            );
+            assert_eq!(
+                vllm_oom_score(&capture),
+                0,
+                "a {label}-separated llama.cpp OOM must not be attributed to vLLM"
+            );
+        }
+
+        // The control, per separator: a capture whose *anchored* segment carries
+        // the OOM must still match, so the boundary set did not simply blind the
+        // checker to every capture that contains one.
+        for (label, sep) in [
+            ("CR", "\r"),
+            ("ESC E (NEL)", "\u{1b}E"),
+            ("VT", "\u{b}"),
+            ("a stray control byte", "\u{1}"),
+        ] {
+            let capture = format!(
+                "Downloading shards:  90%{sep}\
+                 vllm: torch.OutOfMemoryError: HIP out of memory{sep}"
+            );
+            let score = vllm_oom_score(&capture);
+            assert!(
+                score >= MIN_SCORE_FOR_MATCH,
+                "an anchored OOM segment must still match across {label}: score was {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn colour_codes_inside_a_line_do_not_split_a_genuine_vllm_oom() {
+        // The other half of the boundary question, and the reason this is a
+        // grammar walk and not `char::is_control()`. A colourised logger emits
+        // SGR *inside* a line -- level name in colour, message plain -- so a
+        // splitter that treats every escape, or every control character, as a
+        // boundary cuts a real `vllm: ... torch.OutOfMemoryError` between its
+        // anchor and its error token. Measured on the one-line
+        // `is_control()`-split candidate: this case went from 95 to 0, trading
+        // the false positive above for a silent miss on the most ordinary real
+        // input there is.
+        let plain = "vllm: torch.OutOfMemoryError: HIP out of memory";
+        let coloured =
+            "\u{1b}[31mvllm: \u{1b}[1mtorch.OutOfMemoryError: HIP out of memory\u{1b}[0m";
+        assert_eq!(
+            vllm_oom_score(coloured),
+            vllm_oom_score(plain),
+            "SGR inside a line must not change the verdict"
+        );
+        let score = vllm_oom_score(coloured);
+        assert!(score >= HIGH_CONFIDENCE, "score was {score}");
+
+        // And the same line after a progress-bar repaint, which is how it
+        // actually arrives: the CR is a boundary, the SGR around it is not.
+        assert!(
+            vllm_oom_score(&format!("Loading:  90%\r{coloured}\n")) >= HIGH_CONFIDENCE,
+            "a colourised OOM after a CR repaint must still match"
+        );
+    }
+
+    #[test]
+    fn rocm_cli_s_own_low_vram_hint_is_never_a_verdict_on_its_own() {
+        // `gpu[-_]memory[-_]utilization` is both an anchor and a scoring entry,
+        // so a line that merely echoes the flag anchors itself. rocm-cli's own
+        // low-VRAM hint prints `--gpu-memory-utilization`, and users paste it
+        // back in. That must stay a weak signal, never a diagnosis: worth 20,
+        // far below MIN_SCORE_FOR_MATCH, with nothing else on the line to
+        // corroborate it.
+        let report = diagnose(&linux_base(), crate::VLLM_GPU_MEMORY_UTILIZATION_HINT);
+        let oom = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-16-vllm-oom")
+            .expect("the flag mention stays visible as a weak signal");
+        assert!(
+            oom.score < MIN_SCORE_FOR_MATCH,
+            "a bare flag echo must not diagnose an OOM, got {} from {:?}",
+            oom.score,
+            oom.evidence
+        );
+    }
+
+    #[test]
+    fn canonical_vllm_oom_symptom_is_diagnosable() {
+        // The engine's fallback symptom must always clear the threshold, so the
+        // `rocm diagnose` command it prints never reports nothing.
+        assert!(vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM));
+        // And a bare framework mention the engine would reject is not diagnosable.
+        assert!(!vllm_oom_symptom_is_diagnosable("vllm: out of memory"));
+    }
+
+    #[test]
+    fn every_checker_platform_is_covered_by_its_recipe() {
+        // `render_report_text` ends a matched diagnosis with `apply with: rocm
+        // fix {id}`, and `fix::apply` then gates that id on the recipe's
+        // `applies_on` against the *running* OS. So any platform family a
+        // checker is registered for but its recipe omits is a platform where the
+        // tool names a command and then refuses to run it -- which is exactly
+        // what `fix-16-vllm-oom` did on WSL2, where the checker opts into `wsl`
+        // and the recipe was LINUX_ONLY.
+        //
+        // Only one direction is an error. A recipe may legitimately apply more
+        // widely than its checker answers (a user can reach `rocm fix <id>`
+        // directly, without a diagnosis), so this asserts containment rather
+        // than equality.
+        for (check, families) in CHECKERS {
+            let id = check(&Examination::default(), "").id;
+            let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
+                panic!(
+                    "checker id `{id}` has no recipe in the fix catalog, so the \
+                     `apply with: rocm fix {id}` line diagnose prints is dead"
+                )
+            });
+            for family in *families {
+                assert!(
+                    applies_on.contains(family),
+                    "`{id}` is diagnosed on `{family}` but its recipe only applies on \
+                     {applies_on:?}; `rocm fix {id}` would print the plan and then exit 3 there"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
+        // fix-15 and fix-16 live in two places: the `rocm fix` catalog
+        // (crate::fix::RECIPES) and the Fix these checks embed in a Diagnosis.
+        // The prose *framing* legitimately differs by surface (a catalog
+        // rationale vs a diagnosis summary), but the actionable remediation must
+        // not silently diverge -- the verify command, the notes, and the
+        // executable command lines have to agree. This is the guard that they
+        // do; it caught a two-vs-three-space `verify` and a reworded note.
+        let vllm_oom = check_16_vllm_oom(
+            &Examination {
+                os_family: "linux".to_owned(),
+                ..Examination::default()
+            },
+            VLLM_OOM_CANONICAL_SYMPTOM,
+        );
+        let msvc = check_15_msvc_redist(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_present: Some(false),
+                ..Examination::default()
+            },
+            "ImportError: DLL load failed: vcruntime140_1.dll not found",
+        );
+        for diag in [vllm_oom, msvc] {
+            assert!(
+                diag.score >= MIN_SCORE_FOR_MATCH,
+                "test setup must yield a real match for {}",
+                diag.id
+            );
+            let fix = diag.fix.expect("a matched diagnosis must carry a Fix");
+            let (verify, notes, run_commands) =
+                crate::fix::recipe_verify_notes_and_run_commands(&fix.fix_id)
+                    .expect("a shared fix_id must exist in the recipe catalog");
+            assert_eq!(fix.verify, verify, "verify diverged for {}", fix.fix_id);
+            assert_eq!(
+                fix.notes,
+                notes.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                "notes diverged for {}",
+                fix.fix_id
+            );
+            let emitted_run = fix
+                .commands
+                .iter()
+                .map(String::as_str)
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                emitted_run, run_commands,
+                "executable command lines diverged for {}",
+                fix.fix_id
+            );
+        }
     }
 
     #[test]
