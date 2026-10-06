@@ -1499,15 +1499,13 @@ pub(crate) fn restart_managed_service(
         .spawn()
         .context("failed to spawn recovery supervisor")?;
 
-    record.record_supervisor_identity(child.id());
-    record.write()?;
+    record_spawned_supervisor(paths, record, child.id())?;
 
     thread::sleep(Duration::from_millis(200));
     if let Some(status) = child
         .try_wait()
         .context("failed to check recovery supervisor startup state")?
     {
-        record.status = "failed".to_owned();
         // Not a write-back of `record`: a stop issued since the spawn has
         // persisted its marker, and a `failed` record without one is what
         // recovery restarts. Same discipline as the supervisor's own writes.
@@ -1521,6 +1519,34 @@ pub(crate) fn restart_managed_service(
     }
 
     Ok(())
+}
+
+/// Record the supervisor [`restart_managed_service`] just spawned, as `pid`.
+///
+/// Between the restart's first write — which clears the recorded PIDs, since
+/// no supervisor exists yet — and this one, the record names no process at
+/// all. A stop that starts in that window persists its marker first and then
+/// finds nothing to signal; writing the restart's whole copy back here would
+/// erase that marker while the new supervisor comes up, and leave the stop's
+/// own final write comparing against a record that no longer shows the
+/// process it has to answer for. So only the supervisor's identity is applied,
+/// to the record as it is on disk now, through the same ownership guard as the
+/// supervisor's own writes: against the copy from before this assignment, so
+/// it is the cleared PID that has to still be there. If the new supervisor has
+/// already recorded itself, or the record was removed, nothing is written.
+fn record_spawned_supervisor(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    pid: u32,
+) -> Result<()> {
+    let unrecorded = record.clone();
+    record.record_supervisor_identity(pid);
+    let (supervisor_pid, supervisor_start_ticks) =
+        (record.supervisor_pid, record.supervisor_start_ticks);
+    crate::service::update_supervised_record(paths, &unrecorded, |current| {
+        current.supervisor_pid = supervisor_pid;
+        current.supervisor_start_ticks = supervisor_start_ticks;
+    })
 }
 
 fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
@@ -1648,7 +1674,6 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "linux")]
     use crate::test_support::identity_probe_record;
     use crate::test_support::{
         UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
@@ -3422,6 +3447,72 @@ mod tests {
             Some(1),
             "the restart's failure write must not withdraw a stop issued meanwhile"
         );
+        Ok(())
+    }
+
+    /// Between a restart's first write, which clears the recorded PIDs, and the
+    /// one recording the supervisor it spawned, a stop can persist its marker.
+    /// Writing the restart's own copy back would erase it while the new
+    /// supervisor comes up — so only the identity is applied.
+    #[test]
+    fn restart_records_its_supervisor_without_erasing_a_stop_marker() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-spawn-keeps-marker");
+        paths.ensure()?;
+        let service_id = "svc-restart-spawn-marker";
+        // The restart's copy after its first write: no supervisor, no marker.
+        let mut restarting = identity_probe_record(&paths, service_id, 11457);
+        restarting.status = "recovering".to_owned();
+        restarting.supervisor_pid = 0;
+        restarting.supervisor_start_ticks = None;
+        // A stop started since: same (empty) processes, marker set.
+        let mut on_disk = restarting.clone();
+        on_disk.stop_requested_unix_ms = Some(1);
+        on_disk.write()?;
+
+        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_eq!(restarting.supervisor_pid, std::process::id());
+        assert_eq!(persisted.supervisor_pid, std::process::id());
+        assert_eq!(
+            persisted.supervisor_start_ticks,
+            restarting.supervisor_start_ticks
+        );
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1),
+            "recording the spawned supervisor must not withdraw a standing stop"
+        );
+        Ok(())
+    }
+
+    /// The spawned supervisor may record itself before the restart does, and
+    /// the record may be removed outright; either way the restart's write is
+    /// not the one to land.
+    #[test]
+    fn restart_leaves_a_record_naming_another_supervisor_or_none() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-spawn-not-owner");
+        paths.ensure()?;
+        let service_id = "svc-restart-spawn-not-owner";
+        let mut restarting = identity_probe_record(&paths, service_id, 11458);
+        restarting.supervisor_pid = 0;
+        restarting.supervisor_start_ticks = None;
+        let mut on_disk = restarting.clone();
+        on_disk.supervisor_pid = 4_242_424;
+        on_disk.write()?;
+
+        record_spawned_supervisor(&paths, &mut restarting.clone(), std::process::id())?;
+        let after_supervisor = load_service_record(&paths, service_id);
+
+        fs::remove_file(paths.service_manifest_path(service_id))?;
+        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
+        let resurrected = paths.service_manifest_path(service_id).exists();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(after_supervisor?.supervisor_pid, 4_242_424);
+        assert!(!resurrected, "a removed record must not be written back");
         Ok(())
     }
 }
