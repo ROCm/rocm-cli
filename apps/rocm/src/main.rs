@@ -3924,6 +3924,28 @@ fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
     record.write()
 }
 
+/// Retire `record` on a failed launch without letting a failed write displace the
+/// launch's own error, which is what diagnoses it. The write failure is still
+/// reported, on stderr, because a record left unretired keeps claiming its
+/// engine + model.
+fn retire_managed_launch_or_warn(record: &mut ManagedServiceRecord) {
+    if let Some(warning) = managed_launch_retirement_warning(record) {
+        eprintln!("{warning}");
+    }
+}
+
+/// Retire `record`, returning the warning to print if the retirement could not be
+/// written. Split from [`retire_managed_launch_or_warn`] so a test can read the
+/// warning alongside the record it describes.
+fn managed_launch_retirement_warning(record: &mut ManagedServiceRecord) -> Option<String> {
+    mark_managed_launch_failed(record).err().map(|error| {
+        format!(
+            "warning: could not mark managed service `{}` as failed: {error:#}",
+            record.service_id
+        )
+    })
+}
+
 /// Retire `record` when `outcome` failed, so a bail-out before the child exists
 /// stops it claiming its engine + model.
 ///
@@ -3942,12 +3964,10 @@ fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
 /// Takes an already-evaluated `Result` rather than a closure so it can wrap that
 /// prefix without holding a second borrow of `record` across the call.
 ///
-/// The retirement error is deliberately dropped: what the user needs to see is
-/// the failure that aborted the launch, not a bookkeeping failure behind it.
+/// The returned error is always the one that aborted the launch; a failed
+/// retirement is only warned about (see [`retire_managed_launch_or_warn`]).
 fn retire_record_on_error<T>(record: &mut ManagedServiceRecord, outcome: Result<T>) -> Result<T> {
-    outcome.inspect_err(|_| {
-        let _ = mark_managed_launch_failed(record);
-    })
+    outcome.inspect_err(|_| retire_managed_launch_or_warn(record))
 }
 
 /// Fail the launch if the freshly spawned engine had already exited, retiring the
@@ -3973,10 +3993,10 @@ fn fail_managed_launch_if_engine_died(
     let Some(status) = startup_exit else {
         return Ok(());
     };
-    // Dropped, not propagated, for the same reason as `retire_record_on_error`:
-    // the engine's own exit status and log tail are what diagnose this launch, and
-    // a failed record write must not displace them.
-    let _ = mark_managed_launch_failed(record);
+    // Warned about, not propagated, for the same reason as
+    // `retire_record_on_error`: the engine's own exit status and log tail are what
+    // diagnose this launch, and a failed record write must not displace them.
+    retire_managed_launch_or_warn(record);
     bail!(
         "{}",
         managed_engine_startup_failure_detail(status, &record.log_path)
@@ -27976,6 +27996,40 @@ install therock";
         assert!(
             still_blocking.is_none(),
             "a spawn that never started must not keep claiming the engine+model"
+        );
+        Ok(())
+    }
+
+    /// A retirement that cannot be written must say so — the record it failed to
+    /// write still claims the engine + model — while the launch's own error stays
+    /// the one returned.
+    #[test]
+    fn a_retirement_that_cannot_be_written_is_reported_not_swallowed() -> Result<()> {
+        let (root, paths) = test_paths("managed-retirement-write-fails");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11518);
+        // A directory where the manifest file should be makes the write fail.
+        fs::create_dir_all(&record.manifest_path)?;
+
+        let warning = managed_launch_retirement_warning(&mut record);
+        let manifest_is_still_unwritten = record.manifest_path.is_dir();
+        let outcome: Result<u32> =
+            retire_record_on_error(&mut record, Err(anyhow::anyhow!("spawn refused")));
+        let _ = fs::remove_dir_all(root);
+
+        let warning = warning.expect("a failed retirement must produce a warning");
+        assert!(
+            manifest_is_still_unwritten,
+            "precondition: the retirement really did not reach disk"
+        );
+        assert!(
+            warning.contains("lemonade-qwen-3000") && warning.contains("failed to write"),
+            "the warning must name the service and the write that failed: {warning}"
+        );
+        let error = outcome.expect_err("the launch must still fail").to_string();
+        assert_eq!(
+            error, "spawn refused",
+            "the launch's own error is what reaches the user"
         );
         Ok(())
     }
