@@ -30815,12 +30815,15 @@ install therock";
         Ok(())
     }
 
-    /// A spawn that fails outright strands the same record an unretired early
-    /// exit would: it was written before the spawn, so returning past it leaves a
-    /// pid-0 `"starting"` corpse that no liveness refresh can demote. The
-    /// original spawn error must still be what reaches the user.
+    /// The helper itself, fed a synthetic failure: it must retire the record and
+    /// hand back the *original* error, since that is what reaches the user.
+    ///
+    /// This proves the helper, not that any launch or restart calls it — the
+    /// call-site wiring is pinned by the real launch failures driven through
+    /// `spawn_managed_engine_child` (the key-guard refusal and the missing
+    /// runtime), which leave the record retired only if their site retires it.
     #[test]
-    fn a_spawn_that_never_started_frees_the_engine_for_the_next_serve() -> Result<()> {
+    fn retire_record_on_error_retires_the_record_and_keeps_the_original_error() -> Result<()> {
         let (root, paths) = test_paths("managed-spawn-failure-unblocks");
         paths.ensure()?;
         let mut record = pre_spawn_record(&paths, 11515);
@@ -31096,6 +31099,10 @@ install therock";
             None,
             true,
         );
+        // The refusal fires after the claiming record is written, so this is a
+        // real launch path abandoning its pid-0 `"starting"` record — the one
+        // `retire_record_on_error` exists for. Read before the cleanup below.
+        let still_claimed = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
 
         let Err(error) = result else {
@@ -31109,6 +31116,68 @@ install therock";
         assert!(
             message.contains("without authentication"),
             "the refusal must say what the risk is: {message}"
+        );
+        assert!(
+            still_claimed.is_none(),
+            "a refused launch must retire its record, or every later `rocm serve` for \
+             this engine + model is refused as already running"
+        );
+        Ok(())
+    }
+
+    /// A second real launch-path failure after the record write, at a different
+    /// call site from the key-guard refusal above: the runtime the launch names
+    /// has no installed manifest, so resolving its engine environment fails
+    /// before any child is spawned. No GPU, engine, or network is involved.
+    #[test]
+    fn a_managed_spawn_naming_a_missing_runtime_frees_the_engine_for_the_next_serve() -> Result<()>
+    {
+        let (root, paths) = test_paths("managed-spawn-missing-runtime");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "vllm".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            // vLLM, not Lemonade: Lemonade manages its own runtime and never
+            // looks the runtime manifest up, so it would not reach this failure.
+            "vllm",
+            "vllm-qwen-3000",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11516,
+            &resolve.device_policy,
+            &[],
+            Some("no-such-runtime"),
+            None,
+            None,
+            false,
+        );
+        let still_claimed = existing_live_managed_service(&paths, "vllm", "qwen-canonical");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            result.is_err(),
+            "a launch naming an uninstalled runtime must fail before spawning"
+        );
+        assert!(
+            still_claimed.is_none(),
+            "a launch that failed before its spawn must not keep claiming the engine+model"
         );
         Ok(())
     }
