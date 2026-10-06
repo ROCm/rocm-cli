@@ -124,15 +124,31 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
     // Checked before the unattributed-error gate too, so a pin still gets
     // consulted when this channel has no runtimes of its own yet — otherwise
     // an unrelated channel's `status=error` line would shadow it and this run
-    // would silently serve whatever else is already active in the tree.
+    // would silently serve whatever else is already active in the tree. For
+    // the same reason, a degraded `status=error` line (no `channel=`, see the
+    // gate below) still counts as a candidate when its own key names this
+    // channel, so a transient index blip on the pinned runtime's own probe
+    // doesn't shadow it either.
+    //
+    // Matched against each line's OWN `runtime_key`, never `target_runtime_key`
+    // (`serving_runtime_key()`): `target=` always names the channel's
+    // freshly-resolved LATEST key (`render_update_report` derives it from
+    // `runtime_update_plan`'s `version_selector: None` resolution), so for any
+    // pin other than the current latest, matching against it would never find
+    // the already-installed pinned runtime and would reinstall on every run.
     if let Some(pin) = pin {
-        return match channel_runtimes
+        let channel_prefix = format!("{channel}-");
+        return match runtimes
             .iter()
-            .find(|line| key_matches_pin(line.serving_runtime_key(), pin))
+            .filter(|line| {
+                line.channel.as_deref() == Some(channel)
+                    || (line.channel.is_none() && line.runtime_key.starts_with(&channel_prefix))
+            })
+            .find(|line| key_matches_pin(&line.runtime_key, pin))
         {
             Some(pinned) => Decision::Reuse {
                 reason: format!("runtime already matches the pinned version {pin}"),
-                activate: Some(pinned.serving_runtime_key().to_owned()),
+                activate: Some(pinned.runtime_key.clone()),
             },
             // `update`/`repair` only ever apply the report's `target=` key, which
             // is the index's latest — never this pin — so a miss means a fresh
@@ -1433,6 +1449,50 @@ runtime release-wheel-gfx94x-dcgpu-7-11-0 format=wheel channel=release status=up
             decide(text, "release", Some("7.11.0")),
             "two distinct pins against the same tree must resolve to distinct runtime keys"
         );
+    }
+
+    #[test]
+    fn pin_matches_its_own_key_even_when_target_names_the_channel_latest() {
+        // `target=` always names the channel's freshly-resolved latest, never the
+        // pin. Matching against `serving_runtime_key()` (which prefers `target=`)
+        // would never find a pin other than that latest, reinstalling every run.
+        let text = report_with_target(
+            "update_available",
+            "release",
+            "release-wheel-gfx94x-dcgpu-7-15-0",
+        );
+        let Decision::Reuse { activate, .. } = decide(&text, "release", Some("7.13.0")) else {
+            panic!("the pinned runtime's own key must be reused, not shadowed by target=");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn pin_matches_an_unattributed_error_line_for_its_own_runtime() {
+        // A degraded `status=error` line (no `channel=`) for the pinned runtime's
+        // own probe must still be found, or a transient index outage reinstalls
+        // the exact runtime the pin already has on disk.
+        let text = "update\n  runtime release-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n";
+        let Decision::Reuse { activate, .. } = decide(text, "release", Some("7.13.0")) else {
+            panic!("an unattributed error on the pinned runtime's own line must reuse it");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
+    }
+
+    #[test]
+    fn pin_does_not_match_another_channels_unattributed_error_line() {
+        // The broadened pin search must still respect the channel prefix guard —
+        // an unrelated channel's degraded error line must not satisfy this pin.
+        let text = "update\n  runtime nightly-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+status=error message=failed to reach the index\n";
+        assert_eq!(decide(text, "release", Some("7.11.0")), Decision::Install);
     }
 
     #[test]
