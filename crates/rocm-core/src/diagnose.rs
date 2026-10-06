@@ -1695,7 +1695,6 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
             "# problem; pick a smaller or quantized model (single-GPU serving only).".to_owned(),
         ],
         fix_id: "fix-16-vllm-oom".to_owned(),
-        auto_applicable: false,
         verify: "rocm serve <model> <case-appropriate options above>   # re-run and watch for a clean startup".to_owned(),
         notes: vec![
             "Only lower --gpu-memory-utilization when the GPU is shared or already busy; on a GPU dedicated to this server it cannot create the room a too-large model needs.".to_owned(),
