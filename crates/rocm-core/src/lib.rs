@@ -4027,7 +4027,9 @@ fn select_active_managed_therock_record(
 /// record written before the field existed reads as `0`. `rocm`'s own registry
 /// load breaks the same tie on the runtime key, ascending; using the same rule
 /// here keeps the runtime this crate falls back to the same one the CLI's
-/// startup update check reports on.
+/// startup update check reports on. Shared by all three registry fallbacks:
+/// the active-runtime fallback, the `amd-smi` binary resolver, and the SDK
+/// probe candidate list.
 fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
     records.sort_by(|(left_path, left), (right_path, right)| {
         right
@@ -4151,7 +4153,7 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
     };
-    let mut candidates = Vec::new();
+    let mut records = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -4166,28 +4168,28 @@ pub(crate) fn managed_therock_sdk_probe_candidates(
         if !record.looks_like_therock() {
             continue;
         }
-        let Some(sdk) = record.rocm_sdk else {
-            continue;
-        };
-        if !sdk.import_ok {
+        let sdk_ready = record
+            .rocm_sdk
+            .as_ref()
+            .is_some_and(|sdk| sdk.import_ok && sdk.root_path.is_some() && sdk.bin_path.is_some());
+        if !sdk_ready {
             continue;
         }
-        let Some(root_path) = sdk.root_path else {
-            continue;
-        };
-        let Some(bin_path) = sdk.bin_path else {
-            continue;
-        };
-        candidates.push(TheRockSdkProbeCandidate {
-            installed_at_unix_ms: record.installed_at_unix_ms.unwrap_or(0),
-            site_packages: sdk.site_packages,
-            root_path,
-            bin_path,
-            library_paths: sdk.library_paths,
-        });
+        records.push((path, record));
     }
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.installed_at_unix_ms));
-    candidates
+    sort_records_newest_install_first(&mut records);
+    records
+        .into_iter()
+        .filter_map(|(_, record)| {
+            let sdk = record.rocm_sdk?;
+            Some(TheRockSdkProbeCandidate {
+                site_packages: sdk.site_packages,
+                root_path: sdk.root_path?,
+                bin_path: sdk.bin_path?,
+                library_paths: sdk.library_paths,
+            })
+        })
+        .collect()
 }
 
 fn managed_sdk_tool_path(bin_path: &Path, tool: &str) -> Option<PathBuf> {
@@ -4374,7 +4376,6 @@ struct TheRockSdkProbeManifest {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TheRockSdkProbeCandidate {
-    installed_at_unix_ms: u128,
     pub(crate) site_packages: Option<PathBuf>,
     pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
@@ -10001,6 +10002,54 @@ mod tests {
             assert_eq!(
                 resolved,
                 Some(expected.into_os_string()),
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn managed_therock_sdk_probe_candidates_break_install_time_ties_on_the_runtime_key()
+    -> Result<()> {
+        // Same shape as the amd-smi and active-runtime fallback tie tests: both
+        // pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let temp_root = std::env::temp_dir().join(format!(
+                "rocm-cli-sdk-probe-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                unix_time_millis()
+            ));
+            let registry_dir = temp_root.join("runtimes/registry");
+            fs::create_dir_all(&registry_dir)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                let root = temp_root.join(key);
+                let bin = root.join("bin");
+                fs::create_dir_all(&bin)?;
+                fs::write(
+                    registry_dir.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                        "rocm_sdk": {
+                            "import_ok": true,
+                            "root_path": root,
+                            "bin_path": bin,
+                        },
+                    }))?,
+                )?;
+            }
+
+            let candidates = managed_therock_sdk_probe_candidates(&registry_dir);
+            let expected_bin_path = temp_root.join("aaa").join("bin");
+            let _ = fs::remove_dir_all(&temp_root);
+
+            assert_eq!(
+                candidates
+                    .first()
+                    .map(|candidate| candidate.bin_path.clone()),
+                Some(expected_bin_path),
                 "files first={first_file_key}, second={second_file_key}"
             );
         }
