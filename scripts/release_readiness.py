@@ -485,6 +485,35 @@ def verification_is_required(
     )
 
 
+def resolve_verification(
+    require_signatures: bool,
+    require_production_trust: bool,
+    explicit_public_key: Path | None,
+) -> tuple[bool, Path | None, str | None]:
+    """The whole verify wiring: decide, then resolve the key when required.
+
+    Returns ``(verify, public_key, key_source)``; ``key_source`` is ``None``
+    when no verification is required.
+
+    This exists because testing the *decision* was not enough. An earlier round
+    extracted :func:`verification_is_required` and pinned it in isolation, but
+    nothing exercised ``main``'s use of it -- neutralising the call there
+    (``verify = False and verification_is_required(...)``) left ``--self-test``
+    exiting 0, which is the original fail-open: ``--require-signatures`` would
+    again accept a ``.sig`` signed by the wrong key. Dropping the
+    ``resolve_signing_key`` call stayed green for the same reason.
+
+    So the sequence itself is the unit, and ``main`` holds no copy of it.
+    """
+    verify = verification_is_required(
+        require_signatures, require_production_trust, explicit_public_key
+    )
+    if not verify:
+        return False, None, None
+    public_key, key_source = resolve_signing_key(explicit_public_key)
+    return True, public_key, key_source
+
+
 def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
     """Resolve the public key release signatures are verified against.
 
@@ -674,6 +703,25 @@ def run_with_env(values: dict[str, str | Path | None], func):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def _assert_verification_wiring(expected_key: Path) -> None:
+    """`resolve_verification` must decide AND resolve, not just decide."""
+    verify, public_key, key_source = resolve_verification(True, False, None)
+    if not verify:
+        raise ReadinessError(
+            "--require-signatures must force verification through the wiring main uses"
+        )
+    if public_key != expected_key or not key_source:
+        raise ReadinessError(
+            f"verification was required but no key was resolved: {public_key!r} / {key_source!r}; "
+            "a required verification that silently resolves no key is the fail-open this gate closes"
+        )
+    off_verify, off_key, off_source = resolve_verification(False, False, None)
+    if off_verify or off_key is not None or off_source is not None:
+        raise ReadinessError(
+            "verification must stay off, and resolve no key, when nothing asks for it"
+        )
 
 
 def run_self_test(root: Path) -> None:
@@ -1049,6 +1097,21 @@ def run_self_test(root: Path) -> None:
                 "readiness run would demand a signing key it has no reason to need"
             )
         print("release readiness self-test: verify gate ok")
+        # The wiring, not just the decision. Pinning `verification_is_required`
+        # alone was not enough: `main` could stop using it
+        # (`verify = False and verification_is_required(...)`) or skip
+        # `resolve_signing_key` entirely and this self-test stayed green --
+        # the original fail-open, where `--require-signatures` accepts a `.sig`
+        # from the wrong key. `main` now holds no copy of the sequence, so
+        # these cases cover what it actually does.
+        run_with_env(
+            {
+                SIGNING_PUBLIC_KEY_PATH_ENV: key_path,
+                SIGNING_PUBLIC_KEY_ENV: None,
+            },
+            lambda: _assert_verification_wiring(key_path),
+        )
+        print("release readiness self-test: verify wiring ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
@@ -1121,14 +1184,12 @@ def main() -> None:
     require_production_trust = args.require_production_trust or truthy(
         os.environ.get("ROCM_CLI_REQUIRE_PRODUCTION_TRUST")
     )
-    verify = verification_is_required(
-        require_signatures, require_production_trust, args.public_key
-    )
-    public_key: Path | None = None
     messages: list[str] = []
     try:
-        if verify:
-            public_key, key_source = resolve_signing_key(args.public_key)
+        verify, public_key, key_source = resolve_verification(
+            require_signatures, require_production_trust, args.public_key
+        )
+        if key_source is not None:
             messages.append(f"signature verification key: {key_source}")
         messages.extend(
             validate_release(
