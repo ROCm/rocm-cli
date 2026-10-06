@@ -2017,34 +2017,6 @@ esac
     /// WITHOUT them. `E2E_ONLY_LIFECYCLE` keeps it to @lifecycle scenarios, none
     /// of which use a scripted seam, and the lane packages and installs the
     /// binary through the real installer — so it must ship what a release ships.
-    /// Nothing shipped may be built with a test-only feature.
-    ///
-    /// Stated as "no `--features` at all on a release build" rather than as a
-    /// deny-list of feature names. A deny-list only catches the features that
-    /// existed when it was written: the pre-existing guard spells
-    /// `e2e-test-hooks` literally, which does not match the substring
-    /// `e2e-oom-fault-injection` this branch adds, so a release build carrying
-    /// only the new one would have passed. `release.yml` legitimately needs no
-    /// features today, so the stronger, shape-based rule costs nothing and
-    /// covers every future test-only feature without being updated.
-    ///
-    /// Scoped to `release.yml`'s own build steps: `cargo xtask e2e` builds the
-    /// binaries it tests WITH the hooks, which is correct and must keep working.
-    #[test]
-    fn the_release_workflow_builds_no_feature_gated_binaries() {
-        let release = read_workflow("release.yml");
-        let offenders: Vec<&str> = release
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.contains("cargo build") && line.contains("--features"))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "release.yml must build the shipped binaries with no `--features`, so a test-only \
-             feature cannot reach a release artefact; found:\n{offenders:#?}"
-        );
-    }
-
     #[test]
     fn ci_windows_lifecycle_lane_reuses_the_binaries_it_built() {
         let ci = read_workflow("ci.yml");
@@ -2108,6 +2080,55 @@ esac
             !lifecycle.contains("e2e-test-hooks"),
             "the lifecycle-only lane packages and installs what a release ships, \
              so it must NOT carry the test hooks:\n{lifecycle}"
+        );
+    }
+
+    /// Nothing shipped may be built with a test-only feature.
+    ///
+    /// Shape-based rather than a deny-list of feature names: a deny-list only
+    /// catches the features that existed when it was written. The pre-existing
+    /// guard spells `e2e-test-hooks` literally, which does not match the
+    /// substring `e2e-oom-fault-injection`, so a release build carrying only
+    /// the new one would have passed.
+    ///
+    /// Matches `--features`, `--all-features` and `-F`, because `--features`
+    /// alone misses the other two — `--all-features` does not contain the
+    /// substring `--features`, and would compile in every test-only feature at
+    /// once. Read over joined `run: |` blocks so a flag on a `\`
+    /// continuation line is still seen, and asserts a build was actually found,
+    /// so a renamed or deleted build step fails loudly instead of passing
+    /// vacuously.
+    #[test]
+    fn the_release_workflow_builds_no_feature_gated_binaries() {
+        let release = read_workflow("release.yml");
+        let mut builds = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for block in multiline_run_blocks(&release)
+            .into_iter()
+            .chain(std::iter::once(release.clone()))
+        {
+            for line in block.lines().map(str::trim) {
+                if !line.contains("cargo build") {
+                    continue;
+                }
+                builds += 1;
+                if line.contains("--features")
+                    || line.contains("--all-features")
+                    || line.split_whitespace().any(|w| w == "-F")
+                {
+                    offenders.push(line.to_owned());
+                }
+            }
+        }
+        assert!(
+            builds > 0,
+            "release.yml has no `cargo build` step for this guard to check; if the build moved, \
+             point this test at it rather than letting it pass vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "release.yml must build the shipped binaries with no feature flags, so a test-only \
+             feature cannot reach a release artefact; found:\n{offenders:#?}"
         );
     }
 
