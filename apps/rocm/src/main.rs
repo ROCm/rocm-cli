@@ -27631,8 +27631,10 @@ install therock";
         fs::create_dir_all(&root).expect("test dir");
         let log_path = root.join("absent.log");
 
-        // Zero interval: the re-read loop still runs all of its iterations, so the
-        // branch it guards is exercised, without ~600 ms of real sleeps.
+        // Zero interval only keeps this fast: the log never appears, so this pins
+        // the no-tail message and nothing about the re-reads themselves. Those
+        // are pinned by
+        // `managed_engine_startup_failure_detail_picks_up_a_log_written_while_polling`.
         let detail = managed_engine_startup_failure_detail_polling(
             exit_status_from_code(1),
             &log_path,
@@ -27647,6 +27649,45 @@ install therock";
         assert!(
             !detail.contains("recent startup log output"),
             "empty log should not advertise a tail: {detail}"
+        );
+    }
+
+    /// A child that died at startup may still be flushing its log when the
+    /// failure is rendered. The re-reads exist for exactly that, so the tail
+    /// must appear when the log lands only after the first read found nothing.
+    #[test]
+    fn managed_engine_startup_failure_detail_picks_up_a_log_written_while_polling() {
+        let (root, _paths) = test_paths("managed-startup-failure-late-log");
+        fs::create_dir_all(&root).expect("test dir");
+        let log_path = root.join("late.log");
+        let staged = root.join("late.log.partial");
+
+        // The writer starts the clock only once released, and then waits well
+        // past the first (immediate) read but well inside the re-read window
+        // (5 x 250 ms). Landing the file by rename means a read never sees it
+        // half-written.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let (log_path, staged) = (log_path.clone(), staged.clone());
+            thread::spawn(move || {
+                released.recv().expect("release writer");
+                thread::sleep(Duration::from_millis(60));
+                fs::write(&staged, "fatal: flushed after exit\n").expect("stage log");
+                fs::rename(&staged, &log_path).expect("land log");
+            })
+        };
+        release.send(()).expect("release writer");
+        let detail = managed_engine_startup_failure_detail_polling(
+            exit_status_from_code(1),
+            &log_path,
+            Duration::from_millis(250),
+        );
+        writer.join().expect("writer thread");
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            detail.contains("fatal: flushed after exit"),
+            "a log written after the first read must still reach the user: {detail}"
         );
     }
 
