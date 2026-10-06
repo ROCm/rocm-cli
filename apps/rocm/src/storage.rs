@@ -818,7 +818,7 @@ pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
                     plan.actions.push(UninstallPlanEntry {
                         kind,
                         path,
-                        resolved: None,
+                        planned: crate::PlannedAs::Unchecked,
                     });
                 }
             }

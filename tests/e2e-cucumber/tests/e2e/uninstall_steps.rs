@@ -43,8 +43,15 @@ fn config_dir(world: &E2eWorld) -> PathBuf {
     config_dir_at(root(world))
 }
 
+/// Inside the scenario's home, where ROCm CLI's folders normally live: on
+/// Windows the scenario root is itself under `C:\\Users\\<runner>`, so a folder
+/// outside the scenario home would count as another user's home there.
 fn config_dir_at(root: &Path) -> PathBuf {
-    root.join("rocm").join("config")
+    home_at(root).join(".rocm").join("config")
+}
+
+fn home_at(root: &Path) -> PathBuf {
+    root.join("users").join("home")
 }
 
 /// The scenario's own HOME.
@@ -105,11 +112,11 @@ fn run_command_in(world: &mut E2eWorld, args: &[&str], cwd: Option<&Path>) {
         ("ROCM_CLI_CONFIG_DIR", config_dir_at(&root).into_os_string()),
         (
             "ROCM_CLI_DATA_DIR",
-            root.join("rocm").join("data").into_os_string(),
+            home_at(&root).join(".rocm").join("data").into_os_string(),
         ),
         (
             "ROCM_CLI_CACHE_DIR",
-            root.join("cache-local").into_os_string(),
+            home_at(&root).join(".rocm").join("cache").into_os_string(),
         ),
         ("UV_CACHE_DIR", root.join("uv-cache").into_os_string()),
         ("HF_HOME", root.join("hf-home").into_os_string()),
@@ -464,7 +471,7 @@ async fn refusal_names_source(world: &mut E2eWorld, setting: String) {
 #[then(expr = "the refusal says the data folder {string} resolves to the home folder")]
 async fn refusal_says_resolves_to_home(world: &mut E2eWorld, folder: String) {
     let stdout = output(world);
-    let home = home(world).canonicalize().expect("home exists");
+    let home = crate::e2e::runtime_steps::canonical_without_verbatim(&home(world));
     let line = format!(
         "  - data: {folder} is your home folder (set by ROCM_CLI_DATA_DIR; resolves to {})",
         home.display()
@@ -494,9 +501,7 @@ async fn data_is_unmarked(world: &mut E2eWorld) {
 #[then("the refusal advises creating the marker if the folder is ROCm CLI's")]
 async fn advises_marker(world: &mut E2eWorld) {
     let stdout = output(world);
-    let marker = unmarked_data(world)
-        .canonicalize()
-        .expect("data exists")
+    let marker = crate::e2e::runtime_steps::canonical_without_verbatim(&unmarked_data(world))
         .join(".rocm-cli-root");
     assert!(rc(world) != 0, "a refused preview must fail:\n{stdout}");
     assert!(
@@ -513,7 +518,7 @@ async fn create_advised_marker(world: &mut E2eWorld) {
     // The marker the refusal names for the data folder, taken from the
     // message itself, so this follows the advice the user reads.
     let stdout = output(world).to_owned();
-    let data = unmarked_data(world).canonicalize().expect("data exists");
+    let data = crate::e2e::runtime_steps::canonical_without_verbatim(&unmarked_data(world));
     let marker = stdout
         .split("create ")
         .skip(1)
@@ -582,6 +587,16 @@ async fn dashboard_uninstall(world: &mut E2eWorld) {
 )]
 async fn dashboard_refusal_names_venv(world: &mut E2eWorld) {
     let stdout = output(world);
+    // `mcp-call` itself succeeds and reports the child's result as JSON; the
+    // approved `rocm uninstall` it ran must have failed.
+    let reply: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("mcp-call did not print JSON ({e}):\n{stdout}"));
+    let child_exit = reply["structuredContent"]["exit_status"].as_i64();
+    assert!(
+        child_exit.is_some_and(|code| code != 0)
+            && reply["isError"] == serde_json::Value::Bool(true),
+        "the approved uninstall must exit non-zero, got {child_exit:?}:\n{stdout}"
+    );
     assert!(
         stdout.contains("set by setup.therock_venv"),
         "the refusal must name setup.therock_venv:\n{stdout}"

@@ -597,10 +597,11 @@ rocm logs --search error timeout")]
     #[command(
         after_help = "Removes a config, data, or cache folder inside your home folder as usual. \
 Never removes the top of the filesystem, your home folder or a folder containing it, a system \
-location or anything inside it (/usr, /etc, /lib*, /run, /mnt, /media, /snap, ...; Windows, \
-Program Files and ProgramData on the system drive), or another user's home folder. Anywhere \
-else outside your home folder (/opt, /var, /srv, another disk) a folder is removed only if it \
-carries the .rocm-cli-root file ROCm CLI writes into the folders it creates. Judged by where \
+location or anything inside it (/usr, /etc, /lib*, /run, /media, /snap, ...; Windows, Program \
+Files and ProgramData on the system drive or a WSL /mnt/<drive>), a folder other programs \
+share (anything directly under /, /var/lib, /var/cache, /var/log, /var/tmp, /mnt/<drive>), or \
+another user's home folder. Anywhere else outside your home folder a folder is removed only if \
+it carries the .rocm-cli-root file ROCm CLI writes into the folders it creates itself. Judged by where \
 the folder really is as well as how it is written. A refused folder stops the whole \
 uninstall before anything is removed; the review names the folder, why, the setting it came \
 from, and what clears it (--keep-<config|data|cache>, another setting, or the marker file). \
@@ -1422,24 +1423,9 @@ fn run() -> Result<()> {
     // non-blocking file writer, so an early drop would silently truncate the
     // log. A failed/missing `AppPaths::discover()` degrades to no logging
     // rather than a startup failure.
-    let startup_paths = AppPaths::discover().ok();
-    // Roots this process creates — by logging just below, or later by any
-    // command — are marked as ROCm CLI's own, so `rocm uninstall` can remove
-    // them even outside the home folder. Declared before the log guard so it
-    // drops after it, once nothing else will create a root.
-    let root_claims = startup_paths.as_ref().map(|paths| {
-        rocm_core::RootClaims::record([
-            paths.config_dir.as_path(),
-            paths.data_dir.as_path(),
-            paths.cache_dir.as_path(),
-        ])
-    });
-    let _log_guard = startup_paths.as_ref().and_then(logging::init);
-    // Logging may have just created the data folder; mark it now, before a
-    // command (such as `rocm uninstall`) judges it.
-    if let Some(claims) = &root_claims {
-        claims.mark_created();
-    }
+    let _log_guard = AppPaths::discover()
+        .ok()
+        .and_then(|paths| logging::init(&paths));
 
     maybe_migrate_legacy_dashboard_config();
     maybe_notice_legacy_uv_cache();
@@ -16009,7 +15995,7 @@ fn run_rocm_capture_for_paths(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    apply_app_path_env(&mut command, paths);
+    apply_app_path_env_for_rocm_child(&mut command, paths);
     let output = run_command_with_timeout(command, timeout)
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
@@ -21054,9 +21040,44 @@ struct UninstallOptions {
 struct UninstallPlanEntry {
     kind: &'static str,
     path: PathBuf,
-    /// For a root that is a real directory, where it really was when the plan
-    /// was made. Removal re-resolves it and refuses if that changed.
-    resolved: Option<PathBuf>,
+    /// What the entry was when the review was made, checked again right
+    /// before it is removed.
+    planned: PlannedAs,
+}
+
+/// What a planned entry was at review time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedAs {
+    /// A real directory, and where it really was.
+    Dir(PathBuf),
+    /// A symbolic link, and where the folder holding it really was.
+    Link { parent: Option<PathBuf> },
+    /// A file, and where the folder holding it really was.
+    File { parent: Option<PathBuf> },
+    /// Not re-checked (`rocm storage remove-downloads` entries, which have
+    /// their own removal loop).
+    Unchecked,
+}
+
+impl PlannedAs {
+    /// A non-directory entry as it is now, with its folder resolved.
+    fn non_dir(path: &Path, metadata: &fs::Metadata, canonicalize: Canonicalize<'_>) -> Self {
+        let parent = path
+            .parent()
+            .map(|parent| {
+                if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                }
+            })
+            .and_then(|parent| canonicalize(parent).ok());
+        if metadata.file_type().is_symlink() {
+            Self::Link { parent }
+        } else {
+            Self::File { parent }
+        }
+    }
 }
 
 /// A config/data/cache root `rocm uninstall` will not remove, and why.
@@ -21110,6 +21131,20 @@ impl RefusedRoot {
             sentence.push_str(
                 " Moving setup.therock_venv instead would orphan the ROCm SDK installed there.",
             );
+        }
+        match self.why {
+            rocm_core::ProtectedLocation::NotMarked => sentence.push_str(
+                " Folders created by ROCm CLI releases before this one carry no marker; a \
+                 config.json or runtime registry inside it is not taken as proof that it is \
+                 ROCm CLI's.",
+            ),
+            rocm_core::ProtectedLocation::SharedTopLevel
+            | rocm_core::ProtectedLocation::OtherUsersHome
+            | rocm_core::ProtectedLocation::System => sentence.push_str(
+                " ROCm CLI never removes this folder itself; if you are sure what in it is \
+                 ROCm CLI's, remove those files by hand.",
+            ),
+            _ => {}
         }
         sentence
     }
@@ -21188,8 +21223,8 @@ type Canonicalize<'a> = &'a dyn Fn(&Path) -> io::Result<PathBuf>;
 /// What `rocm uninstall` does with one config, data or cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RootJudgment {
-    /// Remove it; `resolved` is set for a real directory.
-    Remove { resolved: Option<PathBuf> },
+    /// Remove it; `planned` is what it is now, to check again before removal.
+    Remove { planned: PlannedAs },
     /// Refuse the whole uninstall. `shown` is the resolved location when it
     /// differs from the spelling; `real` is the resolved location regardless.
     Refuse {
@@ -21223,7 +21258,9 @@ fn judge_uninstall_root(
     // `symlink_metadata`: a symlinked root is unlinked, never walked, and a
     // file is just a file.
     if !metadata.is_dir() {
-        return RootJudgment::Remove { resolved: None };
+        return RootJudgment::Remove {
+            planned: PlannedAs::non_dir(path, metadata, canonicalize),
+        };
     }
     // A directory that cannot be resolved cannot be judged by where it is, and
     // is about to be walked recursively: refuse rather than guess.
@@ -21259,7 +21296,7 @@ fn judge_uninstall_root(
             refuse(ProtectedLocation::NotMarked)
         }
         UninstallRootVerdict::Allowed | UninstallRootVerdict::NeedsMarker => RootJudgment::Remove {
-            resolved: Some(resolved),
+            planned: PlannedAs::Dir(resolved),
         },
     }
 }
@@ -21325,10 +21362,13 @@ fn build_uninstall_plan_with(
                     ));
                     continue;
                 }
+                let planned = fs::symlink_metadata(&path).map_or(PlannedAs::Unchecked, |meta| {
+                    PlannedAs::non_dir(&path, &meta, canonicalize)
+                });
                 plan.actions.push(UninstallPlanEntry {
                     kind: "binary",
                     path,
-                    resolved: None,
+                    planned,
                 });
             }
         }
@@ -21379,10 +21419,10 @@ fn build_uninstall_plan_with(
                 why,
                 source: source.clone(),
             }),
-            RootJudgment::Remove { resolved } => plan.actions.push(UninstallPlanEntry {
+            RootJudgment::Remove { planned } => plan.actions.push(UninstallPlanEntry {
                 kind,
                 path,
-                resolved,
+                planned,
             }),
         }
     }
@@ -23159,10 +23199,19 @@ fn apply_app_path_env(command: &mut ProcessCommand, paths: &AppPaths) {
     for (key, value) in app_path_env_vars(paths) {
         command.env(key, value);
     }
-    // The variables above pin the child's folders, which would make the child
-    // report every one as "set by ROCM_CLI_*_DIR". Tell it where they really
-    // came from, so a refusal names a setting the user can change.
-    if let Ok(sources) = serde_json::to_string(&rocm_core::AppPathSources::for_paths(paths)) {
+}
+
+/// [`apply_app_path_env`] for a `rocm` child run on the user's behalf (the
+/// dashboard's and assistant's approved commands). The variables pin the
+/// child's folders, which would make it report every one as "set by
+/// ROCM_CLI_*_DIR"; this also tells it where each pinned folder really came
+/// from, so a refusal names a setting the user can change. Not used for an
+/// interactive shell or an engine, which have no use for it.
+fn apply_app_path_env_for_rocm_child(command: &mut ProcessCommand, paths: &AppPaths) {
+    apply_app_path_env(command, paths);
+    if let Ok(sources) =
+        serde_json::to_string(&rocm_core::ForwardedAppPathSources::for_paths(paths))
+    {
         command.env(rocm_core::APP_PATH_SOURCES_ENV, sources);
     }
 }
@@ -23767,7 +23816,7 @@ mod tests {
         super::UninstallPlanEntry {
             kind,
             path,
-            resolved: None,
+            planned: super::PlannedAs::Unchecked,
         }
     }
 
@@ -23975,6 +24024,10 @@ mod tests {
     /// data root this way — is refused, and nothing at all is removed: not the
     /// home folder, and not the other roots either.
     #[test]
+    // Unix only: it needs a folder outside the sandbox home that is not another
+    // user's, and on Windows the temp folder is itself inside `C:\\Users\\<runner>`,
+    // where everything outside the sandbox home counts as another user's home.
+    #[cfg(unix)]
     fn uninstall_refuses_and_removes_nothing_when_a_root_is_protected() {
         let root = std::env::temp_dir().join(format!("rocm-refuse-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -24262,7 +24315,7 @@ mod tests {
             ("/etc/ssl", rocm_core::ProtectedLocation::System),
             ("/usr/bin", rocm_core::ProtectedLocation::System),
             ("/usr/lib", rocm_core::ProtectedLocation::System),
-            ("/var/lib", rocm_core::ProtectedLocation::NotMarked),
+            ("/var/lib", rocm_core::ProtectedLocation::SharedTopLevel),
         ] {
             if !Path::new(folder).is_dir() {
                 continue;
@@ -24284,6 +24337,10 @@ mod tests {
     /// advice to create the marker is true: once it exists, the same plan goes
     /// ahead and removes the folder.
     #[test]
+    // Unix only: it needs a folder outside the sandbox home that is not another
+    // user's, and on Windows the temp folder is itself inside `C:\\Users\\<runner>`,
+    // where everything outside the sandbox home counts as another user's home.
+    #[cfg(unix)]
     fn creating_the_advised_marker_clears_the_refusal() {
         let root = sandbox("marker-advice");
         let home = root.join("users").join("home");
@@ -24359,6 +24416,10 @@ mod tests {
     /// `--keep-data` and warns that moving the setting would orphan the SDK —
     /// and `--keep-data` clears the refusal.
     #[test]
+    // Unix only: it needs a folder outside the sandbox home that is not another
+    // user's, and on Windows the temp folder is itself inside `C:\\Users\\<runner>`,
+    // where everything outside the sandbox home counts as another user's home.
+    #[cfg(unix)]
     fn a_therock_venv_refusal_advises_keep_data_first() {
         let root = sandbox("venv-advice");
         let home = root.join("users").join("home");
@@ -24453,9 +24514,9 @@ mod tests {
         assert_eq!(plan.refused[0].why, rocm_core::ProtectedLocation::Home);
     }
 
-    /// A system location that is itself a link (Silverblue: `/mnt -> var/mnt`)
-    /// protects where it really is: a folder under `var/mnt` is refused as a
-    /// system location although `var/mnt` is not on the list as written. The
+    /// A system location that is itself a link (Silverblue: `/media -> run/media`)
+    /// protects where it really is: a folder under its target is refused as a
+    /// system location although the target is not on the list as written. The
     /// resolver is injected so the layout can be built in a sandbox.
     #[test]
     #[cfg(unix)]
@@ -24467,7 +24528,7 @@ mod tests {
         std::fs::create_dir_all(real_mnt.join("data")).unwrap();
         let mnt_target = real_mnt.clone();
         let resolve: &dyn Fn(&Path) -> std::io::Result<PathBuf> = &move |path: &Path| {
-            if path == Path::new("/mnt") {
+            if path == Path::new("/media") {
                 Ok(mnt_target.clone())
             } else {
                 rocm_core::canonicalize_for_compare(path)
@@ -24484,6 +24545,139 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(plan.refused.len(), 1, "{plan:?}");
         assert_eq!(plan.refused[0].why, rocm_core::ProtectedLocation::System);
+    }
+
+    /// Check, then act, for a root that was a symbolic link at review time:
+    /// replaced by a real folder while the prompt was open, it must not be
+    /// removed recursively; the same goes for a file that became a folder.
+    #[test]
+    #[cfg(unix)]
+    fn a_link_or_file_root_that_became_a_folder_is_not_removed() {
+        let root = sandbox("link-became-dir");
+        let home = root.join("users").join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = home.join("cache");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = home.join("config");
+        std::fs::write(&file, b"settings").unwrap();
+        let paths = AppPaths {
+            config_dir: file.clone(),
+            data_dir: home.join("no-data"),
+            cache_dir: link.clone(),
+        };
+        let plan = super::build_uninstall_plan_for_home(
+            &paths,
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 2, "{plan:?}");
+
+        // The swaps, as if they happened while the prompt was open.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir_all(&link).unwrap();
+        std::fs::write(link.join("precious.txt"), b"keep").unwrap();
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        let precious = link.join("precious.txt").is_file();
+
+        std::fs::remove_dir_all(&link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(&file).unwrap();
+        std::fs::write(file.join("precious.txt"), b"keep").unwrap();
+        let file_outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        let file_precious = file.join("precious.txt").is_file();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            precious,
+            "a link replaced by a folder was removed recursively"
+        );
+        let error = format!("{:#}", outcome.expect_err("must stop"));
+        assert!(
+            error.contains("was a symbolic link when reviewed"),
+            "{error}"
+        );
+        assert!(
+            file_precious,
+            "a file replaced by a folder was removed recursively"
+        );
+        let error = format!("{:#}", file_outcome.expect_err("must stop"));
+        assert!(error.contains("was a file when reviewed"), "{error}");
+    }
+
+    /// A symlink root is unlinked only where the review saw it: if the folder
+    /// holding it is swapped for a link to somewhere else, a link of the same
+    /// name there is not touched.
+    #[test]
+    #[cfg(unix)]
+    fn a_link_root_whose_folder_moved_is_not_unlinked() {
+        let root = sandbox("link-parent-moved");
+        let home = root.join("users").join("home");
+        let holder = home.join("holder");
+        std::fs::create_dir_all(&holder).unwrap();
+        std::os::unix::fs::symlink(root.join("target"), holder.join("cache")).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(root.join("theirs"), elsewhere.join("cache")).unwrap();
+        let plan = super::build_uninstall_plan_for_home(
+            &AppPaths {
+                config_dir: home.join("no-config"),
+                data_dir: home.join("no-data"),
+                cache_dir: holder.join("cache"),
+            },
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 1, "{plan:?}");
+        std::fs::rename(&holder, home.join("holder-old")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &holder).unwrap();
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        let theirs_left = std::fs::symlink_metadata(elsewhere.join("cache")).is_ok();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            theirs_left,
+            "the link in the swapped-in folder was unlinked"
+        );
+        let error = format!("{:#}", outcome.expect_err("must stop"));
+        assert!(error.contains("folder holding it now resolves"), "{error}");
+    }
+
+    /// A planned folder that is already gone when its turn comes (inside one
+    /// removed earlier, or removed by hand during the prompt) is skipped, and
+    /// the rest of the plan still runs.
+    #[test]
+    fn a_planned_folder_already_gone_is_skipped() {
+        let root = sandbox("already-gone");
+        let home = root.join("users").join("home");
+        let config = home.join(".rocm").join("config");
+        let data = home.join(".rocm").join("data");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let paths = AppPaths {
+            config_dir: config.clone(),
+            data_dir: data.clone(),
+            cache_dir: home.join("no-cache"),
+        };
+        let plan = super::build_uninstall_plan_for_home(
+            &paths,
+            &rocm_core::AppPathSources::default(),
+            &keep_binaries(),
+            Some(&home),
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 2, "{plan:?}");
+        std::fs::remove_dir_all(&config).unwrap();
+        let outcome = crate::uninstall::apply_uninstall_plan(&plan);
+        let data_left = data.exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert!(!data_left, "the rest of the plan did not run");
     }
 
     /// Check, then act: a parent swapped for a symlink between the review and
@@ -24544,15 +24738,26 @@ mod tests {
         let (paths, sources) = AppPaths::discover_with_sources().unwrap();
 
         // A parent pins the data folder and forwards where it came from.
+        let forwarded_json =
+            serde_json::to_string(&rocm_core::ForwardedAppPathSources::for_paths(&paths)).unwrap();
         env.set("ROCM_CLI_DATA_DIR", &paths.data_dir.display().to_string());
-        env.set(
-            rocm_core::APP_PATH_SOURCES_ENV,
-            &serde_json::to_string(&sources).unwrap(),
-        );
+        env.set(rocm_core::APP_PATH_SOURCES_ENV, &forwarded_json);
         let (_, forwarded) = AppPaths::discover_with_sources().unwrap();
+        // Stale or forged: the variable now names a different folder than
+        // the forwarded entry describes, so the entry is ignored.
+        env.set(
+            "ROCM_CLI_DATA_DIR",
+            &root.join("elsewhere").display().to_string(),
+        );
+        let (_, stale) = AppPaths::discover_with_sources().unwrap();
+        env.set("ROCM_CLI_DATA_DIR", &paths.data_dir.display().to_string());
         env.clear(rocm_core::APP_PATH_SOURCES_ENV);
         let (_, unforwarded) = AppPaths::discover_with_sources().unwrap();
         drop(env);
+        assert_eq!(
+            stale.data,
+            rocm_core::AppPathSource::Env("ROCM_CLI_DATA_DIR".to_owned())
+        );
         let _ = std::fs::remove_dir_all(&root);
 
         let venv = rocm_core::AppPathSource::TheRockVenv(config.join("config.json"));
@@ -24576,6 +24781,10 @@ mod tests {
     /// user did not set; and a `rocm` child started for an approved command is
     /// told the same sources.
     #[test]
+    // Unix only: it needs a folder outside the sandbox home that is not another
+    // user's, and on Windows the temp folder is itself inside `C:\\Users\\<runner>`,
+    // where everything outside the sandbox home counts as another user's home.
+    #[cfg(unix)]
     fn the_dashboard_path_names_the_setting_the_user_made() {
         let root = sandbox("dash-sources");
         let home = root.join("home");
@@ -24605,7 +24814,17 @@ mod tests {
         )
         .unwrap();
         let mut child = std::process::Command::new("true");
-        super::apply_app_path_env(&mut child, &paths);
+        super::apply_app_path_env_for_rocm_child(&mut child, &paths);
+        // An interactive shell or an engine gets the folders, not the sources.
+        let mut shell = std::process::Command::new("true");
+        super::apply_app_path_env(&mut shell, &paths);
+        let shell_gets_sources = shell
+            .get_envs()
+            .any(|(key, _)| key == rocm_core::APP_PATH_SOURCES_ENV);
+        assert!(
+            !shell_gets_sources,
+            "sources were passed to a non-rocm child"
+        );
         let forwarded = child
             .get_envs()
             .find(|(key, _)| *key == rocm_core::APP_PATH_SOURCES_ENV)
@@ -24617,12 +24836,16 @@ mod tests {
         assert!(text.contains("set by setup.therock_venv"), "{text}");
         assert!(text.contains("Re-run with --keep-data"), "{text}");
         assert!(!text.contains("ROCM_CLI_DATA_DIR"), "{text}");
-        let forwarded: rocm_core::AppPathSources =
+        let forwarded: rocm_core::ForwardedAppPathSources =
             serde_json::from_str(&forwarded.expect("sources forwarded")).unwrap();
         assert!(
-            matches!(forwarded.data, rocm_core::AppPathSource::TheRockVenv(_)),
+            matches!(
+                forwarded.data.source,
+                rocm_core::AppPathSource::TheRockVenv(_)
+            ),
             "{forwarded:?}"
         );
+        assert_eq!(forwarded.data.path, paths.data_dir);
     }
 
     use super::*;

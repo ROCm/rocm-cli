@@ -443,8 +443,9 @@ ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
 Expected result: the first preview refuses the data folder as `outside your
 home folder and not marked as ROCm CLI's own` and names the
 `.rocm-cli-root` file to create; after creating it, the second lists the data
-folder for removal. A system folder such as `/usr/local` is refused in a dry
-run whatever is in it.
+folder for removal. A system folder such as `/usr/local`, or a shared one such
+as `/var/lib` or `/opt`, is refused in a dry run whatever is in it, and the
+refusal does not offer the marker.
 
 A shared cache inside the cache folder is named as deleted (dry run):
 

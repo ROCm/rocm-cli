@@ -825,20 +825,25 @@ folder as usual. It never removes:
 
 - `/`, your home folder, or a folder that contains it;
 - `/usr`, `/etc`, `/boot`, `/bin`, `/sbin`, `/lib*`, `/sys`, `/proc`, `/dev`,
-  `/run`, `/mnt`, `/media`, `/snap`, or anything inside them — on Windows,
-  `Windows`, `Program Files`, `Program Files (x86)` and `ProgramData` on the
-  system drive;
-- another user's home folder (anything under `/home`, `/Users` or
-  `C:\Users`, or beside your own home, that is not inside yours).
+  `/run`, `/media`, `/snap`, or anything inside them — on Windows, `Windows`,
+  `Program Files`, `Program Files (x86)` and `ProgramData` on the system drive,
+  and the same folders on a drive WSL mounts at `/mnt/<drive>`;
+- a folder other programs share: anything directly under `/` (`/opt`, `/srv`,
+  `/tmp`, ...), `/var/lib`, `/var/cache`, `/var/log`, `/var/tmp`, or a mounted
+  drive itself (`/mnt/c`);
+- another user's home folder (anything under `/home`, `/Users`, `C:\Users`
+  or a WSL drive's `Users`, or beside your own home, that is not inside yours).
 
-Anywhere else outside your home folder — `/opt`, `/var`, `/srv`, another
-disk — it removes a folder only if it carries a `.rocm-cli-root` file. ROCm
-CLI writes that file into each of these folders it creates, including an SDK
-`--prefix`, so a folder it made is removed as usual; a folder made before this
-release, or by hand, is not. The check looks at where a folder really is as
-well as how it is written, so `ROCM_CLI_DATA_DIR=.` run from your home folder,
-a home reached through a linked parent folder, or `/usr/lib` reached as
-`/lib`, is caught too.
+Anywhere else outside your home folder — `/opt/rocm-cli`, `/srv/rocm`,
+`/mnt/d/rocm`, another disk — it removes a folder only if it carries a
+`.rocm-cli-root` file. ROCm CLI writes that file only into a folder it creates
+itself: the config, data and cache folders it sets up, the data folder its log
+is first written to, and an SDK `--prefix` it creates. A folder that already
+existed, one made by hand, or one made by a release before this one is not
+marked. The check looks at where a folder really is as well as how it is
+written, so `ROCM_CLI_DATA_DIR=.` run from your home folder, a home reached
+through a linked parent folder, or a system folder reached through a link is
+caught too.
 
 If a folder is refused (for example `ROCM_CLI_DATA_DIR=/`, or an SDK installed
 with `--prefix ~`), the review lists it under "Refused" with why and the

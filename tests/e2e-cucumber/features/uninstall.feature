@@ -81,7 +81,9 @@ Feature: Uninstall
 
   # A real folder outside the home folder is only removed when ROCm CLI marked
   # it as its own. The refusal says how to mark it; doing so clears it.
-  @id:uninstall-unmarked-folder-refused-until-marked
+  # Linux-only: on Windows the scenario root sits inside the runner's own user
+  # folder, where a folder outside the scenario home is another user's home.
+  @id:uninstall-unmarked-folder-refused-until-marked @requires-os:linux
   Scenario: uninstall-07 - A data folder outside home without ROCm CLI's marker is refused until the advised marker exists
     Given the data folder is a folder outside the home folder without ROCm CLI's marker
     When the user previews an uninstall

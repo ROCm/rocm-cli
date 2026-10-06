@@ -4875,10 +4875,14 @@ fn ensure_marked_uv_venv(
     python_launcher: &Path,
     install_root: &Path,
 ) -> Result<()> {
+    // Both decided BEFORE `ensure_uv_venv`, which may remove and recreate the
+    // folder (an incompatible venv is rebuilt) and so lose the marker: a
+    // folder ROCm CLI created, or one it had already marked, is marked again.
     let created = !install_root.exists();
+    let was_marked = install_root.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
     ensure_uv_venv(paths, uv, python_launcher, install_root)?;
-    if created {
-        rocm_core::mark_root(install_root)?;
+    if (created || was_marked) && !install_root.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file() {
+        rocm_core::mark_root(install_root);
     }
     Ok(())
 }
@@ -9336,14 +9340,35 @@ exit 1
             .unwrap();
         ensure_marked_uv_venv(&paths, &uv, &python_launcher, &existing).unwrap();
 
+        // A stale venv ROCm CLI had already marked is rebuilt (removed and
+        // recreated) and must keep its marker.
+        let rebuilt = root.join("rebuilt");
+        fs::create_dir_all(rebuilt.join("bin")).unwrap();
+        write_fake_python_reporting(&rebuilt.join("bin"), "python", "cp312", "Python 3.12.10")
+            .unwrap();
+        fs::write(rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER), b"").unwrap();
+        ensure_marked_uv_venv(&paths, &uv, &python_launcher, &rebuilt).unwrap();
+        let rebuilt_python = wheel_compatibility_for_python(&venv_python_path(&rebuilt))
+            .map(|compat| compat.python_tag);
+
         let fresh_marked = fresh.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
         let existing_marked = existing.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
+        let rebuilt_marked = rebuilt.join(rocm_core::ROCM_CLI_ROOT_MARKER).is_file();
         fs::remove_dir_all(root).ok();
         assert!(
             fresh_marked,
             "the install folder this install created is not marked"
         );
         assert!(!existing_marked, "a folder that already existed was marked");
+        assert_eq!(
+            rebuilt_python.ok().as_deref(),
+            Some("cp314"),
+            "the stale venv was not rebuilt, so this case proves nothing"
+        );
+        assert!(
+            rebuilt_marked,
+            "rebuilding a marked venv dropped its marker"
+        );
     }
 
     #[test]

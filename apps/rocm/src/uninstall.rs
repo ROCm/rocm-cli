@@ -16,8 +16,8 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::{
-    UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall, remove_path,
-    render_uninstall_plan,
+    PlannedAs, UninstallOptions, UninstallPlan, build_uninstall_plan, confirm_uninstall,
+    remove_path, render_uninstall_plan,
 };
 
 pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
@@ -83,9 +83,9 @@ pub(crate) fn apply_uninstall_plan(plan: &UninstallPlan) -> Result<()> {
         // symlink while the prompt was open would point the same spelling at
         // a different folder. Resolve again, refuse if it moved, and remove
         // the resolved location rather than re-walking the spelling.
-        let target = match &entry.resolved {
-            None => entry.path.clone(),
-            Some(planned) => match rocm_core::canonicalize_for_compare(&entry.path) {
+        let target = match &entry.planned {
+            PlannedAs::Unchecked => entry.path.clone(),
+            PlannedAs::Dir(planned) => match rocm_core::canonicalize_for_compare(&entry.path) {
                 Ok(now) if &now == planned => now,
                 Ok(now) => bail!(
                     "stopped before removing the {} folder {}: it now resolves to {}, not {} as \
@@ -107,6 +107,57 @@ pub(crate) fn apply_uninstall_plan(plan: &UninstallPlan) -> Result<()> {
                     });
                 }
             },
+            // A link or file is unlinked, never walked — unless it has turned
+            // into something else since the review: a link replaced by a real
+            // folder would otherwise be removed recursively, unreviewed.
+            PlannedAs::Link { parent } | PlannedAs::File { parent } => {
+                let was_link = matches!(entry.planned, PlannedAs::Link { .. });
+                let spelled = crate::entry_path(&entry.path);
+                let now = match std::fs::symlink_metadata(&spelled) {
+                    Ok(now) => now,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to check {} before removing it", spelled.display())
+                        });
+                    }
+                };
+                let unchanged = if was_link {
+                    now.file_type().is_symlink()
+                } else {
+                    now.is_file()
+                };
+                if !unchanged {
+                    bail!(
+                        "stopped before removing the {} {}: it was a {} when reviewed and is \
+                         not one now. Anything reported as removed above is gone; nothing after \
+                         it was touched. Check it and run the uninstall again.",
+                        entry.kind,
+                        entry.path.display(),
+                        if was_link { "symbolic link" } else { "file" }
+                    );
+                }
+                let parent_now = spelled
+                    .parent()
+                    .map(|p| {
+                        if p.as_os_str().is_empty() {
+                            std::path::Path::new(".")
+                        } else {
+                            p
+                        }
+                    })
+                    .and_then(|p| rocm_core::canonicalize_for_compare(p).ok());
+                if parent.is_some() && &parent_now != parent {
+                    bail!(
+                        "stopped before removing the {} {}: the folder holding it now resolves \
+                         somewhere else than the review showed. Anything reported as removed \
+                         above is gone; nothing after it was touched.",
+                        entry.kind,
+                        entry.path.display()
+                    );
+                }
+                spelled
+            }
         };
         remove_path(&target)
             .with_context(|| format!("failed to remove {}", entry.path.display()))?;

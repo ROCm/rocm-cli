@@ -87,6 +87,10 @@ pub fn init(paths: &AppPaths) -> Option<WorkerGuard> {
 fn validated_log_dir(paths: &AppPaths) -> Option<PathBuf> {
     let root = paths.data_dir.as_path();
     let log_dir = paths.client_log_dir();
+    // Logging is usually what first brings the data folder into being, so it
+    // is created here as ROCm CLI's own (marked), and only if this call is
+    // what creates it.
+    rocm_core::create_marked_root(root).ok()?;
     std::fs::create_dir_all(&log_dir).ok()?;
 
     let canonical_root = std::fs::canonicalize(root).ok()?;
@@ -166,6 +170,34 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    /// Logging usually creates the data folder first; when it does, the
+    /// folder is marked as ROCm CLI's own. A data folder that was already
+    /// there is not marked.
+    #[test]
+    fn the_data_folder_logging_creates_is_marked_and_an_existing_one_is_not() {
+        let (root, fresh) = temp_paths("marks-data-root");
+        validated_log_dir(&fresh).expect("log dir");
+        let fresh_marked = fresh
+            .data_dir
+            .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+            .is_file();
+
+        let (other_root, existing) = temp_paths("keeps-existing-data-root");
+        std::fs::create_dir_all(&existing.data_dir).unwrap();
+        validated_log_dir(&existing).expect("log dir");
+        let existing_marked = existing
+            .data_dir
+            .join(rocm_core::ROCM_CLI_ROOT_MARKER)
+            .exists();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&other_root);
+        assert!(
+            fresh_marked,
+            "the data folder logging created is not marked"
+        );
+        assert!(!existing_marked, "an existing data folder was marked");
     }
 
     #[test]

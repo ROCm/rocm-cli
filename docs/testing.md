@@ -579,8 +579,9 @@ there against oracles restated from each policy, over seeds that include other
 users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper system
 descendants, for several homes (including `/`). Runtime folders are refused
 inside the runtime system list; `rocm uninstall`'s roots are refused inside its
-own list and in other users' homes, and need the `.rocm-cli-root` marker
-anywhere else outside home:
+own list (checked before any home allowance), at shared top-level folders and
+mounted drives, and in other users' homes, and need the `.rocm-cli-root`
+marker anywhere else outside home:
 
 ```bash
 cargo test -p rocm-core --lib runtime::tests::delete_guard_properties

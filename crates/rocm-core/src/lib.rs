@@ -72,7 +72,7 @@ pub use report::{
 };
 use runtime::env_path_override;
 pub use runtime::{
-    ProtectedLocation, ROCM_CLI_ROOT_MARKER, RUNTIME_LIBRARY_PATH_ENV, RootClaims, RuntimeHost,
+    ProtectedLocation, ROCM_CLI_ROOT_MARKER, RUNTIME_LIBRARY_PATH_ENV, RuntimeHost,
     RuntimePlatform, UninstallRootVerdict, canonicalize_for_compare, create_marked_root,
     current_executable_path, default_cache_dir, default_config_dir, default_data_dir,
     default_interactive_shell_program, managed_logs_dir, managed_pip_cache_dir,
@@ -1785,9 +1785,43 @@ impl Default for AppPathSources {
 /// A parent that runs `rocm` for the dashboard or the assistant pins the
 /// child's folders with the three `ROCM_CLI_*_DIR` variables, so the child
 /// would otherwise report every folder as "set by ROCM_CLI_*_DIR" — a setting
-/// the user never made and cannot change. The child takes a folder's source
-/// from here only while that folder's variable is set, as the parent set it.
+/// the user never made and cannot change. Each entry carries the folder it
+/// describes, and the child takes it only while that folder's variable still
+/// names exactly that folder — so a stale or hand-written value cannot rename
+/// the source of a folder it does not describe.
 pub const APP_PATH_SOURCES_ENV: &str = "ROCM_CLI_APP_PATH_SOURCES";
+
+/// One folder's source, with the folder it applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedAppPathSource {
+    pub path: PathBuf,
+    pub source: AppPathSource,
+}
+
+/// What a parent `rocm` passes in [`APP_PATH_SOURCES_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedAppPathSources {
+    pub config: PinnedAppPathSource,
+    pub data: PinnedAppPathSource,
+    pub cache: PinnedAppPathSource,
+}
+
+impl ForwardedAppPathSources {
+    /// `paths` pinned with where each folder came from.
+    #[must_use]
+    pub fn for_paths(paths: &AppPaths) -> Self {
+        let sources = AppPathSources::for_paths(paths);
+        let pin = |path: &Path, source: AppPathSource| PinnedAppPathSource {
+            path: path.to_path_buf(),
+            source,
+        };
+        Self {
+            config: pin(&paths.config_dir, sources.config),
+            data: pin(&paths.data_dir, sources.data),
+            cache: pin(&paths.cache_dir, sources.cache),
+        }
+    }
+}
 
 impl AppPathSources {
     /// Where `paths`' folders came from: discovery's answer for each folder
@@ -1851,12 +1885,19 @@ impl AppPaths {
         let from_venv = || AppPathSource::TheRockVenv(paths.config_path());
         let forwarded = std::env::var(APP_PATH_SOURCES_ENV)
             .ok()
-            .and_then(|text| serde_json::from_str::<AppPathSources>(&text).ok());
-        let env_or_forwarded = |var: &str, pick: fn(&AppPathSources) -> &AppPathSource| {
-            forwarded
-                .as_ref()
-                .map_or_else(|| AppPathSource::Env(var.to_owned()), |f| pick(f).clone())
-        };
+            .and_then(|text| serde_json::from_str::<ForwardedAppPathSources>(&text).ok());
+        // Honoured only while the variable still names the folder the entry
+        // was written for.
+        let env_or_forwarded =
+            |var: &str, pick: fn(&ForwardedAppPathSources) -> &PinnedAppPathSource| {
+                let pinned = forwarded.as_ref().map(pick).filter(|pinned| {
+                    env_path_override(var).is_some_and(|value| value == pinned.path)
+                });
+                pinned.map_or_else(
+                    || AppPathSource::Env(var.to_owned()),
+                    |pinned| pinned.source.clone(),
+                )
+            };
         let sources = AppPathSources {
             config: if config_overridden {
                 env_or_forwarded("ROCM_CLI_CONFIG_DIR", |f| &f.config)
@@ -13127,32 +13168,6 @@ Class Name:                Display
         );
         assert!(data, "the data folder ensure created is not marked");
         assert!(cache, "the cache folder ensure created is not marked");
-    }
-
-    /// A root the process found absent and then created by any means (here a
-    /// plain `create_dir_all` of a subfolder, as logging does) is marked; one
-    /// that was already there is not.
-    #[test]
-    fn root_claims_mark_only_the_roots_created_after_recording() {
-        let (root, paths) = temp_app_paths("root-claims");
-        fs::create_dir_all(&paths.config_dir).unwrap();
-        let claims = RootClaims::record([
-            paths.config_dir.as_path(),
-            paths.data_dir.as_path(),
-            paths.cache_dir.as_path(),
-        ]);
-        fs::create_dir_all(paths.data_dir.join("logs")).unwrap();
-        claims.mark_created();
-        let data_marked = paths.data_dir.join(ROCM_CLI_ROOT_MARKER).is_file();
-        // The cache folder appears later; dropping the claims marks it too.
-        fs::create_dir_all(paths.cache_dir.join("therock")).unwrap();
-        drop(claims);
-        let cache_marked = paths.cache_dir.join(ROCM_CLI_ROOT_MARKER).is_file();
-        let config_marked = paths.config_dir.join(ROCM_CLI_ROOT_MARKER).is_file();
-        fs::remove_dir_all(root).ok();
-        assert!(data_marked, "a root created after recording was not marked");
-        assert!(cache_marked, "a root created before drop was not marked");
-        assert!(!config_marked, "a root that already existed was marked");
     }
 
     fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
