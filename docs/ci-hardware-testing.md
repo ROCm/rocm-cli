@@ -36,8 +36,13 @@ separate tier flag or tag filter to maintain.
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu | self-hosted `[self-hosted, linux, devlab-dispatch, strix-halo]` |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Windows 11 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo (gfx1151) on Ubuntu under WSL2 | self-hosted `[self-hosted, windows, devlab-dispatch, strix-halo]` |
-| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon AI PRO R9700 (gfx1201) on Linux | self-hosted `[self-hosted, linux, r9700]` |
-| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (AMD Instinct, gfx950) on Linux | self-hosted `[self-hosted, linux, mi350p]` |
+
+`e2e-gpu-strix-ubuntu` additionally runs a `strategy.matrix.channel: [release,
+nightly]` axis — two concurrent legs on the same job, channel-suffixed
+artifact names — so the per-PR smoke gate proves the nightly channel boots on
+at least one platform without adding the axis (and its wall-clock cost) to
+every per-PR lane. This mirrors `nightly.yml`'s channel matrix from
+ROCMAI-429, applied to a single per-PR lane rather than all of them.
 
 All three Strix Halo lanes run on the AMD Ryzen DevLab Dispatch pool: a fresh
 runner is registered per job and destroyed after, opt-in only via the
@@ -81,7 +86,7 @@ resolve to skip here, and known bugs resolve to xfail from
 `expectations.toml`. It is a required check and must stay green.
 
 The self-hosted jobs (`e2e-gpu`, `e2e-gpu-strix-ubuntu`, `e2e-gpu-strix-windows`,
-`e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p`) run on AMD GPU systems, so they
+and `e2e-wsl`) run on AMD GPU systems, so they
 exercise host/GPU detection, engine `detect`/`capabilities`, and live serving
 scenarios that the mock job cannot. GPU availability is advisory in the WSL lane, as
 described below.
@@ -140,9 +145,11 @@ not applicable, instead of failing them on a premise the host cannot meet.
 
 Each workflow has its own consolidated report job. `ci.yml`'s `e2e-report`
 covers the mock platform;
-`e2e-selfhosted.yml`'s `e2e-report` covers the GPU platforms;
-`nightly.yml`'s `e2e-report-nightly` covers the same platforms with the
-`@nightly` scenarios included. Each joins its platforms'
+`e2e-selfhosted.yml`'s `e2e-report` covers the per-PR GPU platforms;
+`nightly.yml`'s `e2e-report-nightly` covers a strict superset of those
+platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
+per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
+included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
@@ -193,10 +200,9 @@ They can also be triggered manually via `e2e-selfhosted.yml`'s
 `workflow_dispatch`, independent of the `serve` gate, with these inputs:
 
 - `platform` (choice: `all`, `app-dev-gpu`, `strix-ubuntu`, `strix-windows`,
-  `strix-wsl`, `rad3`, `mi350p`) — which self-hosted job(s) to run. `app-dev-gpu`
+  `strix-wsl`) — which self-hosted job(s) to run. `app-dev-gpu`
   maps to `e2e-gpu`, `strix-ubuntu` to `e2e-gpu-strix-ubuntu`, `strix-windows` to
-  `e2e-gpu-strix-windows`, `strix-wsl` to `e2e-wsl`, `rad3` to
-  `e2e-gpu-rad3`, and `mi350p` to `e2e-gpu-mi350p`. (The mock lane has its own
+  `e2e-gpu-strix-windows`, and `strix-wsl` to `e2e-wsl`. (The mock lane has its own
   `platform` input on `ci.yml`; it is not part of this workflow.)
 - `name_filter` (string) — a scenario-name regex forwarded to the cucumber
   harness (`cargo xtask e2e -- --name <regex>`) so a dispatch can run a
@@ -237,6 +243,11 @@ self-hosted lane calls:
 ```bash
 cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
 ```
+
+(`e2e-gpu-strix-ubuntu`'s two channel-matrix legs pass `--channel ${{
+matrix.channel }}` instead, resolving to `release` or `nightly` per leg;
+every other lane is release-only and keeps the literal `--channel release`
+above.)
 
 before the suite. `rocm update` compares both the channel version and the wheel
 composition recorded in the runtime manifest (source-layout generation and exact
@@ -279,12 +290,11 @@ the pre-warm block is duplicated across multiple jobs in two shells;
 ## Blocking vs. non-blocking
 
 The self-hosted jobs — `e2e-gpu`, `e2e-gpu-strix-ubuntu`,
-`e2e-gpu-strix-windows`, `e2e-wsl`, `e2e-gpu-rad3`, and `e2e-gpu-mi350p` — all run with
+`e2e-gpu-strix-windows`, and `e2e-wsl` — all run with
 check names that are absent from branch protection's required-status-check
 list (see below), so a hardware failure never gates a PR merge no matter how
-it reports. Five of them run with `continue-on-error: false`, so a real
-regression shows red instead of always green; `e2e-gpu-mi350p` still runs with
-`continue-on-error: true`, unchanged and out of scope here. Their results also
+it reports. All four run with `continue-on-error: false`, so a real
+regression shows red instead of always green. Their results also
 surface in the self-hosted consolidated report for visibility.
 
 ### Timeouts on the Strix lanes

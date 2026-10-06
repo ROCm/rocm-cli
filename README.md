@@ -228,6 +228,7 @@ form works depends on the engine your GPU selects.
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
 | `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
+| `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
@@ -261,7 +262,7 @@ the JSON report, not the human-readable one.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
@@ -283,20 +284,54 @@ fix` takes the id, not the position.
   skips checks that need to read the distribution's own environment
   (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
   `rocm diagnose` inside the distribution for those.
+- `--report` shows exactly what this machine would contribute to a problem
+  report, and sends nothing — there is no transport yet, and there will be no
+  automatic one: a report leaves a machine only by its owner's own action. The
+  content is deliberately narrow (a schema version, the matched entry, whether
+  a fix was offered for it, the GPU architecture and which compatibility
+  matrix snapshot it was checked against, the OS family, distribution and
+  major version, the ROCm release, the inference engine and its release, the
+  CLI version), and it carries no host name, user name, file path, or error
+  text. The ROCm release and the inference engine's release are each cut
+  back to a release, so a build number that would narrow toward one machine
+  never appears there; the CLI's own version is the exception, since it names
+  the tool that wrote the report rather than something read off the machine.
+  The distribution is checked against a list of known names rather than
+  repeated from the machine. Hardware that is not on AMD's published
+  compatibility matrix produces no report at all, and the CLI says why. So
+  does a WSL machine, for a different reason: this CLI does not inspect the
+  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+  matrix and says that rather than claiming the architecture could not be
+  read.
+- `--send`, which requires `--report`, additionally offers a prefilled mail
+  carrying that report. It still sends nothing: the mail opens already filled
+  in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
+  and it leaves the machine only when you send it yourself. Requiring
+  `--report` is what guarantees the content is shown before the mail is
+  offered. A mail client opens only when you asked and the machine looks like
+  a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
+  set, the address and the link are printed instead, which is also what
+  happens on a machine with no mail client. It is not combinable with
+  `--json`, which exists for scripts, and a script is not a person who can
+  read a mail before sending it. Note that a mail carries your address, which
+  the report itself does not.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
-to list the whole catalog. Each fix is marked AUTO (this command carries out
-the change) or PRINT-ONLY (it prints the steps for you to run yourself —
-usually because the right command depends on a choice only you can make,
-sometimes because it also needs sudo or a reboot).
+to list the whole catalog. Each fix carries a marker saying what happens on
+this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
+once given the argument it names), PRINT-ONLY (it prints the steps for you to
+run yourself — usually because the right command depends on a choice only you
+can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
+(no reliable fix exists, so nothing will be changed -- no catalog entry
+carries this marker today; it is reserved for a future detect-but-cannot-repair
+failure).
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
-- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`;
-  without it, that fix only prints the `rocminfo` (Linux) or `hipInfo.exe`
-  (Windows) query needed to find the index and makes no change, despite
-  being marked AUTO.
+- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
+  NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
+  `hipInfo.exe` (Windows) query needed to find the index and makes no change.
 
 ### ROCm installation
 
@@ -566,7 +601,8 @@ Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
-per-GPU VRAM with `amd-smi` and picks the lowest-numbered GPU that is idle and
+per-GPU VRAM (via `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is
+not installed) and picks the lowest-numbered GPU that is idle and
 not already used by another rocm-cli server (managed or foreground), falling
 back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
 pin a specific device. The

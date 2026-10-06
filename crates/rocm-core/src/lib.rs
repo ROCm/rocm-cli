@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
@@ -34,13 +35,17 @@ pub mod fix;
 pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod report;
+pub mod report_delivery;
 pub mod runtime;
+pub mod terminal;
+
 #[cfg(test)]
 mod test_env;
 pub mod uv;
 pub use diagnose::{
-    DiagnoseReport, Diagnosis, Fix, Route, diagnose as run_diagnose,
-    render_report_text as render_diagnose_text,
+    DiagnoseReport, Diagnosis, Fix, Route, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
+    render_report_text as render_diagnose_text, vllm_oom_symptom_is_diagnosable,
 };
 pub use disk_space::{
     SpaceCheck, available_space_for_path, check_space_for_path, ensure_space_for,
@@ -51,10 +56,19 @@ use examine::extract_rocm_version;
 pub use examine::{
     Examination, FrameworkProbe, WSL_PLATFORM_NOTE, gfx_is_apu_family, probe_wsl_distro_from_host,
 };
-pub use fix::{FixOptions, apply as apply_fix, list_recipes as list_fix_recipes};
+pub use fix::{
+    CATALOG_CONTRACT_VERSION, CatalogManifest, FixOptions, ManifestEntry, ManifestPlatform,
+    apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
+    list_recipes as list_fix_recipes,
+};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     process_start_ticks, terminate_verified,
+};
+pub use report::{
+    APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
+    Refusal as ReportRefusal, Report, is_rocm_supported, prepare_report, read_report,
+    refusal_envelope,
 };
 use runtime::env_path_override;
 pub use runtime::{
@@ -1943,6 +1957,19 @@ impl AppPaths {
         self.data_dir.join("telemetry")
     }
 
+    /// The directive file that moves `rocm dash`'s telemetry daemon off wall time
+    /// and onto a logical observation clock (see `docs/release-trust.md`).
+    ///
+    /// `rocm dash` reads it in every build, and nothing in rocm-cli creates it —
+    /// only the E2E harness plants one, in its isolated data root. Both resolve it
+    /// through this one method, so the path the harness plants and the path the
+    /// dashboard reads cannot drift apart. If they did, the dashboard would
+    /// silently stay on wall time, and the clock-driven scenarios would not fail
+    /// outright: they would keep passing, but only by timing.
+    pub fn dash_test_clock_file(&self) -> PathBuf {
+        self.telemetry_state_dir().join("test-clock-offset")
+    }
+
     /// Log file for the rocm-dash telemetry daemon, under the shared logs dir.
     ///
     /// Deliberately under the canonical `AppPaths` data root
@@ -2592,7 +2619,7 @@ pub(crate) fn is_wsl1_kernel(kernel_release: &str) -> bool {
 ///
 /// Search the conventional locations, and report "could not ask" as `None`
 /// rather than as an empty answer.
-fn ldconfig_cache() -> Option<String> {
+pub(crate) fn ldconfig_cache() -> Option<String> {
     for program in ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"] {
         if let Some(text) = capture_optional_command(program, &["-p"]) {
             return Some(text);
@@ -4109,7 +4136,9 @@ fn push_existing_runtime_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     paths.push(path);
 }
 
-fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkProbeCandidate> {
+pub(crate) fn managed_therock_sdk_probe_candidates(
+    registry_dir: &Path,
+) -> Vec<TheRockSdkProbeCandidate> {
     let Ok(entries) = fs::read_dir(registry_dir) else {
         return Vec::new();
     };
@@ -4145,6 +4174,7 @@ fn managed_therock_sdk_probe_candidates(registry_dir: &Path) -> Vec<TheRockSdkPr
             site_packages: sdk.site_packages,
             root_path,
             bin_path,
+            library_paths: sdk.library_paths,
         });
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.installed_at_unix_ms));
@@ -4166,20 +4196,11 @@ fn managed_sdk_tool_path(bin_path: &Path, tool: &str) -> Option<PathBuf> {
 
 fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<OsString> {
     let mut paths = Vec::new();
-    collect_sdk_library_paths(&candidate.root_path, &mut paths);
-    if let Some(site_packages) = candidate.site_packages.as_deref()
-        && let Ok(entries) = fs::read_dir(site_packages)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if name.starts_with("_rocm_sdk_") {
-                collect_sdk_library_paths(&path, &mut paths);
-            }
-        }
-    }
+    collect_managed_runtime_library_paths(
+        &candidate.root_path,
+        candidate.site_packages.as_deref(),
+        &mut paths,
+    );
     let wsl_lib = PathBuf::from("/usr/lib/wsl/lib");
     if wsl_lib.is_dir() {
         paths.push(wsl_lib);
@@ -4196,7 +4217,64 @@ fn managed_sdk_ld_library_path(candidate: &TheRockSdkProbeCandidate) -> Option<O
     }
 }
 
-fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+/// Every library directory a managed runtime keeps, given its root and the
+/// `site-packages` its SDK recorded.
+///
+/// One description of the layout, deliberately. A wheel-format runtime does not
+/// keep its ROCm libraries under the root: they sit in a sibling `_rocm_sdk_*`
+/// package inside `site-packages`, and a caller that walks the root alone sees
+/// an empty runtime rather than a populated one. That is not a difference a
+/// caller should have to remember, so it lives here and every search shares it.
+pub(crate) fn collect_managed_runtime_library_paths(
+    root: &Path,
+    site_packages: Option<&Path>,
+    paths: &mut Vec<PathBuf>,
+) {
+    collect_sdk_library_paths(root, paths);
+    // Nothing to do when `site_packages` is `None`, and the absence of an
+    // `else` is deliberate rather than an oversight.
+    //
+    // `None` is not reachable from a real candidate today: `ROCM_SDK_PROBE_SCRIPT`
+    // has recorded `site_packages` unconditionally, outside its `try`, since the
+    // probe's initial version, so every manifest that parses at all carries
+    // `Some` here. `site_packages` stays `Option` because the field is
+    // `serde(default)` (a read-only probe cannot depend on a registry record
+    // being current), not because there is a real shape it needs to degrade
+    // gracefully for.
+    //
+    // There also is not a guess worth making if this were ever reached: `root`
+    // is one of the runtime's own `_rocm_sdk_*` package directories (the probe
+    // script's `_devel.get_devel_root()` result, or the first package root it
+    // found when there is no `devel` extra), never a venv root with a
+    // `root/lib/<python>/site-packages` layout underneath it to re-derive. A
+    // fallback that assumed that shape previously shipped here and could not
+    // have been exercised by any real record; removed along with its test
+    // rather than kept as a guess for a case that cannot arise.
+    if let Some(recorded) = site_packages {
+        collect_sdk_package_library_paths(recorded, paths);
+    }
+}
+
+/// Library directories of the `_rocm_sdk_*` packages inside `site_packages`.
+///
+/// They belong to the runtime that contains them, not to themselves.
+fn collect_sdk_package_library_paths(site_packages: &Path, paths: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(site_packages) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("_rocm_sdk_"))
+        {
+            collect_sdk_library_paths(&path, paths);
+        }
+    }
+}
+
+pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
     for path in [
         root.join("bin"),
         root.join("lib"),
@@ -4286,11 +4364,19 @@ struct TheRockSdkProbeManifest {
 }
 
 #[derive(Debug, Clone)]
-struct TheRockSdkProbeCandidate {
+pub(crate) struct TheRockSdkProbeCandidate {
     installed_at_unix_ms: u128,
-    site_packages: Option<PathBuf>,
-    root_path: PathBuf,
+    pub(crate) site_packages: Option<PathBuf>,
+    pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
+    /// The SDK's own recorded library directories -- every package root the
+    /// probe script actually imported and asked Python for (see
+    /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
+    /// `root_path`/`site_packages` after the fact. This is what
+    /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
+    /// a caller that needs to find a managed runtime's actual libraries (comgr
+    /// included) should prefer this over re-deriving the layout.
+    pub(crate) library_paths: Vec<PathBuf>,
 }
 
 pub fn detect_host_gfx_target() -> Option<String> {
@@ -5647,8 +5733,21 @@ fn detect_linux_drm_ip_discovery_gfx_target() -> Option<String> {
     None
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn is_amdgpu_device(device_dir: &Path) -> bool {
+/// Whether a DRM `device` directory belongs to an AMD GPU: the PCI `vendor` id
+/// (`0x1002`), or, when that is unreadable, an `amdgpu` `uevent` `DRIVER=` line.
+///
+/// Both signals are needed. A vendor-only test under-counts on hosts where
+/// `vendor` is absent or unreadable, and the callers are counting *cards* — the
+/// KFD/DRM count authority here and the `rocm` CLI's sysfs fallback probe — so
+/// an under-count silently narrows the multi-card ordinal guard.
+///
+/// `pub` and not `#[cfg(target_os = "linux")]` precisely so there is one copy:
+/// the CLI's fallback probe used to carry its own, with a doc comment asserting
+/// the two were "the same two-signal test" and nothing holding them to it. It
+/// reads files, so there is nothing platform-specific to gate, and gating it
+/// would put it out of reach of a dependent crate's `cfg(test)` build.
+#[must_use]
+pub fn is_amdgpu_device(device_dir: &Path) -> bool {
     if let Ok(vendor) = fs::read_to_string(device_dir.join("vendor"))
         && vendor.trim().eq_ignore_ascii_case("0x1002")
     {
@@ -8064,6 +8163,27 @@ pub fn resolve_amd_smi_binary() -> OsString {
     }
     resolve_amd_smi_binary_in_home(runtime_home_dir().as_deref())
 }
+
+/// The `--gpu-memory-utilization` workaround for a shared/busy GPU.
+///
+/// Shared by the `rocm` CLI (pre-launch low-VRAM note), the vLLM engine adapter
+/// (post-failure OOM hint) and the `fix-16-vllm-oom` diagnosis summary, so those
+/// surfaces never drift into different wording for the same fix. The
+/// `rocm fix fix-16-vllm-oom` catalog rationale is deliberately NOT this text —
+/// it frames the same fault for a different reader — but its worked value is
+/// pinned to this one (see below). vLLM reserves a fixed fraction of each
+/// GPU's *total* VRAM by default (~0.9), independent of the model size or how
+/// much is currently free, so on a shared or busy card that reservation
+/// collides with memory already in use and the engine OOMs even a tiny model.
+///
+/// The worked example must stay the value the `fix-16-vllm-oom` recipe and the
+/// docs hand the user (`0.5`). A smaller budget such as `0.1` sits below the
+/// weights of most models people actually serve, so it trades one startup
+/// failure for another. Pinned by
+/// `the_utilization_hint_example_matches_the_recipe_command`.
+pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GPU's total VRAM by default; on a shared or busy GPU this can \
+     collide with memory already in use. Lower the reservation with `--gpu-memory-utilization \
+     <0-1>` (e.g. 0.5 for a small model), or target a less-busy GPU with `--gpu <index>`.";
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
@@ -10512,6 +10632,57 @@ Class Name:                Display
         assert_eq!(
             detect_managed_therock_sdk_gfx_target(&paths),
             Some("gfx1201".to_owned())
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// `managed_therock_sdk_probe_candidates` surfaces the SDK's own recorded
+    /// `library_paths` rather than dropping them.
+    ///
+    /// Those are what `examine`'s comgr/HIP search now reads to find a managed
+    /// runtime's libraries (see `known_install_roots`/`install_library_dirs` in
+    /// `examine.rs`), in place of re-deriving the layout from `root_path` and
+    /// `site_packages` after the fact -- a guess that does not hold for every
+    /// real install shape, which is what left a managed runtime's own code
+    /// object manager library unseen on a real host
+    /// (`examine-finds-the-managed-runtimes-own-compilation-library`). A
+    /// candidate whose `library_paths` came back empty would defeat that fix
+    /// silently, so this pins the field surviving the read.
+    #[test]
+    fn managed_sdk_probe_candidate_carries_recorded_library_paths() -> Result<()> {
+        let (root, paths) = temp_app_paths("managed-sdk-library-paths");
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        let site_packages = root.join("site-packages");
+        let sdk_root = site_packages.join("_rocm_sdk_devel");
+        let sdk_bin = sdk_root.join("bin");
+        let comgr_dir = site_packages.join("_rocm_sdk_core").join("lib");
+        fs::create_dir_all(&sdk_bin)?;
+        fs::create_dir_all(&comgr_dir)?;
+        fs::create_dir_all(&registry)?;
+        fs::write(
+            registry.join("runtime.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "runtime_id": "therock-release:gfx120X-all",
+                "family": "gfx120X-all",
+                "installed_at_unix_ms": 10,
+                "rocm_sdk": {
+                    "import_ok": true,
+                    "site_packages": site_packages,
+                    "root_path": sdk_root,
+                    "bin_path": sdk_bin,
+                    "library_paths": [comgr_dir]
+                }
+            }))?,
+        )?;
+
+        let candidates = managed_therock_sdk_probe_candidates(&registry);
+        assert_eq!(candidates.len(), 1, "expected exactly one candidate");
+        assert_eq!(
+            candidates[0].library_paths,
+            vec![comgr_dir],
+            "the recorded library_paths must survive into the candidate, or the \
+             comgr/HIP search has nowhere else reliable to find them"
         );
         fs::remove_dir_all(root).ok();
         Ok(())

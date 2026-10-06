@@ -1234,7 +1234,8 @@ jobs:
       # `SystemTime`. See that job's copy of this step for the full reasoning.
       # Kept in sync by hand until the two lanes are deduplicated (#294);
       # `both_wsl_lanes_settle_the_clock_before_running_the_suite` in
-      # xtask/src/workflow_contract.rs fails if either copy goes missing.
+      # xtask/src/workflow_contract.rs fails if either copy goes missing, moves
+      # after the suite, or drifts from the other.
       - name: Settle the clock before anything times a scenario
         shell: powershell
         run: |
