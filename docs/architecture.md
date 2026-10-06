@@ -51,7 +51,7 @@ Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber` th
 
 Extracted so far:
 - `persistence.rs` — `record_event`/`load_managed_services`, the automation-event/audit-log and managed-service-registry I/O shared across the daemon's sandbox, MCP, service-lifecycle, and watcher code.
-- `common.rs` — helpers shared across ≥2 of those remaining clusters: GPU/amd-smi snapshotting, the bridge-snapshot diagnostic, `CommandCapture`/command-timeout plumbing including the shared `rocm`-subprocess capture helpers the sandbox and MCP clusters both call, and small arg/healthcheck/endpoint-key utilities.
+- `common.rs` — helpers shared across ≥2 of those remaining clusters: GPU/amd-smi snapshotting, the bridge-snapshot diagnostic, `CommandCapture`/command-timeout plumbing including the shared `rocm`-subprocess capture helpers the sandbox and MCP clusters both call, and small healthcheck/endpoint-key utilities.
 
 A helper earns a place in `common.rs` only once a second still-inline cluster calls it directly; a helper with exactly one caller stays in `lib.rs` next to that caller until its own cluster's extraction PR, even if it is conceptually similar to something that did move.
 
