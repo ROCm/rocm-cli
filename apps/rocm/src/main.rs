@@ -18682,7 +18682,28 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
 }
 
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
+    stop_internal_managed_service_with(paths, service_id, terminate_recorded_service_pids)
+}
+
+/// [`stop_internal_managed_service`], with the termination of the recorded
+/// processes supplied by the caller. Production passes
+/// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
+/// what is on disk at the moment the processes would be signalled. Everything
+/// else — the engine stop, the manifest writes, the key cleanup — runs for real.
+fn stop_internal_managed_service_with(
+    paths: &AppPaths,
+    service_id: &str,
+    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+) -> Result<serde_json::Value> {
     let mut record = load_managed_service(paths, service_id)?;
+    // Record the request on disk before anything is stopped, not only after.
+    // From the engine `Stop` below until the last recorded process is confirmed
+    // gone, the record still reads `ready`/`running` while its endpoint stops
+    // answering — exactly what the daemon's `server-recover` watcher restarts.
+    // That watcher skips a record carrying this marker, so it has to be on disk
+    // for the whole stop. Same order as `rocmd`'s `stop_managed_service_with`.
+    record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
+    record.write()?;
     let engine_stop = if record.engine == "lemonade" {
         unload_lemonade_service_model(&record).map(|()| StopResponse {
             stopped: true,
@@ -18699,21 +18720,21 @@ fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<s
             },
         )
     };
-    let (signaled_pids, all_stopped) = terminate_recorded_service_pids(&record);
+    let (signaled_pids, all_stopped) = terminate(&record);
     // Only claim "stopped" when every recorded process is confirmed gone. When a
     // stop cannot confirm termination (rare: SIGKILL-resistant or unverifiable
     // PID), leave the prior status so the standard liveness refresh reconciles it
     // to "stopped" once the process actually dies — rather than asserting a stop
     // that did not happen.
+    //
+    // Otherwise the marker written above stays set: it records that a stop was
+    // *asked for* even though it could not be confirmed.
+    // `refresh_managed_service_runtime_liveness` needs it to tell a service the
+    // operator stopped from one that merely crashed: only the former should lose
+    // its endpoint key once its processes are gone.
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
-    } else {
-        // Record that a stop was *asked for* even though it could not be
-        // confirmed. `refresh_managed_service_runtime_liveness` needs this to
-        // tell a service the operator stopped from one that merely crashed: only
-        // the former should lose its endpoint key once its processes are gone.
-        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
     }
     record.write()?;
     // Drop the endpoint key with the service by deleting its 0600 key file.
@@ -31569,6 +31590,71 @@ install therock";
         );
         assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
         assert_eq!(record.stop_requested_unix_ms, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_records_its_marker_on_disk_before_any_process_is_signalled() {
+        // The daemon's `server-recover` watcher restarts a managed service whose
+        // endpoint stops answering unless the record carries a stop marker. A
+        // stop that wrote the marker only after terminating the processes would
+        // leave that whole window — the engine `Stop`, then up to the grace
+        // period per PID — open for the daemon to bring the service back. So at
+        // the moment the processes are signalled the marker must already be on
+        // disk, not just in the stop's in-memory copy.
+        let (root, paths) = test_paths("stop-marker-before-signal");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-marker-order";
+        // A port nothing listens on, so the lemonade unload fails fast instead
+        // of reaching a real server.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().unwrap();
+
+        // Read the file as-is: `load_managed_service` runs the liveness refresh,
+        // which would consume the marker of a record whose PIDs are dead.
+        let on_disk = || {
+            serde_json::from_slice::<ManagedServiceRecord>(
+                &fs::read(paths.service_manifest_path(service_id)).unwrap(),
+            )
+            .unwrap()
+        };
+        let seen_at_signal = std::cell::Cell::new(None);
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let on_disk = on_disk();
+            seen_at_signal.set(Some(on_disk.stop_requested_unix_ms));
+            (Vec::new(), false)
+        })
+        .unwrap();
+
+        assert!(
+            matches!(seen_at_signal.get(), Some(Some(_))),
+            "the stop marker must be persisted before the processes are signalled, \
+             saw {:?}",
+            seen_at_signal.get()
+        );
+        // The final-state gating is unchanged: an unconfirmed stop keeps the
+        // marker it wrote up front.
+        assert!(on_disk().stop_requested_unix_ms.is_some());
+        assert_eq!(report["signaled_pids"], serde_json::json!([]));
         let _ = fs::remove_dir_all(root);
     }
 
