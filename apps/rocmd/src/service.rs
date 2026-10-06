@@ -88,6 +88,13 @@ pub(crate) fn stop_managed_service_with(
     // would each be false.
     let all_stopped =
         stops.iter().all(|stop| stop.stopped) && stopping.names_same_processes(&record);
+    // A PID whose identity cannot be read at all — `/proc/<pid>/stat`
+    // unreadable while `kill(pid, 0)` still answers: another uid, `hidepid`, an
+    // LSM — comes back `Unverified`, which never counts as stopped. Nor can it
+    // be forced: `terminate_verified` returns before it consults `force`, so a
+    // service holding such a PID stays unconfirmed and cannot be stopped from
+    // the CLI at all. Deliberate: signalling a process nobody could identify is
+    // the blind kill the identity check exists to prevent.
     // Claim a stop only when every recorded process is confirmed gone, and
     // otherwise record that one was *asked for*. `rocm services stop`
     // (`stop_internal_managed_service`) keeps the same contract on these same
