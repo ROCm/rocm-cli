@@ -398,18 +398,25 @@ version. An upgrade or downgrade keeps the previous install on disk. Only a
 same-version reinstall reuses the same root.
 
 `--prefix` changes this. The folder you name is used as-is for every version, so
-successive installs into one prefix replace each other in place. If the venv
-already there no longer runs its own Python, ROCm CLI rebuilds it only when it
-can show it created that venv: the folder has `pyvenv.cfg` and either the
-`.rocm-cli-runtime.json` a ROCm CLI install writes, naming that folder, or a
-place inside ROCm CLI's own managed runtimes folder. The rebuild removes only
-the venv's own files (`bin`/`Scripts`, `lib`/`Lib`, `lib64`, `include`,
-`pyvenv.cfg`) and keeps everything else in the folder, such as ComfyUI's models,
-workflows, and outputs under `apps/comfyui`; the install prints what it kept.
-Any other folder, or one in a protected system location, is refused with
-nothing changed; choose an empty folder, or one ROCm CLI created, instead.
-A `UV_VENV_CLEAR` exported in your shell is ignored when ROCm CLI creates the
-venv, so it cannot make uv clear the folder either.
+successive installs into one prefix replace each other in place. A venv that
+runs and matches is reused. Otherwise, a folder that is missing or empty gets a
+new venv, and a folder with anything in it is used only if ROCm CLI can show it
+created it: the `.rocm-cli-runtime.json` a wheel install writes, naming that
+folder, or a place inside ROCm CLI's own managed runtimes folder. ROCm CLI then
+removes only the venv's own files (`pyvenv.cfg`, `CACHEDIR.TAG`,
+`bin`/`Scripts`, `lib`/`Lib`, `lib64`, `include`/`Include`), keeps everything
+else in the folder, such as ComfyUI's models, workflows, and outputs under
+`apps/comfyui`, and prints what it kept. If that clearing stops part-way, the
+next install finishes it the same way. Any other non-empty folder, or one in a
+protected system location, is refused with nothing changed; choose an empty
+folder, or one ROCm CLI created, instead. `--dry-run` reports which of these
+will happen.
+
+ROCm CLI never runs `uv venv` over a folder that has anything in it without
+`--allow-existing`, and sets `UV_VENV_CLEAR=0` for that command, so neither
+uv's own handling of an existing folder (older uv deletes an existing venv,
+newer uv refuses it) nor a `UV_VENV_CLEAR` exported in your shell can clear the
+folder.
 
 #### Driver installation
 

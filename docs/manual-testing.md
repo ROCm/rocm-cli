@@ -157,12 +157,13 @@ Expected result:
 - `rocm install sdk ... --dry-run` never prompts or refuses, whatever the
   active default is: the preview stops before the gate.
 - rocm-cli creates or reuses a rocm-cli managed Python venv.
-- If the `--prefix` folder already holds a venv whose Python no longer runs,
-  rocm-cli rebuilds only that venv's own files, and only when it created the
-  venv (the folder has `pyvenv.cfg` and its `.rocm-cli-runtime.json`). It prints
-  what it kept, and anything else in the folder, such as `apps/comfyui`, is
-  still there afterwards. A folder it did not create, such as your home folder
-  with a broken `~/bin/python`, is refused with nothing changed.
+- If the `--prefix` folder already has anything in it and its venv does not
+  run, rocm-cli rebuilds only that venv's own files, and only in a folder it
+  created (its `.rocm-cli-runtime.json` from a wheel install names the folder).
+  It prints what it kept, and anything else in the folder, such as
+  `apps/comfyui`, is still there afterwards. A folder it did not create, such
+  as your home folder with a broken `~/bin/python`, is refused with nothing
+  changed, and `--dry-run` predicts that refusal in its `python_env:` line.
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned

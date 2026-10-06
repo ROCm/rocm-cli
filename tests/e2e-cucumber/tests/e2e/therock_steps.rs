@@ -1142,8 +1142,11 @@ async fn assert_vllm_rocm10_discovery_pins(world: &mut E2eWorld) {
 //
 // A fake `uv` stands in for the real one: it creates a venv on `uv venv` and
 // fails everything else, so the install stops at the package step right after
-// the decision under test. The fake is a shell script, hence these scenarios
-// are Linux-only.
+// the decision under test. Like uv 0.10, it refuses a folder with entries
+// unless `--allow-existing` is passed, and wipes it on `--clear` or
+// `UV_VENV_CLEAR=1`, so an install that leaned on uv to cope with an existing
+// folder fails here as it would for real. The fake is a shell script, hence
+// these scenarios are Linux-only.
 
 /// The user's home folder in the reported case: their files beside a
 /// `bin/python` that fails `--version`.
@@ -1192,6 +1195,10 @@ fn plant_python_that_no_longer_runs(folder: &Path) {
 /// `HOME` is the user's home folder from runtime-19 throughout, so the CLI sees
 /// the same home the user would.
 fn install_sdk_into(world: &mut E2eWorld, folder: &Path) {
+    run_sdk_install_into(world, folder, false);
+}
+
+fn run_sdk_install_into(world: &mut E2eWorld, folder: &Path, dry_run: bool) {
     let uv = root(world).join("fake-uv").join("uv");
     write_executable(
         &uv,
@@ -1206,10 +1213,24 @@ if [ "$1" = pip ] && [ "$2" = compile ]; then
   exit 0
 fi
 if [ "$1" = venv ] && [ "$2" = --python ]; then
-  mkdir -p "$4/bin"
-  printf '#!/bin/sh\necho Python 3.14.0\n' > "$4/bin/python"
-  chmod +x "$4/bin/python"
-  echo 'home = /usr/bin' > "$4/pyvenv.cfg"
+  target="$4"; allow=0; clear=0
+  for arg in "$@"; do
+    [ "$arg" = --allow-existing ] && allow=1
+    [ "$arg" = --clear ] && clear=1
+  done
+  [ "$allow" = 0 ] && [ "${{UV_VENV_CLEAR-}}" = 1 ] && clear=1
+  if [ -d "$target" ] && [ -n "$(ls -A "$target")" ]; then
+    if [ "$clear" = 1 ]; then
+      rm -rf "$target"
+    elif [ "$allow" = 0 ]; then
+      echo "error: A directory already exists at: $target" >&2
+      exit 2
+    fi
+  fi
+  mkdir -p "$target/bin"
+  printf '#!/bin/sh\necho Python 3.14.0\n' > "$target/bin/python"
+  chmod +x "$target/bin/python"
+  echo 'home = /usr/bin' > "$target/pyvenv.cfg"
   exit 0
 fi
 echo "fake uv: $*" >&2
@@ -1230,24 +1251,37 @@ exit 1
         .command_env
         .push(("ROCM_CLI_PYTHON", launcher.into_os_string()));
     world.command_env.push(("HOME", home.into_os_string()));
+    // `command_env` is consumed by each command, so the fixture index the
+    // `Given` pointed the CLI at has to be named again for every run here, or
+    // the second command of a scenario resolves the live index instead.
+    allow_base_overrides(world);
+    let current = current_pip_base(world);
+    let next = next_pip_base(world);
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_RELEASE_PIP_BASE", current.into()));
+    world
+        .command_env
+        .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
     let prefix = folder.display().to_string();
-    preview(
-        world,
-        &[
-            "install",
-            "sdk",
-            "--channel",
-            "release",
-            "--format",
-            "wheel",
-            "--family",
-            RAW_ARCH,
-            "--version",
-            NEXT_ROCM_VERSION,
-            "--prefix",
-            &prefix,
-        ],
-    );
+    let mut args = vec![
+        "install",
+        "sdk",
+        "--channel",
+        "release",
+        "--format",
+        "wheel",
+        "--family",
+        RAW_ARCH,
+        "--version",
+        NEXT_ROCM_VERSION,
+        "--prefix",
+        &prefix,
+    ];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    preview(world, &args);
 }
 
 fn reported(world: &E2eWorld) -> String {
@@ -1282,6 +1316,7 @@ async fn rocm_cli_folder_with_comfyui_models(world: &mut E2eWorld) {
     let marker = serde_json::to_string_pretty(&serde_json::json!({
         "runtime_key": "release-wheel-gfx1200-7-10-0",
         "runtime_id": format!("therock-release:{GROUP_FAMILY}"),
+        "format": "wheel",
         "install_root": folder,
     }))
     .expect("failed to serialize runtime marker");
@@ -1309,6 +1344,57 @@ async fn install_sdk_into_empty_folder(world: &mut E2eWorld) {
     install_sdk_into(world, &empty);
 }
 
+#[when("the user previews installing the SDK into their home folder")]
+async fn preview_sdk_install_into_home(world: &mut E2eWorld) {
+    let home = install_folder(world, USER_HOME_FOLDER);
+    run_sdk_install_into(world, &home, true);
+}
+
+#[when("the user previews installing the SDK into the folder ROCm CLI installed into")]
+async fn preview_sdk_install_into_rocm_cli_folder(world: &mut E2eWorld) {
+    let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
+    run_sdk_install_into(world, &folder, true);
+}
+
+#[then("the preview predicts the refusal of the home folder and changes nothing")]
+async fn preview_predicts_home_refusal(world: &mut E2eWorld) {
+    let home = install_folder(world, USER_HOME_FOLDER);
+    let reported = reported(world);
+    assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    assert!(
+        reported.contains(&format!(
+            "python_env: the install will refuse this folder: refusing to create the Python environment at {}",
+            home.display()
+        )),
+        "the preview did not predict the refusal:\n{reported}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.join("Documents").join("thesis.txt")).ok(),
+        Some("years of work".to_owned()),
+        "a preview changed the home folder"
+    );
+    assert!(home.join("bin").join("python").is_file());
+}
+
+#[then("the preview shows a rebuild in place that keeps the folder")]
+async fn preview_shows_rebuild_in_place(world: &mut E2eWorld) {
+    let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
+    let reported = reported(world);
+    assert_eq!(world.cli_rc, Some(0), "the preview failed:\n{reported}");
+    assert!(
+        reported.contains("python_env: reuse the Python environment ROCm CLI created here"),
+        "the preview did not describe the in-place rebuild:\n{reported}"
+    );
+    assert!(
+        reported.contains(&format!("{} --allow-existing &&", folder.display())),
+        "the previewed uv venv command is not the one a rebuild runs:\n{reported}"
+    );
+    assert!(
+        folder.join("lib").is_dir() && folder.join("pyvenv.cfg").is_file(),
+        "a preview changed the folder"
+    );
+}
+
 #[when("the user installs the SDK into the folder ROCm CLI installed into")]
 async fn install_sdk_into_rocm_cli_folder(world: &mut E2eWorld) {
     let folder = install_folder(world, ROCM_CLI_MADE_FOLDER);
@@ -1322,7 +1408,7 @@ async fn install_refuses_home_folder(world: &mut E2eWorld) {
     assert_ne!(world.cli_rc, Some(0), "the install succeeded:\n{reported}");
     assert!(
         reported.contains(&format!(
-            "refusing to rebuild the Python environment at {}",
+            "refusing to create the Python environment at {}",
             home.display()
         )),
         "the refusal did not name the home folder:\n{reported}"
@@ -1353,7 +1439,7 @@ async fn install_proceeds_in_empty_folder(world: &mut E2eWorld) {
     let empty = install_folder(world, EMPTY_INSTALL_FOLDER);
     let reported = reported(world);
     assert!(
-        !reported.contains("refusing to rebuild"),
+        !reported.contains("refusing to create"),
         "following the refusal's advice was refused again:\n{reported}"
     );
     assert!(

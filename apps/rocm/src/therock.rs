@@ -4918,8 +4918,10 @@ fn ensure_uv_venv(
     let rebuilding = match venv_folder_state(paths, install_root)? {
         VenvFolder::Empty => false,
         VenvFolder::Owned => {
+            // Read before the clear, which removes the Python it reports on.
+            let had_python = env_python.is_file();
             let kept = clear_owned_venv_for_rebuild(paths, install_root)?;
-            progress_line(venv_rebuild_line(install_root, env_python.is_file(), &kept));
+            progress_line(venv_rebuild_line(install_root, had_python, &kept));
             true
         }
     };
@@ -9910,9 +9912,12 @@ exit 1
             .iter()
             .find(|line| line.contains("rebuilding only its venv files"))
             .unwrap_or_else(|| panic!("no rebuild line in {printed:?}"));
-        assert!(
-            line.contains("kept: .rocm-cli-runtime.json, apps"),
-            "{line}"
+        assert_eq!(
+            line,
+            &format!(
+                "Existing Python environment at {} no longer runs or does not match the required interpreter; rebuilding only its venv files (kept: .rocm-cli-runtime.json, apps).",
+                install_root.display()
+            )
         );
         for kept in [".rocm-cli-runtime.json", "apps"] {
             assert!(install_root.join(kept).exists(), "{kept} was reported kept");
