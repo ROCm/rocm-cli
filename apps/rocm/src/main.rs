@@ -19501,19 +19501,23 @@ fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
 }
 
 fn format_bytes_for_user(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * KB;
-    const GB: f64 = 1024.0 * MB;
-    let bytes = bytes as f64;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes / GB)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes / KB)
-    } else {
-        format!("{} bytes", bytes as u64)
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    // Below 1 KB the count is printed whole, so no rounding can disagree with
+    // the comparison.
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
     }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    // Promote while the value AS PRINTED would reach 1024, not merely while the
+    // raw value does: 1_048_575 bytes is 1023.999… KB, which `{:.1}` renders as
+    // "1024.0 KB". Comparing the rounded tenths, as `rocm_core::format_bytes`
+    // does, keeps every size in the unit it belongs to.
+    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
@@ -26865,6 +26869,107 @@ model recipes
         assert_eq!(format_bytes(1_048_575), "1.0 MiB");
         assert_eq!(format_bytes(1_048_576), "1.0 MiB");
         assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+    }
+
+    /// Just below a unit boundary the value rounds up to a full 1024 of the
+    /// SMALLER unit, which has to be reported as 1.0 of the larger one — the
+    /// same defect `rocm_core::format_bytes` had. Each pair is the last input
+    /// that still belongs to the smaller unit and the first that `{:.1}` rounds
+    /// up to 1024.0 of it; the second used to print "1024.0 KB" / "1024.0 MB".
+    #[test]
+    fn format_bytes_for_user_promotes_a_value_that_rounds_up_to_a_full_unit() {
+        assert_eq!(format_bytes_for_user(1023), "1023 bytes");
+        assert_eq!(format_bytes_for_user(1024), "1.0 KB");
+        assert_eq!(format_bytes_for_user(1_048_524), "1023.9 KB");
+        assert_eq!(format_bytes_for_user(1_048_525), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_048_575), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes_for_user(1_073_689_395), "1023.9 MB");
+        assert_eq!(format_bytes_for_user(1_073_689_396), "1.0 GB");
+        assert_eq!(format_bytes_for_user(1_073_741_823), "1.0 GB");
+        // GB is the top unit: nothing to promote to, so 1024 GB stays in it.
+        assert_eq!(format_bytes_for_user(1_099_511_627_776), "1024.0 GB");
+    }
+
+    /// The units `format_bytes_for_user` prints, smallest first.
+    const USER_BYTE_UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+
+    /// Byte counts that actually visit the unit boundaries. A uniform `u64`
+    /// almost always lands far above the top unit, so on its own it never
+    /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
+    /// draw uniformly within one unit's range, and from a window just below
+    /// each rounded boundary (KB→MB, MB→GB) that scales with the boundary, as
+    /// the band does — see `rocm_core::disk_space`'s generator for the full
+    /// reasoning.
+    fn user_byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<u64>(),
+            (0u32..=3).prop_flat_map(|exponent| {
+                let low = if exponent == 0 {
+                    0
+                } else {
+                    1024u64.pow(exponent)
+                };
+                low..1024u64.pow(exponent + 1)
+            }),
+            (2u32..=3).prop_flat_map(|exponent| {
+                let boundary = 1024u64.pow(exponent);
+                (boundary - boundary / 16384)..=(boundary + 1)
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// A size is rendered in the unit it belongs to, which has two edges.
+        ///
+        /// Upper: below the top unit, the printed mantissa is under 1024.0 —
+        /// otherwise the size is shown in a unit it has outgrown.
+        ///
+        /// Lower: above `bytes`, the printed mantissa is at least 1.0, and the
+        /// next smaller unit would have printed 1024.0 or more — otherwise the
+        /// size was promoted before it reached a whole unit.
+        ///
+        /// Both edges compare the mantissa as printed, in tenths: that is the
+        /// quantity a reader sees, so it is the one the scaling has to decide on.
+        #[test]
+        fn format_bytes_for_user_renders_a_size_in_its_own_unit(
+            bytes in user_byte_count_strategy(),
+        ) {
+            let rendered = format_bytes_for_user(bytes);
+            let (value, unit) = rendered
+                .split_once(' ')
+                .expect("rendered size is `<number> <unit>`");
+            let value: f64 = value.parse().expect("numeric part parses");
+            let tenths = (value * 10.0).round();
+            let exponent = USER_BYTE_UNITS
+                .iter()
+                .position(|name| *name == unit)
+                .expect("rendered unit is one of the known units");
+            if exponent + 1 < USER_BYTE_UNITS.len() {
+                proptest::prop_assert!(
+                    tenths < 10_240.0,
+                    "{bytes} rendered as {rendered}, which should have been \
+                     promoted to the next unit",
+                );
+            }
+            if exponent > 0 {
+                proptest::prop_assert!(
+                    tenths >= 10.0,
+                    "{bytes} rendered as {rendered}, which was promoted before \
+                     it reached a whole unit",
+                );
+                // Dividing by a power of two is exact, so this is the value the
+                // smaller unit would have printed, not an approximation of it.
+                let smaller = (1..exponent).fold(bytes as f64, |value, _| value / 1024.0);
+                proptest::prop_assert!(
+                    (smaller * 10.0).round() >= 10_240.0,
+                    "{bytes} rendered as {rendered}, but still fits the smaller \
+                     unit as {smaller:.1} {}",
+                    USER_BYTE_UNITS[exponent - 1],
+                );
+            }
+        }
     }
 
     #[test]
@@ -37844,7 +37949,10 @@ ID_LIKE="suse opensuse"
                 arguments: serde_json::json!({
                     "artifact_ref": "tiny/model#gguf",
                     "allow_artifact_download": true,
-                    "artifact_max_bytes": 1_048_576
+                    // One byte under 1 MiB: `{:.1}` rounds it up to a full
+                    // 1024 KB, so the approved cap must read as "1.0 MB", not
+                    // "1024.0 KB".
+                    "artifact_max_bytes": 1_048_575
                 }),
                 reviewed_at_unix_ms: None,
             },

@@ -125,6 +125,42 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+## Coverage floors
+
+Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
+floor in `coverage-floors.toml`. CI fails when a crate drops more than a small tolerance
+below its floor, so deleting a test is a check failure rather than a silent loss.
+
+Check the floors locally. This needs both the instrumentation tooling and the LLVM
+tools the toolchain ships separately — CI installs the same two:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo xtask coverage
+```
+
+After adding tests, ratchet the floors up to the new measurement:
+
+```bash
+cargo xtask coverage --bless
+```
+
+`--bless` rewrites `coverage-floors.toml`; commit the result. Lowering a floor is
+allowed but deliberate — it shows up as a diff a reviewer has to approve, so say in the
+commit why coverage legitimately dropped (a crate shrank, tests moved elsewhere) rather
+than re-blessing to make a red check go away.
+
+Adding a workspace crate fails the check until that crate has a floor, so a new crate
+cannot land outside the gate. A crate that no test binary compiles at all never shows up
+in the coverage report; both the check and `--bless` fail on it by name, and the way out
+is tests or an entry in `EXCLUDED` in `xtask/src/coverage.rs` with the reason — there is
+no measurement to bless a floor from.
+
+These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules as
+covered source. That inflates the numbers and damps the gate — see the module comment in
+`xtask/src/coverage.rs` for what the measurement is and is not good for.
+
 ## Remote control-channel checks
 
 `rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
