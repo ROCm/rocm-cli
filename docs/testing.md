@@ -1268,3 +1268,74 @@ The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
 including the two that need a synthetic signed catalog to trigger
 deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
 produce them on an arbitrary real host.
+
+## Doctor Report Preflight
+
+Preview the content a problem report would carry, without sending anything:
+
+```bash
+rocm diagnose --report
+rocm diagnose --report --json
+```
+
+The command refuses rather than prepares a report on three hosts, and the
+three reasons are not interchangeable. One holds an architecture the ROCm
+compatibility matrix does not list as supported (`unreleased-hardware`). One
+has an AMD GPU architecture that could not be read (`architecture-unreadable`).
+The third is any WSL host (`platform-not-probed`): `examine` returns before
+any GPU probe runs there, so nothing has looked, and saying the architecture
+could not be read would state a finding about hardware nothing inspected. All
+three exit 0 and are told apart by `--json`'s `refused` field, and the refusal
+envelope also carries `architecture_matrix`, the same compatibility-matrix
+snapshot stamp a genuine report carries, so a refusal is just as traceable to
+a matrix revision as a report is.
+
+Offer a prefilled mail carrying that report, which still sends nothing:
+
+```bash
+rocm diagnose --report --send
+```
+
+Two argument rules are worth checking by hand, because both are the kind that
+only break when somebody reorders a declaration. `--send` without `--report`
+must be refused, since showing the content first is the guarantee `--send`
+makes. `--send` with `--json` must also be refused: that combination is for
+scripts, and starting a browser from a scripted invocation is not wanted.
+
+Whether `--send` opens a mail client or prints the address and link depends on
+the machine, and the printed line says which happened. It prints rather than
+opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
+`ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
+configured reaches the same printed form, which is why the address appears on
+its own and not only inside the `mailto:` link. That is the common case on
+servers and in containers. The opt-out is the easiest to check on a desktop:
+
+```bash
+ROCM_NO_BROWSER=1 rocm diagnose --report --send
+```
+
+The destination is `ROCmCLI@amd.com`, fixed in code. A report also carries its
+classification in the mail subject, because a mailbox has no labels: the
+subject names the matched catalog entry, or `unrecognised`, then the
+architecture and the distribution. Check that the subject carries no field the
+report body does not.
+
+On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
+`crates/rocm-core/src/report.rs`), the command prints the full `Report`:
+`schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
+`os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
+`fix_offered`. This path has not been exercised against real hardware in CI;
+verifying it needs a lane whose GPU architecture is on the allowlist.
+
+Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
+answer with a word rather than a value, and the words are not interchangeable.
+`none` means the thing is absent, `unknown` means this build looked and could
+not tell, and `other` means a distribution was named but is not one this build
+recognises. A host with no ROCm installed reports `"rocm": "none"`, while a
+host whose install exists but whose version could not be read reports `"rocm":
+"unknown"` — worth checking by hand on a machine with a partial install, since
+the two are easy to merge by accident and a counter cannot tell them apart
+afterwards. `engine`/`engine_version` carry the same distinction: a host a
+probe found no engine on reports `"engine": "none"`, while a host whose engine
+probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
+since a probe that never ran cannot say an engine is absent.

@@ -34,8 +34,9 @@ const ENGINE_IMPORT_FIX_ID: &str = "fix-17-torch-dlpack";
 const PREVIEW_FIX_ID: &str = "fix-1-arch";
 
 /// A recipe that would really change the machine, used to prove the CLI asks
-/// first. Of the four AUTO recipes this is the only one that reaches the
-/// confirmation gate on a host with nothing installed: `fix-2-unset-override`
+/// first. Of the entries the CLI carries out, this is the only one that
+/// reaches the confirmation gate on a host with nothing installed:
+/// `fix-2-unset-override`
 /// never calls it on Linux, `fix-4-render-group` exits early once the user is
 /// already in the groups, and `fix-6-path` exits early with "no ROCm install
 /// found". This one needs only `--device-index`, which the scenario supplies.
@@ -86,20 +87,65 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-5-distro-too-old",
     "fix-wsl-6-host-driver-too-old",
     "fix-wsl-7-wsl1",
-    // `fix-18` is the code object manager entry on its own branch, kept
-    // distinct for the same reason `fix-16` is.
+    "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
 ];
 
-/// The fixes the CLI carries out itself. Every other entry only prints a plan.
+/// The fixes the CLI carries out itself **on the host running the suite**.
+///
 /// Pinned exactly: a mode quietly promoted to AUTO would begin changing
 /// machines that callers had been told it only ever advised on.
-const AUTO_APPLICABLE_FIX_IDS: &[&str] = &[
-    "fix-2-unset-override",
-    "fix-4-render-group",
-    "fix-6-path",
-    "fix-9-igpu-dgpu",
-];
+///
+/// Host-dependent because the catalog is. `fix-2-unset-override` persists the
+/// change through `setx` on Windows but only reports on Linux, where its runner
+/// takes no options and never writes. `fix-9-igpu-dgpu` is on neither list: it
+/// acts only once `--device-index` names a target, and is marked NEEDS-ARG.
+/// Both used to claim AUTO everywhere, which is the defect this pins.
+fn auto_applicable_fix_ids() -> &'static [&'static str] {
+    if cfg!(windows) {
+        return &["fix-2-unset-override", "fix-6-path"];
+    }
+    // WSL is its own catalog family, not "Linux with a flag", so `cfg!` cannot
+    // answer this -- it is a property of the running host. `fix-4-render-group`
+    // is bare-metal only and `fix-2-unset-override` only reports there, which
+    // leaves one entry the CLI actually carries out.
+    if e2e_cucumber::capability::host_capability().is_wsl {
+        return &["fix-6-path"];
+    }
+    &["fix-4-render-group", "fix-6-path"]
+}
+
+/// The one catalog entry whose behaviour splits by platform: it persists the
+/// change through `setx` on Windows, while on Linux `run_unset_override_linux`
+/// takes no options and only reports where the value is set.
+const PLATFORM_SPLIT_FIX_ID: &str = "fix-2-unset-override";
+
+/// What that entry does on the host running the suite. The listing has to agree
+/// with the machine in front of it — claiming AUTO on Linux is what told users
+/// a change was coming that never came.
+const fn platform_split_marker_here() -> &'static str {
+    // Windows persists the change; Linux and WSL both run the arm that only
+    // reports, so both see PRINT-ONLY.
+    if cfg!(windows) { "AUTO" } else { "PRINT-ONLY" }
+}
+
+/// The entry the CLI will carry out, but not until it is told which device to
+/// pin. Asked plainly it prints the identifying query and stops.
+const NEEDS_ARGUMENT_FIX_ID: &str = "fix-9-igpu-dgpu";
+
+/// The argument it is waiting for. Named in the flags line, so a reader is not
+/// left to find it in the notes.
+const NEEDS_ARGUMENT_FLAG: &str = "--device-index";
+
+/// The marker in a listing row — the contents of its first `[...]` group.
+///
+/// Read rather than matched against a padded literal, so the assertions do not
+/// break when a longer marker widens the column.
+fn row_marker(line: &str) -> Option<&str> {
+    let open = line.find('[')?;
+    let close = line[open..].find(']')? + open;
+    Some(line[open + 1..close].trim())
+}
 
 /// A WSL distribution name no host will have. Deliberately not a plausible one:
 /// the scenario must fail for "this machine does not exist", never because the
@@ -134,6 +180,11 @@ const fn fix_id_for_the_other_os() -> &'static str {
         "fix-13-hip-sdk-missing" // windows-only
     }
 }
+
+/// The entry for a code object manager library belonging to a different
+/// installation than the active runtime. Advisory by design: both remedies can
+/// break a working Python environment.
+const COMGR_CONFLICT_FIX_ID: &str = "fix-18-comgr-conflict";
 
 /// Contents planted in the scenario's own shell rc file. The assertion is that
 /// this survives the run byte for byte.
@@ -229,9 +280,24 @@ async fn user_chose_fix_needing_sudo_and_relogin(world: &mut E2eWorld) {
     world.model_name = Some(COMMAND_FAILURE_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen the fix for a shadowed compilation library")]
+async fn user_chose_comgr_conflict_fix(world: &mut E2eWorld) {
+    world.model_name = Some(COMGR_CONFLICT_FIX_ID.to_string());
+}
+
 #[given("a user who names a fix the CLI does not offer")]
 async fn user_named_unknown_fix(world: &mut E2eWorld) {
     world.model_name = Some("fix-does-not-exist".to_string());
+}
+
+#[given("a fix the CLI carries out on one kind of machine and only explains on another")]
+async fn user_chose_platform_split_fix(world: &mut E2eWorld) {
+    world.model_name = Some(PLATFORM_SPLIT_FIX_ID.to_string());
+}
+
+#[given("a user who has chosen a fix that cannot run until it is told what to act on")]
+async fn user_chose_fix_needing_an_argument(world: &mut E2eWorld) {
+    world.model_name = Some(NEEDS_ARGUMENT_FIX_ID.to_string());
 }
 
 #[given("a user who has chosen a fix that would change the machine")]
@@ -325,6 +391,17 @@ async fn user_diagnoses_json(world: &mut E2eWorld) {
 async fn user_lists_fixes(world: &mut E2eWorld) {
     let (stdout, _, rc) = crate::run_rocm(world, &["fix"]);
     world.cli_output = Some(stdout);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user asks the CLI to apply it without saying what to act on")]
+async fn user_applies_fix_without_its_argument(world: &mut E2eWorld) {
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    // Deliberately no `--device-index`: the branch under test is the one that
+    // reports what is still needed instead of acting.
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["fix", &fix_id]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
     world.cli_rc = Some(rc);
 }
 
@@ -489,10 +566,15 @@ async fn assert_markers_explained(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     // The markers were printed with no legend, so a reader could not tell
     // whether PRINT-ONLY meant "advisory" or "not implemented yet".
-    assert!(
-        output.contains("AUTO =") && output.contains("PRINT-ONLY ="),
-        "expected the listing to explain its AUTO/PRINT-ONLY markers:\n{output}"
-    );
+    // Every marker the listing can print has to be explained, or the newer
+    // ones land in exactly the position PRINT-ONLY was in.
+    for marker in ["AUTO =", "NEEDS-ARG =", "PRINT-ONLY =", "DIAGNOSE-ONLY ="] {
+        assert!(
+            output.contains(marker),
+            "the listing prints markers it never explains; `{marker}` is missing \
+             from the legend:\n{output}"
+        );
+    }
 }
 
 #[then("the CLI always points to somewhere the problem can be reported")]
@@ -1040,15 +1122,85 @@ async fn assert_auto_set_is_exact(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no fix list output");
     let marked_auto: Vec<&str> = output
         .lines()
-        .filter(|line| line.contains("[      AUTO]"))
+        .filter(|line| row_marker(line) == Some("AUTO"))
         .filter_map(|line| CATALOG_FIX_IDS.iter().copied().find(|id| line.contains(id)))
         .collect();
     // Exact, not "at least": a mode quietly promoted to AUTO would start
     // changing machines that callers were told it only ever advised.
     assert_eq!(
-        marked_auto, AUTO_APPLICABLE_FIX_IDS,
+        marked_auto,
+        auto_applicable_fix_ids(),
         "the set of fixes the CLI applies itself has changed:\n{output}"
     );
+}
+
+#[then("that fix is shown as what it does on this machine")]
+async fn assert_platform_split_fix_is_listed_for_this_machine(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix list output");
+    let fix_id = world.model_name.clone().expect("no fix id set");
+    let row = output
+        .lines()
+        .find(|line| line.contains(&fix_id))
+        .unwrap_or_else(|| panic!("the listing has no row for {fix_id}:\n{output}"));
+    assert_eq!(
+        row_marker(row),
+        Some(platform_split_marker_here()),
+        "{fix_id} is listed as something other than what it does on this machine. \
+         The catalog is authoritative: if its behaviour here changed, change the \
+         catalog and this expectation together — do not loosen the assertion.\n{row}"
+    );
+}
+
+#[then("the CLI names what it still needs and reports no change")]
+async fn assert_missing_argument_is_named(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Exit 0, not an error code: nothing went wrong and nothing was attempted.
+    // A nonzero code would read as a failed fix rather than an unanswered
+    // question.
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "reporting what it still needs is not a failure:\n{output}"
+    );
+    // The flags line specifically, not the output as a whole. The recipe's
+    // notes mention the argument either way, so a whole-output search passes
+    // even when the entry is marked as one the CLI applies outright -- which is
+    // exactly the defect, and an earlier version of this assertion missed it.
+    let flags = output
+        .lines()
+        .find(|line| line.starts_with("Flags:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no flags line, so nothing told the user the CLI is waiting on \
+                 `{NEEDS_ARGUMENT_FLAG}` rather than acting:\n{output}"
+            )
+        });
+    assert!(
+        flags.contains(NEEDS_ARGUMENT_FLAG),
+        "the flags line does not name `{NEEDS_ARGUMENT_FLAG}`, so the user is told \
+         only that the fix is unavailable, not what would make it available:\n{flags}"
+    );
+    // The whole defect was a report of a change that never happened, so the
+    // absence of that claim is the assertion -- but it has to name text the
+    // product can actually produce. This asserted the absence of "Applied",
+    // which appears nowhere in the CLI, so it held against every possible
+    // regression. `fix-9`'s Linux arm announces a real change by naming the
+    // file it appended to; the Windows arm by naming the value it persisted.
+    // Only text the CLI prints *after* acting. The catalog's own plan includes
+    // `setx HIP_VISIBLE_DEVICES <dGPU-index>`, which this path legitimately
+    // shows, so the placeholder command is not evidence of a change; the
+    // announcements below are printed only once a write has happened.
+    for claim in [
+        "Appended to ",
+        "setx only takes effect in NEW shells",
+        "Plan: persist HIP_VISIBLE_DEVICES",
+    ] {
+        assert!(
+            !output.contains(claim),
+            "the CLI was not told what to act on, so it must not report having acted \
+             ({claim:?}):\n{output}"
+        );
+    }
 }
 
 #[then("the CLI lists the fixes it can apply")]
@@ -1904,6 +2056,13 @@ async fn user_diagnoses_with_model_and_distro(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user asks the CLI what a report would carry")]
+async fn user_asks_what_a_report_would_carry(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
 #[then("the CLI refuses and says --model answers for this machine, not the one --distro names")]
 async fn assert_model_with_distro_refused(world: &mut E2eWorld) {
     let output = world.cli_output.clone().unwrap_or_default();
@@ -1942,5 +2101,235 @@ async fn assert_no_model_verdict_on_refusal(world: &mut E2eWorld) {
     assert!(
         !output.contains(&verdict_marker),
         "a refused request must not also report a model verdict for the wrong machine:\n{output}"
+    );
+}
+
+#[when("the user asks the CLI what a report would carry in machine-readable form")]
+async fn user_asks_what_a_report_would_carry_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--report", "--json"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI either shows the whole report or says why it will not prepare one")]
+async fn report_is_shown_or_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    let shown = out.contains("a report would carry");
+    let refused = out.contains("no report was prepared") || out.contains("No report was prepared");
+    assert!(
+        shown || refused,
+        "asking for a report produced neither a report nor a stated refusal, which leaves a \
+         user unable to tell what would be published:\n{out}"
+    );
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "a refusal is this command working, not failing, so both branches exit 0:\n{out}"
+    );
+}
+
+#[then("the CLI states that nothing has been sent")]
+async fn nothing_has_been_sent(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Only the prepared-report branch makes the promise; a refusal prepared
+    // nothing to send, so requiring the sentence there would assert about a
+    // report that does not exist.
+    if out.contains("a report would carry") {
+        assert!(
+            out.contains("Nothing has been sent"),
+            "the report was shown without saying it stayed here, which is the one thing a user \
+             needs to know before reading it:\n{out}"
+        );
+    }
+}
+
+#[then("the answer names no user, no host, and no file path")]
+async fn answer_names_nothing_identifying(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // A refusal envelope (`{"schema","refused","explanation"}`) trivially
+    // contains none of the markers swept below, so on a lane whose hardware is
+    // not on the allowlist -- the common case, since most lanes have no AMD
+    // GPU at all -- every sweep would pass without a report ever having
+    // existed to sweep. Branch on the outcome, the same way the sibling step
+    // `nothing_has_been_sent` already does.
+    //
+    // `cli_version` is the discriminator, not `architecture`: the
+    // `ArchitectureUnreadable` refusal's own explanation text ("No AMD GPU
+    // *architecture* could be read here...") contains the word "architecture",
+    // so keying off that field name would make this same vacuous pass survive
+    // under a different guise on exactly the refusal this sandbox reaches.
+    // `cli_version` is a field `Report` carries and no refusal explanation
+    // does.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains("architecture"),
+            "a genuine report is missing the architecture field it is supposed to carry:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+        return;
+    }
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    if !user.is_empty() && user.len() > 2 {
+        assert!(
+            !out.contains(&user),
+            "the user name reached what a report would publish:\n{out}"
+        );
+    }
+    let host = hostname_of_this_machine();
+    if !host.is_empty() && host.len() > 2 {
+        assert!(
+            !out.contains(&host),
+            "the host name reached what a report would publish:\n{out}"
+        );
+    }
+    for path_marker in ["/opt/rocm", "/home/", "C:\\", "/usr/"] {
+        assert!(
+            !out.contains(path_marker),
+            "a file path ({path_marker}) reached what a report would publish:\n{out}"
+        );
+    }
+}
+
+/// The mailbox `--send` offers to prefill, mirrored from
+/// `rocm_core::report_delivery::DESTINATION`. Kept as a literal rather than a
+/// dependency on `rocm-core`: this crate only runs the built binary, it does
+/// not link the library behind it.
+const REPORT_DESTINATION: &str = "ROCmCLI@amd.com";
+
+#[when("the user asks the CLI for a way to send a report, without asking to see the report first")]
+async fn user_asks_to_send_without_report(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["diagnose", "--send"]);
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and explains that the report must be requested too")]
+async fn assert_send_without_report_refused(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    assert_eq!(
+        world.cli_rc,
+        Some(2),
+        "asking for a way to send a report without asking to see it first is an argument \
+         mistake, caught before anything is examined, so it exits the way any other bad \
+         argument combination does:\n{out}"
+    );
+    assert!(
+        out.contains("--report"),
+        "the refusal does not name the flag the user needed to add first:\n{out}"
+    );
+}
+
+/// Forces the headless branch deterministically: no display of any kind, no
+/// SSH-forwarded display, and no override asking for a browser regardless.
+/// Linux-only in effect, because the CLI under test only reads these on
+/// Linux — but the scenario that uses this is the one tagged
+/// `@requires-os:linux`, not this helper, so nothing here needs to branch on
+/// host.
+#[when("the user asks the CLI for a way to send a report, with no desktop available to open it on")]
+async fn user_asks_to_send_on_a_headless_machine(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["diagnose", "--report", "--send"],
+        &[
+            ("DISPLAY", ""),
+            ("WAYLAND_DISPLAY", ""),
+            ("SSH_CONNECTION", ""),
+            ("SSH_CLIENT", ""),
+            ("SSH_TTY", ""),
+            ("ROCM_NO_BROWSER", ""),
+        ],
+    );
+    world.cli_output = Some(format!("{stdout}\n{stderr}"));
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI prints the address to mail and a link, and starts nothing")]
+async fn assert_send_headless_prints_address_and_link(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().expect("no CLI output");
+    // Same discriminator as `answer_names_nothing_identifying`: a refusal
+    // envelope has no `cli_version` field, so branch on its presence rather
+    // than asserting a shape that only a genuine report has.
+    if out.contains("cli_version") {
+        assert!(
+            out.contains(REPORT_DESTINATION),
+            "a headless machine was not given the address to mail by hand:\n{out}"
+        );
+        assert!(
+            out.contains("mailto:"),
+            "a headless machine was not given a link, only the sentence around it:\n{out}"
+        );
+        assert!(
+            !out.contains("was opened"),
+            "a mail client was reported opened on a machine with no desktop to open it on:\n{out}"
+        );
+    } else {
+        assert!(
+            out.contains("no report was prepared")
+                || out.contains("No report was prepared")
+                || out.contains("\"refused\""),
+            "the output is neither a genuine report nor a stated refusal, so this assertion \
+             would otherwise pass without a report ever existing to check:\n{out}"
+        );
+    }
+}
+
+/// This machine's host name, or empty when it cannot be read.
+///
+/// Read here rather than from the CLI: the assertion is that the name never
+/// appears in a report, so taking it from the thing under test would compare
+/// the report against itself.
+fn hostname_of_this_machine() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default()
+}
+
+#[then("the CLI explains that it will not make the change itself")]
+async fn assert_fix_is_advisory(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "printing advice is not a failure:\n{output}"
+    );
+    assert!(
+        output.contains("print-only") || output.contains("will NOT run it"),
+        "the user has to be told the CLI is not going to do this for them:\n{output}"
+    );
+}
+
+#[then("the CLI offers both options without ranking them")]
+async fn assert_both_options_unranked(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix output");
+    // Both remedies have to be present. Offering one is a recommendation by
+    // omission, and the wrong one breaks a working environment.
+    //
+    // Keyed on the option markers rather than on words like "remove", which also
+    // occur in the surrounding prose -- an assertion that matched those would
+    // still pass with one of the two options deleted, which is exactly the
+    // regression it exists to catch.
+    for option in ["(a)", "(b)"] {
+        assert!(
+            output.contains(option),
+            "only one way out was offered; option `{option}` is missing, which makes \
+             the other a recommendation by omission:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("Neither option is recommended"),
+        "the CLI has to say it is not choosing between them -- which is right \
+         depends on which stack the user means to keep:\n{output}"
     );
 }

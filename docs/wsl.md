@@ -200,17 +200,23 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the prerequisites above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
-One entry outside this list also applies here. `fix-19-shm-too-small` is not a
+Two entries outside this list also apply here. `fix-19-shm-too-small` is not a
 WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
 serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
 can meet it on an otherwise healthy stack. Its guidance names the container and
 bare-metal cases; under WSL2 the remedy is the host one, remounting `/dev/shm`
 larger and adding the matching `/etc/fstab` line inside the distro.
 
+`fix-18-comgr-conflict` also applies here: a wheel copy and a system copy of
+the code object manager library collide on WSL2 exactly as they do on bare
+metal, through the same `LD_LIBRARY_PATH`/loader-cache search, so the finding
+is not specific to either platform.
+
 Every WSL remedy is print-only. `rocm fix <id>` shows the commands and does not
 run them: they either install packages with `sudo`, edit loader configuration, or
-belong to the Windows host, and none of that meets the bar the four
-auto-applicable fixes clear.
+belong to the Windows host, and none of that meets the bar an auto-applied fix
+has to clear. On WSL the CLI carries out exactly one catalog entry itself,
+`fix-6-path`, which is not one of the WSL entries.
 
 Two deliberate silences, so a report can be trusted:
 
