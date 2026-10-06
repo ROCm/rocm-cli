@@ -334,12 +334,15 @@ async fn update_offered_for_behind_runtime(world: &mut E2eWorld) {
 
 /// Installed as `7.0.0-rc1`; the catalog publishes the normalised `7.0.0rc1`.
 const RESPELLED_RUNTIME_KEY: &str = "nightly-tarball-gfx120x-all-7-0-0-rc1";
-/// Installed as a four-component release; the catalog publishes `6.4.3`.
-const FOUR_COMPONENT_RUNTIME_KEY: &str = "nightly-tarball-gfx110x-all-7-2-4-70204";
+/// Installed as a four-component release, `7.10.0.71000`; the catalog
+/// publishes `7.9.0`. As text `7.10.0.71000` sorts below `7.9.0`, and the old
+/// comparator fell back to text for any four-component version, so this pair
+/// is one it got wrong (it offered 7.9.0 as an update).
+const FOUR_COMPONENT_RUNTIME_KEY: &str = "nightly-tarball-gfx110x-all-7-10-0-71000";
 
 /// Serves a nightly tarball catalog that has nothing newer for either
 /// registered runtime: one it publishes under a different spelling of the same
-/// version, and one it is a major release behind.
+/// version, and one it is a minor release behind.
 #[given("a nightly tarball catalog that has no newer version for either registered runtime")]
 async fn nightly_catalog_with_nothing_newer(world: &mut E2eWorld) {
     let root = world
@@ -360,13 +363,13 @@ async fn nightly_catalog_with_nothing_newer(world: &mut E2eWorld) {
         &root,
         FOUR_COMPONENT_RUNTIME_KEY,
         "gfx110X-all",
-        "7.2.4.70204",
+        "7.10.0.71000",
         1_000,
     );
     serve_nightly_tarball_catalog(
         world,
         &root,
-        &[("gfx120X-all", "7.0.0rc1"), ("gfx110X-all", "6.4.3")],
+        &[("gfx120X-all", "7.0.0rc1"), ("gfx110X-all", "7.9.0")],
     );
 }
 
@@ -391,8 +394,8 @@ async fn no_update_for_four_component_runtime(world: &mut E2eWorld) {
     let offer = format!("run `rocm update --apply --runtime {FOUR_COMPONENT_RUNTIME_KEY}`");
     assert!(
         !out.contains(&offer),
-        "the report offered to install the catalog's 6.4.3 over an installed \
-         7.2.4.70204:\n{out}"
+        "the report offered to install the catalog's 7.9.0 over an installed \
+         7.10.0.71000:\n{out}"
     );
 }
 
