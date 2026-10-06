@@ -23269,6 +23269,20 @@ fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
         .is_some_and(|backend| backend.trim().to_ascii_lowercase().starts_with("rocm"))
 }
 
+/// Whether two model names refer to the same model, leniently.
+///
+/// Deliberately a bidirectional `contains` after suffix/case normalisation, so
+/// the abbreviated names people actually type match the canonical ones the
+/// engines report. The bound that buys: it admits any *overlapping* name, so a
+/// live service for `qwen3-8b-instruct` satisfies a query for `qwen`. On the
+/// serve reuse pre-gate that means the `ResolveModel` round-trip and any
+/// self-managed engine install can run ahead of the no-usable-GPU bail for a
+/// service this invocation cannot actually reuse.
+///
+/// Left lenient on purpose: tightening it would trade that bounded, visible
+/// cost for false negatives that silently break legitimate reuse, which is the
+/// worse failure. Recorded here rather than implied, since four call sites
+/// share this one relation.
 fn service_model_names_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
