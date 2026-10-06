@@ -185,6 +185,9 @@ enum Command {
     /// tree stays a cache: an install happens only when nothing is present for the
     /// channel, an in-place side-by-side update only when the index is genuinely
     /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    /// `--version`/`--build-date` override all of that: a pin is served if already
+    /// installed, else freshly installed side-by-side — the index's latest is
+    /// never consulted while a pin is set.
     E2ePrewarm {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]

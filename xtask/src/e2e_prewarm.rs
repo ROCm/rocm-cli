@@ -114,33 +114,6 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
         .filter_map(RuntimeLine::parse)
         .collect();
 
-    // A degraded `status=error` line omits `channel=` because resolution failed
-    // before the renderer had a plan. It proves a runtime exists but cannot be
-    // attributed safely, so the conservative choice is reuse, not a fresh
-    // multi-GiB install. A later healthy probe will identify the channel.
-    // In a mixed-channel tree the error may belong to another channel, but the
-    // report has discarded that identity. Reuse remains the safe floor until a
-    // healthy probe can distinguish "missing channel" from "unknown freshness".
-    if !runtimes
-        .iter()
-        .any(|line| line.channel.as_deref() == Some(channel))
-    {
-        if runtimes
-            .iter()
-            .any(|line| line.channel.is_none() && line.status.as_deref() == Some("error"))
-        {
-            return Decision::Reuse {
-                reason: "could not establish runtime freshness; leaving the shared tree untouched"
-                    .to_owned(),
-                activate: None,
-            };
-        }
-
-        // Nothing installed for THIS channel. The tree may still hold another
-        // channel's runtime, so install this one.
-        return Decision::Install;
-    }
-
     let channel_runtimes = runtimes
         .iter()
         .filter(|line| line.channel.as_deref() == Some(channel))
@@ -148,6 +121,10 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
 
     // A pin overrides every status-driven branch below: those all chase the
     // index's latest, which is the one thing a pin explicitly opts out of.
+    // Checked before the unattributed-error gate too, so a pin still gets
+    // consulted when this channel has no runtimes of its own yet — otherwise
+    // an unrelated channel's `status=error` line would shadow it and this run
+    // would silently serve whatever else is already active in the tree.
     if let Some(pin) = pin {
         return match channel_runtimes
             .iter()
@@ -162,6 +139,30 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
             // side-by-side `install sdk --version/--build-date`, not an update.
             None => Decision::Install,
         };
+    }
+
+    // A degraded `status=error` line omits `channel=` because resolution failed
+    // before the renderer had a plan. It proves a runtime exists but cannot be
+    // attributed safely, so the conservative choice is reuse, not a fresh
+    // multi-GiB install. A later healthy probe will identify the channel.
+    // In a mixed-channel tree the error may belong to another channel, but the
+    // report has discarded that identity. Reuse remains the safe floor until a
+    // healthy probe can distinguish "missing channel" from "unknown freshness".
+    if channel_runtimes.is_empty() {
+        if runtimes
+            .iter()
+            .any(|line| line.channel.is_none() && line.status.as_deref() == Some("error"))
+        {
+            return Decision::Reuse {
+                reason: "could not establish runtime freshness; leaving the shared tree untouched"
+                    .to_owned(),
+                activate: None,
+            };
+        }
+
+        // Nothing installed for THIS channel. The tree may still hold another
+        // channel's runtime, so install this one.
+        return Decision::Install;
     }
 
     // A current composition already in the tree satisfies the lane even while an
