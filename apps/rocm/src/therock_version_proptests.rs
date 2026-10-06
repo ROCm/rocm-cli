@@ -24,9 +24,10 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 
 use super::{
-    InstalledRuntimeManifest, RuntimeFreshness, VersionOrderKey, compare_version_strings,
-    parse_host_version, parse_version, runtime_freshness, select_rocm_version,
-    select_startup_update_manifest, sort_manifests_newest_install_first,
+    InstalledRuntimeManifest, RuntimeFreshness, VersionOrderKey, VersionStage,
+    compare_version_strings, parse_host_version, parse_version, parse_version_for_ordering,
+    runtime_freshness, select_rocm_version, select_startup_update_manifest,
+    sort_manifests_newest_install_first,
 };
 use crate::storage::{RetentionInputs, select_runtimes_to_remove};
 
@@ -1204,15 +1205,15 @@ fn runtime_freshness_follows_the_version_order() {
 /// these properties are about.
 ///
 /// Printed with `cargo test -- --nocapture`. This is a measurement, not an
-/// assertion about the code under test; it asserts only that the generator
-/// itself is not degenerate.
+/// assertion about the code under test; it fails only if the generator stops
+/// reaching the cases the other properties in this file depend on.
+///
+/// The RNG is a fixed, deterministic one (not seeded from the environment),
+/// so these floors cannot flake from run to run.
 #[test]
 fn generator_reach_report() {
     const SAMPLES: u32 = 20_000;
-    let mut runner = TestRunner::new(ProptestConfig {
-        cases: SAMPLES,
-        ..ProptestConfig::default()
-    });
+    let mut runner = TestRunner::deterministic();
 
     let mut pair_total = 0u32;
     let mut pair_both_parse_strict = 0u32;
@@ -1221,6 +1222,14 @@ fn generator_reach_report() {
     let mut pair_oracle_comparable = 0u32;
     let mut pair_equal_strings = 0u32;
     let mut pair_oracle_equal_strings_differ = 0u32;
+    let mut pair_unreadable_for_ordering = 0u32;
+    let mut pair_four_component_release = 0u32;
+    let mut pair_stage_dev = 0u32;
+    let mut pair_stage_alpha = 0u32;
+    let mut pair_stage_beta = 0u32;
+    let mut pair_stage_rc = 0u32;
+    let mut pair_stage_post = 0u32;
+    let mut pair_update_downgrade_direction = 0u32;
 
     let pair = (version(), version());
     for _ in 0..SAMPLES {
@@ -1237,10 +1246,43 @@ fn generator_reach_report() {
             if ordering == Ordering::Equal && left != right {
                 pair_oracle_equal_strings_differ += 1;
             }
+            if ordering == Ordering::Greater {
+                pair_update_downgrade_direction += 1;
+            }
         }
         if left == right {
             pair_equal_strings += 1;
         }
+
+        let left_key = parse_version_for_ordering(&left);
+        let right_key = parse_version_for_ordering(&right);
+        if left_key.is_none() || right_key.is_none() {
+            pair_unreadable_for_ordering += 1;
+        }
+        let keys = [&left_key, &right_key];
+        if keys.into_iter().flatten().any(|key| key.release.len() >= 4) {
+            pair_four_component_release += 1;
+        }
+        let mut saw_dev = false;
+        let mut saw_alpha = false;
+        let mut saw_beta = false;
+        let mut saw_rc = false;
+        let mut saw_post = false;
+        for key in keys.into_iter().flatten() {
+            match key.stage {
+                VersionStage::Dev => saw_dev = true,
+                VersionStage::Alpha => saw_alpha = true,
+                VersionStage::Beta => saw_beta = true,
+                VersionStage::Rc => saw_rc = true,
+                VersionStage::Post => saw_post = true,
+                VersionStage::Stable => {}
+            }
+        }
+        pair_stage_dev += u32::from(saw_dev);
+        pair_stage_alpha += u32::from(saw_alpha);
+        pair_stage_beta += u32::from(saw_beta);
+        pair_stage_rc += u32::from(saw_rc);
+        pair_stage_post += u32::from(saw_post);
     }
 
     let mut set_total = 0u32;
@@ -1333,6 +1375,38 @@ fn generator_reach_report() {
         "  numerically equal, textually differ {pair_oracle_equal_strings_differ:>6} ({:.1}%)",
         pct(pair_oracle_equal_strings_differ, pair_total)
     );
+    println!(
+        "  unreadable by the ordering parser   {pair_unreadable_for_ordering:>6} ({:.1}%)",
+        pct(pair_unreadable_for_ordering, pair_total)
+    );
+    println!(
+        "  installed newer than catalog        {pair_update_downgrade_direction:>6} ({:.1}%)",
+        pct(pair_update_downgrade_direction, pair_total)
+    );
+    println!(
+        "  four-component (or longer) release  {pair_four_component_release:>6} ({:.1}%)",
+        pct(pair_four_component_release, pair_total)
+    );
+    println!(
+        "  dev-stage version                   {pair_stage_dev:>6} ({:.1}%)",
+        pct(pair_stage_dev, pair_total)
+    );
+    println!(
+        "  alpha-stage version                 {pair_stage_alpha:>6} ({:.1}%)",
+        pct(pair_stage_alpha, pair_total)
+    );
+    println!(
+        "  beta-stage version                  {pair_stage_beta:>6} ({:.1}%)",
+        pct(pair_stage_beta, pair_total)
+    );
+    println!(
+        "  rc-stage version                    {pair_stage_rc:>6} ({:.1}%)",
+        pct(pair_stage_rc, pair_total)
+    );
+    println!(
+        "  post-stage version                  {pair_stage_post:>6} ({:.1}%)",
+        pct(pair_stage_post, pair_total)
+    );
     println!("manifest sets (n={set_total}):");
     println!(
         "  equal installed_at_unix_ms          {set_with_timestamp_tie:>6} ({:.1}%)",
@@ -1372,8 +1446,8 @@ fn generator_reach_report() {
     // `parse_version`'s strict grammar, and every entry in `VERSIONS` could be
     // readable for ordering while still mixing under the strict one.
     assert!(
-        pair_oracle_comparable < pair_total,
-        "generator never produces a version the ordering parser cannot read, so \
+        pair_unreadable_for_ordering > SAMPLES / 50,
+        "generator rarely produces a version the ordering parser cannot read, so \
          the comparator's unreadable arms go unexercised"
     );
     // Two spellings of one version are where the sort order and the update
@@ -1391,5 +1465,35 @@ fn generator_reach_report() {
     assert!(
         set_with_downgrade > SAMPLES / 200,
         "generator rarely produces a downgrade"
+    );
+    assert!(
+        pair_four_component_release > SAMPLES / 50,
+        "generator rarely produces a four-component (or longer) release, so \
+         that release-length handling goes unexercised"
+    );
+    assert!(
+        pair_stage_dev > SAMPLES / 50,
+        "generator rarely produces a dev-stage version, so VersionStage::Dev goes unexercised"
+    );
+    assert!(
+        pair_stage_alpha > SAMPLES / 50,
+        "generator rarely produces an alpha-stage version, so VersionStage::Alpha goes unexercised"
+    );
+    assert!(
+        pair_stage_beta > SAMPLES / 50,
+        "generator rarely produces a beta-stage version, so VersionStage::Beta goes unexercised"
+    );
+    assert!(
+        pair_stage_rc > SAMPLES / 50,
+        "generator rarely produces an rc-stage version, so VersionStage::Rc goes unexercised"
+    );
+    assert!(
+        pair_stage_post > SAMPLES / 50,
+        "generator rarely produces a post-stage version, so VersionStage::Post goes unexercised"
+    );
+    assert!(
+        pair_update_downgrade_direction > SAMPLES / 50,
+        "generator rarely produces an installed-newer-than-catalog pair, so that \
+         update/downgrade direction goes unexercised"
     );
 }
