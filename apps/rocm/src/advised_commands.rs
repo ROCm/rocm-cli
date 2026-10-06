@@ -1242,8 +1242,9 @@ fn origin(item: &Advice) -> Origin {
 
 /// Guards the scanner itself, source by source: a broken extractor would make
 /// `every_advised_command_parses` pass vacuously for everything it feeds. Each
-/// extractor must still find a known advised command and a floor of entries
-/// (set well below today's counts so ordinary doc edits do not trip it).
+/// source (help, Rust, Markdown, tapes) must still yield a named, long-lived
+/// command and a floor of entries (set well below today's counts so ordinary
+/// doc edits do not trip it).
 #[test]
 fn every_source_is_scanned() {
     let advice = all_advice();
@@ -1287,7 +1288,15 @@ fn every_source_is_scanned() {
     );
     assert!(count(Origin::Rust, Surface::CommandLine) >= 90);
     assert!(count(Origin::Rust, Surface::InlineProse) >= 130);
-    // Markdown: fenced lines and inline spans.
+    // Markdown: the quick-start fenced line and an inline span.
+    assert!(
+        has("README.md:", "rocm install sdk", Surface::CommandLine),
+        "README fenced `rocm install sdk` not found: fenced-block extraction is broken"
+    );
+    assert!(
+        has("README.md:", "rocm examine", Surface::InlineProse),
+        "README inline `rocm examine` not found: inline-span extraction is broken"
+    );
     assert!(count(Origin::Markdown, Surface::CommandLine) >= 100);
     assert!(count(Origin::Markdown, Surface::InlineProse) >= 120);
     assert!(
@@ -1295,7 +1304,11 @@ fn every_source_is_scanned() {
             + count(Origin::Markdown, Surface::InlineProse)
             >= 300
     );
-    // Tapes.
+    // Tapes: the CLI demo's first command.
+    assert!(
+        has("docs/tapes/cli.tape:", "rocm examine", Surface::CommandLine),
+        "`Type \"rocm examine\"` not found in the CLI tape: tape extraction is broken"
+    );
     assert!(count(Origin::Tape, Surface::CommandLine) >= 5);
 }
 
