@@ -298,7 +298,12 @@ Same model as the ComfyUI override above: in a build without
 `e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
 reads the environment, so a release build always probes the real machine. The
 re-rooting changes only where the probes read; the CLI still names the logical
-path (`/dev/kfd`) when it reports a device.
+path (`/dev/kfd`) when it reports a device. The dashboard test clock above is
+read from a state file by the same binary that ships, while this seam is
+compiled out; the difference is the one drawn there: the clock can skew
+telemetry but cannot select code or redirect a download, whereas a re-rooted
+hardware probe decides which plan runs against the real machine, so it must not
+exist in a shipped build.
 
 Some reads stay on the real machine even in a hook build:
 
@@ -313,6 +318,8 @@ Some reads stay on the real machine even in a hook build:
   OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
   `rocm` runs before serving. Their commands run against the real machine, so a
   simulated host must not pick the distro they are built for.
+- Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
+  this process's own environment, not the hardware.
 
 One check is routed but keeps the real device as a veto: the `rocm dash`
 pre-flight that decides whether to start `amd-smi`. Because it gates a real
