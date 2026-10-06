@@ -1009,7 +1009,7 @@ fn kfd_node_pci_id(properties: &str) -> Option<String> {
 /// it. (`target_os` alone would have left the tests Linux-only; `test` alone
 /// would not compile on Windows CI, which is how this was found.)
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
+fn detect_kfd_gfx_target_in(nodes_dir: &Path) -> Option<String> {
     let mut targets: Vec<(String, String)> = fs::read_dir(nodes_dir)
         .ok()?
         .flatten()
@@ -3053,6 +3053,25 @@ pub(crate) fn collect_managed_runtime_library_paths(
     paths: &mut Vec<PathBuf>,
 ) {
     collect_sdk_library_paths(root, paths);
+    // Nothing to do when `site_packages` is `None`, and the absence of an
+    // `else` is deliberate rather than an oversight.
+    //
+    // `None` is not reachable from a real candidate today: `ROCM_SDK_PROBE_SCRIPT`
+    // has recorded `site_packages` unconditionally, outside its `try`, since the
+    // probe's initial version, so every manifest that parses at all carries
+    // `Some` here. `site_packages` stays `Option` because the field is
+    // `serde(default)` (a read-only probe cannot depend on a registry record
+    // being current), not because there is a real shape it needs to degrade
+    // gracefully for.
+    //
+    // There also is not a guess worth making if this were ever reached: `root`
+    // is one of the runtime's own `_rocm_sdk_*` package directories (the probe
+    // script's `_devel.get_devel_root()` result, or the first package root it
+    // found when there is no `devel` extra), never a venv root with a
+    // `root/lib/<python>/site-packages` layout underneath it to re-derive. A
+    // fallback that assumed that shape previously shipped here and could not
+    // have been exercised by any real record; removed along with its test
+    // rather than kept as a guess for a case that cannot arise.
     if let Some(recorded) = site_packages {
         collect_sdk_package_library_paths(recorded, paths);
     }
@@ -3093,9 +3112,16 @@ pub(crate) fn collect_sdk_library_paths(root: &Path, paths: &mut Vec<PathBuf>) {
 #[derive(Debug, Clone)]
 pub(crate) struct TheRockSdkProbeCandidate {
     installed_at_unix_ms: u128,
-    pub(crate) site_packages: Option<PathBuf>,
+    site_packages: Option<PathBuf>,
     pub(crate) root_path: PathBuf,
     bin_path: PathBuf,
+    /// The SDK's own recorded library directories -- every package root the
+    /// probe script actually imported and asked Python for (see
+    /// `ROCM_SDK_PROBE_SCRIPT`'s `add_runtime_root`), not a layout guessed from
+    /// `root_path`/`site_packages` after the fact. This is what
+    /// `probe_runtime_devices` puts on `LD_LIBRARY_PATH` for a served process;
+    /// a caller that needs to find a managed runtime's actual libraries (comgr
+    /// included) should prefer this over re-deriving the layout.
     pub(crate) library_paths: Vec<PathBuf>,
 }
 
