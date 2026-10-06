@@ -509,7 +509,12 @@ fn runtime_manifest_round_trips_through_the_registry() {
         match saved {
             Ok(()) => {
                 prop_assert_eq!(listed.len(), 1, "saved manifest was not listed back");
-                prop_assert_eq!(manifest_text(&listed[0]), manifest_text(&manifest));
+                // Loading puts path text in the host's form (e.g. `/` becomes `\` on
+                // Windows), so the record must come back as saved, in that form.
+                prop_assert_eq!(
+                    manifest_text(&listed[0]),
+                    manifest_text(&manifest.clone().normalize_host_paths())
+                );
             }
             Err(error) => {
                 // Refusing is fine, but nothing half-written may be listed.
@@ -579,7 +584,12 @@ fn runtime_manifest_round_trips_for_utf8_install_roots() {
         saved.map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
         let listed = listed.map_err(|e| TestCaseError::fail(format!("{e:#}")))?;
         prop_assert_eq!(listed.len(), 1);
-        prop_assert_eq!(manifest_text(&listed[0]), manifest_text(&manifest));
+        // Loading puts path text in the host's form (e.g. `/` becomes `\` on
+        // Windows), so the record must come back as saved, in that form.
+        prop_assert_eq!(
+            manifest_text(&listed[0]),
+            manifest_text(&manifest.clone().normalize_host_paths())
+        );
         Ok(())
     });
     let [unicode, spaced, empty, none, big_ts, non_ascii] =
