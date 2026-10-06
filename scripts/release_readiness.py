@@ -459,6 +459,32 @@ def env_text(name: str) -> str | None:
     return value
 
 
+def verification_is_required(
+    require_signatures: bool,
+    require_production_trust: bool,
+    explicit_public_key: Path | None,
+) -> bool:
+    """Whether this run must cryptographically verify signatures.
+
+    Requiring signatures means requiring they verify. Checking only that a
+    ``.sig`` exists would pass an artifact signed by the wrong key, truncated,
+    or corrupted -- so whenever signatures are required, so is verification,
+    and a key that cannot be resolved is a hard failure rather than a quiet
+    downgrade to the presence check.
+
+    Split out of ``main`` so ``--self-test`` can reach it. ``main`` returns on
+    the ``--self-test`` branch long before the gate, and the self-test's
+    ``validate_release`` cases pass ``verify`` explicitly, so nothing exercised
+    this decision: dropping ``require_signatures`` from it left the self-test
+    green while removing the gate entirely.
+    """
+    return (
+        require_signatures
+        or require_production_trust
+        or explicit_public_key is not None
+    )
+
+
 def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
     """Resolve the public key release signatures are verified against.
 
@@ -1000,6 +1026,29 @@ def run_self_test(root: Path) -> None:
                 f"expected --public-key to win over the environment, got {explicit_source}"
             )
         print("release readiness self-test: signing key resolution ok")
+
+        # The verify gate itself. Without these, dropping `require_signatures`
+        # from `verification_is_required` left `--self-test` green while
+        # removing the whole point of the gate: `--require-signatures` would
+        # accept a `.sig` signed by the wrong key whenever no key is
+        # configured. `main` returns on the `--self-test` branch before the
+        # gate, and the `validate_release` cases above pass `verify`
+        # explicitly, so nothing else reaches this decision.
+        for label, flags in (
+            ("--require-signatures", (True, False, None)),
+            ("--require-production-trust", (False, True, None)),
+            ("--public-key", (False, False, Path("/nonexistent/key.pem"))),
+        ):
+            if not verification_is_required(*flags):
+                raise ReadinessError(
+                    f"{label} must force cryptographic verification, not just a .sig check"
+                )
+        if verification_is_required(False, False, None):
+            raise ReadinessError(
+                "verification must stay off when nothing asks for it, or an ordinary "
+                "readiness run would demand a signing key it has no reason to need"
+            )
+        print("release readiness self-test: verify gate ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
@@ -1072,13 +1121,8 @@ def main() -> None:
     require_production_trust = args.require_production_trust or truthy(
         os.environ.get("ROCM_CLI_REQUIRE_PRODUCTION_TRUST")
     )
-    # Requiring signatures means requiring they verify. Checking only that a
-    # .sig exists would pass an artifact signed by the wrong key, truncated, or
-    # corrupted — so whenever signatures are required, so is cryptographic
-    # verification, and a key that cannot be resolved is a hard failure rather
-    # than a quiet downgrade to the presence check.
-    verify = (
-        require_signatures or require_production_trust or args.public_key is not None
+    verify = verification_is_required(
+        require_signatures, require_production_trust, args.public_key
     )
     public_key: Path | None = None
     messages: list[str] = []
