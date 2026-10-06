@@ -513,7 +513,7 @@ fn runtime_manifest_round_trips_through_the_registry() {
                 // Windows), so the record must come back as saved, in that form.
                 prop_assert_eq!(
                     manifest_text(&listed[0]),
-                    manifest_text(&manifest.clone().normalize_host_paths())
+                    manifest_text(&manifest.normalize_host_paths())
                 );
             }
             Err(error) => {
@@ -588,7 +588,7 @@ fn runtime_manifest_round_trips_for_utf8_install_roots() {
         // Windows), so the record must come back as saved, in that form.
         prop_assert_eq!(
             manifest_text(&listed[0]),
-            manifest_text(&manifest.clone().normalize_host_paths())
+            manifest_text(&manifest.normalize_host_paths())
         );
         Ok(())
     });
