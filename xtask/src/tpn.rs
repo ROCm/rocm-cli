@@ -258,8 +258,12 @@ mod tests {
         assert_eq!(parse_about_version(""), None);
     }
 
-    /// The pinned constant and the version CI installs must never drift: if they
-    /// do, the hook regenerates notices that fail the byte-for-byte gate.
+    /// The pinned constant and the version CI installs, and the version
+    /// CONTRIBUTING.md tells contributors to install locally, must never drift:
+    /// a workflow mismatch makes the hook regenerate notices that fail the
+    /// byte-for-byte gate (CI); a CONTRIBUTING.md mismatch sends a contributor
+    /// to install a version `classify_generator` rejects, so the hook silently
+    /// no-ops and CI remains the only gate.
     #[test]
     fn pinned_version_matches_workflows() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -276,5 +280,14 @@ mod tests {
                 "{workflow} must install {expected} to match ABOUT_VERSION in tpn.rs"
             );
         }
+
+        let contributing = root.join("CONTRIBUTING.md");
+        let text = std::fs::read_to_string(&contributing)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", contributing.display()));
+        assert!(
+            text.contains(&expected),
+            "CONTRIBUTING.md must instruct `cargo install {expected} --locked --features cli` \
+             to match ABOUT_VERSION in tpn.rs"
+        );
     }
 }

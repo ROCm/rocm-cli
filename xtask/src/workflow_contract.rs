@@ -2153,8 +2153,10 @@ esac
     /// The version lives in exactly one place — `ci.yml`'s `license-headers`
     /// job's `env:` mapping — and is read from there with the extractors this
     /// file already has fixture tests for (`job_block`, `job_mapping`), rather
-    /// than duplicated into a constant, so a bump only ever needs the two
-    /// edits this test actually guards (ci.yml and CONTRIBUTING.md).
+    /// than duplicated into a constant. A bump needs three edits: this test
+    /// guards two of them (ci.yml's `HAWKEYE_VERSION` and CONTRIBUTING.md);
+    /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
+    /// here — see the comment at its definition.
     #[test]
     fn hawkeye_pin_matches_ci_workflow() {
         let ci = read_workflow("ci.yml");
@@ -2173,11 +2175,108 @@ esac
         let contributing_text = std::fs::read_to_string(&contributing)
             .unwrap_or_else(|e| panic!("reading {}: {e}", contributing.display()));
         let documented = format!("cargo install hawkeye@{version} --locked");
+
+        // Check every `hawkeye@` line, not just that the correct one is present:
+        // a stale duplicate left behind by a previous bump would otherwise still
+        // satisfy a plain `contains`.
+        let pins: Vec<&str> = contributing_text
+            .lines()
+            .filter(|line| line.contains("hawkeye@"))
+            .collect();
         assert!(
-            contributing_text.contains(&documented),
+            !pins.is_empty(),
             "CONTRIBUTING.md must instruct `{documented}` to match ci.yml's \
              license-headers job (HAWKEYE_VERSION: {installed})"
         );
+        for pin in pins {
+            assert!(
+                pin.contains(&documented),
+                "CONTRIBUTING.md has a stale hawkeye pin that does not match ci.yml's \
+                 license-headers job (HAWKEYE_VERSION: {installed}):\n{pin}"
+            );
+        }
+    }
+
+    /// Extensions this repo's license-header enforcement covers, mapped to the
+    /// prek/`identify` tag that extension resolves to. Hand-maintained: `identify`'s
+    /// extension→tag table isn't something this crate can query, so a new glob in
+    /// `licenserc.toml`'s `[files].includes` needs a matching entry here before the
+    /// test below can check it.
+    const LICENSE_HEADER_EXTENSION_TAGS: &[(&str, &str)] = &[
+        ("rs", "rust"),
+        ("py", "python"),
+        ("sh", "shell"),
+        ("md", "markdown"),
+    ];
+
+    /// `licenserc.toml`'s `[files].includes` and `.pre-commit-config.yaml`'s
+    /// `license-headers` hook `types_or` must cover the same file types: a glob in
+    /// `includes` with no matching tag in `types_or` means prek silently skips that
+    /// file type locally while CI's hawkeye still enforces it — the exact gap the
+    /// `markdown` tag above was added to close.
+    #[test]
+    fn license_header_hook_covers_licenserc_includes() {
+        let licenserc = std::fs::read_to_string(repo_root().join("licenserc.toml"))
+            .unwrap_or_else(|e| panic!("reading licenserc.toml: {e}"));
+        let includes_block = licenserc
+            .split_once("includes = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map_or_else(
+                || panic!("licenserc.toml has no `includes = [...]` array:\n{licenserc}"),
+                |(block, _)| block,
+            );
+
+        let precommit = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .unwrap_or_else(|e| panic!("reading .pre-commit-config.yaml: {e}"));
+        let hook_block = precommit.split_once("id: license-headers").map_or_else(
+            || panic!("no `license-headers` hook in .pre-commit-config.yaml"),
+            |(_, rest)| {
+                rest.split_once("\n      - id:")
+                    .map_or(rest, |(block, _)| block)
+            },
+        );
+        let types_or_line = hook_block
+            .lines()
+            .find(|line| line.trim_start().starts_with("types_or:"))
+            .unwrap_or_else(|| {
+                panic!("license-headers hook has no `types_or:` line:\n{hook_block}")
+            });
+        let types_or: Vec<&str> = types_or_line
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map_or_else(
+                || panic!("`types_or:` is not a bracketed list:\n{types_or_line}"),
+                |(tags, _)| tags.split(',').map(str::trim).collect(),
+            );
+
+        for glob in includes_block
+            .split(',')
+            .map(|entry| entry.trim().trim_matches('"'))
+            .filter(|glob| !glob.is_empty())
+        {
+            let ext = glob
+                .rsplit('.')
+                .next()
+                .unwrap_or_else(|| panic!("licenserc.toml include `{glob}` has no extension"));
+            let tag = LICENSE_HEADER_EXTENSION_TAGS
+                .iter()
+                .find(|(e, _)| *e == ext)
+                .map_or_else(
+                    || {
+                        panic!(
+                            "licenserc.toml includes `{glob}` (.{ext}); add its prek tag to \
+                             LICENSE_HEADER_EXTENSION_TAGS before this test can check it"
+                        )
+                    },
+                    |(_, tag)| *tag,
+                );
+            assert!(
+                types_or.contains(&tag),
+                "licenserc.toml includes `{glob}` but .pre-commit-config.yaml's \
+                 license-headers hook `types_or` does not list `{tag}`, so prek silently \
+                 skips {ext} files that CI's hawkeye still enforces:\ntypes_or: {types_or:?}"
+            );
+        }
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the
