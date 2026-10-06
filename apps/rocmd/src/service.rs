@@ -651,19 +651,28 @@ pub(crate) fn supervise_service(
     // key-file fallback is false precisely when a service has been stopped, and
     // the weakened record would then be written back at the bottom of this
     // function. That is the outcome the comment above says must not happen.
-    let previously_required = crate::persistence::load_managed_services(paths)
+    let existing = crate::persistence::load_managed_services(paths)
         .context(
             "could not read the service registry to check whether this service requires an \
              endpoint API key; refusing to recover it rather than assume it does not",
         )?
-        .iter()
-        .any(|existing| existing.service_id == record.service_id && existing.requires_api_key);
+        .into_iter()
+        .find(|existing| existing.service_id == record.service_id);
+    let previously_required = existing
+        .as_ref()
+        .is_some_and(|existing| existing.requires_api_key);
     // Only what the registry recorded. The `|| key-file-is-present` clause that
     // used to be here re-derived the flag the same way `spawn_managed_engine_child`
     // did, and was wrong for the same reason: a public bind always has a key file
     // whether or not auth was ever demanded, so recovery re-armed this on services
     // that never asked for it and refused them with the wrong remediation.
     record.requires_api_key = previously_required;
+    // A standing stop request is carried over too. The restart that launched
+    // this supervisor clears the marker before it does so, so one found here was
+    // set by a stop issued since — and `ManagedServiceRecord::new` starting it
+    // at `None` would quietly withdraw that stop and hand the service straight
+    // back to the daemon's recovery.
+    record.stop_requested_unix_ms = existing.and_then(|existing| existing.stop_requested_unix_ms);
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
@@ -722,48 +731,97 @@ pub(crate) fn supervise_service(
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
 
+    // Every write from here on goes through `update_supervised_record`: it
+    // applies only this supervisor's own fields to the record as it is on disk
+    // now, so a stop marker, or anything else another writer persisted meanwhile,
+    // survives it.
+    //
     // Captured while the child is known alive, so a later stop verifies this
     // exact process instead of whatever has since inherited its PID.
-    record.record_engine_identity(child.id());
-    record.status = "running".to_owned();
-    record.write()?;
+    let engine_pid = child.id();
+    update_supervised_record(paths, &record, |current| {
+        current.record_engine_identity(engine_pid);
+        current.status = "running".to_owned();
+    })?;
 
-    // Clone the fields the poller reads so the `on_phase` closure can borrow
-    // `record` mutably to persist each startup-phase transition to disk.
-    let ready_engine = record.engine.clone();
-    let ready_service_id = record.service_id.clone();
-    let ready_log_path = record.log_path.clone();
     let became_ready = wait_for_service_ready(
         paths,
-        &ready_engine,
-        &ready_service_id,
-        &ready_log_path,
+        &record.engine,
+        &record.service_id,
+        &record.log_path,
         Duration::from_mins(3),
         |phase| {
-            record.startup_phase = Some(phase.to_owned());
-            let _ = record.write();
+            let _ = update_supervised_record(paths, &record, |current| {
+                current.startup_phase = Some(phase.to_owned());
+            });
         },
     );
     if became_ready {
-        record.status = "ready".to_owned();
-        // The phase only describes the coming-up window; clear it once ready.
-        record.startup_phase = None;
-        record.write()?;
+        update_supervised_record(paths, &record, |current| {
+            current.status = "ready".to_owned();
+            // The phase only describes the coming-up window; clear it once ready.
+            current.startup_phase = None;
+        })?;
     }
 
     let exit_status = child.wait().context("failed waiting for engine child")?;
-    record.status = if exit_status.success() {
-        "stopped".to_owned()
-    } else {
-        "failed".to_owned()
-    };
-    record.write()?;
+    record_supervised_exit(paths, &record, exit_status.success())?;
 
     if exit_status.success() {
         Ok(())
     } else {
         std::process::exit(exit_status.code().unwrap_or(1));
     }
+}
+
+/// Apply one of [`supervise_service`]'s own changes to its service's record as
+/// it is on disk now, rather than writing back the copy the supervisor built at
+/// startup.
+///
+/// `write` replaces the whole file, and the supervisor's copy is stale the
+/// moment anyone else writes: a stop records `stop_requested_unix_ms` before it
+/// signals anything, and `rocm`'s liveness refresh and the daemon's restart
+/// write here too. Writing the startup snapshot back would erase that stop
+/// marker — and a record reading `failed` with no marker is exactly what the
+/// daemon's recovery restarts, undoing the stop. So `update` touches only the
+/// fields the supervisor owns, and never the marker.
+///
+/// Nothing is written when the record no longer belongs to this supervisor:
+///
+/// - it is gone — `rocm services remove` deleted it, and writing would
+///   resurrect a service the operator removed;
+/// - it names a different supervisor process — a confirmed stop clears the
+///   recorded PIDs, and a restart records its own. Either way the record now
+///   describes something this supervisor is not, and its view of the service
+///   (`running`, `failed`, …) would overwrite a truer one.
+fn update_supervised_record(
+    paths: &AppPaths,
+    supervisor: &ManagedServiceRecord,
+    update: impl FnOnce(&mut ManagedServiceRecord),
+) -> Result<()> {
+    if !paths.service_manifest_path(&supervisor.service_id).exists() {
+        return Ok(());
+    }
+    let mut current = crate::watchers::load_service_record(paths, &supervisor.service_id)?;
+    if current.supervisor_pid != supervisor.supervisor_pid
+        || current.supervisor_start_ticks != supervisor.supervisor_start_ticks
+    {
+        return Ok(());
+    }
+    update(&mut current);
+    current.write()
+}
+
+/// [`supervise_service`]'s last write: the engine child has exited, so record
+/// how. Separate so a test can drive exactly this write.
+fn record_supervised_exit(
+    paths: &AppPaths,
+    supervisor: &ManagedServiceRecord,
+    success: bool,
+) -> Result<()> {
+    update_supervised_record(paths, supervisor, |current| {
+        current.status = if success { "stopped" } else { "failed" }.to_owned();
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -958,7 +1016,7 @@ mod tests {
         UNCONFIRMED_STOP_PID, seed_keyed_service, temp_app_paths, unique_test_root,
     };
     use crate::watchers::load_service_record;
-    use crate::watchers::stop_requested;
+    use crate::watchers::{find_recoverable_service, stop_requested};
 
     /// Drive `supervise_service` far enough to reach the key guard, and return
     /// what it did.
@@ -1958,6 +2016,118 @@ mod tests {
             persisted?.supervisor_start_ticks.is_some(),
             "supervise_service must persist the supervisor's start-time token beside its PID"
         );
+        Ok(())
+    }
+
+    /// The supervisor's last write lands after its engine child exits — which
+    /// is what a stop that could not verify the supervisor, but did kill the
+    /// engine, leaves behind. Writing back the record the supervisor built at
+    /// startup would erase the stop marker the stop persisted, and a `failed`
+    /// record with no marker is exactly what the daemon's recovery restarts.
+    #[test]
+    fn supervisor_exit_write_keeps_a_standing_stop_marker() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-exit-keeps-marker");
+        paths.ensure()?;
+        let service_id = "svc-supervise-exit-marker";
+        // The supervisor's own copy, as `supervise_service` builds it: no marker.
+        let mut supervisor = identity_probe_record(&paths, service_id, 11446);
+        supervisor.record_supervisor_identity(std::process::id());
+        supervisor.status = "running".to_owned();
+        // What is on disk once a stop has run: same processes, marker set.
+        let mut on_disk = supervisor.clone();
+        on_disk.stop_requested_unix_ms = Some(1);
+        on_disk.write()?;
+
+        record_supervised_exit(&paths, &supervisor, false)?;
+        let persisted = load_service_record(&paths, service_id);
+        let recoverable = find_recoverable_service(&paths);
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_eq!(
+            persisted.status, "failed",
+            "the supervisor's own field lands"
+        );
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1),
+            "the supervisor's exit write must not withdraw a standing stop"
+        );
+        assert!(
+            recoverable?.is_none(),
+            "a stopped service must not become a recovery candidate"
+        );
+        Ok(())
+    }
+
+    /// A record that names another supervisor — a confirmed stop cleared the
+    /// PIDs, or a restart recorded its own — or that was removed outright, is
+    /// no longer this supervisor's to write.
+    #[test]
+    fn supervisor_exit_write_leaves_a_record_it_no_longer_owns() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-exit-not-owner");
+        paths.ensure()?;
+        let service_id = "svc-supervise-exit-not-owner";
+        let mut supervisor = identity_probe_record(&paths, service_id, 11447);
+        supervisor.record_supervisor_identity(std::process::id());
+        supervisor.status = "running".to_owned();
+        // A confirmed stop's final write: status stopped, PIDs cleared.
+        let mut stopped = supervisor.clone();
+        stopped.status = "stopped".to_owned();
+        stopped.supervisor_pid = 0;
+        stopped.supervisor_start_ticks = None;
+        stopped.write()?;
+
+        record_supervised_exit(&paths, &supervisor, false)?;
+        let after_stop = load_service_record(&paths, service_id);
+
+        fs::remove_file(paths.service_manifest_path(service_id))?;
+        record_supervised_exit(&paths, &supervisor, false)?;
+        let resurrected = paths.service_manifest_path(service_id).exists();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(after_stop?.status, "stopped");
+        assert!(!resurrected, "a removed record must not be written back");
+        Ok(())
+    }
+
+    /// The supervisor's first write rebuilds the record from its arguments.
+    /// The restart that launched it cleared any stop marker first, so a marker
+    /// on disk here was set by a stop issued since, and must survive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervise_service_first_write_keeps_a_standing_stop_marker() -> Result<()> {
+        let (root, paths) = temp_app_paths("supervise-first-write-keeps-marker");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-supervise-first-write-marker";
+        let mut seeded = identity_probe_record(&paths, service_id, 11448);
+        seeded.stop_requested_unix_ms = Some(1);
+        seeded.write()?;
+        // Stop `supervise_service` right after its first write; see
+        // `supervise_service_persists_the_supervisor_identity_token`.
+        fs::create_dir_all(&seeded.log_path)?;
+
+        let outcome = supervise_service(
+            &paths,
+            service_id.to_owned(),
+            "llamacpp".to_owned(),
+            "a-model".to_owned(),
+            "a-model".to_owned(),
+            None,
+            None,
+            "127.0.0.1".to_owned(),
+            11448,
+            "gpu_required".to_owned(),
+            None,
+            None,
+        );
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(outcome.is_err(), "the log path is a directory");
+        assert_eq!(persisted?.stop_requested_unix_ms, Some(1));
         Ok(())
     }
 }
