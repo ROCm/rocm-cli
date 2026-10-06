@@ -979,7 +979,7 @@ fn compare_version_strings_orders_7_9_below_7_10_0() {
 /// compare. Sorting low is the safe end *here*: `select_rocm_version` takes the
 /// maximum, so junk can only be selected when every candidate is junk. It is
 /// the wrong end for `runtime_freshness`, which is why that caller asks
-/// `actionable_version_relation` instead — see
+/// [`super::version_relation`] instead — see
 /// `runtime_freshness_follows_the_version_order`.
 #[test]
 fn compare_version_strings_places_unreadable_versions_below_readable_ones() {
@@ -987,7 +987,12 @@ fn compare_version_strings_places_unreadable_versions_below_readable_ones() {
     // and the empty string. Note what is NOT in this list — `7.1.2.3` is a
     // four-component release and `7.0.0rc` is `rc0`; both are real versions and
     // are ordered as such.
-    for unreadable in ["1!2.0", "7.0.0rc1.dev1", "latest", ""] {
+    //
+    // Each unreadable shape is chosen so that a parser which *approximated* it
+    // instead of declining would land ABOVE `7.0.0.dev1` and fail here: the
+    // epoch's release is `8.0` (dropping the epoch reads as 8.0), and the
+    // combined suffix folded onto its first stage reads as `rc1`.
+    for unreadable in ["1!8.0", "7.0.0rc1.dev1", "latest", ""] {
         assert_eq!(
             compare_version_strings(unreadable, "7.0.0.dev1"),
             Ordering::Less,
