@@ -27755,7 +27755,6 @@ install therock";
         let (root, _paths) = test_paths("managed-startup-failure-late-log");
         fs::create_dir_all(&root).expect("test dir");
         let log_path = root.join("late.log");
-        let staged = root.join("late.log.partial");
 
         // The writer starts the clock only once released, and then waits well
         // past the first (immediate) read but well inside the re-read window
@@ -27763,7 +27762,8 @@ install therock";
         // half-written.
         let (release, released) = std::sync::mpsc::channel::<()>();
         let writer = {
-            let (log_path, staged) = (log_path.clone(), staged.clone());
+            let log_path = log_path.clone();
+            let staged = root.join("late.log.partial");
             thread::spawn(move || {
                 released.recv().expect("release writer");
                 thread::sleep(Duration::from_millis(60));
