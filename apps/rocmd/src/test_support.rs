@@ -95,14 +95,14 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
 }
 
 /// Build the record a supervisor would construct for `service_id`, to learn
-/// the paths it derives before the real call does.
-#[cfg(target_os = "linux")]
+/// the paths it derives before the real call does. Not platform-gated:
+/// the supervisor exit-write tests use it on every platform.
 pub(crate) fn identity_probe_record(
     paths: &AppPaths,
     service_id: &str,
     port: u16,
-) -> rocm_core::ManagedServiceRecord {
-    rocm_core::ManagedServiceRecord::new(
+) -> ManagedServiceRecord {
+    ManagedServiceRecord::new(
         paths,
         service_id,
         "llamacpp",
