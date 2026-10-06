@@ -2,6 +2,12 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Property-based tests for version ordering and update-source selection.
+/// A child module so it can reach this module's private comparators directly.
+#[cfg(test)]
+#[path = "therock_version_proptests.rs"]
+mod version_proptests;
+
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
@@ -951,11 +957,45 @@ struct ParsedVersion {
     stage_number: u64,
 }
 
+/// A version's position in the PEP 440 order, as produced by
+/// [`parse_version_for_ordering`].
+///
+/// Separate from [`ParsedVersion`] because the two answer different questions.
+/// `ParsedVersion` is what [`parse_version`]'s strict grammar gate yields, and
+/// its fixed `major`/`minor`/`patch` are read directly by the PyTorch stack
+/// matchers. This one exists only to be compared, so its release segment is a
+/// vector and it has no fields a caller would reach into.
+///
+/// Field order is the comparison order, and it is PEP 440's: release segment
+/// first, then stage, then the stage's number.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct VersionOrderKey {
+    /// Release components, trailing zeros removed so that `7.9`, `7.9.0` and
+    /// `7.9.0.0` share one key and plain `Vec` ordering matches PEP 440's
+    /// zero-padded comparison.
+    release: Vec<u64>,
+    stage: VersionStage,
+    stage_number: u64,
+}
+
+/// Where a version sits within its release.
+///
+/// Declaration order is the ordering, and it is PEP 440's: a dev release
+/// precedes its alpha, which precedes beta, release candidate, the final
+/// release, and finally any post-release of that final release.
+///
+/// [`parse_version`] only ever yields `Alpha`, `Rc` or `Stable` — it is the
+/// strict grammar gate for "a version shape this tool will route an install
+/// on", not an ordering parser. The remaining variants come from
+/// [`parse_version_for_ordering`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum VersionStage {
+    Dev,
     Alpha,
+    Beta,
     Rc,
     Stable,
+    Post,
 }
 
 /// Outcome of an `install sdk` request.
@@ -1359,7 +1399,10 @@ fn runtime_freshness(
     required_composition: Option<&WheelRuntimeComposition>,
     target_runtime_key: &str,
 ) -> RuntimeFreshness {
-    match compare_version_strings(&manifest.version, latest_version) {
+    let Some(relation) = version_relation(&manifest.version, latest_version) else {
+        return RuntimeFreshness::AheadOfIndex;
+    };
+    match relation {
         Ordering::Less => RuntimeFreshness::UpdateAvailable,
         Ordering::Greater => RuntimeFreshness::AheadOfIndex,
         Ordering::Equal
@@ -1372,6 +1415,40 @@ fn runtime_freshness(
         }
         Ordering::Equal => RuntimeFreshness::UpToDate,
     }
+}
+
+/// How two versions relate *as versions*, for the callers asking "is this a
+/// different build?" rather than "where does this sort?".
+///
+/// Those are not the same question, and [`compare_version_strings`] only
+/// answers the second. It is a total order over *strings*, which is what
+/// sorting needs, and it gets there two ways this caller must not inherit:
+///
+/// * Its last tiebreak is the raw string, so two spellings of one version sort
+///   apart. `7.0.0-rc1` and `7.0.0rc1` are the same version — that is why the
+///   parser accepts both — but they are different strings. Treating that as a
+///   difference offers an update that re-downloads the runtime already
+///   installed. PyPI normalises versions, so an index can serve one spelling
+///   while an older manifest recorded the other.
+/// * A string it cannot read sorts below everything readable. That is the safe
+///   end for the "newest candidate" pickers, which take a maximum, and the
+///   wrong end here, where the unreadable string is the *installed* version and
+///   "lowest" reads as "older than the index" — an offer that could be a
+///   downgrade. A runtime adopted from an existing environment carries whatever
+///   its probe reported, so this is reachable without any index being odd.
+///
+/// So: compare the parsed keys, which are equal exactly when the two strings
+/// denote one version, and return `None` when either side cannot be identified
+/// at all. Byte-identical strings short-circuit, which keeps the
+/// repair/up-to-date path working for a runtime whose version this tool cannot
+/// parse but which plainly matches what the index offers.
+fn version_relation(left: &str, right: &str) -> Option<Ordering> {
+    if left == right {
+        return Some(Ordering::Equal);
+    }
+    let left_key = parse_version_for_ordering(left)?;
+    let right_key = parse_version_for_ordering(right)?;
+    Some(left_key.cmp(&right_key))
 }
 
 fn runtime_freshness_with_manifests(
@@ -2508,7 +2585,15 @@ fn active_default_relation_text(
     resolved_version: &str,
 ) -> String {
     if active.family == family && active.channel == channel.as_str() {
-        let relation = match compare_version_strings(resolved_version, &active.version) {
+        // "reinstall" is a claim about versions, not strings: `7.0.0-rc1` and
+        // `7.0.0rc1` are one version and must not read as an upgrade. When
+        // either side cannot be identified (`version_relation` is `None`) there
+        // is no better word available here, so the total order still decides
+        // rather than inventing a fourth one; an unreadable version sorts below
+        // every readable one, so it reads as the older side.
+        let relation = match version_relation(resolved_version, &active.version)
+            .unwrap_or_else(|| compare_version_strings(resolved_version, &active.version))
+        {
             Ordering::Greater => "upgrade",
             Ordering::Less => "downgrade",
             Ordering::Equal => "reinstall",
@@ -2543,15 +2628,20 @@ fn host_rocm_version_newer_than(resolved_version: &str) -> Option<String> {
 fn host_version_newer_than(host_version: Option<String>, resolved_version: &str) -> Option<String> {
     let host_version = host_version?;
     // Only claim the host is newer when BOTH versions parse and the host is
-    // strictly greater. `parse_host_version` normalises the shapes hosts
-    // actually report — a build suffix (`7.2.4-98` -> 7.2.4) and a
-    // two-component report (`7.4` -> 7.4.0) — so those are compared, not
-    // discarded. Only a string that still fails to parse is "can't tell", and
+    // strictly greater. Only a string that fails to parse is "can't tell", and
     // "can't tell" is never "newer". Falling back to a lexicographic compare
     // here wrongly ranks e.g. `7.2.4-98` above `7.13.0` (because '2' > '1' at
     // the third char), inventing a host-newer note that misleads the user.
+    //
+    // Each side is read with the parser for where it came from.
+    // `parse_host_version` additionally drops the packaging build number a
+    // legacy ROCm reports (`7.2.4-98` -> 7.2.4); a two-component report
+    // (`7.4` -> 7.4.0) and a `-rc1` pre-release are read the same way by both.
+    // `resolved_version` is not a host string: it is the version resolved from
+    // the index or the tarball catalogue, so it is read exactly as the
+    // comparator that picked it reads it.
     let host_parsed = parse_host_version(&host_version)?;
-    let resolved_parsed = parse_host_version(resolved_version)?;
+    let resolved_parsed = parse_version_for_ordering(resolved_version)?;
     (host_parsed > resolved_parsed).then_some(host_version)
 }
 
@@ -2590,10 +2680,15 @@ fn repo_version_without_wheels(
     resolved_version: &str,
 ) -> Option<String> {
     let newest = newest_repo?;
-    match compare_version_strings(newest, resolved_version) {
-        Ordering::Greater => Some(newest.to_owned()),
-        _ => None,
-    }
+    // "Is there a genuinely newer version?", not "which string sorts higher?".
+    // Two spellings of one version would otherwise produce a warning naming the
+    // same version on both sides of "installing X instead", and a pair this
+    // tool cannot identify would produce one it cannot justify.
+    matches!(
+        version_relation(newest, resolved_version),
+        Some(Ordering::Greater)
+    )
+    .then(|| newest.to_owned())
 }
 
 /// Where an already-granted approval for displacing the active default came
@@ -6186,13 +6281,203 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Total order over published version strings — the single definition of
+/// "newer" for every "which build does the user get?" decision in this module.
+///
+/// Ordering is PEP 440's, because these strings come from a Python simple
+/// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <
+/// `7.0.0rc1` < `7.0.0` < `7.0.0.post1`. The release segment is compared
+/// component-wise with the shorter side zero-padded, so `7.9` is `7.9.0` and
+/// precedes `7.10.0`, and `7.2.4.70204` — the shape ROCm's own packages are
+/// named with — is above `7.2.4` and below `7.2.5`.
+///
+/// Where this is not PEP 440, it declines to answer rather than guessing: an
+/// epoch (`1!2.0`), a combined stage suffix (`7.0.0rc1.dev1`) and anything else
+/// unreadable all return `None` from [`parse_version_for_ordering`]. Local
+/// version metadata is dropped rather than ordered, so `7.9.0+local` ties with
+/// `7.9.0` and is separated by the string tiebreak below.
+///
+/// A string that cannot be read keeps a *defined* position instead of switching
+/// the comparator to a different relation: it sorts below everything readable,
+/// and unreadable strings are ordered against each other by the string itself.
+/// Sorting below is the safe end for the "newest candidate" pickers, which take
+/// the maximum: an unreadable string can only win when every candidate is
+/// unreadable, rather than beating a real release by being lexicographically
+/// longer. It would cut the *other* way for [`runtime_freshness`], where the
+/// unreadable string is the installed version and "lowest" would read as "older
+/// than the index" — an offer that could be a downgrade.
+///
+/// Versions that are equal but textually different (`7.9` and `7.9.0`,
+/// `7.0.0-rc1` and `7.0.0rc1`, `7.9.0` and `7.9.0+local`) are separated by the
+/// raw string, so no two distinct strings compare `Equal` and `sort_by` is
+/// deterministic. That tiebreak is right for sorting and wrong for deciding
+/// whether a build is new: a caller asking "is there a newer runtime?" must use
+/// [`version_relation`], which compares the parsed keys, so that a spelling
+/// difference is not mistaken for an update.
+///
+/// This replaces an implementation that compared numerically only when *both*
+/// sides matched [`parse_version`]'s grammar and fell back to a byte-wise
+/// string compare otherwise. Mixing two relations in one comparator is not
+/// transitive — `7.0.0 < 7.0.0b1`, `7.0.0b1 < 7.0.0rc1`, yet `7.0.0 >
+/// 7.0.0rc1` — so `sort_by` had no defined result, "newest" depended on the
+/// order the index listed its candidates in, and `runtime_freshness` could
+/// offer a downgrade as an update.
 fn compare_version_strings(left: &str, right: &str) -> Ordering {
-    match (parse_version(left), parse_version(right)) {
+    match (
+        parse_version_for_ordering(left),
+        parse_version_for_ordering(right),
+    ) {
         (Some(left_parsed), Some(right_parsed)) => {
             left_parsed.cmp(&right_parsed).then_with(|| left.cmp(right))
         }
-        _ => left.cmp(right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => left.cmp(right),
     }
+}
+
+/// Lenient parse of a published version string, for ordering only.
+///
+/// Reads a PEP 440 public version: a release segment of any length, followed by
+/// at most one `dev`/`a`/`b`/`rc`/`post` stage. Because the module declares the
+/// order is PEP 440's, the spellings PEP 440 treats as equal are accepted as
+/// equal — case (`7.0.0RC1`), any of `.`, `-`, `_` or nothing as the separator
+/// before a stage label (`7.0.0-rc1`, `7.0.0_rc1`, `7.0.0rc1`), the alias
+/// labels (`alpha`, `beta`, `c`, `pre`, `preview`, `rev`, `r`), an omitted
+/// stage numeral (`7.0.0rc` is `rc0`), and a leading `v`.
+///
+/// The release segment is a *vector*, not three fixed components, because a
+/// four-component version is a shape this project really meets: ROCm's own
+/// packages are named `7.2.4.70204`. Folding that onto `7.2.4`, or rejecting
+/// it, both put it in the wrong place relative to a plain `6.4.3`.
+///
+/// Returns `None` rather than approximating where this stops being PEP 440,
+/// because a shape read *approximately* is a silently wrong order while `None`
+/// lands in the position [`compare_version_strings`] documents:
+/// * An epoch (`1!2.0`), which changes what the release numbers mean.
+/// * A combined stage suffix (`7.0.0rc1.dev1`).
+/// * PEP 440's implicit post-release (`7.2.4-98` meaning `7.2.4.post98`).
+///   That spelling collides with the packaging build number a system ROCm
+///   reports, which [`parse_host_version`] must read as plain `7.2.4`.
+///   Implementing the PEP 440 reading here would put the two parsers back into
+///   disagreement about one string, which is the defect this shared parser
+///   exists to remove; leaving it unreadable keeps them consistent and costs
+///   only a defined position.
+///
+///   What makes the two sides agree is that [`parse_host_version`] strips a
+///   `-` suffix only when it is *numeric*. A host `7.2.4-98` is reduced to
+///   `7.2.4` before it reaches here, so this function never sees that shape
+///   from the host; and `7.0.0-rc1` is left intact, so both sides read it as a
+///   release candidate. Widening either side of that rule re-opens the
+///   disagreement.
+///
+/// Local version metadata is dropped rather than ordered, so `7.9.0+local` and
+/// `7.9.0` produce the same key and [`compare_version_strings`] separates them
+/// by the string. PEP 440 would sort the local version above the plain one;
+/// nothing here depends on that, and the string tiebreak happens to agree.
+fn parse_version_for_ordering(value: &str) -> Option<VersionOrderKey> {
+    // Drop local version metadata: `7.9.0+local` -> `7.9.0`.
+    let value = value.split('+').next().unwrap_or(value).trim();
+    // PEP 440 is case-insensitive (`7.0.0RC1` is `7.0.0rc1`).
+    let value = value.to_ascii_lowercase();
+    let value = value.strip_prefix('v').unwrap_or(&value);
+    if value.is_empty() {
+        return None;
+    }
+
+    // An epoch (`1!2.0`) changes what the release numbers mean, so a version
+    // carrying one must not be ordered as though it did not.
+    if value.contains('!') {
+        return None;
+    }
+
+    let mut release = Vec::new();
+    let mut rest = value;
+    loop {
+        let (number, tail) = split_leading_number(rest)?;
+        release.push(number);
+        match tail.strip_prefix('.') {
+            // Another release component only if a digit follows the dot;
+            // `.post1` and `.dev1` are stages, not components.
+            Some(next) if next.starts_with(|ch: char| ch.is_ascii_digit()) => rest = next,
+            _ => {
+                rest = tail;
+                break;
+            }
+        }
+    }
+    // `7.9`, `7.9.0` and `7.9.0.0` are one release. Stripping trailing zeros
+    // makes the plain `Vec` comparison below agree with PEP 440's rule of
+    // zero-padding the shorter release to the longer one.
+    while release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let (stage, stage_number) = parse_version_stage(rest)?;
+    Some(VersionOrderKey {
+        release,
+        stage,
+        stage_number,
+    })
+}
+
+/// Split a leading run of ASCII digits off `value`, returning it and the rest.
+/// `None` when `value` does not start with a digit, or the digits overflow.
+fn split_leading_number(value: &str) -> Option<(u64, &str)> {
+    let digits = value.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some((value[..digits].parse().ok()?, &value[digits..]))
+}
+
+/// Map a PEP 440 stage suffix onto its [`VersionStage`] and number.
+///
+/// Accepts the spellings PEP 440 normalises away: any of `.`, `-`, `_` or no
+/// separator before the label, the alias labels (`alpha`, `beta`, `c`, `pre`,
+/// `preview`, `rev`, `r`), and an omitted numeral, which PEP 440 defines as
+/// zero. `value` is already lowercased by the caller.
+///
+/// A combined suffix (`7.0.0rc1.dev1`) is rejected rather than folded onto the
+/// first stage it happens to match: an approximate position is a silently wrong
+/// order, while `None` lands in the place [`compare_version_strings`]
+/// documents.
+fn parse_version_stage(suffix: &str) -> Option<(VersionStage, u64)> {
+    if suffix.is_empty() {
+        return Some((VersionStage::Stable, 0));
+    }
+    let label = suffix.strip_prefix(['.', '-', '_']).unwrap_or(suffix);
+    // Longest spelling first: `a` would otherwise swallow `alpha`, and `r`
+    // would swallow `rev`, matching and then failing on the leftover letters.
+    for (prefix, stage) in [
+        ("preview", VersionStage::Rc),
+        ("alpha", VersionStage::Alpha),
+        ("beta", VersionStage::Beta),
+        ("post", VersionStage::Post),
+        ("pre", VersionStage::Rc),
+        ("dev", VersionStage::Dev),
+        ("rev", VersionStage::Post),
+        ("rc", VersionStage::Rc),
+        ("a", VersionStage::Alpha),
+        ("b", VersionStage::Beta),
+        ("c", VersionStage::Rc),
+        ("r", VersionStage::Post),
+    ] {
+        let Some(number) = label.strip_prefix(prefix) else {
+            continue;
+        };
+        // PEP 440: an omitted numeral is zero, so `7.0.0rc` is `7.0.0rc0`.
+        let number = number.trim_start_matches(['.', '-', '_']);
+        return Some((
+            stage,
+            if number.is_empty() {
+                0
+            } else {
+                number.parse().ok()?
+            },
+        ));
+    }
+    None
 }
 
 fn parse_version(value: &str) -> Option<ParsedVersion> {
@@ -6232,51 +6517,30 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
 }
 
 /// Lenient parse of a host-reported ROCm version for the "is the host newer?"
-/// decision. Unlike [`parse_version`], this tolerates the shapes a legacy/system
-/// ROCm actually reports: a build suffix (`7.2.4-98`) and a missing patch
-/// component (`7.4`). Major and minor are required; patch defaults to 0 when
-/// absent and may still carry an `rc`/`a` stage suffix. Returns `None` when
-/// major/minor cannot be read so an unparseable host string is treated as
-/// "can't tell" instead of being compared lexicographically.
-fn parse_host_version(value: &str) -> Option<ParsedVersion> {
-    // Drop build/local metadata: `7.2.4-98`, `7.2.4+local` -> `7.2.4`.
-    let value = value.split(['+', '-']).next().unwrap_or(value).trim();
-    let mut parts = value.splitn(3, '.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let (patch, stage, stage_number) = match parts.next() {
-        // Two-component report (`7.4`) -> treat as `7.4.0`.
-        None => (0, VersionStage::Stable, 0),
-        Some(patch_and_rest) => {
-            let patch_len = patch_and_rest
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .count();
-            if patch_len == 0 {
-                return None;
-            }
-            let patch = patch_and_rest[..patch_len].parse().ok()?;
-            let suffix = &patch_and_rest[patch_len..];
-            let (stage, stage_number) = if suffix.is_empty() {
-                (VersionStage::Stable, 0)
-            } else if let Some(rest) = suffix.strip_prefix("rc") {
-                (VersionStage::Rc, rest.parse().ok()?)
-            } else if let Some(rest) = suffix.strip_prefix('a') {
-                (VersionStage::Alpha, rest.parse().ok()?)
-            } else {
-                return None;
-            };
-            (patch, stage, stage_number)
-        }
+/// decision.
+///
+/// [`parse_version_for_ordering`] already handles every shape this needs except
+/// one: a legacy/system ROCm reports a packaging build number as `7.2.4-98`,
+/// which is not a PEP 440 spelling of anything.
+///
+/// Only a *numeric* `-` suffix is dropped. `-` is also a PEP 440 pre-release
+/// separator, so stripping it unconditionally would read `7.0.0-rc1` as the
+/// final `7.0.0` — and then this function and the comparator would disagree
+/// about that string, which is exactly the self-contradiction the shared parser
+/// exists to remove.
+///
+/// Sharing the parser is the point: a host version and an index version are
+/// compared against each other, and the two must not disagree about which is
+/// newer. Returns `None` when the string still cannot be read, so an
+/// unparseable host string is "can't tell" rather than a lexicographic guess.
+fn parse_host_version(value: &str) -> Option<VersionOrderKey> {
+    // `7.2.4-98` -> `7.2.4`, but `7.0.0-rc1` is left for the PEP 440 parser.
+    let trimmed = value.trim();
+    let candidate = match trimmed.split_once('-') {
+        Some((head, tail)) if tail.starts_with(|ch: char| ch.is_ascii_digit()) => head,
+        _ => trimmed,
     };
-
-    Some(ParsedVersion {
-        major,
-        minor,
-        patch,
-        stage,
-        stage_number,
-    })
+    parse_version_for_ordering(candidate)
 }
 
 /// Recovery guidance appended to family/index resolution failures so a clean
@@ -6526,9 +6790,29 @@ fn load_runtime_manifests_reporting_unparsed(
             Err(_) => unparsed.push(path),
         }
     }
-    manifests.sort_by_key(|manifest| std::cmp::Reverse(manifest.installed_at_unix_ms));
+    sort_manifests_newest_install_first(&mut manifests);
     unparsed.sort();
     Ok((manifests, unparsed))
+}
+
+/// Order installed runtimes newest install first, breaking ties on the runtime
+/// key.
+///
+/// The tiebreak is what makes this a function of the registry contents rather
+/// than of the order `read_dir` happened to return them in. Two runtimes can
+/// share an `installed_at_unix_ms` — a `--devel` install and its plain sibling
+/// land in the same millisecond, and the field is only millisecond-resolution —
+/// and `select_startup_update_manifest` falls back to the first entry when no
+/// active runtime key is configured, so without it the filesystem decided which
+/// runtime the startup update check looked at. `select_runtimes_to_remove`
+/// already applies the same rule to its retention groups.
+fn sort_manifests_newest_install_first(manifests: &mut [InstalledRuntimeManifest]) {
+    manifests.sort_by(|left, right| {
+        right
+            .installed_at_unix_ms
+            .cmp(&left.installed_at_unix_ms)
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+    });
 }
 
 fn has_nontrivial_directory_contents(path: &Path) -> Result<bool> {

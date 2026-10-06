@@ -991,6 +991,23 @@ cargo test -p rocm --bin rocm render_update_text_reports_all_update_surfaces
 surfaces honestly. `rocm update --apply` remains runtime-only until production
 metadata feeds exist for the other surfaces.
 
+Runtime version-ordering tests:
+
+```bash
+cargo test -p rocm --bin rocm version_proptests
+cargo xtask e2e -- -n 'update-0[78]'
+```
+
+Which runtime build `rocm install sdk` resolves to, and whether `rocm update`
+offers one, both follow one PEP 440 order over published version strings
+(`7.9` < `7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`,
+`7.2.4.70204` above `7.2.4`). The property tests check that it is a total
+order, that picks do not depend on the order the index lists versions in, and
+that the update verdict points the same way as the order. Two spellings of one
+version (`7.0.0-rc1` and `7.0.0rc1`) are never an update. `generator_reach_report`
+prints how often each hard case is generated (run it with `-- --nocapture`), and
+fails if the generator stops reaching them.
+
 Model recipe engine metadata checks:
 
 ```bash

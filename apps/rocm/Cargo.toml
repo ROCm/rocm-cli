@@ -66,4 +66,5 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # is exactly the input a hand-picked example misses. Same version and features
 # as rocm-core's, so no new crate or feature enters the lockfile.
 # Test-only, so it adds nothing to any shipped binary.
+# Also used for TheRock version ordering and runtime selection.
 proptest = { version = "1", default-features = false, features = ["std"] }

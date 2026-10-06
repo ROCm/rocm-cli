@@ -257,12 +257,24 @@ struct ManagedRuntimeCandidate {
 fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntimeManifest>> {
     let paths = AppPaths::discover()?;
     let registry = paths.data_dir.join("runtimes").join("registry");
+    load_runtime_manifests_in(&registry, runtime_id)
+}
+
+/// Order newest install first, breaking ties on the runtime key and then on the
+/// manifest's own file path, so the result is a function of registry contents
+/// only rather than of whatever order `read_dir` happened to return — a
+/// `--devel` install and its plain sibling land in the same millisecond. This
+/// matches the tiebreak the CLI's own registry order uses.
+fn load_runtime_manifests_in(
+    registry: &Path,
+    runtime_id: Option<&str>,
+) -> Result<Vec<TheRockRuntimeManifest>> {
     if !registry.is_dir() {
         return Ok(Vec::new());
     }
     let mut manifests = Vec::new();
     for entry in
-        fs::read_dir(&registry).with_context(|| format!("failed to read {}", registry.display()))?
+        fs::read_dir(registry).with_context(|| format!("failed to read {}", registry.display()))?
     {
         let path = entry?.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -276,9 +288,16 @@ fn load_runtime_manifests(runtime_id: Option<&str>) -> Result<Vec<TheRockRuntime
         if !runtime_matches(&manifest, runtime_id) {
             continue;
         }
-        manifests.push((manifest.installed_at_unix_ms.unwrap_or(0), manifest));
+        manifests.push((path, manifest));
     }
-    manifests.sort_by_key(|(installed_at, _)| std::cmp::Reverse(*installed_at));
+    manifests.sort_by(|(left_path, left), (right_path, right)| {
+        right
+            .installed_at_unix_ms
+            .unwrap_or(0)
+            .cmp(&left.installed_at_unix_ms.unwrap_or(0))
+            .then_with(|| left.runtime_key.cmp(&right.runtime_key))
+            .then_with(|| left_path.cmp(right_path))
+    });
     Ok(manifests
         .into_iter()
         .map(|(_, manifest)| manifest)
@@ -687,5 +706,62 @@ mod tests {
             rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
             None
         );
+    }
+
+    #[test]
+    fn load_runtime_manifests_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        // Both pairings of file name and runtime key, so a read-order pick is wrong
+        // in one of them. A third, older manifest proves the tie only applies to
+        // manifests that actually share `installed_at_unix_ms`.
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let registry = std::env::temp_dir().join(format!(
+                "rocm-engine-vllm-runtime-tie-{first_file_key}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&registry)?;
+
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec(&serde_json::json!({
+                        "runtime_key": key,
+                        "runtime_id": "therock-stable:gfx94X-dcgpu",
+                        "installed_at_unix_ms": 2_000_u128,
+                    }))?,
+                )?;
+            }
+            fs::write(
+                registry.join("older.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "runtime_key": "older",
+                    "runtime_id": "therock-stable:gfx94X-dcgpu",
+                    "installed_at_unix_ms": 1_000_u128,
+                }))?,
+            )?;
+
+            let manifests =
+                load_runtime_manifests_in(&registry, Some("therock-stable:gfx94X-dcgpu"));
+            let _ = fs::remove_dir_all(&registry);
+            let manifests = manifests?;
+
+            let keys: Vec<Option<String>> = manifests
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![
+                    Some("aaa".to_owned()),
+                    Some("bbb".to_owned()),
+                    Some("older".to_owned())
+                ],
+                "files first={first_file_key}, second={second_file_key}"
+            );
+        }
+        Ok(())
     }
 }
