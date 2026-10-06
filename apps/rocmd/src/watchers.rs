@@ -1350,7 +1350,9 @@ const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPo
     }
 }
 
-fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRecord, String)>> {
+pub(crate) fn find_recoverable_service(
+    paths: &AppPaths,
+) -> Result<Option<(ManagedServiceRecord, String)>> {
     let now = unix_time_millis();
     for record in crate::persistence::load_managed_services(paths)? {
         if record.mode != "managed" || stop_requested(&record) {
