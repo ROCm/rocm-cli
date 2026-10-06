@@ -4237,10 +4237,23 @@ impl ManagedServiceRecord {
                     .map(|pid| (pid, "start_ticks"))
             });
         if let Some((pid, ticks_key)) = engine_pid
-            && let Ok(pid) = u32::try_from(pid)
+            && let Ok(engine_pid) = u32::try_from(pid)
         {
-            self.engine_pid = Some(pid);
-            self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+            self.engine_pid = Some(engine_pid);
+            // When `server_pid` names the same process as `pid`, `start_ticks`
+            // is that process's token too. vLLM wrote its state that way —
+            // `server_pid` equal to `pid`, and only `start_ticks` — before it
+            // wrote `server_start_ticks`, so without this the PID of every such
+            // service was adopted with no token, and a stop could only signal
+            // it blind once the PID had been recycled.
+            self.engine_start_ticks = state
+                .get(ticks_key)
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    (state.get("pid").and_then(serde_json::Value::as_u64) == Some(pid))
+                        .then(|| state.get("start_ticks").and_then(serde_json::Value::as_u64))
+                        .flatten()
+                });
         }
         // Adopt the engine's inference verification so the CLI side does not
         // re-probe a service the engine healthcheck already confirmed.
@@ -6072,6 +6085,75 @@ mod tests {
         );
         assert_eq!(record.restart_count, 3);
         assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    /// Writes `state` as the record's engine state file and runs the refresh.
+    fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-engine-state-{name}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create state dir");
+        let mut record = probe_test_record(11437);
+        record.status = "running".to_owned();
+        record.engine_state_path = dir.join("state.json");
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(state).expect("serialize state"),
+        )
+        .expect("write state");
+        record.refresh_from_engine_state().expect("refresh");
+        let _ = fs::remove_dir_all(dir);
+        record
+    }
+
+    /// vLLM records one process as both `pid` and `server_pid` with only
+    /// `start_ticks`. The refresh prefers `server_pid`, so it has to find that
+    /// process's token under `start_ticks`, or the PID is adopted with none.
+    #[test]
+    fn engine_refresh_takes_start_ticks_when_server_pid_is_the_same_process() {
+        let record = refresh_from_state(
+            "same-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 4321,
+                "server_pid": 4321,
+                "start_ticks": 987_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(4321));
+        assert_eq!(record.engine_start_ticks, Some(987));
+    }
+
+    /// The fallback is only for the same process: a distinct server PID never
+    /// borrows the launcher's token, which would make the stop's identity check
+    /// refute the server and leave it running.
+    #[test]
+    fn engine_refresh_never_gives_a_server_pid_the_launchers_token() {
+        let record = refresh_from_state(
+            "distinct-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(200));
+        assert_eq!(record.engine_start_ticks, None);
+
+        let record = refresh_from_state(
+            "distinct-pid-own-token",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+                "server_start_ticks": 222_u64,
+            }),
+        );
+        assert_eq!(record.engine_start_ticks, Some(222));
     }
 
     /// Each role is written with its own PID's token, so a stop can verify it.
