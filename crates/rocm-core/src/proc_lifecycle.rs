@@ -486,6 +486,37 @@ fn parse_start_ticks(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_start_time_is_readable_and_stable_for_our_own_pid() {
+        let pid = std::process::id();
+        let first = process_start_ticks(pid).expect("our own creation time is readable");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(process_start_ticks(pid), Some(first));
+        assert_ne!(first, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_start_time_is_none_for_an_unopenable_pid_and_differs_per_process() {
+        assert_eq!(process_start_ticks(u32::MAX - 1), None);
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn a child");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let ours = process_start_ticks(std::process::id());
+        let theirs = process_start_ticks(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(theirs.is_some());
+        assert_ne!(
+            ours, theirs,
+            "a different process has a different creation time"
+        );
+    }
+
     #[cfg(unix)]
     use std::process::{Child, Command, Stdio};
 

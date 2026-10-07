@@ -41519,6 +41519,65 @@ ID_LIKE="suse opensuse"
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_daemon_stop_that_is_not_confirmed_aborts_and_a_confirmed_one_is_recorded() {
+        let (root, paths) = test_paths("uninstall-daemon-stop-outcome");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a live daemon stand-in"),
+        );
+        let pid = child.0.id();
+        let mut state = runtime_state(true, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        assert!(state.daemon_start_ticks.is_some());
+        state.write(&paths).expect("write runtime state");
+
+        let mut report = ManagedServiceStopReport::default();
+        stop_background_helper_with(&paths, &mut report, |_| {
+            rocm_core::TerminationOutcome::TimedOut
+        });
+        assert!(report.stopped.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::StopTheDaemon);
+        assert!(uninstall_removal_gate(&report).is_err());
+
+        let mut report = ManagedServiceStopReport::default();
+        stop_background_helper_with(&paths, &mut report, |_| {
+            rocm_core::TerminationOutcome::Graceful
+        });
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.stopped, vec!["rocmd (background helper)".to_owned()]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn two_failures_of_one_class_get_that_classes_advice_once_and_name_both_ids() {
+        let failure = |id: &str| FailedManagedServiceStop {
+            service_id: id.to_owned(),
+            reason: "still ready".to_owned(),
+            remedy: StopFailureRemedy::StopTheService,
+        };
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![failure("svc-a"), failure("svc-b")],
+            warnings: Vec::new(),
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert_eq!(
+            message.matches("rocm services stop <id> --yes").count(),
+            1,
+            "one class, one piece of advice: {message}"
+        );
+        assert!(
+            message.contains("svc-a") && message.contains("svc-b"),
+            "{message}"
+        );
+        assert!(message.ends_with("No files were removed."), "{message}");
+    }
+
     #[test]
     fn the_endpoint_sentence_follows_the_failure_class() {
         let sentence = "may still be serving";

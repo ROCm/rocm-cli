@@ -246,6 +246,23 @@ pub(crate) fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
 ) {
+    stop_background_helper_with(paths, report, |identity| {
+        rocm_core::terminate_verified(
+            identity,
+            rocm_core::KillScope::Tree,
+            MANAGED_STOP_GRACE,
+            true,
+        )
+    });
+}
+
+/// [`stop_background_helper_before_uninstall`] with the verified termination
+/// injectable, so a test can make the stop come back unconfirmed.
+pub(crate) fn stop_background_helper_with(
+    paths: &AppPaths,
+    report: &mut ManagedServiceStopReport,
+    terminate: impl FnOnce(&rocm_core::ProcessIdentity) -> rocm_core::TerminationOutcome,
+) {
     // Three outcomes, not two. `load` returns `Ok(None)` only when there is no
     // state file at all; a permission error or a half-written file returns
     // `Err`, and discarding that would skip the daemon stop silently and let
@@ -335,12 +352,7 @@ pub(crate) fn stop_background_helper_before_uninstall(
         DaemonIdentityOutcome::Stop => {}
     }
     println!("stopping the background helper (rocmd)");
-    let outcome = rocm_core::terminate_verified(
-        &identity,
-        rocm_core::KillScope::Tree,
-        MANAGED_STOP_GRACE,
-        true,
-    );
+    let outcome = terminate(&identity);
     if outcome.stopped() {
         report.stopped.push("rocmd (background helper)".to_owned());
     } else {
