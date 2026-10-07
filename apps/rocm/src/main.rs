@@ -15024,7 +15024,8 @@ fn chat_cli_has_flag(args: &[String], name: &str) -> bool {
     })
 }
 
-#[cfg(test)]
+// Only the unix-only respelling test calls this.
+#[cfg(all(test, unix))]
 fn chat_install_prefix_is_system(prefix: &Path) -> bool {
     chat_install_prefix_protection(prefix).is_some()
 }
