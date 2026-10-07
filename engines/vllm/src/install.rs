@@ -126,12 +126,20 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         vllm_version_prefix: "0.29",
         flash_attn_version_prefix: "2.8",
         amd_aiter_version_prefix: "0.1",
-        torch_version_prefix: "2.12",
-        torchvision_version_prefix: "0.27",
+        // 2.13, not 2.12: AMD's own `rocm/vllm:rocm10.1.0_..._vllm-0.29.0`
+        // image (whose Dockerfile build args pin `TORCH_VERSION=2.13.0`,
+        // `TORCHVISION_VERSION=0.28.0`) builds this exact vllm release
+        // against torch 2.13, not 2.12. `vllm` 0.29's own `_rocm_C.abi3.so`
+        // needs a `c10::NotImplementedError` constructor symbol torch
+        // 2.12.0+rocm10.1.0 does not export; 2.13 is published on this same
+        // `whl-next` index and matches what vllm was actually built against.
+        torch_version_prefix: "2.13",
+        torchvision_version_prefix: "0.28",
         // Exact, not `2.11.*`: `whl-next` publishes three `+rocm10.1.0`
         // torchaudio builds, `2.11.0`, `2.11.0.2` and `2.11.0.3`, alongside
         // torch 2.12, 2.13 and 2.14. A series match resolves the newest,
-        // `2.11.0.3`, whose native library does not load against torch 2.12.
+        // `2.11.0.3`, whose native library does not load against torch 2.12
+        // or 2.13 (AMD's own image pins torchaudio to plain `2.11.0` too).
         torchaudio_version: DiscoverVersion::Exact("2.11.0"),
     },
 ];
@@ -1935,8 +1943,10 @@ mod tests {
         );
         assert_eq!(ten_one.vllm_version_prefix, "0.29");
         // `whl-next` carries `2.11.0`, `2.11.0.2` and `2.11.0.3` for
-        // `+rocm10.1.0`; only `2.11.0` pairs with this row's torch 2.12.
-        assert_eq!(ten_one.torch_version_prefix, "2.12");
+        // `+rocm10.1.0`; only `2.11.0` pairs with this row's torch, matching
+        // AMD's own `rocm/vllm:...vllm-0.29.0` image's pin.
+        assert_eq!(ten_one.torch_version_prefix, "2.13");
+        assert_eq!(ten_one.torchvision_version_prefix, "0.28");
         assert_eq!(ten_one.torchaudio_version, DiscoverVersion::Exact("2.11.0"));
 
         // An unpublished line must not borrow another line's wheels.
@@ -2038,8 +2048,8 @@ exit 0
         assert_eq!(
             discovered,
             [
-                "torch==2.12.*",
-                "torchvision==0.27.*",
+                "torch==2.13.*",
+                "torchvision==0.28.*",
                 "torchaudio==2.11.0",
                 "vllm==0.29.*",
                 "flash-attn==2.8.*",
