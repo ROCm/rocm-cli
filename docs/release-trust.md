@@ -56,13 +56,25 @@ against the release signing public key via `cargo xtask verify`. The key is
 taken from `--public-key` when given, then from the key file named by
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, then from the inline
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
-signing-key secret — the same path-before-PEM order `install.sh` and
-`cargo xtask package` use. If none resolves, the gate fails. It deliberately does
+signing-key secret — the same path-before-PEM precedence `install.sh` applies to
+the public key, and `cargo xtask package` to the private one. If none resolves,
+the gate fails. It deliberately does
 not fall back to checking that a `.sig` file is present: a sidecar produced by
 the wrong key, truncated, or corrupted would pass such a check, and because an
 unset GitHub secret expands to the empty string, the fallback would be reached
 silently whenever the secret was removed or rotated away. The log line
-`signature verification key:` names the key the run actually used.
+`signature verification key:` names the key the run actually used, and is
+printed as soon as the key resolves so that a run which then fails verification
+still records which trust root it used.
+
+Verification is driven by what the run asks for, not by what happens to be in
+the environment: `--require-signatures`, `--require-production-trust` or an
+explicit `--public-key`. Previously a key present in
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` was enough to opportunistically verify even
+without those flags; that trigger was removed when the flags began to imply
+verification, so a readiness run that asks for neither now checks neither
+signature presence nor validity. Every `release.yml` and `nightly.yml`
+invocation passes `--require-signatures`, so no workflow takes that path.
 
 Release CI also enables `--require-rocm-asset-names`, which rejects branch-like,
 path-like, or otherwise unsupported archive names before upload.
