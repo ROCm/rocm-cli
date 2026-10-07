@@ -194,10 +194,16 @@ pub fn uv_pip_install_base(venv_python: &Path) -> Vec<String> {
 }
 
 /// Arguments for `uv pip freeze` targeting the interpreter `venv_python`.
+///
+/// `--color never`, same as its sibling [`uv_pip_check_args`]: this output is parsed too,
+/// and a `FORCE_COLOR`/`CLICOLOR_FORCE` escape prefix would break the `name==version`
+/// line parsing just as it would break the check parsing there.
 pub fn uv_pip_freeze_args(venv_python: &Path) -> Vec<String> {
     vec![
         "pip".to_owned(),
         "freeze".to_owned(),
+        "--color".to_owned(),
+        "never".to_owned(),
         "--python".to_owned(),
         venv_python.to_string_lossy().into_owned(),
     ]
@@ -650,6 +656,23 @@ mod tests {
         assert_eq!(
             args,
             vec!["venv", "--python", "/py/bin/python3", "/envs/run"]
+        );
+    }
+
+    #[test]
+    fn pip_freeze_args_target_venv_python_and_disable_color() {
+        let args = uv_pip_freeze_args(Path::new("/envs/run/bin/python"));
+        assert_eq!(
+            args,
+            vec![
+                "pip",
+                "freeze",
+                "--color",
+                "never",
+                "--python",
+                "/envs/run/bin/python"
+            ],
+            "the output is parsed (name==version), so color must be off even under FORCE_COLOR"
         );
     }
 
