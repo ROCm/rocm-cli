@@ -22,5 +22,5 @@
 "rocm-engine-lemonade" = 63.82  # 5554 lines
 "rocm-engine-protocol" = 98.37  # 491 lines
 "rocm-engine-vllm" = 66.76  # 3030 lines
-"rocmd" = 75.36  # 7714 lines
+"rocmd" = 75.11  # 7500 lines
 "xtask" = 76.18  # 5447 lines
