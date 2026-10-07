@@ -11,17 +11,42 @@
 //! GPU-required path fails loudly instead of silently falling back to CPU.
 //!
 //! Replaces the former `scripts/smoke_local.py`, preserving each of its
-//! assertions. Two deliberate differences from that script:
+//! assertions, on the same commands, in the same order. Where it differs from
+//! that script, the difference is deliberate:
 //!
-//! * The target directory is resolved with [`crate::paths::target_dir`], so a
+//! * The binaries are looked for with [`crate::paths::target_dir`], so a
 //!   configured `CARGO_TARGET_DIR` is honoured. The script always looked under
 //!   `<root>/target` and so reported every binary missing when that variable
-//!   pointed elsewhere.
+//!   pointed elsewhere. The throwaway state root stays at
+//!   `<root>/target/smoke-local`, as in the script, because it is wiped on every
+//!   run and a target directory may be shared between checkouts.
+//! * `--profile release` builds release binaries, and `--target-dir` is handed
+//!   to the build as well as the lookup. The script always built debug, so both
+//!   flags built one place and then looked in another; see [`build_args`].
+//! * A child killed by a signal is reported with the negated signal number
+//!   (`-9`), as the script's `returncode` was; see [`exit_code_text`].
+//! * The build runs in this process's own environment, not the isolated one.
+//!   The script built under the isolated environment too, where the redirected
+//!   `HOME` hid cargo's registry and config from the build; no build script
+//!   reads a variable the isolation sets. The build uses the `cargo` this task
+//!   runs under (`$CARGO`, which `cargo xtask` always sets), where the script
+//!   searched `PATH` and then `~/.cargo/bin`.
 //! * The script merged each child's stderr into its stdout pipe, truly
 //!   interleaving them. `std::process` has no portable equivalent, so the two
-//!   streams are captured separately and concatenated (stdout first). Every
-//!   assertion here is a substring test or reads the first line of stdout, so
-//!   the ordering between streams is not load-bearing.
+//!   streams are captured separately and concatenated (stdout first). No check
+//!   depends on the seam: each asserts a substring, reads the first line of the
+//!   captured output, compares whole outputs for equality (the version
+//!   surfaces), or requires the whole of it to be one JSON value. (On
+//!   Linux, each command smoked here was also measured writing to only one of
+//!   the two.)
+//!
+//! Smaller differences that change no result today: output is decoded lossily
+//! and keeps Windows' `\r` until the line comparisons trim it, where the script
+//! decoded strictly and translated newlines; on Windows a crashed child's status
+//! prints as a signed code (`-1073741819`), where Python printed it unsigned
+//! (`3221225477`); the children inherit the variables `cargo xtask` adds to the
+//! environment; and the `managed_runtimes`/`managed_services` failures name the
+//! check, `rocm examine`, where the script said `rocm examine first-run state`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -32,7 +57,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::paths::{binary_name, target_dir, workspace_root};
+use crate::paths::{binary_name, workspace_root};
 
 /// Build profile whose binaries are smoked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -135,7 +160,7 @@ impl JsonCheck {
         match self {
             Self::Parses => Ok(()),
             Self::Protocol(expected) => {
-                if value.is_object() && json_field_is(value, "protocol", expected) {
+                if json_field_is(value, "protocol", expected) {
                     Ok(())
                 } else {
                     bail!("unexpected bridge snapshot protocol: {value}")
@@ -175,6 +200,12 @@ struct Check {
     not_contains: Vec<&'static str>,
     json: Option<JsonCheck>,
 }
+
+/// Token in a check's argv replaced with the ephemeral port chosen for this
+/// run. The two serve rejections need a port nothing is listening on, and
+/// keeping them in the table is what puts them under the order and expectation
+/// pins — they are the checks the gate exists for.
+const PORT_TOKEN: &str = "{port}";
 
 impl Check {
     fn new(label: &'static str, bin: Bin, args: &[&'static str]) -> Self {
@@ -217,6 +248,20 @@ impl Check {
     const fn json(mut self, check: JsonCheck) -> Self {
         self.json = Some(check);
         self
+    }
+
+    /// Argv with [`PORT_TOKEN`] resolved against the port chosen for this run.
+    fn resolved_args(&self, port: &str) -> Vec<String> {
+        self.args
+            .iter()
+            .map(|arg| {
+                if *arg == PORT_TOKEN {
+                    port.to_string()
+                } else {
+                    (*arg).to_string()
+                }
+            })
+            .collect()
     }
 
     fn assert_output(&self, output: &str) -> Result<()> {
@@ -273,12 +318,19 @@ fn assert_path_missing(path: &Path, label: &str) -> Result<()> {
 /// and reject the placeholder `unknown` ref a build with no resolvable
 /// tag/branch emits.
 fn assert_version_string(text: &str, label: &str) -> Result<()> {
-    let Some((version, git_ref, hash)) = parse_version_line(text) else {
+    let Some((_version, git_ref, _hash)) = parse_version_line(text) else {
         bail!("{label} did not match 'rocm-cli <version> (<ref>, <hash>)':\n{text}");
     };
-    debug_assert!(!version.is_empty() && !hash.is_empty());
     if git_ref == "unknown" {
-        bail!("{label} has an unresolved ref ('unknown'), expected a real tag/branch:\n{text}");
+        // The ref comes from the build script's `git describe`/`rev-parse`, so a
+        // detached HEAD or a git-stripped tarball yields `unknown` even though
+        // nothing is wrong with the binary. Name that, or the gate reads as a
+        // regression during a bisect.
+        bail!(
+            "{label} has an unresolved ref ('unknown'), expected a real tag/branch. \
+             A detached HEAD or a source tree without git metadata produces this; \
+             build from a branch or tag:\n{text}"
+        );
     }
     Ok(())
 }
@@ -320,12 +372,14 @@ fn json_field_is(value: &Value, field: &str, expected: &str) -> bool {
 /// A sandbox tool reply is accepted only when it names the tool that was asked
 /// for and reports success.
 fn sandbox_reply_ok(value: &Value, tool: &str) -> bool {
-    value.is_object() && json_field_is(value, "tool", tool) && json_truthy(value, "ok")
+    // No `is_object` guard is needed: `Value::get` on any non-object is `None`,
+    // so a bare string or array fails both fields below.
+    json_field_is(value, "tool", tool) && json_truthy(value, "ok")
 }
 
 /// vLLM must advertise OpenAI-compatible serving and must not advertise CPU.
 fn vllm_capabilities_ok(value: &Value) -> bool {
-    value.is_object() && json_truthy(value, "openai_compatible") && !json_truthy(value, "cpu")
+    json_truthy(value, "openai_compatible") && !json_truthy(value, "cpu")
 }
 
 fn parse_json(text: &str, label: &str) -> Result<Value> {
@@ -333,8 +387,12 @@ fn parse_json(text: &str, label: &str) -> Result<Value> {
         .with_context(|| format!("{label} did not return valid JSON:\n{text}"))
 }
 
-/// Environment overrides that confine a smoke run to `smoke_root`, so it can
-/// neither read nor write the developer's real ROCm CLI state.
+/// Environment overrides that point the CLI's own state directories, and the
+/// platform profile directories under them, at `smoke_root`.
+///
+/// This is the script's allowlist, not a sandbox: a `ROCM_CLI_*` variable
+/// outside the four below is still inherited, so an exported one can change
+/// what the gate sees.
 fn isolated_env(smoke_root: &Path) -> BTreeMap<&'static str, OsString> {
     let mut env = BTreeMap::new();
     env.insert("ROCM_CLI_UPDATE_USER_PATH", OsString::from("0"));
@@ -372,6 +430,14 @@ fn isolated_env(smoke_root: &Path) -> BTreeMap<&'static str, OsString> {
         env.insert("HOME", smoke_root.join("home").into_os_string());
     }
     env
+}
+
+/// The cache and data directories the smoke children were pointed at.
+fn state_dirs(env: &BTreeMap<&'static str, OsString>) -> (PathBuf, PathBuf) {
+    (
+        PathBuf::from(&env["ROCM_CLI_CACHE_DIR"]),
+        PathBuf::from(&env["ROCM_CLI_DATA_DIR"]),
+    )
 }
 
 /// Bind an ephemeral port and hand back the number, so the serve-rejection
@@ -435,18 +501,30 @@ fn run_command(
     Ok(combined)
 }
 
+/// The script printed Python's `returncode`, which is the negated signal number
+/// for a child that was killed. Keep that, so an OOM kill and a segfault stay
+/// distinguishable.
 fn exit_code_text(status: &std::process::ExitStatus) -> String {
-    status
-        .code()
-        .map_or_else(|| "signal".to_string(), |code| code.to_string())
+    if let Some(code) = status.code() {
+        return code.to_string();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return format!("-{signal}");
+        }
+    }
+    "signal".to_string()
 }
 
-/// Every check whose command line is fixed, in the exact order the script ran
-/// them. Order is part of the contract: each runs against the same throwaway
-/// state root, so a command moved earlier or later sees different state.
+/// Every check the gate runs after the version comparison, in the exact order
+/// the script ran them. Order is part of the contract: each runs against the
+/// same throwaway state root, so a command moved earlier or later sees
+/// different state.
 ///
-/// The two serve rejections are not here because they need a port chosen at run
-/// time; they are driven at the end of [`run`], which is where they ran.
+/// The two serve rejections, which ran last, need a port chosen at run time;
+/// their argv carries [`PORT_TOKEN`], which [`execute`] resolves.
 fn checks() -> Vec<Check> {
     let mut checks = checks_before_platform_gate();
     if cfg!(windows) {
@@ -593,60 +671,176 @@ fn checks_after_platform_gate() -> Vec<Check> {
         )
         .failing()
         .contains("no CPU fallback is used"),
+        // The point of the whole gate: a GPU-required serve must refuse rather
+        // than quietly running on CPU, and an explicit CPU serve must be
+        // refused too.
+        Check::new(
+            "vllm reject required gpu",
+            Bin::Rocm,
+            &[
+                "serve",
+                "qwen",
+                "--engine",
+                "vllm",
+                "--device",
+                "gpu_required",
+                "--foreground",
+                "--port",
+                PORT_TOKEN,
+            ],
+        )
+        .failing()
+        .contains("gpu_required")
+        .not_contains("CPU fallback"),
+        Check::new(
+            "rocm vllm reject cpu serve",
+            Bin::Rocm,
+            &[
+                "serve",
+                "qwen",
+                "--engine",
+                "vllm",
+                "--device",
+                "cpu",
+                "--foreground",
+                "--port",
+                PORT_TOKEN,
+            ],
+        )
+        .failing()
+        .contains("CPU mode is not a fallback path"),
     ]
 }
 
-/// Build the workspace, then run every smoke check against the built binaries
-/// in an isolated state root.
-pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathBuf>) -> Result<()> {
-    let root = workspace_root()?;
-    let env_root = target_dir(&root).join("smoke-local");
-    let env = isolated_env(&env_root);
-
-    if !skip_build {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let cargo = PathBuf::from(cargo);
-        // `--all-targets` matches the script: the local gate also catches a
-        // test target that no longer compiles, not just the four binaries.
-        run_command(
-            "build workspace all targets",
-            &cargo,
-            &["build", "--workspace", "--all-targets"],
-            &env,
-            &root,
-            false,
-        )?;
+/// `cargo build` argv for a smoke run, so the build lands where the binaries are
+/// then looked for. The script hard-coded a debug workspace build, which made
+/// `--profile release` build one profile and then smoke another.
+///
+/// The debug build keeps the script's `--workspace --all-targets`: as the local
+/// gate it also catches a test target that no longer compiles. The release
+/// build is narrowed to the four binaries the gate runs, for two reasons. A
+/// release build of every test and bench target is a heavy price for four
+/// executables. And `cargo xtask` is itself a release build of this crate, so a
+/// release `--workspace` build would relink the very executable that is running
+/// it — which Windows refuses.
+///
+/// `target_dir` is the already-resolved directory, so cargo and the binary
+/// lookup cannot disagree about a relative path.
+fn build_args(profile: Profile, target_dir: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["build".to_string()];
+    match profile {
+        Profile::Debug => {
+            args.push("--workspace".to_string());
+            args.push("--all-targets".to_string());
+        }
+        Profile::Release => {
+            args.push("--release".to_string());
+            for bin in Bin::ALL {
+                args.push("-p".to_string());
+                args.push(bin.stem().to_string());
+            }
+        }
     }
-
-    let binary_dir = match target_dir_override {
-        Some(dir) if dir.is_absolute() => dir,
-        Some(dir) => root.join(dir),
-        None => target_dir(&root),
+    if let Some(dir) = target_dir {
+        args.push("--target-dir".to_string());
+        args.push(dir.display().to_string());
     }
-    .join(profile.dir_name());
-    let binaries = Binaries::new(binary_dir);
-    binaries.require_all_present()?;
+    args
+}
 
-    if env_root.exists() {
-        std::fs::remove_dir_all(&env_root)
-            .with_context(|| format!("failed to clear {}", env_root.display()))?;
+/// Resolve a `--target-dir` override against the workspace root once, so the
+/// build and the binary lookup are handed the same absolute path.
+fn resolve_target_dir(root: &Path, dir: &Path) -> PathBuf {
+    if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        root.join(dir)
     }
-    std::fs::create_dir_all(&env_root)
-        .with_context(|| format!("failed to create {}", env_root.display()))?;
+}
 
-    let reject_port = free_tcp_port()?.to_string();
-    let rocm = binaries.path(Bin::Rocm);
+/// Directory the built binaries are looked for in: the resolved override, or
+/// the active cargo target directory.
+fn binary_dir(root: &Path, profile: Profile, target_dir: Option<&Path>) -> PathBuf {
+    target_dir
+        .map_or_else(|| crate::paths::target_dir(root), Path::to_path_buf)
+        .join(profile.dir_name())
+}
+
+/// Label printed for the build step, so the log says what was compiled.
+const fn build_label(profile: Profile) -> &'static str {
+    match profile {
+        // The script's label, kept: this is the build it ran.
+        Profile::Debug => "build workspace all targets",
+        Profile::Release => "build release binaries",
+    }
+}
+
+/// Everything a smoke run decides before it spawns anything, so those decisions
+/// can be checked without building or running a binary.
+#[derive(Debug)]
+struct Plan {
+    root: PathBuf,
+    /// Throwaway state root, wiped at the start of every run.
+    env_root: PathBuf,
+    env: BTreeMap<&'static str, OsString>,
+    binaries: Binaries,
+    /// `cargo` argv for the build, or `None` with `--skip-build`.
+    build: Option<Vec<String>>,
+}
+
+impl Plan {
+    fn new(
+        root: &Path,
+        profile: Profile,
+        skip_build: bool,
+        target_dir_override: Option<&Path>,
+    ) -> Self {
+        // Resolved once, so the build and the binary lookup get the same path.
+        let target_dir = target_dir_override.map(|dir| resolve_target_dir(root, dir));
+        // Rooted at the checkout, not the active target dir: `docs/testing.md`
+        // tells contributors to share one `CARGO_TARGET_DIR` across checkouts,
+        // and this directory is wiped at the start of every run — two worktrees
+        // sharing a target dir would delete each other's state mid-run.
+        let env_root = root.join("target").join("smoke-local");
+        Self {
+            root: root.to_path_buf(),
+            env: isolated_env(&env_root),
+            env_root,
+            binaries: Binaries::new(binary_dir(root, profile, target_dir.as_deref())),
+            build: (!skip_build).then(|| build_args(profile, target_dir.as_deref())),
+        }
+    }
+}
+
+/// Runs one smoke command: `(label, program, argv, expect_failure)` to its
+/// combined output. [`run`] passes [`run_command`]; tests pass a fake, which is
+/// what lets [`execute`] — the gate's whole logic — be tested without binaries.
+type Runner<'a> = dyn FnMut(&str, &Path, &[&str], bool) -> Result<String> + 'a;
+
+/// The gate: the version comparison, every table check in order, and the
+/// first-run assertions, against binaries the plan has located.
+fn execute(plan: &Plan, port: &str, run: &mut Runner<'_>) -> Result<()> {
+    plan.binaries.require_all_present()?;
+
+    if plan.env_root.exists() {
+        std::fs::remove_dir_all(&plan.env_root)
+            .with_context(|| format!("failed to clear {}", plan.env_root.display()))?;
+    }
+    std::fs::create_dir_all(&plan.env_root)
+        .with_context(|| format!("failed to create {}", plan.env_root.display()))?;
+
+    let rocm = plan.binaries.path(Bin::Rocm);
 
     // The three version surfaces must agree on the build string, and `rocm
     // version` reports the active SDK and driver on top of it.
-    let version_flag = run_command("rocm --version", &rocm, &["--version"], &env, &root, false)?;
-    let version_short = run_command("rocm -V", &rocm, &["-V"], &env, &root, false)?;
+    let version_flag = run("rocm --version", &rocm, &["--version"], false)?;
+    let version_short = run("rocm -V", &rocm, &["-V"], false)?;
     if version_flag != version_short {
         bail!(
             "version flag surfaces returned different output: {version_flag:?} vs {version_short:?}"
         );
     }
-    let version_command = run_command("rocm version", &rocm, &["version"], &env, &root, false)?;
+    let version_command = run("rocm version", &rocm, &["version"], false)?;
     let build_line = version_command.lines().next().unwrap_or_default();
     if build_line != version_flag {
         bail!(
@@ -658,77 +852,71 @@ pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathB
     assert_contains(&version_command, "GPU driver:", "rocm version")?;
 
     for check in &checks() {
-        let program = binaries.path(check.bin);
-        let output = run_command(
-            check.label,
-            &program,
-            &check.args,
-            &env,
-            &root,
-            check.expect_failure,
-        )?;
+        let program = plan.binaries.path(check.bin);
+        let args = check.resolved_args(port);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = run(check.label, &program, &argv, check.expect_failure)?;
         check.assert_output(&output)?;
     }
 
-    // The point of the whole gate: a GPU-required serve must refuse rather than
-    // quietly running on CPU, and an explicit CPU serve must be refused too.
-    let gpu_required = run_command(
-        "vllm reject required gpu",
-        &rocm,
-        &[
-            "serve",
-            "qwen",
-            "--engine",
-            "vllm",
-            "--device",
-            "gpu_required",
-            "--foreground",
-            "--port",
-            &reject_port,
-        ],
-        &env,
-        &root,
-        true,
-    )?;
-    assert_contains(&gpu_required, "gpu_required", "vllm reject required gpu")?;
-    assert_not_contains(&gpu_required, "CPU fallback", "vllm reject required gpu")?;
-
-    let cpu_serve = run_command(
-        "rocm vllm reject cpu serve",
-        &rocm,
-        &[
-            "serve",
-            "qwen",
-            "--engine",
-            "vllm",
-            "--device",
-            "cpu",
-            "--foreground",
-            "--port",
-            &reject_port,
-        ],
-        &env,
-        &root,
-        true,
-    )?;
-    assert_contains(
-        &cpu_serve,
-        "CPU mode is not a fallback path",
-        "rocm vllm reject cpu serve",
-    )?;
-
     // Nothing above should have provisioned anything: a first run that quietly
     // created a uv cache or a runtime registry would mean a command took an
-    // install path it was never asked to take.
+    // install path it was never asked to take. The parent directories come from
+    // the map the children were given, so renaming one in `isolated_env` cannot
+    // leave this looking somewhere the CLI was never pointed.
+    let (cache_dir, data_dir) = state_dirs(&plan.env);
+    assert_path_missing(&cache_dir.join("uv"), "first-run smoke uv cache")?;
     assert_path_missing(
-        &env_root.join("rocm-cache").join("uv"),
-        "first-run smoke uv cache",
-    )?;
-    assert_path_missing(
-        &env_root.join("rocm-data").join("runtimes").join("registry"),
+        &data_dir.join("runtimes").join("registry"),
         "first-run smoke runtime registry",
     )?;
+    Ok(())
+}
 
+/// The runner [`run`] hands to [`execute`]: every child gets the plan's isolated
+/// environment and runs in the workspace root.
+///
+/// Separate from `run` so a test can prove it. A runner that lost the isolation
+/// would not fail the gate — the binaries would read and write the developer's
+/// real state, and on a clean machine still print `smoke: ok` — so running the
+/// gate cannot catch that; only a test of this function can.
+fn child_runner(plan: &Plan) -> impl FnMut(&str, &Path, &[&str], bool) -> Result<String> + '_ {
+    move |label, program, argv, expect_failure| {
+        run_command(label, program, argv, &plan.env, &plan.root, expect_failure)
+    }
+}
+
+/// Build, then run every smoke check against the built binaries in an isolated
+/// state root.
+///
+/// Glue between the environment and the tested parts: the gate's logic is
+/// [`execute`], the up-front decisions are [`Plan`], and the children's
+/// isolation is [`child_runner`]. What is untested is this function's own
+/// wiring — the build step, the choice of port, and the hand-off of
+/// `child_runner` to `execute` — which runs only when the gate itself is run.
+pub fn run(profile: Profile, skip_build: bool, target_dir_override: Option<PathBuf>) -> Result<()> {
+    let root = workspace_root()?;
+    let plan = Plan::new(&root, profile, skip_build, target_dir_override.as_deref());
+
+    if let Some(args) = &plan.build {
+        let cargo = PathBuf::from(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        // The build inherits this process's environment rather than the isolated
+        // one. Isolation exists for the binaries under test; under it, a redirected
+        // `HOME` hides cargo's registry and config from the build. No build
+        // script reads the variables the isolation sets.
+        run_command(
+            build_label(profile),
+            &cargo,
+            &argv,
+            &BTreeMap::new(),
+            &root,
+            false,
+        )?;
+    }
+
+    let port = free_tcp_port()?.to_string();
+    execute(&plan, &port, &mut child_runner(&plan))?;
     println!("smoke: ok");
     Ok(())
 }
@@ -780,11 +968,138 @@ mod tests {
         assert_eq!(Profile::Release.dir_name(), "release");
     }
 
+    /// The gate's whole content, pinned.
+    ///
+    /// With `scripts/smoke_local.py` deleted, nothing else records what this
+    /// gate asserts: the order and label tests below pass just as happily over
+    /// a check whose expectations have been quietly dropped. Dropping
+    /// `.failing()` from a rejection check — turning "this must be refused"
+    /// into "this must succeed" — is the failure this exists to catch.
+    ///
+    /// Update it when a check genuinely changes, and say why in the commit.
+    #[test]
+    fn every_check_pins_its_command_and_its_expectations() {
+        let rendered: Vec<String> = checks().iter().map(render_check).collect();
+        let expected = vec![
+            r#"rocm examine | rocm ["examine"] | =contains["rocm examine", "default_engine:", "managed_runtimes: 0", "managed_services: 0"]"#,
+            r#"rocm engines list | rocm ["engines", "list"] | =contains["lemonade", "vllm"]"#,
+            r#"rocm config set telemetry off | rocm ["config", "set-telemetry", "off"] | =contains["telemetry mode set to off", "policy: disabled"]"#,
+            r#"rocm config show | rocm ["config", "show"] | =contains["telemetry_mode: off", "telemetry_policy: disabled"]"#,
+            r#"rocm engines install requires exact runtime | rocm ["engines", "install", "vllm"] | !contains["no active ROCm runtime is configured"]"#,
+            r#"rocm chat local status | rocm ["chat", "--provider", "local"] | =any["Provider: local", "Assistant source: local model on this computer"]"#,
+            r#"rocm freeform installed status question | rocm ["is rocm installed?"] | =contains["ROCm status", "Nothing was changed."] absent["No ROCm action selected"]"#,
+            r#"rocm freeform comfyui help question | rocm ["how do i setup comfyui"] | =contains["ComfyUI status", "Nothing was changed."] absent["No ROCm action selected"]"#,
+            r#"rocm freeform comfyui install request | rocm ["can you setup comfyui for me"] | =contains["Install ComfyUI", "approval: required"]"#,
+            r#"rocm freeform vllm plan | rocm ["serve qwen with vllm"] | =contains["engine: vllm", "no CPU fallback is implied"]"#,
+            r#"rocm freeform tiny gpu recipe plan | rocm ["serve tiny-gpt2"] | =contains["model: sshleifer/tiny-gpt2", "device_policy: gpu_required", "--device gpu_required", "approval: required"]"#,
+            #[cfg(windows)]
+            r#"windows tarball sdk rejection | rocm ["install", "sdk", "--format", "tarball", "--dry-run"] | !contains["TheRock tarball installs are not supported on Windows"]"#,
+            r#"rocmd status | rocmd ["status"] | =contains["rocmd status"]"#,
+            r#"rocmd bridge snapshot | rocmd ["bridge-snapshot"] | =json(Protocol("rocmd-codex-bridge-v0"))"#,
+            r#"rocmd sandbox examine snapshot | rocmd ["sandbox-run", "examine_snapshot", "--allow-native-fallback"] | =json(SandboxTool { tool: "examine_snapshot", noun: "examine" })"#,
+            r#"rocmd sandbox list servers | rocmd ["sandbox-run", "list_servers", "--allow-native-fallback"] | =json(SandboxTool { tool: "list_servers", noun: "list" })"#,
+            r#"rocmd sandbox prefetch validation | rocmd ["sandbox-run", "prefetch_artifact", "--allow-native-fallback"] | !contains["prefetch_artifact requires"]"#,
+            r#"vllm detect | vllm ["detect"] | =json(Parses)"#,
+            r#"vllm capabilities | vllm ["capabilities"] | =json(VllmCapabilities)"#,
+            r#"vllm resolve qwen | vllm ["resolve-model", "qwen"] | =contains["qwen"]"#,
+            r#"vllm reject cpu | vllm ["resolve-model", "qwen", "--device-policy", "cpu_only"] | !contains["no CPU fallback is used"]"#,
+            r#"vllm reject required gpu | rocm ["serve", "qwen", "--engine", "vllm", "--device", "gpu_required", "--foreground", "--port", "{port}"] | !contains["gpu_required"] absent["CPU fallback"]"#,
+            r#"rocm vllm reject cpu serve | rocm ["serve", "qwen", "--engine", "vllm", "--device", "cpu", "--foreground", "--port", "{port}"] | !contains["CPU mode is not a fallback path"]"#,
+        ];
+        assert_eq!(rendered, expected);
+    }
+
+    /// `=` expects success, `!` expects a non-zero exit.
+    fn render_check(check: &Check) -> String {
+        // Debug formatting quotes every element, so the rendering shows argv
+        // boundaries: `["serve qwen with vllm"]` is one argument, and splitting
+        // it into four would make `rocm` parse a real `serve` subcommand. The
+        // JSON expectation is rendered whole for the same reason — its payload
+        // is what the check asserts, not its variant name.
+        let mut parts = vec![
+            check.label.to_string(),
+            format!("{} {:?}", check.bin.key(), check.args),
+        ];
+        let mut expectations = vec![if check.expect_failure {
+            "!".to_string()
+        } else {
+            "=".to_string()
+        }];
+        if !check.contains.is_empty() {
+            expectations.push(format!("contains{:?}", check.contains));
+        }
+        if !check.contains_any.is_empty() {
+            expectations.push(format!("any{:?}", check.contains_any));
+        }
+        if !check.not_contains.is_empty() {
+            expectations.push(format!("absent{:?}", check.not_contains));
+        }
+        if let Some(json) = check.json {
+            expectations.push(format!("json({json:?})"));
+        }
+        let head = expectations.remove(0);
+        parts.push(format!("{head}{}", expectations.join(" ")));
+        parts.join(" | ")
+    }
+
+    /// An empty needle is satisfied by every string, so a check carrying one
+    /// asserts nothing while looking like it does.
+    #[test]
+    fn no_check_carries_an_empty_needle() {
+        for check in &checks() {
+            for needle in check
+                .contains
+                .iter()
+                .chain(check.contains_any.iter())
+                .chain(check.not_contains.iter())
+            {
+                assert!(
+                    !needle.trim().is_empty(),
+                    "{} carries an empty needle",
+                    check.label
+                );
+            }
+        }
+    }
+
+    /// The port token is substituted, not passed through to the CLI as a
+    /// literal — and only where it appears.
+    #[test]
+    fn the_port_token_is_resolved_in_argv() {
+        let check = Check::new(
+            "demo",
+            Bin::Rocm,
+            &["serve", "--port", PORT_TOKEN, "--device", "cpu"],
+        );
+        assert_eq!(
+            check.resolved_args("54321"),
+            vec!["serve", "--port", "54321", "--device", "cpu"]
+        );
+        // The token is substituted only as a whole argument, so one embedded in
+        // a larger argument (`--port={port}`) would reach the CLI verbatim. Catch
+        // that by substring, which the whole-argument substitution cannot hide.
+        for check in &checks() {
+            assert!(
+                !check
+                    .resolved_args("1")
+                    .iter()
+                    .any(|arg| arg.contains(PORT_TOKEN)),
+                "{} passes the port token through unresolved",
+                check.label
+            );
+        }
+        let embedded = Check::new("demo", Bin::Rocm, &["--port={port}"]);
+        assert!(
+            embedded.resolved_args("1")[0].contains(PORT_TOKEN),
+            "the substring check above must be able to see an embedded token"
+        );
+    }
+
     /// Order is part of the contract, not an accident of how the table was
     /// written: every check shares one throwaway state root, so a command moved
     /// earlier or later sees different state. This pins the sequence the
-    /// `scripts/smoke_local.py` gate ran, minus the platform-gated entry and the
-    /// two port-using serve rejections that `run` drives at the end.
+    /// `scripts/smoke_local.py` gate ran after its version comparison, minus the
+    /// platform-gated entry, which the next test places.
     #[test]
     fn the_check_sequence_matches_the_gate_it_replaces() {
         let labels: Vec<&str> = checks_before_platform_gate()
@@ -815,6 +1130,8 @@ mod tests {
                 "vllm capabilities",
                 "vllm resolve qwen",
                 "vllm reject cpu",
+                "vllm reject required gpu",
+                "rocm vllm reject cpu serve",
             ]
         );
     }
@@ -1107,25 +1424,39 @@ mod tests {
         let env = isolated_env(root);
 
         assert_eq!(env["ROCM_CLI_UPDATE_USER_PATH"], OsString::from("0"));
+        // Every other entry is a directory, and every one must sit under the
+        // throwaway root. Asserting only that the keys are present would let any
+        // one of them be pointed at the developer's real profile unnoticed.
+        for (key, value) in &env {
+            if *key == "ROCM_CLI_UPDATE_USER_PATH" {
+                continue;
+            }
+            let value = PathBuf::from(value);
+            assert!(
+                value.starts_with(root),
+                "{key} escaped the smoke root: {value:?}"
+            );
+        }
         for key in [
             "ROCM_CLI_CONFIG_DIR",
             "ROCM_CLI_DATA_DIR",
             "ROCM_CLI_CACHE_DIR",
         ] {
-            let value = PathBuf::from(&env[key]);
-            assert!(
-                value.starts_with(root),
-                "{key} escaped the smoke root: {value:?}"
-            );
+            assert!(env.contains_key(key), "{key} is not redirected");
         }
     }
 
     #[cfg(windows)]
     #[test]
     fn isolated_env_redirects_the_windows_profile_dirs() {
-        let env = isolated_env(Path::new("C:\\smoke"));
+        let root = Path::new("C:\\smoke");
+        let env = isolated_env(root);
         for key in ["APPDATA", "LOCALAPPDATA"] {
-            assert!(env.contains_key(key), "{key} is not redirected");
+            let value = PathBuf::from(env.get(key).unwrap_or_else(|| panic!("{key} is not set")));
+            assert!(
+                value.starts_with(root),
+                "{key} points outside the smoke root: {value:?}"
+            );
         }
         assert!(!env.contains_key("HOME"));
     }
@@ -1135,22 +1466,31 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn isolated_env_redirects_the_xdg_dirs_and_home() {
-        let env = isolated_env(Path::new("/tmp/smoke-local"));
+        let root = Path::new("/tmp/smoke-local");
+        let env = isolated_env(root);
         for key in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "HOME"] {
-            assert!(env.contains_key(key), "{key} is not redirected");
+            let value = PathBuf::from(env.get(key).unwrap_or_else(|| panic!("{key} is not set")));
+            assert!(
+                value.starts_with(root),
+                "{key} points outside the smoke root: {value:?}"
+            );
         }
         assert!(!env.contains_key("APPDATA"));
     }
 
-    /// A child killed by a signal has no exit code, and the gate's failure must
-    /// still say something rather than render an empty status.
+    /// A child killed by a signal has no exit code. The script printed Python's
+    /// negated signal number, which keeps an OOM kill (`-9`) distinguishable
+    /// from a segfault (`-11`); a bare "signal" would not.
     #[cfg(unix)]
     #[test]
-    fn a_signalled_child_is_reported_as_a_signal() {
+    fn a_signalled_child_keeps_its_signal_number() {
         use std::os::unix::process::ExitStatusExt as _;
 
-        let signalled = std::process::ExitStatus::from_raw(9);
-        assert_eq!(exit_code_text(&signalled), "signal");
+        assert_eq!(exit_code_text(&std::process::ExitStatus::from_raw(9)), "-9");
+        assert_eq!(
+            exit_code_text(&std::process::ExitStatus::from_raw(11)),
+            "-11"
+        );
     }
 
     #[test]
@@ -1166,10 +1506,607 @@ mod tests {
         assert_eq!(exit_code_text(&status), "3");
     }
 
+    /// Run a shell script through `run_command`, so it is driven for real rather
+    /// than reasoned about. Each test supplies the script for both shells: `cmd`
+    /// is not POSIX — `;` is not a separator there and there is no `cat` — so a
+    /// shared script would test something different on each platform.
+    fn run_script(
+        label: &str,
+        unix: &str,
+        windows: &str,
+        env: &BTreeMap<&'static str, OsString>,
+        cwd: &Path,
+        expect_failure: bool,
+    ) -> Result<String> {
+        let (program, flag, script) = if cfg!(windows) {
+            ("cmd", "/C", windows)
+        } else {
+            ("sh", "-c", unix)
+        };
+        run_command(
+            label,
+            Path::new(program),
+            &[flag, script],
+            env,
+            cwd,
+            expect_failure,
+        )
+    }
+
+    fn run_shell(label: &str, unix: &str, windows: &str, expect_failure: bool) -> Result<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run_script(
+            label,
+            unix,
+            windows,
+            &BTreeMap::new(),
+            dir.path(),
+            expect_failure,
+        )
+    }
+
+    /// Lines with `cmd`'s `\r` and trailing spaces removed, so both shells'
+    /// output compares the same way.
+    fn lines_of(output: &str) -> Vec<String> {
+        output.lines().map(|line| line.trim().to_string()).collect()
+    }
+
+    #[test]
+    fn run_command_returns_the_trimmed_output_of_a_successful_child() {
+        let output =
+            run_shell("demo", "echo hello", "echo hello", false).expect("the child succeeds");
+        assert_eq!(output, "hello");
+    }
+
+    /// Both streams reach the assertions, stdout first. The script merged them
+    /// into one pipe; this concatenates them, so a check asserting on stderr must
+    /// still see it. Exact lines, not substrings: under `cmd` a mis-quoted script
+    /// echoes its own text, which would satisfy a substring test by accident.
+    #[test]
+    fn run_command_captures_stderr_after_stdout() {
+        let output = run_shell(
+            "demo",
+            "echo to-stdout; echo to-stderr 1>&2",
+            "echo to-stdout& 1>&2 echo to-stderr",
+            false,
+        )
+        .expect("the child succeeds");
+        assert_eq!(lines_of(&output), vec!["to-stdout", "to-stderr"]);
+    }
+
+    /// The failure names the check and the status, so a red gate says which
+    /// command broke without the reader going to the transcript.
+    #[test]
+    fn run_command_fails_when_an_expected_success_exits_non_zero() {
+        let error = run_shell("demo", "exit 7", "exit 7", false).expect_err("the child fails");
+        let message = format!("{error}");
+        assert!(message.contains("demo exited with status 7"), "{message}");
+    }
+
+    #[test]
+    fn run_command_accepts_a_failure_it_was_told_to_expect() {
+        let output = run_shell(
+            "demo",
+            "echo refused 1>&2; exit 1",
+            "1>&2 echo refused& exit 1",
+            true,
+        )
+        .expect("a failure was expected");
+        assert_eq!(lines_of(&output), vec!["refused"]);
+    }
+
+    /// The inverse, and the one that matters: a rejection check whose command
+    /// starts succeeding must fail the gate rather than pass quietly.
+    #[test]
+    fn run_command_fails_when_an_expected_failure_succeeds() {
+        let error =
+            run_shell("demo", "exit 0", "exit 0", true).expect_err("success is the failure here");
+        assert!(
+            format!("{error}").contains("demo unexpectedly succeeded"),
+            "{error}"
+        );
+    }
+
+    /// Children are handed a null stdin, so a command that reads to EOF returns
+    /// instead of hanging the gate — the contract `rocm chat` relies on.
+    ///
+    /// This only has teeth where the test process's own stdin is an open pipe or
+    /// a terminal, as under a local `cargo test`. Where the harness already gives
+    /// tests a null stdin, an inherited one would also read EOF and this passes
+    /// either way; nothing in `std::process::Command` exposes the configured
+    /// stdin for a direct assertion.
+    #[test]
+    fn run_command_hands_the_child_a_closed_stdin() {
+        let output = run_shell("demo", "cat; echo done", "sort& echo done", false)
+            .expect("the reader sees EOF at once");
+        assert_eq!(lines_of(&output), vec!["done"]);
+    }
+
+    /// The isolated environment and the working directory both reach the child.
+    /// The directory is proved by a file only it contains, not by comparing
+    /// paths: a Windows temp directory can come back in 8.3 short form.
+    #[test]
+    fn run_command_passes_the_env_and_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("marker-file"), b"").expect("marker");
+        let mut env = BTreeMap::new();
+        env.insert("SMOKE_PROBE", OsString::from("from-env"));
+
+        let output = run_script(
+            "demo",
+            r#"echo "$SMOKE_PROBE" && ls marker-file"#,
+            "echo %SMOKE_PROBE%& dir /b marker-file",
+            &env,
+            dir.path(),
+            false,
+        )
+        .expect("the probe and the marker are both visible");
+        assert_eq!(lines_of(&output), vec!["from-env", "marker-file"]);
+    }
+
+    /// The JSON branch of `assert_output` is reached through a real check, not
+    /// only by calling `JsonCheck::assert_value` directly.
+    #[test]
+    fn assert_output_runs_the_json_check_it_carries() {
+        let check = Check::new("demo", Bin::Rocmd, &["bridge-snapshot"])
+            .json(JsonCheck::Protocol("rocmd-codex-bridge-v0"));
+
+        check
+            .assert_output(r#"{"protocol":"rocmd-codex-bridge-v0"}"#)
+            .expect("the protocol matches");
+
+        let wrong = check
+            .assert_output(r#"{"protocol":"other"}"#)
+            .expect_err("the protocol does not match");
+        assert!(
+            format!("{wrong}").contains("unexpected bridge snapshot protocol"),
+            "{wrong}"
+        );
+
+        let unparsable = check
+            .assert_output("not json")
+            .expect_err("not JSON at all");
+        assert!(
+            format!("{unparsable}").contains("demo did not return valid JSON"),
+            "{unparsable}"
+        );
+    }
+
+    /// `--profile release` must build the profile it then smokes, and a
+    /// `--target-dir` must reach the build too: otherwise the flags build one
+    /// place and look in another.
+    #[test]
+    fn the_build_lands_where_the_binaries_are_looked_for() {
+        assert_eq!(
+            build_args(Profile::Debug, None),
+            vec!["build", "--workspace", "--all-targets"],
+            "the debug build keeps the script's whole-workspace build"
+        );
+        assert_eq!(
+            build_args(Profile::Release, None),
+            vec![
+                "build",
+                "--release",
+                "-p",
+                "rocm",
+                "-p",
+                "rocmd",
+                "-p",
+                "rocm-engine-lemonade",
+                "-p",
+                "rocm-engine-vllm",
+            ],
+            "the release build names only the binaries the gate runs"
+        );
+        assert!(
+            !build_args(Profile::Release, None).contains(&"--workspace".to_string()),
+            "a release --workspace build would relink the running `cargo xtask`"
+        );
+
+        // An absolute path from a real directory, so it is absolute on Windows
+        // too — `/tmp/...` has no drive and is relative there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("elsewhere");
+        let args = build_args(Profile::Release, Some(&out));
+        let target_flag = args
+            .iter()
+            .position(|arg| arg == "--target-dir")
+            .expect("the build is told where to put the binaries");
+        assert_eq!(args[target_flag + 1], out.display().to_string());
+
+        let root = dir.path().join("repo");
+        assert_eq!(
+            binary_dir(&root, Profile::Release, Some(&out)),
+            out.join("release")
+        );
+    }
+
+    /// A relative `--target-dir` is resolved once, against the workspace root,
+    /// so the build and the lookup are given the same path whatever directory
+    /// cargo happens to run in.
+    #[test]
+    fn a_relative_target_dir_resolves_against_the_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        let absolute = dir.path().join("abs");
+
+        assert_eq!(
+            resolve_target_dir(&root, Path::new("rel")),
+            root.join("rel")
+        );
+        assert_eq!(
+            resolve_target_dir(&root, &absolute),
+            absolute,
+            "an absolute path is used as given"
+        );
+
+        let resolved = Some(resolve_target_dir(&root, Path::new("rel")));
+        let args = build_args(Profile::Debug, resolved.as_deref());
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some(root.join("rel").display().to_string().as_str()),
+            "the build receives the resolved path, not the relative one"
+        );
+        assert_eq!(
+            binary_dir(&root, Profile::Debug, resolved.as_deref()),
+            root.join("rel").join("debug")
+        );
+    }
+
+    /// The first-run assertions look where the CLI was told to write.
+    #[test]
+    fn the_first_run_checks_look_in_the_isolated_state_dirs() {
+        let root = Path::new("/tmp/smoke-local");
+        let env = isolated_env(root);
+        let (cache_dir, data_dir) = state_dirs(&env);
+        assert_eq!(cache_dir, PathBuf::from(&env["ROCM_CLI_CACHE_DIR"]));
+        assert_eq!(data_dir, PathBuf::from(&env["ROCM_CLI_DATA_DIR"]));
+        assert!(cache_dir.starts_with(root) && data_dir.starts_with(root));
+    }
+
+    const FAKE_VERSION: &str = "rocm-cli 0.1.0 (main, a1b2c3d)";
+    const FAKE_PORT: &str = "45678";
+
+    /// Output that satisfies a check's own expectations, built from the check —
+    /// so a test can make one check fail by overriding only that one.
+    fn satisfying_output(check: &Check) -> String {
+        if let Some(json) = check.json {
+            return match json {
+                JsonCheck::Parses => "{}".to_string(),
+                JsonCheck::Protocol(protocol) => format!(r#"{{"protocol":"{protocol}"}}"#),
+                JsonCheck::SandboxTool { tool, .. } => {
+                    format!(r#"{{"tool":"{tool}","ok":true}}"#)
+                }
+                JsonCheck::VllmCapabilities => {
+                    r#"{"openai_compatible":true,"cpu":false}"#.to_string()
+                }
+            };
+        }
+        let mut lines: Vec<&str> = check.contains.clone();
+        lines.extend(check.contains_any.first());
+        lines.join("\n")
+    }
+
+    /// One recorded call: label, program file name, argv, `expect_failure`.
+    type Call = (String, String, Vec<String>, bool);
+
+    /// A plan over a throwaway tree, with the four binaries present as empty
+    /// files so `execute` can locate them.
+    fn fake_plan(dir: &Path) -> Plan {
+        let target = dir.join("target-dir");
+        let bin_dir = target.join("debug");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        for bin in Bin::ALL {
+            std::fs::write(bin_dir.join(binary_name(bin.stem())), b"").expect("stub binary");
+        }
+        Plan::new(&dir.join("repo"), Profile::Debug, true, Some(&target))
+    }
+
+    /// Drive `execute` with a fake runner that answers every command with
+    /// passing output, except where `overrides` says otherwise. `on_call` runs
+    /// before each answer, so a test can simulate a command's side effects.
+    fn execute_with(
+        plan: &Plan,
+        overrides: &BTreeMap<&str, String>,
+        on_call: &mut dyn FnMut(&str),
+    ) -> (Result<()>, Vec<Call>) {
+        let table = checks();
+        let mut calls = Vec::new();
+        let result = execute(
+            plan,
+            FAKE_PORT,
+            &mut |label, program, argv, expect_failure| {
+                on_call(label);
+                calls.push((
+                    label.to_string(),
+                    program
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    argv.iter().map(|arg| (*arg).to_string()).collect(),
+                    expect_failure,
+                ));
+                if let Some(output) = overrides.get(label) {
+                    return Ok(output.clone());
+                }
+                Ok(match label {
+                    "rocm --version" | "rocm -V" => FAKE_VERSION.to_string(),
+                    "rocm version" => format!("{FAKE_VERSION}\nROCm SDK: none\nGPU driver: none"),
+                    _ => satisfying_output(
+                        table
+                            .iter()
+                            .find(|check| check.label == label)
+                            .unwrap_or_else(|| panic!("unexpected command {label}")),
+                    ),
+                })
+            },
+        );
+        (result, calls)
+    }
+
+    /// The gate runs the version surfaces, then every table check in table
+    /// order, each against its own binary, with the port resolved and its
+    /// expected exit status passed through.
+    #[test]
+    fn execute_runs_every_check_in_order_against_the_right_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        let (result, calls) = execute_with(&plan, &BTreeMap::new(), &mut |_| {});
+        result.expect("every check is satisfied");
+
+        let table = checks();
+        let mut expected: Vec<Call> = vec![
+            (
+                "rocm --version".into(),
+                binary_name("rocm"),
+                vec!["--version".into()],
+                false,
+            ),
+            (
+                "rocm -V".into(),
+                binary_name("rocm"),
+                vec!["-V".into()],
+                false,
+            ),
+            (
+                "rocm version".into(),
+                binary_name("rocm"),
+                vec!["version".into()],
+                false,
+            ),
+        ];
+        expected.extend(table.iter().map(|check| {
+            (
+                check.label.to_string(),
+                binary_name(check.bin.stem()),
+                check.resolved_args(FAKE_PORT),
+                check.expect_failure,
+            )
+        }));
+        assert_eq!(calls, expected);
+        assert!(
+            calls
+                .iter()
+                .any(|(_, _, argv, _)| argv.iter().any(|arg| arg == FAKE_PORT)),
+            "the serve rejections receive the chosen port"
+        );
+    }
+
+    /// The failure that matters most: a check whose output does not meet its
+    /// expectations must fail the gate. Without this, a gate that stopped
+    /// asserting would still print `smoke: ok`.
+    #[test]
+    fn execute_fails_a_check_whose_output_misses_its_expectation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        let overrides = BTreeMap::from([("rocm config show", "telemetry_mode: on".to_string())]);
+        let (result, _) = execute_with(&plan, &overrides, &mut |_| {});
+        let error = result.expect_err("the expectation is unmet");
+        assert!(
+            format!("{error}").contains("rocm config show did not contain expected text"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn execute_fails_when_the_version_surfaces_disagree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+
+        let short = BTreeMap::from([("rocm -V", "rocm-cli 0.1.0 (main, ffffff)".to_string())]);
+        let (result, _) = execute_with(&plan, &short, &mut |_| {});
+        assert!(format!("{}", result.expect_err("-V disagrees")).contains("version flag surfaces"),);
+
+        let long = BTreeMap::from([(
+            "rocm version",
+            "rocm-cli 0.1.0 (main, ffffff)\nROCm SDK: none\nGPU driver: none".to_string(),
+        )]);
+        let (result, _) = execute_with(&plan, &long, &mut |_| {});
+        assert!(
+            format!("{}", result.expect_err("the build line disagrees"))
+                .contains("build line does not match"),
+        );
+    }
+
+    /// `rocm version` must carry a traceable build string and report the SDK
+    /// and driver. Each override keeps the three version surfaces equal, so the
+    /// earlier equality checks pass and only the assertion under test can fail.
+    #[test]
+    fn execute_checks_what_rocm_version_reports() {
+        let unknown = "rocm-cli 0.1.0 (unknown, a1b2c3d)";
+        let cases = [
+            (
+                unknown,
+                format!("{unknown}\nROCm SDK: none\nGPU driver: none"),
+                "unresolved ref",
+            ),
+            (
+                FAKE_VERSION,
+                format!("{FAKE_VERSION}\nGPU driver: none"),
+                "did not contain expected text: ROCm SDK:",
+            ),
+            (
+                FAKE_VERSION,
+                format!("{FAKE_VERSION}\nROCm SDK: none"),
+                "did not contain expected text: GPU driver:",
+            ),
+        ];
+        for (flag, version, expected) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let plan = fake_plan(dir.path());
+            let overrides = BTreeMap::from([
+                ("rocm --version", flag.to_string()),
+                ("rocm -V", flag.to_string()),
+                ("rocm version", version),
+            ]);
+            let (result, _) = execute_with(&plan, &overrides, &mut |_| {});
+            let error = result.expect_err("the version report is incomplete");
+            assert!(format!("{error}").contains(expected), "{error}");
+        }
+    }
+
+    /// A command that provisions a uv cache or a runtime registry fails the
+    /// gate. The paths are written here independently of the production code,
+    /// so a typo in either subpath there leaves the check looking somewhere
+    /// nothing is created, and this test catches it.
+    #[test]
+    fn execute_fails_when_a_command_provisions_state() {
+        for (subpath, expected) in [
+            (&["uv"][..], "first-run smoke uv cache"),
+            (
+                &["runtimes", "registry"][..],
+                "first-run smoke runtime registry",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let plan = fake_plan(dir.path());
+            let parent = if subpath[0] == "uv" {
+                PathBuf::from(&plan.env["ROCM_CLI_CACHE_DIR"])
+            } else {
+                PathBuf::from(&plan.env["ROCM_CLI_DATA_DIR"])
+            };
+            let provisioned = subpath.iter().fold(parent, |path, part| path.join(part));
+            let (result, _) = execute_with(&plan, &BTreeMap::new(), &mut |label| {
+                if label == "rocm examine" {
+                    std::fs::create_dir_all(&provisioned).expect("simulate provisioning");
+                }
+            });
+            let error = result.expect_err("provisioned state is a failure");
+            assert!(format!("{error}").contains(expected), "{error}");
+        }
+    }
+
+    /// The state root is wiped before any command runs, so leftovers from a
+    /// previous run — including a uv cache — neither leak in nor fail the gate.
+    #[test]
+    fn execute_starts_from_an_empty_state_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        let stale_cache = PathBuf::from(&plan.env["ROCM_CLI_CACHE_DIR"]).join("uv");
+        std::fs::create_dir_all(&stale_cache).expect("stale cache");
+        let stale_file = plan.env_root.join("stale");
+        std::fs::write(&stale_file, b"").expect("stale file");
+
+        let mut seen_stale = false;
+        let (result, _) = execute_with(&plan, &BTreeMap::new(), &mut |_| {
+            seen_stale |= stale_file.exists();
+        });
+        result.expect("a previous run's leftovers are cleared, not reported");
+        assert!(!seen_stale, "a command ran before the state root was wiped");
+    }
+
+    #[test]
+    fn execute_refuses_a_partial_build() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        std::fs::remove_file(plan.binaries.path(Bin::Vllm)).expect("remove one binary");
+        let (result, calls) = execute_with(&plan, &BTreeMap::new(), &mut |_| {});
+        assert!(
+            format!("{}", result.expect_err("a binary is missing"))
+                .contains("missing smoke binary vllm"),
+        );
+        assert!(calls.is_empty(), "nothing runs against a partial build");
+    }
+
+    /// Every child runs with the plan's isolated environment and in the
+    /// workspace root. This is what keeps the gate off the developer's real
+    /// state, and running the gate cannot detect its loss — so it is proved here,
+    /// through a real shell. Values are compared as the strings that were set,
+    /// not as resolved paths, which Windows can return in 8.3 short form.
+    #[test]
+    fn child_runner_isolates_every_child_and_runs_it_in_the_workspace_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = fake_plan(dir.path());
+        std::fs::create_dir_all(&plan.root).expect("workspace root");
+        std::fs::write(plan.root.join("marker-file"), b"").expect("marker");
+
+        let (program, flag, script, profile_var) = if cfg!(windows) {
+            (
+                "cmd",
+                "/C",
+                "echo %LOCALAPPDATA%& echo %ROCM_CLI_DATA_DIR%& dir /b marker-file",
+                "LOCALAPPDATA",
+            )
+        } else {
+            (
+                "sh",
+                "-c",
+                r#"echo "$HOME"; echo "$ROCM_CLI_DATA_DIR"; ls marker-file"#,
+                "HOME",
+            )
+        };
+        let output = child_runner(&plan)("probe", Path::new(program), &[flag, script], false)
+            .expect("the probe runs in the workspace root");
+
+        let expected = vec![
+            plan.env[profile_var].to_string_lossy().into_owned(),
+            plan.env["ROCM_CLI_DATA_DIR"].to_string_lossy().into_owned(),
+            "marker-file".to_string(),
+        ];
+        assert_eq!(lines_of(&output), expected);
+        assert!(
+            PathBuf::from(&expected[0]).starts_with(&plan.env_root),
+            "the profile directory the child saw is the throwaway one"
+        );
+    }
+
+    /// The plan builds the profile it then smokes, in the directory it then
+    /// looks in, and skips the build only when asked.
+    #[test]
+    fn the_plan_builds_and_looks_in_the_same_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+
+        let release = Plan::new(&root, Profile::Release, false, Some(Path::new("rel")));
+        assert_eq!(
+            release.build,
+            Some(build_args(Profile::Release, Some(&root.join("rel"))))
+        );
+        assert!(
+            release
+                .build
+                .as_ref()
+                .is_some_and(|args| args.contains(&"--release".to_string()))
+        );
+        assert_eq!(release.binaries.dir, root.join("rel").join("release"));
+
+        let skipped = Plan::new(&root, Profile::Release, true, None);
+        assert_eq!(skipped.build, None);
+
+        assert_eq!(release.env_root, root.join("target").join("smoke-local"));
+        assert!(PathBuf::from(&release.env["ROCM_CLI_DATA_DIR"]).starts_with(&release.env_root));
+    }
+
+    #[test]
+    fn the_build_label_names_what_is_built() {
+        assert_eq!(build_label(Profile::Debug), "build workspace all targets");
+        assert_eq!(build_label(Profile::Release), "build release binaries");
+    }
+
     #[test]
     fn a_free_port_is_outside_the_reserved_range() {
         let port = free_tcp_port().expect("an ephemeral port");
-        assert!(port > 0);
+        assert!(port > 1023, "{port} is in the reserved range");
     }
 
     #[test]

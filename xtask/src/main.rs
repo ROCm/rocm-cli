@@ -243,23 +243,25 @@ pub(crate) enum Command {
         #[arg(long)]
         html_out: PathBuf,
     },
-    /// Run the local no-fallback smoke gate: build the workspace, then drive
-    /// the built `rocm`, `rocmd` and engine binaries against a throwaway state
-    /// root and assert their first-run output.
+    /// Run the local no-fallback smoke gate: build, then drive the built
+    /// `rocm`, `rocmd` and engine binaries against a throwaway state root and
+    /// assert their first-run output.
     ///
-    /// Replaces the former `scripts/smoke_local.py`, preserving its assertions.
-    /// The gate's reason for existing is the last of them: every GPU-required
-    /// path must fail loudly rather than fall back to CPU.
+    /// Replaces the former `scripts/smoke_local.py`, preserving its assertions —
+    /// chiefly that every GPU-required path fails loudly rather than falling back
+    /// to CPU.
     Smoke {
-        /// Build profile whose binaries are smoked.
+        /// Build profile to build and smoke. `debug` builds the whole workspace
+        /// with all targets; `release` builds only the four binaries the gate
+        /// runs.
         #[arg(long, value_enum, default_value_t = smoke::Profile::Debug)]
         profile: smoke::Profile,
         /// Smoke binaries that are already built instead of building first.
         #[arg(long)]
         skip_build: bool,
-        /// Directory holding the profile subdirectory with the built binaries.
-        /// Relative paths resolve against the workspace root. Defaults to the
-        /// active cargo target directory.
+        /// Target directory to build into and to find the binaries in, under its
+        /// profile subdirectory. Relative paths resolve against the workspace
+        /// root. Defaults to the active cargo target directory.
         #[arg(long)]
         target_dir: Option<PathBuf>,
     },
