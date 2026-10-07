@@ -1673,10 +1673,12 @@ jobs:
           } > "/tmp/${page}"
 
           wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
-          # A wiki with no page yet has no git repo to clone; start one.
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
           if ! git clone --depth 1 "$wiki" wiki; then
-            git init -b master wiki
-            git -C wiki remote add origin "$wiki"
+            echo "::error::Cannot clone the wiki. Enable the wiki in repo settings and create its first page once in the web UI; GitHub does not create the wiki git repo until then."
+            exit 1
           fi
           cp "/tmp/${page}" "wiki/${page}"
           cd wiki

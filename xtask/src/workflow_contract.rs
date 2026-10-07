@@ -1723,6 +1723,10 @@ esac
                 && publish.contains(".wiki.git"),
             "the wiki job must download the nightly consolidated artifact and push to the wiki repo"
         );
+        assert!(
+            !publish.contains("git init"),
+            "git init cannot create the remote wiki; a missing wiki must fail with the prerequisite"
+        );
     }
 
     #[test]
