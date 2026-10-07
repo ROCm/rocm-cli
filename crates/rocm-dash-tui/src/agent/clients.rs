@@ -209,6 +209,62 @@ where
     Ok(annotate_reply(reply, &skills))
 }
 
+/// The seam fields every real `AgentClient` backend carries identically:
+/// sampling controls, the bin-injected tool executor, and the approval
+/// channel. Bundled so [`run_agent_request`] stays under clippy's
+/// too-many-arguments limit; each backend builds one from its own fields.
+struct BackendSeam<'a> {
+    params: &'a InferenceParams,
+    executor: Option<&'a SharedRocmToolExecutor>,
+    approval_tx: Option<&'a UnboundedSender<ClientMsg>>,
+}
+
+/// Drive one `complete()` call from a preamble'd `AgentBuilder` through to a
+/// reply string: apply the sampling knobs, register the SAME three tool sets
+/// (telemetry/skill, ROCm read, ROCm mutating) in the SAME order, build the
+/// prompt request with the shared history/turn-limit, and hand off to
+/// [`finish_agent_request`].
+///
+/// The ONE definition of what used to be triplicated across
+/// `RigAgentClient::complete`, `ChatGptAgentClient::complete`, and
+/// `AnthropicAgentClient::complete` (ROCMAI-200). Each backend still builds its
+/// own agent (client/model construction and any backend-specific setup, e.g.
+/// ChatGPT's device-code auth, differ) and still owns its own empty-history
+/// check and backend tag — only the shared middle is here.
+async fn run_agent_request<M, P>(
+    agent: rig::agent::AgentBuilder<M, P>,
+    seam: BackendSeam<'_>,
+    last: &str,
+    prior: &[ChatTurn],
+    snapshot: StateSnapshot,
+    backend: &'static str,
+) -> Result<String, AgentError>
+where
+    M: rig::completion::CompletionModel + 'static,
+    P: rig::agent::PromptHook<M> + 'static,
+{
+    use rig::completion::Prompt;
+
+    let snap = Arc::new(snapshot);
+    let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+
+    let agent = apply_inference_params(agent, seam.params);
+    // Telemetry + skill registry tools (shared registration site).
+    let agent = register_telemetry_tools(agent, &snap, &fired);
+    // Read-only ROCm machine-inspection tools (forward across the seam).
+    let agent = register_rocm_read_tools(agent, seam.executor, &fired);
+    // Mutating ROCm tools (surface approval; never execute in the rig loop).
+    let agent =
+        register_rocm_mutating_tools(agent, seam.executor, seam.approval_tx, &fired).build();
+
+    let req = agent
+        .prompt(last.to_string())
+        .max_turns(MAX_TOOL_TURNS)
+        .with_history(build_messages(prior));
+
+    finish_agent_request(backend, req, &fired).await
+}
+
 /// Live Rig-backed client for an OpenAI-compatible endpoint. The Rig client is
 /// constructed once; the agent + tools are rebuilt per request from the
 /// captured snapshot.
@@ -291,35 +347,17 @@ impl AgentClient for RigAgentClient {
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
-        use rig::completion::Prompt;
 
         let Some((last, prior)) = history.split_last() else {
             return Err(AgentError::Empty);
         };
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
-
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
-            agent,
-            self.executor.as_ref(),
-            self.approval_tx.as_ref(),
-            &fired,
-        )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("rig-openai", req, &fired).await
+        let seam = BackendSeam {
+            params: &self.params,
+            executor: self.executor.as_ref(),
+            approval_tx: self.approval_tx.as_ref(),
+        };
+        run_agent_request(agent, seam, &last.content, prior, snapshot, "rig-openai").await
     }
 }
 
@@ -429,7 +467,6 @@ impl AgentClient for ChatGptAgentClient {
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::agent::AgentBuilder;
-        use rig::completion::Prompt;
         use rig::providers::chatgpt::ResponsesCompletionModel;
 
         let Some((last, prior)) = history.split_last() else {
@@ -448,30 +485,14 @@ impl AgentClient for ChatGptAgentClient {
             .await
             .map_err(|e| AgentError::Auth(e.to_string()))?;
 
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
-            agent,
-            self.executor.as_ref(),
-            self.approval_tx.as_ref(),
-            &fired,
-        )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("chatgpt-oauth", req, &fired).await
+        let seam = BackendSeam {
+            params: &self.params,
+            executor: self.executor.as_ref(),
+            approval_tx: self.approval_tx.as_ref(),
+        };
+        run_agent_request(agent, seam, &last.content, prior, snapshot, "chatgpt-oauth").await
     }
 }
 
@@ -542,38 +563,21 @@ impl AgentClient for AnthropicAgentClient {
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
-        use rig::completion::Prompt;
 
         let Some((last, prior)) = history.split_last() else {
             return Err(AgentError::Empty);
         };
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
         // Identical tool registration to RigAgentClient / ChatGptAgentClient:
         // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
         // capability and approval behavior are uniform across backends.
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
-            agent,
-            self.executor.as_ref(),
-            self.approval_tx.as_ref(),
-            &fired,
-        )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("anthropic", req, &fired).await
+        let seam = BackendSeam {
+            params: &self.params,
+            executor: self.executor.as_ref(),
+            approval_tx: self.approval_tx.as_ref(),
+        };
+        run_agent_request(agent, seam, &last.content, prior, snapshot, "anthropic").await
     }
 }
 
