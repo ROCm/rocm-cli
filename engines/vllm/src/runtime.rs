@@ -95,6 +95,18 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
+/// Whether `runtime`'s recorded ROCm SDK version matches a ROCm 10.x
+/// discover-build row (see [`crate::install::vllm_rocm_discover_build`]).
+/// Exposed as runtime metadata so callers outside `install` — the vLLM
+/// launch path in `process.rs`, specifically — don't need to reach into
+/// `install`'s build-selection table directly for a plain yes/no check.
+pub(crate) fn runtime_is_rocm10_discover_build(runtime: &VllmRuntime) -> bool {
+    runtime
+        .rocm_sdk_version
+        .as_deref()
+        .is_some_and(|version| crate::install::vllm_rocm_discover_build(version).is_some())
+}
+
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     let runtime_scope = if runtime_is_managed(runtime) {
         "rocm-cli records this vLLM command from a managed TheRock runtime; `rocm engines install vllm` can install vLLM into that runtime"
