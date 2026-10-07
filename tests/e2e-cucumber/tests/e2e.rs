@@ -832,6 +832,44 @@ pub fn run_rocm_with_env(
     )
 }
 
+/// Like [`run_rocm`], but without `ROCM_CLI_DATA_DIR`, so the CLI has to work
+/// out its data folder from its own settings file as it does for a user who
+/// never set it.
+///
+/// The home directory is pointed inside the scenario's sandbox as well, so the
+/// default data folder the CLI falls back to (`~/.rocm`) is never the real
+/// one on the runner.
+pub fn run_rocm_without_data_dir_override(
+    world: &E2eWorld,
+    args: &[&str],
+) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let home = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has an isolated root")
+        .path()
+        .join("home");
+    std::fs::create_dir_all(&home).expect("failed to create sandbox home");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.env_remove("ROCM_CLI_DATA_DIR");
+    cmd.env("HOME", &home);
+    cmd.env("USERPROFILE", &home);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
 /// Run `rocm` with the behavioral fixture established by a Given step, then
 /// consume it so it cannot leak into a later action in the same scenario.
 pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {

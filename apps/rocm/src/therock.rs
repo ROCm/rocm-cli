@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
+#[cfg(test)]
+use rocm_core::atomic_write::{publish_temp_file, write_file_atomically_with_publish};
+use rocm_core::atomic_write::{stage_file_for_atomic_publish, write_file_atomically};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
@@ -22,10 +25,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::cmp::Ordering;
-use std::ffi::{OsStr, OsString};
+#[cfg(test)]
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read, Write};
+#[cfg(test)]
+use std::io;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -4631,194 +4637,6 @@ fn windows_child_path(path: &Path) -> String {
     runtime_path_for_windows_child(path)
 }
 
-/// A unique temp path next to `path`, preserving the full file name so a
-/// multi-extension artifact keeps its extensions (`sdk.tar.gz` becomes
-/// `sdk.tar.gz.tmp-<id>`, where `with_extension` would drop `.gz`).
-const ATOMIC_WRITE_TEMP_ATTEMPTS: u32 = 128;
-
-fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
-    let parent = path.parent().context("file path has no parent directory")?;
-    let mut file_name = path
-        .file_name()
-        .context("file path has no file name")?
-        .to_os_string();
-    file_name.push(".tmp-");
-    file_name.push(suffix);
-    Ok(parent.join(file_name))
-}
-
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
-    write_file_atomically_with(
-        path,
-        bytes,
-        |attempt| OsString::from(format!("{temp_id}-{attempt}")),
-        || {},
-    )
-}
-
-fn write_file_atomically_with<S, P>(
-    path: &Path,
-    bytes: &[u8],
-    suffix_for_attempt: S,
-    before_publish: P,
-) -> Result<()>
-where
-    S: FnMut(u32) -> OsString,
-    P: FnOnce(),
-{
-    write_file_atomically_with_publish(
-        path,
-        bytes,
-        suffix_for_attempt,
-        before_publish,
-        publish_temp_file,
-    )
-}
-
-fn write_file_atomically_with_publish<S, P, F>(
-    path: &Path,
-    bytes: &[u8],
-    suffix_for_attempt: S,
-    before_publish: P,
-    publish: F,
-) -> Result<()>
-where
-    S: FnMut(u32) -> OsString,
-    P: FnOnce(),
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    let tmp = stage_file_for_atomic_publish_with(path, bytes, suffix_for_attempt)?;
-    before_publish();
-    publish_staged_file_with(&tmp, path, publish)
-}
-
-fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
-    let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
-    stage_file_for_atomic_publish_with(path, bytes, |attempt| {
-        OsString::from(format!("{temp_id}-{attempt}"))
-    })
-}
-
-fn stage_file_for_atomic_publish_with<S>(
-    path: &Path,
-    bytes: &[u8],
-    mut suffix_for_attempt: S,
-) -> Result<PathBuf>
-where
-    S: FnMut(u32) -> OsString,
-{
-    let parent = path.parent().context("file path has no parent directory")?;
-    fs::create_dir_all(parent)?;
-
-    let mut reserved = None;
-    for attempt in 0..ATOMIC_WRITE_TEMP_ATTEMPTS {
-        let suffix = suffix_for_attempt(attempt);
-        let tmp = temp_sibling_path(path, &suffix)?;
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => {
-                reserved = Some((tmp, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to create {}", tmp.display()));
-            }
-        }
-    }
-    let Some((tmp, mut file)) = reserved else {
-        bail!(
-            "failed to reserve a temporary file next to {} after {} attempts",
-            path.display(),
-            ATOMIC_WRITE_TEMP_ATTEMPTS
-        );
-    };
-
-    if let Err(error) = file.write_all(bytes) {
-        drop(file);
-        let _ = fs::remove_file(&tmp);
-        return Err(disk_space::map_write_error(error, &tmp));
-    }
-    drop(file);
-    Ok(tmp)
-}
-
-#[cfg(test)]
-fn publish_staged_file(tmp: &Path, path: &Path) -> Result<()> {
-    publish_staged_file_with(tmp, path, publish_temp_file)
-}
-
-fn publish_staged_file_with<F>(tmp: &Path, path: &Path, publish: F) -> Result<()>
-where
-    F: FnOnce(&Path, &Path) -> io::Result<()>,
-{
-    publish(tmp, path)
-        .inspect_err(|_| {
-            let _ = fs::remove_file(tmp);
-        })
-        .with_context(|| format!("failed to publish {}", path.display()))
-}
-
-#[cfg(not(windows))]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(tmp, path)
-}
-
-#[cfg(windows)]
-fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
-    if path.try_exists()? {
-        return replace_file_windows(path, tmp);
-    }
-
-    match fs::rename(tmp, path) {
-        Ok(()) => Ok(()),
-        Err(rename_error) => {
-            if path.try_exists()? {
-                replace_file_windows(path, tmp)
-            } else {
-                Err(rename_error)
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement_wide: Vec<u16> = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-
-    // SAFETY: both path buffers are valid, NUL-terminated UTF-16 strings and
-    // remain alive for the duration of the synchronous Windows API call. The
-    // optional backup, exclude, and reserved pointers are intentionally null.
-    let replaced = unsafe {
-        ReplaceFileW(
-            path_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replaced == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 fn extract_tarball(archive_path: &Path, target_dir: &Path) -> Result<()> {
     run_command(
         Path::new("tar"),
@@ -5725,8 +5543,24 @@ fn save_managed_python_manifest(paths: &AppPaths, manifest: &ManagedPythonManife
     .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Record the managed interpreter under `tools.python` in `config.json`.
+///
+/// A `config.json` that exists but cannot be read is an error here, as it is
+/// for [`RocmCliConfig::load`] itself: it is not "no config yet", and saving
+/// over it would replace the user's active runtime, TheRock folder, providers
+/// and preferences with defaults. The callers fail rather than skip the
+/// record: the install cannot finish against that file anyway (activating the
+/// new runtime loads it strictly), and failing here does so before any runtime
+/// is downloaded.
 fn record_managed_python_config(paths: &AppPaths, python: &Path) -> Result<()> {
-    let mut config = RocmCliConfig::load(paths).unwrap_or_default();
+    let mut config = RocmCliConfig::load(paths).with_context(|| {
+        format!(
+            "cannot record the managed Python in {} because that file cannot be read; it was \
+             left unchanged. Repair it, or move it aside to start from default settings, then \
+             run the command again",
+            paths.config_path().display()
+        )
+    })?;
     config.tools.insert(
         "python".to_owned(),
         ManagedToolConfig {
@@ -5872,7 +5706,7 @@ fn ensure_managed_python(
             "Using existing Python {version} at {}.",
             manifest.executable.display()
         ));
-        let _ = record_managed_python_config(paths, &manifest.executable);
+        record_managed_python_config(paths, &manifest.executable)?;
         return Ok(PythonLauncher {
             executable: manifest.executable,
             source: "managed",
@@ -5942,7 +5776,7 @@ fn ensure_managed_python(
         installed_at_unix_ms: unix_time_millis(),
     };
     save_managed_python_manifest(paths, &manifest)?;
-    let _ = record_managed_python_config(paths, &executable);
+    record_managed_python_config(paths, &executable)?;
     progress_line(format!(
         "Python {version} is ready at {}.",
         executable.display()
@@ -6561,6 +6395,10 @@ fn slugify(value: &str) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "therock_persisted_state_props.rs"]
+mod persisted_state_props;
 
 #[cfg(test)]
 mod tests {
@@ -7189,135 +7027,6 @@ mod tests {
         assert!(text.contains("ran out of disk space"), "{text}");
     }
 
-    /// The temp name keeps every extension, so a cleanup sweep over a cache
-    /// directory can still tell what a leftover was going to be.
-    #[test]
-    fn temp_sibling_path_preserves_multi_dot_file_names() {
-        let temp = temp_sibling_path(
-            Path::new("/tmp/cache/sdk.tar.gz"),
-            std::ffi::OsStr::new("test"),
-        )
-        .unwrap();
-        let name = temp.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(name, "sdk.tar.gz.tmp-test");
-        assert_eq!(temp.parent().unwrap(), Path::new("/tmp/cache"));
-    }
-
-    #[test]
-    fn concurrent_atomic_writes_do_not_remove_a_published_destination() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-collision-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("sdk.tar.gz");
-        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
-            .into_iter()
-            .enumerate()
-            .map(|(writer, bytes)| {
-                let destination = destination.clone();
-                let before_publish = std::sync::Arc::clone(&before_publish);
-                std::thread::spawn(move || {
-                    write_file_atomically_with(
-                        &destination,
-                        bytes,
-                        |attempt| {
-                            if attempt == 0 {
-                                std::ffi::OsString::from("same-millisecond")
-                            } else {
-                                std::ffi::OsString::from(format!(
-                                    "same-millisecond-{writer}-{attempt}"
-                                ))
-                            }
-                        },
-                        || {
-                            before_publish.wait();
-                        },
-                    )
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().unwrap().unwrap();
-        }
-        let published = fs::read(&destination).expect("a writer must remain published");
-        let _ = fs::remove_dir_all(&root);
-        assert!(published == b"first" || published == b"second");
-    }
-
-    #[test]
-    fn concurrent_cached_publications_use_distinct_staging_files() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-publish-collision-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.body");
-        let before_publish = std::sync::Arc::new(std::sync::Barrier::new(2));
-
-        let writers: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
-            .into_iter()
-            .map(|bytes| {
-                let destination = destination.clone();
-                let before_publish = std::sync::Arc::clone(&before_publish);
-                std::thread::spawn(move || {
-                    let staged = stage_file_for_atomic_publish(&destination, bytes)?;
-                    before_publish.wait();
-                    publish_staged_file(&staged, &destination)
-                })
-            })
-            .collect();
-
-        for writer in writers {
-            writer.join().unwrap().unwrap();
-        }
-        let published = fs::read(&destination).expect("a cache writer must remain published");
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().contains(".tmp-"))
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert!(published == b"first" || published == b"second");
-        assert!(
-            leftovers.is_empty(),
-            "staged cache files leaked: {leftovers:?}"
-        );
-    }
-
-    #[test]
-    fn failed_cached_publication_preserves_destination_and_cleans_staging_file() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-cache-publish-failure-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("index.body");
-        fs::write(&destination, b"published").unwrap();
-        let staged = stage_file_for_atomic_publish(&destination, b"replacement").unwrap();
-
-        publish_staged_file_with(&staged, &destination, |_, _| {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "simulated cache publication failure",
-            ))
-        })
-        .expect_err("simulated cache publication failure must be returned");
-
-        assert_eq!(fs::read(&destination).unwrap(), b"published");
-        assert!(
-            !staged.exists(),
-            "failed publication leaked its staging file"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
     fn cached_http_entry(generation: &str) -> CachedHttpCacheEntry {
         CachedHttpCacheEntry {
             metadata: CachedHttpMetadata {
@@ -7433,137 +7142,6 @@ mod tests {
 
         assert_eq!(preserved, previous);
         assert_eq!(leftovers, vec![OsString::from("index.json")]);
-    }
-
-    #[test]
-    fn failed_atomic_replace_preserves_destination_and_cleans_temp() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-replace-failure-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let destination = root.join("sdk.tar.gz");
-        fs::write(&destination, b"published").unwrap();
-
-        write_file_atomically_with_publish(
-            &destination,
-            b"replacement",
-            |attempt| OsString::from(format!("replace-failure-{attempt}")),
-            || {},
-            |tmp, path| {
-                assert_eq!(fs::read(tmp).unwrap(), b"replacement");
-                assert_eq!(path, destination);
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "simulated atomic replacement failure",
-                ))
-            },
-        )
-        .expect_err("simulated replacement failure must be returned");
-
-        assert_eq!(fs::read(&destination).unwrap(), b"published");
-        let leftovers: Vec<_> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(leftovers, vec![OsString::from("sdk.tar.gz")]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_temp_name_preserves_non_unicode_file_name_bytes() {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-
-        let file_name = std::ffi::OsString::from_vec(b"sdk-\xff.tar.gz".to_vec());
-        let destination = Path::new("/tmp").join(&file_name);
-        let temp = temp_sibling_path(&destination, std::ffi::OsStr::new("collision")).unwrap();
-
-        let mut expected = file_name.into_vec();
-        expected.extend_from_slice(b".tmp-collision");
-        assert_eq!(temp.file_name().unwrap().as_bytes(), expected);
-    }
-
-    /// Regression: a failed write must not leave a `.tmp-*` scratch file
-    /// behind. The name is unique per attempt, so before this an orphan
-    /// accumulated per retry — and when the failure is a full disk, those
-    /// orphans are exactly what keeps it full.
-    ///
-    /// Provokes the failure by pointing the destination at a non-empty
-    /// directory: the temp file is written, then neither the rename nor the
-    /// replace fallback can succeed. Portable, unlike an out-of-space test.
-    #[test]
-    fn write_file_atomically_cleans_up_temp_when_the_rename_fails() {
-        let root = std::env::temp_dir().join(format!(
-            "rocm-atomic-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let occupied = root.join("sdk.tar.gz");
-        fs::create_dir_all(occupied.join("nested")).unwrap();
-        fs::write(occupied.join("nested").join("keep"), b"x").unwrap();
-
-        write_file_atomically(&occupied, b"payload")
-            .expect_err("renaming onto a non-empty directory should fail");
-
-        let leftovers: Vec<String> = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".tmp-"))
-            .collect();
-        let _ = fs::remove_dir_all(&root);
-        assert!(
-            leftovers.is_empty(),
-            "failed write left temp files behind: {leftovers:?}"
-        );
-    }
-
-    /// Mirrors the `/dev/shm` reproduction from the original report: a genuine
-    /// ENOSPC, not a rename failure standing in for one.
-    ///
-    /// Ignored by default because it fills `/dev/shm`, which is shared with
-    /// anything else on the host, so it is not safe to run concurrently. Run
-    /// with `cargo test -p rocm -- --ignored write_file_atomically_cleans_up`.
-    #[test]
-    #[ignore = "fills /dev/shm to provoke ENOSPC; not safe to run concurrently"]
-    fn write_file_atomically_cleans_up_temp_on_write_failure() {
-        let shm = Path::new("/dev/shm");
-        if !shm.is_dir() {
-            eprintln!("skipping: /dev/shm unavailable");
-            return;
-        }
-        let dir = shm.join(format!("rocm-enospc-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("artifact.tar.gz");
-        // Larger than the tmpfs, so the write is guaranteed to hit ENOSPC.
-        let payload = vec![0u8; 256 * 1024 * 1024];
-
-        let mut failures = Vec::new();
-        for _ in 0..2 {
-            write_file_atomically(&dest, &payload)
-                .expect_err("writing past the end of the filesystem should fail");
-            failures.push(
-                fs::read_dir(&dir)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>(),
-            );
-        }
-        let destination_exists = dest.exists();
-        let _ = fs::remove_dir_all(&dir);
-
-        for leftovers in &failures {
-            assert!(
-                leftovers.is_empty(),
-                "failed write left files behind: {leftovers:?}"
-            );
-        }
-        assert!(
-            !destination_exists,
-            "destination must not exist after failure"
-        );
     }
 
     #[test]
@@ -9195,6 +8773,130 @@ echo Python 3.12.10
         fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
         Ok(path)
+    }
+
+    /// A stand-in `uv` that records every invocation and answers
+    /// `python install` / `python find` without touching the network.
+    /// Planted where `ensure_uv_binary` looks for the managed copy, so no
+    /// download and no environment override is needed.
+    #[cfg(unix)]
+    fn plant_fake_uv(paths: &AppPaths, python: &Path, log: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = managed_tools_dir(&paths.data_dir).join("uv").join("latest");
+        fs::create_dir_all(&dir)?;
+        let uv = dir.join(rocm_core::uv_binary_name());
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\nif [ \"$1 $2\" = \"python find\" ]; then echo '{python}'; fi\nexit 0\n",
+            log = log.display(),
+            python = python.display(),
+        );
+        fs::write(&uv, script)?;
+        fs::set_permissions(&uv, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    /// A config.json `load` rejects, holding settings that must survive.
+    #[cfg(unix)]
+    fn plant_unreadable_config(paths: &AppPaths) -> Result<Vec<u8>> {
+        fs::create_dir_all(&paths.config_dir)?;
+        let damaged = br#"{"active_runtime_key": "kept-runtime", "onboarding_dismissed": "yes"}"#;
+        fs::write(paths.config_path(), damaged)?;
+        assert!(RocmCliConfig::load(paths).is_err());
+        Ok(damaged.to_vec())
+    }
+
+    /// The reuse path: a usable managed Python is already recorded, so
+    /// `ensure_managed_python` returns early. Meeting an unreadable config
+    /// there must fail — not report success with the record silently skipped
+    /// — before anything is installed, and leave the file as it was.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_reuse_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        // Held because the uv and Python versions are read from the
+        // environment, which other tests in this module set.
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-reuse-unreadable");
+        let python_dir = managed_tools_dir(&paths.data_dir).join("python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        save_managed_python_manifest(
+            &paths,
+            &ManagedPythonManifest {
+                executable: python.clone(),
+                version: managed_python_version(python_requirement(SourceLayout::Canonical)),
+                installed_at_unix_ms: 1,
+            },
+        )?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let Err(error) = ensure_managed_python(&paths, python_requirement(SourceLayout::Canonical))
+        else {
+            panic!("an unreadable config must fail the reuse path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            !uv_calls.contains("python install"),
+            "the reuse path installed Python before failing: {uv_calls}"
+        );
+        Ok(())
+    }
+
+    /// The install path: no managed Python yet, so `uv python install` runs
+    /// and the new interpreter is recorded at the end. An unreadable config
+    /// there fails the bootstrap too, with the file left as it was, before
+    /// the caller goes on to download a runtime.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_managed_python_install_path_fails_on_an_unreadable_config() -> Result<()> {
+        if current_platform_wheel_tags().is_err() {
+            return Ok(());
+        }
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let (root, paths) = test_paths("ensure-python-install-unreadable");
+        let python_dir = root.join("uv-python");
+        fs::create_dir_all(&python_dir)?;
+        let python = write_fake_python_with_venv(&python_dir, "python")?;
+        let uv_log = root.join("uv.log");
+        plant_fake_uv(&paths, &python, &uv_log)?;
+        let damaged = plant_unreadable_config(&paths)?;
+
+        // `PythonLauncher` is not `Debug`, so `expect_err` is unavailable.
+        let Err(error) = ensure_managed_python(&paths, python_requirement(SourceLayout::Canonical))
+        else {
+            panic!("an unreadable config must fail the install path");
+        };
+        let uv_calls = fs::read_to_string(&uv_log).unwrap_or_default();
+        let after = fs::read(paths.config_path())?;
+        fs::remove_dir_all(root).ok();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot record the managed Python")
+                && message.contains("it was left unchanged"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(after, damaged, "config.json was rewritten");
+        assert!(
+            uv_calls.contains("python install"),
+            "expected the install path to run: {uv_calls}"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

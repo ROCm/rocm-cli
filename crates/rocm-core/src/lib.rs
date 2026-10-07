@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod atomic_write;
 pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
@@ -34,6 +35,8 @@ pub mod examine;
 pub mod fix;
 pub mod model_readiness;
 pub mod openmpi;
+#[cfg(test)]
+mod persisted_paths_props;
 pub mod proc_lifecycle;
 pub mod report;
 pub mod report_delivery;
@@ -1734,6 +1737,14 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Resolve the config, data and cache dirs from the environment and
+    /// `config.json`.
+    ///
+    /// Errors when no data dir is given through `ROCM_CLI_DATA_DIR` and
+    /// `config.json` exists but cannot be read: the managed root it records
+    /// decides the data dir, so guessing the default would point every command
+    /// at the wrong runtimes. Callers that only want paths for best-effort work
+    /// (logging, diagnosis) already treat an error here as "no paths".
     pub fn discover() -> Result<Self> {
         let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
         let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
@@ -1751,24 +1762,27 @@ impl AppPaths {
                 .context("unable to determine cache directory for rocm-cli")?,
         }
         .normalize_for_host();
-        Ok(Self::discover_from_paths(
+        Self::discover_from_paths(
             paths,
             data_dir_override.is_some(),
             cache_dir_override.is_some(),
-        ))
+        )
     }
 
+    /// Fails when `ROCM_CLI_DATA_DIR` is unset and `config.json` exists but
+    /// cannot be read, because the data dir it records is then unknown; see
+    /// `configured_managed_root_from_config`.
     fn discover_from_paths(
         mut paths: Self,
         data_dir_overridden: bool,
         cache_dir_overridden: bool,
-    ) -> Self {
+    ) -> Result<Self> {
         if !data_dir_overridden
-            && let Some(managed_root) = configured_managed_root_from_config(&paths)
+            && let Some(managed_root) = configured_managed_root_from_config(&paths)?
         {
             paths = paths.with_managed_root(managed_root, cache_dir_overridden);
         }
-        paths.normalize_for_host()
+        Ok(paths.normalize_for_host())
     }
 
     fn normalize_for_host(mut self) -> Self {
@@ -1991,16 +2005,137 @@ impl AppPaths {
     }
 }
 
-fn configured_managed_root_from_config(paths: &AppPaths) -> Option<PathBuf> {
-    let bytes = fs::read(paths.config_path()).ok()?;
-    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-    value
-        .get("setup")?
-        .get("therock_venv")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+/// The managed root recorded in `config.json` (`setup.therock_venv`), if any.
+///
+/// Agrees with [`RocmCliConfig::load`] that a missing file means "nothing
+/// configured" and an unreadable one is an error. Treating an unreadable file
+/// as "nothing configured" would quietly move the data dir — the runtime
+/// registry, the active-runtime marker, service records — back to the default,
+/// so a `--prefix` install's runtimes would vanish and new ones would land in
+/// the wrong place.
+///
+/// Only what this one field needs is checked: a file that is valid JSON but
+/// that `load` rejects for some other field still yields its recorded root.
+/// That keeps the data dir right, and leaves the complaint about the other
+/// field to `load`, which names it.
+fn configured_managed_root_from_config(paths: &AppPaths) -> Result<Option<PathBuf>> {
+    let path = paths.config_path();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable_config_error(&path, &error.to_string(), None)),
+    };
+    let unreadable = |detail: String| {
+        unreadable_config_error(&path, &detail, recorded_root_in_damaged_config(&bytes))
+    };
+    // Whatever `load` accepts, discovery reads the same way.
+    if let Ok(config) = serde_json::from_slice::<RocmCliConfig>(&bytes) {
+        // JSON strings are UTF-8, so the lossy view is exact; trimmed like
+        // the lenient path below.
+        return Ok(config.setup.therock_venv.and_then(|root| {
+            let text = root.to_string_lossy();
+            let text = text.trim();
+            (!text.is_empty()).then(|| PathBuf::from(text))
+        }));
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error| unreadable(format!("not valid JSON: {error}")))?;
+    let Some(top) = value.as_object() else {
+        return Err(unreadable(format!("expected a JSON object, found {value}")));
+    };
+    let setup = match top.get("setup") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Object(setup)) => setup,
+        Some(other) => {
+            return Err(unreadable(format!(
+                "setup should be an object, found {other}"
+            )));
+        }
+    };
+    match setup.get("therock_venv") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text.trim())
+            .filter(|text| !text.is_empty())
+            .map(PathBuf::from)),
+        Some(other) => Err(unreadable(format!(
+            "setup.therock_venv should be a path, found {other}"
+        ))),
+    }
+}
+
+/// The error for a `config.json` that discovery cannot read, with recovery
+/// advice that is true of what each way out actually does:
+///
+/// - repairing the file restores everything;
+/// - `ROCM_CLI_DATA_DIR` only tells discovery where the data is — commands
+///   that read settings still fail on the broken file;
+/// - moving the file aside resets every setting, and puts the data dir back
+///   to the default, so runtimes in a custom folder need `ROCM_CLI_DATA_DIR`.
+///
+/// When the damaged bytes still name the recorded folder, the advice names the
+/// exact `ROCM_CLI_DATA_DIR` value that finds it.
+fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>) -> anyhow::Error {
+    let (data_dir_hint, aside_hint) = match recorded {
+        Some(recorded) => {
+            let data_root = managed_runtime_data_root(&recorded);
+            (
+                format!(
+                    "It still names {} as the ROCm folder: setting ROCM_CLI_DATA_DIR={} lets \
+                     commands find those runtimes meanwhile",
+                    recorded.display(),
+                    data_root.display()
+                ),
+                format!(
+                    "the runtimes under {} then also need ROCM_CLI_DATA_DIR={}",
+                    data_root.display(),
+                    data_root.display()
+                ),
+            )
+        }
+        None => (
+            "Setting ROCM_CLI_DATA_DIR to the folder that holds your runtimes lets commands \
+             find them meanwhile"
+                .to_owned(),
+            "runtimes installed into a custom folder then need ROCM_CLI_DATA_DIR set to that \
+             folder"
+                .to_owned(),
+        ),
+    };
+    anyhow::anyhow!(
+        "cannot tell where rocm-cli keeps its data: {} cannot be read ({detail}). Repair that \
+         file to restore your settings. {data_hint}, but commands that read your settings keep \
+         failing until the file is repaired. Moving the file aside resets every setting to its \
+         default, and {aside_hint}",
+        path.display(),
+        data_hint = data_dir_hint,
+    )
+}
+
+/// Best-effort recovery of `setup.therock_venv` from a `config.json` that does
+/// not parse — typically one cut short. Finds the key and reads the JSON string
+/// after it only if that string is complete; never guesses past a truncation.
+fn recorded_root_in_damaged_config(bytes: &[u8]) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(bytes);
+    let after_key = &text[text.find("\"therock_venv\"")? + "\"therock_venv\"".len()..];
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    for (index, ch) in after_colon.char_indices().skip(1) {
+        match ch {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => {
+                let literal = &after_colon[..=index];
+                let value = serde_json::from_str::<String>(literal).ok()?;
+                let value = value.trim();
+                return (!value.is_empty()).then(|| PathBuf::from(value));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
@@ -6408,16 +6543,29 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Write the config so that [`Self::load`] can always read it back.
+    ///
+    /// Two ways a save used to leave a file `load` rejects, both closed here:
+    ///
+    /// - an interrupted write (a full disk mid-install is the usual one) left
+    ///   a truncated file, because a plain `fs::write` truncates first. The
+    ///   write is now atomic: a reader sees the old file or the new one.
+    /// - a value that serializes but does not deserialize, such as a
+    ///   non-finite `f64` (JSON has no NaN, so it is written as `null`). The
+    ///   bytes are parsed back before anything is written, and the save fails
+    ///   with the existing file left as it was.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        let bytes =
+            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
+        serde_json::from_slice::<Self>(&bytes).with_context(|| {
+            format!(
+                "refusing to write {}: the new contents would not load back",
+                path.display()
+            )
+        })?;
+        atomic_write::write_file_atomically(&path, &bytes)
+            .with_context(|| format!("failed to write {}", path.display()))
     }
 
     pub fn engine_config(&self, engine: &str) -> Option<&EngineUserConfig> {
@@ -6510,6 +6658,29 @@ impl RocmCliConfig {
 
         // Dashboard-specific knobs map into the new sub-config.
         let d = &parsed.daemon;
+        // rocm-dash's own reader (`rocm_dash_core::config`) rejects a tick that
+        // is not a valid `Duration` — NaN, infinite, negative, or too large —
+        // so it already treats this file as unreadable. Migrating it anyway
+        // would also write a non-finite value as JSON `null`, which `load`
+        // rejects. Refuse on the same rule, leaving the TOML untouched.
+        for (key, value) in [
+            ("gpu_tick", d.gpu_tick),
+            ("discovery_tick", d.discovery_tick),
+            ("instance_tick", d.instance_tick),
+        ] {
+            if let Some(secs) = value
+                && let Err(error) = Duration::try_from_secs_f64(secs)
+            {
+                bail!(
+                    "legacy config {} sets daemon.{key} = {secs}, which is not a valid tick \
+                     ({error}); set it to a finite, non-negative number of seconds to migrate the file. \
+                     Migration only runs while {} does not exist, so fix it before any rocm command \
+                     saves settings, or re-enter the dashboard settings by hand afterwards",
+                    legacy.display(),
+                    paths.config_path().display()
+                );
+            }
+        }
         if let Some(v) = &d.listen {
             config.dashboard.daemon.listen = v.clone();
         }
@@ -12701,6 +12872,87 @@ Class Name:                Display
         Ok(())
     }
 
+    /// `save` must replace `config.json`, not rewrite it in place: an in-place
+    /// write truncates first, so a full disk part-way through leaves a file
+    /// `load` rejects. A hard link taken before the save still names the old
+    /// file's contents only if the save published a new file over the path.
+    ///
+    /// Unix-only because it observes replacement through a hard link; the
+    /// Windows publish step (`ReplaceFileW`) is covered by the atomic writer's
+    /// own tests in `apps/rocm/src/therock.rs`.
+    #[cfg(unix)]
+    #[test]
+    fn config_save_replaces_the_file_instead_of_rewriting_it_in_place() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-replaces");
+        let previous = RocmCliConfig {
+            active_runtime_key: Some("previous-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        previous.save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+        let witness = root.join("config-before-save.json");
+        fs::hard_link(paths.config_path(), &witness)?;
+
+        let next = RocmCliConfig {
+            active_runtime_key: Some("next-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        next.save(&paths)?;
+
+        let witnessed = fs::read(&witness)?;
+        let loaded = RocmCliConfig::load(&paths)?;
+        let leftovers: Vec<_> = fs::read_dir(&paths.config_dir)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter(|name| name != "config.json")
+            .collect();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            witnessed, before,
+            "save rewrote the existing config.json in place"
+        );
+        assert_eq!(loaded.active_runtime_key.as_deref(), Some("next-runtime"));
+        assert!(
+            leftovers.is_empty(),
+            "save left files behind: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    /// A value that serializes but cannot be read back (a non-finite tick is
+    /// written as JSON `null`) must fail the save and leave the existing file
+    /// exactly as it was, rather than replace a good config with one `load`
+    /// rejects.
+    #[test]
+    fn config_save_refuses_contents_load_would_reject_and_keeps_the_old_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-refuses");
+        let good = RocmCliConfig {
+            active_runtime_key: Some("kept-runtime".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        good.save(&paths)?;
+        let before = fs::read(paths.config_path())?;
+
+        let mut bad = good;
+        bad.dashboard.daemon.gpu_tick_secs = f64::NAN;
+        let error = bad
+            .save(&paths)
+            .expect_err("a config load would reject must not be saved");
+        let after = fs::read(paths.config_path())?;
+        let reloaded = RocmCliConfig::load(&paths)?;
+        fs::remove_dir_all(root).ok();
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("refusing to write") && rendered.contains("config.json"),
+            "unexpected error: {rendered}"
+        );
+        assert_eq!(after, before, "the existing config.json was changed");
+        assert_eq!(reloaded.active_runtime_key.as_deref(), Some("kept-runtime"));
+        Ok(())
+    }
+
     #[test]
     fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
         let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");
@@ -12749,21 +13001,169 @@ Class Name:                Display
             }))?,
         )?;
 
-        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false);
+        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false)?;
         assert_eq!(discovered.config_dir, paths.config_dir);
         assert_eq!(discovered.data_dir, managed_root);
         assert_eq!(discovered.cache_dir, managed_root.join("cache"));
 
-        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false);
+        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false)?;
         assert_eq!(data_overridden.data_dir, paths.data_dir);
         assert_eq!(data_overridden.cache_dir, paths.cache_dir);
 
-        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true);
+        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true)?;
         assert_eq!(cache_overridden.data_dir, managed_root);
         assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
 
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    /// An unreadable `config.json` stops discovery with a message naming the
+    /// file and the ways out, and discovery leaves the file alone. Each way
+    /// out the message names is then shown to do what the message says it
+    /// does — including what it does *not* fix.
+    #[test]
+    fn app_paths_refuse_to_guess_the_data_dir_from_an_unreadable_config() -> Result<()> {
+        let (root, paths) = temp_app_paths("configured-managed-root-unreadable");
+        let managed_root = root.join("managed");
+        let mut config = RocmCliConfig::default();
+        config.setup.therock_venv = Some(managed_root.clone());
+        config.save(&paths)?;
+        let saved = fs::read(paths.config_path())?;
+        let healthy = AppPaths::discover_from_paths(paths.clone(), false, false)?;
+        assert_eq!(healthy.data_dir, managed_root);
+
+        let recorded = serde_json::to_string(&managed_root)?;
+        let value_at = String::from_utf8_lossy(&saved)
+            .find(&recorded)
+            .expect("the saved config records the managed root");
+        let cut_after_root = saved[..value_at + recorded.len() + 2].to_vec();
+        let cut_inside_root = saved[..value_at + recorded.len() / 2].to_vec();
+        let suggested = format!("ROCM_CLI_DATA_DIR={}", managed_root.display());
+
+        for (label, damaged, names_the_root) in [
+            ("cut short after the folder", cut_after_root, true),
+            ("cut short inside the folder", cut_inside_root, false),
+            ("not an object", br#""x""#.to_vec(), false),
+            ("setup retyped", br#"{"setup": "x"}"#.to_vec(), false),
+            (
+                "therock_venv retyped",
+                br#"{"setup": {"therock_venv": 7}}"#.to_vec(),
+                false,
+            ),
+        ] {
+            fs::write(paths.config_path(), &damaged)?;
+            let error = AppPaths::discover_from_paths(paths.clone(), false, false)
+                .expect_err("discovery must not guess the data dir");
+            let message = format!("{error:#}");
+            for needle in [
+                "cannot tell where rocm-cli keeps its data",
+                "config.json",
+                "Repair that file",
+                "commands that read your settings keep failing",
+                "Moving the file aside resets every setting",
+            ] {
+                assert!(
+                    message.contains(needle),
+                    "{label}: missing {needle:?} in: {message}"
+                );
+            }
+            assert_eq!(
+                message.contains(&suggested),
+                names_the_root,
+                "{label}: whether the recorded folder is named: {message}"
+            );
+            assert_eq!(
+                fs::read(paths.config_path())?,
+                damaged,
+                "{label}: discovery changed config.json"
+            );
+
+            // ROCM_CLI_DATA_DIR set to the suggested folder finds the same data
+            // dir the healthy file did...
+            let overridden = AppPaths::discover_from_paths(
+                AppPaths {
+                    data_dir: managed_root.clone(),
+                    ..paths.clone()
+                },
+                true,
+                false,
+            )?;
+            assert_eq!(overridden.data_dir, healthy.data_dir, "{label}");
+            // ...but does not make the settings readable, as the message says.
+            assert!(RocmCliConfig::load(&overridden).is_err(), "{label}");
+        }
+
+        // A config.json that exists but cannot be read at all (here, a
+        // directory: a non-NotFound read error on every platform, no root or
+        // chmod needed) is an error too, not "nothing configured".
+        fs::remove_file(paths.config_path())?;
+        fs::create_dir(paths.config_path())?;
+        let error = AppPaths::discover_from_paths(paths.clone(), false, false)
+            .expect_err("an unreadable config.json must not read as absent");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("cannot tell where rocm-cli keeps its data")
+                && message.contains("Repair that file"),
+            "unexpected error: {message}"
+        );
+        assert!(paths.config_path().is_dir(), "discovery touched the path");
+        fs::remove_dir(paths.config_path())?;
+
+        // Way out: repair the file.
+        fs::write(paths.config_path(), &saved)?;
+        let repaired = AppPaths::discover_from_paths(paths.clone(), false, false)?;
+        assert_eq!(repaired.data_dir, managed_root);
+
+        // Way out: move it aside. Settings are back to defaults, and the data
+        // dir is back to the default too — which is why the message says a
+        // custom folder then needs ROCM_CLI_DATA_DIR.
+        fs::rename(paths.config_path(), root.join("config.json.bak"))?;
+        let moved_aside = AppPaths::discover_from_paths(paths.clone(), false, false)?;
+        assert_eq!(moved_aside.data_dir, paths.data_dir);
+        assert_ne!(moved_aside.data_dir, managed_root);
+        assert!(
+            RocmCliConfig::load(&moved_aside)?
+                .setup
+                .therock_venv
+                .is_none()
+        );
+
+        // A file that is valid JSON but that `load` rejects for another field
+        // still names the right data dir; `load` reports that field itself.
+        let mut value = serde_json::from_slice::<serde_json::Value>(&saved)?;
+        value["dashboard"]["tui"]["chat_top_p"] = serde_json::json!(1.5);
+        fs::write(paths.config_path(), serde_json::to_vec(&value)?)?;
+        assert!(RocmCliConfig::load(&paths).is_err());
+        let other_field_bad = AppPaths::discover_from_paths(paths, false, false)?;
+        assert_eq!(other_field_bad.data_dir, managed_root);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    /// The recorded folder is recovered from a damaged file only when its
+    /// string is complete: a value cut off part-way is never guessed at.
+    #[test]
+    fn recorded_root_is_recovered_only_from_a_complete_value() {
+        let escaped = br#"{"setup": {"therock_venv": "C:\\ROCm \"x\"\\venv", "completed"#;
+        assert_eq!(
+            recorded_root_in_damaged_config(escaped),
+            Some(PathBuf::from(r#"C:\ROCm "x"\venv"#))
+        );
+        for damaged in [
+            &br#"{"setup": {"therock_venv": "/opt/ro"#[..],
+            br#"{"setup": {"therock_venv": 7"#,
+            br#"{"setup": {"therock_venv": "  ", "#,
+            br#"{"setup": {"#,
+        ] {
+            assert_eq!(
+                recorded_root_in_damaged_config(damaged),
+                None,
+                "{}",
+                String::from_utf8_lossy(damaged)
+            );
+        }
     }
 
     #[test]
@@ -13195,6 +13595,89 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(again, None);
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A tick that is not a valid duration is refused, naming the key, and the
+    /// refusal writes nothing: no `config.json` appears and the TOML is
+    /// unchanged, so the startup notice "skipped legacy dashboard config
+    /// migration" is true and fixing the value lets the next run migrate —
+    /// provided nothing has created `config.json` meanwhile, which the refusal
+    /// itself warns about.
+    #[test]
+    fn migrate_legacy_dashboard_toml_refuses_an_invalid_tick_and_writes_nothing() -> Result<()> {
+        for (value, rendered) in [
+            ("nan", "NaN"),
+            ("inf", "inf"),
+            ("-inf", "-inf"),
+            ("-1.0", "-1"),
+        ] {
+            let (root, paths) = temp_app_paths("migrate-dash-bad-tick");
+            fs::create_dir_all(&root)?;
+            let legacy = root.join("legacy-config.toml");
+            let text = format!(
+                "default_engine = \"vllm\"\n[daemon]\ndiscovery_tick = {value}\n[tui]\ntheme = \"nord\"\n"
+            );
+            fs::write(&legacy, &text)?;
+
+            let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+                .expect_err("an invalid tick must not migrate");
+            let config_written = paths.config_path().exists();
+            let legacy_after = fs::read_to_string(&legacy)?;
+            let _ = fs::remove_dir_all(&root);
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("daemon.discovery_tick = {rendered}")),
+                "{value}: unexpected error: {message}"
+            );
+            assert!(!config_written, "{value}: config.json was written");
+            assert_eq!(legacy_after, text, "{value}: the legacy TOML was modified");
+        }
+
+        // The refusal warns that the window closes once config.json exists —
+        // and it does: after any save, the still-broken legacy file is skipped
+        // without a word, and fixing it later no longer migrates it either.
+        let (root, paths) = temp_app_paths("migrate-dash-window-closes");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = nan\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let error = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)
+            .expect_err("an invalid tick must not migrate");
+        let message = format!("{error:#}");
+        RocmCliConfig::default().save(&paths)?;
+        let while_broken = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        fs::write(
+            &legacy,
+            "[daemon]\ngpu_tick = 1.0\n[tui]\ntheme = \"nord\"\n",
+        )?;
+        let once_fixed = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let theme = RocmCliConfig::load(&paths)?.dashboard.tui.theme;
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            message.contains(&format!(
+                "Migration only runs while {} does not exist",
+                paths.config_path().display()
+            )) && message.contains("re-enter the dashboard settings by hand"),
+            "unexpected error: {message}"
+        );
+        assert_eq!(while_broken, None);
+        assert_eq!(once_fixed, None);
+        assert_ne!(theme, "nord", "the legacy theme was migrated after all");
+
+        // Zero is a valid duration for rocm-dash too, so it still migrates.
+        let (root, paths) = temp_app_paths("migrate-dash-zero-tick");
+        fs::create_dir_all(&root)?;
+        let legacy = root.join("legacy-config.toml");
+        fs::write(&legacy, "[daemon]\ngpu_tick = 0\n")?;
+        let migrated = RocmCliConfig::migrate_legacy_dashboard_toml_from(&paths, &legacy)?;
+        let loaded = RocmCliConfig::load(&paths);
+        let _ = fs::remove_dir_all(&root);
+        assert!(migrated.is_some());
+        assert!(loaded.is_ok());
         Ok(())
     }
 

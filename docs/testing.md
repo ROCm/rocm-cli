@@ -125,6 +125,40 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+### Property tests for persisted state
+
+State `rocm` keeps across commands and upgrades — `config.json`, its
+migration from a legacy rocm-dash `config.toml`, the runtime registry, the
+startup update-check cache, the active-runtime marker, and how the data
+directory is found — has `proptest` properties. They run in the ordinary
+`cargo test`; to run only them:
+
+```bash
+cargo test -p rocm-core --test persisted_config_props
+cargo test -p rocm-core --lib persisted_paths_props
+cargo test -p rocm --bin rocm persisted_state_props
+```
+
+A property that fails prints its shrunk counterexample. Each run also prints a
+`reach:` line counting how many generated cases hit the interesting input
+(non-finite ticks, unreadable files, and so on); a property whose reach is zero
+passed without testing anything.
+
+Known gaps are kept as `#[ignore]`d reproducers, each with the defect in its
+ignore reason, so they stay runnable until fixed:
+
+```bash
+cargo test -p rocm-core --test persisted_config_props -- --ignored
+cargo test -p rocm --bin rocm persisted_state_props -- --ignored
+```
+
+When a fix lands, remove the `#[ignore]` in the same change, so the reproducer
+becomes its regression test.
+
+The atomic writer's out-of-space test is ignored for a different reason: it
+fills `/dev/shm`, which other processes share. Run it alone with
+`cargo test -p rocm-core --lib -- --ignored atomic_write`.
+
 ## Coverage floors
 
 Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
