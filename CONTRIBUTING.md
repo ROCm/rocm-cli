@@ -79,7 +79,7 @@ Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforce
 
 `docs/architecture.md`'s path citations are enforced by `cargo xtask check-architecture-doc` (`xtask/src/architecture_doc.rs`) — it fails CI if a citation isn't found where it's cited, naming the expected location per citation (exactly where depends on its shape: a slash path, a bare filename, or a bare directory name; see `citation_exists`'s doc comment in that file for the full rule) — though it doesn't check the accuracy of the surrounding prose.
 
-Every markdown link and `#anchor` fragment in the repo is checked by the `docs-links` CI job (`lychee.toml`), which fails if one doesn't resolve.
+Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead — is checked by the `docs-links` CI job (`lychee.toml`); it runs offline only, so it doesn't catch broken external `https://` links (see `lychee.toml` for the current exclusions).
 
 ### Test commands
 
