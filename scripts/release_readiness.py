@@ -724,6 +724,44 @@ def _assert_verification_wiring(expected_key: Path) -> None:
         )
 
 
+def _assert_main_consults_the_gate(dist: Path) -> None:
+    """`main` must route its verify decision through `resolve_verification`.
+
+    Pinning the helpers was not enough on its own. `--self-test` returns before
+    `main` reaches the gate, so swapping that call for constants
+    (`verify, public_key, key_source = False, None, None`) left every check
+    green while restoring the original fail-open: `--require-signatures`
+    accepting a `.sig` signed by the wrong key. So drive `main` itself. With
+    signatures required and no key resolvable, it must exit 1; the dist is
+    otherwise valid, so a `main` that skipped the gate would accept it on the
+    presence check alone and exit 0.
+    """
+
+    def attempt() -> None:
+        saved_argv = sys.argv
+        sys.argv = ["release_readiness.py", "--dist", str(dist), "--require-signatures"]
+        try:
+            main()
+        finally:
+            sys.argv = saved_argv
+
+    try:
+        attempt()
+    except SystemExit as exit_error:
+        if exit_error.code == 1:
+            return
+        # argparse exits 2; treat anything that is not the readiness failure as
+        # a broken test rather than a passing gate.
+        raise ReadinessError(
+            f"main exited {exit_error.code!r} rather than failing the readiness "
+            "check; the gate self-test is no longer exercising what it claims"
+        ) from exit_error
+    raise ReadinessError(
+        "main accepted a signature-required run with no key configured; its "
+        "verify decision no longer goes through resolve_verification"
+    )
+
+
 def run_self_test(root: Path) -> None:
     if root.exists():
         shutil.rmtree(root)
@@ -1112,6 +1150,26 @@ def run_self_test(root: Path) -> None:
             lambda: _assert_verification_wiring(key_path),
         )
         print("release readiness self-test: verify wiring ok")
+
+        # ...and `main`'s use of that wiring, which none of the above reaches.
+        # A dist that is valid on every other axis, so the only thing that can
+        # reject it is the gate.
+        gate_dist = root / "gate-dist"
+        gate_dist.mkdir()
+        gate_archive = gate_dist / "rocm-cli-test-linux-amd64.tar.gz"
+        create_test_tar(gate_archive, "rocm-cli-test-linux-amd64")
+        write_sha(gate_archive)
+        Path(f"{gate_archive}.sig").write_bytes(b"detached signature placeholder\n")
+        run_with_env(
+            {
+                SIGNING_PUBLIC_KEY_PATH_ENV: None,
+                SIGNING_PUBLIC_KEY_ENV: None,
+                "ROCM_CLI_REQUIRE_SIGNATURE": None,
+                "ROCM_CLI_REQUIRE_PRODUCTION_TRUST": None,
+            },
+            lambda: _assert_main_consults_the_gate(gate_dist),
+        )
+        print("release readiness self-test: main consults the verify gate ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
