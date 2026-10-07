@@ -19112,6 +19112,16 @@ fn restart_internal_managed_service(
         &record.engine_state_path,
         Some(&record.log_path),
     )?;
+    // E2E-only, mirroring the launch path: swap in arguments the child rejects
+    // immediately, so the restart below observes a real engine that really died
+    // during startup. The restart path needs its own swap because it builds its
+    // own argument vector from the record rather than reusing the launch one.
+    #[cfg(feature = "e2e-test-hooks")]
+    let serve_args = if scripted_managed_engine_startup_failure() {
+        managed_engine_startup_failure_args()
+    } else {
+        serve_args
+    };
     let engine_envs_root = env_root_for_service(
         paths,
         &record.engine,
