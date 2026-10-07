@@ -11,7 +11,7 @@ use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint, GpuSelection, LaunchRequest,
     LaunchResponse, ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +22,6 @@ use crate::runtime::{VllmRuntime, runtime_has_discover_build};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
-pub(crate) const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -117,7 +116,8 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     };
     let child = spawn_vllm_server(&serve_request, &runtime, Some(&log_path))?;
     let pid = child.id();
-    crate::state::write_running_state(&serve_request, &runtime, pid)?;
+    let payload = running_state_payload(&serve_request, &runtime, pid);
+    crate::state::write_state(&serve_request.state_path, &payload)?;
     Ok(LaunchResponse {
         service_id: request.service_id,
         pid,
@@ -142,11 +142,71 @@ pub(crate) struct ServeHttpRequest {
     pub engine_recipe: Option<EngineRecipeHint>,
 }
 
+/// Assembles the JSON payload persisted as a running service's state.
+///
+/// Built here rather than in `state.rs` because every field but `pid` comes
+/// from data this module already owns (the launch request, the resolved
+/// runtime, and process-launch helpers like [`engine_recipe_launch_args`]/
+/// [`runtime_bin_paths`]/[`therock_library_path_entries`]). `state.rs` only
+/// ever receives the finished [`Value`] to serialize — it never reaches back
+/// into this module to compute any of it.
+fn running_state_payload(request: &ServeHttpRequest, runtime: &VllmRuntime, pid: u32) -> Value {
+    // Kernel start-time of the launcher PID, captured while it is alive. Paired
+    // with `pid`, it identifies this exact process across PID recycling so a
+    // later stop never signals a reused PID.
+    let start_ticks = rocm_core::process_start_ticks(pid);
+    json!({
+        "service_id": request.service_id,
+        "engine": crate::ENGINE_NAME,
+        "status": "running",
+        "pid": pid,
+        "model_ref": request.model_ref,
+        "host": request.host,
+        "port": request.port,
+        "endpoint_url": crate::state::endpoint_url(&request.host, request.port),
+        "device_policy": "gpu_required",
+        "runtime_id": runtime.runtime_id,
+        "requested_runtime_id": request.runtime_id,
+        "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
+        "runtime_executable": runtime.command,
+        "server_pid": pid,
+        "engine_recipe": request.engine_recipe,
+        "engine_recipe_required_flags": engine_recipe_launch_args(request.engine_recipe.as_ref()),
+        "therock_runtime_env": therock_runtime_env_payload(runtime),
+        "started_at_unix_ms": crate::state::current_unix_millis(),
+        "start_ticks": start_ticks,
+        // `server_pid` is the same process, so the same token. `rocm-core`
+        // pairs `server_pid` with this key, so it must be written too —
+        // without it the server PID is adopted with no token at all.
+        "server_start_ticks": start_ticks
+    })
+}
+
+fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
+    let root = runtime.sdk_root.as_ref()?;
+    Some(json!({
+        "runtime_id": runtime.runtime_id,
+        "env_id": runtime.env_id,
+        "root": root.display().to_string(),
+        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
+        "bin_paths": runtime_bin_paths(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "library_paths": therock_library_path_entries(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "source": runtime.source,
+    }))
+}
+
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = crate::runtime::resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
-    crate::state::write_running_state(&request, &runtime, child.id())?;
+    let payload = running_state_payload(&request, &runtime, child.id());
+    crate::state::write_state(&request.state_path, &payload)?;
 
     // Wait for the server to become ready, with comprehensive error logging
     if let Err(e) = wait_for_vllm_ready(
@@ -880,7 +940,7 @@ fn wait_for_vllm_ready(
 /// Reads the last N lines from a log file and returns them as a formatted string.
 /// Delegates the seek/tail logic to `rocm_core::tail_lines`.
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
-    let lines = rocm_core::tail_lines(log_path, limit, MAX_TAIL_READ)?;
+    let lines = rocm_core::tail_lines(log_path, limit, crate::state::MAX_TAIL_READ)?;
     if lines.is_empty() {
         return Ok(String::new());
     }
@@ -1495,6 +1555,161 @@ mod tests {
         .expect_err("unsupported recipe contract should fail");
 
         assert!(error.to_string().contains("unsupported"));
+    }
+    #[test]
+    fn running_state_payload_records_managed_therock_env_for_gpu_verification() -> Result<()> {
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11439,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
+            env_id: None,
+            state_path: PathBuf::new(),
+            log_path: None,
+            engine_recipe: None,
+        };
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from(if cfg!(windows) {
+                r"C:\venv\Scripts\vllm.exe"
+            } else {
+                "/home/user/.venv/bin/vllm"
+            }),
+            python_executable: None,
+            version: Some("test".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(PathBuf::from(if cfg!(windows) {
+                r"C:\rocm-sdk"
+            } else {
+                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
+            })),
+            sdk_bin: Some(PathBuf::from(if cfg!(windows) {
+                r"C:\rocm-sdk\bin"
+            } else {
+                "/home/user/.venv/lib/python/site-packages/rocm_sdk/bin"
+            })),
+            sdk_bin_paths: vec![PathBuf::from(if cfg!(windows) {
+                r"C:\rocm-sdk\extra-bin"
+            } else {
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
+            })],
+            sdk_library_paths: vec![PathBuf::from(if cfg!(windows) {
+                r"C:\rocm-sdk\extra-lib"
+            } else {
+                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
+            })],
+            rocm_sdk_version: None,
+        };
+
+        // A live PID, so the identity tokens below are real values on Linux.
+        let pid = std::process::id();
+        let state = running_state_payload(&request, &runtime, pid);
+
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(pid))
+        );
+        assert_eq!(
+            state.get("runtime_id").and_then(Value::as_str),
+            Some("therock-release:gfx120X-all")
+        );
+        assert_eq!(
+            state.get("requested_runtime_id").and_then(Value::as_str),
+            Some("runtime-key-gfx120x")
+        );
+        let runtime_env = state
+            .get("therock_runtime_env")
+            .expect("runtime env should be recorded");
+        assert_eq!(
+            runtime_env.get("runtime_id").and_then(Value::as_str),
+            Some("therock-release:gfx120X-all")
+        );
+        assert!(
+            runtime_env
+                .get("root")
+                .and_then(Value::as_str)
+                .is_some_and(|root| root.contains("rocm"))
+        );
+        assert!(
+            runtime_env
+                .get("bin_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| paths.len() >= 2)
+        );
+        assert!(
+            runtime_env
+                .get("library_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| !paths.is_empty())
+        );
+        // The identity token must be recorded so a later stop can verify it —
+        // under both PID keys, since `server_pid` is the same process and is
+        // the one `rocm-core` adopts, together with `server_start_ticks`.
+        assert!(state.get("start_ticks").is_some());
+        assert!(state.get("server_start_ticks").is_some());
+        assert_eq!(state.get("server_start_ticks"), state.get("start_ticks"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            state
+                .get("server_start_ticks")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a live PID has a token on Linux"
+        );
+        Ok(())
+    }
+    #[test]
+    fn running_state_payload_round_trips_through_disk_via_state_write_and_read() -> Result<()> {
+        // Characterizes the seam with state.rs: this module assembles the
+        // payload and hands the finished `Value` to `crate::state::write_state`,
+        // which never reaches back into this module to compute any of it.
+        let state_path = std::env::temp_dir().join(format!(
+            "rocm-vllm-state-{}-{}.json",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11439,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
+            env_id: None,
+            state_path: state_path.clone(),
+            log_path: None,
+            engine_recipe: None,
+        };
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: Some("test".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        let payload = running_state_payload(&request, &runtime, 12345);
+        crate::state::write_state(&state_path, &payload)?;
+        let state = crate::state::read_service_state(&state_path)?;
+        fs::remove_file(&state_path).ok();
+
+        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("service_id").and_then(Value::as_str),
+            Some("svc-vllm")
+        );
+        Ok(())
     }
     #[test]
     fn vllm_ready_timeout_uses_default_without_override() {
