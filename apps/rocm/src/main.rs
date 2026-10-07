@@ -4256,9 +4256,13 @@ fn print_managed_launch_plain(report: &ManagedLaunchReport, endpoint_api_key: Op
     }
     println!("  endpoint: {}", report.endpoint_url);
     if let Some(key) = endpoint_api_key {
-        // codeql[rust/cleartext-logging]: intentional one-time display of a freshly
-        // generated API key to the terminal so the user can copy it — the designed
-        // delivery channel documented on `render_endpoint_client_config`, not a log.
+        // Intentional one-time display of a freshly generated API key to the
+        // terminal so the user can copy it — the designed delivery channel
+        // documented on `render_endpoint_client_config`, not a log. The tag below
+        // is currently inert (Rust's CodeQL pack has no AlertSuppression.ql yet —
+        // github/codeql#21637) but will start working once that lands, since the
+        // tag must be the single line immediately before the flagged code.
+        // codeql[rust/cleartext-logging]
         print!(
             "{}",
             render_endpoint_client_config(&report.endpoint_url, key)
@@ -4541,9 +4545,12 @@ fn run_attached_service(
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
     if let Some(key) = endpoint_api_key {
-        // codeql[rust/cleartext-logging]: intentional one-time display of a freshly
-        // generated API key to the terminal so the user can copy it — the designed
-        // delivery channel documented on `render_endpoint_client_config`, not a log.
+        // Intentional one-time display of a freshly generated API key to the
+        // terminal so the user can copy it — the designed delivery channel
+        // documented on `render_endpoint_client_config`, not a log. See the
+        // rationale on the sibling call site in `print_managed_launch_plain`
+        // for why the tag below is currently inert.
+        // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }
     println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
@@ -28309,9 +28316,9 @@ install therock";
     #[test]
     fn endpoint_client_config_shows_key_once_with_bearer_guidance() {
         let rendered = render_endpoint_client_config("http://0.0.0.0:11435/v1", "secret-123");
-        // codeql[rust/cleartext-logging]: dummy literal exercising the intentional
-        // one-time key display documented on `render_endpoint_client_config`; not a
-        // real credential or a log write.
+        // Dummy literal exercising the intentional one-time key display documented
+        // on `render_endpoint_client_config`; not a real credential or a log write.
+        // codeql[rust/cleartext-logging]
         assert!(rendered.contains("secret-123"), "{rendered}");
         // codeql[rust/cleartext-logging]: see rationale above.
         assert!(rendered.contains("Authorization: Bearer"), "{rendered}");
