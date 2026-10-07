@@ -9,7 +9,8 @@
 //! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
 //! remains in the crate root and is reached via `use crate::EnginesCommand`;
 //! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
-//! also called from `serve_cmd.rs`; the other env-root/runtime helpers here
+//! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
+//! only caller is `serve_cmd.rs`; the remaining env-root/runtime helpers here
 //! are used only from other root-level commands in `main.rs` — all stay
 //! `pub(crate)` rather than private either way.
 

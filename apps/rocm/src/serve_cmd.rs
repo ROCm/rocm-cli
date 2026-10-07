@@ -6,8 +6,9 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
-//! re-imported via `use crate::serve_cmd::{serve, ServeArgs};`). `Cli` is not
-//! referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
+//! re-imported via `use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};`
+//! — `select_serve_engine` rides along for `assess_model_for_host`, not dispatch).
+//! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
 //! Several `serve()`-only helpers stay in `main.rs` and are re-imported here
