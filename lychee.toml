@@ -1,6 +1,9 @@
 # Config for the `docs-links` CI job (.github/workflows/ci.yml), which checks
-# every markdown link in the repo resolves. Replaces xtask/src/architecture_doc.rs's
-# hand-rolled path-citation checker — see issue #578 for why.
+# every markdown link in the repo resolves. First step toward replacing
+# xtask/src/architecture_doc.rs's hand-rolled path-citation checker: that
+# checker stays in place, running alongside this gate, until a follow-up PR
+# rewrites docs/architecture.md's citations as markdown links and removes it
+# — see issue #578 for why.
 
 # Only check local file/anchor links, no network requests. Keeps this gate
 # immune to external-host flakiness (rate limits, transient DNS) — see the
