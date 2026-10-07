@@ -43,6 +43,7 @@ tar = "0.4"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -57,3 +58,12 @@ apple-native-keyring-store = { version = "1.0", features = ["keychain"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-crypto-rust"] }
+
+[dev-dependencies]
+# Property-based tests for the byte-size formatter behind the `download:
+# approved up to …` line. "A size is printed in its own unit" has to hold at
+# every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0
+# is exactly the input a hand-picked example misses. Same version and features
+# as rocm-core's, so no new crate or feature enters the lockfile.
+# Test-only, so it adds nothing to any shipped binary.
+proptest = { version = "1", default-features = false, features = ["std"] }

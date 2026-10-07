@@ -101,6 +101,31 @@ definitions when no existing scenario already covers it:
 - purely internal changes (refactors, CI plumbing, docs) do not need one; say why in the
   PR text rather than leaving it unexplained
 
+**A message about the CLI's own behavior is asserted together with the behavior.** When a
+change adds or edits a line the CLI prints about what it just did, what it will do next,
+or what the user must do to recover, the covering test asserts the message *and* the
+resulting state in the same test. Three shapes need this:
+
+- claims of an outcome ("this becomes the active default runtime", "nothing was saved")
+- remediation advice naming a command — the named command must exist, accept those flags,
+  and actually clear the condition that printed it
+- promises that something will *not* happen ("no driver commands will be executed",
+  "never stops servers automatically"), which no happy-path test exercises
+
+A test that only pins the wording certifies the string, not the truth of it, and a pin
+over a false claim holds the claim in place. Where the text genuinely has to be pinned on
+its own, the assertion carries a comment naming the test that proves the behavior — see
+`setup_reset_cli_output_is_plain_and_persists_first_time_prompt` in `apps/rocm/src/main.rs`,
+which pins the onboarding line and points at
+`startup_focus_gate_only_opens_onboarding_for_explicit_setup_focus` for the behavior
+itself.
+
+The message and the code it describes are usually in different functions and often
+different files, so nothing links them by construction. Where the printed line can be
+derived from the same value the branch is taken on — as `preapproved_install_line` in
+`apps/rocm/src/therock.rs` derives it from the approval source — prefer that: a message
+computed from the decision cannot disagree with it.
+
 ## 4) Live State Verification Before Any External Claim
 
 Before each stateful decision or public status update:
@@ -110,7 +135,7 @@ Before each stateful decision or public status update:
 - verify review context against current PR head commit
 
 Do not rely on stale memory, partial CI views, or prior snapshots.
-Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan.
+Subagent reports are hypotheses until directly re-verified. When re-verifying, match the verification scope to the claim: if subagent claimed "tests pass", re-run the same test suite; if it claimed "no conflicts", do the rebase locally; if it claimed "leak-free", re-run the scan. A passing unit test asserting exact string content only proves the string is unchanged, not that the claim is true — re-derive the claim against the actual code path rather than accepting the test as proof.
 
 After rebase/cherry-pick/merge, grep for conflict markers:
 
@@ -143,6 +168,18 @@ Understand existing patterns first:
 Fix at the correct layer (root cause), not by shrinking symptom visibility.
 If approach choice is ambiguous, present alternatives and recommend one.
 
+Keep docs and behavior claims in sync while editing:
+
+- when a command's flags, defaults, arguments, or observable behavior
+  change, update README.md, its --help/doc comment, docs/testing.md, and
+  docs/manual-testing.md in the same change — do not leave user-facing docs
+  for a follow-up
+- the same behavior claim (e.g. "does X automatically") often repeats across
+  README.md, --help doc comments, printed CLI output, and docs/*.md; each
+  drifts independently, so grep for the claim's wording across all of them,
+  not just the surface you're editing, and check each against the actual
+  code path
+
 ## 6) rocm-cli Architecture Guardrails
 
 Current workspace members:
@@ -151,12 +188,23 @@ Current workspace members:
 - shared crates: `crates/rocm-core`, `crates/rocm-engine-protocol`
 - engine crates: `engines/lemonade`, `engines/vllm`
 
+Shared UI components — reuse rather than hand-rolling new ones:
+`apps/rocm/src/cli_progress.rs`'s `Spinner` for a caller-driven indicator that
+only advances when the caller's own loop ticks it (e.g. `serve`'s
+HTTP-polling wait loop); that same file's `AnimatedSpinner` for progress that
+must keep animating between caller updates, which can go quiet for long
+stretches (e.g. a download or the ComfyUI/SDK extraction spinner); and
+`crates/rocm-dash-tui/src/ui/approval.rs` for approval-state prompts.
+
 Guardrails:
 
+- new subsystems/subcommands: default their domain implementation to its own file from day one (full domain extraction, e.g. `therock.rs`/`comfyui.rs` — private `mod` in `apps/rocm`, accessed via qualified paths; the clap command enum and its dispatch function usually stay in `main.rs`, though not always — see `docs/architecture.md`'s `bootstrap.rs` note), not growth inside `main.rs`/`lib.rs` awaiting a future extraction pass; see `docs/architecture.md` for the module map and the mechanical-relocation alternative used for dispatch-adjacent clusters
 - `crates/rocm-engine-protocol` is a contract surface; verify all impacted engines after protocol changes
+- first-party crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`); a new first-party dependency edge failing that check means the edge needs review, not a bypass
 - preserve strict GPU-required behavior; do not introduce silent CPU fallback
 - respect platform gates (for example, native Windows handling for vLLM)
 - pin third-party GitHub Actions to a full commit SHA with a trailing `# vX.Y.Z` comment, never a moving tag (`@v2`, `@main`); a retagged or compromised action otherwise enters CI silently. Bump the SHA and comment together when upgrading
+- before hand-rolling CLI output (completion reports, progress/spinner indicators, confirmation/approval prompts), check for and reuse the existing shared components (e.g. `apps/rocm/src/cli_report.rs::ActionReport`) instead of duplicating the pattern inline; extend the shared component if it doesn't yet cover the needed case
 - supported host platforms are Windows and Linux only (including WSL where documented)
 - platforms outside Windows/Linux are unsupported; do not implement, debug, or "fix" unsupported-platform behavior
   - if a test fails only on unsupported platforms (e.g., macOS), skip or mark as out of scope; do not alter logic to make it pass
@@ -168,6 +216,7 @@ When changing assistant-adjacent behavior, keep consistency with:
 
 - `docs/llm-tool-use.md`
 - `skills/rocm-cli-assistant/SKILL.md`
+- `skills/rocm-doctor/SKILL.md` and `skills/rocm-doctor/reference.md`
 
 Required consistency points:
 
@@ -175,6 +224,62 @@ Required consistency points:
 - mutating actions require approval flow
 - avoid invented shell/package-manager commands in assistant behavior paths
 - preserve built-in assistant constraints and no-CPU-fallback policy
+
+### `skills/rocm-doctor/` — published from here, and a test fixture
+
+`skills/rocm-cli-assistant/SKILL.md` is compiled into the binary
+(`include_str!` in `apps/rocm/src/main.rs`). `skills/rocm-doctor/` is different
+on two counts, and both change how you edit it:
+
+- **This repo is its source of truth.** The skill is a thin driver over the
+  `rocm` binary, so it is versioned with the binary and lives here.
+  [`amd/skills`](https://github.com/amd/skills) is still in Phase-1
+  incubation for this skill: it carries no automated federation for
+  `rocm-doctor` yet — `.github/federation.json` there only declares
+  `AMD-AGI/TraceLens` as a source, and this skill instead sits under
+  `staging/rocm-doctor`, outside any job's coverage. Until federation picks it
+  up, the rocm-cli team hand-syncs `staging/rocm-doctor` from this folder
+  whenever it changes materially. So edit it here, and never edit the
+  `amd/skills` copy directly — the next hand-sync overwrites it.
+- **`reference.md` is an e2e fixture.** `tests/e2e-cucumber/features/rocm_doctor_skill.feature`
+  parses its closed-catalog table and compares it to what `rocm fix` reports.
+  The failure catalog itself is authoritative in `crates/rocm-core/src/fix.rs`
+  (the `RECIPES` list) and `crates/rocm-core/src/diagnose.rs` (each mode's
+  checker and OS scoping) — adding, renaming, or re-scoping a failure mode
+  means changing the CLI **first**, then the two docs. That feature is what
+  catches you if you forget.
+
+The folder is excluded from `licenserc.toml`: `SKILL.md` must open with YAML
+frontmatter for the skill loader, and skills published this way carry no
+license headers of their own. The licence is stated in `skill-card.md`
+instead.
+
+Two checks gate it, and they cover different things:
+
+- **`skill-evals` (skillscope, advisory today)** — the frontmatter an agent
+  runtime parses, the `evals/evals.json` coverage bar (at least 3 prompts that
+  should trigger the skill and 2 near misses that should not), the
+  `skill-card.md` sections, and every internal markdown link. It is not yet a
+  required status check in branch protection: an admin must add its exact
+  context, `Skill checks (skillscope)` (the job's `name:`, not the
+  `skill-evals` job id), before a red run actually blocks a merge. Reproduce
+  it locally with
+  `uv tool install git+https://github.com/amd/skillscope@v0.1.0`, then
+  `skillscope structural --skills-dir 'skills/rocm-doctor' --skill-files
+  skill-card.md --skill-sections Description,Owner,License`. Add `--external`
+  to check the outbound URLs too; CI does not, because a rate-limited host is
+  not a broken link.
+- **`rocm_doctor_skill.feature` (e2e, blocking)** — whether the prose still
+  describes the binary, as above.
+
+Neither grades whether the skill actually *fires*. That is skillscope's
+`routing` and `behavioral`, which need an authenticated `claude` CLI and an
+`ANTHROPIC_API_KEY` this repo does not have. The dataset is written and checked
+so those can be switched on without further work.
+
+`skills/rocm-cli-assistant/` is **not** in scope for skillscope: it is embedded
+verbatim into the chat system prompt with `include_str!`, so the YAML
+frontmatter a published skill needs would end up inside that prompt.
 
 ## 8) Verification Matrix For This Repo
 
@@ -185,6 +290,11 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 python scripts/smoke_local.py
 ```
+
+Deleting or weakening a test is a change in its own right: every crate has a committed
+coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops
+below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
+the commit why — do not re-bless to clear a red check.
 
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
@@ -227,6 +337,8 @@ If a vendored upstream tree is introduced in the future, apply the following rul
 - avoid AI-generated boilerplate footers
 - do not resolve reviewer threads you did not author; reply with fix commit context
 - if reviewed code must be updated, explain what changed since review
+- automated reviewers (e.g. Copilot) can post new findings on a commit that itself fixed earlier findings; after pushing a fix and replying to the original threads, re-fetch PR comments once more before treating the review round as closed
+- to check whether a review comment already has a reply, do not call `gh api repos/OWNER/REPO/pulls/comments/$id/replies` (GET); it 404s. Fetch the full list (`gh api repos/OWNER/REPO/pulls/{pr}/comments --paginate`) and cross-reference each comment's `in_reply_to_id` against other comments' `id`s
 
 **Stacked and dependent PRs:**
 

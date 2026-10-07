@@ -54,6 +54,15 @@ pub struct ReplayController {
 }
 
 impl ReplayController {
+    /// A controller wired to a channel nobody drains — for tests that only
+    /// need `AppState::replay` to be `Some` (e.g. footer-chip gating), not a
+    /// live replay session.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        Self { tx }
+    }
+
     pub fn pause(&self) {
         let _ = self.tx.send(ReplayControl::Pause);
     }

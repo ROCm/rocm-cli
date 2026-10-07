@@ -45,7 +45,7 @@ repos:
 
   # Python: lint + format the helper scripts and engine workers.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.4
+    rev: v0.16.6
     hooks:
       - id: ruff-check
         args: [--fix]
@@ -84,7 +84,7 @@ repos:
         groups: [local-tools] # local-only; CI uses the `commit-signatures` job
 
   # License headers: mirrors the fast/hawkeye CI check.
-  # Requires: cargo install hawkeye
+  # Requires: hawkeye, pinned version documented in CONTRIBUTING.md
   - repo: local
     hooks:
       - id: license-headers
@@ -93,7 +93,7 @@ repos:
         language: system
         types_or: [rust, python, shell]
         pass_filenames: false
-        groups: [local-tools] # runs in the dedicated `license-headers` CI job (hawkeye action)
+        groups: [local-tools] # runs in the dedicated `license-headers` CI job (pinned prebuilt binary, no Action)
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.
   - repo: local
@@ -122,6 +122,19 @@ repos:
         pass_filenames: false
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated build-and-test CI job
+      - id: architecture-doc
+        name: architecture doc path citations are current
+        # No `types:`/`files:` filter, unlike its siblings above: the CI job
+        # this mirrors runs unconditionally too, because a change anywhere in
+        # the tracked tree (not just a Rust file, and not just
+        # docs/architecture.md itself) can make a citation stale without
+        # touching the doc that cites it — see the CI job's own comment in
+        # ci.yml for why gating this on a path filter would be unsound.
+        entry: cargo xtask check-architecture-doc
+        language: system
+        pass_filenames: false
+        stages: [pre-push] # compiles xtask; too slow for every commit
+        groups: [local-tools] # runs in the dedicated `architecture-doc` CI job
       - id: powershell-script-analyzer
         name: PSScriptAnalyzer
         # Lints every .ps1 with PSScriptAnalyzer, which also covers syntax (a file
@@ -155,6 +168,18 @@ repos:
         entry: cargo xtask manifest
         language: system
         files: '^((.*/)?Cargo\.(toml|lock)|xtask/.*|MANIFEST\.md)$'
+        pass_filenames: false
+        stages: [pre-commit]
+        groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job
+      - id: cargo-catalog
+        name: Published Doctor catalog is current
+        # The catalog the CLI ships and the file tools read have to be the same
+        # thing. Write form, like cargo-manifest: prek fails the commit when a
+        # hook rewrites a file, so a stale catalog is refreshed and re-staged
+        # rather than merely reported.
+        entry: cargo xtask catalog
+        language: system
+        files: '^(crates/rocm-core/src/fix\.rs|xtask/.*|doctor-catalog\.json)$'
         pass_filenames: false
         stages: [pre-commit]
         groups: [local-tools] # compiles xtask; CI covers it in the `clippy` job

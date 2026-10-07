@@ -21,7 +21,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -168,7 +168,7 @@ fn activate_selected(u: &mut UpdateManagerState, jobs: &mut State) -> Vec<SideEf
         let request = ApprovalRequest::new(
             action.label().to_string(),
             vec![
-                format!("{} {}", exe_label(&cmd), action.args().join(" ")),
+                format!("{} {}", exe_label(&cmd), display_args(&action.args())),
                 String::new(),
                 "This installs a ROCm package update on this machine.".to_string(),
             ],

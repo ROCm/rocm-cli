@@ -20,6 +20,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use rocm_dash_core::metrics::ObservationFreshness;
+
 use crate::app::{AppState, KeyAction, PaneFocus};
 use crate::ui::format;
 use crate::ui::panel::{self, BoxRole};
@@ -222,7 +224,7 @@ fn draw_detail(
 
     // State-aware block: what's actually installed / known / running for this
     // verb, so the pane reflects the system rather than fixed copy.
-    let live = live_lines(v.action, state, theme);
+    let (live, live_any_held) = live_lines(v.action, state, theme);
     if !live.is_empty() {
         lines.extend(live);
         lines.push(Line::from(""));
@@ -291,7 +293,28 @@ fn draw_detail(
         )));
     }
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    // Reserve a dedicated, always-visible row for HELD_LEGEND rather than
+    // appending it as just another line in `lines`: this whole block renders
+    // through a clipped/wrapped `Paragraph`, and "What you'll do" plus the
+    // step list can easily push a trailing line off-screen in a short
+    // viewport even while the held marker earlier in `lines` is visible.
+    let [content, legend] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(u16::from(live_any_held)),
+        ])
+        .areas(inner);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+    if live_any_held {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format::HELD_LEGEND,
+                Style::default().fg(theme.muted),
+            ))),
+            legend,
+        );
+    }
 }
 
 /// State-aware "current status" lines for a verb, or empty when the verb has no
@@ -300,7 +323,11 @@ fn draw_detail(
 /// Surfaces what's actually installed (ROCm/engines), known (model catalog), or
 /// running (instances) so the detail pane reflects the system — including the
 /// running-instances view inline, without opening the services popup.
-fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'static>> {
+/// Returns the state-aware detail lines plus whether any displayed row's
+/// value carries a held marker. The caller renders `HELD_LEGEND` in its own
+/// guaranteed-visible row rather than this function appending it inline —
+/// see the comment at the `draw_detail` render site.
+fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'static>>, bool) {
     let head = |t: String| {
         Line::from(Span::styled(
             t,
@@ -357,7 +384,7 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                     ]));
                 }
             }
-            lines
+            (lines, false)
         }
         KeyAction::OpenEngineManager => {
             let mut lines = vec![head("Engines".into())];
@@ -378,12 +405,12 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                 Span::styled("· ", Style::default().fg(theme.muted)),
                 Span::styled("vLLM — open to check", Style::default().fg(theme.muted)),
             ]));
-            lines
+            (lines, false)
         }
         KeyAction::OpenServeWizard => {
             let n = state.model_recipes.len();
             if n == 0 {
-                return Vec::new();
+                return (Vec::new(), false);
             }
             let mut lines = vec![head(format!("Model catalog — {n} known"))];
             for r in state.model_recipes.iter().take(4) {
@@ -398,7 +425,7 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                     Style::default().fg(theme.muted),
                 )));
             }
-            lines
+            (lines, false)
         }
         KeyAction::OpenServices => {
             let running: Vec<_> = state
@@ -407,6 +434,7 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                 .filter(|i| i.status.is_serving())
                 .collect();
             let mut lines = vec![head(format!("Running now — {}", running.len()))];
+            let mut any_held = false;
             if running.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "  none running",
@@ -414,6 +442,15 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                 )));
             } else {
                 for i in running.iter().take(5) {
+                    // `gen_tps_compact` only ever prints HELD_MARKER for a
+                    // finite `Some` gen_tps — mirror that condition here so
+                    // held metadata on a `None`/non-finite value (rendered
+                    // as "gen -" with no marker) can't add an unexplained
+                    // legend.
+                    any_held |= i.gen_tps.is_some_and(f64::is_finite)
+                        && i.gen_tps_observation
+                            .as_ref()
+                            .is_some_and(|m| m.freshness == ObservationFreshness::Held);
                     let port = i.port.map_or_else(String::new, |p| format!(" :{p}"));
                     lines.push(Line::from(vec![
                         Span::styled("● ", Style::default().fg(theme.ok)),
@@ -435,8 +472,8 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> Vec<Line<'s
                     )));
                 }
             }
-            lines
+            (lines, any_held)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), false),
     }
 }

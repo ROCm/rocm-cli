@@ -4,6 +4,11 @@
 
 #![allow(clippy::items_after_test_module)]
 
+mod common;
+mod persistence;
+#[cfg(test)]
+mod test_support;
+
 use anyhow::{Context, Result, bail};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -12,24 +17,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(test)]
-use rocm_core::engine_plugin_dirs;
+use rocm_core::AutomationEventRecord;
 use rocm_core::{
-    AppPaths, AuditEventRecord, AutomationEventRecord, AutomationProposalRecord,
-    AutomationRuntimeState, AutomationTriggerEvent, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary, ManagedServiceRecord,
-    ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode, WatcherRuntimeSnapshot,
-    append_audit_event, append_automation_event, append_automation_proposal, builtin_watcher,
-    builtin_watchers, daemon_binary_path, default_engine_for_platform, format_host_port,
-    load_recent_automation_events, model_artifact_cache_status, resolve_amd_smi_binary,
-    resolve_model_recipe_artifact, unix_time_millis,
+    AppPaths, AuditEventRecord, AutomationProposalRecord, AutomationRuntimeState,
+    AutomationTriggerEvent, CodexBridgeGpuSnapshot, DEFAULT_LOCAL_HOST, ExamineSummary,
+    ManagedServiceRecord, ModelRecipeArtifactRecord, RocmCliConfig, WatcherMode,
+    WatcherRuntimeSnapshot, append_audit_event, append_automation_proposal, builtin_watcher,
+    builtin_watchers, daemon_binary_path, load_recent_automation_events,
+    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
 };
-#[cfg(test)]
-use rocm_engine_protocol::EnginePluginDescriptor;
-use rocm_engine_protocol::{
-    EngineMethod, EngineRequestEnvelope, EngineResponseEnvelope, HealthcheckRequest,
-    HealthcheckResponse,
-};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
@@ -39,7 +35,6 @@ use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
@@ -58,7 +53,6 @@ const GPU_METRICS_INTERVAL_MS: u128 = 60 * 1000;
 const GPU_THERMAL_HOTSPOT_PRESSURE_C: f64 = 95.0;
 const GPU_THERMAL_MEMORY_PRESSURE_C: f64 = 95.0;
 const GPU_MEMORY_VRAM_PRESSURE_PERCENT: f64 = 95.0;
-const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const ARTIFACT_PREFETCH_TIMEOUT: Duration = Duration::from_mins(10);
 
 #[derive(Parser, Debug)]
@@ -266,6 +260,25 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     runtime.block_on(run_cli(cli))
 }
 
+fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
+    let snapshot = common::build_bridge_snapshot(paths)?;
+
+    if pretty {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot)
+                .context("failed to serialize bridge snapshot")?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string(&snapshot).context("failed to serialize bridge snapshot")?
+        );
+    }
+
+    Ok(())
+}
+
 async fn run_cli(cli: Cli) -> Result<()> {
     let paths = AppPaths::discover()?;
 
@@ -379,40 +392,6 @@ async fn run_cli(cli: Cli) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn print_bridge_snapshot(paths: &AppPaths, pretty: bool) -> Result<()> {
-    let snapshot = build_bridge_snapshot(paths)?;
-
-    if pretty {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&snapshot)
-                .context("failed to serialize bridge snapshot")?
-        );
-    } else {
-        println!(
-            "{}",
-            serde_json::to_string(&snapshot).context("failed to serialize bridge snapshot")?
-        );
-    }
-
-    Ok(())
-}
-
-fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
-    let config = RocmCliConfig::load(paths).unwrap_or_default();
-    Ok(CodexBridgeSnapshot {
-        protocol: "rocmd-codex-bridge-v0".to_owned(),
-        generated_at_unix_ms: unix_time_millis(),
-        examine: ExamineSummary::gather()?,
-        gpu: gather_gpu_snapshot_for_config(&config),
-        config,
-        automation_runtime: AutomationRuntimeState::load(paths)?,
-        recent_automation_events: load_recent_automation_events(paths, 32)?,
-        engines: bridge_engine_inventory(),
-        services: load_managed_services(paths)?,
-    })
 }
 
 fn run_sandbox_runner(
@@ -561,11 +540,12 @@ fn run_sandbox_tool(
 ) -> Result<Value> {
     match tool {
         SandboxToolArg::CheckUpdates => {
-            let output = run_rocm_capture_for_paths(paths, &["update"], Duration::from_mins(1))?;
+            let output =
+                common::run_rocm_capture_for_paths(paths, &["update"], Duration::from_mins(1))?;
             Ok(sandbox_check_updates_value(output))
         }
         SandboxToolArg::DriverPlan => {
-            let output = run_rocm_capture_for_paths(
+            let output = common::run_rocm_capture_for_paths(
                 paths,
                 &["install", "driver", "--dkms", "--dry-run"],
                 Duration::from_mins(1),
@@ -582,7 +562,7 @@ fn run_sandbox_tool(
             }))
         }
         SandboxToolArg::ListServers => {
-            let services = load_managed_services(paths)?;
+            let services = persistence::load_managed_services(paths)?;
             Ok(json!({
                 "tool": tool.as_cli_value(),
                 "status": "listed",
@@ -593,7 +573,7 @@ fn run_sandbox_tool(
         }
         SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires `--service-id`")?;
-            let mut record = load_managed_services(paths)?
+            let mut record = persistence::load_managed_services(paths)?
                 .into_iter()
                 .find(|record| record.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -1191,11 +1171,11 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> io::Result<()> {
     }
 }
 
-fn sandbox_check_updates_value(output: CommandCapture) -> Value {
+fn sandbox_check_updates_value(output: common::CommandCapture) -> Value {
     let status = update_check_status(&output);
     let update_available =
         output.exit_status == 0 && update_output_reports_update_available(&output.stdout);
-    let message = update_check_message(status);
+    let message = common::update_check_message(status);
     json!({
         "tool": SandboxToolArg::CheckUpdates.as_cli_value(),
         "status": status,
@@ -1209,7 +1189,7 @@ fn sandbox_check_updates_value(output: CommandCapture) -> Value {
     })
 }
 
-fn update_check_status(output: &CommandCapture) -> &'static str {
+fn update_check_status(output: &common::CommandCapture) -> &'static str {
     if output.exit_status != 0 {
         "error"
     // A newer version outranks a composition repair: reporting the repair while
@@ -1236,20 +1216,7 @@ fn update_output_reports_update_available(stdout: &str) -> bool {
             .any(|part| part == "update_available=true")
 }
 
-fn update_check_message(status: &str) -> &'static str {
-    match status {
-        "repair_available" => {
-            "ran read-only `rocm update`; a ROCm runtime repair is available because its package composition changed; no updates were applied"
-        }
-        "update_available" => {
-            "ran read-only `rocm update`; a ROCm runtime update is available; no updates were applied"
-        }
-        "error" => "read-only `rocm update` failed; no updates were applied",
-        _ => "ran read-only `rocm update`; no updates were applied",
-    }
-}
-
-fn sandbox_driver_plan_value(output: CommandCapture) -> Value {
+fn sandbox_driver_plan_value(output: common::CommandCapture) -> Value {
     let status = if output.exit_status == 0 {
         "planned"
     } else {
@@ -1414,129 +1381,6 @@ fn command_available(name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok()
-}
-
-fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
-    let static_snapshot = match capture_amd_smi_json(&["static", "-a", "-g", "all", "--json"]) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            return CodexBridgeGpuSnapshot {
-                amd_smi_available: false,
-                static_snapshot: None,
-                monitor_snapshot: None,
-                note: Some(error.to_string()),
-            };
-        }
-    };
-
-    let monitor_snapshot = match capture_amd_smi_json(&[
-        "monitor", "-p", "-t", "-u", "-m", "-v", "-g", "all", "--json",
-    ]) {
-        Ok(value) => Some(value),
-        Err(error) => {
-            return CodexBridgeGpuSnapshot {
-                amd_smi_available: true,
-                static_snapshot,
-                monitor_snapshot: None,
-                note: Some(error.to_string()),
-            };
-        }
-    };
-
-    CodexBridgeGpuSnapshot {
-        amd_smi_available: true,
-        static_snapshot,
-        monitor_snapshot,
-        note: None,
-    }
-}
-
-fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBridgeGpuSnapshot {
-    if config.telemetry.local_inspection_enabled() {
-        gather_gpu_snapshot()
-    } else {
-        CodexBridgeGpuSnapshot {
-            amd_smi_available: false,
-            static_snapshot: None,
-            monitor_snapshot: None,
-            note: Some(
-                "gpu telemetry is disabled by rocm-cli config; no external reporting is implemented"
-                    .to_owned(),
-            ),
-        }
-    }
-}
-
-fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
-    let amd_smi_binary = resolve_amd_smi_binary();
-    let mut command = ProcessCommand::new(&amd_smi_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
-        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        anyhow::bail!(
-            "amd-smi {} failed: {}",
-            args.join(" "),
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
-}
-
-fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
-    let default_engine = default_engine_for_platform();
-    let current_exe = std::env::current_exe().ok();
-    rocmd_engine_inventory()
-        .iter()
-        .map(|(id, summary)| CodexBridgeEngine {
-            id: (*id).to_owned(),
-            summary: (*summary).to_owned(),
-            default_for_platform: *id == default_engine,
-            installed_binary: true,
-            binary_path: current_exe.as_ref().map(|path| path.display().to_string()),
-        })
-        .collect()
-}
-
-const fn rocmd_engine_inventory() -> &'static [(&'static str, &'static str)] {
-    &[
-        (
-            "lemonade",
-            "embedded Lemonade server with ROCm llama.cpp backend",
-        ),
-        (
-            "vllm",
-            "Linux/WSL ROCm GPU serving engine through external vLLM",
-        ),
-    ]
-}
-
-#[cfg(test)]
-fn find_engine_plugin_binary<I, P>(engine: &str, plugin_dirs: I) -> Result<Option<PathBuf>>
-where
-    I: IntoIterator<Item = P>,
-    P: AsRef<std::path::Path>,
-{
-    Ok(rocm_engine_protocol::discover_engine_plugins(plugin_dirs)
-        .context("failed to discover engine plugin binaries")?
-        .into_iter()
-        .find(|plugin: &EnginePluginDescriptor| plugin.id == engine)
-        .map(|plugin| plugin.executable_path))
 }
 
 fn run_mcp_server(paths: &AppPaths) -> Result<()> {
@@ -2088,7 +1932,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
     match name {
         "examine" => {
             let examine = ExamineSummary::gather()?;
-            let output = run_rocm_capture(&["examine"])?;
+            let output = common::run_rocm_capture(&["examine"])?;
             let text = command_capture_text(&output);
             if output.exit_status == 0 {
                 Ok(tool_success(text, json!(examine)))
@@ -2105,7 +1949,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             }
         }
         "bridge_snapshot" => {
-            let snapshot = build_bridge_snapshot(paths)?;
+            let snapshot = common::build_bridge_snapshot(paths)?;
             Ok(tool_success(
                 format!(
                     "Captured bridge snapshot for {} / {} with default engine `{}`.",
@@ -2116,7 +1960,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         }
         "gpu_snapshot" => {
             let config = RocmCliConfig::load(paths).unwrap_or_default();
-            let gpu = gather_gpu_snapshot_for_config(&config);
+            let gpu = common::gather_gpu_snapshot_for_config(&config);
             let status = if !config.telemetry.local_inspection_enabled() {
                 "GPU telemetry is disabled by rocm-cli config."
             } else if gpu.amd_smi_available {
@@ -2127,14 +1971,14 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             Ok(tool_success(status.to_owned(), json!(gpu)))
         }
         "engines" => {
-            let engines = bridge_engine_inventory();
+            let engines = common::bridge_engine_inventory();
             Ok(tool_success(
                 format!("Found {} engine entries.", engines.len()),
                 json!({ "engines": engines }),
             ))
         }
         "services" => {
-            let services = load_managed_services(paths)?;
+            let services = persistence::load_managed_services(paths)?;
             Ok(tool_success(
                 format!("Found {} managed services.", services.len()),
                 json!({ "services": services }),
@@ -2150,7 +1994,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 .and_then(Value::as_u64)
                 .unwrap_or(80)
                 .clamp(1, 500) as usize;
-            let record = load_managed_services(paths)?
+            let record = persistence::load_managed_services(paths)?
                 .into_iter()
                 .find(|service| service.service_id == service_id)
                 .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -2191,7 +2035,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 .get("request")
                 .and_then(Value::as_str)
                 .context("natural_language_plan requires `request`")?;
-            let output = run_rocm_capture(&[request])?;
+            let output = common::run_rocm_capture(&[request])?;
             Ok(tool_result_from_command(
                 "Ran natural-language planning through `rocm`.",
                 output,
@@ -2202,7 +2046,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             let argv = normalized_rocm_command_args(&arguments)?;
             ensure_rocm_command_is_read_only(&argv)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran read-only `rocm` command.",
                 output,
@@ -2210,7 +2054,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
             ))
         }
         "update_check" => {
-            let output = run_rocm_capture(&["update"])?;
+            let output = common::run_rocm_capture(&["update"])?;
             Ok(tool_result_from_command(
                 "Ran `rocm update`.",
                 output,
@@ -2220,7 +2064,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_sdk_dry_run" => {
             let argv = build_install_sdk_args(&arguments, true)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk --dry-run`.",
                 output,
@@ -2230,7 +2074,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_sdk" => {
             let argv = build_install_sdk_args(&arguments, false)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm install sdk`.",
                 output,
@@ -2240,7 +2084,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "install_engine" => {
             let argv = build_install_engine_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm engines install`.",
                 output,
@@ -2250,7 +2094,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "launch_server" => {
             let argv = build_launch_server_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm serve --managed`.",
                 output,
@@ -2271,7 +2115,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
         "watcher_enable" => {
             let argv = build_watcher_enable_args(&arguments)?;
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations enable`.",
                 output,
@@ -2289,7 +2133,7 @@ fn handle_mcp_tool_call(paths: &AppPaths, params: &Value) -> Result<Value> {
                 watcher.to_owned(),
             ];
             let refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
-            let output = run_rocm_capture(&refs)?;
+            let output = common::run_rocm_capture(&refs)?;
             Ok(tool_result_from_command(
                 "Ran `rocm automations disable`.",
                 output,
@@ -2329,7 +2173,7 @@ fn tool_error(text: String, structured: Value) -> Value {
     })
 }
 
-fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool) -> Value {
+fn tool_result_from_command(prefix: &str, output: common::CommandCapture, is_error: bool) -> Value {
     let text = format!("{prefix}\n\n{}", command_capture_text(&output));
     json!({
         "content": [
@@ -2348,7 +2192,7 @@ fn tool_result_from_command(prefix: &str, output: CommandCapture, is_error: bool
     })
 }
 
-fn command_capture_text(output: &CommandCapture) -> String {
+fn command_capture_text(output: &common::CommandCapture) -> String {
     if output.stderr.trim().is_empty() {
         output.stdout.trim().to_owned()
     } else if output.stdout.trim().is_empty() {
@@ -2359,85 +2203,6 @@ fn command_capture_text(output: &CommandCapture) -> String {
             output.stdout.trim(),
             output.stderr.trim()
         )
-    }
-}
-
-#[derive(Debug)]
-struct CommandCapture {
-    argv: Vec<String>,
-    exit_status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
-    let paths = AppPaths::discover()?;
-    run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
-}
-
-fn run_rocm_capture_for_paths(
-    paths: &AppPaths,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<CommandCapture> {
-    let rocm_binary = rocm_core::daemon_binary_path()?;
-    let mut command = ProcessCommand::new(&rocm_binary);
-    command
-        .args(args)
-        .env("ROCM_CLI_CONFIG_DIR", &paths.config_dir)
-        .env("ROCM_CLI_DATA_DIR", &paths.data_dir)
-        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
-        .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
-    Ok(CommandCapture {
-        argv: std::iter::once(rocm_binary.display().to_string())
-            .chain(args.iter().map(|value| (*value).to_owned()))
-            .collect(),
-        exit_status: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2501,7 +2266,13 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
     let read_only = match first.as_deref() {
         Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => true,
         Some("update") => !args.iter().any(|arg| arg == "--apply"),
-        Some("runtimes") => second.as_deref().is_none_or(|value| value == "list"),
+        Some("runtimes") => {
+            second.as_deref().is_none_or(|value| value == "list")
+                || (second
+                    .as_deref()
+                    .is_some_and(|value| value == "uninstall" || value == "remove")
+                    && args.iter().any(|arg| arg == "--dry-run"))
+        }
         Some("engines") => second.as_deref().is_some_and(|value| value == "list"),
         Some("services") => second
             .as_deref()
@@ -2516,9 +2287,18 @@ fn ensure_rocm_command_is_read_only(args: &[String]) -> Result<()> {
         // two `remove-*` verbs delete, so they stay off the read-only list.
         Some("storage") => second.as_deref().is_none_or(|value| value == "report"),
         // `setup status` reports first-time setup state (read-only); `setup reset`
-        // re-arms it and is mutating. Mirrors the bin's rocm_command classifier so
+        // clears the completion/dismissal state and is mutating (it does not by
+        // itself reopen onboarding). Mirrors the bin's rocm_command classifier so
         // the read-only allowlist is consistent across binaries.
         Some("setup") => second.as_deref().is_none_or(|value| value == "status"),
+        // `remote targets` reads the local tailnet, `doctor` fetches another
+        // machine's state and scores it here, `status` probes sessions that
+        // already exist. None of them change anything on either machine.
+        // `serve`, `attach` and `stop` start, publish or tear down, so they stay
+        // off the list and go through the approval UI like any other mutation.
+        Some("remote") => second
+            .as_deref()
+            .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")),
         _ => false,
     };
     if read_only {
@@ -2587,6 +2367,28 @@ fn build_install_sdk_args(
     }
     if dry_run {
         argv.push("--dry-run".to_owned());
+    } else {
+        // `run_rocm_capture_for_paths` spawns `rocm` with null stdin, so
+        // `interactive_terminal()` is false in the child and an active default
+        // managed runtime would make the approval gate refuse with "re-run with
+        // `--approve-replacing-active-default`" — a flag no MCP caller of this
+        // tool can supply.
+        //
+        // Not `--yes` itself: that flag carries a second, unrelated consent —
+        // approving required system-package installs, which run `sudo`. This
+        // spawn has no terminal, so it could never answer a sudo password
+        // prompt; granting that consent would make the vLLM/OpenMPI step attempt
+        // an install it cannot complete and abort the engine auto-install that
+        // previously warned and continued. `--approve-replacing-active-default`
+        // grants only the runtime-displacement consent the gate asks for.
+        //
+        // Consent is not bypassed: `install_sdk` is in
+        // `mcp_tool_requires_direct_approval`, so a direct `rocmd mcp-call`
+        // needs `--allow-mutation` after an explicit user approval, and over the
+        // MCP protocol the tool is annotated `destructiveHint` for the client's
+        // approval UI. Mirrors the chat/MCP arm in `apps/rocm`. The dry-run
+        // branch never reaches the gate (it returns earlier), so it stays bare.
+        argv.push("--approve-replacing-active-default".to_owned());
     }
     Ok(argv)
 }
@@ -2702,7 +2504,7 @@ fn system_prefix_requires_ack(prefix: &std::path::Path) -> bool {
 }
 
 fn stop_managed_service(paths: &AppPaths, service_id: &str) -> Result<Value> {
-    let mut record = load_managed_services(paths)?
+    let mut record = persistence::load_managed_services(paths)?
         .into_iter()
         .find(|record| record.service_id == service_id)
         .with_context(|| format!("managed service `{service_id}` not found"))?;
@@ -3015,7 +2817,7 @@ async fn run_daemon(
 
     paths.ensure()?;
     state.write(paths)?;
-    record_event(
+    persistence::record_event(
         paths,
         &mut state,
         "rocmd",
@@ -3049,7 +2851,7 @@ async fn run_daemon(
                 if let Some(event) = event {
                     let config = RocmCliConfig::load(paths)?;
                     reconcile_watcher_snapshots(&config, &mut state);
-                    record_event(
+                    persistence::record_event(
                         paths,
                         &mut state,
                         "rocmd",
@@ -3065,7 +2867,7 @@ async fn run_daemon(
                     if let Err(error) =
                         evaluate_watchers_for_events(paths, &config, &mut state, &[event])
                     {
-                        record_event(
+                        persistence::record_event(
                             paths,
                             &mut state,
                             "rocmd",
@@ -3082,7 +2884,7 @@ async fn run_daemon(
                 } else {
                     local_webhook_receiver = None;
                     state.local_webhook_endpoint = None;
-                    record_event(
+                    persistence::record_event(
                         paths,
                         &mut state,
                         "rocmd",
@@ -3103,7 +2905,7 @@ async fn run_daemon(
     state.running = false;
     state.last_tick_unix_ms = unix_time_millis();
     state.local_webhook_endpoint = None;
-    record_event(
+    persistence::record_event(
         paths,
         &mut state,
         "rocmd",
@@ -3169,7 +2971,7 @@ fn print_status(paths: &AppPaths) -> Result<()> {
     );
     println!("  audit events: {}", paths.audit_events_path().display());
 
-    let records = load_managed_services(paths)?;
+    let records = persistence::load_managed_services(paths)?;
     if records.is_empty() {
         println!("  services: none");
         return Ok(());
@@ -3183,6 +2985,16 @@ fn print_status(paths: &AppPaths) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    match rocm_engine_protocol::GpuSelection::parse_cli_value(raw).map_err(anyhow::Error::msg)? {
+        rocm_engine_protocol::GpuSelection::Auto => Ok(Vec::new()),
+        rocm_engine_protocol::GpuSelection::Index(index) => Ok(vec![index]),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3224,15 +3036,42 @@ fn supervise_service(
     );
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
+    // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts
+    // this false, so rebuilding a record here without restoring it would not
+    // just skip the check now — it would write the weakened record back and
+    // disarm every later `rocm services restart` as well.
+    //
+    // Propagated, not defaulted. This read arms the guard below, so it is not
+    // best-effort the way an identical-looking call feeding a printed warning
+    // would be. `load_managed_services` already *skips* unparseable records, so
+    // an `Err` here is a real I/O failure — and a missing directory is `Ok`
+    // anyway. Swallowing it would say "no service ever required a key", the
+    // key-file fallback is false precisely when a service has been stopped, and
+    // the weakened record would then be written back at the bottom of this
+    // function. That is the outcome the comment above says must not happen.
+    let previously_required = persistence::load_managed_services(paths)
+        .context(
+            "could not read the service registry to check whether this service requires an \
+             endpoint API key; refusing to recover it rather than assume it does not",
+        )?
+        .iter()
+        .any(|existing| existing.service_id == record.service_id && existing.requires_api_key);
+    // Only what the registry recorded. The `|| key-file-is-present` clause that
+    // used to be here re-derived the flag the same way `spawn_managed_engine_child`
+    // did, and was wrong for the same reason: a public bind always has a key file
+    // whether or not auth was ever demanded, so recovery re-armed this on services
+    // that never asked for it and refused them with the wrong remediation.
+    record.requires_api_key = previously_required;
     // Refuse a keyless public respawn before the manifest write, so a refused
     // attempt leaves the recorded restart_count and timestamps intact instead of
     // clobbering them with a record no live process will ever back. The spawn
     // site below re-checks against the key actually threaded onto the command.
-    ensure_public_service_has_endpoint_key(
+    common::ensure_public_service_has_endpoint_key(
         &record.host,
         rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
             .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
             .is_some(),
+        record.requires_api_key,
     )?;
     record.write()?;
 
@@ -3270,8 +3109,13 @@ fn supervise_service(
     // If the key is gone the child would listen on the recorded public host with
     // no auth, so fail closed instead — an unreachable service is recoverable,
     // an anonymous public one is not.
-    let endpoint_key_applied = apply_endpoint_key_env(&mut command, paths, &record.service_id);
-    ensure_public_service_has_endpoint_key(&record.host, endpoint_key_applied)?;
+    let endpoint_key_applied =
+        common::apply_endpoint_key_env(&mut command, paths, &record.service_id);
+    common::ensure_public_service_has_endpoint_key(
+        &record.host,
+        endpoint_key_applied,
+        record.requires_api_key,
+    )?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn engine supervisor child for {engine}"))?;
@@ -3315,6 +3159,13 @@ fn supervise_service(
         Ok(())
     } else {
         std::process::exit(exit_status.code().unwrap_or(1));
+    }
+}
+
+fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
+    match value {
+        Some(value) => vec![flag.to_owned(), value.to_owned()],
+        None => Vec::new(),
     }
 }
 
@@ -3608,7 +3459,7 @@ fn collect_automation_events(
     state: &AutomationRuntimeState,
 ) -> Result<Vec<AutomationTriggerEvent>> {
     collect_automation_events_with_gpu_snapshot(paths, state, || {
-        gather_gpu_snapshot_for_config(config)
+        common::gather_gpu_snapshot_for_config(config)
     })
 }
 
@@ -3820,7 +3671,7 @@ where
     };
     match policy {
         WatcherPolicyAction::Observe | WatcherPolicyAction::QueueProposal => {
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "therock-update",
@@ -3843,7 +3694,7 @@ where
         WatcherPolicyAction::RunContained => match update_runner(paths) {
             Ok(output) => match restricted_check_updates_result(&output) {
                 Ok(result) => {
-                    record_event(
+                    persistence::record_event(
                         paths,
                         state,
                         "therock-update",
@@ -3856,7 +3707,7 @@ where
                         &format!(
                             "{message}; restricted check_updates status={}; {}",
                             result.status,
-                            update_check_message(result.status)
+                            common::update_check_message(result.status)
                         ),
                         None,
                     )?;
@@ -3865,7 +3716,7 @@ where
                     }
                 }
                 Err(error) => {
-                    record_event(
+                    persistence::record_event(
                         paths,
                         state,
                         "therock-update",
@@ -3879,7 +3730,7 @@ where
                 }
             },
             Err(error) => {
-                record_event(
+                persistence::record_event(
                     paths,
                     state,
                     "therock-update",
@@ -3939,7 +3790,7 @@ fn record_update_available_notification(
     } else {
         "A ROCm runtime update is available. Preview it before applying. No updates were applied."
     };
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "therock-update",
@@ -4032,7 +3883,7 @@ fn handle_gpu_metrics_event(
         other => other,
     };
 
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "gpu-metrics",
@@ -4269,7 +4120,7 @@ fn handle_gpu_thermal_protect_event(
     let reason = event.reason.as_deref().unwrap_or("gpu_pressure_threshold");
 
     if matches!(mode, WatcherMode::Observe) {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4283,7 +4134,7 @@ fn handle_gpu_thermal_protect_event(
     }
 
     let Some(record) = resolve_gpu_pressure_service_target(paths, event)? else {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4297,7 +4148,7 @@ fn handle_gpu_thermal_protect_event(
     };
 
     if pending_stop_proposal_exists(paths, &record.service_id)? {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "gpu-thermal-protect",
@@ -4321,7 +4172,7 @@ fn handle_gpu_thermal_protect_event(
         "{summary}; {mode_note}; selected managed server {} ({})",
         record.service_id, record.endpoint_url
     );
-    record_event(
+    persistence::record_event(
         paths,
         state,
         "gpu-thermal-protect",
@@ -4371,7 +4222,7 @@ fn resolve_gpu_pressure_service_target(
         return Ok(active_pressure_target(record));
     }
 
-    let active = load_managed_services(paths)?
+    let active = persistence::load_managed_services(paths)?
         .into_iter()
         .filter_map(active_pressure_target)
         .collect::<Vec<_>>();
@@ -4421,7 +4272,7 @@ where
     F: FnMut(&str) -> Result<bool>,
 {
     let Some(artifact_ref) = payload_string(&event.payload, "artifact_ref") else {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "cache-warm",
@@ -4434,7 +4285,7 @@ where
     match artifact_exists(&artifact_ref) {
         Ok(true) => {}
         Ok(false) => {
-            return record_event(
+            return persistence::record_event(
                 paths,
                 state,
                 "cache-warm",
@@ -4447,7 +4298,7 @@ where
             );
         }
         Err(error) => {
-            return record_event(
+            return persistence::record_event(
                 paths,
                 state,
                 "cache-warm",
@@ -4461,7 +4312,7 @@ where
         }
     }
     match mode {
-        WatcherMode::Observe => record_event(
+        WatcherMode::Observe => persistence::record_event(
             paths,
             state,
             "cache-warm",
@@ -4483,7 +4334,7 @@ where
                     "cache warm requested for {artifact_ref}; queueing a reviewed prefetch proposal"
                 )
             };
-            record_event(paths, state, "cache-warm", "info", action, &message, None)?;
+            persistence::record_event(paths, state, "cache-warm", "info", action, &message, None)?;
             queue_proposal_with_arguments(
                 paths,
                 "cache-warm",
@@ -4528,7 +4379,7 @@ where
     F: FnOnce(&AppPaths) -> Result<Value>,
 {
     if payload_string(&event.payload, "component").as_deref() != Some("driver") {
-        return record_event(
+        return persistence::record_event(
             paths,
             state,
             "driver-upgrade",
@@ -4540,7 +4391,7 @@ where
     }
 
     match mode {
-        WatcherMode::Observe => record_event(
+        WatcherMode::Observe => persistence::record_event(
             paths,
             state,
             "driver-upgrade",
@@ -4553,7 +4404,7 @@ where
             let action = "prepare_driver_plan";
             let message =
                 "local driver update signal received; queueing a reviewed read-only driver plan";
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "driver-upgrade",
@@ -4573,7 +4424,7 @@ where
         }
         WatcherMode::Contained => match driver_plan_runner(paths) {
             Ok(output) => match restricted_driver_plan_result(&output) {
-                Ok(result) => record_event(
+                Ok(result) => persistence::record_event(
                     paths,
                     state,
                     "driver-upgrade",
@@ -4589,7 +4440,7 @@ where
                     ),
                     None,
                 ),
-                Err(error) => record_event(
+                Err(error) => persistence::record_event(
                     paths,
                     state,
                     "driver-upgrade",
@@ -4601,7 +4452,7 @@ where
                     None,
                 ),
             },
-            Err(error) => record_event(
+            Err(error) => persistence::record_event(
                 paths,
                 state,
                 "driver-upgrade",
@@ -4695,7 +4546,7 @@ fn handle_server_recover_event(
         .context("server-recover event is missing service_id")?;
     let mut record = load_service_record(paths, service_id)?;
     if !service_record_matches_recovery_event(paths, &record, event) {
-        record_event(
+        persistence::record_event(
             paths,
             state,
             "server-recover",
@@ -4723,8 +4574,8 @@ fn service_record_matches_recovery_event(
         }
         "service.endpoint_recoverable" => endpoint_service_recovery_reason(record).is_some(),
         "service.healthcheck_recoverable" => {
-            engine_healthcheck_response(paths, &record.engine, &record.service_id)
-                .is_ok_and(|healthcheck| healthcheck_response_recoverable(&healthcheck))
+            common::engine_healthcheck_response(paths, &record.engine, &record.service_id)
+                .is_ok_and(|healthcheck| common::healthcheck_response_recoverable(&healthcheck))
         }
         _ => false,
     }
@@ -4742,7 +4593,7 @@ fn handle_server_recover_event_with_record(
     let recovery_reason_display = display_recovery_reason(recovery_reason);
 
     match watcher_policy_action("server-recover", mode) {
-        WatcherPolicyAction::Observe => record_event(
+        WatcherPolicyAction::Observe => persistence::record_event(
             paths,
             state,
             "server-recover",
@@ -4759,7 +4610,7 @@ fn handle_server_recover_event_with_record(
                 "managed service {} needs recovery ({recovery_reason_display}); queueing restart proposal",
                 record.service_id,
             );
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "server-recover",
@@ -4788,13 +4639,14 @@ fn handle_server_recover_event_with_record(
             // Report it and stop, rather than letting a permanent failure
             // propagate out of `evaluate_watchers` and take the whole daemon —
             // and every other watcher — down on each 30s recovery tick.
-            if let Err(error) = ensure_public_service_has_endpoint_key(
+            if let Err(error) = common::ensure_public_service_has_endpoint_key(
                 &record.host,
                 rocm_engine_protocol::endpoint_key_file_if_present(paths, &record.service_id)
                     .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
                     .is_some(),
+                record.requires_api_key,
             ) {
-                return record_event(
+                return persistence::record_event(
                     paths,
                     state,
                     "server-recover",
@@ -4809,7 +4661,7 @@ fn handle_server_recover_event_with_record(
                 );
             }
             restart_managed_service(paths, &mut *record)?;
-            record_event(
+            persistence::record_event(
                 paths,
                 state,
                 "server-recover",
@@ -4881,7 +4733,7 @@ const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPo
 
 fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRecord, String)>> {
     let now = unix_time_millis();
-    for record in load_managed_services(paths)? {
+    for record in persistence::load_managed_services(paths)? {
         if record.mode != "managed" {
             continue;
         }
@@ -4890,14 +4742,14 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
         }
         if matches!(record.status.as_str(), "ready" | "running") {
             let Ok(healthcheck) =
-                engine_healthcheck_response(paths, &record.engine, &record.service_id)
+                common::engine_healthcheck_response(paths, &record.engine, &record.service_id)
             else {
                 if let Some(reason) = endpoint_service_recovery_reason(&record) {
                     return Ok(Some((record, reason)));
                 }
                 continue;
             };
-            if healthcheck_response_recoverable(&healthcheck) {
+            if common::healthcheck_response_recoverable(&healthcheck) {
                 return Ok(Some((
                     record,
                     format!("healthcheck_status_{}", healthcheck.status),
@@ -4912,7 +4764,7 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
-    (!wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
+    (!common::wait_for_port(&record.host, record.port, ENDPOINT_HEALTH_TIMEOUT))
         .then(|| "endpoint_status_unreachable".to_owned())
 }
 
@@ -5038,49 +4890,6 @@ fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
     args
 }
 
-fn record_event(
-    paths: &AppPaths,
-    state: &mut AutomationRuntimeState,
-    watcher_id: &str,
-    level: &str,
-    action: &str,
-    message: &str,
-    service_id: Option<String>,
-) -> Result<()> {
-    let now = unix_time_millis();
-    if let Some(snapshot) = state.watcher_mut(watcher_id) {
-        snapshot.last_event = Some(message.to_owned());
-        snapshot.last_event_unix_ms = Some(now);
-    }
-    let event = AutomationEventRecord {
-        at_unix_ms: now,
-        watcher_id: watcher_id.to_owned(),
-        level: level.to_owned(),
-        action: action.to_owned(),
-        message: message.to_owned(),
-        service_id,
-    };
-    append_automation_event(paths, &event)?;
-
-    let audit_watcher_id = (watcher_id != "rocmd").then(|| watcher_id.to_owned());
-    append_audit_event(
-        paths,
-        &AuditEventRecord {
-            at_unix_ms: now,
-            source: "rocmd".to_owned(),
-            category: "automation".to_owned(),
-            actor: audit_watcher_id
-                .as_deref()
-                .map_or_else(|| "rocmd".to_owned(), |id| format!("watcher:{id}")),
-            level: level.to_owned(),
-            action: action.to_owned(),
-            message: message.to_owned(),
-            watcher_id: audit_watcher_id,
-            service_id: event.service_id,
-        },
-    )
-}
-
 fn queue_proposal(
     paths: &AppPaths,
     watcher_id: &str,
@@ -5152,32 +4961,6 @@ fn proposal_arguments_for_action(action: &str, service_id: Option<&str>) -> Valu
     }
 }
 
-fn load_managed_services(paths: &AppPaths) -> Result<Vec<ManagedServiceRecord>> {
-    let services_dir = paths.services_dir();
-    if !services_dir.is_dir() {
-        return Ok(Vec::new());
-    }
-
-    let mut records = Vec::new();
-    for entry in fs::read_dir(&services_dir)
-        .with_context(|| format!("failed to read {}", services_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        if let Ok(record) = serde_json::from_slice::<ManagedServiceRecord>(&bytes) {
-            records.push(record);
-        }
-    }
-
-    records.sort_by_key(|record| std::cmp::Reverse(record.created_at_unix_ms));
-    Ok(records)
-}
-
 #[cfg(unix)]
 fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
     let mut command = ProcessCommand::new("setsid");
@@ -5193,9 +4976,244 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{temp_app_paths, unique_test_root, workspace_test_artifact_dir};
     use clap::CommandFactory;
     use rocm_core::ModelRecipeArtifactSourcePolicyRecord;
     use std::path::PathBuf;
+
+    #[test]
+    fn remote_read_only_verbs_are_allowed_and_mutating_ones_are_not() {
+        let allow = |args: &[&str]| {
+            let owned = args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+            super::ensure_rocm_command_is_read_only(&owned)
+        };
+
+        // These read: the local tailnet, another machine's state, sessions that
+        // already exist. Rejecting them made the whole family unusable here even
+        // though none of them change anything.
+        for args in [
+            &["remote", "targets"][..],
+            &["remote", "targets", "--tag", "gpu"][..],
+            &["remote", "doctor", "gpu-box"][..],
+            &["remote", "status"][..],
+        ] {
+            allow(args).unwrap_or_else(|error| panic!("{args:?} should be read-only: {error:#}"));
+        }
+
+        // These start, publish or tear down, so they go through approval.
+        for args in [
+            &["remote", "serve", "gpu-box", "a-model"][..],
+            &["remote", "attach", "sess"][..],
+            &["remote", "stop", "sess"][..],
+            &["remote"][..],
+        ] {
+            assert!(allow(args).is_err(), "{args:?} must not be read-only");
+        }
+    }
+
+    /// Drive `supervise_service` far enough to reach the key guard, and return
+    /// what it did.
+    ///
+    /// The guard sits before the manifest write and well before any spawn, so a
+    /// refusal returns without starting a process — which is what makes the real
+    /// call site testable at all. The arguments below are the shape a recovery
+    /// re-exec passes: a loopback bind, no GPU, no recipe.
+    ///
+    /// This exists because testing `ensure_public_service_has_endpoint_key`
+    /// directly with literal arguments cannot catch the defect that actually
+    /// happened twice in this crate's history — the guard being *wired up* with
+    /// the wrong value at its call site.
+    ///
+    /// Bounded, and the bound is the assertion. A guard that fails to refuse
+    /// does not return an error — it falls through to the engine spawn and
+    /// supervises a child that never exits, so an unbounded call would hang the
+    /// suite instead of failing it. Both callers below are regression tests for
+    /// a fail-*open*, which is exactly the shape that turns into a hang.
+    fn supervise_at_the_guard(paths: &AppPaths, service_id: &str) -> Result<()> {
+        let paths = paths.clone();
+        let service_id = service_id.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = supervise_service(
+                &paths,
+                service_id,
+                "llamacpp".to_owned(),
+                "a-model".to_owned(),
+                "a-model".to_owned(),
+                None,
+                None,
+                "127.0.0.1".to_owned(),
+                11434,
+                "gpu_required".to_owned(),
+                None,
+                None,
+            );
+            let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "supervise_service did not return within 30s: the key guard let the call \
+                     through and it reached the engine spawn, which is the fail-open this test \
+                     exists to catch"
+                )
+            })
+            .map_err(anyhow::Error::msg)
+    }
+
+    /// Write a service record into the registry the way a live service would
+    /// have left it behind.
+    fn seed_registry(paths: &AppPaths, service_id: &str, requires_api_key: bool) {
+        fs::create_dir_all(paths.services_dir()).unwrap();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id.to_owned(),
+            "llamacpp".to_owned(),
+            "a-model".to_owned(),
+            "a-model".to_owned(),
+            "127.0.0.1".to_owned(),
+            11434,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.requires_api_key = requires_api_key;
+        record.write().unwrap();
+    }
+
+    /// Drive `supervise_service` and report whether the key guard let it past.
+    ///
+    /// Decided on what the call *returns*, not on any file. The obvious
+    /// observable — the manifest appearing — is useless here, because
+    /// `seed_registry` has already written one, so polling for it passes
+    /// whatever the guard does. That mistake was made first and caught by
+    /// mutating the code the test claims to protect.
+    ///
+    /// A call the guard admits does not return: it carries on to the engine
+    /// spawn. So the guard's refusal is the only thing that comes back quickly,
+    /// and it is identified by its message rather than by the mere fact of an
+    /// error — a later, unrelated failure must not read as a refusal.
+    fn guard_admits(paths: &AppPaths, service_id: &str) -> bool {
+        let owned_paths = paths.clone();
+        let owned_id = service_id.to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = supervise_service(
+                &owned_paths,
+                owned_id,
+                "llamacpp".to_owned(),
+                "a-model".to_owned(),
+                "a-model".to_owned(),
+                None,
+                None,
+                "127.0.0.1".to_owned(),
+                11434,
+                "gpu_required".to_owned(),
+                None,
+                None,
+            );
+            let _ = sender.send(outcome.map_err(|error| format!("{error:#}")));
+        });
+
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            // The key guard refused, by its own words.
+            Ok(Err(rendered)) if rendered.contains("without authentication") => false,
+            // Anything else means it got past the guard: it either finished, or
+            // failed later for a reason that is not this guard, or is still
+            // running because it reached the spawn.
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn a_service_that_never_required_a_key_is_not_refused_for_lacking_one() {
+        // The other direction of the guard, and the one no test covered.
+        // Hardcoding `record.requires_api_key = true` at the restore site passes
+        // every other test in this crate, because they all seed a service that
+        // *does* require a key. This is the case that catches it.
+        //
+        // Two records are seeded, not one: with a single record the
+        // `existing.service_id == record.service_id` half of the lookup does
+        // nothing, so dropping that comparison would go unnoticed and one
+        // service's requirement would leak onto another's.
+        let (root, paths) = temp_app_paths("supervise-no-key-needed");
+        seed_registry(&paths, "svc-needs-key", true);
+        seed_registry(&paths, "svc-plain", false);
+
+        assert!(
+            guard_admits(&paths, "svc-plain"),
+            "a loopback service that never asked for a key must not be refused for lacking one"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn supervising_a_service_that_required_a_key_refuses_when_the_key_is_gone() {
+        // The real call site, not the guard in isolation. `supervise_service`
+        // rebuilds the record with `ManagedServiceRecord::new`, which starts
+        // `requires_api_key` false, and restores it from the registry. Passing
+        // the wrong value here — a literal, or the freshly-built field before it
+        // is restored — is exactly the miswiring that shipped twice in this
+        // crate and that a literal-argument unit test cannot see.
+        let (root, paths) = temp_app_paths("supervise-requires-key");
+        seed_registry(&paths, "svc-needs-key", true);
+
+        let error = supervise_at_the_guard(&paths, "svc-needs-key")
+            .expect_err("a service that required a key must not be recovered without one");
+        assert!(
+            format!("{error:#}").contains("without authentication"),
+            "{error:#}"
+        );
+
+        // And the refusal must not have weakened what is on disk. The guard runs
+        // before `record.write()` precisely so a refused attempt leaves the
+        // recorded requirement armed for the next attempt.
+        let stored = persistence::load_managed_services(&paths).unwrap();
+        let stored = stored
+            .iter()
+            .find(|candidate| candidate.service_id == "svc-needs-key")
+            .expect("the seeded record must survive a refused recovery");
+        assert!(
+            stored.requires_api_key,
+            "a refused recovery must not disarm the requirement"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registry_that_cannot_be_read_refuses_recovery_rather_than_assuming_no_key() {
+        // `load_managed_services` already skips records it cannot parse, so an
+        // `Err` from it is a real I/O failure — and a missing directory is `Ok`.
+        // Defaulting it away therefore says "no service ever required a key",
+        // which is fail-open on an auth gate and, worse, gets written back.
+        //
+        // The failure is provoked portably: a directory named like a record
+        // makes the `fs::read` inside the loop fail rather than the read_dir.
+        let (root, paths) = temp_app_paths("supervise-unreadable-registry");
+        fs::create_dir_all(paths.services_dir().join("not-a-record.json")).unwrap();
+
+        let error = supervise_at_the_guard(&paths, "svc-unknown")
+            .expect_err("an unreadable registry must refuse, not assume no key was required");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("could not read the service registry"),
+            "{rendered}"
+        );
+
+        // Nothing was written: a registry we could not read is not a registry we
+        // may add a weakened record to.
+        assert!(
+            !paths.service_manifest_path("svc-unknown").exists(),
+            "a refused recovery must not persist a record"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// Regression: a failed write must not leave a `.tmp-*` scratch file
     /// behind. The name is unique per attempt, so before this an orphan
@@ -5743,6 +5761,34 @@ mod tests {
     }
 
     #[test]
+    fn rocm_command_helper_treats_runtimes_uninstall_dry_run_as_read_only() -> Result<()> {
+        // Mirrors the bin's chat_rocm_command_action_from_args classifier so a
+        // dry-run preview stays read-only on every binary's tool surface while
+        // an actual uninstall/remove still requires approval.
+        for verb in ["uninstall", "remove"] {
+            let dry_run_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb, "--dry-run"] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            ensure_rocm_command_is_read_only(&dry_run_args)
+                .unwrap_or_else(|_| panic!("runtimes {verb} --dry-run should be read-only"));
+
+            let mutating_args = normalized_rocm_command_args(
+                serde_json::json!({ "args": ["runtimes", verb] })
+                    .as_object()
+                    .expect("json object"),
+            )?;
+            let error = match ensure_rocm_command_is_read_only(&mutating_args) {
+                Ok(()) => panic!("runtimes {verb} without --dry-run must go through approval"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("approval UI"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn storage_report_is_read_only_but_removal_is_not() -> Result<()> {
         for args in [vec!["storage"], vec!["storage", "report"]] {
             let normalized = normalized_rocm_command_args(
@@ -5768,24 +5814,6 @@ mod tests {
     }
 
     #[test]
-    fn gpu_snapshot_respects_disabled_telemetry_policy() {
-        let mut config = RocmCliConfig::default();
-        config.telemetry.mode = rocm_core::TELEMETRY_MODE_OFF.to_owned();
-
-        let snapshot = gather_gpu_snapshot_for_config(&config);
-
-        assert!(!snapshot.amd_smi_available);
-        assert!(snapshot.static_snapshot.is_none());
-        assert!(snapshot.monitor_snapshot.is_none());
-        assert!(
-            snapshot
-                .note
-                .as_deref()
-                .is_some_and(|note| note.contains("disabled by rocm-cli config"))
-        );
-    }
-
-    #[test]
     fn read_tail_lines_returns_last_lines_only() -> Result<()> {
         let path = unique_test_path(&format!(
             "rocmd-tail-test-{}-{}.log",
@@ -5796,23 +5824,6 @@ mod tests {
         let tail = read_tail_lines(&path, 2)?;
         fs::remove_file(&path)?;
         assert_eq!(tail, "line3\nline4");
-        Ok(())
-    }
-
-    #[test]
-    fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
-        let (root, paths) = temp_app_paths("engine-plugin");
-        let plugin_dir = paths.data_dir.join("engines").join("plugins");
-        fs::create_dir_all(&plugin_dir)?;
-        let plugin_path = plugin_dir.join(
-            rocm_engine_protocol::platform_engine_plugin_binary_name("vllm"),
-        );
-        fs::write(&plugin_path, "plugin")?;
-
-        let discovered = find_engine_plugin_binary("vllm", engine_plugin_dirs(&paths))?;
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(discovered, Some(plugin_path));
         Ok(())
     }
 
@@ -5879,6 +5890,70 @@ mod tests {
             error.to_string().contains("allow_system_prefix=true"),
             "{error:#}"
         );
+    }
+
+    /// The test above only ever hands `system_prefix_requires_ack` an
+    /// already-canonical path, so it cannot catch the bug this crate's fix
+    /// addresses: a `..`-respelled prefix that escapes `$HOME` used to compare
+    /// equal to a path still inside it (`Path::ancestors()` treats `..` as an
+    /// ordinary component), so acknowledgement was never required. Drive the
+    /// same check with a prefix built by walking `..` out of the real home
+    /// directory, which is exactly the shape the original bug let through.
+    #[test]
+    #[cfg(unix)]
+    fn install_sdk_rejects_system_prefix_reached_by_escaping_home() {
+        let home = rocm_core::runtime_home_dir().expect("a home directory");
+        let escaped_prefix = format!("{}/../../usr", home.display());
+
+        let arguments =
+            serde_json::Map::from_iter([("prefix".to_owned(), Value::String(escaped_prefix))]);
+        let error = build_install_sdk_args(&arguments, false).unwrap_err();
+        assert!(
+            error.to_string().contains("allow_system_prefix=true"),
+            "{error:#}"
+        );
+    }
+
+    /// The `install_sdk` MCP tool spawns `rocm` with null stdin, so a real
+    /// install over an active default managed runtime would hit the approval
+    /// gate's non-interactive refusal and bail asking for a flag no MCP caller
+    /// can pass. The real-install argv must therefore carry the consent flag;
+    /// the dry-run argv must not, because a dry run never reaches the gate and
+    /// the flag there would claim an approval the caller did not give.
+    ///
+    /// It must be `--approve-replacing-active-default` and never `--yes`:
+    /// `--yes` additionally approves running `sudo` for required system
+    /// packages, and a null-stdin spawn has no terminal on which that password
+    /// prompt could be answered.
+    #[test]
+    fn install_sdk_real_install_args_approve_only_the_runtime_replacement() -> Result<()> {
+        let arguments = serde_json::Map::new();
+
+        let real = build_install_sdk_args(&arguments, false)?;
+        assert!(
+            real.contains(&"--approve-replacing-active-default".to_owned()),
+            "real install argv must approve the replacement for the null-stdin spawn: {real:?}"
+        );
+        assert!(
+            !real.contains(&"--yes".to_owned()),
+            "real install argv must not grant the system-package consent it cannot answer: {real:?}"
+        );
+        assert!(
+            !real.contains(&"--dry-run".to_owned()),
+            "real install argv must not be a dry run: {real:?}"
+        );
+
+        let dry = build_install_sdk_args(&arguments, true)?;
+        assert!(
+            !dry.contains(&"--approve-replacing-active-default".to_owned())
+                && !dry.contains(&"--yes".to_owned()),
+            "dry-run argv must not carry a consent flag: {dry:?}"
+        );
+        assert!(
+            dry.contains(&"--dry-run".to_owned()),
+            "dry-run argv must carry --dry-run: {dry:?}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -7111,7 +7186,7 @@ mod tests {
             &mut state,
             &event,
             |_paths| {
-                Ok(sandbox_driver_plan_value(CommandCapture {
+                Ok(sandbox_driver_plan_value(common::CommandCapture {
                     argv: vec![
                         "rocm".to_owned(),
                         "install".to_owned(),
@@ -7373,140 +7448,6 @@ mod tests {
     }
 
     #[test]
-    fn healthcheck_readiness_requires_ready_loaded_model() {
-        let ready = HealthcheckResponse {
-            status: "ready".to_owned(),
-            model_loaded: true,
-            device: "cuda".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(healthcheck_response_ready(&ready));
-
-        let mut loading = ready.clone();
-        loading.status = "loading_model".to_owned();
-        assert!(!healthcheck_response_ready(&loading));
-
-        let mut unloaded = ready;
-        unloaded.model_loaded = false;
-        assert!(!healthcheck_response_ready(&unloaded));
-    }
-
-    #[test]
-    fn healthcheck_recoverability_tracks_failed_endpoint_state() {
-        let mut response = HealthcheckResponse {
-            status: "ready".to_owned(),
-            model_loaded: true,
-            device: "cuda".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(!healthcheck_response_recoverable(&response));
-
-        response.status = "unreachable".to_owned();
-        assert!(healthcheck_response_recoverable(&response));
-
-        response.status = "failed".to_owned();
-        assert!(healthcheck_response_recoverable(&response));
-
-        response.status = "loading_model".to_owned();
-        assert!(!healthcheck_response_recoverable(&response));
-
-        // The status the engines report for a model that is listed but has not
-        // yet served an inference request. Restarting it would kill a model
-        // mid-load and start the wait over.
-        response.status = "loading".to_owned();
-        assert!(!healthcheck_response_recoverable(&response));
-    }
-
-    #[test]
-    fn healthcheck_readiness_withheld_while_the_model_only_lists() {
-        // What an engine reports once `/v1/models` answers but inference has not:
-        // not ready, so `rocm serve` keeps waiting instead of handing the caller
-        // an endpoint that will hang on its first request.
-        let listing_only = HealthcheckResponse {
-            status: "loading".to_owned(),
-            model_loaded: false,
-            device: "unknown".to_owned(),
-            uptime_sec: 1,
-            queue_depth: 0,
-            last_error: None,
-            tokens_per_sec: None,
-        };
-        assert!(!healthcheck_response_ready(&listing_only));
-    }
-
-    #[test]
-    fn apply_endpoint_key_env_sets_var_only_when_key_file_present() {
-        let (_root, paths) = temp_app_paths("apply-endpoint-key-env");
-        let service_id = "svc-endpoint-key-env";
-
-        // Loopback service: no key file has ever been written, so the child's
-        // environment must be left untouched.
-        let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
-        assert!(
-            command
-                .get_envs()
-                .all(|(key, _)| key != rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
-            "loopback service must not receive the endpoint key env var"
-        );
-
-        // Public service: once a key file exists at the deterministic path,
-        // it must be threaded onto the child so the engine's HTTP probe
-        // authenticates.
-        let key_path = rocm_engine_protocol::endpoint_key_file_path(&paths, service_id);
-        fs::create_dir_all(paths.services_dir()).unwrap();
-        fs::write(&key_path, "secret-key").unwrap();
-        let mut command = ProcessCommand::new("true");
-        assert!(apply_endpoint_key_env(&mut command, &paths, service_id));
-        let env_value = command
-            .get_envs()
-            .find_map(|(key, value)| {
-                (key == rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV)
-                    .then_some(value)
-                    .flatten()
-            })
-            .expect("endpoint key env var must be set once the key file exists");
-        assert_eq!(env_value, key_path.as_os_str());
-
-        // An empty (or otherwise unusable) key file is not a key: the engine
-        // adapters would enforce nothing, so reporting `true` here would let the
-        // respawn guard pass and still open an anonymous public listener.
-        fs::write(&key_path, "   \n").unwrap();
-        let mut command = ProcessCommand::new("true");
-        assert!(!apply_endpoint_key_env(&mut command, &paths, service_id));
-        assert!(
-            command
-                .get_envs()
-                .all(|(key, _)| key != rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV),
-            "an unusable key file must not be threaded onto the child"
-        );
-    }
-
-    #[test]
-    fn recovery_respawn_fails_closed_for_a_public_service_without_a_key() {
-        // Daemon recovery re-execs `rocmd supervise` for the recorded host. With
-        // the key gone the child would listen on that public host anonymously,
-        // so the spawn must be refused instead.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false).unwrap_err();
-        assert!(
-            error.to_string().contains("without authentication"),
-            "{error:#}"
-        );
-
-        ensure_public_service_has_endpoint_key("0.0.0.0", true).unwrap();
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false)
-                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
-        }
-    }
-
-    #[test]
     fn manifest_recovery_policy_covers_terminal_and_stale_transient_states() {
         let (root, paths) = temp_app_paths("manifest-recovery-policy");
         let mut record = ManagedServiceRecord::new(
@@ -7613,52 +7554,6 @@ mod tests {
     }
 
     #[test]
-    fn record_event_mirrors_watcher_actions_to_audit_log() -> Result<()> {
-        let (root, paths) = temp_app_paths("record-event-audit");
-        let mut state = AutomationRuntimeState {
-            running: true,
-            automations_enabled: true,
-            daemon_pid: 1,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 1,
-            local_webhook_endpoint: None,
-            active_watchers: vec![WatcherRuntimeSnapshot {
-                id: "server-recover".to_owned(),
-                enabled: true,
-                mode: WatcherMode::Contained,
-                summary: "recover failed managed services".to_owned(),
-                last_event: None,
-                last_event_unix_ms: None,
-            }],
-        };
-
-        record_event(
-            &paths,
-            &mut state,
-            "server-recover",
-            "info",
-            "restart_managed_service",
-            "restarted failed managed service svc-1",
-            Some("svc-1".to_owned()),
-        )?;
-
-        let automation_text = fs::read_to_string(paths.automation_events_path())?;
-        let automation_event =
-            serde_json::from_str::<AutomationEventRecord>(automation_text.trim())?;
-        let audit_text = fs::read_to_string(paths.audit_events_path())?;
-        let audit_event = serde_json::from_str::<AuditEventRecord>(audit_text.trim())?;
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(automation_event.watcher_id, "server-recover");
-        assert_eq!(automation_event.action, "restart_managed_service");
-        assert_eq!(audit_event.category, "automation");
-        assert_eq!(audit_event.actor, "watcher:server-recover");
-        assert_eq!(audit_event.watcher_id.as_deref(), Some("server-recover"));
-        assert_eq!(audit_event.service_id.as_deref(), Some("svc-1"));
-        Ok(())
-    }
-
-    #[test]
     fn server_recover_propose_mode_queues_restart_proposal() -> Result<()> {
         let (root, paths) = temp_app_paths("server-recover-proposal");
         paths.ensure()?;
@@ -7743,7 +7638,7 @@ mod tests {
             &mut state,
             &event,
             |_paths| {
-                Ok(sandbox_check_updates_value(CommandCapture {
+                Ok(sandbox_check_updates_value(common::CommandCapture {
                     argv: vec!["rocm".to_owned(), "update".to_owned()],
                     exit_status: 0,
                     stdout: "update\n  managed runtimes: none\n".to_owned(),
@@ -7807,7 +7702,7 @@ mod tests {
             &mut state,
             &event,
             |_paths| {
-                Ok(sandbox_check_updates_value(CommandCapture {
+                Ok(sandbox_check_updates_value(common::CommandCapture {
                     argv: vec!["rocm".to_owned(), "update".to_owned()],
                     exit_status: 0,
                     stdout: "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
@@ -7963,7 +7858,7 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_is_read_only_and_preserves_output() {
-        let value = sandbox_check_updates_value(CommandCapture {
+        let value = sandbox_check_updates_value(common::CommandCapture {
             argv: vec!["rocm".to_owned(), "update".to_owned()],
             exit_status: 0,
             stdout: "update\n  runtime release status=up_to_date\n".to_owned(),
@@ -7992,7 +7887,7 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_marks_runtime_update_available() {
-        let value = sandbox_check_updates_value(CommandCapture {
+        let value = sandbox_check_updates_value(common::CommandCapture {
             argv: vec!["rocm".to_owned(), "update".to_owned()],
             exit_status: 0,
             stdout: "update\n  runtime release-pip-gfx120x-all status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
@@ -8031,7 +7926,7 @@ mod tests {
 
     #[test]
     fn sandbox_check_updates_value_marks_runtime_repair_available() {
-        let value = sandbox_check_updates_value(CommandCapture {
+        let value = sandbox_check_updates_value(common::CommandCapture {
             argv: vec!["rocm".to_owned(), "update".to_owned()],
             exit_status: 0,
             stdout: "update\n  runtime release-wheel-multi-arch-7-14-0 status=repair_available installed=7.14.0 latest=7.14.0\n".to_owned(),
@@ -8059,7 +7954,7 @@ mod tests {
 
     #[test]
     fn a_newer_version_outranks_a_composition_repair_in_the_watcher_report() {
-        let value = sandbox_check_updates_value(CommandCapture {
+        let value = sandbox_check_updates_value(common::CommandCapture {
             argv: vec!["rocm".to_owned(), "update".to_owned()],
             exit_status: 0,
             stdout: "update\n  runtime old status=repair_available installed=7.14.0 latest=7.14.0\n  runtime stale status=update_available installed=7.13.0 latest=7.14.0\n".to_owned(),
@@ -8074,7 +7969,7 @@ mod tests {
 
     #[test]
     fn sandbox_driver_plan_value_is_read_only_and_preserves_output() {
-        let value = sandbox_driver_plan_value(CommandCapture {
+        let value = sandbox_driver_plan_value(common::CommandCapture {
             argv: vec![
                 "rocm".to_owned(),
                 "install".to_owned(),
@@ -9205,39 +9100,10 @@ mod tests {
         Ok(format!("http://{addr}/artifact.bin"))
     }
 
-    fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-        let root = unique_test_root(&format!(
-            "rocmd-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
-        ));
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        (root, paths)
-    }
-
-    fn unique_test_root(label: &str) -> PathBuf {
-        let root = workspace_test_artifact_dir().join(label);
-        fs::create_dir_all(&root).expect("create workspace-local test root");
-        root
-    }
-
     fn unique_test_path(label: &str) -> PathBuf {
         let root = workspace_test_artifact_dir();
         fs::create_dir_all(&root).expect("create workspace-local test dir");
         root.join(label)
-    }
-
-    fn workspace_test_artifact_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join(".rocm-work")
-            .join("tests")
-            .join("rocmd")
     }
 
     fn test_watcher_snapshot(
@@ -9281,23 +9147,6 @@ async fn shutdown_signal() {
 #[cfg(not(unix))]
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-}
-
-fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    match rocm_engine_protocol::GpuSelection::parse_cli_value(raw).map_err(anyhow::Error::msg)? {
-        rocm_engine_protocol::GpuSelection::Auto => Ok(Vec::new()),
-        rocm_engine_protocol::GpuSelection::Index(index) => Ok(vec![index]),
-    }
-}
-
-fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
-    match value {
-        Some(value) => vec![flag.to_owned(), value.to_owned()],
-        None => Vec::new(),
-    }
 }
 
 /// Keep only the final visible segment of a `\r`-redrawn progress line.
@@ -9366,6 +9215,12 @@ fn read_new_log_phase(log_path: &Path, pos: &mut u64) -> Option<&'static str> {
     phase
 }
 
+fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
+    Ok(common::healthcheck_response_ready(
+        &common::engine_healthcheck_response(paths, engine, service_id)?,
+    ))
+}
+
 /// Poll a freshly-spawned service until its healthcheck reports ready (or the
 /// timeout elapses), tailing its log file meanwhile and reporting each coarse
 /// startup phase transition via `on_phase`.
@@ -9388,179 +9243,6 @@ fn wait_for_service_ready(
             on_phase(phase);
         }
         if engine_healthcheck_ready(paths, engine, service_id).unwrap_or(false) {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-    false
-}
-
-fn engine_healthcheck_ready(paths: &AppPaths, engine: &str, service_id: &str) -> Result<bool> {
-    Ok(healthcheck_response_ready(&engine_healthcheck_response(
-        paths, engine, service_id,
-    )?))
-}
-
-fn engine_healthcheck_response(
-    paths: &AppPaths,
-    engine: &str,
-    service_id: &str,
-) -> Result<HealthcheckResponse> {
-    engine_request::<_, HealthcheckResponse>(
-        paths,
-        engine,
-        service_id,
-        EngineMethod::Healthcheck,
-        &HealthcheckRequest {
-            service_id: service_id.to_owned(),
-        },
-    )
-}
-
-fn healthcheck_response_ready(response: &HealthcheckResponse) -> bool {
-    response.status == "ready" && response.model_loaded
-}
-
-fn healthcheck_response_recoverable(response: &HealthcheckResponse) -> bool {
-    matches!(
-        response.status.as_str(),
-        "failed" | "unreachable" | "exited"
-    )
-}
-
-/// Re-thread the endpoint key file (public bind only) onto an engine child's
-/// environment, mirroring the initial `rocm serve` spawn. A loopback service
-/// with no stored key leaves the command's environment untouched, matching the
-/// unauthenticated default.
-///
-/// Returns whether a key was applied. Callers that spawn a *listener* must
-/// check it against the service's host — a public bind with no key would come
-/// up anonymous (see [`ensure_public_service_has_endpoint_key`]). Callers that
-/// only make a stdio plugin call can ignore it.
-///
-/// The file must hold a *usable* key, not merely exist: the engine adapters
-/// resolve it with `endpoint_api_key_from_file` and enforce nothing when that
-/// yields `None`, so treating an empty or malformed file as "protected" would
-/// let the guard pass while the endpoint served anonymously.
-#[must_use]
-fn apply_endpoint_key_env(
-    command: &mut ProcessCommand,
-    paths: &AppPaths,
-    service_id: &str,
-) -> bool {
-    if let Some(key_file) = rocm_engine_protocol::endpoint_key_file_if_present(paths, service_id)
-        .and_then(|path| rocm_engine_protocol::endpoint_api_key_file_if_valid(&path))
-    {
-        command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
-        return true;
-    }
-    false
-}
-
-/// Refuse to respawn a recorded service on a public host without its endpoint
-/// API key, so daemon recovery cannot reopen a protected endpoint anonymously.
-///
-/// Mirrors the guard of the same name in `rocm`; the shared
-/// [`rocm_engine_protocol::is_public_bind_host`] keeps the two classifications
-/// identical for a given `ManagedServiceRecord::host`.
-fn ensure_public_service_has_endpoint_key(host: &str, key_present: bool) -> Result<()> {
-    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
-        bail!(
-            "refusing to respawn a service bound to the public host `{host}` without an endpoint \
-             API key: it would come back up without authentication. Relaunch it with \
-             `rocm serve --host {host} --allow-public-bind` to issue a new key."
-        );
-    }
-    Ok(())
-}
-
-fn engine_request<T, R>(
-    paths: &AppPaths,
-    engine: &str,
-    service_id: &str,
-    method: EngineMethod,
-    request: &T,
-) -> Result<R>
-where
-    T: Serialize,
-    R: DeserializeOwned,
-{
-    let envelope = EngineRequestEnvelope {
-        method,
-        payload: serde_json::to_value(request).context("failed to serialize engine request")?,
-    };
-    let engine_binary =
-        std::env::current_exe().context("failed to resolve current rocm executable path")?;
-    let mut command = ProcessCommand::new(&engine_binary);
-    command
-        .arg("__engine-stdio")
-        .arg(engine)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // A protected public endpoint enforces its key on every request, including
-    // this stdio-transported healthcheck — without the carrier the engine
-    // adapter's HTTP probe is unauthenticated and the endpoint looks
-    // unreachable, which would misclassify a healthy protected service as
-    // recoverable.
-    //
-    // No host to check here: this is a stdio plugin call, not a listener, so a
-    // missing key only weakens this probe rather than opening a port.
-    let _ = apply_endpoint_key_env(&mut command, paths, service_id);
-    let mut child = command.spawn().with_context(|| {
-        format!(
-            "failed to spawn engine stdio process {}",
-            engine_binary.display()
-        )
-    })?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("engine stdio child did not expose stdin")?;
-        serde_json::to_writer(&mut *stdin, &envelope).context("failed to write engine request")?;
-        stdin.write_all(b"\n")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("failed waiting for engine stdio response")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if stderr.is_empty() {
-            bail!("engine stdio process exited with status {}", output.status);
-        }
-        bail!(
-            "engine stdio process exited with status {}: {}",
-            output.status,
-            stderr
-        );
-    }
-    let envelope: EngineResponseEnvelope =
-        serde_json::from_slice(&output.stdout).context("failed to parse engine response")?;
-    if !envelope.ok {
-        let detail = envelope.error.map_or_else(
-            || "unknown engine error".to_owned(),
-            |error| format!("{}: {}", error.code, error.message),
-        );
-        bail!(detail);
-    }
-    let data = envelope
-        .data
-        .context("engine response did not include data")?;
-    serde_json::from_value(data).context("failed to deserialize engine response data")
-}
-
-fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
-    let address: SocketAddr = match format_host_port(host, port).parse() {
-        Ok(value) => value,
-        Err(_) => return false,
-    };
-
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok() {
             return true;
         }
         thread::sleep(Duration::from_millis(200));

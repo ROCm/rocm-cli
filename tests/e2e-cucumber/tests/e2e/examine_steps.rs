@@ -40,10 +40,18 @@ async fn setup_wsl_host(world: &mut E2eWorld) {
     );
 }
 
-#[when("the user asks for the version")]
+#[when("the user asks for the version through every CLI surface")]
 async fn user_asks_version(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["version"]);
-    world.cli_output = Some(stdout);
+    world.cli_outputs = Some(
+        [
+            ["version"].as_slice(),
+            ["--version"].as_slice(),
+            ["-V"].as_slice(),
+        ]
+        .into_iter()
+        .map(|args| crate::run_rocm(world, args).0)
+        .collect(),
+    );
 }
 
 #[when("the user lists available engines")]
@@ -76,12 +84,64 @@ async fn user_previews_driver_install_plan(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[then("a version string is returned")]
+#[then("matching traceable version strings are returned")]
 async fn assert_version_returned(world: &mut E2eWorld) {
-    let output = world.cli_output.as_ref().expect("no command was run");
+    let outputs = world.cli_outputs.as_ref().expect("no commands were run");
+    assert_eq!(outputs.len(), 3, "expected all three version surfaces");
+    let (version_output, flag_outputs) = outputs.split_first().expect("three version surfaces");
     assert!(
-        output.trim().starts_with("rocm "),
-        "expected version string starting with 'rocm ': {output}"
+        flag_outputs.windows(2).all(|pair| pair[0] == pair[1]),
+        "-V/--version returned different output: {flag_outputs:?}"
+    );
+
+    // `rocm version` additionally reports the active ROCm SDK and GPU driver,
+    // so only its first line -- the same traceable build string -- has to
+    // match `-V`/`--version`.
+    let version_first_line = version_output.lines().next().unwrap_or_default();
+    assert_eq!(
+        version_first_line,
+        flag_outputs[0].trim(),
+        "`rocm version`'s build line does not match `-V`/`--version`: {outputs:?}"
+    );
+
+    let output = version_first_line.trim();
+    let parsed = output
+        .strip_prefix("rocm-cli ")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.split_once(" ("))
+        .and_then(|(version, rest)| {
+            rest.split_once(", ")
+                .map(|(reference, hash)| (version, reference, hash))
+        });
+    let Some((version, reference, hash)) = parsed else {
+        panic!("expected 'rocm-cli <version> (<ref>, <hash>)': {output}");
+    };
+    assert!(!version.is_empty(), "version is empty: {output}");
+    assert!(!reference.is_empty(), "version ref is empty: {output}");
+    assert_ne!(
+        reference, "unknown",
+        "version ref did not resolve: {output}"
+    );
+    assert!(
+        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "version hash is not hexadecimal: {output}"
+    );
+
+    // `rocm version`'s own two lines beyond the build string. Both are printed
+    // unconditionally (either the detected value or a "not detected"/"unmanaged"
+    // variant), so their presence -- not their value, which depends on the host
+    // -- is what this surface promises.
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("ROCm SDK:")),
+        "`rocm version` did not report the ROCm SDK line:\n{version_output}"
+    );
+    assert!(
+        version_output
+            .lines()
+            .any(|line| line.starts_with("GPU driver:")),
+        "`rocm version` did not report the GPU driver line:\n{version_output}"
     );
 }
 
@@ -180,6 +240,44 @@ async fn assert_all_engines_listed(world: &mut E2eWorld) {
             "engine '{engine}' not found in:\n{output}"
         );
     }
+}
+
+#[then("the engine listing explains the default-engine marker")]
+async fn engine_listing_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the listing")]
+async fn host_default_engine_marked_in_listing(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("* {expected}")),
+        "expected '{expected}' marked as the default engine, got:\n{output}"
+    );
+}
+
+#[then("the inspection explains the default-engine marker")]
+async fn inspection_explains_default_marker(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    assert!(
+        output.contains("legend: * = default engine"),
+        "expected the default-engine marker legend in examine output, got:\n{output}"
+    );
+}
+
+#[then("the host's default engine is marked in the inspection's engine inventory")]
+async fn host_default_engine_marked_in_inspection(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no command was run");
+    let expected = &e2e_cucumber::capability::host_capability().effective_serve_engine;
+    assert!(
+        output.contains(&format!("  * {expected} ")),
+        "expected '{expected}' marked as the default engine in engine_inventory, got:\n{output}"
+    );
 }
 
 #[then("the inspection reports Linux as the operating system")]
@@ -298,6 +396,91 @@ async fn user_inspects_both_ways(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+/// The runtime key config names as active while the registry holds nothing.
+const FORGOTTEN_RUNTIME_KEY: &str = "release-tarball-gfx942";
+
+/// Where the `Given` plants that folder, recomputed rather than carried on the
+/// World: it is a pure function of the scenario's isolated root, so a field
+/// would only be a second place for it to be wrong.
+fn planted_setup_runtime_root(world: &E2eWorld) -> std::path::PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("setup-runtime")
+}
+
+#[given("setup names a runtime folder the registry has forgotten")]
+async fn setup_names_folder_registry_forgot(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let install_root = planted_setup_runtime_root(world);
+    std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    // The install tree's own copy of its manifest. This is what makes the
+    // registry entry recoverable, so planting it is what makes the scenario's
+    // ordering load-bearing: run the text form first and
+    // `recover_setup_runtime_registration` re-files this into the registry,
+    // after which `--json` can resolve `active_runtime_root` without having
+    // earned it. Without this file recovery bails and both orders agree.
+    let manifest = serde_json::json!({
+        "runtime_key": FORGOTTEN_RUNTIME_KEY,
+        // `:` is safe in a field value; only the registry filename comes from
+        // `runtime_key`.
+        "runtime_id": "therock-release:gfx942",
+        "channel": "release",
+        "format": "tarball",
+        "family": "gfx942",
+        "family_source": "manual",
+        "version": "1.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/release-tarball-gfx942.tar.gz",
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write local runtime manifest");
+    // Black-box: plain JSON matching the CLI's on-disk config schema, not a
+    // typed import from the crates. Every field defaults, so naming these two
+    // is enough. The isolated registry starts empty, which IS the state under
+    // test.
+    let config = serde_json::json!({
+        "active_runtime_key": FORGOTTEN_RUNTIME_KEY,
+        "setup": { "therock_venv": install_root },
+    });
+    std::fs::write(
+        root.path().join("config").join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user inspects the system for scripting before reading")]
+async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
+    // The order is the scenario. The `Given` plants an install tree the text
+    // form's `recover_setup_runtime_registration` can re-file the registry
+    // entry from, so running it first would hand the machine-readable form an
+    // `active_runtime_root` it is supposed to have no way to resolve — swap
+    // these two lines and the last `Then` fails. The text form still runs,
+    // second, so the comparison step can hold the two to each other.
+    let (json, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    let (human, _, _) = crate::run_rocm(world, &["examine"]);
+    world.cli_stderr = Some(human);
+    world.cli_output = Some(json);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user inspects the system in machine-readable form")]
+async fn user_inspects_for_scripting(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects the system without probing frameworks")]
 async fn user_inspects_skipping_frameworks(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -328,6 +511,18 @@ const FACTS_A_TOOL_ALSO_NEEDS: &[(&str, &[&str])] = &[
         &["managed_runtimes", "managed_runtime_count"],
     ),
     ("config_dir", &["config_dir"]),
+    // Where the active runtime lives. A caller holding the key cannot compute
+    // this: `install sdk --prefix`, `runtimes adopt` and `runtimes import` all
+    // set `install_root` freely.
+    ("active_runtime_root", &["active_runtime_root"]),
+    // Setup's folder, which is a different fact from the active runtime's: it
+    // can name a stale or removed install while another runtime is active, and
+    // it is readable when the registry is not.
+    ("setup_runtime_root", &["setup_runtime_root"]),
+    (
+        "setup_runtime_pip_cache_dir",
+        &["setup_runtime_pip_cache_dir"],
+    ),
 ];
 
 /// Every field name appearing anywhere in the document, at any depth.
@@ -364,6 +559,85 @@ fn human_states(human: &str, label: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[then("the framework report names the runtime's interpreter")]
+async fn assert_framework_names_the_runtimes_interpreter(world: &mut E2eWorld) {
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let value = parsed_json(world);
+    // Read the runtime from the machine-readable form, which is the one this
+    // scenario is about. Asserted rather than branched on: the scenario's
+    // `Given` activates one, so its absence is a broken precondition, and
+    // silently falling through to the `PATH` case is how this scenario would
+    // stop testing anything.
+    let Some(root) = value
+        .pointer("/summary/active_runtime_root")
+        .and_then(serde_json::Value::as_str)
+    else {
+        panic!("the scenario activates a managed runtime, but `--json` names none:\n{value:#}")
+    };
+    // Both forms resolve the active manifest the same way, so a disagreement
+    // means one of the two paths is looking at a different runtime. What this
+    // cannot see: were the registry entry missing, the human run — which goes
+    // first — would re-file it before `--json` ever looked. examine-16 plants
+    // exactly that state and runs the machine-readable form first, so the
+    // divergence stays visible there.
+    if let Some(stated) = human_states(human, "active_runtime_root") {
+        assert_eq!(
+            root, stated,
+            "the two forms name different roots for the same active runtime"
+        );
+    }
+
+    let source = value
+        .get("framework_source")
+        .and_then(serde_json::Value::as_str)
+        .expect("`examine --json` must report which interpreter answered");
+    assert_eq!(
+        source, "managed-runtime",
+        "this host's active runtime is {root}, and its torch -- not the ambient \
+         interpreter's -- is the one the engines will load"
+    );
+
+    let named_interpreter = value
+        .get("framework_notes")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|notes| {
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|note| note.split_once("active managed runtime's interpreter: "))
+                .map(|(_, path)| path.trim().to_owned())
+                .find(|path| !path.is_empty())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the report must name the interpreter it used (runtime root here is \
+                 {root}): {:?}",
+                value.get("framework_notes")
+            )
+        });
+
+    // The containment check is restored where it holds rather than dropped
+    // outright. It was right for a runtime this CLI installed -- `install sdk`
+    // builds the venv under `install_root`, so an interpreter outside it means
+    // the report is describing some OTHER runtime than the active one -- and
+    // wrong only for an imported or adopted runtime, which records an
+    // interpreter that can sit anywhere. Those are exactly the runtimes the
+    // report calls `read-only`, so gating on the mode it already prints keeps
+    // the guard and drops the false-fail that made it go away. Absent mode:
+    // skip, rather than guess.
+    if human_states(human, "active_runtime_mode").as_deref() == Some("managed") {
+        assert!(
+            std::path::Path::new(&named_interpreter).starts_with(root),
+            "a managed runtime keeps its interpreter under its own root, so naming \
+             {named_interpreter} instead of something under {root} means the framework \
+             report is describing a different runtime than the active one"
+        );
+    }
+}
+
 #[then("the machine-readable form states everything the readable one does")]
 async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
     let human = world
@@ -387,6 +661,65 @@ async fn assert_json_states_what_human_does(world: &mut E2eWorld) {
         "the machine-readable form withholds what the readable one states:\n{}\n\n\
          A caller reading `--json` cannot learn these without scraping text.",
         withheld.join("\n")
+    );
+}
+
+#[then("the machine-readable form names the setup runtime folder")]
+async fn assert_json_names_setup_runtime_folder(world: &mut E2eWorld) {
+    let planted = planted_setup_runtime_root(world).display().to_string();
+    let human = world
+        .cli_stderr
+        .as_ref()
+        .expect("the human report was not captured");
+    let value = parsed_json(world);
+    // The folder itself against what the `Given` planted, which is the
+    // correctness half: two forms agreeing on a wrong path would still agree.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_root")
+            .and_then(serde_json::Value::as_str),
+        Some(planted.as_str()),
+        "config names the setup runtime folder and the text form prints it, so a \
+         caller reading `--json` must not have to scrape text for it:\n{value:#}"
+    );
+    // The pip cache against the TEXT form rather than a path built here.
+    // `managed_pip_cache_dir` runs its argument through
+    // `normalize_runtime_path_for_host`, which rewrites separators and the drive
+    // letter on Windows; re-deriving it in the test would re-implement that and
+    // fail on the Windows lane for a product that is behaving. Holding the two
+    // forms to each other is also the fact this ticket is about.
+    assert_eq!(
+        value
+            .pointer("/summary/setup_runtime_pip_cache_dir")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        human_states(human, "setup_runtime_pip_cache_dir"),
+        "the pip cache is the text form's sibling fact, derived from the same \
+         folder, so the two forms must not name different ones:\n{value:#}"
+    );
+}
+
+#[then("it does not pass that folder off as the active runtime's")]
+async fn assert_json_keeps_setup_and_active_apart(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    // Without this the scenario would pass on a host where nothing is active at
+    // all, which is not the state the two fields have to stay distinct in.
+    assert!(
+        value
+            .pointer("/summary/active_runtime_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty()),
+        "the planted config names an active runtime key:\n{value:#}"
+    );
+    // Setup's folder is where setup was pointed, which can be a stale or removed
+    // install while a different runtime is active. Answering `active_runtime_root`
+    // with it would mislabel, so the unresolvable root stays null.
+    assert_eq!(
+        value.pointer("/summary/active_runtime_root"),
+        Some(&serde_json::Value::Null),
+        "no registry entry resolves, so the active runtime has no root to name — \
+         reporting setup's folder here would be a different fact under this \
+         label:\n{value:#}"
     );
 }
 
@@ -581,5 +914,362 @@ async fn assert_gpu_target_matches_kfd(world: &mut E2eWorld) {
         reported, expected,
         "examine reported {reported}, but KFD reports gfx_target_version {packed} \
          ({major}.{minor}.{revision} = {expected})\n{output}"
+    );
+}
+
+/// The `gfx_target_version` of every GPU the KFD topology describes, read
+/// straight from sysfs.
+///
+/// `None` when the topology is unreadable, which is the normal case off Linux.
+/// CPU nodes report a `gfx_target_version` of `0` and are skipped, so the length
+/// is the kernel's own GPU count and the values say whether those GPUs are all
+/// the same part.
+fn kfd_gpu_node_versions() -> Option<Vec<u32>> {
+    let mut versions = Vec::new();
+    for entry in std::fs::read_dir("/sys/class/kfd/kfd/topology/nodes")
+        .ok()?
+        .flatten()
+    {
+        let Ok(properties) = std::fs::read_to_string(entry.path().join("properties")) else {
+            continue;
+        };
+        let version = properties.lines().find_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next()? != "gfx_target_version" {
+                return None;
+            }
+            parts.next()?.parse::<u32>().ok()
+        });
+        if let Some(value) = version.filter(|value| *value != 0) {
+            versions.push(value);
+        }
+    }
+    Some(versions)
+}
+
+/// Whether `lspci` is on PATH, which is what supplies the PCI addresses this
+/// step asserts. Without it the CLI's topology fallback is the right answer and
+/// there is nothing here to check.
+fn host_has_lspci() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("lspci").is_file()))
+}
+
+#[then("it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target")]
+async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
+    let Some(versions) = kfd_gpu_node_versions().filter(|versions| !versions.is_empty()) else {
+        return;
+    };
+    if !host_has_lspci() {
+        return;
+    }
+    let expected = versions.len();
+    let json = parsed_json(world);
+    let gpus = json
+        .get("gpus")
+        .and_then(serde_json::Value::as_array)
+        .expect("`examine --json` did not report a gpus array");
+    let amd: Vec<&serde_json::Value> = gpus
+        .iter()
+        .filter(|gpu| gpu.get("is_amd").and_then(serde_json::Value::as_bool) == Some(true))
+        .collect();
+
+    assert_eq!(
+        amd.len(),
+        expected,
+        "the kernel describes {expected} GPU node(s) but the report lists {} AMD GPU(s): {gpus:#?}",
+        amd.len()
+    );
+    for gpu in &amd {
+        let pci_id = gpu
+            .get("pci_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !pci_id.is_empty(),
+            "an AMD GPU was reported without a PCI address, so it came from the \
+             topology fallback rather than the PCI enumeration: {gpu:#?}"
+        );
+    }
+
+    // The other half of the enumeration: each listed card must also carry the
+    // target the kernel attributes to it. `lspci` cannot supply one -- it reads
+    // a marketing name, and on an Instinct host `pci.ids` often spells that
+    // "Device 74a1" -- so on a box without `rocminfo` the per-node target from
+    // the topology is the only thing that can fill `gfx_target`, and that fill
+    // is what makes the field non-empty here.
+    //
+    // Gated on the topology being uniform, on the same premise-failure footing
+    // as the guards above: where nodes disagree, which target belongs to which
+    // card is a question this step cannot answer from a node count alone, so it
+    // says nothing rather than something it has not established. The other
+    // premise -- node count equal to the number of AMD entries -- is already
+    // guaranteed by the assertion above, which fails first if it does not hold.
+    if versions.iter().any(|version| *version != versions[0]) {
+        return;
+    }
+    for gpu in &amd {
+        let gfx_target = gpu
+            .get("gfx_target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            !gfx_target.is_empty(),
+            "the kernel describes {expected} GPU node(s) all of one target, but an AMD GPU was \
+             reported with no gfx_target, so the topology's target never reached the report: \
+             {gpu:#?}"
+        );
+    }
+}
+
+#[then("the inspection lists the code object manager libraries it found")]
+async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("comgr_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Each entry has to carry enough to act on. A list of bare paths would not
+    // say which install a copy belongs to, which is the whole question.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported copy is missing `{field}`, so a reader cannot tell \
+                 where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+#[then("it lists the HIP runtime libraries the machine holds the same way")]
+async fn assert_hip_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("hip_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Whether the code object manager belongs to the active runtime is a
+    // question about two libraries, not one -- so the HIP side has to carry
+    // the same `install_root` attribution the comgr side does, or there is
+    // nothing for the conflict check to compare against.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported HIP runtime copy is missing `{field}`, so a reader \
+                 cannot tell where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+// Sources the loader itself actually consults, mirrored from
+// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
+// `managed-runtime` hit is evidence a copy exists, not evidence anything
+// would load it. Shared by the HIP and comgr selection assertions below so
+// the two cannot drift apart.
+const LOADER_PATH_SOURCES: [&str; 3] = ["active-runtime", "ld-library-path", "loader-cache"];
+
+#[then("it names which HIP runtime copy would load, or says it found none")]
+async fn assert_hip_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["hip_paths"]
+        .as_array()
+        .expect("hip_paths must be a list")
+        .clone();
+    let selected = value
+        .get("hip_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+        // Same reasoning as the comgr assertion below: `hip_paths: []` and
+        // `hip_selected: null` also hold by nothing more than `Examination`'s
+        // own defaults, so without this the assertion cannot tell "probed,
+        // found none" from "never probed".
+        let notes = value["notes"].as_array().expect("notes must be a list");
+        assert!(
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|note| note.contains("no libamdhip64 found")),
+            "no HIP runtime copies were reported, but the inspection's notes \
+             never say the search ran and found none -- so this cannot tell \
+             \"probed, found nothing\" from \"never probed\":\n{value:#}"
+        );
+    } else if selected.is_null() {
+        // Copies exist, but none sits on a tier the loader itself consults --
+        // every hit is a `rocm-install` or `managed-runtime` copy nothing has
+        // put on the library path, in the loader cache, or in front of an
+        // active runtime. This is `select_loader_copy` returning `None` on
+        // purpose (pinned there for `libamdhip64` directly), not a gap in the
+        // step -- without this arm it fell into the branch below and panicked
+        // on a state the CLI deliberately produces.
+        for copy in &copies {
+            let source = copy
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("every copy must name its source:\n{copy:#}"));
+            assert!(
+                !LOADER_PATH_SOURCES.contains(&source),
+                "a copy on a loader-consulted tier ({source}) was found, but none was \
+                 selected -- the selection must have missed a real loader-path hit:\n{value:#}"
+            );
+        }
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("copies were found but none was selected:\n{value:#}"));
+        let selected_source = selected
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name its source:\n{value:#}"));
+        assert!(
+            LOADER_PATH_SOURCES.contains(&selected_source),
+            "the selected copy's source ({selected_source}) is not one the loader actually \
+             consults; a rocm-install or managed-runtime hit must never be reported as \
+             \"would load\":\n{value:#}"
+        );
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
+}
+
+#[then("it names which of them would load, or says it found none")]
+async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["comgr_paths"]
+        .as_array()
+        .expect("comgr_paths must be a list")
+        .clone();
+    let selected = value
+        .get("comgr_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    // The two have to agree. "Some copies exist but none was selected" would
+    // leave a reader unable to tell which one the loader picks, which is the
+    // only thing the list is for.
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+        // `comgr_paths: []` and `comgr_selected: null` are also what an
+        // `Examination` defaults to, so on their own they would pass whether
+        // the probe ran and found nothing or never ran at all -- exactly the
+        // state of every lane where this scenario is the only coverage. The
+        // "no libamd_comgr found" note is pushed only by the probe actually
+        // running and coming up empty (see `probe_comgr` in examine.rs), so
+        // requiring it here is what makes this assertion prove the probe ran.
+        let notes = value["notes"].as_array().expect("notes must be a list");
+        assert!(
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|note| note.contains("no libamd_comgr found")),
+            "no code object manager copies were reported, but the inspection's \
+             notes never say the search ran and found none -- so this cannot \
+             tell \"probed, found nothing\" from \"never probed\":\n{value:#}"
+        );
+    } else if selected.is_null() {
+        // Copies exist, but none sits on a tier the loader itself consults --
+        // every hit is a `rocm-install` or `managed-runtime` copy nothing has
+        // put on the library path, in the loader cache, or in front of an
+        // active runtime. Reporting `null` here, rather than naming the first
+        // entry regardless of its tier, is the whole fix: a leftover
+        // `/opt/rocm-*` install or an inactive managed runtime must not be
+        // reported as "the library that loads" just because it was found.
+        for copy in &copies {
+            let source = copy
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("every copy must name its source:\n{copy:#}"));
+            assert!(
+                !LOADER_PATH_SOURCES.contains(&source),
+                "a copy on a loader-consulted tier ({source}) was found, but none was \
+                 selected -- the selection must have missed a real loader-path hit:\n{value:#}"
+            );
+        }
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name a path:\n{value:#}"));
+        let selected_source = selected
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name its source:\n{value:#}"));
+        assert!(
+            LOADER_PATH_SOURCES.contains(&selected_source),
+            "the selected copy's source ({selected_source}) is not one the loader actually \
+             consults; a rocm-install or managed-runtime hit must never be reported as \
+             \"would load\":\n{value:#}"
+        );
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
+}
+
+#[then("the inspection attributes a code object manager library to that runtime")]
+async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["comgr_paths"]
+        .as_array()
+        .expect("comgr_paths must be a list")
+        .clone();
+
+    // The precondition installed a managed runtime, so one has to be there.
+    // Without this the assertion below is satisfied by a machine holding no
+    // copies at all, which is the state that hid this gap in the first place.
+    assert!(
+        !copies.is_empty(),
+        "a managed runtime is installed, so the inspection cannot report zero \
+         code object manager libraries:\n{value:#}"
+    );
+
+    // `active-runtime`, not `managed-runtime`: the precondition makes this
+    // runtime the *active* one, and the search checks the active runtime's own
+    // directories first, ahead of the generic managed-runtime scan, so that is
+    // the label this copy gets -- the later `managed-runtime` hit for the same
+    // resolved file is the dedup's job to drop, not a second, differently
+    // labelled copy. Accepting either label is what proves "the CLI's own
+    // installed copy was found" without over-specifying which of the two
+    // overlapping sources happened to see it first.
+    assert!(
+        copies.iter().any(|copy| {
+            matches!(
+                copy.get("source").and_then(|s| s.as_str()),
+                Some("managed-runtime" | "active-runtime")
+            )
+        }),
+        "the CLI installed this runtime and its ROCm wheels, so the search has to \
+         find the copy it put there. Reported copies:\n{copies:#?}"
     );
 }

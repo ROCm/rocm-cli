@@ -7,6 +7,9 @@ Feature: Runtime lifecycle state machine
   # runtimes in the isolated registry, so no SDK download or GPU is needed — they
   # run on the mock lane every PR. Related EAI-7404.
 
+  # Also covers the `rocm runtimes rollback` recovery hint: absent on the first
+  # activation (no previous runtime, rollback would hard-error), present once a
+  # previous runtime exists to roll back to.
   @id:runtime-lifecycle-activate-records-previous
   Scenario: runtime-lifecycle-01 - Activating a runtime records where it changed from
     Given two registered runtimes and none active
@@ -28,8 +31,20 @@ Feature: Runtime lifecycle state machine
     Then its registry entry is removed
     And its external folder is left in place
 
+  @id:runtime-lifecycle-uninstall-requires-yes-noninteractive
+  Scenario: runtime-lifecycle-04 - Uninstalling without --yes is refused outside a terminal
+    Given a registered read-only runtime
+    When the user tries to uninstall that runtime without confirming
+    Then the CLI refuses and requires --yes
+
+  @id:runtime-lifecycle-uninstall-dry-run
+  Scenario: runtime-lifecycle-05 - Dry-running an uninstall makes no changes
+    Given a registered read-only runtime
+    When the user dry-runs an uninstall of that runtime
+    Then the dry run reports the plan without confirming or changing anything
+
   @id:runtime-lifecycle-import-rejects-duplicate-unless-replacing
-  Scenario: runtime-lifecycle-04 - Importing a runtime, then rejecting a duplicate unless replacing
+  Scenario: runtime-lifecycle-06 - Importing a runtime, then rejecting a duplicate unless replacing
     Given a runtime manifest to import
     When the user imports the runtime
     Then the runtime is registered as read-only
@@ -43,10 +58,25 @@ Feature: Runtime lifecycle state machine
   # they mean. This asserts the printed legend actually names both glyphs, so the
   # rendered marker and its explanation can't drift apart silently.
   @id:runtime-lifecycle-list-shows-marker-legend
-  Scenario: runtime-lifecycle-05 - Listing runtimes explains the active and rollback markers
+  Scenario: runtime-lifecycle-07 - Listing runtimes explains the active and rollback markers
     Given two registered runtimes with the second active after the first
     When the user rolls back
     And the user lists the registered runtimes
     Then the listing explains the active and rollback markers
     And the first runtime is marked active
     And the second runtime is marked as the rollback target
+
+  # Re-selecting the runtime you are already on changes nothing the user can
+  # see, so it must not quietly take away the recovery path the previous
+  # activation had just offered ("if this causes problems, run `rocm runtimes
+  # rollback`"). It used to: the activation recomputed the rollback target from
+  # the runtime being left, and when there was none it cleared the recorded one
+  # instead of leaving it alone. The shortest command sequence that exposes this
+  # is three activations in a row, which is why none of the hand-written
+  # examples above caught it: every one- and two-command sequence conforms.
+  @id:runtime-lifecycle-reactivating-keeps-rollback-target
+  Scenario: runtime-lifecycle-08 - Re-selecting the runtime already in use keeps the rollback target
+    Given two registered runtimes with the second active after the first
+    When the user activates the second runtime again
+    Then the second runtime is still the one in use
+    And the first runtime is still the rollback target

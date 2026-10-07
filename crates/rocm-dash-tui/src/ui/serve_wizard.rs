@@ -29,7 +29,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
@@ -176,6 +176,13 @@ impl ServeWizardState {
 
     /// Build the `rocm` argv for the current form, or an error message.
     fn build_args(&self) -> Result<Vec<String>, String> {
+        // Trimmed, and deliberately so: `self.model` is typed as often as it is
+        // browser-filled, and three other places already derive from the
+        // trimmed form — the approval card's title, the job id, and the
+        // "already running" guard. Staging an untrimmed value here would let
+        // two launches differing only by trailing whitespace collide on one job
+        // id while actually running different commands. `host` and `port` below
+        // follow the same rule.
         let model = self.model.trim();
         if model.is_empty() {
             return Err("model is required".to_string());
@@ -339,7 +346,7 @@ fn request_launch(w: &mut ServeWizardState) {
     match w.build_args() {
         Ok(args) => {
             let cmd = resolve_exe();
-            let cmdline = format!("{} {}", exe_label(&cmd), args.join(" "));
+            let cmdline = format!("{} {}", exe_label(&cmd), display_args(&args));
             let request = ApprovalRequest::new(
                 format!("serve “{}”", w.model.trim()),
                 vec![
@@ -482,7 +489,10 @@ fn field_line<'a>(
         "(type a name / path, or Tab to browse)"
     };
     let (label, value): (&str, String) = match field {
-        Field::Model => ("Model", display_value(&w.model, model_placeholder)),
+        Field::Model => (
+            "Model",
+            crate::ui::format::display_or_placeholder(&w.model, model_placeholder),
+        ),
         Field::Engine => (
             "Engine",
             ENGINES[w.engine_idx.min(ENGINES.len() - 1)].to_string(),
@@ -491,8 +501,14 @@ fn field_line<'a>(
             "Device",
             DEVICES[w.device_idx.min(DEVICES.len() - 1)].to_string(),
         ),
-        Field::Host => ("Host", display_value(&w.host, "(engine default)")),
-        Field::Port => ("Port", display_value(&w.port, "(engine default)")),
+        Field::Host => (
+            "Host",
+            crate::ui::format::display_or_placeholder(&w.host, "(engine default)"),
+        ),
+        Field::Port => (
+            "Port",
+            crate::ui::format::display_or_placeholder(&w.port, "(engine default)"),
+        ),
         Field::Mode => (
             "Mode",
             if w.managed {
@@ -534,14 +550,6 @@ fn field_line<'a>(
         Span::styled(format!("{label:<8}"), label_style),
         Span::styled(value, value_style),
     ])
-}
-
-fn display_value(v: &str, placeholder: &'static str) -> String {
-    if v.is_empty() {
-        placeholder.to_string()
-    } else {
-        v.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -615,6 +623,21 @@ mod tests {
         assert!(args.windows(2).any(|p| p == ["--device", "gpu_required"]));
         assert!(args.contains(&"--foreground".to_string()));
         assert!(!args.contains(&"--managed".to_string()));
+    }
+
+    #[test]
+    fn model_is_trimmed_so_argv_matches_the_job_id_and_approval_title() {
+        let w = ServeWizardState {
+            model: " /mnt/models/glm ".into(),
+            ..Default::default()
+        };
+        let args = w.build_args().unwrap();
+        assert_eq!(
+            args[1], "/mnt/models/glm",
+            "the approval title, the job id and the duplicate-launch guard all \
+             key off model.trim(); staging an untrimmed value here would let \
+             two launches share one job id while running different commands"
+        );
     }
 
     #[test]

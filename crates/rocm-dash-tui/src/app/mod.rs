@@ -2,469 +2,64 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Event loop. Sets up the terminal, spawns the client task, drives renders.
+//! Dashboard reducer: `AppState` and its `apply_event` entry point (the
+//! `apply_action`-adjacent reducer impl it dispatches into lives in
+//! `actions.rs`).
+//!
+//! Split into focused submodules to keep this file to the reducer's core:
+//! `app/types.rs` (shared type/enum defs), `app/event_loop.rs` (terminal
+//! lifecycle + tick loop), `app/scrollbar.rs` (mouse hit-testing), and
+//! `app/actions.rs` (`KeyAction` dispatch). `crate::app::*` paths for the
+//! public surface moved out are unchanged via the re-exports below.
 
-use std::collections::VecDeque;
-use std::io;
-use std::time::Duration;
-
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use futures::StreamExt;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use rocm_dash_core::bench_schema::BenchmarkRow;
 use rocm_dash_core::metrics::{Instance, Snapshot};
 use rocm_dash_core::protocol::Event;
-use tokio::sync::mpsc;
-use tokio::time::interval;
 
-use crate::client::{self, ClientMsg};
-use crate::ui;
 use crate::ui::theme::Theme;
 
-// Submodules holding cohesive pieces of `AppState` + free fns split out of this
-// file to keep the core reducer + event loop focused (a file→dir module move:
-// `crate::app::*` paths are unchanged).
+// Submodules holding cohesive pieces of `AppState` + free fns split out of
+// this file to keep the core reducer focused (a file→dir module move:
+// `crate::app::*` paths for the public surface are unchanged).
+mod actions;
 mod chat;
+mod event_loop;
+mod scrollbar;
 mod slash;
 mod summary;
+mod types;
 
-use chat::{
-    StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
-    discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
+// Re-exports restoring the pre-split `crate::app::*` public surface. A
+// `pub(crate)` item with no caller through that path isn't re-exported just
+// because it was reachable there pre-split (see the removed
+// `NO_CHAT_BACKEND_MSG` re-export this rule cost).
+pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
+pub(crate) use event_loop::{
+    HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
+    restore_terminal, shutdown_claimed_on,
 };
-use summary::{parse_plan_result, summarize_json_value, summarize_slash_tool};
 
-/// Which single flow a *focused host* runs.
-///
-/// The bare-`rocm` launcher opens one overlay to completion — no embedded
-/// daemon, no tab shell — then returns to the menu. `None` on
-/// [`ResolvedArgs::focus`] is the normal full dashboard, so every existing
-/// dash/chat path is byte-identical when focus is unset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
-    /// First-run onboarding (install / adopt ROCm) — the launcher's
-    /// `Set up this system` row and `rocm bootstrap setup`.
-    Setup,
-    /// The serve-a-model wizard — the launcher's `Serve a model` row.
-    Serve,
-    /// Read-only `rocm examine` environment check — the launcher's
-    /// `Diagnose & fix` row. Auto-runs on open.
-    Examine,
-}
-
-/// Args after CLI + config resolution. Consumed by `run`.
-#[derive(Debug, Clone)]
-pub struct ResolvedArgs {
-    pub connect: String,
-    pub token: Option<String>,
-    pub theme: String,
-    /// When `Some`, replay events from a file instead of connecting to a
-    /// live daemon. Mutually exclusive with `connect` (enforced by clap).
-    pub replay: Option<std::path::PathBuf>,
-    /// Which tab is active when the TUI opens. `Chat` for the chat-first launch
-    /// (bare `rocm` / `rocm chat`); `Home` for the dashboard (`rocm dash`).
-    pub initial_tab: ActiveTab,
-    /// When `Some`, run as a *focused host*: open exactly the overlay for this
-    /// flow, skip the embedded daemon + chat backend, render overlay-only, and
-    /// exit back to the launcher when the overlay is closed at its root. `None`
-    /// (the default) is the normal full dashboard — every path stays unchanged.
-    pub focus: Option<Focus>,
-    /// Chat endpoint base URL, CLI-flag value already merged over config.
-    pub chat_url: Option<String>,
-    /// Chat model, CLI-flag value already merged over config.
-    pub chat_model: Option<String>,
-    /// Custom auth header NAME (CLI-flag value merged over config), e.g.
-    /// `Ocp-Apim-Subscription-Key` for Azure APIM gateways.
-    pub chat_auth_header: Option<String>,
-    /// Sampling temperature for chat requests, CLI-flag value merged over
-    /// config. `None` leaves the endpoint default untouched.
-    pub chat_temperature: Option<f32>,
-    /// Nucleus-sampling `top_p` for chat requests, CLI merged over config.
-    pub chat_top_p: Option<f32>,
-    /// Max generated tokens for chat requests, CLI merged over config.
-    pub chat_max_tokens: Option<u32>,
-    /// Chat endpoint base URL from the environment (`OPENAI_BASE_URL`).
-    /// A separate, lower-precedence tier than `chat_url`.
-    pub chat_env_url: Option<String>,
-    /// Chat api key, sourced from the environment ONLY (never TOML/CLI/source).
-    /// Used by the local/OpenAI backends.
-    pub chat_api_key: Option<String>,
-    /// Anthropic API key, sourced by the bin (env-first then OS secure store —
-    /// NEVER argv) and carried in-process via this seam. `None` when absent;
-    /// the Anthropic backend then surfaces an actionable error on switch.
-    pub anthropic_api_key: Option<String>,
-    /// Pre-consent to using the detected endpoint (`--chat-yes`), skipping the
-    /// one-time in-TUI prompt for the demo.
-    pub chat_auto_consent: bool,
-    /// Use the offline `MockAgentClient` for chat (`--chat-mock`) — a
-    /// deterministic, fully-offline demo with no live LLM.
-    pub chat_mock: bool,
-    /// Built-in model recipes for the serve wizard's picker (Phase 3 Wave 1).
-    /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
-    /// needs no `rocm-core` dep. Empty when none are available.
-    pub model_recipes: Vec<crate::ui::model_picker::ModelRecipeSummary>,
-    /// Registered ROCm runtimes for the runtime manager (Phase 3 Wave 2).
-    /// Adapted by the bin (`apps/rocm`, which has `rocm-core`) so this crate
-    /// needs no `rocm-core` dep. Empty when none are available.
-    pub runtimes: Vec<crate::ui::runtime_manager::RuntimeSummary>,
-    /// Background checks for the automations manager (Phase 3 Wave 3). Adapted
-    /// by the bin. Empty when none are available.
-    pub automations: Vec<crate::ui::automations_manager::AutomationSummary>,
-    /// System prompt for the chat assistant: the ROCm tool-use prompt plus this
-    /// machine's detected facts (OS, WSL, AMD GPU, available engines). Composed
-    /// by the bin (`apps/rocm`, which has `rocm-core`) so this crate needs no
-    /// `rocm-core` dep. `None` for demo/replay/`--chat-mock`, which have no bin
-    /// seam and keep the agent's built-in default preamble.
-    pub chat_system_prompt: Option<String>,
-    /// Bin-injected tool-executor seam; None for demo/replay/mock — dash behaves
-    /// as today. Stored here (Phase 2 plumbing); Phase 3 will use it.
-    pub tool_executor: Option<crate::tool_exec::SharedRocmToolExecutor>,
-    /// Daemon-tailed bench CSV path (`config.dashboard.daemon.bench_results_dir`).
-    ///
-    /// When `Some`, the bench-run form defaults `--out` to this path so appended
-    /// rows appear live in the bench tab. Adapted by the bin (owns `rocm-core`).
-    pub bench_results_dir: Option<std::path::PathBuf>,
-}
-
-impl ResolvedArgs {
-    /// The optional sampling controls (temperature/top_p/max_tokens) resolved
-    /// for chat, bundled for the agent builders. CLI-over-config merge already
-    /// happened in the bin, so these are the final values.
-    pub(crate) const fn inference_params(&self) -> crate::agent::InferenceParams {
-        crate::agent::InferenceParams {
-            temperature: self.chat_temperature,
-            top_p: self.chat_top_p,
-            max_tokens: self.chat_max_tokens,
-        }
-    }
-}
-
-type Tui = Terminal<CrosstermBackend<io::Stdout>>;
+pub use event_loop::{run, spawn_termination_watcher};
+// Only reached via a test (`launcher.rs`'s
+// `the_front_door_comes_back_after_a_session_ends_cleanly`); gated to that
+// build so the compiler (not a hand-maintained `#[allow]`) flags this as dead
+// if that caller ever disappears.
+#[cfg(test)]
+pub(crate) use event_loop::restore_after_session;
+pub use scrollbar::{FooterChip, PaneFocus, ScrollDrag, ScrollTarget, ScrollbarHandle};
+pub use types::{
+    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PlannedAction,
+    ReplayState, ResolvedArgs, UpdateStatus, format_mmss,
+};
+pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
 /// How many snapshots to keep for sparklines.
 pub const HISTORY_CAP: usize = 240;
 
 /// How many benchmark rows to keep client-side for the bench panel.
 pub const BENCH_CAP: usize = 200;
-
-/// Lines per PageUp/PageDown step in the chat transcript.
-const CHAT_SCROLL_STEP: i16 = 5;
-
-#[derive(Debug, Clone, Default)]
-pub enum ConnState {
-    #[default]
-    Initial,
-    Connecting,
-    Connected {
-        host: String,
-        version: String,
-    },
-    Disconnected {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ActiveTab {
-    // 5-tab IA. Home is the default; ROCm and Serving are the two domain tabs
-    // (Actions list + inline Details); Observe folds the host/instance/bench
-    // telemetry; Chat is the assistant. The former single Action tab is gone —
-    // its guided verbs are split across ROCm + Serving.
-    #[default]
-    Home,
-    Rocm,
-    Serving,
-    Observe,
-    Chat,
-}
-
-impl ActiveTab {
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Home => Self::Rocm,
-            Self::Rocm => Self::Serving,
-            Self::Serving => Self::Observe,
-            Self::Observe => Self::Chat,
-            Self::Chat => Self::Home,
-        }
-    }
-    #[must_use]
-    pub const fn prev(self) -> Self {
-        match self {
-            Self::Home => Self::Chat,
-            Self::Rocm => Self::Home,
-            Self::Serving => Self::Rocm,
-            Self::Observe => Self::Serving,
-            Self::Chat => Self::Observe,
-        }
-    }
-    pub const fn from_digit(d: char) -> Option<Self> {
-        match d {
-            '1' => Some(Self::Home),
-            '2' => Some(Self::Rocm),
-            '3' => Some(Self::Serving),
-            '4' => Some(Self::Observe),
-            '5' => Some(Self::Chat),
-            _ => None,
-        }
-    }
-}
-
-/// Who authored a chat turn. Plain TUI-local data — `rocm-dash-core` carries
-/// no chat types; chat is owned by the TUI crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatRole {
-    User,
-    Agent,
-    Error,
-    /// Operational notice generated by the TUI itself (e.g. "switched to
-    /// local"), rendered in the transcript but **never** sent to the model —
-    /// `build_messages` drops it so it can't masquerade as a prior assistant
-    /// turn and corrupt the model's context.
-    System,
-}
-
-/// One line in the chat transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatTurn {
-    pub role: ChatRole,
-    pub content: String,
-}
-
-impl ChatTurn {
-    pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::User,
-            content: content.into(),
-        }
-    }
-    pub fn agent(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::Agent,
-            content: content.into(),
-        }
-    }
-    pub fn error(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::Error,
-            content: content.into(),
-        }
-    }
-    /// A TUI-generated operational notice. Rendered but dropped from the LLM
-    /// history by [`build_messages`](crate::agent::build_messages).
-    pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: ChatRole::System,
-            content: content.into(),
-        }
-    }
-}
-
-/// Consent state for using the auto-detected LLM endpoint. The chat surface
-/// asks once before any request leaves the machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ChatConsent {
-    /// No endpoint detected from any source — actionable empty-state.
-    #[default]
-    Unavailable,
-    /// Endpoint detected; awaiting the user's one-time accept/decline.
-    Pending,
-    /// User accepted — chat is enabled.
-    Accepted,
-    /// User declined — chat stays off until re-enabled.
-    Declined,
-}
-
-/// Inputs `handle_key` needs to interpret keys on the Chat tab without holding
-/// `&AppState` (keeps the function pure and unit-testable).
-#[derive(Debug, Clone, Copy)]
-pub struct ChatKeyCtx {
-    pub focused: bool,
-    pub consent: ChatConsent,
-    /// A locally-detected endpoint is awaiting use/dismiss — its keys take
-    /// precedence over the normal consent prompt.
-    pub offer_pending: bool,
-}
-
-impl Default for ChatKeyCtx {
-    fn default() -> Self {
-        // Default to a usable, unfocused surface for tests that don't exercise
-        // consent/insert specifics.
-        Self {
-            focused: false,
-            consent: ChatConsent::Accepted,
-            offer_pending: false,
-        }
-    }
-}
-
-/// Replay scrubber state. Only present when `--replay` was given.
-#[derive(Debug, Clone)]
-pub struct ReplayState {
-    pub controller: crate::replay::ReplayController,
-    pub paused: bool,
-    pub speed: f64,
-    /// Current playhead in seconds since the start of the recording.
-    pub elapsed_s: u64,
-    /// Total length of the recording in seconds.
-    pub total_s: u64,
-}
-
-impl ReplayState {
-    pub const fn new(controller: crate::replay::ReplayController) -> Self {
-        Self {
-            controller,
-            paused: false,
-            speed: 1.0,
-            elapsed_s: 0,
-            total_s: 0,
-        }
-    }
-}
-
-/// Format a duration in seconds as `M:SS` (or `H:MM:SS` past an hour).
-pub fn format_mmss(secs: u64) -> String {
-    if secs >= 3600 {
-        let h = secs / 3600;
-        let m = (secs % 3600) / 60;
-        let s = secs % 60;
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        let m = secs / 60;
-        let s = secs % 60;
-        format!("{m}:{s:02}")
-    }
-}
-
-/// Which chat LLM backend is active. The dash can switch live via `/provider`
-/// (Phase 8); every backend calls the SAME ROCm tools through the seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ChatProvider {
-    /// The auto-detected local OpenAI-compatible endpoint (or the no-key ChatGPT
-    /// OAuth default). This is the launch default and reuses the inline build.
-    #[default]
-    Local,
-    /// OpenAI's hosted Chat Completions API (`OPENAI_API_KEY`).
-    Openai,
-    /// Anthropic's Claude API (`ANTHROPIC_API_KEY`).
-    Anthropic,
-}
-
-impl ChatProvider {
-    /// Parse the `/provider <name>` argument (case-insensitive). `None` for an
-    /// unrecognized name so the handler can hint instead of switching silently.
-    pub(crate) fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().as_str() {
-            "local" => Some(Self::Local),
-            "openai" => Some(Self::Openai),
-            "anthropic" => Some(Self::Anthropic),
-            _ => None,
-        }
-    }
-
-    /// The lowercase label used in turns and hints.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-        }
-    }
-}
-
-/// Actionable empty-state shown when a chat is submitted with no agent built
-/// (no detected endpoint and no provider key). Surfaced as an error turn — never
-/// an error dump or a panic — and names the two concrete recovery actions.
-pub(crate) const NO_CHAT_BACKEND_MSG: &str = "no chat backend is configured. Press d to detect a local engine, or use \
-     /provider openai|anthropic with the matching API key set.";
-
-/// Result of routing a chat-input line through the slash-command handler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SlashOutcome {
-    /// The line was a slash command and was handled in-reducer (state mutated,
-    /// or a slash-tool request raised). It must NOT be sent to the LLM.
-    Handled,
-    /// The line is not a slash command — fall through to normal agent dispatch.
-    NotCommand,
-}
-
-/// A pending read-only slash command that needs the bin executor (no overlay).
-/// `submit_chat` sets it; the event loop drains it once, off the async thread.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlashToolRequest {
-    /// Tool name to execute across the seam (e.g. `rocm_command`).
-    pub name: String,
-    /// JSON args for the tool (e.g. `{"args":["model"]}`).
-    pub args: serde_json::Value,
-    /// Human label for the chat turn header (e.g. `model`).
-    pub label: String,
-}
-
-/// The structured next action from a natural-language plan (Phase 7).
-///
-/// Plain data mirrored from the bin's `freeform_plan_next_action_with_context`
-/// so the reducer can decide whether to hand a complete mutating action to the
-/// approval modal. A placeholder action (`has_placeholders`) stays plan-only.
-/// `pub` (not `pub(crate)`) because it is a payload of the `pub` [`ClientMsg`]
-/// enum (mirrors [`crate::tool_exec::ApprovalIntent`]); the reducer entrypoints
-/// that consume it stay crate-private.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlannedAction {
-    /// The rocm CLI argv to run (e.g. `["install","sdk","--prefix","/x"]`).
-    pub args: Vec<String>,
-    /// Whether the planned action mutates local ROCm state (needs approval).
-    pub approval_required: bool,
-    /// Whether any arg is still a `<placeholder>` (the plan is incomplete).
-    pub has_placeholders: bool,
-    /// Whether a planner provider produced this plan. Provider-assisted plans
-    /// stay review-only (never auto-forwarded to execution), mirroring the
-    /// bin's `validate_freeform_execution_action` guard.
-    pub provider_assisted: bool,
-}
-
-/// A surfaced mutating-tool approval awaiting the operator's decision (Phase 4).
-/// Reusable for any [`crate::tool_exec::ApprovalIntent`] (the same modal serves
-/// later phases: update/uninstall, permissions, plan). The modal owns keyboard
-/// focus while `Some`; on Approve the `(name, arguments)` are replayed through
-/// `execute_approved`; on Deny/Cancel nothing runs.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingApproval {
-    pub req: crate::ui::approval::ApprovalRequest,
-    pub choice: crate::ui::approval::ApprovalChoice,
-    /// Tool name to re-execute on Approve (the validator already accepted it).
-    pub name: String,
-    /// JSON args for the approved re-execution.
-    pub arguments: serde_json::Value,
-}
-
-/// Modal overlays. Only one is shown at a time, on top of the active tab body.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Modal {
-    #[default]
-    None,
-    Help,
-    Detail,
-    ThemePicker,
-    /// btop-style Esc main menu (Options / Help / Quit).
-    Menu,
-    /// "Go to…" command palette (tab/destination switch).
-    Palette,
-    /// Tabbed Options panel (General / CPU / GPU / Engines).
-    Options,
-    /// Global 2-column keyboard reference (distinct from the contextual `?`).
-    GlobalHelp,
-}
 
 pub struct AppState {
     pub connect: String,
@@ -501,8 +96,13 @@ pub struct AppState {
     pub theme_name: String,
     pub theme: Theme,
     pub theme_picker_sel: usize,
-    /// Scroll offset (in lines) inside the Bench Detail modal. Reset on Open.
-    pub bench_detail_scroll: u16,
+    /// Scroll offset (in lines) inside the instance Detail modal's body
+    /// (launch args / env vars panes). Reset when the modal opens.
+    pub instance_detail_scroll: u16,
+    /// Last-measured upper bound for `instance_detail_scroll`, written back
+    /// by the renderer each frame (see `ui::tabs::instances::draw_detail`),
+    /// mirroring `chat_max_scroll`.
+    pub instance_detail_max_scroll: u16,
     /// Vertical scroll offset (first visible line) of the active job console.
     /// Shared by whichever operational manager is showing its console; reset
     /// when an overlay opens (`close_overlays`).
@@ -585,6 +185,10 @@ pub struct AppState {
     /// from `replay`, which is playback-control state and is not set by the
     /// screenshot/cast generators.
     pub simulated: bool,
+    /// Managed-service records that are no longer running, from the bin's
+    /// registry read at launch (see `ResolvedArgs::services_past_attempts`).
+    /// Rendered by the services overlay so failed servers are not invisible.
+    pub services_past_attempts: usize,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -659,6 +263,16 @@ pub struct AppState {
     /// switch, so a failed build (missing key) reverts to the prior provider
     /// rather than unconditionally to `Local`.
     pub(crate) provider_switch: Option<ProviderSwitch>,
+    /// Result of the last completed background update check. Drives the Home
+    /// tab's Updates tile. `Unknown` until the first check resolves.
+    pub update_status: UpdateStatus,
+    /// True while a `home-update-check` job is running (spawned but not yet
+    /// terminal). Drives the tile's "Checking…" state.
+    pub update_status_pending: bool,
+    /// When the next periodic update check is due. Checked each tick;
+    /// initialized to `Instant::now()` so a check is due immediately after
+    /// startup.
+    pub(crate) update_check_due_at: std::time::Instant,
 }
 
 /// A pending `/provider` switch edge: the `target` backend plus the `previous`
@@ -698,7 +312,8 @@ impl AppState {
             theme_name,
             theme,
             theme_picker_sel,
-            bench_detail_scroll: 0,
+            instance_detail_scroll: 0,
+            instance_detail_max_scroll: 0,
             console_scroll: 0,
             console_hscroll: 0,
             tick_count: 0,
@@ -724,6 +339,7 @@ impl AppState {
             chat_endpoint_rebuild: None,
             replay: None,
             simulated: false,
+            services_past_attempts: 0,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -752,6 +368,9 @@ impl AppState {
             approval: None,
             active_provider: ChatProvider::default(),
             provider_switch: None,
+            update_status: UpdateStatus::Unknown,
+            update_status_pending: false,
+            update_check_due_at: std::time::Instant::now(),
         }
     }
 
@@ -919,8 +538,8 @@ impl AppState {
             ScrollTarget::Console => self.console_scroll = p,
             ScrollTarget::ConsoleH => self.console_hscroll = p,
             ScrollTarget::Chat => self.set_chat_scroll(position),
-            ScrollTarget::BenchDetail => self.bench_detail_scroll = p,
             ScrollTarget::DockLogs => self.dock_logs_scroll = p,
+            ScrollTarget::InstanceDetail => self.instance_detail_scroll = p,
         }
     }
 
@@ -964,6 +583,27 @@ impl AppState {
             || self.bench_run.is_some()
     }
 
+    /// Whether a chat tool-call approval is pending. Its own gating layer,
+    /// separate from [`has_open_overlay`](Self::has_open_overlay) — a real
+    /// keypress or click can never reach `OpenThemePicker`/`ToggleHelp`/`Quit`/
+    /// a scrollbar/the pane body while this is `true`, so every input path
+    /// that swallows for an open overlay must also check this, or a mouse
+    /// gesture could bypass a gate no keypress ever could. Single source of
+    /// truth for that check so the call sites can't drift apart.
+    pub(crate) const fn approval_pending(&self) -> bool {
+        self.approval.is_some()
+    }
+
+    /// Whether *either* gating layer owns the screen: an open manager overlay
+    /// or a pending chat approval. This exact `||` is what every input path
+    /// that swallows for one must also swallow for the other — two call sites
+    /// wrote it out by hand before this existed, each with its own copy of
+    /// this same reasoning; a third forgetting one half would reopen the
+    /// class of bug `approval_pending`'s own doc comment describes.
+    pub(crate) const fn overlay_or_approval(&self) -> bool {
+        self.has_open_overlay() || self.approval_pending()
+    }
+
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
     /// overlay is closed (no manager is `Some`).
     ///
@@ -972,7 +612,7 @@ impl AppState {
     /// while the user is inside one of those. It does NOT by itself protect a
     /// running job console: the shared console maps `q` / running-`Esc` to
     /// "close overlay", which would null the manager mid-job. That case is
-    /// handled upstream in `event_loop` by [`focused_close_key_blocked`], which
+    /// handled upstream in `event_loop` by `focused_close_key_blocked`, which
     /// swallows those keys while the job is non-terminal — so by the time this
     /// gate is checked, a focused overlay only ever closed at its root (form
     /// screen or a terminal job). Always `false` for the normal
@@ -988,7 +628,7 @@ impl AppState {
     /// manager is open at a time, so this reflects that one; `true` when none is
     /// open. Gates the Esc back-out so Esc cancels the innermost layer first
     /// (and is ignored while a job runs) before it can eject the manager.
-    fn active_overlay_at_root(&self) -> bool {
+    pub(crate) fn active_overlay_at_root(&self) -> bool {
         self.serve_wizard.as_ref().is_none_or(|w| {
             w.browser.is_none()
                 && w.picker.is_none()
@@ -999,7 +639,10 @@ impl AppState {
             .as_ref()
             .is_none_or(|m| m.browser.is_none() && m.approval.is_none() && m.active_job.is_none())
             && self.onboarding.as_ref().is_none_or(|m| {
-                m.browser.is_none() && m.approval.is_none() && m.active_job.is_none()
+                m.browser.is_none()
+                    && m.install_config.is_none()
+                    && m.approval.is_none()
+                    && m.active_job.is_none()
             })
             && self.runtime_manager.as_ref().is_none_or(|m| {
                 m.browser.is_none()
@@ -1043,10 +686,33 @@ impl AppState {
     }
 
     /// Whether an `Esc` keypress should back out of an inline manager: true on
-    /// ROCm/Serving while a manager overlay is open AND that manager is at its
-    /// root screen. The event loop closes the manager and returns focus to the
+    /// any tab while a manager overlay is open AND that manager is at its root
+    /// screen. The event loop closes the manager and returns focus to the
     /// Actions list when this holds. Pure read so it is unit-testable (the
     /// mutation lives in the event-loop arm).
+    ///
+    /// Not just ROCm/Serving: a manager can be opened from a non-domain tab
+    /// (e.g. `examine_manager` from an Observe hotkey). This used to be gated
+    /// on `active_tab == Rocm | Serving`, so on other tabs the manager's own
+    /// event-loop arm handled root Esc directly (every overlay type already
+    /// has a dedicated `Some(Ok(CtEvent::Key(k))) if state.<overlay>.is_some()`
+    /// arm ahead of the generic handler, and each self-closes on root Esc
+    /// regardless of `active_tab` — so there was no "Modal stays set but
+    /// invisible" bug to fix here — true of every manager except onboarding,
+    /// see below). Dropping the tab guard moves the close from the manager's
+    /// own `on_key` to this shared path (`close_overlays()` + `pane_focus =
+    /// Actions`) so a future manager doesn't need to duplicate that root-Esc
+    /// handling. `pane_focus` is meaningless outside Rocm/Serving, so
+    /// resetting it there is a harmless no-op.
+    ///
+    /// This generalization is only correct if `active_overlay_at_root`'s
+    /// per-manager clause enumerates every nesting field the manager's state
+    /// struct has — see the note on `OnboardingState` (and its sibling
+    /// manager-state structs) about keeping that enumeration in sync when a
+    /// new nested sub-view field is added. `active_overlay_at_root_enumeration_is_exhaustive`
+    /// turns that into a build break instead of a silent drift: it destructures
+    /// every one of those structs without `..`, so adding a field to any of
+    /// them without updating both the test and this function fails to compile.
     ///
     /// When the manager has a sub-popup / approval / job console open, this is
     /// `false` so Esc falls through to the manager's own handler (cancel the
@@ -1058,14 +724,14 @@ impl AppState {
     /// returns focus from the Details preview to the Actions list via the normal
     /// `PaneFocusActions` key path.
     pub(crate) fn should_pane_back_out(&self, code: crossterm::event::KeyCode) -> bool {
-        matches!(self.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-            && self.has_open_overlay()
+        self.has_open_overlay()
             && self.active_overlay_at_root()
             && matches!(code, crossterm::event::KeyCode::Esc)
     }
 
     /// Open the theme picker modal, positioning the cursor on the active theme.
     pub fn open_theme_picker(&mut self) {
+        self.close_overlays();
         let names = crate::ui::theme::theme_names();
         self.theme_picker_sel = names
             .iter()
@@ -1096,17 +762,25 @@ impl AppState {
         }
     }
 
-    /// Reset the bench-detail scroll offset (called when opening the modal).
-    pub const fn reset_bench_detail_scroll(&mut self) {
-        self.bench_detail_scroll = 0;
+    /// Reset the instance Detail modal's scroll offset (called when opening
+    /// the modal, so a stale offset never carries over from a previous
+    /// instance's selection).
+    pub const fn reset_instance_detail_scroll(&mut self) {
+        self.instance_detail_scroll = 0;
+        self.instance_detail_max_scroll = 0;
     }
 
-    /// Adjust the bench-detail scroll. `delta` is in lines; clamped at 0
-    /// (no upper bound — the renderer clamps against the actual line count).
-    pub fn scroll_bench_detail(&mut self, delta: i16) {
-        let cur = i32::from(self.bench_detail_scroll);
-        let next = u16::try_from((cur + i32::from(delta)).max(0)).unwrap_or(u16::MAX);
-        self.bench_detail_scroll = next;
+    /// Adjust the instance Detail modal's scroll. `delta` is in lines;
+    /// clamped against `[0, instance_detail_max_scroll]` (the latter is last
+    /// written back by the renderer, see `instance_detail_max_scroll`), so
+    /// `i16::MIN`/`i16::MAX` ("jump to start/end") land exactly on
+    /// `0`/`instance_detail_max_scroll` instead of overflowing into an offset
+    /// far past the real content length.
+    pub fn scroll_instance_detail(&mut self, delta: i16) {
+        let cur = i32::from(self.instance_detail_scroll);
+        let max = i32::from(self.instance_detail_max_scroll);
+        let next = u16::try_from((cur + i32::from(delta)).clamp(0, max)).unwrap_or(u16::MAX);
+        self.instance_detail_scroll = next;
     }
 
     /// Install the resolved chat endpoint and set the initial consent state.
@@ -1338,7 +1012,9 @@ impl AppState {
         self.close_overlays();
         self.approval = Some(PendingApproval {
             req: crate::ui::approval::ApprovalRequest::new(intent.title, intent.body),
-            choice: crate::ui::approval::ApprovalChoice::Approve,
+            // An unreviewed tool call the model wants to run defaults to Deny,
+            // unlike the shared `ApprovalChoice` default (see its doc comment).
+            choice: crate::ui::approval::ApprovalChoice::Deny,
             name: intent.name,
             arguments: intent.arguments,
         });
@@ -1554,2128 +1230,35 @@ impl AppState {
     }
 }
 
-/// Whether the event loop should skip the embedded daemon client AND the chat
-/// backend resolution. True exactly when a [`Focus`] is set: a focused host runs
-/// one overlay that streams its own job through the job-bridge, so it needs
-/// neither live telemetry nor an LLM. `focus == None` (the dashboard) keeps both.
-/// Pure predicate → unit-testable without a runtime; also names the render branch
-/// (`draw_focused` when true, `draw` when false).
-const fn should_skip_daemon(focus: Option<Focus>) -> bool {
-    focus.is_some()
-}
-
-/// In a focused host, whether a console "close" key must be SWALLOWED because
-/// the active job is still running.
-///
-/// In the dashboard, `q` / running-`Esc` detach the console and leave the job
-/// running in the background (the app persists). A focused host has no
-/// background: closing the overlay trips the [`AppState::focused_should_exit`]
-/// gate and returns from `event_loop`, tearing down the runtime and killing the
-/// child via `kill_on_drop` — truncating a mutating install/serve mid-write. So
-/// while the job is non-terminal we swallow those keys; the user stops a job
-/// explicitly with `Ctrl+C` (never blocked here), and once it is terminal `q` /
-/// `Esc` exit normally. Always `false` for the dashboard (`focus == None`).
-fn focused_close_key_blocked(state: &AppState, focus: Option<Focus>, code: KeyCode) -> bool {
-    if !should_skip_daemon(focus) {
-        return false;
-    }
-    let running = state
-        .active_job_id()
-        .and_then(|id| state.jobs.job(id))
-        .is_some_and(|j| !j.is_terminal());
-    running && matches!(code, KeyCode::Char('q') | KeyCode::Esc)
-}
-
-/// Open the single overlay a focused host should host, returning any initial
-/// job-bridge side effects to pump (Examine auto-runs `rocm examine` on open;
-/// Setup/Serve open their form and wait for input). Clears any other overlay
-/// first (mutually-exclusive invariant). Pure w.r.t. process I/O — the caller
-/// runs the returned effects through [`crate::jobs::run_effects`].
-fn open_overlay_for_focus(
-    state: &mut AppState,
-    focus: Focus,
-) -> Vec<rocm_dash_core::state::SideEffect> {
-    state.close_overlays();
-    match focus {
-        Focus::Setup => {
-            state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
-            Vec::new()
-        }
-        Focus::Serve => {
-            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
-            Vec::new()
-        }
-        Focus::Examine => {
-            let (mgr, fx) = crate::ui::examine_manager::open_running(&mut state.jobs);
-            state.examine_manager = Some(mgr);
-            fx
-        }
-    }
-}
-
-pub async fn run(args: ResolvedArgs) -> color_eyre::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let res = event_loop(&mut terminal, &args).await;
-
-    // Best-effort terminal restoration: never let teardown failures override the
-    // session result. If the controlling terminal already went away (e.g. the
-    // PTY closed on quit), these writes can fail with a broken pipe — that must
-    // not turn a clean exit into a non-zero one.
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
-    let _ = terminal.show_cursor();
-    res
-}
-
-async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel::<ClientMsg>();
-    // Job-bridge channel (Phase 3 Wave 1): the async runtime streams
-    // `StateEvent`s (JobLine/JobDone/JobErr) for operational screens here.
-    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<rocm_dash_core::state::StateEvent>();
-    // Retain a sender for chat replies BEFORE `tx` is moved into the client /
-    // replay task below — the spawned agent task feeds replies back through the
-    // same `rx.recv()` arm the daemon events already use (no new plumbing).
-    let chat_tx = tx.clone();
-    let replay_controller = if let Some(path) = args.replay.clone() {
-        Some(crate::replay::spawn(path, tx))
-    } else if should_skip_daemon(args.focus) {
-        // Focused host: no daemon client. The overlay streams its own job via
-        // the job-bridge and the telemetry chrome isn't drawn, so a live
-        // connection would only spawn an unused embedded daemon. Drop `tx`
-        // (its `chat_tx` clone keeps `rx` alive for the loop); nothing is sent.
-        drop(tx);
-        None
-    } else {
-        client::spawn(args.connect.clone(), tx);
-        None
-    };
-
-    let mut events = EventStream::new();
-    let mut tick = interval(Duration::from_millis(250));
-    let connect_label = match &args.replay {
-        Some(p) => format!(
-            "replay:{}",
-            p.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-        ),
-        None => args.connect.clone(),
-    };
-    let mut state = AppState::new(connect_label, args.theme.clone());
-    // Honor the chat-first vs dashboard launch choice (rocm-cli semantics).
-    state.active_tab = args.initial_tab;
-    // Serve-wizard recipe picker source (Phase 3 Wave 1), adapted by the bin.
-    state.model_recipes = args.model_recipes.clone();
-    // Runtime manager source (Phase 3 Wave 2), adapted by the bin.
-    state.runtimes = args.runtimes.clone();
-    // Automations manager source (Phase 3 Wave 3), adapted by the bin.
-    state.automations = args.automations.clone();
-    // Tool-executor seam (Phase 2 plumbing), injected by the bin; None for
-    // demo/replay/mock. Phase 3 will use it.
-    state.tool_executor = args.tool_executor.clone();
-    // Daemon-tailed bench CSV path for the bench-run form's default --out.
-    state.bench_results_dir = args.bench_results_dir.clone();
-    // Focused host: open exactly the overlay for the requested flow (Examine
-    // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
-    // overlay — the same wizard `rocm bootstrap setup` routes to.
-    if let Some(focus) = args.focus {
-        let fx = open_overlay_for_focus(&mut state, focus);
-        crate::jobs::run_effects(fx, &job_tx);
-    }
-    state.replay = replay_controller.map(ReplayState::new);
-    // Both `--demo` (a generated session replayed) and `--replay <file>` present
-    // non-live data, so mark the session simulated for the honesty chrome.
-    state.simulated = state.replay.is_some();
-
-    // Resolve the chat backend. `--chat-mock` short-circuits detection with a
-    // deterministic offline MockAgentClient (no live LLM, no network); otherwise
-    // we auto-detect the endpoint (the std-TCP probe runs once on a blocking
-    // thread before the first frame) and build the Rig backend.
-    let mut agent: Option<std::sync::Arc<dyn crate::agent::AgentClient>> = if should_skip_daemon(
-        args.focus,
-    ) {
-        // Focused host: Setup/Serve/Diagnose never chat. Skip endpoint detection
-        // and backend construction entirely — no probe, no network, no OAuth
-        // default. `chat_llm` stays `None` and the Chat tab is never drawn here.
-        None
-    } else if args.chat_mock {
-        state.set_chat_config(
-            Some(crate::llm::LlmConfig {
-                base_url: "mock://offline-demo".to_string(),
-                model: "mock-agent".to_string(),
-                api_key: None,
-                auth_header: None,
-            }),
-            true,
-        );
-        Some(
-            std::sync::Arc::new(crate::agent::MockAgentClient::with_tool_call(
-                "GPU-2 is running hot: 87% util, 71°C, drawing 250 W (90 GB/192 GB VRAM).",
-                "gpu_status",
-            )) as std::sync::Arc<dyn crate::agent::AgentClient>,
-        )
-    } else {
-        // An endpoint we launched ourselves (managed-services registry) takes
-        // priority over the well-known default port — this is how a tool-launched
-        // engine on a non-default port (e.g. vLLM on :11435) is found. It does
-        // NOT override an explicitly configured `chat_url`/env URL, so config
-        // precedence is preserved (we only consult the registry when neither is
-        // set, i.e. where the well-known default would otherwise be probed).
-        // When neither an explicit URL (CLI/config) nor an env URL is set, run
-        // the SAME full local-engine detection the manual 'd' path uses:
-        // registry-first (an engine we launched ourselves, on whatever port it
-        // bound), then a probe of the well-known Lemonade/vLLM/rocm-serve
-        // ports (parallelized — see `llm::detect_local_endpoint` — so a cold
-        // start with no server doesn't pay 3x the probe timeout), plus a
-        // best-effort served-model fetch. This is what lets a local server win
-        // over the ChatGPT cloud default at startup instead of only the single
-        // well-known :8000 port that a bare `resolve_llm_config` probe covers.
-        //
-        // NOTE: unmerged PR #97 also touches this branch (model discovery when
-        // `chat_model` is None, inside `resolve_llm_config`'s own fallback
-        // path) — this change is conflict-minimal by leaving the
-        // `resolve_llm_config` call below untouched.
-        //
-        // Gate on `chat_api_key.is_none()` too: local detection returns a
-        // keyless `detected_llm_config` (api_key/auth_header forced to None),
-        // so firing it when the user configured a key would SILENTLY DROP that
-        // key and 401 at request time. A configured key means "use my
-        // configured backend", so skip the swap and let `resolve_llm_config`
-        // carry the key through its normal precedence.
-        let detection_ran = chat::should_detect_local_chat(
-            args.chat_url.as_deref(),
-            args.chat_env_url.as_deref(),
-            args.chat_api_key.as_deref(),
-        );
-        let detected = if detection_ran {
-            detect_local_chat(state.tool_executor.clone()).await
-        } else {
-            None
-        };
-        let probe_target = args
-            .chat_url
-            .clone()
-            .or_else(|| args.chat_env_url.clone())
-            .unwrap_or_else(|| crate::llm::DEFAULT_CHAT_BASE_URL.to_string());
-        // A detected endpoint (managed or probed) is already verified. When
-        // detection ran and found nothing it already probed the well-known
-        // vLLM :8000 port (== `DEFAULT_CHAT_BASE_URL`), so re-probing the same
-        // fallback target here is redundant and just burns another probe
-        // timeout on a cold start — treat that as unreachable directly.
-        // Otherwise (an explicit URL/env/key path) TCP-probe the target.
-        let startup_outcome = startup_chat_outcome(detection_ran, detected.is_some());
-        let probe_ok = match startup_outcome {
-            StartupChatOutcome::Local => true,
-            StartupChatOutcome::OAuth => false,
-            StartupChatOutcome::Configured => tokio::task::spawn_blocking(move || {
-                crate::llm::probe_endpoint(&probe_target, crate::llm::PROBE_TIMEOUT)
-            })
-            .await
-            .unwrap_or(false),
-        };
-        let llm = detected.or_else(|| {
-            crate::llm::resolve_llm_config(
-                args.chat_url.as_deref(),
-                args.chat_model.as_deref(),
-                None,
-                None,
-                args.chat_api_key.as_deref(),
-                args.chat_env_url.as_deref(),
-                args.chat_auth_header.as_deref(),
-                probe_ok,
-            )
-        });
-        // PR #97 port onto PR #100's startup flow: a *configured* URL (CLI/env)
-        // with no explicit model resolves to the `local-model` placeholder,
-        // which 404s on servers that register the model under its real id. Only
-        // the `Configured` outcome needs this — the `Local` outcome already
-        // carries a `/v1/models`-discovered model from `detect_local_chat`, and
-        // `OAuth` has no config. Discovery is gated inside the helper on
-        // `probe_ok` (an unreachable endpoint is never probed nor replaced) and
-        // on the absence of an explicit model (config precedence wins).
-        let llm = match llm {
-            Some(cfg) if startup_outcome == StartupChatOutcome::Configured => Some(
-                discover_configured_chat_model(cfg, args.chat_model.as_deref(), probe_ok).await,
-            ),
-            other => other,
-        };
-        state.set_chat_config(llm, args.chat_auto_consent);
-        // No reachable local endpoint AND no key/url configured → the no-key
-        // ChatGPT OAuth default (device-code login surfaced in the chat tab).
-        // This restores the no-key login the vendored Codex path provided; it
-        // takes NO api_key (env-only invariant untouched — OAuth, not a key).
-        let no_key_no_endpoint = startup_outcome == StartupChatOutcome::OAuth;
-        if no_key_no_endpoint {
-            let oauth_tx = chat_tx.clone();
-            crate::agent::ChatGptAgentClient::new(
-                args.chat_model.clone(),
-                args.inference_params(),
-                move |url, code| {
-                    let _ = oauth_tx.send(ClientMsg::ChatReply {
-                        text: format!(
-                            "To enable chat, sign in to ChatGPT: open {url} and enter the code {code}"
-                        ),
-                    });
-                },
-                state.tool_executor.clone(),
-                Some(chat_tx.clone()),
-            )
-            .ok()
-            .map(|c| c.with_preamble(args.chat_system_prompt.clone()))
-            .map(|c| std::sync::Arc::new(c) as std::sync::Arc<dyn crate::agent::AgentClient>)
-        } else {
-            // A build failure leaves `agent` None; a submit surfaces an error turn.
-            match &state.chat_llm {
-                Some(cfg) => build_local_agent(
-                    cfg.clone(),
-                    args.inference_params(),
-                    state.tool_executor.clone(),
-                    chat_tx.clone(),
-                    args.chat_system_prompt.clone(),
-                )
-                .ok(),
-                None => None,
-            }
-        }
-    };
-
-    // Snapshot the auto-detected local backend so `/provider local` can restore
-    // it after a switch to a remote provider. Without this, switching to OpenAI
-    // and back to local would leave `agent` pointing at the OpenAI backend
-    // (silent wrong-backend bug) — `build_chat_agent(Local)` returns None by
-    // design (Local is the inline-built backend), so the caller must restore the
-    // saved clone here. `Option<Arc<…>>` clone is a cheap Arc refcount bump.
-    let mut local_agent = agent.clone();
-
-    loop {
-        // Focused host renders overlay-only (no header / tabs / dock / footer
-        // chrome); the dashboard renders the full shell.
-        if should_skip_daemon(args.focus) {
-            terminal.draw(|f| ui::draw_focused(f, &mut state))?;
-        } else {
-            terminal.draw(|f| ui::draw(f, &mut state))?;
-        }
-        tokio::select! {
-            _ = tick.tick() => {
-                // Advance the animation clock so spinners cycle even while a
-                // job produces no new output.
-                state.tick_count = state.tick_count.wrapping_add(1);
-            }
-            maybe_msg = rx.recv() => {
-                match maybe_msg {
-                    Some(ClientMsg::Connecting) => state.conn = ConnState::Connecting,
-                    Some(ClientMsg::Connected { host, daemon_version }) => {
-                        state.conn = ConnState::Connected { host, version: daemon_version };
-                    }
-                    Some(ClientMsg::Disconnected { reason }) => {
-                        state.conn = ConnState::Disconnected { reason };
-                        state.latest = None;
-                    }
-                    Some(ClientMsg::Event(ev)) => state.apply_event(*ev),
-                    Some(ClientMsg::ReplaySeek) => state.reset_for_seek(),
-                    Some(ClientMsg::ReplayPosition { elapsed_s, total_s }) => {
-                        if let Some(r) = state.replay.as_mut() {
-                            r.elapsed_s = elapsed_s;
-                            r.total_s = total_s;
-                        }
-                    }
-                    Some(ClientMsg::ChatReply { text }) => state.on_chat_reply(text),
-                    Some(ClientMsg::SlashToolReply { text }) => state.on_slash_tool_reply(text),
-                    Some(ClientMsg::ChatError { message }) => state.on_chat_error(message),
-                    Some(ClientMsg::ChatDetectResult { offer }) => state.set_detect_result(offer),
-                    // A mutating tool (or slash command) surfaced an approval —
-                    // open the modal; nothing executes until the operator approves.
-                    Some(ClientMsg::ChatApprovalRequired { intent }) => state.open_approval(intent),
-                    // An approved action finished: append the result turn and
-                    // fire exactly one automatic follow-up agent turn.
-                    Some(ClientMsg::ChatApprovalResult { text }) => state.on_approval_result(text),
-                    // A `/plan` plan completed: render the review and (for a
-                    // complete mutating action) hand it to the approval modal.
-                    Some(ClientMsg::PlanReady { text, action }) => {
-                        state.on_plan_ready(text, action);
-                    }
-                    None => break,
-                }
-            }
-            // Job-bridge events feed the operational-screen job model (Wave 1).
-            maybe_job = job_rx.recv() => {
-                if let Some(ev) = maybe_job {
-                    let fx = state.jobs.apply(ev);
-                    crate::jobs::run_effects(fx, &job_tx);
-                }
-            }
-            maybe_ev = events.next() => {
-                match maybe_ev {
-                    // Only ACT on key presses. Terminals (notably Windows
-                    // Terminal / ConPTY under WSL, and any with the kitty
-                    // keyboard protocol) also emit Release/Repeat events; the
-                    // general `handle_key` already drops non-Press, but the
-                    // operational-overlay arms below dispatch straight to their
-                    // managers and would otherwise process the SAME keystroke
-                    // twice. That double-fire is what made Enter in the serve
-                    // wizard's model picker re-open the picker (seeding it with
-                    // the just-chosen model as a filter) instead of choosing.
-                    // Swallow non-Press key events here, above every key arm, so
-                    // the Press-only invariant holds for overlays too.
-                    Some(Ok(CtEvent::Key(k))) if !is_actionable_key(k.kind) => {
-                        let _ = k;
-                    }
-                    // The approval modal, when open, owns ALL keys with the
-                    // highest priority (above every operational overlay and the
-                    // general handler) so the operator's decision can't be
-                    // pre-empted. On Approve: replay the approved action off the
-                    // event loop (spawn_blocking) and post ChatApprovalResult.
-                    // On Deny/Cancel: a declined turn, no execution.
-                    Some(Ok(CtEvent::Key(k))) if state.approval.is_some() => {
-                        use crate::ui::approval::ApprovalVerdict;
-                        match state.on_approval_key(k.code) {
-                            Some(ApprovalVerdict::Approve) => {
-                                if let Some((name, args)) = state.take_approval() {
-                                    match state.tool_executor.clone() {
-                                        Some(executor) => {
-                                            let reply_tx = chat_tx.clone();
-                                            tokio::task::spawn_blocking(move || {
-                                                let text = run_approved(&executor, &name, &args);
-                                                let _ = reply_tx
-                                                    .send(ClientMsg::ChatApprovalResult { text });
-                                            });
-                                        }
-                                        None => state.on_approval_result(
-                                            "ROCm tools unavailable in this mode".to_string(),
-                                        ),
-                                    }
-                                }
-                            }
-                            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => {
-                                state.on_approval_declined();
-                            }
-                            None => { /* cursor moved or key ignored — modal stays open */ }
-                        }
-                    }
-                    // De-modal back-out: on ROCm/Serving, an inline manager is
-                    // shown in the Details pane. Esc closes it and returns focus
-                    // to the Actions list — intercepted BEFORE the per-manager
-                    // key arms so the manager doesn't eat Esc first. `←` is left
-                    // to the manager (some use it to cycle options).
-                    Some(Ok(CtEvent::Key(k))) if state.should_pane_back_out(k.code) => {
-                        state.close_overlays();
-                        state.pane_focus = PaneFocus::Actions;
-                    }
-                    // While a manager is showing its job console, the navigation
-                    // keys pan the log (PgUp/PgDn = page, arrows = line). Routed
-                    // BEFORE the per-manager arms (which would ignore them); the
-                    // console action keys (Ctrl+C/q/Esc/Enter) are NOT scroll keys
-                    // so they still fall through to `on_console_key`.
-                    Some(Ok(CtEvent::Key(k)))
-                        if state.has_active_console() && console_scroll_delta(k.code).is_some() =>
-                    {
-                        let (dv, dh) = console_scroll_delta(k.code).unwrap_or((0, 0));
-                        state.scroll_console(dv, dh);
-                    }
-                    // Focused host only: while the hosted job is still RUNNING,
-                    // swallow the console close keys (`q`, running-`Esc`) so the
-                    // overlay is never nulled mid-job — which would trip the
-                    // focused exit gate and tear the runtime down, killing the
-                    // child via kill_on_drop. `Ctrl+C` (cancel) and the scroll
-                    // keys above still flow, so the user can always stop a job;
-                    // once it is terminal, `q`/`Esc` exit normally. Routed BEFORE
-                    // the per-manager arms so the manager can't close first.
-                    Some(Ok(CtEvent::Key(k)))
-                        if focused_close_key_blocked(&state, args.focus, k.code) => {}
-                    // The services-manager overlay, when open, owns all keys
-                    // (and may spawn lifecycle jobs through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.services.is_some() => {
-                        let fx = crate::ui::services_manager::on_key(
-                            &mut state.services,
-                            &mut state.jobs,
-                            &state.instances,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The serve-wizard overlay, when open, owns all keys (and may
-                    // spawn a launch job through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.serve_wizard.is_some() => {
-                        let fx = crate::ui::serve_wizard::on_key(
-                            &mut state.serve_wizard,
-                            &mut state.jobs,
-                            &state.model_recipes,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The engine-manager overlay, when open, owns all keys (and
-                    // may stream an install job through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.engine_manager.is_some() => {
-                        let fx = crate::ui::engine_manager::on_key(
-                            &mut state.engine_manager,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The examine overlay, when open, owns all keys (read-only
-                    // `rocm examine` job through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.examine_manager.is_some() => {
-                        let fx = crate::ui::examine_manager::on_key(
-                            &mut state.examine_manager,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The update overlay, when open, owns all keys (check/preview
-                    // read-only; apply gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.update_manager.is_some() => {
-                        let fx = crate::ui::update_manager::on_key(
-                            &mut state.update_manager,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The install overlay, when open, owns all keys (dry-run
-                    // read-only; install gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.install_manager.is_some() => {
-                        let fx = crate::ui::install_manager::on_key(
-                            &mut state.install_manager,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The logs overlay, when open, owns all keys (read-only
-                    // `rocm logs` through the job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.logs_view.is_some() => {
-                        let fx = crate::ui::logs_view::on_key(
-                            &mut state.logs_view,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The runtime manager, when open, owns all keys (refresh
-                    // read-only; activate/rollback/uninstall/adopt/import gated).
-                    Some(Ok(CtEvent::Key(k))) if state.runtime_manager.is_some() => {
-                        let fx = crate::ui::runtime_manager::on_key(
-                            &mut state.runtime_manager,
-                            &state.runtimes,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The onboarding wizard, when open, owns all keys (install /
-                    // adopt gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.onboarding.is_some() => {
-                        let fx = crate::ui::onboarding::on_key(
-                            &mut state.onboarding,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The automations manager, when open, owns all keys (refresh
-                    // read-only; enable/disable gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.automations_manager.is_some() => {
-                        let fx = crate::ui::automations_manager::on_key(
-                            &mut state.automations_manager,
-                            &state.automations,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The command runner, when open, owns all keys (every
-                    // command gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.command_screen.is_some() => {
-                        let fx = crate::ui::command_screen::on_key(
-                            &mut state.command_screen,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // The config & provider manager, when open, owns all keys
-                    // (show read-only; provider toggles gated → job-bridge).
-                    Some(Ok(CtEvent::Key(k))) if state.config_manager.is_some() => {
-                        let fx = crate::ui::config_manager::on_key(
-                            &mut state.config_manager,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    // Bench-run form, when open, owns all keys.
-                    Some(Ok(CtEvent::Key(k))) if state.bench_run.is_some() => {
-                        let fx = crate::ui::bench_run::on_key(
-                            &mut state.bench_run,
-                            &mut state.jobs,
-                            k,
-                        );
-                        crate::jobs::run_effects(fx, &job_tx);
-                    }
-                    Some(Ok(CtEvent::Key(k))) => {
-                        let chat_ctx = ChatKeyCtx {
-                            focused: state.chat_focused,
-                            consent: state.chat_consent,
-                            offer_pending: state.chat_detect_offer.is_some(),
-                        };
-                        let action = handle_key(k, state.active_tab, &state.modal, chat_ctx);
-                        if apply_action(&mut state, action) {
-                            break;
-                        }
-                    }
-                    Some(Ok(CtEvent::Mouse(me))) => {
-                        let action = resolve_mouse(me, &state);
-                        if apply_action(&mut state, action) {
-                            break;
-                        }
-                    }
-                    Some(Ok(CtEvent::Resize(_, _))) => { /* repaint */ }
-                    // A terminal event-source error means the controlling
-                    // terminal went away (e.g. the PTY/stdin closed) — the
-                    // session is over, so quit cleanly rather than propagating a
-                    // fatal error. Propagating it made `rocm chat` exit non-zero
-                    // when its terminal closed before the first key was read
-                    // (e.g. the acceptance PTY smoke under the embedded-daemon
-                    // start delay); the legacy blocking reader treated this as
-                    // end-of-session too. Mirrors the `None => break` EOF arm.
-                    Some(Err(e)) => {
-                        tracing::debug!(error = %e, "terminal event stream ended; quitting");
-                        break;
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-        }
-
-        // A `/quit` (or `/exit`) slash command sets `should_quit` from inside
-        // the reducer; honor it here (mirrors the `KeyAction::Quit` break).
-        if state.should_quit {
-            break;
-        }
-
-        // Focused host: the launcher hosts exactly one overlay. Once the user
-        // backs out of it at root (the per-manager `on_key` set its state to
-        // `None`), return so `app::run` hands control back to the launcher menu.
-        // `focused_should_exit` stays `false` while any sub-popup / job console
-        // keeps the overlay `Some`, so this never ejects mid-flow. No-op for the
-        // dashboard (`focus == None`).
-        if state.focused_should_exit(args.focus) {
-            break;
-        }
-
-        // Drain a pending executor-backed read-only slash command (`/model`,
-        // `/daemon`). Off-thread (spawn_blocking) so the seam's synchronous
-        // execute() never blocks the async event loop; the concise summary
-        // returns via ClientMsg::SlashToolReply — its own message variant, so
-        // the slash-tool path never disturbs the agent's `chat_sending` flag.
-        if let Some(req) = state.slash_tool.take() {
-            match state.tool_executor.clone() {
-                Some(executor) => {
-                    let reply_tx = chat_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        // One path for read-only AND mutating slash commands:
-                        // `Result`/`Error` → a concise reply turn; an
-                        // `ApprovalRequired` (mutating) → open the approval modal
-                        // via ChatApprovalRequired (nothing executes yet).
-                        let msg = match executor.execute(&req.name, &req.args) {
-                            crate::tool_exec::RocmToolOutcome::ApprovalRequired(intent) => {
-                                ClientMsg::ChatApprovalRequired { intent }
-                            }
-                            outcome => ClientMsg::SlashToolReply {
-                                text: summarize_slash_tool(&req.label, &outcome),
-                            },
-                        };
-                        let _ = reply_tx.send(msg);
-                    });
-                }
-                None => {
-                    state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
-                }
-            }
-        }
-
-        // Drain a pending `/plan` natural-language plan. Off-thread
-        // (spawn_blocking) so the read-only `natural_language_plan` tool's
-        // synchronous execute() never blocks the async loop. The rendered plan +
-        // structured next action return via ClientMsg::PlanReady; the tool only
-        // PLANS — no mutation happens here. A complete mutating action is handed
-        // to the approval modal by `on_plan_ready`.
-        if let Some(req) = state.plan_request.take() {
-            match state.tool_executor.clone() {
-                Some(executor) => {
-                    let reply_tx = chat_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let args = serde_json::json!({ "request": req });
-                        let msg = match executor.execute("natural_language_plan", &args) {
-                            crate::tool_exec::RocmToolOutcome::Result(v) => {
-                                match parse_plan_result(&v) {
-                                    Some((text, action)) => ClientMsg::PlanReady { text, action },
-                                    None => ClientMsg::SlashToolReply {
-                                        text: "/plan: planner returned no usable plan".to_string(),
-                                    },
-                                }
-                            }
-                            crate::tool_exec::RocmToolOutcome::Error(e) => {
-                                ClientMsg::SlashToolReply {
-                                    text: format!("/plan failed: {e}"),
-                                }
-                            }
-                            crate::tool_exec::RocmToolOutcome::ApprovalRequired(_) => {
-                                ClientMsg::SlashToolReply {
-                                    text:
-                                        "/plan: planning is read-only and should not need approval"
-                                            .to_string(),
-                                }
-                            }
-                        };
-                        let _ = reply_tx.send(msg);
-                    });
-                }
-                None => {
-                    state.on_slash_tool_reply("ROCm tools unavailable in this mode".to_string());
-                }
-            }
-        }
-
-        // Drain a `/provider` switch (Phase 8). Rebuild the live `agent` for the
-        // newly-selected backend. `Local` reuses whatever the inline launch path
-        // built (it owns the auto-detect probe). `Openai`/`Anthropic` are built
-        // from `ResolvedArgs` keys (in-process seam, never argv). A build failure
-        // (e.g. missing key) leaves `agent` unchanged and surfaces an actionable
-        // error turn. Construction only — no network until the next submit.
-        if let Some(ProviderSwitch { previous, target }) = state.provider_switch.take() {
-            match target {
-                ChatProvider::Local => {
-                    // Restore the auto-detected local backend saved before the
-                    // event loop. `build_chat_agent(Local)` returns None by
-                    // design, so the restore must happen here — otherwise a prior
-                    // `/provider openai` would leave requests routed to OpenAI.
-                    agent = local_agent.clone();
-                    state
-                        .chat
-                        .push(ChatTurn::system("switched to local".to_string()));
-                }
-                ChatProvider::Openai | ChatProvider::Anthropic => {
-                    if let Some(new_agent) =
-                        build_chat_agent(target, args, state.tool_executor.clone(), chat_tx.clone())
-                    {
-                        agent = Some(new_agent);
-                        state
-                            .chat
-                            .push(ChatTurn::system(format!("switched to {}", target.label())));
-                    } else {
-                        // Revert the optimistic `active_provider` set by the slash
-                        // handler back to the provider active BEFORE the switch
-                        // attempt — not unconditionally Local — so the displayed
-                        // provider stays honest (e.g. a failed openai→anthropic
-                        // switch stays on openai). `agent` is never reassigned on a
-                        // failed build, so it already matches `previous`; the two
-                        // stay consistent (no stale-remote routing under a wrong
-                        // label).
-                        state.active_provider = previous;
-                        let hint = if target == ChatProvider::Anthropic {
-                            "anthropic requires ANTHROPIC_API_KEY in env or secure store"
-                        } else {
-                            "openai requires OPENAI_API_KEY in the environment"
-                        };
-                        state.chat.push(ChatTurn::error(format!(
-                            "could not switch to {}: {hint}",
-                            target.label()
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Drain the endpoint-rebuild edge (Phase 8 sibling). An accepted
-        // detected-local offer must re-point the LIVE `agent` — and the
-        // `/provider local` restore snapshot — at the new local backend.
-        // `accept_detect_offer` swaps `chat_llm` to the auth-free local config
-        // but stays I/O-free, so without this the stale startup agent keeps
-        // routing chat to the cloud gateway (wrong-backend 401 bug). The edge
-        // carries the provider active BEFORE the optimistic switch to `Local`;
-        // on failure we revert `active_provider` to it (mirrors the
-        // `provider_switch` drain) so the tab never shows `Local` while `agent`
-        // still points elsewhere. Construction only — no network until submit.
-        if let Some(previous) = state.chat_endpoint_rebuild.take() {
-            // `revert` restores the optimistic switch and surfaces an actionable
-            // error turn so the tab does not sit on `Local` with the old agent.
-            let revert = |state: &mut AppState, msg: String| {
-                state.active_provider = previous;
-                state.chat.push(ChatTurn::error(msg));
-            };
-            match state.chat_llm.clone() {
-                Some(cfg) => {
-                    match build_local_agent(
-                        cfg,
-                        args.inference_params(),
-                        state.tool_executor.clone(),
-                        chat_tx.clone(),
-                        args.chat_system_prompt.clone(),
-                    ) {
-                        Ok(arc) => {
-                            agent = Some(arc.clone());
-                            // Refresh the restore snapshot so a later `/provider
-                            // local` restores THIS accepted backend, not the
-                            // stale startup one.
-                            local_agent = Some(arc);
-                            state
-                                .chat
-                                .push(ChatTurn::system("switched to local".to_string()));
-                        }
-                        Err(e) => revert(
-                            &mut state,
-                            format!("could not switch to the detected local endpoint: {e}"),
-                        ),
-                    }
-                }
-                // Edge raised but `chat_llm` is None (shouldn't happen after a
-                // real accept, but don't leave the tab stuck on `Local` with the
-                // old agent and no feedback).
-                None => revert(
-                    &mut state,
-                    "could not switch to the detected local endpoint: no endpoint configured"
-                        .to_string(),
-                ),
-            }
-        }
-
-        // Spawn the agent round-trip on the submit edge — keeps `apply_action`
-        // I/O-free. `chat_dispatch` is raised once by `submit_chat`; consume it
-        // so the in-flight request is spawned exactly once (not every tick).
-        if state.chat_dispatch {
-            state.chat_dispatch = false;
-            match agent.clone() {
-                Some(agent) => {
-                    let history = state.chat.clone();
-                    let snapshot = state.state_snapshot();
-                    let reply_tx = chat_tx.clone();
-                    tokio::spawn(async move {
-                        let msg = match agent.complete(&history, snapshot).await {
-                            Ok(text) => ClientMsg::ChatReply { text },
-                            Err(e) => ClientMsg::ChatError {
-                                message: e.to_string(),
-                            },
-                        };
-                        let _ = reply_tx.send(msg);
-                    });
-                }
-                None => state.on_chat_error(NO_CHAT_BACKEND_MSG.to_string()),
-            }
-        }
-
-        // Run the local-engine probe + `/v1/models` query on the detect edge,
-        // off the reducer. Raised once by `request_detect`; result returns via
-        // `ClientMsg::ChatDetectResult`.
-        if state.chat_detect_dispatch {
-            state.chat_detect_dispatch = false;
-            let reply_tx = chat_tx.clone();
-            let executor = state.tool_executor.clone();
-            tokio::spawn(async move {
-                let offer = detect_local_chat(executor).await;
-                let _ = reply_tx.send(ClientMsg::ChatDetectResult { offer });
-            });
-        }
-
-        // Persist the accepted endpoint on the save edge (a small synchronous
-        // file write; the message surfaces success/failure on the gate is not
-        // shown once Accepted, so we keep it terse via tracing + chat_detect_msg).
-        if state.chat_persist_dispatch {
-            state.chat_persist_dispatch = false;
-            if let Some(cfg) = state.chat_llm.clone() {
-                match persist_chat_endpoint(&cfg.base_url, &cfg.model) {
-                    Ok(path) => {
-                        tracing::info!(?path, "saved chat endpoint to config");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to save chat endpoint");
-                        state.chat_detect_msg = Some(format!("could not save config: {e}"));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Run an approved mutating action across the seam and render a concise summary
-/// (never a raw JSON dump). Sync + executor-generic so the approve path is
-/// unit-testable without tokio; the event loop calls it inside spawn_blocking.
-fn run_approved(
-    executor: &crate::tool_exec::SharedRocmToolExecutor,
-    name: &str,
-    args: &serde_json::Value,
-) -> String {
-    use crate::tool_exec::RocmToolOutcome;
-    match executor.execute_approved(name, args) {
-        RocmToolOutcome::Result(v) => {
-            let body = summarize_json_value(&v);
-            if body.is_empty() {
-                format!("Approved · {name}: done")
-            } else {
-                format!("Approved · {name}:\n{body}")
-            }
-        }
-        RocmToolOutcome::Error(e) => format!("Approved · {name} failed: {e}"),
-        // A mutating tool's approved replay should not re-request approval; if it
-        // somehow does, surface it plainly rather than silently looping.
-        RocmToolOutcome::ApprovalRequired(_) => {
-            format!("Approved · {name}: unexpected second approval request (not run)")
-        }
-    }
-}
-
-/// Wrap a list cursor by `delta`, cycling within `0..len`. `len == 0` → 0.
-const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let n = len.cast_signed();
-    (cur.cast_signed() + delta).rem_euclid(n) as usize
-}
-
-/// Apply a `KeyAction` to mutable state. Returns `true` when the action
-/// requests application exit (Quit).
-fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
-    match action {
-        KeyAction::Quit => return true,
-        KeyAction::SwitchTab(t) => {
-            state.active_tab = t;
-            state.modal = Modal::None;
-            // A fresh tab always starts with focus on its Actions list, never
-            // stranded in the Details pane from a previous visit.
-            state.pane_focus = PaneFocus::Actions;
-        }
-        KeyAction::Move(d) => {
-            if state.modal == Modal::ThemePicker {
-                state.theme_picker_move(d);
-            } else {
-                // Changing the verb selection snaps focus back to the Actions
-                // list so Details re-previews the newly selected operation.
-                if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                    state.pane_focus = PaneFocus::Actions;
-                }
-                state.move_selection(d);
-            }
-        }
-        KeyAction::PaneFocusDetail => {
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                state.pane_focus = PaneFocus::Detail;
-            }
-        }
-        KeyAction::PaneFocusActions => {
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                state.pane_focus = PaneFocus::Actions;
-            }
-        }
-        KeyAction::PaneActivate => {
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                match state.pane_focus {
-                    // From the Actions list, Enter steps INTO the Details pane.
-                    PaneFocus::Actions => state.pane_focus = PaneFocus::Detail,
-                    // From Details, Enter opens the operation's manager.
-                    PaneFocus::Detail => {
-                        let verb = state.pane_verb_action();
-                        return apply_action(state, verb);
-                    }
-                }
-            }
-        }
-        KeyAction::PaneEscape => {
-            // Esc backs out one level: Details → Actions, then Actions → menu.
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-                && state.pane_focus == PaneFocus::Detail
-            {
-                state.pane_focus = PaneFocus::Actions;
-            } else {
-                return apply_action(state, KeyAction::OpenMenu);
-            }
-        }
-        KeyAction::PaneSelect(i) => {
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                let last = state.pane_verb_count().saturating_sub(1);
-                state.set_selection(state.active_tab, i.min(last));
-                state.pane_focus = PaneFocus::Actions;
-            }
-        }
-        KeyAction::SelectFirst => {
-            if state.modal == Modal::ThemePicker {
-                state.theme_picker_first();
-            } else {
-                state.select_first();
-            }
-        }
-        KeyAction::SelectLast => {
-            if state.modal == Modal::ThemePicker {
-                state.theme_picker_last();
-            } else {
-                state.select_last();
-            }
-        }
-        KeyAction::OpenDetail => {
-            if matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving) {
-                // Verb rows open the matching manager via the existing seam;
-                // there is no detail modal on the ROCm/Serving tabs.
-                let verb = state.pane_verb_action();
-                return apply_action(state, verb);
-            }
-            if state.selection_len() > 0 {
-                state.modal = Modal::Detail;
-            }
-        }
-        KeyAction::ToggleHelp => {
-            state.modal = if state.modal == Modal::Help {
-                Modal::None
-            } else {
-                Modal::Help
-            };
-        }
-        KeyAction::CloseModal => state.modal = Modal::None,
-        // The operational overlays are mutually exclusive: opening any one first
-        // closes the rest (see `close_overlays`), so no open path — key, mouse,
-        // or effect — can ever leave two `Some` at once.
-        KeyAction::OpenServices => {
-            state.close_overlays();
-            state.services = Some(crate::ui::services_manager::ServicesManagerState::default());
-        }
-        KeyAction::OpenServeWizard => {
-            state.close_overlays();
-            state.serve_wizard = Some(crate::ui::serve_wizard::ServeWizardState::default());
-        }
-        KeyAction::OpenEngineManager => {
-            state.close_overlays();
-            state.engine_manager = Some(crate::ui::engine_manager::EngineManagerState::default());
-        }
-        KeyAction::OpenExamine => {
-            state.close_overlays();
-            state.examine_manager =
-                Some(crate::ui::examine_manager::ExamineManagerState::default());
-        }
-        KeyAction::OpenUpdate => {
-            state.close_overlays();
-            state.update_manager = Some(crate::ui::update_manager::UpdateManagerState::default());
-        }
-        KeyAction::OpenInstall => {
-            state.close_overlays();
-            state.install_manager =
-                Some(crate::ui::install_manager::InstallManagerState::default());
-        }
-        KeyAction::OpenLogs => {
-            state.close_overlays();
-            state.logs_view = Some(crate::ui::logs_view::LogsViewState::default());
-        }
-        KeyAction::OpenRuntimes => {
-            state.close_overlays();
-            state.runtime_manager =
-                Some(crate::ui::runtime_manager::RuntimeManagerState::default());
-        }
-        KeyAction::OpenOnboarding => {
-            state.close_overlays();
-            state.onboarding = Some(crate::ui::onboarding::OnboardingState::default());
-        }
-        KeyAction::OpenAutomations => {
-            state.close_overlays();
-            state.automations_manager =
-                Some(crate::ui::automations_manager::AutomationsManagerState::default());
-        }
-        KeyAction::OpenCommand => {
-            state.close_overlays();
-            state.command_screen = Some(crate::ui::command_screen::CommandScreenState::default());
-        }
-        KeyAction::OpenConfig => {
-            state.close_overlays();
-            state.config_manager = Some(crate::ui::config_manager::ConfigManagerState::default());
-        }
-        KeyAction::OpenBenchRun => {
-            let bench_csv = state.bench_results_dir.clone();
-            state.close_overlays();
-            state.bench_run = Some(crate::ui::bench_run::BenchRunState::new(
-                bench_csv.as_deref(),
-            ));
-        }
-        KeyAction::OpenThemePicker => state.open_theme_picker(),
-        KeyAction::ApplyThemePick => state.apply_theme_pick(),
-        KeyAction::OpenMenu => {
-            state.modal = Modal::Menu;
-            state.menu_sel = 0;
-        }
-        KeyAction::OpenPalette => {
-            state.modal = Modal::Palette;
-            state.palette_sel = 0;
-        }
-        KeyAction::MenuMove(d) => match state.modal {
-            Modal::Menu => {
-                state.menu_sel = wrap_cursor(state.menu_sel, d, crate::ui::modal::MENU_ITEMS);
-            }
-            Modal::Palette => {
-                state.palette_sel =
-                    wrap_cursor(state.palette_sel, d, crate::ui::modal::PALETTE_DESTS.len());
-            }
-            _ => {}
-        },
-        KeyAction::OptionsTab(d) => {
-            if state.modal == Modal::Options {
-                state.options_tab =
-                    wrap_cursor(state.options_tab, d, crate::ui::modal::OPTIONS_TABS.len());
-            }
-        }
-        KeyAction::MenuActivate => match state.modal {
-            Modal::Menu => match state.menu_sel {
-                0 => {
-                    state.modal = Modal::Options;
-                    state.options_tab = 0;
-                }
-                1 => state.modal = Modal::GlobalHelp,
-                _ => return true, // Quit
-            },
-            Modal::Palette => {
-                if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
-                    state.active_tab = *tab;
-                }
-                state.modal = Modal::None;
-            }
-            _ => {}
-        },
-        // ponytail: P3 folds Bench into Observe; the per-tab Bench detail modal
-        // (the only scrollable detail) is no longer reachable, so modal scroll
-        // is a no-op until/unless a scrollable Observe detail is wired.
-        KeyAction::ScrollModal(_) => {}
-        KeyAction::ScrollConsole(dv, dh) => state.scroll_console(dv, dh),
-        KeyAction::ScrollDock(dv) => state.scroll_dock(dv),
-        KeyAction::ScrollGrab(target, pos, grab_offset) => {
-            state.apply_scroll_grab(target, pos, grab_offset);
-        }
-        KeyAction::ScrollRelease => state.scroll_drag = None,
-        KeyAction::ReplayTogglePause => {
-            if let Some(r) = state.replay.as_mut() {
-                r.paused = !r.paused;
-                if r.paused {
-                    r.controller.pause();
-                } else {
-                    r.controller.resume();
-                }
-            }
-        }
-        KeyAction::ReplaySpeedUp => {
-            if let Some(r) = state.replay.as_mut() {
-                r.speed = crate::replay::next_speed(r.speed);
-                r.controller.set_speed(r.speed);
-            }
-        }
-        KeyAction::ReplaySpeedDown => {
-            if let Some(r) = state.replay.as_mut() {
-                r.speed = crate::replay::prev_speed(r.speed);
-                r.controller.set_speed(r.speed);
-            }
-        }
-        KeyAction::ReplayJump(delta_s) => {
-            if let Some(r) = state.replay.as_ref() {
-                r.controller.jump(delta_s);
-            }
-        }
-        KeyAction::ChatInput(c) => state.chat_input.push(c),
-        KeyAction::ChatBackspace => {
-            state.chat_input.pop();
-        }
-        KeyAction::ChatSubmit => state.submit_chat(),
-        KeyAction::ChatFocus => state.chat_focused = true,
-        KeyAction::ChatBlur => state.chat_focused = false,
-        KeyAction::ChatConsentAccept => state.accept_chat_consent(),
-        KeyAction::ChatConsentDecline => state.decline_chat_consent(),
-        KeyAction::ChatDetect => state.request_detect(),
-        KeyAction::ChatDetectAccept => state.accept_detect_offer(),
-        KeyAction::ChatDetectSave => state.save_detect_offer(),
-        KeyAction::ChatDetectDismiss => state.dismiss_detect_offer(),
-        KeyAction::ChatScroll(d) => {
-            let next = (i32::from(state.chat_scroll) + i32::from(d)).max(0) as usize;
-            state.set_chat_scroll(next);
-        }
-        KeyAction::Nothing => {}
-    }
-    false
-}
-
-/// Convert a displayed position to the target's own offset units. Dock logs are
-/// tail-anchored, so their displayed top-to-bottom position is inverted.
-fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
-    if h.target == ScrollTarget::DockLogs {
-        h.max_position().saturating_sub(displayed)
-    } else {
-        displayed
-    }
-}
-
-fn target_position(state: &AppState, h: &ScrollbarHandle) -> usize {
-    let position = match h.target {
-        ScrollTarget::Console => usize::from(state.console_scroll),
-        ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
-        ScrollTarget::Chat => usize::from(state.chat_scroll),
-        ScrollTarget::BenchDetail => usize::from(state.bench_detail_scroll),
-        ScrollTarget::DockLogs => h
-            .max_position()
-            .saturating_sub(usize::from(state.dock_logs_scroll)),
-    };
-    position.min(h.max_position())
-}
-
-/// If `(col, row)` lands on a recorded scrollbar, preserve a thumb grab or use
-/// a proportional full-track jump for a track click.
-fn scrollbar_hit(state: &AppState, col: u16, row: u16) -> Option<KeyAction> {
-    let bars = state.scrollbars.borrow();
-    let h = bars.iter().find(|h| point_in(h.track, col, row))?;
-    let displayed = target_position(state, h);
-    let grab_offset = h.grab_offset(col, row, displayed);
-    let next = grab_offset.map_or_else(|| h.track_position_at(col, row), |_| displayed);
-    Some(KeyAction::ScrollGrab(
-        h.target,
-        target_offset(h, next),
-        grab_offset.unwrap_or(0),
-    ))
-}
-
-fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
-    // A held drag on a scrollbar keeps updating that offset until release, even
-    // when the pointer slides off the narrow track.
-    if me.kind == MouseEventKind::Drag(MouseButton::Left) {
-        if let Some(drag) = state.scroll_drag
-            && let Some(h) = state
-                .scrollbars
-                .borrow()
-                .iter()
-                .find(|h| h.target == drag.target)
-        {
-            let current = target_position(state, h);
-            let displayed = h.position_at(me.column, me.row, drag.grab_offset, current);
-            return KeyAction::ScrollGrab(
-                drag.target,
-                target_offset(h, displayed),
-                drag.grab_offset,
-            );
-        }
-        return KeyAction::Nothing;
-    }
-    // Any button release ends an active scrollbar drag.
-    if matches!(me.kind, MouseEventKind::Up(_)) {
-        return if state.scroll_drag.is_some() {
-            KeyAction::ScrollRelease
-        } else {
-            KeyAction::Nothing
-        };
-    }
-
-    if me.kind == MouseEventKind::Down(MouseButton::Left) {
-        // Scrollbar tracks win over everything (incl. an open overlay's console
-        // bar), so a click on the bar grabs it instead of falling through.
-        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
-            return a;
-        }
-        if let Some(area) = state.last_tab_bar_area
-            && let Some(tab) = tab_bar_hit(area, me.column, me.row)
-        {
-            return KeyAction::SwitchTab(tab);
-        }
-        // Footer legend: a click on a key chip acts exactly like the key press.
-        if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
-            return chip;
-        }
-        // While an operational manager is open it owns the body — swallow body
-        // clicks so they can't fall THROUGH the inline manager to the obscured
-        // Actions/Details list (which would silently change the selection or
-        // re-open a verb). Tab-bar and footer-chip clicks above still work.
-        if state.has_open_overlay() {
-            return KeyAction::Nothing;
-        }
-        if state.modal == Modal::None
-            && let Some(area) = state.last_body_area
-        {
-            // ponytail: Observe folds the instances table into a stacked region;
-            // body-click hit-testing best-efforts the instances rows. Keyboard
-            // selection is the primary path.
-            let action = match state.active_tab {
-                // Observe's AI table is keyboard + scroll-wheel driven (the
-                // scroll path maps to Move in `handle_mouse`); left-click select
-                // is intentionally not wired (the table sits below the hero band,
-                // so a body-relative row map would be wrong). No-op here.
-                ActiveTab::Rocm => ui::tabs::rocm::hit_test(area, me.column, me.row),
-                ActiveTab::Serving => ui::tabs::serving::hit_test(area, me.column, me.row),
-                _ => None,
-            };
-            if let Some(a) = action {
-                return a;
-            }
-        }
-        return KeyAction::Nothing;
-    }
-
-    // Scroll wheel (incl. horizontal wheel where the device emits it). Per-notch
-    // deltas: ±1 line / ±1 col here, scaled per target below.
-    let (dv, dh): (i16, i16) = match me.kind {
-        MouseEventKind::ScrollDown => (1, 0),
-        MouseEventKind::ScrollUp => (-1, 0),
-        MouseEventKind::ScrollRight => (0, 1),
-        MouseEventKind::ScrollLeft => (0, -1),
-        // Not a scroll (e.g. moves / other buttons): nothing to route.
-        _ => return KeyAction::Nothing,
-    };
-
-    // An open manager owns the body. When it is showing its job console, the
-    // wheel pans that log (bigger vertical step, wider horizontal step so long
-    // command lines come into view). On a form screen there is nothing to pan —
-    // swallow it so the wheel can't move the obscured Actions list underneath.
-    if state.has_open_overlay() {
-        return if state.has_active_console() {
-            KeyAction::ScrollConsole(dv * 3, dh * 6)
-        } else {
-            KeyAction::Nothing
-        };
-    }
-
-    // Wide-layout right LOGS dock: the wheel pans the log stream when the pointer
-    // is over it (vertical only — it's a tail-anchored log).
-    if state.modal == Modal::None
-        && dv != 0
-        && let Some(dock) = state.last_dock_area
-        && point_in(dock, me.column, me.row)
-    {
-        return KeyAction::ScrollDock(dv * 3);
-    }
-
-    // No overlay: on a domain tab the wheel moves the Actions selection by ONE
-    // row — but only while the pointer is actually over the Actions column, so
-    // hovering the Details pane doesn't nudge the list. Anything else falls
-    // through to the modal/tab scroll routing.
-    if state.modal == Modal::None
-        && matches!(state.active_tab, ActiveTab::Rocm | ActiveTab::Serving)
-    {
-        if dv != 0
-            && let Some(body) = state.last_body_area
-            && point_in(crate::ui::tabs::pane::actions_rect(body), me.column, me.row)
-        {
-            return KeyAction::Move(dv as isize);
-        }
-        return KeyAction::Nothing;
-    }
-
-    handle_mouse(me, &state.modal, state.active_tab)
-}
-
-/// Whether `(x, y)` lies inside `r` (end-exclusive on both axes).
-const fn point_in(r: ratatui::layout::Rect, x: u16, y: u16) -> bool {
-    x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
-}
-
-/// Resolve a pointer `(col, row)` against the recorded footer-legend chips.
-/// Returns the chip's action when the pointer lands inside a chip span.
-fn footer_chip_hit(chips: &[FooterChip], col: u16, row: u16) -> Option<KeyAction> {
-    chips
-        .iter()
-        .find(|c| row == c.y && col >= c.x0 && col < c.x1)
-        .map(|c| c.action)
-}
-
-/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
-/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PaneFocus {
-    /// Browsing the Actions list (left column).
-    #[default]
-    Actions,
-    /// Inside the Details pane (right column), ready to start the operation.
-    Detail,
-}
-
-/// A clickable footer-legend chip: an absolute screen span on the footer row
-/// plus the action a left-click should dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FooterChip {
-    pub x0: u16,
-    /// End-exclusive.
-    pub x1: u16,
-    pub y: u16,
-    pub action: KeyAction,
-}
-
-/// Active pointer drag for a scrollbar thumb.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrollDrag {
-    pub target: ScrollTarget,
-    pub grab_offset: u16,
-}
-
-/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
-/// scrollbar track write the right offset field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollTarget {
-    /// Job console vertical (`console_scroll`).
-    Console,
-    /// Job console horizontal (`console_hscroll`).
-    ConsoleH,
-    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
-    DockLogs,
-    /// Bench row detail modal (`bench_detail_scroll`).
-    BenchDetail,
-    /// Chat transcript (`chat_scroll`).
-    Chat,
-}
-
-/// A scrollbar drawn this frame, recorded so a mouse click/drag can hit-test it.
-///
-/// `track` is the screen rect of the bar; `content_len`/`viewport_len` size the
-/// thumb; `target` says which offset to move. Vertical bars map the mouse row,
-/// horizontal bars the column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScrollbarHandle {
-    pub track: ratatui::layout::Rect,
-    pub horizontal: bool,
-    pub content_len: usize,
-    pub viewport_len: usize,
-    pub target: ScrollTarget,
-}
-
-impl ScrollbarHandle {
-    /// Build a handle from the rect passed to a scrollbar helper (`area`) and its
-    /// returned content rect (`drawn`). Returns `None` when they're equal — i.e.
-    /// no bar was drawn because the content fit — so nothing gets hit-tested.
-    pub(crate) fn new(
-        area: ratatui::layout::Rect,
-        drawn: ratatui::layout::Rect,
-        horizontal: bool,
-        content_len: usize,
-        viewport_len: usize,
-        target: ScrollTarget,
-    ) -> Option<Self> {
-        if drawn == area {
-            return None;
-        }
-        let track = if horizontal {
-            ratatui::layout::Rect::new(area.x, area.y + area.height - 1, area.width, 1)
-        } else {
-            ratatui::layout::Rect::new(area.x + area.width - 1, area.y, 1, area.height)
-        };
-        Some(Self {
-            track,
-            horizontal,
-            content_len,
-            viewport_len,
-            target,
-        })
-    }
-
-    const fn max_position(&self) -> usize {
-        self.content_len.saturating_sub(self.viewport_len)
-    }
-
-    const fn axis(&self, col: u16, row: u16) -> (u16, u16, u16) {
-        if self.horizontal {
-            (col, self.track.x, self.track.width)
-        } else {
-            (row, self.track.y, self.track.height)
-        }
-    }
-
-    /// Ratatui 0.30.2 `Scrollbar::part_lengths` geometry for the logical
-    /// first-visible-unit position used by the dashboard.
-    fn thumb_geometry(&self, logical_position: usize) -> (u16, u16) {
-        let (_, _, span) = self.axis(0, 0);
-        if span == 0 || self.content_len == 0 {
-            return (0, 0);
-        }
-        let track_len = usize::from(span);
-        let rendered_max = self.content_len.saturating_sub(1);
-        let rendered_position =
-            logical_position.min(self.max_position()) * rendered_max / self.max_position().max(1);
-        let denominator = rendered_max.saturating_add(self.viewport_len);
-        let rounded_divide =
-            |numerator: usize| numerator.saturating_add(denominator / 2) / denominator.max(1);
-        let thumb_len =
-            rounded_divide(self.viewport_len.saturating_mul(track_len)).clamp(1, track_len);
-        let thumb_start = rounded_divide(rendered_position.saturating_mul(track_len))
-            .clamp(0, track_len.saturating_sub(thumb_len));
-        (thumb_start as u16, thumb_len as u16)
-    }
-
-    fn grab_offset(&self, col: u16, row: u16, position: usize) -> Option<u16> {
-        let (coord, track_start, _) = self.axis(col, row);
-        let relative = coord.saturating_sub(track_start);
-        let (thumb_start, thumb_len) = self.thumb_geometry(position);
-        (relative >= thumb_start && relative < thumb_start.saturating_add(thumb_len))
-            .then(|| relative - thumb_start)
-    }
-
-    /// Proportional track-click mapping. The endpoints map exactly to the
-    /// logical endpoints and do not depend on thumb geometry.
-    fn track_position_at(&self, col: u16, row: u16) -> usize {
-        let max_position = self.max_position();
-        let (coord, start, span) = self.axis(col, row);
-        if max_position == 0 || span <= 1 {
-            return 0;
-        }
-        usize::from(coord.saturating_sub(start).min(span - 1)) * max_position
-            / usize::from(span - 1)
-    }
-
-    /// Invert Ratatui's rounded thumb-start mapping. When several logical
-    /// positions render at the requested start, retain `current_position` if it
-    /// lies on that plateau; otherwise choose the nearest plateau endpoint.
-    fn position_at(&self, col: u16, row: u16, grab_offset: u16, current_position: usize) -> usize {
-        let max_position = self.max_position();
-        if max_position == 0 {
-            return 0;
-        }
-        let (coord, start, span) = self.axis(col, row);
-        let (_, thumb_len) = self.thumb_geometry(0);
-        let desired_start = coord
-            .saturating_sub(start)
-            .saturating_sub(grab_offset)
-            .min(span.saturating_sub(thumb_len));
-        if desired_start == 0 {
-            return 0;
-        }
-        if desired_start == span.saturating_sub(thumb_len) {
-            return max_position;
-        }
-
-        let first_at_or_after = |wanted: u16| {
-            let mut low = 0usize;
-            let mut high = max_position;
-            while low < high {
-                let mid = low + (high - low) / 2;
-                if self.thumb_geometry(mid).0 < wanted {
-                    low = mid + 1;
-                } else {
-                    high = mid;
-                }
-            }
-            low
-        };
-        let first = first_at_or_after(desired_start);
-        if self.thumb_geometry(first).0 != desired_start {
-            if first == 0 {
-                return 0;
-            }
-            let before = first - 1;
-            let before_start = self.thumb_geometry(before).0;
-            let after_start = self.thumb_geometry(first).0;
-            return if desired_start - before_start <= after_start - desired_start {
-                before
-            } else {
-                first
-            };
-        }
-        let after = first_at_or_after(desired_start.saturating_add(1));
-        let last = if after == max_position && self.thumb_geometry(after).0 == desired_start {
-            after
-        } else {
-            after.saturating_sub(1)
-        };
-        current_position.clamp(first, last)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyAction {
-    Nothing,
-    Quit,
-    SwitchTab(ActiveTab),
-    /// ROCm/Serving tab: move focus into the Details pane (`→`).
-    PaneFocusDetail,
-    /// ROCm/Serving tab: move focus back to the Actions list (`←`).
-    PaneFocusActions,
-    /// ROCm/Serving tab: activate the current focus — from the Actions list,
-    /// focus the Details pane; from Details, open the operation's manager.
-    PaneActivate,
-    /// ROCm/Serving tab: Esc — step out of Details back to the Actions list, or,
-    /// when already on the list, fall through to the main menu.
-    PaneEscape,
-    /// ROCm/Serving tab: select the verb at this index and park focus on the
-    /// Actions list (from a mouse click on a verb row).
-    PaneSelect(usize),
-    Move(isize),
-    SelectFirst,
-    SelectLast,
-    OpenDetail,
-    ToggleHelp,
-    CloseModal,
-    OpenThemePicker,
-    ApplyThemePick,
-    /// Vertical scroll inside the active modal body (positive = down).
-    ScrollModal(i16),
-    /// Pan the active job console: `(vertical_lines, horizontal_cols)`, negative
-    /// = up/left. No-op when no console is showing.
-    ScrollConsole(i16, i16),
-    /// Scroll the wide-layout right LOGS dock by N lines (negative = toward the
-    /// newest line). No-op when the dock isn't showing.
-    ScrollDock(i16),
-    /// Grab a scrollbar at `position`, retaining the pointer's offset inside the
-    /// thumb so subsequent drag events track without a jump.
-    ScrollGrab(ScrollTarget, usize, u16),
-    /// Release the active scrollbar drag (mouse button up).
-    ScrollRelease,
-    /// Toggle replay pause / resume. No-op when not replaying.
-    ReplayTogglePause,
-    /// Step replay speed up or down (clamped). No-op when not replaying.
-    ReplaySpeedUp,
-    ReplaySpeedDown,
-    /// Move the replay playhead by `delta_s` seconds (negative = rewind).
-    ReplayJump(i64),
-    /// Chat insert-mode: append a character to `chat_input`.
-    ChatInput(char),
-    /// Chat insert-mode: pop the last character from `chat_input`.
-    ChatBackspace,
-    /// Chat: submit the current input buffer as a user turn.
-    ChatSubmit,
-    /// Chat: enter text-entry focus.
-    ChatFocus,
-    /// Chat: leave text-entry focus.
-    ChatBlur,
-    /// Chat: accept the detected endpoint (one-time consent).
-    ChatConsentAccept,
-    /// Chat: decline the detected endpoint.
-    ChatConsentDecline,
-    /// Chat: probe for a local engine and offer it (in-TUI auto-detect).
-    ChatDetect,
-    /// Chat: accept the detected local endpoint for this session.
-    ChatDetectAccept,
-    /// Chat: accept the detected endpoint and persist it to config.
-    ChatDetectSave,
-    /// Chat: dismiss the detected-endpoint offer, keeping the prior config.
-    ChatDetectDismiss,
-    /// Chat: scroll the transcript by N lines (positive = down).
-    ChatScroll(i16),
-    /// Open the btop-style Esc main menu (P4).
-    OpenMenu,
-    /// Open the "Go to…" command palette (P4).
-    OpenPalette,
-    /// Move the cursor within the active overlay (Menu / Palette) by N rows.
-    MenuMove(isize),
-    /// Cycle the Options panel's tab by N (left/right).
-    OptionsTab(isize),
-    /// Activate the highlighted row in the active overlay (Menu / Palette).
-    MenuActivate,
-    /// Open the services-manager overlay (Phase 3 Wave 1).
-    OpenServices,
-    /// Open the serve-wizard overlay (Phase 3 Wave 1).
-    OpenServeWizard,
-    /// Open the engine-manager overlay (Phase 3 Wave 1).
-    OpenEngineManager,
-    /// Open the examine overlay (Phase 3 Wave 2).
-    OpenExamine,
-    /// Open the update overlay (Phase 3 Wave 2).
-    OpenUpdate,
-    /// Open the install overlay (Phase 3 Wave 2).
-    OpenInstall,
-    /// Open the runtime manager overlay.
-    OpenRuntimes,
-    /// Open the onboarding wizard overlay.
-    OpenOnboarding,
-    /// Open the automations manager overlay.
-    OpenAutomations,
-    /// Open the command runner overlay.
-    OpenCommand,
-    /// Open the config & provider manager overlay.
-    OpenConfig,
-    /// Open the logs overlay (Phase 3 Wave 3).
-    OpenLogs,
-    /// Open the bench-run form overlay.
-    OpenBenchRun,
-}
-
-/// Whether a crossterm key event should be acted on. Terminals emit
-/// Release/Repeat events in addition to Press (notably Windows Terminal /
-/// ConPTY under WSL, and any terminal advertising the kitty keyboard protocol).
-///
-/// The whole TUI acts on Press only. Both the general [`handle_key`] and the
-/// event loop's operational-overlay dispatch share this gate — without it, a
-/// single keystroke reaches an overlay's `on_key` more than once, which made
-/// Enter in the serve wizard's model picker re-open the picker (seeded with the
-/// just-chosen model as a filter) instead of choosing it.
-const fn is_actionable_key(kind: KeyEventKind) -> bool {
-    matches!(kind, KeyEventKind::Press)
-}
-
-fn handle_key(k: KeyEvent, current: ActiveTab, modal: &Modal, chat: ChatKeyCtx) -> KeyAction {
-    if !is_actionable_key(k.kind) {
-        return KeyAction::Nothing;
-    }
-    // Chat tab key handling, placed BEFORE the global hotkey match so focused
-    // text entry and the consent prompt absorb keys (the short-circuit that
-    // stops `q`, `1`–`5`, etc. from firing while typing / deciding consent).
-    if current == ActiveTab::Chat && *modal == Modal::None {
-        // A detected-endpoint offer (gate-only) absorbs its decision keys before
-        // the normal consent prompt: y use now, n/Esc dismiss. ([s] use & save
-        // is wired with persistence.) Other keys fall through to the globals.
-        if chat.offer_pending && chat.consent != ChatConsent::Accepted {
-            match k.code {
-                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                    return KeyAction::ChatDetectAccept;
-                }
-                KeyCode::Char('s' | 'S') => {
-                    return KeyAction::ChatDetectSave;
-                }
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    return KeyAction::ChatDetectDismiss;
-                }
-                _ => {}
-            }
-        }
-        match chat.consent {
-            ChatConsent::Accepted => {
-                // History scroll works whether or not the input is focused.
-                match k.code {
-                    KeyCode::PageUp => return KeyAction::ChatScroll(-CHAT_SCROLL_STEP),
-                    KeyCode::PageDown => return KeyAction::ChatScroll(CHAT_SCROLL_STEP),
-                    _ => {}
-                }
-                if chat.focused {
-                    return match k.code {
-                        KeyCode::Esc => KeyAction::ChatBlur,
-                        KeyCode::Enter => KeyAction::ChatSubmit,
-                        KeyCode::Backspace => KeyAction::ChatBackspace,
-                        KeyCode::Char(c) => KeyAction::ChatInput(c),
-                        _ => KeyAction::Nothing,
-                    };
-                }
-                // Not focused: `i`/`Enter` enter insert mode; other keys fall
-                // through to the global hotkeys below.
-                if let KeyCode::Char('i') | KeyCode::Enter = k.code {
-                    return KeyAction::ChatFocus;
-                }
-            }
-            ChatConsent::Pending | ChatConsent::Declined => {
-                // Consent gate: y/Enter accept, n decline, d detect a local
-                // engine. Other keys (q, digits, Tab, ?) fall through to the
-                // globals so the user isn't trapped.
-                match k.code {
-                    KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                        return KeyAction::ChatConsentAccept;
-                    }
-                    KeyCode::Char('n' | 'N') => {
-                        return KeyAction::ChatConsentDecline;
-                    }
-                    KeyCode::Char('d' | 'D') => {
-                        return KeyAction::ChatDetect;
-                    }
-                    _ => {}
-                }
-            }
-            // No endpoint configured: the only gate action is to detect one.
-            ChatConsent::Unavailable => {
-                if let KeyCode::Char('d' | 'D') = k.code {
-                    return KeyAction::ChatDetect;
-                }
-            }
-        }
-    }
-    // ThemePicker is a navigable modal — j/k/g/G move the cursor, Enter applies.
-    if *modal == Modal::ThemePicker {
-        return match k.code {
-            KeyCode::Char('q') => KeyAction::Quit,
-            KeyCode::Esc | KeyCode::Char('t') => KeyAction::CloseModal,
-            KeyCode::Enter => KeyAction::ApplyThemePick,
-            KeyCode::Char('j') | KeyCode::Down => KeyAction::Move(1),
-            KeyCode::Char('k') | KeyCode::Up => KeyAction::Move(-1),
-            KeyCode::Char('g') | KeyCode::Home => KeyAction::SelectFirst,
-            KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Detail modal: vertical scroll keys, plus quit/close.
-    if *modal == Modal::Detail {
-        return match k.code {
-            KeyCode::Char('q') => KeyAction::Quit,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
-            KeyCode::Char('j') | KeyCode::Down => KeyAction::ScrollModal(1),
-            KeyCode::Char('k') | KeyCode::Up => KeyAction::ScrollModal(-1),
-            KeyCode::PageDown => KeyAction::ScrollModal(10),
-            KeyCode::PageUp => KeyAction::ScrollModal(-10),
-            KeyCode::Char('g') | KeyCode::Home => KeyAction::ScrollModal(i16::MIN),
-            KeyCode::Char('G') | KeyCode::End => KeyAction::ScrollModal(i16::MAX),
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Help absorbs everything except quit / close / ? toggle.
-    if *modal == Modal::Help {
-        return match k.code {
-            KeyCode::Char('q') => KeyAction::Quit,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Global help overlay (opened from the Esc menu): close-only.
-    if *modal == Modal::GlobalHelp {
-        return match k.code {
-            KeyCode::Char('q') => KeyAction::Quit,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => KeyAction::CloseModal,
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Esc main menu: ↑↓ cycle Options/Help/Quit, Enter activates, Esc closes.
-    if *modal == Modal::Menu {
-        return match k.code {
-            KeyCode::Esc => KeyAction::CloseModal,
-            KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
-            KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
-            KeyCode::Enter => KeyAction::MenuActivate,
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Command palette: ↑↓ choose destination, Enter goes, Esc closes.
-    if *modal == Modal::Palette {
-        return match k.code {
-            KeyCode::Esc => KeyAction::CloseModal,
-            KeyCode::Char('j') | KeyCode::Down => KeyAction::MenuMove(1),
-            KeyCode::Char('k') | KeyCode::Up => KeyAction::MenuMove(-1),
-            KeyCode::Enter => KeyAction::MenuActivate,
-            _ => KeyAction::Nothing,
-        };
-    }
-    // Options panel: ←→ switch settings tab, Esc closes.
-    if *modal == Modal::Options {
-        return match k.code {
-            KeyCode::Esc => KeyAction::CloseModal,
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => KeyAction::OptionsTab(-1),
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => KeyAction::OptionsTab(1),
-            _ => KeyAction::Nothing,
-        };
-    }
-    match k.code {
-        KeyCode::Char('q') => KeyAction::Quit,
-        // Esc opens the main menu when idle, except on Chat (where Esc keeps its
-        // existing chat meaning) — managers/approval are routed upstream.
-        // On ROCm/Serving, Esc first steps out of the detail pane (resolved
-        // against focus in `apply_action`); elsewhere it opens the main menu.
-        KeyCode::Esc if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::PaneEscape
-        }
-        KeyCode::Esc if current != ActiveTab::Chat => KeyAction::OpenMenu,
-        KeyCode::Esc => KeyAction::Nothing,
-        KeyCode::Char(':') => KeyAction::OpenPalette,
-        KeyCode::Char('?') => KeyAction::ToggleHelp,
-        KeyCode::Char('t') => KeyAction::OpenThemePicker,
-        KeyCode::BackTab => KeyAction::SwitchTab(current.prev()),
-        KeyCode::Tab => {
-            if k.modifiers.contains(KeyModifiers::SHIFT) {
-                KeyAction::SwitchTab(current.prev())
-            } else {
-                KeyAction::SwitchTab(current.next())
-            }
-        }
-        KeyCode::Char(c @ '1'..='5') => match ActiveTab::from_digit(c) {
-            Some(t) => KeyAction::SwitchTab(t),
-            None => KeyAction::Nothing,
-        },
-        KeyCode::PageDown => KeyAction::Move(10),
-        KeyCode::PageUp => KeyAction::Move(-10),
-        KeyCode::Char(' ') => KeyAction::ReplayTogglePause,
-        KeyCode::Char('+' | '=') => KeyAction::ReplaySpeedUp,
-        KeyCode::Char('-' | '_') => KeyAction::ReplaySpeedDown,
-        KeyCode::Char('[') => KeyAction::ReplayJump(-10),
-        KeyCode::Char(']') => KeyAction::ReplayJump(10),
-        KeyCode::Char('{') => KeyAction::ReplayJump(-60),
-        KeyCode::Char('}') => KeyAction::ReplayJump(60),
-        KeyCode::Char('j') | KeyCode::Down => KeyAction::Move(1),
-        KeyCode::Char('k') | KeyCode::Up => KeyAction::Move(-1),
-        KeyCode::Char('g') | KeyCode::Home => KeyAction::SelectFirst,
-        KeyCode::Char('G') | KeyCode::End => KeyAction::SelectLast,
-        // The guided-action letter hotkeys live ONLY on Observe (the telemetry
-        // surface) — quick jumps into the managers via the existing seam. On
-        // ROCm/Serving the Actions list is the single interaction path, so the
-        // per-tab letter hotkeys are retired there.
-        // Services manager: open where servers live.
-        KeyCode::Char('s') if current == ActiveTab::Observe => KeyAction::OpenServices,
-        // Serve wizard: launch a model.
-        KeyCode::Char('w') if current == ActiveTab::Observe => KeyAction::OpenServeWizard,
-        // Engine manager: use/install/reinstall serving engines.
-        KeyCode::Char('e') if current == ActiveTab::Observe => KeyAction::OpenEngineManager,
-        // Examine: read-only environment check.
-        KeyCode::Char('d') if current == ActiveTab::Observe => KeyAction::OpenExamine,
-        // Update: check/preview/apply ROCm package updates.
-        KeyCode::Char('u') if current == ActiveTab::Observe => KeyAction::OpenUpdate,
-        // Install: ROCm SDK (TheRock) install / dry-run.
-        KeyCode::Char('i') if current == ActiveTab::Observe => KeyAction::OpenInstall,
-        // Logs: browse recent ROCm CLI logs.
-        KeyCode::Char('l') if current == ActiveTab::Observe => KeyAction::OpenLogs,
-        // Bench-run: launch a bench sweep from the TUI.
-        KeyCode::Char('b') if current == ActiveTab::Observe => KeyAction::OpenBenchRun,
-        // Runtimes: list/activate/adopt/import ROCm runtimes.
-        KeyCode::Char('r') if current == ActiveTab::Observe => KeyAction::OpenRuntimes,
-        // Onboarding: first-run setup wizard (install / adopt).
-        KeyCode::Char('n') if current == ActiveTab::Observe => KeyAction::OpenOnboarding,
-        // Automations: list/enable/disable background checks.
-        KeyCode::Char('a') if current == ActiveTab::Observe => KeyAction::OpenAutomations,
-        // Command runner: run any ROCm CLI subcommand (gated).
-        KeyCode::Char('c') if current == ActiveTab::Observe => KeyAction::OpenCommand,
-        // Config & providers.
-        KeyCode::Char('p') if current == ActiveTab::Observe => KeyAction::OpenConfig,
-        // ROCm/Serving tabs: arrow keys drive the focus-into-detail interaction;
-        // Enter is focus-aware (list → focus detail, detail → open the manager).
-        KeyCode::Right if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::PaneFocusDetail
-        }
-        KeyCode::Left if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::PaneFocusActions
-        }
-        KeyCode::Enter if matches!(current, ActiveTab::Rocm | ActiveTab::Serving) => {
-            KeyAction::PaneActivate
-        }
-        KeyCode::Enter => KeyAction::OpenDetail,
-        _ => KeyAction::Nothing,
-    }
-}
-
-/// Translate a `MouseEvent` into the existing `KeyAction` vocabulary.
-///
-/// The caller is responsible for the surrounding state context:
-/// - `last_tab_bar_area` / `last_body_area` are read off `AppState` by the
-///   event loop so this function stays pure on the input event.
-/// - Per-tab body clicks are dispatched to the active tab module's
-///   `hit_test` from the event loop.
-///
-/// We only translate the parts of mouse handling that are tab-agnostic:
-/// the scroll wheel, and (in the event loop) the tab-bar click. Per-tab
-/// click is handled in tab modules.
-/// Map a navigation key to a job-console pan delta `(lines, cols)` while a
-/// console is showing. `None` for non-scroll keys so they fall through to the
-/// console's own action handler (Ctrl+C / q / Esc / Enter). A page is 10 lines.
-const fn console_scroll_delta(code: KeyCode) -> Option<(i16, i16)> {
-    match code {
-        KeyCode::PageDown => Some((10, 0)),
-        KeyCode::PageUp => Some((-10, 0)),
-        KeyCode::Down => Some((1, 0)),
-        KeyCode::Up => Some((-1, 0)),
-        KeyCode::Right => Some((0, 4)),
-        KeyCode::Left => Some((0, -4)),
-        _ => None,
-    }
-}
-
-pub fn handle_mouse(ev: MouseEvent, modal: &Modal, tab: ActiveTab) -> KeyAction {
-    // Domain-tab (ROCm/Serving) and overlay/console scroll is resolved in
-    // `resolve_mouse` (it needs `&AppState` for hit-testing and overlay state).
-    // This handles the remaining position-independent targets: the scrollable
-    // modal body and the Observe instances list. One row per wheel notch.
-    let delta: i16 = match ev.kind {
-        MouseEventKind::ScrollDown => 1,
-        MouseEventKind::ScrollUp => -1,
-        _ => return KeyAction::Nothing,
-    };
-    if *modal == Modal::Detail {
-        KeyAction::ScrollModal(delta)
-    } else if *modal == Modal::ThemePicker || (*modal == Modal::None && tab == ActiveTab::Observe) {
-        KeyAction::Move(delta as isize)
-    } else {
-        KeyAction::Nothing
-    }
-}
-
-/// Resolve a left-click at `(x, y)` against `tab_bar_area`. Returns the tab
-/// to switch to, or `None` if the click is outside or doesn't land on a chip.
-///
-/// Uses [`ui::tabs::compute_chip_layout`] so the hit-test geometry exactly
-/// mirrors what `draw_tab_bar` rendered. Separator gaps (` · `) between
-/// chips are intentional dead zones — clicking the dot does nothing.
-pub fn tab_bar_hit(tab_bar_area: ratatui::layout::Rect, x: u16, y: u16) -> Option<ActiveTab> {
-    if y != tab_bar_area.y {
-        return None;
-    }
-    let chips = ui::tabs::compute_chip_layout(tab_bar_area.x);
-    let bar_right = tab_bar_area.x.saturating_add(tab_bar_area.width);
-    for chip in chips {
-        if chip.x_end > bar_right {
-            // Chip overflows the bar — terminal too narrow to show it; skip.
-            continue;
-        }
-        if x >= chip.x_start && x < chip.x_end {
-            return Some(chip.tab);
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+    use tokio::sync::mpsc;
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use crate::client::ClientMsg;
 
-    fn hk(c: KeyCode, tab: ActiveTab) -> KeyAction {
-        handle_key(press(c), tab, &Modal::None, ChatKeyCtx::default())
-    }
-
-    #[test]
-    fn q_quits_esc_does_not() {
-        assert_eq!(hk(KeyCode::Char('q'), ActiveTab::Home), KeyAction::Quit);
-        // P4: Esc opens the main menu (it never quits); Chat keeps its own Esc.
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
-    }
+    use super::actions::run_approved;
+    use super::chat::build_chat_agent;
+    use super::summary::summarize_slash_tool;
+    use super::types::NO_CHAT_BACKEND_MSG;
 
     #[test]
-    fn tab_cycles_forward_and_wraps() {
-        // 5-tab IA: Home → ROCm → Serving → Observe → Chat → Home.
-        assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Rocm)
-        );
-        assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Serving),
-            KeyAction::SwitchTab(ActiveTab::Observe)
-        );
-        assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Observe),
-            KeyAction::SwitchTab(ActiveTab::Chat)
-        );
-        // Chat wraps back to Home.
-        assert_eq!(
-            hk(KeyCode::Tab, ActiveTab::Chat),
-            KeyAction::SwitchTab(ActiveTab::Home)
-        );
-    }
-
-    #[test]
-    fn action_tab_arrows_and_enter_drive_focus() {
-        // → steps into the detail pane, ← steps back, Enter is focus-aware.
-        assert_eq!(
-            hk(KeyCode::Right, ActiveTab::Rocm),
-            KeyAction::PaneFocusDetail
-        );
-        assert_eq!(
-            hk(KeyCode::Left, ActiveTab::Rocm),
-            KeyAction::PaneFocusActions
-        );
-        assert_eq!(hk(KeyCode::Enter, ActiveTab::Rocm), KeyAction::PaneActivate);
-        // Arrows are inert on other tabs (no focus model there).
-        assert_eq!(hk(KeyCode::Right, ActiveTab::Observe), KeyAction::Nothing);
-        // Enter elsewhere keeps its detail-modal meaning.
-        assert_eq!(
-            hk(KeyCode::Enter, ActiveTab::Observe),
-            KeyAction::OpenDetail
-        );
-    }
-
-    #[test]
-    fn action_activate_is_two_step_list_then_open() {
-        // Serving verb 0 = "Serve a model" → OpenServeWizard.
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Serving;
-        s.serving_sel = 0;
-        assert_eq!(s.pane_focus, PaneFocus::Actions);
-        // First activate steps into the detail pane; no overlay yet.
-        apply_action(&mut s, KeyAction::PaneActivate);
-        assert_eq!(s.pane_focus, PaneFocus::Detail);
-        assert!(s.serve_wizard.is_none(), "must not open before stepping in");
-        // Second activate opens the operation's manager.
-        apply_action(&mut s, KeyAction::PaneActivate);
-        assert!(
-            s.serve_wizard.is_some(),
-            "detail-focus Enter opens the manager"
-        );
-        // ROCm verb 2 = "Diagnose (doctor)" → OpenExamine (the other mapping).
-        let mut r = AppState::new("t".into(), "default-dark".into());
-        r.active_tab = ActiveTab::Rocm;
-        r.rocm_sel = 2;
-        r.pane_focus = PaneFocus::Detail;
-        apply_action(&mut r, KeyAction::PaneActivate);
-        assert!(
-            r.examine_manager.is_some(),
-            "ROCm Diagnose opens the doctor"
-        );
-    }
-
-    #[test]
-    fn action_focus_resets_on_move_and_tab_switch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.pane_focus = PaneFocus::Detail;
-        apply_action(&mut s, KeyAction::Move(1));
-        assert_eq!(s.pane_focus, PaneFocus::Actions, "Move snaps back to list");
-        s.pane_focus = PaneFocus::Detail;
-        apply_action(&mut s, KeyAction::SwitchTab(ActiveTab::Home));
-        assert_eq!(s.pane_focus, PaneFocus::Actions, "tab switch resets focus");
-    }
-
-    #[test]
-    fn action_esc_backs_out_of_detail_then_opens_menu() {
-        // Esc on Action is intercepted (not the global OpenMenu) so it can back
-        // out of the detail pane first.
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::PaneEscape);
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.pane_focus = PaneFocus::Detail;
-        apply_action(&mut s, KeyAction::PaneEscape);
-        assert_eq!(s.pane_focus, PaneFocus::Actions, "first Esc → list");
-        assert_eq!(s.modal, Modal::None, "first Esc does not open the menu");
-        apply_action(&mut s, KeyAction::PaneEscape);
-        assert_eq!(s.modal, Modal::Menu, "second Esc opens the menu");
-    }
-
-    #[test]
-    fn action_select_sets_verb_and_parks_on_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.pane_focus = PaneFocus::Detail;
-        apply_action(&mut s, KeyAction::PaneSelect(2));
-        assert_eq!(s.rocm_sel, 2);
-        assert_eq!(s.pane_focus, PaneFocus::Actions);
-        // Out-of-range clamps rather than panicking.
-        apply_action(&mut s, KeyAction::PaneSelect(999));
-        assert!(s.rocm_sel < crate::ui::tabs::rocm::VERB_COUNT);
-    }
-
-    #[test]
-    fn inline_manager_opens_in_detail_then_backs_out() {
-        // Activating a ROCm verb opens its manager inline (focus stays in
-        // Details); `←`/Esc backs out — closing the manager and returning focus
-        // to the Actions list. This mirrors the event-loop back-out arm.
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.rocm_sel = 0; // Set up / Install ROCm → OpenInstall
-        apply_action(&mut s, KeyAction::PaneActivate); // → Details
-        assert_eq!(s.pane_focus, PaneFocus::Detail);
-        assert!(!s.has_open_overlay(), "no manager before second activate");
-        apply_action(&mut s, KeyAction::PaneActivate); // opens install_manager
-        assert!(s.install_manager.is_some(), "verb opens its manager inline");
-        assert!(s.has_open_overlay());
-
-        // Esc backs out on a domain tab while a manager is open.
-        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
-        // `←` is left to the manager (it may cycle options), not a back-out.
-        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Left));
-        // A normal key does not back out (routes to the manager instead).
-        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Char('j')));
-
-        // The event-loop arm closes the manager + parks focus on Actions.
-        s.close_overlays();
-        s.pane_focus = PaneFocus::Actions;
-        assert!(!s.has_open_overlay(), "back-out closed the inline manager");
-        assert_eq!(s.pane_focus, PaneFocus::Actions);
-    }
-
-    #[test]
-    fn back_out_only_on_domain_tabs_with_a_manager() {
+    fn back_out_requires_an_open_manager_on_any_tab() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // No manager open → never backs out, even on a domain tab.
         s.active_tab = ActiveTab::Rocm;
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
-        // Manager open but on a non-domain tab (opened from Observe hotkey) →
-        // the manager keeps its own Esc handling; no domain back-out.
+        // Manager open on a non-domain tab (opened from Observe hotkey) →
+        // Esc backs out uniformly regardless of tab, now that the
+        // Rocm/Serving-only gate is gone. New coverage of the generalized
+        // behavior — the manager's own event-loop arm already closed it on
+        // this tab before the gate was removed, so this isn't a regression
+        // test for a prior bug.
         s.active_tab = ActiveTab::Observe;
         s.examine_manager = Some(crate::ui::examine_manager::ExamineManagerState::default());
         assert!(s.has_open_overlay());
-        assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
 
     #[test]
@@ -3700,295 +1283,25 @@ mod tests {
     }
 
     #[test]
-    fn body_clicks_are_swallowed_while_a_manager_is_open() {
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    fn esc_defers_to_onboarding_install_config_subview() {
+        // Regression coverage for the `install_config` nesting field: the
+        // onboarding wizard's Configure sub-view is a nested sub-view just
+        // like a manager's job console, so root Esc must defer to it instead
+        // of ejecting the whole wizard.
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.active_tab = ActiveTab::Rocm;
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        let click = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 90,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        };
-        // No manager open → the click resolves against the tab's hit-test.
-        assert_ne!(resolve_mouse(click, &s), KeyAction::Nothing);
-        // Manager open → the body click is swallowed (no click-through).
-        s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
-        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
-    }
-
-    /// Build a ScrollDown/Up/Left/Right event at a pointer position.
-    fn wheel(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
-        MouseEvent {
-            kind,
-            column: col,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
-    #[test]
-    fn scrollbar_position_maps_proportionally() {
-        let h = ScrollbarHandle {
-            track: Rect::new(50, 0, 1, 10),
-            horizontal: false,
-            content_len: 100,
-            viewport_len: 10,
-            target: ScrollTarget::Console,
-        };
-        assert_eq!(h.track_position_at(50, 0), 0);
-        assert_eq!(h.track_position_at(50, 9), 90);
-        assert_eq!(h.track_position_at(50, 5), 90 * 5 / 9);
-        assert_eq!(h.track_position_at(50, 99), 90);
-    }
-
-    #[test]
-    fn scrollbar_click_grabs_drag_scrolls_then_releases() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.scrollbars.borrow_mut().push(ScrollbarHandle {
-            track: Rect::new(60, 0, 1, 10),
-            horizontal: false,
-            content_len: 100,
-            viewport_len: 10,
-            target: ScrollTarget::Console,
-        });
-        // Click near the bottom of the track → grab + jump near the end.
-        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
-        let a = resolve_mouse(down, &s);
-        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 90, 0));
-        apply_action(&mut s, a);
-        assert_eq!(s.console_scroll, 90);
-        assert_eq!(
-            s.scroll_drag,
-            Some(ScrollDrag {
-                target: ScrollTarget::Console,
-                grab_offset: 0,
-            })
-        );
-        // Drag to the top — the off-axis column is ignored, so it still tracks.
-        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
-        let a = resolve_mouse(drag, &s);
-        assert_eq!(a, KeyAction::ScrollGrab(ScrollTarget::Console, 0, 0));
-        apply_action(&mut s, a);
-        assert_eq!(s.console_scroll, 0);
-        // Release clears the drag.
-        let up = wheel(MouseEventKind::Up(MouseButton::Left), 40, 0);
-        let a = resolve_mouse(up, &s);
-        assert_eq!(a, KeyAction::ScrollRelease);
-        apply_action(&mut s, a);
-        assert_eq!(s.scroll_drag, None);
-    }
-
-    #[test]
-    fn rendered_thumb_cells_are_grabbable() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        for horizontal in [false, true] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
-            let area = if horizontal {
-                Rect::new(0, 0, 4, 2)
-            } else {
-                Rect::new(0, 0, 2, 4)
-            };
-            let target = if horizontal {
-                ScrollTarget::ConsoleH
-            } else {
-                ScrollTarget::Console
-            };
-            if horizontal {
-                s.console_hscroll = 1;
-            } else {
-                s.console_scroll = 1;
-            }
-            let backend = TestBackend::new(area.width, area.height);
-            let mut terminal = Terminal::new(backend).unwrap();
-            let mut body = area;
-            terminal
-                .draw(|frame| {
-                    body = if horizontal {
-                        crate::ui::panel::horizontal_scrollbar(frame, area, 4, 2, 1, &s.theme)
-                    } else {
-                        crate::ui::panel::vertical_scrollbar(frame, area, 4, 2, 1, &s.theme)
-                    };
-                })
-                .unwrap();
-            s.record_scrollbar(area, body, horizontal, 4, 2, target);
-            let handle = s.scrollbars.borrow()[0];
-            let (thumb_start, thumb_len) = handle.thumb_geometry(1);
-            assert_eq!((thumb_start, thumb_len), (1, 2));
-            for cell in thumb_start..thumb_start + thumb_len {
-                let (col, row) = if horizontal {
-                    (cell, handle.track.y)
-                } else {
-                    (handle.track.x, cell)
-                };
-                assert_eq!(
-                    resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), col, row), &s),
-                    KeyAction::ScrollGrab(target, 1, cell - thumb_start)
-                );
-            }
-            let (before_col, before_row) = if horizontal {
-                (0, handle.track.y)
-            } else {
-                (handle.track.x, 0)
-            };
-            assert_eq!(
-                resolve_mouse(
-                    wheel(
-                        MouseEventKind::Down(MouseButton::Left),
-                        before_col,
-                        before_row
-                    ),
-                    &s,
-                ),
-                KeyAction::ScrollGrab(target, 0, 0)
-            );
-            let (after_col, after_row) = if horizontal {
-                (3, handle.track.y)
-            } else {
-                (handle.track.x, 3)
-            };
-            assert_eq!(
-                resolve_mouse(
-                    wheel(
-                        MouseEventKind::Down(MouseButton::Left),
-                        after_col,
-                        after_row
-                    ),
-                    &s,
-                ),
-                KeyAction::ScrollGrab(target, 2, 0)
-            );
-        }
-    }
-
-    #[test]
-    fn stationary_thumb_drag_preserves_logical_position() {
-        for target in [ScrollTarget::Console, ScrollTarget::DockLogs] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
-            s.console_scroll = 5;
-            s.dock_logs_scroll = 5;
-            s.scrollbars.borrow_mut().push(ScrollbarHandle {
-                track: Rect::new(60, 0, 1, 10),
-                horizontal: false,
-                content_len: 20,
-                viewport_len: 10,
-                target,
-            });
-            let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 4);
-            let action = resolve_mouse(down, &s);
-            apply_action(&mut s, action);
-            let before = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
-            let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 60, 4);
-            let action = resolve_mouse(drag, &s);
-            apply_action(&mut s, action);
-            let after = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
-            assert_eq!(after, before, "stationary {target:?} drag moved");
-        }
-    }
-
-    #[test]
-    fn horizontal_thumb_drag_tracks_pointer_column() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.console_hscroll = 20;
-        s.scrollbars.borrow_mut().push(ScrollbarHandle {
-            track: Rect::new(10, 20, 20, 1),
-            horizontal: true,
-            content_len: 100,
-            viewport_len: 20,
-            target: ScrollTarget::ConsoleH,
-        });
-        let action = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 14, 20), &s);
-        apply_action(&mut s, action);
-        assert_eq!(s.console_hscroll, 20);
-        let action = resolve_mouse(wheel(MouseEventKind::Drag(MouseButton::Left), 19, 99), &s);
-        apply_action(&mut s, action);
-        assert!(s.console_hscroll > 20);
-    }
-
-    #[test]
-    fn dock_scrollbar_grab_inverts_tail_anchored_offset() {
-        let s = AppState::new("t".into(), "default-dark".into());
-        s.scrollbars.borrow_mut().push(ScrollbarHandle {
-            track: Rect::new(0, 0, 1, 10),
-            horizontal: false,
-            content_len: 100,
-            viewport_len: 10,
-            target: ScrollTarget::DockLogs,
-        });
-        // Top of the bar = oldest lines = fully scrolled up from the tail (max).
-        let top = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 0), &s);
-        assert_eq!(top, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 90, 0));
-        // Bottom of the bar = newest tail = offset 0.
-        let bot = resolve_mouse(wheel(MouseEventKind::Down(MouseButton::Left), 0, 9), &s);
-        assert_eq!(bot, KeyAction::ScrollGrab(ScrollTarget::DockLogs, 0, 0));
-    }
-
-    #[test]
-    fn wheel_over_actions_list_moves_selection_by_one() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        // Left column (Actions) is the first ~46% — a low column is over the list.
-        let over_list = wheel(MouseEventKind::ScrollDown, 10, 12);
-        assert_eq!(resolve_mouse(over_list, &s), KeyAction::Move(1));
-        let up = wheel(MouseEventKind::ScrollUp, 10, 12);
-        assert_eq!(resolve_mouse(up, &s), KeyAction::Move(-1));
-    }
-
-    #[test]
-    fn wheel_over_details_pane_does_not_move_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Serving;
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        // A high column lands in the Details pane (right ~54%) → no list move.
-        let over_detail = wheel(MouseEventKind::ScrollDown, 140, 12);
-        assert_eq!(resolve_mouse(over_detail, &s), KeyAction::Nothing);
-    }
-
-    #[test]
-    fn wheel_over_open_console_pans_the_log_not_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        s.logs_view = Some(crate::ui::logs_view::LogsViewState {
-            active_job: Some("logs".into()),
+        s.onboarding = Some(crate::ui::onboarding::OnboardingState {
+            install_config: Some(crate::ui::onboarding::InstallConfig::default()),
             ..Default::default()
         });
-        // Console showing → vertical wheel pans the log (×3 lines), not the list.
-        assert_eq!(
-            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
-            KeyAction::ScrollConsole(3, 0)
+        assert!(s.has_open_overlay());
+        assert!(
+            !s.should_pane_back_out(crossterm::event::KeyCode::Esc),
+            "Esc must defer to onboarding while the Configure sub-view is open"
         );
-        // Horizontal wheel pans columns (×6) for off-screen-wide log lines.
-        assert_eq!(
-            resolve_mouse(wheel(MouseEventKind::ScrollRight, 10, 12), &s),
-            KeyAction::ScrollConsole(0, 6)
-        );
-    }
-
-    #[test]
-    fn wheel_over_logs_dock_scrolls_the_dock() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Serving;
-        // A recorded dock rect off to the right of the body.
-        s.last_dock_area = Some(Rect::new(160, 4, 52, 30));
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        let over_dock = wheel(MouseEventKind::ScrollDown, 180, 12);
-        assert_eq!(resolve_mouse(over_dock, &s), KeyAction::ScrollDock(3));
-        // A point outside the dock does not scroll it.
-        let over_body = wheel(MouseEventKind::ScrollDown, 10, 12);
-        assert_ne!(resolve_mouse(over_body, &s), KeyAction::ScrollDock(3));
+        // Once the sub-view is closed (back at root), Esc backs out again.
+        s.onboarding.as_mut().unwrap().install_config = None;
+        assert!(s.should_pane_back_out(crossterm::event::KeyCode::Esc));
     }
 
     #[test]
@@ -4016,17 +1329,16 @@ mod tests {
     }
 
     #[test]
-    fn wheel_over_form_screen_overlay_is_swallowed() {
+    fn scroll_instance_detail_clamps_to_measured_max() {
         let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Rocm;
-        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
-        // Overlay open but on its form (no active_job) → nothing to pan, and the
-        // obscured Actions list must NOT move.
-        s.install_manager = Some(crate::ui::install_manager::InstallManagerState::default());
-        assert_eq!(
-            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
-            KeyAction::Nothing
-        );
+        s.instance_detail_max_scroll = 9;
+        // i16::MAX is the jump-to-end gesture; it must land on the measured
+        // max, not overflow past it.
+        s.scroll_instance_detail(i16::MAX);
+        assert_eq!(s.instance_detail_scroll, 9, "jump-to-end clamps to max");
+        // i16::MIN is jump-to-start; it must land on 0, not underflow.
+        s.scroll_instance_detail(i16::MIN);
+        assert_eq!(s.instance_detail_scroll, 0, "jump-to-start clamps to 0");
     }
 
     #[test]
@@ -4064,250 +1376,6 @@ mod tests {
         assert_eq!(s.console_hscroll, 0);
     }
 
-    #[test]
-    fn console_scroll_delta_maps_nav_keys_only() {
-        use crossterm::event::KeyCode;
-        assert_eq!(console_scroll_delta(KeyCode::PageDown), Some((10, 0)));
-        assert_eq!(console_scroll_delta(KeyCode::PageUp), Some((-10, 0)));
-        assert_eq!(console_scroll_delta(KeyCode::Down), Some((1, 0)));
-        assert_eq!(console_scroll_delta(KeyCode::Right), Some((0, 4)));
-        // Console action keys are NOT scroll keys (they reach on_console_key).
-        assert_eq!(console_scroll_delta(KeyCode::Esc), None);
-        assert_eq!(console_scroll_delta(KeyCode::Enter), None);
-        assert_eq!(console_scroll_delta(KeyCode::Char('q')), None);
-    }
-
-    #[test]
-    fn footer_chip_hit_maps_click_to_action() {
-        let chips = vec![
-            FooterChip {
-                x0: 0,
-                x1: 5,
-                y: 49,
-                action: KeyAction::Quit,
-            },
-            FooterChip {
-                x0: 6,
-                x1: 9,
-                y: 49,
-                action: KeyAction::ToggleHelp,
-            },
-        ];
-        // Inside the first chip.
-        assert_eq!(footer_chip_hit(&chips, 2, 49), Some(KeyAction::Quit));
-        // End-exclusive: column 5 is past the first chip, before the second.
-        assert_eq!(footer_chip_hit(&chips, 5, 49), None);
-        assert_eq!(footer_chip_hit(&chips, 7, 49), Some(KeyAction::ToggleHelp));
-        // Wrong row never matches.
-        assert_eq!(footer_chip_hit(&chips, 2, 48), None);
-    }
-
-    #[test]
-    fn back_tab_and_shift_tab_both_cycle_backward() {
-        // prev(Observe) = Serving in the 5-tab IA.
-        assert_eq!(
-            hk(KeyCode::BackTab, ActiveTab::Observe),
-            KeyAction::SwitchTab(ActiveTab::Serving)
-        );
-        // Home's previous tab is Chat (the last tab).
-        assert_eq!(
-            hk(KeyCode::BackTab, ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Chat)
-        );
-        let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
-        assert_eq!(
-            handle_key(
-                shift_tab,
-                ActiveTab::Rocm,
-                &Modal::None,
-                ChatKeyCtx::default()
-            ),
-            KeyAction::SwitchTab(ActiveTab::Home)
-        );
-    }
-
-    #[test]
-    fn number_keys_jump_to_tab() {
-        // 5-tab: '1'→Home, '2'→ROCm, '3'→Serving, '4'→Observe, '5'→Chat.
-        assert_eq!(
-            hk(KeyCode::Char('1'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Home)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('2'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Rocm)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('3'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Serving)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('4'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Observe)
-        );
-        // `5` reaches the Chat tab (digit guard widened to '1'..='5').
-        assert_eq!(
-            hk(KeyCode::Char('5'), ActiveTab::Home),
-            KeyAction::SwitchTab(ActiveTab::Chat)
-        );
-        assert_eq!(hk(KeyCode::Char('6'), ActiveTab::Home), KeyAction::Nothing);
-    }
-
-    #[test]
-    fn from_digit_maps_five_to_chat() {
-        // 5-tab digit map; Chat is now '5', '6'/'0' are out of range.
-        assert_eq!(ActiveTab::from_digit('1'), Some(ActiveTab::Home));
-        assert_eq!(ActiveTab::from_digit('5'), Some(ActiveTab::Chat));
-        assert_eq!(ActiveTab::from_digit('6'), None);
-        assert_eq!(ActiveTab::from_digit('0'), None);
-    }
-
-    #[test]
-    fn release_events_are_ignored() {
-        let release = KeyEvent::new_with_kind(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE,
-            KeyEventKind::Release,
-        );
-        assert_eq!(
-            handle_key(
-                release,
-                ActiveTab::Home,
-                &Modal::None,
-                ChatKeyCtx::default()
-            ),
-            KeyAction::Nothing
-        );
-    }
-
-    #[test]
-    fn only_press_key_events_are_actionable() {
-        // The event loop gates overlay dispatch on this predicate so a single
-        // keystroke isn't processed twice by an overlay's `on_key` (Release /
-        // Repeat echoes on Windows Terminal / ConPTY / kitty keyboard). The
-        // double-fire re-opened the serve wizard's model picker on Enter instead
-        // of choosing — this pins Press-only routing.
-        assert!(is_actionable_key(KeyEventKind::Press));
-        assert!(!is_actionable_key(KeyEventKind::Release));
-        assert!(!is_actionable_key(KeyEventKind::Repeat));
-    }
-
-    #[test]
-    fn jk_arrows_and_g_drive_selection() {
-        assert_eq!(
-            hk(KeyCode::Char('j'), ActiveTab::Observe),
-            KeyAction::Move(1)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('k'), ActiveTab::Observe),
-            KeyAction::Move(-1)
-        );
-        assert_eq!(hk(KeyCode::Down, ActiveTab::Rocm), KeyAction::Move(1));
-        assert_eq!(hk(KeyCode::Up, ActiveTab::Rocm), KeyAction::Move(-1));
-        assert_eq!(
-            hk(KeyCode::Char('g'), ActiveTab::Observe),
-            KeyAction::SelectFirst
-        );
-        assert_eq!(
-            hk(KeyCode::Char('G'), ActiveTab::Observe),
-            KeyAction::SelectLast
-        );
-        assert_eq!(
-            hk(KeyCode::Enter, ActiveTab::Observe),
-            KeyAction::OpenDetail
-        );
-    }
-
-    #[test]
-    fn operational_open_keys_are_tab_scoped() {
-        // `s` opens services only on Observe; Nothing elsewhere.
-        assert_eq!(
-            hk(KeyCode::Char('s'), ActiveTab::Observe),
-            KeyAction::OpenServices
-        );
-        assert_eq!(hk(KeyCode::Char('s'), ActiveTab::Home), KeyAction::Nothing);
-        // The letter hotkeys fire ONLY on Observe now — quick jumps into the
-        // managers. They open the matching overlay via the seam.
-        assert_eq!(
-            hk(KeyCode::Char('w'), ActiveTab::Observe),
-            KeyAction::OpenServeWizard
-        );
-        assert_eq!(
-            hk(KeyCode::Char('e'), ActiveTab::Observe),
-            KeyAction::OpenEngineManager
-        );
-        assert_eq!(
-            hk(KeyCode::Char('d'), ActiveTab::Observe),
-            KeyAction::OpenExamine
-        );
-        assert_eq!(
-            hk(KeyCode::Char('i'), ActiveTab::Observe),
-            KeyAction::OpenInstall
-        );
-        // Retired on the domain tabs: the Actions list is the single path there,
-        // so the letter hotkeys are inert on ROCm/Serving (and Home/Chat).
-        for c in ['w', 'e', 'd', 'u', 'i', 'l', 'r', 'n', 'a', 'c', 'p', 's'] {
-            assert_eq!(
-                hk(KeyCode::Char(c), ActiveTab::Rocm),
-                KeyAction::Nothing,
-                "key {c} must be retired on the ROCm tab"
-            );
-            assert_eq!(
-                hk(KeyCode::Char(c), ActiveTab::Serving),
-                KeyAction::Nothing,
-                "key {c} must be retired on the Serving tab"
-            );
-        }
-        assert_eq!(hk(KeyCode::Char('w'), ActiveTab::Home), KeyAction::Nothing);
-        // On the Chat tab none of these open an overlay. `i` means insert mode.
-        for c in ['w', 'e', 'd', 'u', 'l'] {
-            assert_eq!(
-                hk(KeyCode::Char(c), ActiveTab::Chat),
-                KeyAction::Nothing,
-                "key {c} must not open an overlay from Chat"
-            );
-        }
-        assert_eq!(
-            hk(KeyCode::Char('i'), ActiveTab::Chat),
-            KeyAction::ChatFocus,
-            "i is chat-insert on Chat, never OpenInstall"
-        );
-    }
-
-    #[test]
-    fn opening_an_overlay_closes_the_others() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        apply_action(&mut s, KeyAction::OpenServices);
-        assert!(s.services.is_some() && s.serve_wizard.is_none() && s.engine_manager.is_none());
-        // Opening another overlay (defensive path) clears the prior one.
-        apply_action(&mut s, KeyAction::OpenServeWizard);
-        assert!(s.serve_wizard.is_some() && s.services.is_none() && s.engine_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenEngineManager);
-        assert!(s.engine_manager.is_some() && s.services.is_none() && s.serve_wizard.is_none());
-        // Wave 2/3 overlays join the mutual-exclusion set.
-        apply_action(&mut s, KeyAction::OpenExamine);
-        assert!(s.examine_manager.is_some() && s.engine_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenUpdate);
-        assert!(s.update_manager.is_some() && s.examine_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenInstall);
-        assert!(s.install_manager.is_some() && s.update_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenLogs);
-        assert!(s.logs_view.is_some() && s.install_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenRuntimes);
-        assert!(s.runtime_manager.is_some() && s.logs_view.is_none());
-        apply_action(&mut s, KeyAction::OpenOnboarding);
-        assert!(s.onboarding.is_some() && s.runtime_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenAutomations);
-        assert!(s.automations_manager.is_some() && s.onboarding.is_none());
-        apply_action(&mut s, KeyAction::OpenCommand);
-        assert!(s.command_screen.is_some() && s.automations_manager.is_none());
-        apply_action(&mut s, KeyAction::OpenConfig);
-        assert!(s.config_manager.is_some() && s.command_screen.is_none());
-        // T13: OpenBenchRun joins the mutual-exclusion set.
-        apply_action(&mut s, KeyAction::OpenBenchRun);
-        assert!(s.bench_run.is_some() && s.config_manager.is_none());
-    }
-
     // ---------- T13: bench_run overlay invariants ----------
 
     #[test]
@@ -4340,104 +1408,151 @@ mod tests {
         );
     }
 
+    /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
+    /// enumeration of each manager's nested sub-view fields (documented on
+    /// `OnboardingState`, which lists every struct this covers). Nothing stops
+    /// a future field — a new sub-popup, picker, or prompt — from being added
+    /// to one of these structs without a matching update there, which would
+    /// silently let Esc eject the whole manager instead of deferring to the
+    /// new sub-view.
+    ///
+    /// This exhaustively destructures every one of those structs (no `..`),
+    /// naming every field. Adding a field to any of them without updating
+    /// this test — and, in step, `active_overlay_at_root` — fails to compile
+    /// (E0027), turning the silent-drift risk into a build break.
     #[test]
-    fn esc_opens_menu_when_idle_but_not_on_chat() {
-        // Idle (non-Chat) tabs: Esc opens the btop main menu.
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Home), KeyAction::OpenMenu);
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Observe), KeyAction::OpenMenu);
-        // Chat keeps its existing Esc meaning (no menu).
-        assert_eq!(hk(KeyCode::Esc, ActiveTab::Chat), KeyAction::Nothing);
-        // While an overlay modal owns the screen, Esc closes it (not OpenMenu).
-        assert_eq!(
-            handle_key(
-                press(KeyCode::Esc),
-                ActiveTab::Home,
-                &Modal::Menu,
-                ChatKeyCtx::default()
-            ),
-            KeyAction::CloseModal
+    fn active_overlay_at_root_enumeration_is_exhaustive() {
+        use crate::ui::automations_manager::AutomationsManagerState;
+        use crate::ui::command_screen::CommandScreenState;
+        use crate::ui::config_manager::ConfigManagerState;
+        use crate::ui::engine_manager::EngineManagerState;
+        use crate::ui::examine_manager::ExamineManagerState;
+        use crate::ui::install_manager::InstallManagerState;
+        use crate::ui::logs_view::LogsViewState;
+        use crate::ui::onboarding::OnboardingState;
+        use crate::ui::runtime_manager::RuntimeManagerState;
+        use crate::ui::serve_wizard::ServeWizardState;
+        use crate::ui::services_manager::ServicesManagerState;
+        use crate::ui::update_manager::UpdateManagerState;
+
+        let ServeWizardState {
+            field: _,
+            model: _,
+            engine_idx: _,
+            device_idx: _,
+            host: _,
+            port: _,
+            managed: _,
+            browser,
+            picker,
+            approval,
+            active_job,
+            message: _,
+        } = ServeWizardState::default();
+        assert!(
+            browser.is_none() && picker.is_none() && approval.is_none() && active_job.is_none()
         );
-        assert_eq!(
-            handle_key(
-                press(KeyCode::Esc),
-                ActiveTab::Home,
-                &Modal::Options,
-                ChatKeyCtx::default()
-            ),
-            KeyAction::CloseModal
+
+        let InstallManagerState {
+            field: _,
+            channel: _,
+            format_idx: _,
+            prefix: _,
+            dry_run: _,
+            browser,
+            approval,
+            active_job,
+            message: _,
+        } = InstallManagerState::default();
+        assert!(browser.is_none() && approval.is_none() && active_job.is_none());
+
+        let OnboardingState {
+            step: _,
+            choice: _,
+            browser,
+            install_config,
+            approval,
+            active_job,
+            message: _,
+        } = OnboardingState::default();
+        assert!(
+            browser.is_none()
+                && install_config.is_none()
+                && approval.is_none()
+                && active_job.is_none()
         );
-    }
 
-    #[test]
-    fn colon_opens_command_palette() {
-        assert_eq!(
-            hk(KeyCode::Char(':'), ActiveTab::Home),
-            KeyAction::OpenPalette
+        let RuntimeManagerState {
+            selected: _,
+            browser,
+            import_input,
+            approval,
+            active_job,
+            message: _,
+        } = RuntimeManagerState::default();
+        assert!(
+            browser.is_none()
+                && import_input.is_none()
+                && approval.is_none()
+                && active_job.is_none()
         );
-    }
 
-    #[test]
-    fn menu_navigation_and_activation() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        apply_action(&mut s, KeyAction::OpenMenu);
-        assert_eq!(s.modal, Modal::Menu);
-        // ↓ from Options(0) → Help(1); activate opens the global help.
-        apply_action(&mut s, KeyAction::MenuMove(1));
-        assert_eq!(s.menu_sel, 1);
-        apply_action(&mut s, KeyAction::MenuActivate);
-        assert_eq!(s.modal, Modal::GlobalHelp);
-        // Menu → Options activation opens the Options panel.
-        apply_action(&mut s, KeyAction::OpenMenu);
-        apply_action(&mut s, KeyAction::MenuActivate); // sel 0 = Options
-        assert_eq!(s.modal, Modal::Options);
-        // Options tab cycles and wraps.
-        apply_action(&mut s, KeyAction::OptionsTab(-1));
-        assert_eq!(s.options_tab, crate::ui::modal::OPTIONS_TABS.len() - 1);
-    }
+        let EngineManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = EngineManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
 
-    #[test]
-    fn palette_activation_switches_tab() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        apply_action(&mut s, KeyAction::OpenPalette);
-        apply_action(&mut s, KeyAction::MenuMove(3)); // Home→ROCm→Serving→Observe
-        apply_action(&mut s, KeyAction::MenuActivate);
-        assert_eq!(s.active_tab, ActiveTab::Observe);
-        assert_eq!(s.modal, Modal::None);
-    }
+        let ServicesManagerState {
+            selected: _,
+            approval,
+            active_job,
+        } = ServicesManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
 
-    #[test]
-    fn question_mark_toggles_help() {
-        assert_eq!(
-            hk(KeyCode::Char('?'), ActiveTab::Home),
-            KeyAction::ToggleHelp
-        );
-    }
+        let UpdateManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = UpdateManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
 
-    #[test]
-    fn t_opens_theme_picker() {
-        assert_eq!(
-            hk(KeyCode::Char('t'), ActiveTab::Home),
-            KeyAction::OpenThemePicker
-        );
-    }
+        let ConfigManagerState {
+            action_sel: _,
+            provider_sel: _,
+            approval,
+            active_job,
+            message: _,
+        } = ConfigManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
 
-    #[test]
-    fn theme_picker_absorbs_navigation_keys() {
-        let with_picker = |c| {
-            handle_key(
-                press(c),
-                ActiveTab::Home,
-                &Modal::ThemePicker,
-                ChatKeyCtx::default(),
-            )
-        };
-        assert_eq!(with_picker(KeyCode::Char('j')), KeyAction::Move(1));
-        assert_eq!(with_picker(KeyCode::Char('k')), KeyAction::Move(-1));
-        assert_eq!(with_picker(KeyCode::Enter), KeyAction::ApplyThemePick);
-        assert_eq!(with_picker(KeyCode::Esc), KeyAction::CloseModal);
-        assert_eq!(with_picker(KeyCode::Char('t')), KeyAction::CloseModal);
-        assert_eq!(with_picker(KeyCode::Char('q')), KeyAction::Quit);
-        assert_eq!(with_picker(KeyCode::Char('1')), KeyAction::Nothing);
+        let CommandScreenState {
+            input: _,
+            approval,
+            active_job,
+            message: _,
+        } = CommandScreenState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let AutomationsManagerState {
+            selected: _,
+            approval,
+            active_job,
+            message: _,
+        } = AutomationsManagerState::default();
+        assert!(approval.is_none() && active_job.is_none());
+
+        let ExamineManagerState { active_job } = ExamineManagerState::default();
+        assert!(active_job.is_none());
+
+        let LogsViewState {
+            query: _,
+            active_job,
+        } = LogsViewState::default();
+        assert!(active_job.is_none());
     }
 
     #[test]
@@ -4476,132 +1591,10 @@ mod tests {
     }
 
     #[test]
-    fn tab_bar_hit_matches_per_chip_extents() {
-        // 5-tab layout: Home 0..10, ROCm 11..21, Serving 22..35, Observe 36..49,
-        // Chat 50..60.
-        let bar = Rect::new(0, 0, 80, 1);
-        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Rocm));
-        assert_eq!(tab_bar_hit(bar, 28, 0), Some(ActiveTab::Serving));
-        assert_eq!(tab_bar_hit(bar, 42, 0), Some(ActiveTab::Observe));
-        assert_eq!(tab_bar_hit(bar, 55, 0), Some(ActiveTab::Chat));
-        // Separator gap between Home (ends 10 excl.) and ROCm (starts 11).
-        assert_eq!(tab_bar_hit(bar, 10, 0), None);
-        // Wrong row.
-        assert_eq!(tab_bar_hit(bar, 5, 2), None);
-    }
-
-    #[test]
-    fn tab_bar_hit_skips_chips_that_overflow_a_narrow_bar() {
-        // Bar can only fit the first two chips (ROCm ends at 21).
-        let bar = Rect::new(0, 0, 25, 1);
-        assert_eq!(tab_bar_hit(bar, 5, 0), Some(ActiveTab::Home));
-        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Rocm));
-        // Serving chip would be at 22..35 — overflows the 25-wide bar → None.
-        assert_eq!(tab_bar_hit(bar, 28, 0), None);
-    }
-
-    #[test]
-    fn tab_bar_hit_honors_x_offset() {
-        // Bar offset 10 columns to the right: Home chip now spans 10..19.
-        let bar = Rect::new(10, 0, 80, 1);
-        assert_eq!(tab_bar_hit(bar, 15, 0), Some(ActiveTab::Home));
-        // Absolute x=5 is left of the offset bar.
-        assert_eq!(tab_bar_hit(bar, 5, 0), None);
-    }
-
-    #[test]
-    fn handle_mouse_routes_scroll_by_modal_and_tab() {
-        let scroll_down = MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        };
-        // No modal, non-interactive tab → Nothing
-        assert_eq!(
-            handle_mouse(scroll_down, &Modal::None, ActiveTab::Home),
-            KeyAction::Nothing
-        );
-        // No modal, Observe → Move by ONE (drives the instances selection)
-        assert_eq!(
-            handle_mouse(scroll_down, &Modal::None, ActiveTab::Observe),
-            KeyAction::Move(1)
-        );
-        // Detail modal → ScrollModal by one line
-        assert_eq!(
-            handle_mouse(scroll_down, &Modal::Detail, ActiveTab::Observe),
-            KeyAction::ScrollModal(1)
-        );
-        // ThemePicker → Move (drives picker cursor)
-        assert_eq!(
-            handle_mouse(scroll_down, &Modal::ThemePicker, ActiveTab::Home),
-            KeyAction::Move(1)
-        );
-        // Domain-tab scroll is NOT routed here (resolve_mouse owns it) → Nothing.
-        assert_eq!(
-            handle_mouse(scroll_down, &Modal::None, ActiveTab::Rocm),
-            KeyAction::Nothing
-        );
-    }
-
-    #[test]
-    fn scroll_bench_detail_clamps_at_zero() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.bench_detail_scroll = 5;
-        s.scroll_bench_detail(-100);
-        assert_eq!(s.bench_detail_scroll, 0);
-        s.scroll_bench_detail(7);
-        assert_eq!(s.bench_detail_scroll, 7);
-    }
-
-    #[test]
-    fn detail_modal_j_k_emit_scroll() {
-        let with_detail = |c| {
-            handle_key(
-                press(c),
-                ActiveTab::Observe,
-                &Modal::Detail,
-                ChatKeyCtx::default(),
-            )
-        };
-        assert_eq!(with_detail(KeyCode::Char('j')), KeyAction::ScrollModal(1));
-        assert_eq!(with_detail(KeyCode::Char('k')), KeyAction::ScrollModal(-1));
-        assert_eq!(with_detail(KeyCode::PageDown), KeyAction::ScrollModal(10));
-        assert_eq!(
-            with_detail(KeyCode::Char('g')),
-            KeyAction::ScrollModal(i16::MIN)
-        );
-        assert_eq!(
-            with_detail(KeyCode::Char('G')),
-            KeyAction::ScrollModal(i16::MAX)
-        );
-        assert_eq!(with_detail(KeyCode::Esc), KeyAction::CloseModal);
-    }
-
-    #[test]
     fn unknown_initial_theme_falls_back_to_default_dark() {
         let s = AppState::new("test".into(), "nope".into());
         let dark = Theme::default_dark();
         assert_eq!(s.theme.bg, dark.bg);
-    }
-
-    #[test]
-    fn help_modal_absorbs_navigation() {
-        let with_help = |c| {
-            handle_key(
-                press(c),
-                ActiveTab::Observe,
-                &Modal::Help,
-                ChatKeyCtx::default(),
-            )
-        };
-        // j/k inside Help do nothing (Help has no scrollable body today).
-        assert_eq!(with_help(KeyCode::Char('j')), KeyAction::Nothing);
-        assert_eq!(with_help(KeyCode::Tab), KeyAction::Nothing);
-        assert_eq!(with_help(KeyCode::Esc), KeyAction::CloseModal);
-        assert_eq!(with_help(KeyCode::Enter), KeyAction::CloseModal);
-        assert_eq!(with_help(KeyCode::Char('q')), KeyAction::Quit);
     }
 
     #[test]
@@ -4627,36 +1620,6 @@ mod tests {
         assert_eq!(s.instance_sel, 0);
         s.select_last();
         assert_eq!(s.instance_sel, 4);
-    }
-
-    #[test]
-    fn format_mmss_renders_minutes_and_hours() {
-        assert_eq!(format_mmss(0), "0:00");
-        assert_eq!(format_mmss(7), "0:07");
-        assert_eq!(format_mmss(65), "1:05");
-        assert_eq!(format_mmss(599), "9:59");
-        assert_eq!(format_mmss(3600), "1:00:00");
-        assert_eq!(format_mmss(3661), "1:01:01");
-    }
-
-    #[test]
-    fn bracket_keys_emit_replay_jump() {
-        assert_eq!(
-            hk(KeyCode::Char('['), ActiveTab::Home),
-            KeyAction::ReplayJump(-10)
-        );
-        assert_eq!(
-            hk(KeyCode::Char(']'), ActiveTab::Home),
-            KeyAction::ReplayJump(10)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('{'), ActiveTab::Home),
-            KeyAction::ReplayJump(-60)
-        );
-        assert_eq!(
-            hk(KeyCode::Char('}'), ActiveTab::Home),
-            KeyAction::ReplayJump(60)
-        );
     }
 
     #[test]
@@ -4687,181 +1650,6 @@ mod tests {
         s.bench_rows.clear();
         s.clamp_selectors();
         assert_eq!(s.bench_sel, 0);
-    }
-
-    #[test]
-    fn chat_insert_mode_captures_text_and_shortcircuits_hotkeys() {
-        let accepted_focused = ChatKeyCtx {
-            focused: true,
-            consent: ChatConsent::Accepted,
-            offer_pending: false,
-        };
-        let focused = |c| handle_key(press(c), ActiveTab::Chat, &Modal::None, accepted_focused);
-        // Printable chars become input, including ones that are global hotkeys.
-        assert_eq!(focused(KeyCode::Char('h')), KeyAction::ChatInput('h'));
-        assert_eq!(focused(KeyCode::Char('q')), KeyAction::ChatInput('q'));
-        assert_eq!(focused(KeyCode::Char('5')), KeyAction::ChatInput('5'));
-        assert_eq!(focused(KeyCode::Backspace), KeyAction::ChatBackspace);
-        assert_eq!(focused(KeyCode::Enter), KeyAction::ChatSubmit);
-        assert_eq!(focused(KeyCode::Esc), KeyAction::ChatBlur);
-
-        // Accepted but NOT focused: `q` still quits and `i`/Enter enter insert mode.
-        let accepted = ChatKeyCtx {
-            focused: false,
-            consent: ChatConsent::Accepted,
-            offer_pending: false,
-        };
-        let unfocused = |c| handle_key(press(c), ActiveTab::Chat, &Modal::None, accepted);
-        assert_eq!(unfocused(KeyCode::Char('q')), KeyAction::Quit);
-        assert_eq!(unfocused(KeyCode::Char('i')), KeyAction::ChatFocus);
-        assert_eq!(unfocused(KeyCode::Enter), KeyAction::ChatFocus);
-        assert_eq!(
-            unfocused(KeyCode::Char('1')),
-            KeyAction::SwitchTab(ActiveTab::Home)
-        );
-    }
-
-    #[test]
-    fn chat_consent_gate_maps_keys_and_lets_globals_through() {
-        let pending = ChatKeyCtx {
-            focused: false,
-            consent: ChatConsent::Pending,
-            offer_pending: false,
-        };
-        let gate = |c| handle_key(press(c), ActiveTab::Chat, &Modal::None, pending);
-        // y / Y / Enter accept; n / N decline.
-        assert_eq!(gate(KeyCode::Char('y')), KeyAction::ChatConsentAccept);
-        assert_eq!(gate(KeyCode::Enter), KeyAction::ChatConsentAccept);
-        assert_eq!(gate(KeyCode::Char('n')), KeyAction::ChatConsentDecline);
-        // Globals not trapped by the gate: q quits, digit switches tab.
-        assert_eq!(gate(KeyCode::Char('q')), KeyAction::Quit);
-        assert_eq!(
-            gate(KeyCode::Char('2')),
-            KeyAction::SwitchTab(ActiveTab::Rocm)
-        );
-    }
-
-    #[test]
-    fn chat_consent_accept_and_decline_transition_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        // No endpoint → Unavailable; accept/decline are no-ops.
-        s.set_chat_config(None, false);
-        assert_eq!(s.chat_consent, ChatConsent::Unavailable);
-        apply_action(&mut s, KeyAction::ChatConsentAccept);
-        assert_eq!(s.chat_consent, ChatConsent::Unavailable);
-
-        // Endpoint present, no pre-consent → Pending.
-        let llm = crate::llm::LlmConfig {
-            base_url: "http://127.0.0.1:8000".into(),
-            model: "m".into(),
-            api_key: None,
-            auth_header: None,
-        };
-        s.set_chat_config(Some(llm.clone()), false);
-        assert_eq!(s.chat_consent, ChatConsent::Pending);
-        // Accept → Accepted + focused.
-        apply_action(&mut s, KeyAction::ChatConsentAccept);
-        assert_eq!(s.chat_consent, ChatConsent::Accepted);
-        assert!(s.chat_focused);
-        // Decline → Declined + unfocused.
-        apply_action(&mut s, KeyAction::ChatConsentDecline);
-        assert_eq!(s.chat_consent, ChatConsent::Declined);
-        assert!(!s.chat_focused);
-
-        // Pre-consent → Accepted immediately.
-        s.set_chat_config(Some(llm), true);
-        assert_eq!(s.chat_consent, ChatConsent::Accepted);
-    }
-
-    #[test]
-    fn detect_offer_lifecycle_accept_switches_chat() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Chat;
-        // Gateway-configured chat, pending consent.
-        let gw = crate::llm::LlmConfig {
-            base_url: "https://gw/OpenAI".into(),
-            model: "gpt-4o-mini".into(),
-            api_key: Some("k".into()),
-            auth_header: Some("Ocp-Apim-Subscription-Key".into()),
-        };
-        s.set_chat_config(Some(gw), false);
-        // Simulate a prior `/provider openai` so the realignment to Local on
-        // accept is observable (Local is the default, so starting there would
-        // make the assertion below tautological).
-        s.active_provider = ChatProvider::Openai;
-
-        // request_detect raises the dispatch edge + detecting flag.
-        apply_action(&mut s, KeyAction::ChatDetect);
-        assert!(s.chat_detecting && s.chat_detect_dispatch);
-
-        // event_loop reports a detected local engine.
-        let local = crate::llm::detected_llm_config("http://localhost:13305/v1", "Llama-3.2-3B");
-        s.set_detect_result(Some(local.clone()));
-        assert!(!s.chat_detecting);
-        assert_eq!(s.chat_detect_offer.as_ref(), Some(&local));
-
-        // Accept the offer → chat switches to the local endpoint + enabled.
-        apply_action(&mut s, KeyAction::ChatDetectAccept);
-        assert_eq!(s.chat_consent, ChatConsent::Accepted);
-        assert_eq!(s.chat_llm.as_ref(), Some(&local));
-        assert!(s.chat_detect_offer.is_none());
-        assert_eq!(
-            s.chat_endpoint_rebuild,
-            Some(ChatProvider::Openai),
-            "accept raises the rebuild edge carrying the previous provider"
-        );
-        assert_eq!(s.active_provider, ChatProvider::Local);
-    }
-
-    #[test]
-    fn detect_offer_dismiss_keeps_prior_config() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        let gw = crate::llm::LlmConfig {
-            base_url: "https://gw/OpenAI".into(),
-            model: "gpt-4o-mini".into(),
-            api_key: None,
-            auth_header: None,
-        };
-        s.set_chat_config(Some(gw.clone()), false);
-        s.set_detect_result(Some(crate::llm::detected_llm_config(
-            "http://localhost:8000/v1",
-            "x",
-        )));
-        // Dismiss → offer gone, gateway config + Pending consent intact.
-        apply_action(&mut s, KeyAction::ChatDetectDismiss);
-        assert!(s.chat_detect_offer.is_none());
-        assert_eq!(s.chat_llm.as_ref(), Some(&gw));
-        assert_eq!(s.chat_consent, ChatConsent::Pending);
-    }
-
-    #[test]
-    fn save_detect_offer_accepts_and_raises_persist_edge() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        // Start off-Local so the realignment on accept is observable (Local is
-        // the default provider; asserting it without this would be tautological).
-        s.active_provider = ChatProvider::Openai;
-        s.set_detect_result(Some(crate::llm::detected_llm_config(
-            "http://localhost:13305/v1",
-            "Llama-3.2-3B",
-        )));
-        apply_action(&mut s, KeyAction::ChatDetectSave);
-        assert_eq!(s.chat_consent, ChatConsent::Accepted);
-        assert!(s.chat_persist_dispatch, "save raises the persist edge");
-        assert_eq!(
-            s.chat_endpoint_rebuild,
-            Some(ChatProvider::Openai),
-            "save also raises the rebuild edge carrying the previous provider"
-        );
-        assert_eq!(s.active_provider, ChatProvider::Local);
-        assert_eq!(
-            s.chat_llm.as_ref().map(|c| c.base_url.as_str()),
-            Some("http://localhost:13305/v1")
-        );
-        // No offer → save is a no-op (no edge).
-        let mut s2 = AppState::new("t".into(), "default-dark".into());
-        apply_action(&mut s2, KeyAction::ChatDetectSave);
-        assert!(!s2.chat_persist_dispatch);
-        assert!(s2.chat_endpoint_rebuild.is_none());
     }
 
     #[test]
@@ -5015,111 +1803,6 @@ mod tests {
         assert!(last.content.contains("no detected endpoint"));
     }
 
-    #[test]
-    fn detect_key_available_on_gate_and_offer_keys_take_precedence() {
-        // `d` triggers detect from the Unavailable empty-state.
-        let unavail = ChatKeyCtx {
-            focused: false,
-            consent: ChatConsent::Unavailable,
-            offer_pending: false,
-        };
-        assert_eq!(
-            handle_key(
-                press(KeyCode::Char('d')),
-                ActiveTab::Chat,
-                &Modal::None,
-                unavail
-            ),
-            KeyAction::ChatDetect
-        );
-        // With an offer pending, y/n map to the offer (not consent).
-        let offering = ChatKeyCtx {
-            focused: false,
-            consent: ChatConsent::Pending,
-            offer_pending: true,
-        };
-        assert_eq!(
-            handle_key(
-                press(KeyCode::Char('y')),
-                ActiveTab::Chat,
-                &Modal::None,
-                offering
-            ),
-            KeyAction::ChatDetectAccept
-        );
-        assert_eq!(
-            handle_key(
-                press(KeyCode::Char('n')),
-                ActiveTab::Chat,
-                &Modal::None,
-                offering
-            ),
-            KeyAction::ChatDetectDismiss
-        );
-    }
-
-    #[test]
-    fn chat_input_actions_mutate_buffer() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.active_tab = ActiveTab::Chat;
-        s.chat_focused = true;
-        apply_action(&mut s, KeyAction::ChatInput('h'));
-        apply_action(&mut s, KeyAction::ChatInput('i'));
-        assert_eq!(s.chat_input, "hi");
-        apply_action(&mut s, KeyAction::ChatBackspace);
-        assert_eq!(s.chat_input, "h");
-        apply_action(&mut s, KeyAction::ChatBlur);
-        assert!(!s.chat_focused);
-        apply_action(&mut s, KeyAction::ChatFocus);
-        assert!(s.chat_focused);
-    }
-
-    #[test]
-    fn chat_submit_pushes_user_turn_and_raises_dispatch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_input = "what's GPU-2 doing?".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        // Only the user turn is pushed; the agent reply arrives async.
-        assert_eq!(s.chat.len(), 1);
-        assert_eq!(s.chat[0].role, ChatRole::User);
-        assert_eq!(s.chat[0].content, "what's GPU-2 doing?");
-        assert!(s.chat_input.is_empty());
-        assert!(s.chat_sending, "submit marks the request in flight");
-        assert!(s.chat_dispatch, "submit raises the spawn edge");
-    }
-
-    #[test]
-    fn chat_submit_ignores_empty_input() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_input = "   ".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert!(s.chat.is_empty());
-        assert!(!s.chat_sending);
-        assert!(!s.chat_dispatch);
-    }
-
-    #[test]
-    fn chat_submit_ignored_while_request_in_flight() {
-        // A second submit before the first reply lands must be a no-op — no
-        // second user turn, no second spawn (prevents a racing double request).
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_input = "first".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert!(s.chat_sending);
-        assert_eq!(s.chat.len(), 1);
-        s.chat_dispatch = false; // simulate event_loop consuming the edge
-        s.chat_input = "second".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert_eq!(s.chat.len(), 1, "second submit ignored while in flight");
-        assert!(!s.chat_dispatch, "no second dispatch edge raised");
-        // After the reply clears the flag, submits work again.
-        s.on_chat_reply("done".into());
-        assert!(!s.chat_sending);
-        s.chat_input = "third".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert!(s.chat_dispatch);
-    }
-
     // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
 
     fn st() -> AppState {
@@ -5133,59 +1816,6 @@ mod tests {
         // The focus flag is additive and off by default in every constructor, so
         // existing dash/chat behavior is byte-identical.
         assert!(args_with_anthropic_key(None).focus.is_none());
-    }
-
-    #[test]
-    fn should_skip_daemon_predicate_matches_focus() {
-        // The dashboard (focus=None) keeps the daemon client + chat backend; any
-        // focus skips both. The render branch reuses this same predicate.
-        assert!(!should_skip_daemon(None));
-        assert!(should_skip_daemon(Some(Focus::Setup)));
-        assert!(should_skip_daemon(Some(Focus::Serve)));
-        assert!(should_skip_daemon(Some(Focus::Examine)));
-        // focus=None never self-exits — the dash loop only breaks on Quit/EOF.
-        assert!(!st().focused_should_exit(None));
-    }
-
-    #[test]
-    fn open_overlay_for_focus_opens_the_right_overlay() {
-        let mut s = st();
-        assert!(open_overlay_for_focus(&mut s, Focus::Setup).is_empty());
-        assert!(s.onboarding.is_some());
-        assert!(s.serve_wizard.is_none() && s.examine_manager.is_none());
-
-        let mut s = st();
-        assert!(open_overlay_for_focus(&mut s, Focus::Serve).is_empty());
-        assert!(s.serve_wizard.is_some());
-        assert!(s.onboarding.is_none() && s.examine_manager.is_none());
-
-        let mut s = st();
-        let fx = open_overlay_for_focus(&mut s, Focus::Examine);
-        assert!(s.examine_manager.is_some());
-        assert!(s.onboarding.is_none() && s.serve_wizard.is_none());
-        assert_eq!(fx.len(), 1, "examine auto-runs on open");
-    }
-
-    #[test]
-    fn focused_examine_auto_runs_rocm_examine() {
-        let mut s = st();
-        let fx = open_overlay_for_focus(&mut s, Focus::Examine);
-        assert_eq!(fx.len(), 1, "exactly one spawn side effect on open");
-        match &fx[0] {
-            rocm_dash_core::state::SideEffect::SpawnJob { cmd, args, .. } => {
-                assert!(cmd.contains("rocm"), "cmd resolves to the rocm exe: {cmd}");
-                assert!(
-                    args.iter().any(|a| a == "examine"),
-                    "examine in args: {args:?}"
-                );
-            }
-            other => panic!("expected SpawnJob, got {other:?}"),
-        }
-        assert_eq!(
-            s.examine_manager.as_ref().unwrap().active_job.as_deref(),
-            Some("examine"),
-            "the auto-run wires the active job"
-        );
     }
 
     #[test]
@@ -5214,151 +1844,36 @@ mod tests {
             out.contains("Esc"),
             "focused hint carries an Esc affordance"
         );
-    }
-
-    #[test]
-    fn focused_exit_gate_holds_until_examine_closed_at_root() {
-        let mut s = st();
-        // Focused Diagnose: examine opens AND auto-runs → a job-console sub-state.
-        let _ = open_overlay_for_focus(&mut s, Focus::Examine);
-        assert!(s.examine_manager.as_ref().unwrap().active_job.is_some());
-        assert!(
-            !s.focused_should_exit(Some(Focus::Examine)),
-            "a running job keeps the launcher out"
+        // Periphery must carry the same grey_overlay wash `draw()` uses behind
+        // every dashboard modal — text-only assertions above would still pass
+        // if the `grey_overlay` call in `draw_focused` were dropped, since the
+        // corner is plain theme bg either way in terms of glyphs (it's blank).
+        let wash = ratatui::style::Color::Rgb(0x1c, 0x1e, 0x22);
+        let corner = term.backend().buffer().cell((0, 0)).unwrap();
+        assert_eq!(
+            corner.style().bg,
+            Some(wash),
+            "corner cell must carry grey_overlay's wash bg, not plain theme bg"
         );
-
-        // Job terminal → first Esc dismisses the console back to the intro card;
-        // the overlay is still open, so the gate stays shut.
-        s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
-            id: "examine".into(),
-            code: 0,
-        });
-        let _ = crate::ui::examine_manager::on_key(
-            &mut s.examine_manager,
-            &mut s.jobs,
-            press(KeyCode::Esc),
+        // The "Esc back to menu" hint is rendered with a foreground-only
+        // style (no explicit bg), and `ratatui::Style::patch` leaves an
+        // unset field alone rather than clearing it — so the hint inherits
+        // grey_overlay's wash bg from the cells underneath it, exactly like
+        // `draw()`'s footer. Assert on the cell directly (not just its
+        // text), so this fails if the hint's style ever gains an explicit
+        // `bg` that would revert it to plain theme background.
+        let hint_row_y = term.backend().buffer().area().height - 1;
+        let hint_cell = term.backend().buffer().cell((0, hint_row_y)).unwrap();
+        assert_eq!(
+            hint_cell.symbol(),
+            "E",
+            "hint row should start with the Esc affordance"
         );
-        assert!(
-            s.examine_manager.is_some(),
-            "console dismissed, overlay stays"
+        assert_eq!(
+            hint_cell.style().bg,
+            Some(wash),
+            "the Esc hint inherits grey_overlay's wash bg, same as draw()'s footer"
         );
-        assert!(
-            !s.focused_should_exit(Some(Focus::Examine)),
-            "at the intro (not root-closed) the gate is still shut"
-        );
-
-        // Second Esc at the intro (root) closes the overlay → now exit to menu.
-        let _ = crate::ui::examine_manager::on_key(
-            &mut s.examine_manager,
-            &mut s.jobs,
-            press(KeyCode::Esc),
-        );
-        assert!(s.examine_manager.is_none(), "root Esc closes the overlay");
-        assert!(
-            s.focused_should_exit(Some(Focus::Examine)),
-            "closed at root → return to the launcher"
-        );
-    }
-
-    #[test]
-    fn focused_close_keys_swallowed_while_job_runs() {
-        // Regression for the mid-job ejection defect: `q` and running-`Esc` must
-        // be swallowed by the focused host while the job is non-terminal, so the
-        // overlay is never nulled (which would tear the runtime down and kill the
-        // child via kill_on_drop mid-write).
-        let mut s = st();
-        let _ = open_overlay_for_focus(&mut s, Focus::Examine); // auto-runs a job
-        assert!(s.has_active_console(), "examine console is live");
-        // Running job → q and Esc are blocked; Ctrl+C ('c') is NOT (it cancels).
-        assert!(focused_close_key_blocked(
-            &s,
-            Some(Focus::Examine),
-            KeyCode::Char('q')
-        ));
-        assert!(focused_close_key_blocked(
-            &s,
-            Some(Focus::Examine),
-            KeyCode::Esc
-        ));
-        assert!(!focused_close_key_blocked(
-            &s,
-            Some(Focus::Examine),
-            KeyCode::Char('c')
-        ));
-        // The dashboard (focus=None) never blocks — behavior is unchanged there.
-        assert!(!focused_close_key_blocked(&s, None, KeyCode::Char('q')));
-
-        // Because those keys are swallowed (never routed to the manager), the
-        // overlay stays open and the exit gate stays shut mid-job.
-        assert!(s.examine_manager.is_some());
-        assert!(!s.focused_should_exit(Some(Focus::Examine)));
-
-        // Once the job is terminal, close keys are allowed again → normal exit.
-        s.jobs.apply(rocm_dash_core::state::StateEvent::JobDone {
-            id: "examine".into(),
-            code: 0,
-        });
-        assert!(
-            !focused_close_key_blocked(&s, Some(Focus::Examine), KeyCode::Char('q')),
-            "a terminal job no longer blocks exit (the child already exited)"
-        );
-    }
-
-    #[test]
-    fn focused_gate_shut_across_serve_sub_states() {
-        // Exit-at-root (b)+(c): the focused gate stays shut while a folder
-        // browser / model picker / approval is open — it only opens at root.
-        let recipes: Vec<crate::ui::model_picker::ModelRecipeSummary> = Vec::new();
-        let mut s = st();
-        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
-
-        // (b) Tab on the Model field opens the folder-browser sub-popup.
-        let _ = crate::ui::serve_wizard::on_key(
-            &mut s.serve_wizard,
-            &mut s.jobs,
-            &recipes,
-            press(KeyCode::Tab),
-        );
-        assert!(s.serve_wizard.as_ref().unwrap().browser.is_some());
-        assert!(
-            !s.focused_should_exit(Some(Focus::Serve)),
-            "gate shut while the folder browser is open"
-        );
-        // Esc closes the sub-popup, not the wizard → still shut.
-        let _ = crate::ui::serve_wizard::on_key(
-            &mut s.serve_wizard,
-            &mut s.jobs,
-            &recipes,
-            press(KeyCode::Esc),
-        );
-        assert!(s.serve_wizard.as_ref().unwrap().browser.is_none());
-        assert!(s.serve_wizard.is_some());
-        assert!(!s.focused_should_exit(Some(Focus::Serve)));
-
-        // (c) Stage an approval (valid model, Launch field, Enter).
-        {
-            let w = s.serve_wizard.as_mut().unwrap();
-            w.model = "org/model".to_string();
-            w.field = crate::ui::serve_wizard::FIELDS.len() - 1; // Launch
-        }
-        let _ = crate::ui::serve_wizard::on_key(
-            &mut s.serve_wizard,
-            &mut s.jobs,
-            &recipes,
-            press(KeyCode::Enter),
-        );
-        assert!(
-            s.serve_wizard.as_ref().unwrap().approval.is_some(),
-            "a launch approval is pending"
-        );
-        assert!(
-            !s.focused_should_exit(Some(Focus::Serve)),
-            "gate shut while an approval is pending"
-        );
-
-        // Only a root close (wizard → None) opens the gate.
-        s.serve_wizard = None;
-        assert!(s.focused_should_exit(Some(Focus::Serve)));
     }
 
     #[test]
@@ -5568,6 +2083,7 @@ mod tests {
             chat_system_prompt: None,
             tool_executor: None,
             bench_results_dir: None,
+            services_past_attempts: 0,
         }
     }
 
@@ -5791,7 +2307,7 @@ mod tests {
             agent.as_ref().unwrap(),
             local_agent.as_ref().unwrap()
         ));
-        // The Local arm's restore line (mirrors app.rs): the factory cannot help.
+        // The Local arm's restore line (mirrors event_loop.rs): the factory cannot help.
         let args = args_with_anthropic_key(Some("k"));
         assert!(build_chat_agent(ChatProvider::Local, &args, None, tx).is_none());
         agent = local_agent.clone();
@@ -6481,7 +2997,8 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({ "channel": "release", "format": "wheel" }),
         });
-        // Enter on the default (Approve) choice yields an Approve verdict.
+        // The modal defaults to Deny (item #16); move to Approve, then confirm.
+        s.on_approval_key(crossterm::event::KeyCode::Tab);
         let verdict = s.on_approval_key(crossterm::event::KeyCode::Enter);
         assert_eq!(verdict, Some(crate::ui::approval::ApprovalVerdict::Approve));
         let (name, args) = s.take_approval().expect("approval taken on approve");
@@ -6496,6 +3013,102 @@ mod tests {
         assert!(
             summary.contains("Approved"),
             "concise summary, not raw JSON"
+        );
+    }
+
+    /// The leading sentences of the CLI refusal `rocm comfyui install` prints
+    /// when two managed ROCm runtimes are ready and none is activated. This is a
+    /// verbatim *prefix*, not the whole message: the real one continues with an
+    /// `Available: <key>, <key>.` list and a trailing pointer to
+    /// `rocm runtimes list`, both of which depend on the planted runtimes and
+    /// neither of which this test inspects — it only pins what the seam does
+    /// with the envelope it is handed, so the remedy-bearing prefix is the
+    /// relevant part.
+    const AMBIGUOUS_RUNTIME_REFUSAL: &str = "Multiple ROCm runtimes are ready. Pick one in `/runtimes`, set a default \
+         with `rocm runtimes activate <key>`, or pass `--runtime-id <key>`.";
+
+    /// An executor whose approved replay *replicates* what the real seam returns
+    /// for a `rocm` subprocess that exited non-zero: `run_rocm_capture_for_paths`
+    /// *captures* the failure, so `run_internal_mcp_call` returns `Ok` with an
+    /// `isError: true` envelope and the stderr buried in `structuredContent` —
+    /// it never returns `Err`, so the seam never builds `RocmToolOutcome::Error`.
+    ///
+    /// Replicates, not reaches: those producers live in the bin, which depends
+    /// on this crate, so this crate cannot call them. The envelope below is
+    /// hand-built to their shape and the test pins only what happens
+    /// *downstream* of it. That the producers really do hand the seam an `Ok`
+    /// envelope for a non-zero exit is pinned separately, against a real `rocm`
+    /// subprocess, by `seam_execute_approved_captures_a_failing_command_as_a_result`
+    /// in `apps/rocm/src/dash_seam.rs`.
+    #[derive(Debug)]
+    struct CapturedFailureExecutor;
+    impl crate::tool_exec::RocmToolExecutor for CapturedFailureExecutor {
+        fn execute(
+            &self,
+            name: &str,
+            args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::ApprovalRequired(crate::tool_exec::ApprovalIntent {
+                title: "Install ComfyUI".to_string(),
+                body: vec!["rocm comfyui install".to_string()],
+                name: name.to_string(),
+                arguments: args.clone(),
+            })
+        }
+        fn execute_approved(
+            &self,
+            _name: &str,
+            _args: &serde_json::Value,
+        ) -> crate::tool_exec::RocmToolOutcome {
+            crate::tool_exec::RocmToolOutcome::Result(serde_json::json!({
+                "content": [{
+                    "type": "text",
+                    "text": format!("Ran `rocm` command.\n\nstderr:\n{AMBIGUOUS_RUNTIME_REFUSAL}"),
+                }],
+                "structuredContent": {
+                    "argv": ["rocm", "comfyui", "install"],
+                    "exit_status": 1,
+                    "stdout": "",
+                    "stderr": AMBIGUOUS_RUNTIME_REFUSAL,
+                },
+                "isError": true,
+            }))
+        }
+    }
+
+    #[test]
+    fn approved_command_failure_stays_a_collapsed_envelope() {
+        // Pins the second half of the premise the ComfyUI e2e scenario's
+        // CLI-only scope rests on (`tests/e2e-cucumber/features/comfyui.feature`):
+        // *given* the captured `isError: true` envelope, `run_approved` takes
+        // the `Result` arm and `summarize_json_value` collapses every field, so
+        // the refusal text stays out of the chat — reading the `Error` arm
+        // (`Approved · … failed: {e}`) as this path's renderer is wrong. The
+        // first half — that a non-zero `rocm` exit really does arrive as that
+        // envelope rather than as an `Err` — is pinned by the seam test named
+        // on `CapturedFailureExecutor` above.
+        let shared: crate::tool_exec::SharedRocmToolExecutor =
+            std::sync::Arc::new(CapturedFailureExecutor);
+        let summary = run_approved(
+            &shared,
+            "rocm_command",
+            &serde_json::json!({ "args": ["comfyui", "install"] }),
+        );
+        assert!(
+            summary.contains("content: [1 items]"),
+            "the command envelope is collapsed, not inlined: {summary}"
+        );
+        assert!(
+            summary.contains("structuredContent: {4 fields}"),
+            "the captured stdout/stderr subtree is collapsed too: {summary}"
+        );
+        assert!(
+            !summary.contains("Multiple ROCm runtimes are ready"),
+            "the CLI refusal must not reach the chat: {summary}"
+        );
+        assert!(
+            !summary.contains("failed:"),
+            "a captured non-zero exit is not the Error arm: {summary}"
         );
     }
 
@@ -6608,16 +3221,21 @@ mod tests {
             name: "install_sdk".to_string(),
             arguments: serde_json::json!({}),
         });
-        // Tab toggles the cursor to Deny without producing a verdict.
-        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        // Defaults to Deny (the safer default; see item #16).
         assert_eq!(
             s.approval.as_ref().unwrap().choice,
             crate::ui::approval::ApprovalChoice::Deny
         );
-        // Enter now confirms Deny.
+        // Tab toggles the cursor to Approve without producing a verdict.
+        assert_eq!(s.on_approval_key(crossterm::event::KeyCode::Tab), None);
+        assert_eq!(
+            s.approval.as_ref().unwrap().choice,
+            crate::ui::approval::ApprovalChoice::Approve
+        );
+        // Enter now confirms Approve.
         assert_eq!(
             s.on_approval_key(crossterm::event::KeyCode::Enter),
-            Some(crate::ui::approval::ApprovalVerdict::Deny)
+            Some(crate::ui::approval::ApprovalVerdict::Approve)
         );
     }
 
@@ -6690,117 +3308,5 @@ mod tests {
         );
         assert!(!s.chat_sending);
         assert!(s.chat_input.is_empty());
-    }
-
-    #[tokio::test]
-    async fn chat_reply_path_appends_agent_turn_and_clears_sending() {
-        // The wired ChatSubmit→reply path using the MockAgentClient (no LLM).
-        let agent = crate::agent::MockAgentClient::new("GPU-2: 87% util, 71°C");
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_input = "what's GPU-2 doing?".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert!(s.chat_sending);
-        // Simulate event_loop: run the agent over the history, deliver the reply.
-        let snapshot = s.state_snapshot();
-        let reply = crate::agent::AgentClient::complete(&agent, &s.chat, snapshot)
-            .await
-            .expect("mock reply");
-        s.on_chat_reply(reply);
-        assert_eq!(s.chat.last().unwrap().role, ChatRole::Agent);
-        assert_eq!(s.chat.last().unwrap().content, "GPU-2: 87% util, 71°C");
-        assert!(!s.chat_sending);
-    }
-
-    #[test]
-    fn chat_input_handles_unicode_and_long_text() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_focused = true;
-        // Multi-byte / emoji chars push as single chars, no panic.
-        for c in "héllo 🚀 café ∑".chars() {
-            apply_action(&mut s, KeyAction::ChatInput(c));
-        }
-        assert_eq!(s.chat_input, "héllo 🚀 café ∑");
-        // Backspace removes the trailing multi-byte char correctly.
-        apply_action(&mut s, KeyAction::ChatBackspace);
-        assert_eq!(s.chat_input, "héllo 🚀 café ");
-        // Very long input is accepted.
-        for _ in 0..5000 {
-            apply_action(&mut s, KeyAction::ChatInput('x'));
-        }
-        assert!(s.chat_input.len() > 5000);
-        // Submitting unicode pushes one user turn, no panic.
-        s.chat_input = "什么是 GPU-2?".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        assert_eq!(s.chat[0].content, "什么是 GPU-2?");
-    }
-
-    #[test]
-    fn chat_scroll_clamps_and_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_max_scroll = 20;
-        s.chat_scroll = 20;
-        apply_action(&mut s, KeyAction::ChatScroll(-100));
-        assert_eq!(s.chat_scroll, 0, "scroll clamps at top");
-        assert!(!s.chat_follow, "scrolling above the bottom disables follow");
-        apply_action(&mut s, KeyAction::ChatScroll(7));
-        assert_eq!(s.chat_scroll, 7);
-        assert!(!s.chat_follow);
-        apply_action(&mut s, KeyAction::ChatScroll(100));
-        assert_eq!(s.chat_scroll, 20, "scroll clamps at measured bottom");
-        assert!(s.chat_follow, "scrolling to the bottom restores follow");
-        // PageUp/PageDown map to ChatScroll on the Chat tab when accepted.
-        let accepted = ChatKeyCtx {
-            focused: false,
-            consent: ChatConsent::Accepted,
-            offer_pending: false,
-        };
-        assert_eq!(
-            handle_key(
-                press(KeyCode::PageDown),
-                ActiveTab::Chat,
-                &Modal::None,
-                accepted
-            ),
-            KeyAction::ChatScroll(CHAT_SCROLL_STEP)
-        );
-        assert_eq!(
-            handle_key(
-                press(KeyCode::PageUp),
-                ActiveTab::Chat,
-                &Modal::None,
-                accepted
-            ),
-            KeyAction::ChatScroll(-CHAT_SCROLL_STEP)
-        );
-    }
-
-    #[test]
-    fn chat_scrollbar_grab_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_max_scroll = 20;
-        s.chat_scroll = 20;
-
-        s.apply_scroll_grab(ScrollTarget::Chat, 5, 0);
-        assert_eq!(s.chat_scroll, 5);
-        assert!(!s.chat_follow, "dragging above the bottom disables follow");
-
-        s.apply_scroll_grab(ScrollTarget::Chat, 20, 0);
-        assert_eq!(s.chat_scroll, 20);
-        assert!(s.chat_follow, "dragging to the bottom restores follow");
-    }
-
-    #[tokio::test]
-    async fn chat_error_path_appends_error_turn_no_panic() {
-        let agent = crate::agent::MockAgentClient::failing();
-        let mut s = AppState::new("t".into(), "default-dark".into());
-        s.chat_input = "hi".into();
-        apply_action(&mut s, KeyAction::ChatSubmit);
-        let snapshot = s.state_snapshot();
-        let err = crate::agent::AgentClient::complete(&agent, &s.chat, snapshot)
-            .await
-            .unwrap_err();
-        s.on_chat_error(err.to_string());
-        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
-        assert!(!s.chat_sending);
     }
 }

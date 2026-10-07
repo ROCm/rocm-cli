@@ -40,6 +40,57 @@ pub enum JobStatus {
     Cancelled,
 }
 
+impl JobStatus {
+    /// Single glyph (no trailing space — callers add their own spacing) used
+    /// everywhere a job's status is shown as an icon: the job console banner
+    /// and the Home tab activity feed (both the per-job row and its legend
+    /// via [`Self::legend_glyphs`], so the legend can't drift from the glyphs
+    /// it's explaining). Centralized so those renderers can't drift apart on
+    /// which glyph means what.
+    pub const fn glyph(&self) -> &'static str {
+        match self {
+            Self::Running => "⋯",
+            Self::Done { code: 0 } => "✓",
+            Self::Done { .. } => "!",
+            Self::Failed { .. } => "✗",
+            Self::Cancelled => "○",
+        }
+    }
+
+    /// Human-readable status label, e.g. for the job console's status chip.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Running => "running".to_string(),
+            Self::Done { code: 0 } => "done".to_string(),
+            Self::Done { code } => format!("exited ({code})"),
+            Self::Failed { message } => format!("failed: {message}"),
+            Self::Cancelled => "cancelled".to_string(),
+        }
+    }
+
+    /// Representative glyphs for a status legend, in display order
+    /// done/warn/failed/running/cancelled. Derived from real `JobStatus`
+    /// values via [`Self::glyph`] (rather than a second hardcoded copy of the
+    /// glyph table) so the legend can't drift from what real jobs render.
+    ///
+    /// The `code: 1` and empty `message` below are throwaway placeholders —
+    /// safe only because `glyph()` never branches on the exact code value
+    /// (only `code == 0` vs not) or on message content. If `glyph()` ever
+    /// starts branching on either, these placeholders need revisiting too.
+    pub fn legend_glyphs() -> [&'static str; 5] {
+        [
+            Self::Done { code: 0 }.glyph(),
+            Self::Done { code: 1 }.glyph(),
+            Self::Failed {
+                message: String::new(),
+            }
+            .glyph(),
+            Self::Running.glyph(),
+            Self::Cancelled.glyph(),
+        ]
+    }
+}
+
 /// Per-job model: the streamed output ring plus the shared cancel flag the
 /// async runtime watches. `Arc<AtomicBool>` is `std` only (no `tokio`), so it
 /// is safe at the core boundary.
@@ -268,6 +319,52 @@ mod tests {
             timestamp: chrono::DateTime::<Utc>::from_timestamp(secs, 0).unwrap(),
             ..Snapshot::default()
         }
+    }
+
+    #[test]
+    fn job_status_glyph_covers_all_variants() {
+        assert_eq!(JobStatus::Running.glyph(), "⋯");
+        assert_eq!(JobStatus::Done { code: 0 }.glyph(), "✓");
+        assert_eq!(JobStatus::Done { code: 1 }.glyph(), "!");
+        assert_eq!(
+            JobStatus::Failed {
+                message: "boom".into()
+            }
+            .glyph(),
+            "✗"
+        );
+        assert_eq!(JobStatus::Cancelled.glyph(), "○");
+    }
+
+    #[test]
+    fn job_status_legend_glyphs_match_glyph() {
+        let [done, warn, failed, running, cancelled] = JobStatus::legend_glyphs();
+        assert_eq!(done, JobStatus::Done { code: 0 }.glyph());
+        assert_eq!(warn, JobStatus::Done { code: 1 }.glyph());
+        assert_eq!(
+            failed,
+            JobStatus::Failed {
+                message: "anything".into()
+            }
+            .glyph()
+        );
+        assert_eq!(running, JobStatus::Running.glyph());
+        assert_eq!(cancelled, JobStatus::Cancelled.glyph());
+    }
+
+    #[test]
+    fn job_status_label_covers_all_variants() {
+        assert_eq!(JobStatus::Running.label(), "running");
+        assert_eq!(JobStatus::Done { code: 0 }.label(), "done");
+        assert_eq!(JobStatus::Done { code: 2 }.label(), "exited (2)");
+        assert_eq!(
+            JobStatus::Failed {
+                message: "boom".into()
+            }
+            .label(),
+            "failed: boom"
+        );
+        assert_eq!(JobStatus::Cancelled.label(), "cancelled");
     }
 
     #[test]

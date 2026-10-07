@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::mock_server::MockServer;
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
@@ -489,6 +489,19 @@ fn claim_relaunch() -> bool {
 
 #[given("a model is being served on GPU")]
 async fn setup_gpu_model(world: &mut E2eWorld) {
+    serve_gpu_model(world).await;
+}
+
+#[when("the user serves a model on GPU from the installed runtime")]
+async fn user_serves_gpu_model_from_installed_runtime(world: &mut E2eWorld) {
+    // Unlike `setup_active_runtime`, this scenario intentionally keeps the
+    // runtime it just installed in its isolated World. Do not opt into the
+    // persistent E2E_SHARED_RUNTIMES_DIR here: the acceptance criterion is that
+    // vLLM starts from this fresh runtime-only install, not a pre-warmed SDK.
+    serve_gpu_model(world).await;
+}
+
+async fn serve_gpu_model(world: &mut E2eWorld) {
     // Serve by the canonical HuggingFace ID (not the `qwen2.5` alias) with an
     // explicit engine matching this host. This step is a *precondition* for
     // scenarios that test inference/chat behavior, so it must not fail for
@@ -673,6 +686,26 @@ async fn setup_background_model(world: &mut E2eWorld) {
     }
 }
 
+#[given("a local server attempt has failed")]
+async fn setup_failed_local_server(world: &mut E2eWorld) {
+    // Plant the record a failed `rocm serve --managed` leaves behind, in this
+    // scenario's own isolated data dir (`<data>/services/e2e-mock.json`) - the
+    // World starts every scenario with an empty one, so a scenario that seeds
+    // nothing asserts against nothing and cannot fail. Reproducing a real serve
+    // failure would need a GPU and a deterministic way to break it; the record
+    // is the only thing `services list` reads, so planting it is the black-box
+    // equivalent. The mock server exists only to give the record a real
+    // endpoint to name: the CLI never probes a record that is not live.
+    let mock = MockServer::start("TestModel/E2E-1B").await;
+    world.endpoint = Some(mock.base_url());
+    world.model_name = Some("TestModel/E2E-1B".to_string());
+    world.mock = Some(mock);
+    world.register_mock_service_with(ServiceRecordOptions {
+        status: "failed",
+        ..ServiceRecordOptions::default()
+    });
+}
+
 #[given("the served model has been detected")]
 async fn setup_model_detected(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list"]);
@@ -820,6 +853,104 @@ async fn user_sends_completion(world: &mut E2eWorld) {
     crate::send_chat(world).await;
 }
 
+/// Arm the debug/test VRAM hook so the *selected* GPU is reported nearly full.
+/// The GPU lane's real cards are comfortably free, so the serve-plan low-VRAM
+/// OOM warning is otherwise unreachable in E2E; this makes it deterministic
+/// without touching the device the engine actually launches on. Consumed by the
+/// following serve via `run_rocm_with_scenario_env`.
+#[given("the selected GPU is reported nearly out of VRAM")]
+async fn selected_gpu_nearly_out_of_vram(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_FORCE_LOW_VRAM", "0".into()));
+}
+
+/// Preview a vLLM serve plan pinned to the nearly-full GPU. `--managed`
+/// backgrounds the supervisor (teardown stops it), so this returns once the plan
+/// has printed and the service has launched — the plan text is what the scenario
+/// inspects. The engine still launches against the real, free device.
+#[when("the user previews a vLLM serve plan pinned to that GPU")]
+async fn user_previews_vllm_low_vram_serve_plan(world: &mut E2eWorld) {
+    ensure_serve_port_free().await;
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen/Qwen2.5-0.5B-Instruct",
+            "--engine",
+            "vllm",
+            "--gpu",
+            "0",
+            "--managed",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The serve must have actually launched, not just printed a plausible plan: a
+/// non-zero rc after a good plan-print would otherwise go undetected since this
+/// scenario only inspects the plan lines (mirrors `assert_vllm_default`).
+///
+/// This step states the scenario's *premise*, not its verdict: the low-VRAM
+/// warning itself is long-standing behaviour, so the warning text alone proves
+/// nothing about the vLLM guidance this scenario exists for — that is
+/// `assert_serve_plan_names_memory_knob`'s job. What it does pin is that the
+/// warning names the GPU the serve was *pinned to* (`--gpu 0`), so a warning
+/// raised for some other device cannot stand in for the premise.
+#[then("the serve plan warns the GPU is low on VRAM")]
+async fn assert_serve_plan_low_vram_warning(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    assert!(
+        rc == 0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &[
+                "serve",
+                "<vllm model>",
+                "--engine",
+                "vllm",
+                "--gpu",
+                "0",
+                "--managed",
+            ],
+            rc,
+            output,
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
+    assert!(
+        output.contains("serving may fail on VRAM"),
+        "expected a low-VRAM serve-plan warning, got:\n{output}"
+    );
+    assert!(
+        output.contains("GPU 0 has only"),
+        "the low-VRAM warning must be about the pinned GPU 0, got:\n{output}"
+    );
+}
+
+/// The scenario's discriminating assertion — the behaviour added for EAI-8058.
+///
+/// Matching the flag name alone would be too weak to be that: `rocm serve` echoes
+/// engine recipe flags in the same plan, so a `--gpu-memory-utilization` the user
+/// passed themselves would satisfy it. Require the note's own explanation of *why*
+/// a busy GPU OOMs (vLLM's fixed total-VRAM reservation) alongside the flag, so
+/// only the pre-launch hint can satisfy this step.
+#[then("the serve plan explains how to lower vLLM's memory reservation")]
+async fn assert_serve_plan_names_memory_knob(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no serve output");
+    assert!(
+        output.contains("--gpu-memory-utilization"),
+        "expected the vLLM memory-utilization note in the serve plan, got:\n{output}"
+    );
+    assert!(
+        output.contains("vLLM reserves ~90%"),
+        "the note must explain vLLM's total-VRAM reservation, not merely name the flag, got:\n{output}"
+    );
+}
+
 /// Serve under the GPU-required default (no `--device`), pinning the engine to the
 /// host's effective serve engine so the serve reaches GPU enforcement rather than
 /// tripping on engine selection.
@@ -902,6 +1033,69 @@ async fn user_serves_runtime_and_env(world: &mut E2eWorld) {
             "--env-id",
             "some-env",
         ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve pinned to GPU ordinal 1 while an active visibility mask
+/// (`HIP_VISIBLE_DEVICES=0`) hides every device except ordinal 0. On a multi-GPU
+/// host ordinal 1 exists but is masked out, so the CLI must reject it against the
+/// visible set (EAI-7194). The mask names device 0, which every GPU host has, so
+/// the visible set resolves on a single-GPU host as well and ordinal 1 is refused
+/// against it there too — which is why this scenario needs no multi-GPU gate.
+/// Either way the serve must be refused rather than remapped onto the one visible
+/// device.
+#[when("the user serves a model pinned to a GPU hidden by the visibility mask")]
+async fn user_serves_masked_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("HIP_VISIBLE_DEVICES", "0")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve pinned to GPU ordinal 1 while `ROCR_VISIBLE_DEVICES=1` hides every
+/// device except the physical ordinal 1. ROCr re-indexes that survivor to HIP
+/// ordinal 0, so ordinal 1 is outside the visible HIP set and must be refused
+/// (EAI-7194) — not read as the physical token and wrongly accepted.
+///
+/// `@requires-multi-gpu`, because on a single-GPU host the mask token names a
+/// device that is not there: the visible set cannot be resolved and `--gpu`
+/// validation falls back to amd-smi's best-effort count, which does not honour
+/// the mask — so the outcome there depends on whether amd-smi is installed
+/// rather than on the mask. See the scenario comment in
+/// `features/model_serving.feature` for the full note on that gap.
+#[when("the user serves a model pinned past the ROCR-reindexed visible set")]
+async fn user_serves_rocr_reindexed_gpu_index(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine, "--gpu", "1"],
+        &[("ROCR_VISIBLE_DEVICES", "1")],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Serve with both visibility variables set: `ROCR_VISIBLE_DEVICES=` hides every
+/// device at the ROCr level, and `HIP_VISIBLE_DEVICES=0` names an ordinal in the
+/// (now empty) set ROCr leaves behind. The two compose in that order, so the HIP
+/// mask cannot resurrect a device and the GPU-required serve must refuse
+/// (EAI-7194) — not read the HIP mask as though it were the only one set.
+#[when("the user serves a model with ROCR hiding every GPU a HIP mask names")]
+async fn user_serves_with_rocr_hiding_hip_named_gpus(world: &mut E2eWorld) {
+    let (model, engine, _) = host_serve_target();
+    let (stdout, stderr, rc) = crate::run_rocm_with_env(
+        world,
+        &["serve", model, "--engine", engine],
+        &[("ROCR_VISIBLE_DEVICES", ""), ("HIP_VISIBLE_DEVICES", "0")],
     );
     world.cli_output = Some(stdout);
     world.cli_stderr = Some(stderr);
@@ -1043,13 +1237,55 @@ async fn assert_negative_temperature_message(world: &mut E2eWorld) {
 #[then("the user is told that GPU index is unavailable")]
 async fn assert_absent_index_message(world: &mut E2eWorld) {
     let output = serve_output(world).to_lowercase();
-    // The named index must appear alongside an unavailability reason — whether the
-    // CLI rejects it against the detected count ("out of range") or the engine's
-    // probe rejects it ("not available") on a host where amd-smi can't count.
+    // The refusal itself must name ordinal 99; a bare `contains("99")` alongside a
+    // loose reason would also be satisfied by a port, a model tag, or any unrelated
+    // "not available" elsewhere in the output. Four whole-phrase shapes are
+    // legitimate, each pinned to the component that emits it:
+    //   - CLI, no mask set — the index is outside the usable visible set, so the
+    //     absence is the host's, not a mask's. The normal shape for this scenario.
+    //     The wording is deliberate: blaming HIP/ROCR variables the user never set
+    //     sends them chasing an environment problem that does not exist.
+    //   - CLI, a mask is active on the runner — refused against the visible set.
+    //   - CLI, no visible set could be enumerated — falls back to the raw detected
+    //     count.
+    //   - ENGINE, on a host where neither the visible set nor the count could be
+    //     probed: `--gpu` validation takes its permissive fallback and the engine's
+    //     own probe makes the late rejection. Accepted deliberately, unlike in the
+    //     masked sibling below: the CLI-side refusal for an absent index predates
+    //     EAI-7194, so excluding the engine wording here would discriminate no fix
+    //     and only fail the scenario on unprobeable hosts.
+    let refusals = [
+        "--gpu index 99 is not present on this host",
+        "--gpu index 99 is not available under the active visibility mask",
+        "--gpu index 99 is out of range",
+        "requested gpu 99 is not available on this host",
+    ];
     assert!(
-        output.contains("99")
-            && (output.contains("out of range") || output.contains("not available")),
+        refusals.iter().any(|phrase| output.contains(phrase)),
         "expected the absent GPU index to be reported unavailable, got:\n{}",
+        serve_output(world)
+    );
+}
+
+#[then("the user is told the pinned GPU is unavailable")]
+async fn assert_masked_index_message(world: &mut E2eWorld) {
+    let output = serve_output(world).to_lowercase();
+    // Ordinal 1 must be named and refused by the CLI's own pre-flight: against the
+    // active visibility mask ("not available under the active visibility mask") on
+    // a multi-GPU host, or as out of range where no visible set could be
+    // enumerated. Never a silent remap onto the one visible device (ordinal 0).
+    //
+    // The accepted wording is deliberately narrow. A bare "not available" would
+    // also match the ENGINE's own late rejection ("requested GPU 1 is not
+    // available on this host"), which predates this pre-flight — so the scenario
+    // would still pass with the CLI-side fix reverted and prove nothing.
+    // Requiring the `--gpu index 1` prefix pins the refusal to the CLI and to the
+    // requested ordinal.
+    assert!(
+        output.contains("--gpu index 1")
+            && (output.contains("not available under the active visibility mask")
+                || output.contains("out of range")),
+        "expected the masked GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
 }
@@ -1103,6 +1339,43 @@ async fn assert_service_in_list(world: &mut E2eWorld) {
     assert!(
         stdout.contains("127.0.0.1"),
         "endpoint not in services list:\n{stdout}"
+    );
+}
+
+#[then("the list reports the attempt and how to look at it")]
+async fn assert_past_attempts_reported(world: &mut E2eWorld) {
+    let stdout = world
+        .cli_output
+        .as_deref()
+        .expect("no CLI output captured - did the When step run?");
+    // Guard the premise: a record really is hidden from this view. If the
+    // planted record ever started showing up as a row, the assertions below
+    // would be testing the wrong branch.
+    assert!(
+        !stdout.contains("- e2e-mock"),
+        "the default view must still hide the failed record:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Past attempts: 1 local server record(s) that are no longer running."),
+        "the default view must count the record it hides:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rocm services list --all"),
+        "the user must be told how to see the hidden record:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("rocm services logs e2e-mock"),
+        "the user must be given a pasteable command to read the log:\n{stdout}"
+    );
+    // The two lines above only let the user look. Every hidden record keeps an
+    // unrotated engine log, so this is the one line that gets that space back.
+    assert!(
+        stdout.contains("Reclaim the space: rocm services prune"),
+        "the user must be told how to reclaim the space:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Status: none ready"),
+        "the header must not claim nothing is recorded:\n{stdout}"
     );
 }
 

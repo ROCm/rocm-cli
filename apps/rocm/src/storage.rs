@@ -27,14 +27,15 @@ use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_r
 use serde::Serialize;
 
 use crate::{
-    ActiveRuntimeMarker, StorageCommand, UninstallPlan, UninstallPlanEntry,
+    ActiveRuntimeMarker, InstallRootDecision, StorageCommand, UninstallPlan, UninstallPlanEntry,
     active_runtime_marker_path, confirm_uninstall, format_bytes, remove_path,
     should_remove_runtime_install_root, therock,
 };
 
-/// Recent installs kept per channel/format/family by default: the one in use
-/// plus one rollback target. This is the natural floor rather than a tuned
-/// value — see the maintainer question in the pull request description.
+/// Recent installs kept per retention bucket by default (see
+/// [`retention_group`]): the one in use plus one rollback target. This is the
+/// natural floor rather than a tuned value — see the maintainer question in the
+/// pull request description.
 pub(crate) const DEFAULT_KEEP: usize = 2;
 
 // ---------------------------------------------------------------------------
@@ -174,7 +175,9 @@ impl HoldReason {
             Self::Default => "the configured default",
             Self::Marker => "named by the active install marker",
             Self::NotOwned => "added with adopt or import, so ROCm CLI does not own the folder",
-            Self::WithinKeepLimit => "one of the most recent installs kept for this GPU family",
+            Self::WithinKeepLimit => {
+                "one of the most recent installs kept for this GPU family and toolchain choice"
+            }
         }
     }
 }
@@ -268,12 +271,23 @@ pub(crate) fn unconditional_hold(
 }
 
 /// Retention group: a multi-GPU machine legitimately keeps one install per
-/// family, so recency is only ever compared inside a channel/format/family.
-fn retention_group(manifest: &therock::InstalledRuntimeManifest) -> (String, String, String) {
+/// family, so recency is only ever compared inside a
+/// channel/format/family/toolchain bucket.
+///
+/// The toolchain axis exists because the compiler is opt-in: `rocm install sdk`
+/// and `rocm install sdk --devel` at the same version produce two *separate*
+/// runtimes, since `wheel_runtime_key` hashes the requested package specs.
+/// Without this axis they compete for the same `--keep` slots, so prune can
+/// retain the newer runtime-only install and delete the toolchain one — a
+/// multi-gigabyte download the user explicitly asked for, gone without ever
+/// being named as a choice. They are not substitutes for each other, so they do
+/// not compete.
+fn retention_group(manifest: &therock::InstalledRuntimeManifest) -> (String, String, String, bool) {
     (
         manifest.channel.to_ascii_lowercase(),
         manifest.format.to_ascii_lowercase(),
         manifest.family.to_ascii_lowercase(),
+        manifest.includes_devel(),
     )
 }
 
@@ -289,8 +303,10 @@ pub(crate) fn select_runtimes_to_remove(
     keep: usize,
 ) -> (Vec<String>, Vec<(String, HoldReason)>) {
     let mut held: Vec<(String, HoldReason)> = Vec::new();
-    let mut groups: BTreeMap<(String, String, String), Vec<&therock::InstalledRuntimeManifest>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<
+        (String, String, String, bool),
+        Vec<&therock::InstalledRuntimeManifest>,
+    > = BTreeMap::new();
     let default_key = resolved_default_runtime_key(manifests, inputs);
 
     for manifest in manifests {
@@ -452,6 +468,41 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         ),
         PathUsage::measure("ROCm CLI cache folder", paths.cache_dir.clone(), None),
         PathUsage::measure("ROCm CLI data folder", paths.data_dir.clone(), None),
+        // One JSON record per `rocm serve --managed` launch, kept after the
+        // server exits. Never mentioned anywhere and no `rocm storage` command
+        // removes them, so the folder was invisible to a user asking what is on
+        // disk. Reported, never touched by any prune path here - deleting these
+        // belongs to `rocm services prune` / `rocm services remove`, which is
+        // why the note names `prune` as the way to reclaim the space.
+        //
+        // The note names the engine log too, not just the record: `measure`
+        // walks the whole folder, and every managed launch leaves an
+        // `<service_id>.log` beside the manifest. `ManagedServiceRecord::new`
+        // only *computes* that path (via `AppPaths::service_log_path`) - it
+        // writes nothing. The file is created by the launch site,
+        // `spawn_managed_engine_child` here in `main.rs` for
+        // `rocm serve --managed` and `supervise_service` in `rocmd` on the
+        // supervised/recovery path. What *fills* it differs by platform, so the
+        // redirect cannot be stated unqualified: `supervise_service` redirects
+        // the engine child's stdout/stderr into it on every platform, and so
+        // does `spawn_managed_engine_child` on Unix, but on Windows that
+        // function takes the `spawn_detached_no_inherit` branch, which passes
+        // no std handles at all. What keeps the Windows file non-empty is the
+        // `--log-path` the `rocm serve --managed` path hands the child (see
+        // `builtin_engine_serve_http_args`), which makes the engine adapter
+        // append the server's own output; on Unix that adapter output lands in
+        // the same file on top of the redirect. Nothing rotates that log, so on
+        // a host that has served real models the size printed here is dominated
+        // by logs - a note promising only "small files" would contradict the
+        // number beside it.
+        PathUsage::measure(
+            "local server records",
+            paths.services_dir(),
+            Some(
+                "one record plus the engine log per local server launch, kept after it stops; list them with `rocm services list --all`, reclaim the space with `rocm services prune`"
+                    .to_owned(),
+            ),
+        ),
     ];
 
     let mut shared_with_other_tools = vec![PathUsage::measure(
@@ -535,6 +586,9 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
             usage.size_text(),
             usage.path.display()
         );
+        if let Some(note) = usage.note.as_deref() {
+            let _ = writeln!(output, "      note: {note}");
+        }
     }
 
     let _ = writeln!(output);
@@ -621,8 +675,15 @@ pub(crate) fn build_prune_plan(
         // It refuses read-only and imported records and requires a matching
         // in-tree manifest, and it runs `ensure_runtime_install_root_is_safe_to_remove`.
         match should_remove_runtime_install_root(manifest) {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(decision) if decision.should_remove() => {}
+            Ok(InstallRootDecision::ManifestMismatch) => {
+                plan.skipped.push(format!(
+                    "{runtime_key}: local runtime manifest did not match the registry, \
+                     so it is left in place"
+                ));
+                continue;
+            }
+            Ok(_) => {
                 plan.skipped.push(format!(
                     "{runtime_key}: ROCm CLI did not create this folder, so it is left in place"
                 ));
@@ -653,7 +714,8 @@ pub(crate) fn render_prune_plan(plan: &PrunePlan, keep: usize, dry_run: bool) ->
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Keeping the {keep} most recent install(s) for each channel, format, and GPU family."
+        "Keeping the {keep} most recent install(s) for each channel, format, GPU family, and \
+         toolchain choice."
     );
     let _ = writeln!(output);
     if plan.remove.is_empty() {
@@ -872,6 +934,11 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 }
 
                 // Per-key delegation keeps config/marker cleanup in one place.
+                // It rests on `select_runtime_manifest` resolving a key back to
+                // the very manifest the policy decided about — keys that differ
+                // only in letter case are distinct installs here, so a lookup
+                // that folded them together would delete a different runtime
+                // than the one the user just confirmed.
                 let result = crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
                     .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
                 // `uninstall_runtime` re-evaluates ownership itself and can
@@ -962,6 +1029,7 @@ mod tests {
             version: version.to_owned(),
             install_root: PathBuf::from("rocm-storage-test").join(runtime_key),
             selected_artifact_url: "https://example.invalid/therock".to_owned(),
+            source_layout_generation: None,
             index_url: None,
             tarball_file_name: None,
             python_launcher: None,
@@ -972,8 +1040,30 @@ mod tests {
             wheel_composition: None,
             read_only: false,
             imported_from: None,
+            devel: true,
             installed_at_unix_ms,
         }
+    }
+
+    /// The same manifest with the compiler toolchain left out, recorded the way
+    /// a real `rocm install sdk` (no `--devel`) records it: the answer lives in
+    /// the specs `uv` was handed, and `includes_devel` reads it back out of
+    /// them. Writing the `devel` field alone would test a fallback rather than
+    /// the path every wheel install actually takes.
+    fn runtime_only(
+        mut record: therock::InstalledRuntimeManifest,
+        device_target: &str,
+    ) -> therock::InstalledRuntimeManifest {
+        record.devel = false;
+        record.wheel_composition = Some(therock::WheelRuntimeComposition {
+            source_layout_generation: "canonical".to_owned(),
+            package_specs: vec![format!(
+                "rocm[libraries,device-{device_target}]=={}",
+                record.version
+            )],
+            rocm_sdk_target: Some(device_target.to_owned()),
+        });
+        record
     }
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
@@ -1055,6 +1145,55 @@ mod tests {
         assert!(
             held.iter()
                 .all(|(_, reason)| *reason == HoldReason::WithinKeepLimit)
+        );
+    }
+
+    /// A toolchain install and a runtime-only install of the same channel,
+    /// format and family are two separate runtimes, because `wheel_runtime_key`
+    /// hashes the requested specs. If they shared a retention bucket, prune
+    /// would rank them by recency alone and delete the multi-gigabyte toolchain
+    /// the user explicitly asked for — silently, since the failure only shows
+    /// up much later as a missing compiler. Only a *non-active* devel runtime
+    /// is exposed (the active and default ones are held unconditionally), which
+    /// is exactly the case nothing else protects.
+    #[test]
+    fn a_runtime_only_install_never_evicts_the_toolchain_install_it_sits_beside() {
+        let manifests = vec![
+            manifest("release-wheel-gfx120x-devel-1", "gfx120X-all", "7.13.0", 10),
+            manifest("release-wheel-gfx120x-devel-2", "gfx120X-all", "7.14.0", 20),
+            runtime_only(
+                manifest("release-wheel-gfx120x-only-1", "gfx120X-all", "7.13.0", 30),
+                "gfx1201",
+            ),
+            runtime_only(
+                manifest("release-wheel-gfx120x-only-2", "gfx120X-all", "7.14.0", 40),
+                "gfx1201",
+            ),
+        ];
+
+        // `keep = 1` so each bucket has something to give up: the axis must
+        // separate the two toolchain choices without also making `--keep` inert
+        // inside either of them.
+        let (removable, held) =
+            select_runtimes_to_remove(&manifests, &RetentionInputs::default(), 1);
+
+        assert_eq!(
+            removable,
+            vec![
+                "release-wheel-gfx120x-devel-1".to_owned(),
+                "release-wheel-gfx120x-only-1".to_owned(),
+            ],
+            "prune must drop the older install of each toolchain choice, not the \
+             older toolchain choice"
+        );
+        let kept: Vec<&str> = held.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "release-wheel-gfx120x-devel-2",
+                "release-wheel-gfx120x-only-2",
+            ],
+            "the newest install of each toolchain choice must survive"
         );
     }
 
@@ -1271,9 +1410,8 @@ mod tests {
         assert_eq!(removed, vec!["old"]);
         assert!(plan.remove[0].size_bytes >= 2048);
         assert!(
-            plan.skipped
-                .iter()
-                .any(|line| line.starts_with("unowned: ROCm CLI did not create this folder")),
+            plan.skipped.iter().any(|line| line
+                .starts_with("unowned: local runtime manifest did not match the registry")),
             "unowned install must be reported as left alone: {:?}",
             plan.skipped
         );
@@ -1316,6 +1454,84 @@ mod tests {
         assert!(rendered.contains("status: in use"));
         assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
         assert!(rendered.contains("downloaded models"));
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// `rocm serve --managed` leaves one JSON record per launch, kept after the
+    /// server exits, and no `rocm storage` command removes them. The report
+    /// never named the folder, so a user asking what is on disk could not see
+    /// it existed. `rocm services prune` is what reclaims the space, so the
+    /// note has to name it - a row that only says how to *look* at a folder
+    /// whose size is dominated by unrotated logs is informational, not
+    /// actionable.
+    #[test]
+    fn report_lists_the_local_server_records_folder() -> Result<()> {
+        let (root, paths) = test_paths("report-services");
+        std::fs::create_dir_all(paths.services_dir())?;
+        std::fs::write(paths.services_dir().join("svc.json"), b"{}")?;
+
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+        assert!(rendered.contains("local server records"), "{rendered}");
+        assert!(
+            rendered.contains(paths.services_dir().display().to_string().as_str()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("list them with `rocm services list --all`"),
+            "{rendered}"
+        );
+        // The folder holds the engine's unrotated log as well as the record, and
+        // `measure` sums the whole tree - so the note has to name the log, or it
+        // contradicts the size printed next to it on a host that has served.
+        assert!(
+            rendered.contains("one record plus the engine log per local server launch"),
+            "{rendered}"
+        );
+        // No `rocm storage` command removes this folder, so the row is a dead
+        // end unless it names the command that does. Pinned separately from the
+        // listing pointer above: the two answer different questions ("what is
+        // in there" vs "how do I get the space back") and dropping either one
+        // would still leave the other's assertion green.
+        assert!(
+            rendered.contains("reclaim the space with `rocm services prune`"),
+            "{rendered}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    /// Rendering notes in the `ROCm CLI folders` loop was needed for the row
+    /// above, and it also made the two archive rows print the note they have
+    /// always carried in the data and in `--json`. That is the most actionable
+    /// line in the report - `rocm storage remove-downloads` acts on it - so pin
+    /// it rather than leaving it as an unwitnessed side effect a refactor could
+    /// drop again. Asserted against the row rather than anywhere in the output
+    /// because the note is per-row and the two rows carry the *same* string:
+    /// a `contains` check passes on either row alone, so dropping the note from
+    /// `downloaded helper tools` would stay green. Anchoring also pins what the
+    /// user reads - the `note: ` line directly under its own row - so a loop
+    /// that emitted the notes detached from the rows they describe, or beside
+    /// the wrong label, would be caught here instead of shipping.
+    #[test]
+    fn report_marks_the_re_downloadable_folders_as_safe_to_remove() -> Result<()> {
+        let (root, paths) = test_paths("report-download-notes");
+        let rendered = render_report(&build_report(&paths, &RocmCliConfig::default())?);
+
+        for label in ["downloaded ROCm archives", "downloaded helper tools"] {
+            let lines: Vec<&str> = rendered.lines().collect();
+            let at = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(&format!("- {label}:")))
+                .unwrap_or_else(|| panic!("no `{label}` row in:\n{rendered}"));
+            assert_eq!(
+                lines.get(at + 1).map(|line| line.trim()),
+                Some("note: can be downloaded again; safe to remove"),
+                "`{label}` must carry its note:\n{rendered}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
@@ -1493,6 +1709,123 @@ mod tests {
         Ok(())
     }
 
+    /// `rocm runtimes adopt --runtime-key` stores the key the user typed
+    /// verbatim, so an adopted runtime can carry a key that differs from an
+    /// installed one only in case. The registry is one file per key, and
+    /// `ABC.json` and `abc.json` are two files, so nothing rejects the pair.
+    ///
+    /// Prune resolves the key it selected twice: `build_prune_plan` finds the
+    /// manifest with `==`, and the removal it delegates to resolves the same
+    /// string through `select_runtime_manifest`. While that second lookup
+    /// preferred the newest case-insensitive match, an adopted record — stamped
+    /// with the moment it was adopted, so always the newest — won it, and prune
+    /// de-registered the adopted runtime while leaving the install the user
+    /// confirmed in place, reclaiming nothing.
+    ///
+    /// Two case twins are only two registry files on a case-sensitive
+    /// filesystem, so the situation cannot arise — and cannot be staged — on
+    /// Windows, where the second fixture would overwrite the first.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a case-sensitive filesystem to hold two registry entries differing only in case"
+    )]
+    #[test]
+    fn prune_removes_the_install_it_named_and_not_a_case_twin_of_it() -> Result<()> {
+        let (root, paths) = test_paths("case-twin");
+        let old = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-9-0", "gfx110X-all", "7.9.0", 5),
+            2048,
+        )?;
+        let middle = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-10-0", "gfx110X-all", "7.10.0", 10),
+            2048,
+        )?;
+        let newer = install_fixture(
+            &paths,
+            manifest("release-wheel-gfx110x-7-11-0", "gfx110X-all", "7.11.0", 20),
+            2048,
+        )?;
+        // `rocm runtimes adopt --runtime-key RELEASE-WHEEL-GFX110X-7-9-0`.
+        // Adoption always sets read_only and imported_from, and stamps
+        // installed_at with the moment it ran, so it is the newest record.
+        let mut adopted = manifest("RELEASE-WHEEL-GFX110X-7-9-0", "gfx110X-all", "7.9.0", 99);
+        adopted.read_only = true;
+        adopted.imported_from = Some(PathBuf::from("/opt/rocm"));
+        let adopted = install_fixture(&paths, adopted, 2048)?;
+        // The runtime in use is a third one, so neither twin is force-kept by
+        // the active pointer. (A pointer at either twin holds *both*, because
+        // the holds compare case-insensitively — that is what hides this.)
+        let mut config = RocmCliConfig {
+            active_runtime_key: Some("release-wheel-gfx110x-7-11-0".to_owned()),
+            ..RocmCliConfig::default()
+        };
+
+        let plan = build_prune_plan(&paths, &config, 1)?;
+        let planned: Vec<&str> = plan
+            .remove
+            .iter()
+            .map(|entry| entry.runtime_key.as_str())
+            .collect();
+        assert_eq!(
+            planned,
+            vec!["release-wheel-gfx110x-7-9-0"],
+            "the plan the user confirms names the lowercase install: {:?}",
+            plan.skipped
+        );
+
+        // The removal loop in `storage()`, including its last-second re-check.
+        for entry in &plan.remove {
+            let manifests = therock::load_runtime_manifests(&paths)?;
+            let marker = read_active_runtime_marker(&paths);
+            let inputs = RetentionInputs::from_config(&config, marker.as_ref());
+            let default_key = resolved_default_runtime_key(&manifests, &inputs);
+            if let Some(manifest) = manifests
+                .iter()
+                .find(|manifest| manifest.runtime_key == entry.runtime_key)
+                && unconditional_hold(manifest, &inputs, default_key.as_deref()).is_some()
+            {
+                continue;
+            }
+            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+        }
+
+        let registry = paths.data_dir.join("runtimes").join("registry");
+        assert!(
+            !old.install_root.exists(),
+            "the install the plan named must be the one that is gone"
+        );
+        assert!(newer.install_root.is_dir());
+        assert!(middle.install_root.is_dir());
+        assert!(
+            adopted.install_root.is_dir(),
+            "the adopted runtime's folder must survive"
+        );
+        assert!(
+            !registry.join("release-wheel-gfx110x-7-9-0.json").is_file(),
+            "the named install is de-registered too, not just emptied"
+        );
+        assert!(
+            registry.join("RELEASE-WHEEL-GFX110X-7-9-0.json").is_file(),
+            "the adopted runtime must still be registered"
+        );
+        // Belt as well as braces: even if the policy ever did select the
+        // adopted twin, the ownership guard would still refuse its folder.
+        assert_eq!(
+            should_remove_runtime_install_root(&adopted)?,
+            InstallRootDecision::ReadOnly,
+            "an adopted install's folder stays off-limits to deletion"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some("release-wheel-gfx110x-7-11-0"),
+            "removing an old install must not deactivate the runtime in use"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
     /// `--yes` is required when there is nobody to answer the prompt. This is
     /// the gate standing between a scripted invocation and a multi-gigabyte
     /// deletion, so it is worth a test of its own.

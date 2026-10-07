@@ -9,18 +9,22 @@
 //! runtime two ways —
 //!
 //! - **Install ROCm SDK** — a one-shot gated `rocm install sdk` with a Configure
-//!   step to pick the channel (Release/Nightly) and an optional version pin
-//!   (`--build-date` / `--version`); defaults to `--channel release --format
-//!   wheel`.
+//!   step to pick the channel (Release/Nightly), an optional version pin
+//!   (`--build-date` / `--version`), and an optional install folder
+//!   (`--prefix`, via the same Wave-0 [`FolderBrowser`] the Adopt path uses);
+//!   defaults to `--channel release --format wheel` installed into the
+//!   default managed folder.
 //! - **Adopt existing folder** — pick an existing ROCm env with the Wave-0
 //!   [`FolderBrowser`], then approve `rocm runtimes adopt`.
 //!
 //! Reinstall / uninstall / show-log sub-modals (the full frozen onboarding),
 //! first-run auto-trigger + `onboarding_dismissed` persistence, and the frozen
 //! flow's post-install `reconcile_onboarding_engine_preference` are documented
-//! fast-follows — this overlay is additive and key-triggered (`n`), so it never
-//! touches the frozen tui.rs first-run gate. Both paths run through the approval
-//! gate and the job-bridge — zero `std::thread::spawn`/`try_recv`.
+//! fast-follows — this overlay is additive and opens only via the explicit
+//! `n` key on the Observe tab (or explicit `Focus::Setup` selection); no
+//! startup path reads `setup.completed`/`onboarding_dismissed` to auto-open
+//! it. Both paths run through the approval gate and the job-bridge — zero
+//! `std::thread::spawn`/`try_recv`.
 
 use std::path::Path;
 
@@ -36,7 +40,7 @@ use rocm_dash_core::state::{JobStatus, SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
@@ -177,11 +181,19 @@ pub struct InstallConfig {
     pub channel: Channel,
     pub pin_mode: PinMode,
     pub pin_value: String,
+    /// Install folder (`--prefix`); empty uses the CLI's default managed
+    /// folder. Set via the folder browser (`Tab`), never typed directly.
+    pub prefix: String,
 }
 
-/// Build the `install sdk` args from a configuration. A `None` pin (or an empty
-/// value) leaves the command at `--channel <ch> --format wheel`, so the default
-/// Release path is byte-identical to the pre-toggle behavior.
+/// Build the `install sdk` args from a configuration.
+///
+/// The command is always `--channel <ch> --format wheel
+/// --approve-replacing-active-default`. Two optional pairs slot in: `--prefix`
+/// (only when a folder has been chosen, before the approval flag) and
+/// `--build-date`/`--version` (only when a pin mode is selected with a non-empty
+/// value, after it). Leaving both unset keeps the default Release path
+/// byte-identical to the pre-toggle behavior.
 fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
     let mut args = vec![
         "install".to_string(),
@@ -191,6 +203,21 @@ fn build_install_args(cfg: &InstallConfig) -> Vec<String> {
         "--format".to_string(),
         "wheel".to_string(),
     ];
+    // Never trim the value itself: `cfg.prefix` comes only from the folder
+    // browser (never typed), so trimming could silently redirect the install
+    // into a different directory if a real folder name ends in whitespace.
+    if !cfg.prefix.trim().is_empty() {
+        args.push("--prefix".to_string());
+        args.push(cfg.prefix.clone());
+    }
+    args.push(
+        // Onboarding installs are spawned with null stdin, so a would-be
+        // consent prompt cannot be answered and the install would refuse. This
+        // keeps the first-run install non-interactive. Deliberately not `--yes`,
+        // which would also approve a `sudo` system-package install this spawn
+        // has no terminal to answer.
+        "--approve-replacing-active-default".to_string(),
+    );
     let pin = cfg.pin_value.trim();
     if let (Some(flag), false) = (cfg.pin_mode.arg(), pin.is_empty()) {
         args.push(flag.to_string());
@@ -210,6 +237,17 @@ pub struct PendingOnboard {
 }
 
 /// Overlay state. `None` on `AppState` means the wizard is closed.
+///
+/// Any new nested sub-view field (like `browser` or `install_config`) added
+/// here must also be listed in `active_overlay_at_root`'s onboarding clause
+/// in `app/mod.rs` — that hand-maintained enumeration is what tells the
+/// shared Esc back-out path not to eject the whole wizard while a sub-view
+/// has focus. The same applies to every other manager-state struct that
+/// clause enumerates (`serve_wizard`, `install_manager`, `runtime_manager`,
+/// `engine_manager`, `services`, `update_manager`, `config_manager`, ...).
+/// `app::tests::active_overlay_at_root_enumeration_is_exhaustive` destructures
+/// every one of those structs without `..`, so forgetting this fails to
+/// compile rather than silently mis-gating Esc.
 #[derive(Debug, Clone, Default)]
 pub struct OnboardingState {
     pub step: OnboardingStep,
@@ -244,21 +282,34 @@ pub fn on_key(
         return Vec::new();
     };
 
-    // 1) Adopt folder browser has focus.
+    // 1) A folder browser has focus — either the Adopt-path browser, or the
+    //    Configure step's prefix browser opened via Tab. `install_config` is
+    //    the disambiguator: `Some` means Configure opened this browser and
+    //    the chosen path fills `cfg.prefix`; `None` means the Adopt path
+    //    opened it and the chosen path becomes the adopt root instead. Key
+    //    dispatch intercepts every key while Configure holds focus, so this
+    //    can never see a stale `install_config` from a prior step.
     if let Some(fb) = o.browser.as_mut() {
         match fb.on_key(key.code) {
             FolderOutcome::Chosen(path) => {
                 o.browser = None;
-                let root = path.to_string_lossy().into_owned();
-                let args = vec![
-                    "runtimes".to_string(),
-                    "adopt".to_string(),
-                    "--root".to_string(),
-                    root.clone(),
-                    "--python".to_string(),
-                    derive_python_executable(&root),
-                ];
-                stage_approval(o, OnboardingChoice::AdoptExisting, args);
+                let selected = path.to_string_lossy().into_owned();
+                if let Some(cfg) = o.install_config.as_mut() {
+                    // Opened from the SDK Configure step — just fill the
+                    // field; the user still confirms with Enter.
+                    cfg.prefix = selected;
+                } else {
+                    let root = selected;
+                    let args = vec![
+                        "runtimes".to_string(),
+                        "adopt".to_string(),
+                        "--root".to_string(),
+                        root.clone(),
+                        "--python".to_string(),
+                        derive_python_executable(&root),
+                    ];
+                    stage_approval(o, OnboardingChoice::AdoptExisting, args);
+                }
             }
             FolderOutcome::Cancelled => o.browser = None,
             FolderOutcome::None | FolderOutcome::Navigated => {}
@@ -357,8 +408,9 @@ fn activate_choice(o: &mut OnboardingState) -> Vec<SideEffect> {
 }
 
 /// Handle a key while the SDK Configure sub-view has focus: `←/→` toggle the
-/// channel, `↑/↓` cycle the pin mode, typing edits the pin value, Enter stages
-/// the install for approval, Esc returns to the choose menu.
+/// channel, `↑/↓` cycle the pin mode, `Tab` opens the folder browser to pick
+/// an install location, typing edits the pin value, Enter stages the install
+/// for approval, Esc returns to the choose menu.
 fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
     match key.code {
         KeyCode::Esc => {
@@ -371,10 +423,41 @@ fn configure_key(o: &mut OnboardingState, key: KeyEvent) -> Vec<SideEffect> {
                 stage_approval(o, OnboardingChoice::InstallSdk, args);
             }
         }
+        // `Tab` browses for the install folder, mirroring the Tab-browse
+        // binding the install-manager and serve-wizard forms already use. The
+        // channel is on `←/→` only — see the catch-all arm below.
+        //
+        // Gated on `install_config` rather than assuming the caller checked:
+        // `on_key`'s folder-browser branch uses `install_config.is_some()` to
+        // tell a Configure browse from an Adopt one, so opening this browser
+        // with `install_config` unset would silently stage the chosen path as an
+        // *adopt* instead. The guard makes that impossible here rather than
+        // relying on a single caller to keep it true.
+        KeyCode::Tab => {
+            if let Some(cfg) = o.install_config.as_ref() {
+                // Reopen where the user left off, byte-exact: `cfg.prefix` is
+                // written only by the browser, so a real folder name ending in
+                // whitespace must not be trimmed into a different path.
+                let start = if cfg.prefix.trim().is_empty() {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                } else {
+                    std::path::PathBuf::from(cfg.prefix.as_str())
+                };
+                o.browser = Some(FolderBrowser::new("Pick an install folder", start));
+            }
+        }
         other => {
             if let Some(cfg) = o.install_config.as_mut() {
                 match other {
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    // `←/→` only, deliberately: `Tab` is the folder-browser key
+                    // in the arm above, as it is in the install-manager and
+                    // serve-wizard forms, and one key cannot do both. An
+                    // earlier revision of this view (#73) did also toggle the
+                    // channel on `Tab`; do not re-add it here. The on-screen
+                    // hint advertises `←→ channel`, and the test
+                    // `tab_browses_instead_of_toggling_the_channel` pins the
+                    // split.
+                    KeyCode::Left | KeyCode::Right => {
                         cfg.channel = cfg.channel.toggled();
                     }
                     KeyCode::Up => cfg.pin_mode = cfg.pin_mode.prev(),
@@ -401,7 +484,7 @@ fn stage_approval(o: &mut OnboardingState, choice: OnboardingChoice, args: Vec<S
     let request = ApprovalRequest::new(
         choice.title().to_string(),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             choice.explanation().to_string(),
         ],
@@ -531,7 +614,7 @@ pub fn draw_onboarding(
     );
 
     let hint = if o.install_config.is_some() {
-        "←→ channel · ↑↓ pin · type value · Enter confirm · Esc back"
+        "←→ channel · ↑↓ pin · Tab browse folder · type value · Enter confirm · Esc back"
     } else {
         match o.step {
             OnboardingStep::Welcome => "Enter continue · Esc close",
@@ -555,8 +638,8 @@ pub fn draw_onboarding(
     }
 }
 
-/// Render the SDK Configure sub-view: channel toggle, pin-mode selector, and
-/// (when a pin is selected) the value field.
+/// Render the SDK Configure sub-view: channel toggle, pin-mode selector,
+/// (when a pin is selected) the pin value field, and the install-folder row.
 fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme) {
     let chan = |c: Channel| -> Span {
         if cfg.channel == c {
@@ -616,6 +699,16 @@ fn draw_configure(f: &mut Frame, area: Rect, cfg: &InstallConfig, theme: &Theme)
             value,
         ]));
     }
+    lines.push(Line::from(vec![
+        Span::styled("Folder:   ", Style::default().fg(theme.fg)),
+        Span::styled(
+            crate::ui::format::display_or_placeholder(
+                &cfg.prefix,
+                "(default managed folder · Tab to browse)",
+            ),
+            Style::default().fg(theme.fg),
+        ),
+    ]));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -671,7 +764,8 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "default Release path must stay byte-identical to the pre-toggle args"
         );
@@ -883,6 +977,33 @@ mod tests {
         assert!(out.contains("needs approval"));
     }
 
+    #[test]
+    fn snapshot_configure_shows_folder_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = Theme::from_name("default-dark");
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let o = OnboardingState {
+            step: OnboardingStep::Choose,
+            install_config: Some(InstallConfig::default()),
+            ..Default::default()
+        };
+        let jobs = State::default();
+        term.draw(|f| draw_onboarding(f, f.area(), &o, &jobs, &theme))
+            .unwrap();
+        let out: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(out.contains("Folder:"));
+        assert!(out.contains("default managed folder"));
+        assert!(out.contains("Tab browse folder"));
+    }
+
     /// Open the SDK Configure view (choice 0 = InstallSdk) and return the state.
     fn open_configure() -> (Option<OnboardingState>, State) {
         let mut ob = Some(OnboardingState {
@@ -918,8 +1039,41 @@ mod tests {
                 "--channel",
                 "nightly",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ]
+        );
+    }
+
+    /// `Tab` opens the folder browser and `←/→` toggle the channel — two
+    /// separate keys. An earlier revision of this view (#73) toggled the
+    /// channel on `Tab` as well, so pin the split explicitly: a future
+    /// re-grouping of `configure_key`'s catch-all arm could otherwise restore
+    /// or lose either half without a test noticing.
+    #[test]
+    fn tab_browses_instead_of_toggling_the_channel() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        {
+            let o = ob.as_ref().unwrap();
+            assert!(o.browser.is_some(), "Tab opens the folder browser");
+            assert_eq!(
+                o.install_config.as_ref().unwrap().channel,
+                Channel::Release,
+                "Tab must not also cycle the channel"
+            );
+        }
+        // Esc closes the browser without choosing; ←/→ still own the channel.
+        on_key(&mut ob, &mut jobs, key(KeyCode::Esc));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Right));
+        assert_eq!(
+            ob.as_ref()
+                .unwrap()
+                .install_config
+                .as_ref()
+                .unwrap()
+                .channel,
+            Channel::Nightly
         );
     }
 
@@ -948,6 +1102,7 @@ mod tests {
                 "nightly",
                 "--format",
                 "wheel",
+                "--approve-replacing-active-default",
                 "--build-date",
                 "2026-06-05"
             ]
@@ -983,9 +1138,124 @@ mod tests {
                 "--channel",
                 "release",
                 "--format",
-                "wheel"
+                "wheel",
+                "--approve-replacing-active-default"
             ],
             "an empty pin must not add a flag"
+        );
+    }
+
+    #[test]
+    fn tab_opens_browser_from_configure() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_some());
+        assert!(
+            s.install_config.is_some(),
+            "Configure stays open underneath"
+        );
+    }
+
+    #[test]
+    fn choosing_folder_from_configure_sets_prefix_without_staging() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        // Enter on row 0 (UseCurrent) of the freshly opened browser chooses cwd.
+        let fx = on_key(&mut ob, &mut jobs, key(KeyCode::Enter));
+        assert!(fx.is_empty());
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_none());
+        assert!(
+            s.approval.is_none(),
+            "picking a folder must not stage the install by itself"
+        );
+        let cfg = s
+            .install_config
+            .as_ref()
+            .expect("Configure regains focus after choosing a folder");
+        assert!(!cfg.prefix.is_empty());
+    }
+
+    #[test]
+    fn tab_reopens_browser_at_the_already_chosen_prefix() {
+        let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/mnt/data/rocm-env".to_string();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let fb = ob
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .expect("Tab opens the folder browser");
+        assert_eq!(
+            fb.current_dir,
+            std::path::PathBuf::from("/mnt/data/rocm-env"),
+            "re-opening the browser must resume near the prior choice, not cwd"
+        );
+    }
+
+    #[test]
+    fn tab_reopens_at_the_untrimmed_prefix_even_with_trailing_whitespace() {
+        let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/mnt/data/rocm-env ".to_string();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        let fb = ob
+            .as_ref()
+            .unwrap()
+            .browser
+            .as_ref()
+            .expect("Tab opens the folder browser");
+        assert_eq!(
+            fb.current_dir,
+            std::path::PathBuf::from("/mnt/data/rocm-env "),
+            "a real folder name is never mangled, even if it ends in whitespace"
+        );
+    }
+
+    #[test]
+    fn confirming_after_folder_choice_stages_prefix_flag() {
+        let (mut ob, mut jobs) = open_configure();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // choose folder
+        on_key(&mut ob, &mut jobs, key(KeyCode::Enter)); // confirm Configure
+        assert!(
+            staged_args(ob.as_ref().unwrap())
+                .iter()
+                .any(|a| a == "--prefix")
+        );
+    }
+
+    #[test]
+    fn prefix_with_trailing_whitespace_is_passed_through_untrimmed() {
+        let cfg = InstallConfig {
+            prefix: "/opt/rocm-sdk ".to_string(),
+            ..Default::default()
+        };
+        let args = build_install_args(&cfg);
+        let idx = args.iter().position(|a| a == "--prefix").unwrap();
+        assert_eq!(
+            args[idx + 1],
+            "/opt/rocm-sdk ",
+            "a real folder name is never mangled, even if it ends in whitespace"
+        );
+    }
+
+    #[test]
+    fn cancelling_folder_browser_leaves_configure_untouched() {
+        let (mut ob, mut jobs) = open_configure();
+        ob.as_mut().unwrap().install_config.as_mut().unwrap().prefix =
+            "/existing/prefix".to_string();
+        on_key(&mut ob, &mut jobs, key(KeyCode::Tab));
+        on_key(&mut ob, &mut jobs, key(KeyCode::Esc)); // cancel the browser
+        let s = ob.as_ref().unwrap();
+        assert!(s.browser.is_none());
+        let cfg = s.install_config.as_ref().expect("back on Configure");
+        assert_eq!(
+            cfg.prefix, "/existing/prefix",
+            "cancelling the browser must not clear an already-chosen prefix"
         );
     }
 

@@ -18,12 +18,8 @@
 //! exact, approximated, or `n/a`).
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
-use crossterm::QueueableCommand;
-use crossterm::cursor::MoveToColumn;
-use crossterm::terminal::{Clear, ClearType};
 use rocm_core::AppPaths;
 
 use crate::providers::{self, ChatMessage, ChatRequest, ProviderStreamEvent};
@@ -33,8 +29,6 @@ use crate::providers::{self, ChatMessage, ChatRequest, ProviderStreamEvent};
 const SMOKE_PROMPT: &str = "Reply with a short one-sentence greeting.";
 /// Cap the smoke-test generation so a slow or verbose model cannot stall startup.
 const SMOKE_MAX_TOKENS: u32 = 32;
-/// Braille spinner frames (matching the dashboard's visual language).
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Best-effort metrics measured against a freshly-started server. Every field is
 /// optional: any probe failure leaves it `None` and the summary renders `n/a`.
@@ -254,63 +248,6 @@ fn compute_metrics(
         _ => None,
     };
     SmokeMetrics { ttft, gen_tps }
-}
-
-/// A carriage-return status indicator written to stderr. Disabled (a no-op) when
-/// stderr is not a TTY, so piped/redirected output never receives control
-/// characters. Keeps stdout clean for the summary table.
-pub(crate) struct Spinner {
-    enabled: bool,
-    idx: usize,
-    label: String,
-    active: bool,
-}
-
-impl Spinner {
-    pub(crate) fn new(label: impl Into<String>) -> Self {
-        Self {
-            enabled: std::io::stderr().is_terminal(),
-            idx: 0,
-            label: label.into(),
-            active: false,
-        }
-    }
-
-    /// Change the message shown next to the spinner (e.g. "Running smoke test…").
-    pub(crate) fn set_label(&mut self, label: impl Into<String>) {
-        self.label = label.into();
-        self.render_current();
-    }
-
-    /// Advance to the next animation frame and repaint.
-    pub(crate) fn tick(&mut self) {
-        self.idx = self.idx.wrapping_add(1);
-        self.render_current();
-    }
-
-    fn render_current(&mut self) {
-        if !self.enabled {
-            return;
-        }
-        let frame = SPINNER_FRAMES[self.idx % SPINNER_FRAMES.len()];
-        let mut err = std::io::stderr();
-        let _ = err.queue(MoveToColumn(0));
-        let _ = err.queue(Clear(ClearType::CurrentLine));
-        let _ = write!(err, "{frame} {}", self.label);
-        let _ = err.flush();
-        self.active = true;
-    }
-
-    /// Erase the spinner line so the summary table starts on a clean line.
-    pub(crate) fn clear(&mut self) {
-        if self.enabled && self.active {
-            let mut err = std::io::stderr();
-            let _ = err.queue(MoveToColumn(0));
-            let _ = err.queue(Clear(ClearType::CurrentLine));
-            let _ = err.flush();
-            self.active = false;
-        }
-    }
 }
 
 #[cfg(test)]

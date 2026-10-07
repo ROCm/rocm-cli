@@ -27,6 +27,22 @@ async fn check_updates(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user checks for updates as machine-readable JSON")]
+async fn check_updates_json(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user checks for updates as machine-readable JSON with a 5 second timeout")]
+async fn check_updates_json_with_timeout(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--json", "--timeout-secs", "5"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[then("the report shows there are no managed runtimes to update")]
 async fn no_runtimes_to_update(world: &mut E2eWorld) {
     let out = ok_output(world);
@@ -62,6 +78,105 @@ async fn reports_feed_status(world: &mut E2eWorld) {
             None => panic!("no update feed line for {feed:?} in:\n{out}"),
         }
     }
+}
+
+// Covers the JSON envelope shape only (single line, `runtimes: []`).
+// Suppressing wheel-resolution progress output ahead of the JSON contract is
+// a separate concern with no managed runtimes here to trigger it — that's
+// covered by `render_update_json_installs_the_suppression_guard_around_resolution`
+// in `apps/rocm/src/therock.rs`, which exercises a real progress_line call
+// reachable during resolution.
+#[then("the machine-readable check reports no runtimes to update")]
+async fn json_reports_empty_runtimes(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    let mut lines = out.lines();
+    let line = lines
+        .next()
+        .unwrap_or_else(|| panic!("expected a line of JSON on stdout, got empty output"));
+    assert!(
+        lines.next().is_none(),
+        "expected exactly one stdout line (JSON must not share stdout with other output), got:\n{out}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(line)
+        .unwrap_or_else(|e| panic!("stdout line is not valid JSON: {e}\nline: {line}"));
+    let runtimes = doc
+        .get("runtimes")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("expected a `runtimes` array in JSON, got: {doc}"));
+    assert!(
+        runtimes.is_empty(),
+        "expected an empty `runtimes` array, got: {runtimes:?}"
+    );
+}
+
+#[when("the user previews an update")]
+async fn preview_update(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because no managed runtimes are registered")]
+async fn refuses_no_managed_runtimes(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("no managed runtimes are registered"),
+        "expected the real 'no managed runtimes are registered' bail (not a \
+         clap usage error), got:\n{combined}"
+    );
+}
+
+#[when("the user requests updating a specific runtime without --apply or --dry-run")]
+async fn update_runtime_without_apply_or_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--runtime", "some-runtime"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because --apply or --dry-run is required with --runtime or --activate")]
+async fn refuses_apply_or_dry_run_required(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("--runtime and --activate require --apply or --dry-run"),
+        "expected the --runtime/--activate no-op guard bail, got:\n{combined}"
+    );
+}
+
+#[when("the user checks for updates as JSON with --dry-run")]
+async fn check_updates_json_with_dry_run(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["update", "--dry-run", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses because --dry-run and --json cannot be combined")]
+async fn refuses_dry_run_json_conflict(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let combined = format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or(""),
+        world.cli_stderr.as_deref().unwrap_or("")
+    );
+    assert!(rc != 0, "expected a non-zero exit, got {rc}:\n{combined}");
+    assert!(
+        combined.contains("cannot be used with"),
+        "expected a clap conflict error naming --dry-run/--json, got:\n{combined}"
+    );
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

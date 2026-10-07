@@ -2,8 +2,8 @@ Feature: GPU detection and system inspection
 
   @id:examine-version
   Scenario: examine-01 - The CLI reports its version
-    When the user asks for the version
-    Then a version string is returned
+    When the user asks for the version through every CLI surface
+    Then matching traceable version strings are returned
 
   @id:examine-engines-list
   Scenario: examine-02 - The CLI lists all supported engines
@@ -129,3 +129,149 @@ Feature: GPU detection and system inspection
   Scenario: examine-12 - The driver install dry-run shows the effective repo version
     When the user previews the driver install plan
     Then the plan's repo version is a concrete version, not a shell placeholder
+
+  # `rocm engines list` prefixes the engine this machine serves on with `*`,
+  # with nothing else on the page explaining what it means. This asserts the
+  # printed legend actually names the glyph, and that the marked engine
+  # matches the host's independently-derived default, so the rendered marker
+  # and its explanation can't drift apart silently.
+  @id:examine-engines-list-shows-default-engine-legend
+  Scenario: examine-13 - Listing engines explains the default-engine marker
+    When the user lists available engines
+    Then the engine listing explains the default-engine marker
+    And the host's default engine is marked in the listing
+
+  # `rocm examine`'s own engine_inventory block prefixes the effective default
+  # engine with the same `*` marker, via a renderer separate from `engines
+  # list`'s (see `append_examine_engine_inventory` vs
+  # `render_engine_inventory_text_with_paths` in apps/rocm/src/main.rs) — the
+  # two used to be able to drift apart. examine-13 only ever drove `engines
+  # list`, leaving this second renderer's legend unexercised end-to-end.
+  @id:examine-shows-default-engine-legend
+  Scenario: examine-14 - Inspecting the system explains the default-engine marker
+    When the user inspects the system
+    Then the inspection explains the default-engine marker
+    And the host's default engine is marked in the inspection's engine inventory
+
+  # In the managed configuration torch is installed only inside the active
+  # runtime, so a probe that resolves its interpreter from `PATH` reports
+  # `framework: unknown` for a machine that has a working one — and the
+  # machine-readable form is the only surface that reports a framework at all,
+  # so there is nothing to cross-check it against.
+  #
+  # `Given a managed runtime is active` is what lets this scenario fail. Without
+  # it the world's `<data>/runtimes` stays isolated and empty by design (see
+  # `E2eWorld::default`), no interpreter resolves, and any assertion would land
+  # on the `PATH` fallback — holding whether the fix is present or reverted.
+  # That precondition is also why this is `@requires-gpu`: the step installs the
+  # SDK, so only a GPU lane exercises it.
+  #
+  # `framework_source` is what check_8 reads to decide whether comparing this
+  # torch against the *system* ROCm means anything, so it is the field worth
+  # pinning rather than the versions themselves.
+  @id:examine-framework-names-the-interpreter-that-answered @requires-gpu
+  Scenario: examine-15 - The framework report describes the runtime the engines will use
+    Given a managed runtime is active
+    When the user inspects the system both for reading and for scripting
+    Then the framework report names the runtime's interpreter
+  # EAI-8950. The text form repairs a lost registry entry from the install tree
+  # before rendering (`recover_setup_runtime_registration`), so it names the
+  # folder; `--json` skips that call because it writes, and used to answer
+  # `active_runtime_root: null` with no folder anywhere in the document. The
+  # folder is reachable from config without the registry and without writing,
+  # which is what these fields carry.
+  #
+  # The order of the two runs is load-bearing: the `Given` plants an install
+  # tree the text form CAN repair from, so running it first would hand `--json`
+  # an `active_runtime_root` it is supposed to have no way to resolve. The
+  # machine-readable form goes FIRST, while the registry is still empty; the
+  # text form follows so the two answers can be held against each other.
+  #
+  # No GPU needed: config and install tree are planted, and the isolated
+  # registry is empty by design (see `E2eWorld::default`) — which is precisely
+  # the missing-entry state under test.
+  @id:examine-json-names-the-setup-runtime-folder
+  Scenario: examine-16 - The scripting form names the setup runtime folder unaided
+    Given setup names a runtime folder the registry has forgotten
+    When the user inspects the system for scripting before reading
+    Then the machine-readable form names the setup runtime folder
+    And it does not pass that folder off as the active runtime's
+
+  # EAI-8449: Instinct parts enumerate under PCI class 1200 ("Processing
+  # accelerators") rather than a display class, so the lspci probe skipped them
+  # and the machine-readable form fell back to a single topology-sourced entry
+  # carrying no PCI address -- one row for an eight-GPU MI300X host. Neither
+  # examine-04 nor examine-08 noticed, because both assert `detected_gfx_target`
+  # and `has_amd_gpu`, which that fallback still satisfied. So this reads
+  # `gpus[]` itself, cross-checked against the kernel's own GPU node count
+  # rather than against a fixed number, which keeps it host-agnostic.
+  #
+  # It also reads `gpus[].gfx_target`, which is the observable end of the second
+  # half of that fix: `lspci` resolves a target from the marketing name, and on
+  # an Instinct host `pci.ids` frequently spells that "Device 74a1", so without
+  # `rocminfo` the per-node target the kernel reports is the only thing that can
+  # fill the field.
+  #
+  # The step no-ops where a premise does not hold -- no readable KFD topology,
+  # no `lspci` to supply PCI addresses, or a topology whose nodes disagree on a
+  # target -- because on such a host the answer it would otherwise flag is the
+  # correct one.
+  @id:examine-lists-every-gpu-with-its-address-and-target @requires-gpu
+  Scenario: examine-17 - The machine-readable report lists every GPU the kernel sees
+    Given a machine with an AMD GPU
+    When the user inspects the system both for reading and for scripting
+    Then it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of — a system ROCm install and a ROCm Python wheel each
+  # ship one, and this CLI installs the second itself. When the copy that loads
+  # is not the one the active runtime needs, compilation fails with an error
+  # naming neither the library nor the second copy. Nothing looked past the
+  # first match before, so the second copy could not be seen at all.
+  #
+  # No GPU needed: the suite cannot install a second ROCm stack, so it cannot
+  # prove the two-copy case. What every lane can prove is that the inspection
+  # answers the question at all rather than staying silent, and that finding
+  # none is reported as a finding rather than a failure — which is the case
+  # the mock lane actually has. The two-copy behaviour is proven by unit tests
+  # that build the directory layout directly.
+  #
+  # `@requires-os:linux` because `probe_comgr` only runs for `os_family`
+  # "linux" or "wsl" (see `examine.rs`); on native Windows it is never called,
+  # so `comgr_paths: []` and `comgr_selected: null` would hold by nothing more
+  # than `Examination`'s own defaults, and the assertions below would pass
+  # whether the probe ran and found nothing or never ran at all. WSL reports
+  # `os_family` "linux" (see `expectation.rs`), so this still runs there.
+  @id:examine-reports-code-object-manager-copies @requires-os:linux
+  Scenario: examine-18 - The inspection says which code object manager libraries the machine holds
+    When the user inspects the system in machine-readable form
+    Then the inspection lists the code object manager libraries it found
+    And it names which of them would load, or says it found none
+    And it lists the HIP runtime libraries the machine holds the same way
+    And it names which HIP runtime copy would load, or says it found none
+
+  # The copy this CLI installs itself, which is the case the whole entry exists
+  # for: the install path puts ROCm wheels into a managed environment, so a user
+  # on a host that already carries system ROCm ends up holding both copies
+  # having done nothing unusual.
+  #
+  # `@requires-gpu` because the precondition installs the SDK, and only a GPU
+  # lane does that. This is the half the unit tests cannot reach: they build the
+  # directory layout by hand, so they prove the search understands a layout we
+  # described, not that it matches the one the installer actually produces. A
+  # real managed runtime is the only thing that distinguishes those.
+  #
+  # `@requires-os:linux` because `probe_comgr` only ever looks for `libamd_comgr`
+  # and `libamdhip64` -- ELF shared-object names, found via `LD_LIBRARY_PATH`,
+  # the loader cache, or an install root's `lib/` tree. None of that exists on
+  # native Windows, which ships `.dll`s under other names, so the assertion
+  # that a managed runtime's library must be found does not hold there. WSL
+  # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
+  # the WSL lane, where the managed runtime really does carry a `.so`. This
+  # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
+  # diagnose.rs -- the same boundary, stated once there and once here.
+  @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
+  Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
+    Given a managed runtime is active
+    When the user inspects the system in machine-readable form
+    Then the inspection attributes a code object manager library to that runtime

@@ -8,9 +8,10 @@
 //! either mutates reducer state directly (nav / overlays), raises a one-shot
 //! executor edge (`slash_tool` / `plan_request` / `provider_switch`) for the
 //! event loop to drain off-thread, or pushes a usage/error turn. Stays I/O-free.
-//! Split out of `app/mod.rs` to keep the core reducer focused; the slash-command
-//! payload types it raises (`SlashOutcome`, `SlashToolRequest`, `ProviderSwitch`)
-//! stay in `mod.rs` alongside the `AppState` fields that carry them.
+//! Split out of `app/mod.rs` to keep the core reducer focused. Of the
+//! slash-command payload types it raises, `SlashOutcome` and
+//! `SlashToolRequest` live in `types.rs`; `ProviderSwitch` stays in
+//! `mod.rs`, alongside the `AppState` fields that carry them.
 
 use super::{
     ActiveTab, AppState, ChatProvider, ChatTurn, Modal, ProviderSwitch, SlashOutcome,
@@ -249,8 +250,11 @@ impl AppState {
             }
             "setup" => {
                 // Bare `/setup` (or `/setup status`) reports first-time setup
-                // (read-only); `/setup reset` re-arms it (approval-gated). The CLI
-                // only has status + reset — anything else is guided, not run.
+                // (read-only); `/setup reset` clears the completion/dismissal
+                // state (approval-gated) but does not reopen onboarding by
+                // itself — that still needs the explicit `n` key on Observe.
+                // The CLI only has status + reset — anything else is guided,
+                // not run.
                 let sub = rest.split_whitespace().nth(1).map(str::to_lowercase);
                 match sub.as_deref() {
                     None | Some("status") => {

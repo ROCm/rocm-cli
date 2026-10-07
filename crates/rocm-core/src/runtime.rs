@@ -103,6 +103,14 @@ pub const fn runtime_python_executable_name() -> &'static str {
     }
 }
 
+/// The loader search-path variable used to expose a runtime's ROCm libraries to
+/// a child process.
+pub const RUNTIME_LIBRARY_PATH_ENV: &str = if cfg!(windows) {
+    "PATH"
+} else {
+    "LD_LIBRARY_PATH"
+};
+
 pub fn runtime_python_env_bin_dir(env_root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(env_root).join(runtime_python_bin_dir_name())
 }
@@ -300,8 +308,12 @@ pub fn managed_pip_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("pip-cache")
 }
 
-/// `uv`'s content-addressed cache, kept under the managed root so it shares a filesystem
-/// with the environments `uv` populates and hardlinking keeps working (see issue #160).
+/// `uv`'s content-addressed cache, kept under the managed root (see issue #160).
+///
+/// Colocating it keeps the cache reachable from the environments `uv` populates without
+/// crossing a mount point, which is what lets `uv` hardlink into them instead of copying.
+/// It is the mount, not the filesystem: a bind mount or `subPath` volume is enough to make
+/// Linux refuse the hardlink and send `uv` back to copying.
 pub fn managed_uv_cache_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("uv-cache")
 }
@@ -314,17 +326,75 @@ pub fn managed_tools_dir(root: &Path) -> PathBuf {
     normalize_runtime_path_for_host(root).join("tools")
 }
 
+/// Split a search-path list into entries, host-normalising each one.
+///
+/// Safe on an inherited OS `PATH` as well as on a list this tool recorded
+/// itself: the Windows branch implements the same quoting rules as
+/// [`std::env::split_paths`] before it normalises. It adds trimming and the
+/// dropping of empty entries on top, which a recorded list wants and an
+/// inherited one does not mind.
+///
+/// That quote handling is load-bearing rather than incidental. `c:\some;dir` is
+/// a legal Windows path, so a list containing one has to quote it, and a naive
+/// `split(';')` both tears the entry in two and leaves the `"` characters in
+/// the result — where [`std::env::join_paths`] rejects them outright and the
+/// caller loses the whole list, not the one bad entry. Keep this in step with
+/// [`runtime_path_list_join`], which re-quotes on the way back out.
 pub fn runtime_path_list_split(value: &OsStr) -> Vec<PathBuf> {
     if !runtime_is_windows() {
         return std::env::split_paths(value).collect();
     }
-    value
-        .to_string_lossy()
-        .split(';')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
+    split_windows_path_list_text(&value.to_string_lossy())
+        .iter()
         .map(|entry| normalize_runtime_path_for_host(Path::new(entry)))
         .collect()
+}
+
+/// Split a Windows `;`-separated path list, honouring the quoting rules
+/// [`std::env::split_paths`] uses: a `"` opens a run in which `;` is an ordinary
+/// character, and the quotes are removed rather than kept in the entry.
+///
+/// Entries are trimmed and empty ones dropped, so a trailing separator or a
+/// stray `;;` does not yield a path that resolves to the current directory.
+///
+/// Free of any host dependency so the Windows shape stays testable on Linux.
+fn split_windows_path_list_text(value: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in value.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                entries.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    entries.push(current);
+    entries
+        .into_iter()
+        .map(|entry| entry.trim().to_owned())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Render one entry for a Windows path list, quoting it when it contains the
+/// `;` separator so that [`runtime_path_list_split`] can recover it whole.
+///
+/// A `"` in the entry goes out raw, where [`std::env::join_paths`] rejects the
+/// list outright. That rests on a precondition rather than on a check, so name
+/// it: `"` is reserved in a Windows path, and the splitter above consumes quotes
+/// rather than emitting them, so neither a path from disk nor an entry recovered
+/// from a list can hold one. Rejecting the character would trade that
+/// unreachable case for the failure this pair exists to avoid -- one bad entry
+/// costing the caller every entry.
+fn windows_path_list_entry_text(path: &Path) -> String {
+    let text = runtime_path_for_windows_child(path);
+    if text.contains(';') {
+        return format!("\"{text}\"");
+    }
+    text
 }
 
 pub fn runtime_path_list_join<I, P>(entries: I) -> Result<OsString>
@@ -339,7 +409,7 @@ where
     if runtime_is_windows() {
         let joined = entries
             .iter()
-            .map(|entry| runtime_path_for_windows_child(entry))
+            .map(|entry| windows_path_list_entry_text(entry))
             .collect::<Vec<_>>()
             .join(";");
         return Ok(OsString::from(joined));
@@ -415,16 +485,123 @@ pub fn runtime_drive_root_for_key(ch: char) -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
+/// Split a forward-slash path into the prefix that `..` must never climb past
+/// and the components that follow it.
+///
+/// An absolute path's root, a Windows drive, and a UNC share are all anchors:
+/// `/..` is `/` on every POSIX system, and no amount of `..` leaves `C:\`. A
+/// relative path has no anchor, so a leading `..` there is meaningful and is
+/// kept.
+fn split_runtime_path_anchor(value: &str, platform: RuntimePlatform) -> (&str, &str) {
+    // A drive letter and a UNC share are anchors only where they mean anything.
+    // On Linux `C:/x` is an ordinary relative name and `//etc` is just `/etc`,
+    // so reading either as a root would invent a path that is not there.
+    //
+    // The platform is a parameter rather than `runtime_is_windows()` so that the
+    // Windows side of a guard against recursive deletion can be tested from a
+    // Linux host, which is the only host this repository runs clippy and most
+    // of its unit tests on.
+    if platform.is_windows() {
+        if let Some(rest) = value.strip_prefix("//") {
+            // `//server/share/...`: the share itself is the anchor.
+            let share_end = rest
+                .match_indices('/')
+                .nth(1)
+                .map_or(rest.len(), |(index, _)| index);
+            let (anchor_tail, rest) = rest.split_at(share_end);
+            return (&value[..2 + anchor_tail.len()], rest);
+        }
+        let bytes = value.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let drive_end = if bytes.len() > 2 && bytes[2] == b'/' {
+                3
+            } else {
+                2
+            };
+            return value.split_at(drive_end);
+        }
+    }
+    if value.starts_with('/') {
+        return value.split_at(1);
+    }
+    ("", value)
+}
+
+/// Collapse `.`, `..`, repeated separators and a trailing separator, so that
+/// every spelling of one folder reduces to one string.
+///
+/// Purely lexical, and deliberately so: this feeds the comparisons that decide
+/// whether a folder may be recursively deleted, and those run against paths
+/// that often do not exist yet (or exist only in a registry entry), where
+/// `canonicalize` has nothing to resolve.
+///
+/// This is NOT symlink-safe, and the gap is not merely theoretical. Because
+/// [`runtime_install_root_is_protected`] exempts anything inside the user's
+/// home before it consults the protected-root list, a symlink the user owns is
+/// enough: with `$HOME/link -> /etc`, the path `$HOME/link/child` is lexically
+/// inside home, so the guard reports it removable while the kernel lands in
+/// `/etc`. Resolving lexically is strictly better than the raw-text comparison
+/// it replaces — it closes every *spelling* of a protected path — but it does
+/// not close that hole, and closing it needs a decision about canonicalizing
+/// the part of the path that does exist, which is a separate change.
+fn lexically_resolved_runtime_path_text(value: &str, platform: RuntimePlatform) -> String {
+    let (anchor, rest) = split_runtime_path_anchor(value, platform);
+    let anchored = !anchor.is_empty();
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => match parts.last() {
+                // A relative path keeps the `..` it cannot resolve: `../a` names
+                // a real place, just not one this function can name differently.
+                None if !anchored => parts.push(".."),
+                Some(&"..") => parts.push(".."),
+                // Anchored and already at the top: `/..` is `/`.
+                None => {}
+                Some(_) => {
+                    parts.pop();
+                }
+            },
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    if anchored {
+        format!("{}{joined}", anchor.trim_end_matches('/').to_owned() + "/")
+    } else if joined.is_empty() {
+        ".".to_owned()
+    } else {
+        joined
+    }
+}
+
+/// Reduce a path to the single text that names its folder, whatever spelling it
+/// arrived in.
+fn comparable_runtime_path_text(path: &Path, platform: RuntimePlatform) -> String {
+    let text = normalize_runtime_path_text_for_platform(&path.display().to_string(), platform);
+    // Folding `\` to `/` is a WINDOWS rule and must stay gated on the platform.
+    // Off Windows a backslash is an ordinary filename byte, so a directory
+    // genuinely named `..\tmp` inside `/usr` would otherwise be rewritten to
+    // `/usr/../tmp` and the `..` resolution below would walk it straight out of
+    // the protected root — turning a guard into a bypass. Raw-text comparison
+    // tolerated the unconditional fold because equality never *removed*
+    // components; resolving `..` does.
+    let text = if platform.is_windows() {
+        text.replace('\\', "/")
+    } else {
+        text
+    };
+    lexically_resolved_runtime_path_text(&text, platform)
+}
+
 pub fn runtime_paths_equivalent(left: &Path, right: &Path) -> bool {
-    let left = normalize_runtime_path_for_host(left)
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    let right = normalize_runtime_path_for_host(right)
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    if runtime_is_windows() {
+    runtime_paths_equivalent_on(left, right, RuntimePlatform::current())
+}
+
+fn runtime_paths_equivalent_on(left: &Path, right: &Path, platform: RuntimePlatform) -> bool {
+    let left = comparable_runtime_path_text(left, platform);
+    let right = comparable_runtime_path_text(right, platform);
+    if platform.is_windows() {
         left.eq_ignore_ascii_case(&right)
     } else {
         left == right
@@ -432,14 +609,27 @@ pub fn runtime_paths_equivalent(left: &Path, right: &Path) -> bool {
 }
 
 pub fn runtime_path_is_same_or_inside(path: &Path, base: &Path) -> bool {
-    let path = normalize_runtime_path_for_host(path);
-    let base = normalize_runtime_path_for_host(base);
-    if runtime_paths_equivalent(&path, &base) {
-        return true;
+    runtime_path_is_same_or_inside_on(path, base, RuntimePlatform::current())
+}
+
+fn runtime_path_is_same_or_inside_on(path: &Path, base: &Path, platform: RuntimePlatform) -> bool {
+    // Compared after resolution rather than by walking `Path::ancestors`, which
+    // treats `..` as an ordinary component and so counts a path that climbs
+    // back OUT of `base` as still inside it.
+    let path = comparable_runtime_path_text(path, platform);
+    let base = comparable_runtime_path_text(base, platform);
+    let inside_prefix = format!("{}/", base.trim_end_matches('/'));
+    if path.len() <= inside_prefix.len() {
+        return runtime_paths_equivalent_on(Path::new(&path), Path::new(&base), platform);
     }
-    path.ancestors()
-        .skip(1)
-        .any(|ancestor| runtime_paths_equivalent(ancestor, &base))
+    // Compared as bytes: a path may hold any UTF-8, and slicing a `str` at a
+    // byte offset that lands mid-character panics.
+    let head = &path.as_bytes()[..inside_prefix.len()];
+    if platform.is_windows() {
+        head.eq_ignore_ascii_case(inside_prefix.as_bytes())
+    } else {
+        head == inside_prefix.as_bytes()
+    }
 }
 
 const MANAGED_RUNTIME_FORMATS: [&str; 2] = ["wheel", "tarball"];
@@ -1134,5 +1324,489 @@ mod tests {
         assert_eq!(resolved, path_binary);
         fs::remove_dir_all(root).ok();
         Ok(())
+    }
+
+    /// The Windows path-list tests below drive the text helpers directly rather
+    /// than `runtime_path_list_split`, which takes the `std::env::split_paths`
+    /// branch on a Linux host. The helpers carry the whole Windows shape and no
+    /// host dependency, so the behaviour is pinned on every lane; what a Windows
+    /// lane adds is that `runtime_path_list_split` really routes into them.
+    #[test]
+    fn a_quoted_windows_path_entry_survives_the_separator_inside_it() {
+        // `c:\some;dir` is a legal Windows path, so a list carrying one quotes
+        // it. Splitting on every `;` would tear it in two and invent a `dir`
+        // entry relative to wherever the child happens to start.
+        assert_eq!(
+            split_windows_path_list_text(r#"C:\rocm\bin;"C:\some;dir";C:\windows"#),
+            vec![
+                r"C:\rocm\bin".to_owned(),
+                r"C:\some;dir".to_owned(),
+                r"C:\windows".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn splitting_a_windows_path_list_strips_the_quotes_it_split_on() {
+        // The regression this guards: quotes left in an entry make
+        // `std::env::join_paths` fail on Windows, and the caller composing a
+        // loader path then loses every entry rather than the one bad one.
+        let entries = split_windows_path_list_text(r#""C:\quoted\bin";C:\plain\bin"#);
+        assert_eq!(
+            entries,
+            vec![r"C:\quoted\bin".to_owned(), r"C:\plain\bin".to_owned()]
+        );
+        assert!(
+            entries.iter().all(|entry| !entry.contains('"')),
+            "a quote reaching join_paths costs the caller the whole list: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn splitting_a_windows_path_list_trims_and_drops_empty_entries() {
+        // A trailing separator or a stray `;;` must not yield an entry that
+        // resolves against the child's current directory.
+        assert_eq!(
+            split_windows_path_list_text(r"C:\rocm\bin; ;;  C:\windows  ;"),
+            vec![r"C:\rocm\bin".to_owned(), r"C:\windows".to_owned()]
+        );
+    }
+
+    #[test]
+    fn joining_a_windows_path_list_requotes_an_entry_holding_the_separator() {
+        // The other half of the same rule: an entry that goes out unquoted comes
+        // back as two, so join has to restore what split consumed.
+        assert_eq!(
+            windows_path_list_entry_text(Path::new(r"C:\some;dir")),
+            r#""C:\some;dir""#
+        );
+        assert_eq!(
+            windows_path_list_entry_text(Path::new(r"C:\rocm\bin")),
+            r"C:\rocm\bin",
+            "an ordinary entry must not gain quotes it never had"
+        );
+    }
+
+    #[test]
+    fn a_windows_path_list_round_trips_through_split_and_join() {
+        let entries = [r"C:\rocm\bin", r"C:\some;dir", r"C:\windows"];
+        let joined = entries
+            .iter()
+            .map(|entry| windows_path_list_entry_text(Path::new(entry)))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        assert_eq!(split_windows_path_list_text(&joined), entries.to_vec());
+    }
+
+    /// The Windows side of the same comparisons, exercised from whatever host
+    /// runs the tests. `runtime_is_windows()` is decided at compile time, so
+    /// without a platform parameter this branch would be checked only by the
+    /// one CI lane that runs on Windows — and it is the branch that decides
+    /// whether `C:\Windows` may be recursively deleted.
+    #[test]
+    fn windows_containment_sees_through_spelling_and_case() {
+        let windows = RuntimePlatform::Windows;
+        let system_root = Path::new("C:/Windows");
+
+        for inside in [
+            r"C:\Windows",
+            "C:/Windows/",
+            "c:/windows",
+            "C:/Windows/./System32",
+            "C:/Program Files/../Windows/System32",
+            "C:/Windows//System32",
+        ] {
+            assert!(
+                runtime_path_is_same_or_inside_on(Path::new(inside), system_root, windows),
+                "{inside} names C:/Windows or something under it"
+            );
+        }
+
+        for outside in [
+            "C:/Users/dev/.rocm",
+            "C:/Windows/../Users/dev",
+            "C:/WindowsApps",
+            "D:/Windows",
+        ] {
+            assert!(
+                !runtime_path_is_same_or_inside_on(Path::new(outside), system_root, windows),
+                "{outside} is not inside C:/Windows"
+            );
+        }
+
+        // A drive is an anchor: `..` can never climb off it onto another one.
+        // (The resolver is handed forward slashes; the conversion happens in
+        // `comparable_runtime_path_text`, which the assertions above go through.)
+        assert_eq!(
+            lexically_resolved_runtime_path_text("C:/../../Windows", windows),
+            "C:/Windows"
+        );
+        // A UNC share is an anchor too.
+        assert_eq!(
+            lexically_resolved_runtime_path_text("//server/share/../../rocm", windows),
+            "//server/share/rocm"
+        );
+    }
+
+    /// The same text means different things on the two platforms, so the
+    /// resolution must not borrow Windows' reading on Linux: `//etc` is `/etc`
+    /// there, and `C:/x` is an ordinary relative name, not a drive.
+    #[test]
+    fn linux_resolution_does_not_borrow_windows_anchors() {
+        let linux = RuntimePlatform::Linux;
+
+        assert_eq!(lexically_resolved_runtime_path_text("//etc", linux), "/etc");
+        assert_eq!(
+            lexically_resolved_runtime_path_text("/etc/./../etc/", linux),
+            "/etc"
+        );
+        // `/..` is `/` on every POSIX system.
+        assert_eq!(lexically_resolved_runtime_path_text("/../..", linux), "/");
+        // Relative: a leading `..` names a real place this cannot rename.
+        assert_eq!(
+            lexically_resolved_runtime_path_text("../a/../b", linux),
+            "../b"
+        );
+        assert_eq!(lexically_resolved_runtime_path_text("a/..", linux), ".");
+        assert_eq!(
+            lexically_resolved_runtime_path_text("C:/x", linux),
+            "C:/x",
+            "a drive letter is not a root on Linux"
+        );
+    }
+
+    /// `windows_containment_sees_through_spelling_and_case` above exercises the
+    /// Windows path-resolution rules from a Linux host, but only through the
+    /// platform-parameterised helpers. The public gate itself,
+    /// [`runtime_install_root_is_protected`], still decides which protected-root
+    /// list to consult by reading [`runtime_is_windows()`] — a compile-time
+    /// answer — so its Windows arm is reachable only when this binary is
+    /// actually running on Windows. Not `#[cfg(unix)]`-gated, so it compiles
+    /// and runs on every lane: it follows the same `cfg!(windows)`-at-runtime
+    /// shape `ensure_runtime_install_root_rejects_protected_system_path` (in
+    /// `apps/rocm`) already uses to pick host-appropriate fixtures, so a lane
+    /// that is not Windows still exercises the gate end-to-end against the
+    /// Unix answer it already owns.
+    #[test]
+    fn the_public_gate_refuses_every_spelling_of_a_protected_root_on_its_own_host() {
+        let spellings: Vec<PathBuf> = if cfg!(windows) {
+            vec![
+                PathBuf::from("C:/Windows/"),            // trailing separator
+                PathBuf::from("c:/windows"),             // mixed case
+                PathBuf::from("C:/Windows//System32"),   // doubled separator
+                PathBuf::from("C:/Program Files//"),     // doubled separator
+                PathBuf::from("C:/PROGRAM FILES (X86)"), // mixed case
+            ]
+        } else {
+            vec![PathBuf::from("/etc/"), PathBuf::from("//etc")]
+        };
+
+        let accepted: Vec<String> = spellings
+            .into_iter()
+            .filter(|path| !runtime_install_root_is_protected(path))
+            .map(|path| path.display().to_string())
+            .collect();
+
+        assert!(accepted.is_empty(), "accepted as removable: {accepted:?}");
+    }
+
+    // ── Properties: the recursive-delete guard ─────────────────────
+    //
+    // `runtime_install_root_is_protected` is the single source of truth for
+    // "may ROCm CLI `remove_dir_all` this folder?". Everything below states a
+    // contract it must satisfy for EVERY spelling of a path, because the whole
+    // point of the guard is that it is handed a path somebody (or something)
+    // else wrote down — a registry entry, an `--prefix` argument, a tool call
+    // from the local assistant. Such a path is text, and text has many
+    // spellings for one folder.
+    //
+    // Unix-only: the protected-root list the guard consults is the Unix one,
+    // and `runtime_is_windows()` is decided at compile time, so the Windows
+    // branch cannot be exercised from here. All pure and in-process.
+    #[cfg(unix)]
+    mod delete_guard_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The Unix roots `runtime_install_root_is_protected` refuses, restated
+        /// here so a property compares the guard against the policy rather than
+        /// against itself.
+        const PROTECTED_ROOTS: [&str; 13] = [
+            "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/opt", "/proc", "/root", "/sbin",
+            "/sys", "/usr", "/var",
+        ];
+
+        /// Resolve `.`, `..`, repeated and trailing separators lexically — what
+        /// `realpath --no-symlinks`, every shell, and `Path::components` on
+        /// Windows all do, and what the kernel does for a path with no symlinks
+        /// in it.
+        ///
+        /// This is the reference the guard is measured against, and it is
+        /// derived from POSIX semantics rather than from the implementation on
+        /// purpose: an oracle restated from the code under test shares that
+        /// code's mistakes and proves nothing. Keep it that way — note it does
+        /// NOT treat `\` specially, which is exactly what catches an
+        /// unconditional backslash fold leaking into `..` resolution.
+        ///
+        /// It says nothing about symlinks. The guard is not symlink-safe (see
+        /// `lexically_resolved_runtime_path_text`); this reference only pins
+        /// that every *spelling* of one folder resolves alike.
+        ///
+        /// Absolute input only: every generator seed in this module
+        /// (`PROTECTED_ROOTS`, `prefix()`, `home_text()`) is already rooted at
+        /// `/`, so a relative path never reaches this oracle today. That is a
+        /// property of the generators, not of this function's logic, so it is
+        /// asserted rather than merely assumed — a generator change that starts
+        /// seeding relative text would otherwise desync the oracle from
+        /// `runtime_install_root_is_protected` (which does handle relative
+        /// paths) without a single property failing to say so.
+        fn lexically_resolved(path: &str) -> String {
+            assert!(
+                path.starts_with('/'),
+                "lexically_resolved is a POSIX-absolute-path oracle; got relative input {path:?}"
+            );
+            let mut parts: Vec<&str> = Vec::new();
+            for part in path.split('/') {
+                match part {
+                    "" | "." => {}
+                    // POSIX: `/..` is `/`, so popping an empty stack is a no-op.
+                    ".." => {
+                        parts.pop();
+                    }
+                    other => parts.push(other),
+                }
+            }
+            format!("/{}", parts.join("/"))
+        }
+
+        /// Does `path` really name `base` or something under it, once both are
+        /// resolved?
+        fn lexically_same_or_inside(path: &str, base: &str) -> bool {
+            let path = lexically_resolved(path);
+            let base = lexically_resolved(base);
+            path == base || path.starts_with(&format!("{}/", base.trim_end_matches('/')))
+        }
+
+        /// Does `path` really resolve to a protected system location?
+        fn lexically_protected(path: &str) -> bool {
+            let resolved = lexically_resolved(path);
+            resolved == "/"
+                || PROTECTED_ROOTS
+                    .iter()
+                    .any(|root| lexically_same_or_inside(&resolved, root))
+        }
+
+        fn home_text() -> Option<String> {
+            runtime_home_dir().map(|home| home.display().to_string())
+        }
+
+        /// The guard deliberately exempts anything STRICTLY inside the user's
+        /// own home directory, so a user install under `~/.rocm` stays
+        /// removable even when home itself sits under a protected root (`/root`
+        /// for a root user). A property about protection has to grant the same
+        /// exemption, or it would just be re-litigating that decision.
+        fn exempt_as_user_owned(path: &str) -> bool {
+            home_text().is_some_and(|home| {
+                lexically_same_or_inside(path, &home)
+                    && lexically_resolved(path) != lexically_resolved(&home)
+            })
+        }
+
+        /// The spellings [`a_protected_location_is_refused_however_it_is_spelled`]
+        /// shrank to, pinned as examples so each stays named even if the
+        /// generator is retuned. Every one of these names `/etc` (or `/`), and
+        /// every one of them is a plausible way for a path to be written down
+        /// by hand, assembled by a script, or produced by joining.
+        #[test]
+        fn the_delete_guard_refuses_every_spelling_of_a_protected_root() {
+            let home = runtime_home_dir().expect("a home directory");
+            let home = home.display().to_string();
+            let spellings = [
+                "/etc".to_owned(),
+                "/etc/".to_owned(),
+                "//etc".to_owned(),
+                "/./etc".to_owned(),
+                "/etc/.".to_owned(),
+                "/etc//".to_owned(),
+                "/usr/../etc".to_owned(),
+                "/etc/..".to_owned(),
+                format!("{home}/../../etc"),
+                format!("{home}/.rocm/../../../etc"),
+            ];
+            let reported: Vec<(String, bool)> = spellings
+                .into_iter()
+                .map(|text| {
+                    let protected = runtime_install_root_is_protected(Path::new(&text));
+                    (text, protected)
+                })
+                .collect();
+            let removable: Vec<&str> = reported
+                .iter()
+                .filter(|(_, protected)| !protected)
+                .map(|(text, _)| text.as_str())
+                .collect();
+
+            assert!(
+                removable.is_empty(),
+                "reported removable: {removable:?}, full result: {reported:?}"
+            );
+        }
+
+        /// A naive generator is worthless here. Drawing arbitrary strings would
+        /// spend every draw on paths that resolve nowhere near a protected
+        /// root, and would pass against a guard that is wide open. So the
+        /// alphabet is tiny and entirely made of the components that matter:
+        /// `..` and `.` (the ones nothing in the guard resolves), the empty
+        /// string (which produces a doubled separator once joined), and the
+        /// names of real protected roots.
+        fn component() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                6 => Just(".."),
+                3 => Just("."),
+                2 => Just(""),
+                3 => Just("etc"),
+                2 => Just("usr"),
+                2 => Just("rocm"),
+                2 => Just("runtimes"),
+                // Off Windows a backslash is an ordinary filename byte, so this
+                // is ONE legitimate directory name, not two components. It is in
+                // the alphabet because folding `\` to `/` unconditionally and
+                // then resolving `..` silently walks out of a protected root;
+                // without this component every property below still passes.
+                2 => Just(r"..\tmp"),
+                // The leaf names a real managed `install_root` ends in, so the
+                // generated paths look like the ones the guard actually sees.
+                2 => Just("wheel"),
+                2 => Just("tarball"),
+            ]
+        }
+
+        /// Seeded with the places a real `install_root` is written down: the
+        /// protected roots themselves, the user's home, and an ordinary
+        /// unprotected folder.
+        fn prefix() -> impl Strategy<Value = String> {
+            let mut seeds: Vec<String> = PROTECTED_ROOTS
+                .iter()
+                .map(|&root| root.to_owned())
+                .collect();
+            seeds.push("/".to_owned());
+            seeds.push("/tmp".to_owned());
+            seeds.push("/home".to_owned());
+            if let Some(home) = home_text() {
+                seeds.push(format!("{home}/.rocm"));
+                seeds.push(home);
+            }
+            proptest::sample::select(seeds)
+        }
+
+        /// Paths rooted at the user's own home, so the exemption that keeps
+        /// `~/.rocm/...` removable is sampled densely instead of being drowned
+        /// out by the thirteen protected prefixes.
+        fn user_owned_text() -> impl Strategy<Value = String> {
+            let home = home_text().unwrap_or_else(|| "/home/rocm".to_owned());
+            let seeds = vec![
+                home.clone(),
+                format!("{home}/.rocm"),
+                format!("{home}/.rocm/data"),
+            ];
+            path_text(proptest::sample::select(seeds))
+        }
+
+        /// A path is text, and the guard must answer for the folder that text
+        /// names, not for the characters it happens to be spelled with.
+        fn install_root_text() -> impl Strategy<Value = String> {
+            path_text(prefix())
+        }
+
+        fn path_text(prefix: impl Strategy<Value = String>) -> impl Strategy<Value = String> {
+            (
+                prefix,
+                proptest::collection::vec(component(), 0..4),
+                prop_oneof![4 => Just(""), 2 => Just("/"), 1 => Just("/."), 1 => Just("/..")],
+            )
+                .prop_map(|(prefix, parts, trailing)| {
+                    let mut text = prefix;
+                    for part in parts {
+                        text.push('/');
+                        text.push_str(part);
+                    }
+                    text.push_str(trailing);
+                    text
+                })
+        }
+
+        proptest::proptest! {
+            /// The contract the guard exists for: no path that really resolves
+            /// into a protected system location may be reported removable,
+            /// however it is spelled. A counterexample here is `remove_dir_all`
+            /// on a system directory.
+            #[test]
+            fn a_protected_location_is_refused_however_it_is_spelled(
+                text in install_root_text(),
+            ) {
+                prop_assume!(!exempt_as_user_owned(&text));
+                prop_assume!(lexically_protected(&text));
+
+                prop_assert!(
+                    runtime_install_root_is_protected(Path::new(&text)),
+                    "{text} resolves to {} but was reported removable",
+                    lexically_resolved(&text)
+                );
+            }
+
+            /// The guard must not swing the other way either: a folder that
+            /// really is the user's own stays removable, or `runtimes uninstall`
+            /// refuses the very folder it created.
+            #[test]
+            fn a_user_owned_location_stays_removable(text in user_owned_text()) {
+                // Strictly-inside-home is the whole contract: the exemption is
+                // unconditional, so this must hold even when home itself sits
+                // under a protected root (`/root` for a root user). Filtering
+                // those draws out with `!lexically_protected` would both assume
+                // away the interesting case AND reject every draw on such a
+                // host, which proptest reports as a hard abort rather than a
+                // skip.
+                prop_assume!(exempt_as_user_owned(&text));
+
+                prop_assert!(
+                    !runtime_install_root_is_protected(Path::new(&text)),
+                    "{text} resolves to {} but was refused",
+                    lexically_resolved(&text)
+                );
+            }
+
+            /// Containment is what both the home exemption and the protected
+            /// -root check are built out of, so it has to agree with where the
+            /// paths actually resolve — in both directions. Answering "inside"
+            /// for a path that escaped lets a caller out of the guard;
+            /// answering "outside" for one that did not hides a protected root.
+            #[test]
+            fn containment_agrees_with_where_the_paths_resolve(
+                path in install_root_text(),
+                base in prefix(),
+            ) {
+                prop_assert_eq!(
+                    runtime_path_is_same_or_inside(Path::new(&path), Path::new(&base)),
+                    lexically_same_or_inside(&path, &base),
+                    "containment of {} in {} disagrees with {} in {}",
+                    path.clone(),
+                    base.clone(),
+                    lexically_resolved(&path),
+                    lexically_resolved(&base)
+                );
+            }
+
+            /// Two spellings of one folder are one folder.
+            #[test]
+            fn equivalence_sees_through_spelling(text in install_root_text()) {
+                let resolved = lexically_resolved(&text);
+                prop_assert!(
+                    runtime_paths_equivalent(Path::new(&text), Path::new(&resolved)),
+                    "{text} and {resolved} name the same folder but compared unequal"
+                );
+            }
+
+        }
     }
 }
