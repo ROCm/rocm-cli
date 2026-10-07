@@ -26,9 +26,13 @@
 //!   than the specific constant) would let a wrong/tampered constant pass whenever
 //!   the canonical body appears anywhere else in the file — e.g. in the `NEXT` slot
 //!   mid-rotation or a stale comment.
-//! - **CI cross-check.** When `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` is set (as in
-//!   release/nightly CI), it must equal the canonical *current* release key, so the
-//!   key CI verifies against is exactly the one users pin.
+//! - **CI cross-check.** When a CI signing public key is configured — the file
+//!   named by `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else the inline
+//!   `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` release/nightly CI wires from the secret —
+//!   it must equal the canonical *current* release key, so the key CI verifies
+//!   against is exactly the one users pin. Both sources are resolved in the same
+//!   order `scripts/release_readiness.py` uses, so the key cross-checked here is
+//!   always the key that gate verified with.
 
 use std::path::{Path, PathBuf};
 
@@ -190,9 +194,9 @@ fn extract_constant<'a>(source: &'a str, token: &str, embedding: Embedding) -> O
 }
 
 /// Check every populated canonical key against its pinned sources. `ci_public_key`
-/// is the inline PEM CI would verify against (from `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`)
-/// or `None`; it is passed in rather than read here so tests need not mutate the
-/// process environment.
+/// is the PEM text CI would verify against, already resolved by
+/// [`resolve_ci_public_key`] from either key source, or `None`; it is passed in
+/// rather than read here so tests need not mutate the process environment.
 fn check_pinned_keys(root: &Path, ci_public_key: Option<&str>) -> Result<Vec<String>> {
     let mut messages = Vec::new();
     let mut current_release_body: Option<String> = None;
@@ -294,6 +298,38 @@ fn check_ci_public_key(
     ])
 }
 
+/// Resolve the CI signing public key the way `scripts/release_readiness.py`'s
+/// `resolve_signing_key` does: the file named by `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`
+/// first, then the inline `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`.
+///
+/// Reading only the PEM would make the cross-check skip silently whenever the key
+/// was supplied by path, while the readiness gate verified release artifacts
+/// against that very key — a trust root nobody compared with `docs/keys/`, and
+/// reported in the log as "not configured".
+///
+/// A named path that cannot be read is an error, not a fall-through to the PEM:
+/// cross-checking a different key than the operator named is the failure this
+/// check exists to catch. Blank counts as absent, because an unset GitHub secret
+/// expands to the empty string.
+fn resolve_ci_public_key(path_var: Option<&str>, pem_var: Option<&str>) -> Result<Option<String>> {
+    if let Some(path) = path_var.filter(|value| !value.trim().is_empty()) {
+        // The raw value rather than a trimmed one, so this and
+        // `release_readiness.py` always mean the same file.
+        let path = Path::new(path);
+        let pem = std::fs::read_to_string(path).with_context(|| {
+            format!(
+                "failed to read the CI signing public key named by \
+                 ROCM_CLI_SIGNING_PUBLIC_KEY_PATH: {}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(pem));
+    }
+    Ok(pem_var
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned))
+}
+
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is the `xtask/` crate dir; its parent is the repo root,
     // so this is correct regardless of the working directory CI invokes us from.
@@ -304,7 +340,9 @@ fn repo_root() -> PathBuf {
 }
 
 pub fn run() -> Result<()> {
-    let ci_public_key = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM").ok();
+    let path_var = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH").ok();
+    let pem_var = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM").ok();
+    let ci_public_key = resolve_ci_public_key(path_var.as_deref(), pem_var.as_deref())?;
     for message in check_pinned_keys(&repo_root(), ci_public_key.as_deref())? {
         println!("pinned key check: {message}");
     }
@@ -411,5 +449,61 @@ mod tests {
 
         // Malformed CI key -> rejected.
         assert!(check_ci_public_key(Some("not a pem"), Some(&current)).is_err());
+    }
+
+    /// The cross-check must see a key supplied by path, not just the inline PEM.
+    ///
+    /// `release_readiness.py` prefers `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` and
+    /// verifies artifacts against it. Resolving only the PEM here meant that key
+    /// was never compared with `docs/keys/`, and the run still logged
+    /// "not configured — cross-check skipped" while a key was in use.
+    #[test]
+    fn ci_public_key_resolves_the_path_variable_before_the_inline_pem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = dir.path().join("ci-public-key.pem");
+        std::fs::write(&key_file, SAMPLE).expect("write key");
+        let named = key_file.to_str().expect("utf-8 path");
+        let other = SAMPLE.replace("test", "diff");
+
+        // Path wins over the PEM, so the key cross-checked is the key verified with.
+        let resolved = resolve_ci_public_key(Some(named), Some(&other))
+            .expect("readable key")
+            .expect("a key");
+        assert_eq!(pem_body(&resolved).unwrap(), pem_body(SAMPLE).unwrap());
+
+        // ...and that resolved key is what reaches the comparison: a path key that
+        // disagrees with the canonical one must fail rather than skip.
+        let canonical = pem_body(&other).unwrap();
+        assert!(check_ci_public_key(Some(&resolved), Some(&canonical)).is_err());
+
+        // The PEM is still used when no path is named.
+        let from_pem = resolve_ci_public_key(None, Some(SAMPLE))
+            .expect("inline pem")
+            .expect("a key");
+        assert_eq!(from_pem, SAMPLE);
+
+        // Blank counts as absent on both, which is the shape of an unset secret.
+        for blank in [None, Some(""), Some("   ")] {
+            assert!(
+                resolve_ci_public_key(blank, blank)
+                    .expect("no key")
+                    .is_none(),
+                "blank {blank:?} should resolve to no key"
+            );
+        }
+        assert_eq!(
+            resolve_ci_public_key(Some("  "), Some(SAMPLE))
+                .expect("falls through to pem")
+                .as_deref(),
+            Some(SAMPLE)
+        );
+
+        // A named key that cannot be read is an error, never a quiet fall-through
+        // to a different key than the operator named.
+        let missing = dir.path().join("absent.pem");
+        assert!(
+            resolve_ci_public_key(missing.to_str(), Some(SAMPLE)).is_err(),
+            "an unreadable named key must fail rather than fall back to the PEM"
+        );
     }
 }
