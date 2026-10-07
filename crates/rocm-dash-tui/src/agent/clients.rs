@@ -1151,6 +1151,89 @@ mod tests {
         }
     }
 
+    /// Offline (no network) coverage for `run_agent_request` itself — the
+    /// helper `MockAgentClient`-backed tests above never reach, since
+    /// `MockAgentClient::complete` is independent mock logic that bypasses it
+    /// entirely. Drives it through rig-core's `test_utils::MockCompletionModel`
+    /// instead of a real provider.
+    ///
+    /// Scripts more tool-call turns than [`MAX_TOOL_TURNS`] so the agent loop
+    /// can never produce a final answer and must exhaust the turn limit —
+    /// that's what forces every registered tool set through `run_agent_request`
+    /// onto the wire (the model only ever sees tool definitions on the request
+    /// it's given) and pins `run_agent_request`'s `.max_turns(MAX_TOOL_TURNS)`
+    /// call, both of which no ignored round-trip test and no `MockAgentClient`
+    /// test exercises.
+    #[tokio::test]
+    async fn run_agent_request_registers_tool_sets_and_enforces_turn_limit() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        let turns: Vec<MockTurn> = (0..MAX_TOOL_TURNS + 2)
+            .map(|i| MockTurn::tool_call(format!("call_{i}"), "gpu_status", json!({})))
+            .collect();
+        let model = MockCompletionModel::new(turns);
+        let recorded = model.clone();
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+
+        let params = InferenceParams::default();
+        let history = [ChatTurn::user("loop forever")];
+        let Some((last, prior)) = history.split_last() else {
+            unreachable!("history is non-empty");
+        };
+
+        let err = run_agent_request(
+            agent,
+            &params,
+            None,
+            None,
+            &last.content,
+            prior,
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect_err("a tool-call-only script must exhaust the turn limit");
+        let AgentError::Request(msg) = err else {
+            panic!("expected AgentError::Request wrapping rig's MaxTurnsError, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!("limit: {MAX_TOOL_TURNS}")),
+            "error should name the configured turn limit, got: {msg}"
+        );
+
+        // The model actually received the registered tool definitions on the
+        // wire — proves run_agent_request's three register_* calls ran, not
+        // just that they type-check.
+        let requests = recorded.requests();
+        let sent_tool_names: std::collections::BTreeSet<&str> = requests
+            .first()
+            .expect("at least one request was sent before the turn limit was hit")
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        for expected in SKILL_NAMES
+            .iter()
+            .chain(ROCM_READ_TOOL_NAMES.iter())
+            .chain(ROCM_MUTATING_TOOL_NAMES.iter())
+        {
+            assert!(
+                sent_tool_names.contains(expected),
+                "registered tool {expected} missing from the wire request"
+            );
+        }
+
+        // Sanity bound on the request count: enough to have tried every
+        // scripted turn up to the limit, not an early bail-out or a runaway
+        // loop. Not pinned to rig-core's exact internal +1/-1 boundary, which
+        // this test does not mean to assert.
+        assert!(
+            (MAX_TOOL_TURNS..=MAX_TOOL_TURNS + 2).contains(&recorded.request_count()),
+            "expected roughly MAX_TOOL_TURNS requests, got {}",
+            recorded.request_count()
+        );
+    }
+
     /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
     /// a real key). Run with:
     /// `ANTHROPIC_API_KEY=… cargo test -p rocm-dash-tui --lib anthropic_round_trip -- --ignored --nocapture`

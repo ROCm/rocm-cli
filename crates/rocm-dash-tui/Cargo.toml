@@ -66,3 +66,10 @@ libc.workspace = true
 # feature enters the lockfile. Test-only, so it adds nothing to any shipped
 # binary.
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Same rig-core as [dependencies], with its `test-utils` feature (gives
+# `MockCompletionModel`/`MockTurn`) added for test builds only. Cargo unifies
+# features for one crate across [dependencies]/[dev-dependencies] per build
+# unit, so this does not enable test-utils in the shipped binary.
+rig = { package = "rig-core", version = "=0.38.1", default-features = false, features = [
+    "test-utils",
+] }
