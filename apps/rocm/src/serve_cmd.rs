@@ -6,15 +6,23 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
-//! re-imported via `use crate::serve_cmd::{serve, ServeArgs};`). `Cli`
-//! remains at the crate root, as does `DevicePolicyArg` (part of the clap
-//! arg tree). The managed-service-spawning tail (`start_managed_service`,
-//! `run_attached_service`, `spawn_managed_engine_child`) stays in `main.rs`,
-//! re-imported here — not because anything outside this cluster calls it
-//! (it doesn't), but because it is entangled with other still-crate-root
+//! re-imported via `use crate::serve_cmd::{serve, ServeArgs};`). `Cli` is not
+//! referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
+//! is, via `use crate::DevicePolicyArg`.
+//!
+//! Several `serve()`-only helpers stay in `main.rs` and are re-imported here
+//! rather than moving, for two different reasons. The managed-service-
+//! spawning tail (`start_managed_service`, `run_attached_service`,
+//! `spawn_managed_engine_child`) is entangled with other still-crate-root
 //! launch helpers (`stream_attached_logs`, `record_cli_audit_event`, and
-//! friends) that have not been relocated yet. Moving the spawning tail alone
-//! would just relocate the `use` statements, not reduce the coupling.
+//! friends) that have not been relocated yet, so moving it alone would just
+//! relocate the `use` statements, not reduce the coupling. `collect_serve_notes`,
+//! `validate_bind_host`, `resolve_endpoint_auth`,
+//! `ensure_public_bind_engine_supported`, `validate_pinned_gpu_index`, and
+//! `print_managed_launch_plain` have no such entanglement and no non-test
+//! caller left in `main.rs` — they stayed to keep this extraction a minimal,
+//! easy-to-review diff rather than a mixed move-and-reshuffle pass; a later
+//! pass can relocate them along with their test module.
 
 use std::fmt::Write as _;
 

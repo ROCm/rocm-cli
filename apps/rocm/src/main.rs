@@ -24,10 +24,11 @@ mod therock;
 mod uninstall;
 
 // Per-command handlers mechanically relocated into modules — fns, plus the
-// types (e.g. `ServeArgs`, driver-plan types) and command-local selection
-// types (e.g. `select_serve_engine`) that moved with their cluster.
+// types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
-// mergeability).
+// mergeability); the exception is `select_serve_engine` (a fn, not a type),
+// re-imported because `assess_model_for_host` calls it directly, not because
+// dispatch needs it.
 use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{

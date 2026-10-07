@@ -8,8 +8,8 @@
 //! `install()` dispatcher's call sites stay byte-identical
 //! (`install_driver(...)`/`reconcile_driver_install(...)`, re-imported via
 //! `use crate::driver_install::{install_driver, reconcile_driver_install};`).
-//! `InstallTarget`/`Cli` remain in the crate root and are reached through
-//! `crate::`. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
+//! `InstallTarget`/`Cli` remain in the crate root; neither is referenced
+//! from this file. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
 //! private types (`DriverInstallPlan` and friends) used nowhere else, so
 //! those moved here too rather than staying in `main.rs`.
 

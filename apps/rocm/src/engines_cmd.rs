@@ -6,10 +6,12 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`engines(command)`,
-//! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`/`Cli`
-//! remain in the crate root. Several env-root/runtime helpers here are also
-//! called from `serve_cmd.rs` and from other root-level commands, so they
-//! stay `pub(crate)` rather than private.
+//! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
+//! remains in the crate root and is reached via `use crate::EnginesCommand`;
+//! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
+//! also called from `serve_cmd.rs`; the other env-root/runtime helpers here
+//! are used only from other root-level commands in `main.rs` — all stay
+//! `pub(crate)` rather than private either way.
 
 use std::fs;
 use std::path::{Path, PathBuf};
