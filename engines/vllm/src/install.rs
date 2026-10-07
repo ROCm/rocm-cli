@@ -2265,4 +2265,86 @@ exit 0
 
         Ok(())
     }
+    /// Pins the ordering fix directly: the trio realign (torch/torchvision/
+    /// torchaudio `--no-deps`) must run before `uv pip freeze` is even
+    /// invoked, so a freeze failure aborts only the device-plugin lookup that
+    /// follows it, never the realign itself. Reverting the ordering (freeze
+    /// before realign) would leave only 2 real installs here instead of 3.
+    #[test]
+    #[cfg(unix)]
+    fn install_vllm_rocm10_discover_realigns_the_trio_even_if_pip_freeze_fails() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv-calls.log");
+
+        let python = root.path().join("python");
+        std::fs::write(&python, "#!/bin/sh\necho cp314\n")?;
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))?;
+
+        let uv = root.path().join("uv");
+        std::fs::write(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    echo " + ${{pkg}}==9.9.9" >&2
+    ;;
+  *"pip freeze"*)
+    echo "simulated uv pip freeze failure" >&2
+    exit 1
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))?;
+
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let err = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)
+            .expect_err("a pip freeze failure must surface, not silently succeed");
+        assert!(
+            format!("{err:#}").contains("pip freeze"),
+            "error should name the step that failed: {err:#}"
+        );
+
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
+            .lines()
+            .map(|line| line.split_whitespace().map(ToOwned::to_owned).collect())
+            .collect();
+        let real_installs: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|args| !args.contains(&"--dry-run".to_owned()))
+            .filter(|args| args.get(1).map(String::as_str) != Some("freeze"))
+            .collect();
+        assert_eq!(
+            real_installs.len(),
+            3,
+            "torch install, remaining-deps install, and the trio realign must all run before \
+             `uv pip freeze` is even invoked, so its failure cannot skip the realign: {calls:?}"
+        );
+        let stack_realign = real_installs[2];
+        assert!(
+            stack_realign.contains(&"--no-deps".to_owned())
+                && stack_realign.contains(&"--reinstall-package".to_owned())
+                && stack_realign.contains(&"torch".to_owned())
+                && stack_realign.contains(&"torchvision==9.9.9".to_owned())
+                && stack_realign.contains(&"torchaudio==9.9.9".to_owned()),
+            "the trio realign must have already run before the freeze failure: {stack_realign:?}"
+        );
+
+        Ok(())
+    }
 }

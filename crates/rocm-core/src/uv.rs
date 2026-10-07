@@ -660,6 +660,23 @@ mod tests {
     }
 
     #[test]
+    fn pip_freeze_args_target_venv_python_and_disable_color() {
+        let args = uv_pip_freeze_args(Path::new("/envs/run/bin/python"));
+        assert_eq!(
+            args,
+            vec![
+                "pip",
+                "freeze",
+                "--color",
+                "never",
+                "--python",
+                "/envs/run/bin/python"
+            ],
+            "the output is parsed (name==version), so color must be off even under FORCE_COLOR"
+        );
+    }
+
+    #[test]
     fn pip_check_args_target_venv_python_and_disable_color() {
         let args = uv_pip_check_args(Path::new("/envs/run/bin/python"));
         assert_eq!(
