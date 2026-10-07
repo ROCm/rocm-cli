@@ -1587,11 +1587,10 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
 mod tests {
     use super::*;
 
+    use super::super::test_support::press;
+
     fn st() -> AppState {
         AppState::new("t".into(), "default-dark".into())
-    }
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     /// Serialises every test that touches the process-global signal machinery.
