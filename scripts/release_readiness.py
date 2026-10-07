@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import os
@@ -472,11 +473,8 @@ def verification_is_required(
     and a key that cannot be resolved is a hard failure rather than a quiet
     downgrade to the presence check.
 
-    Split out of ``main`` so ``--self-test`` can reach it. ``main`` returns on
-    the ``--self-test`` branch long before the gate, and the self-test's
-    ``validate_release`` cases pass ``verify`` explicitly, so nothing exercised
-    this decision: dropping ``require_signatures`` from it left the self-test
-    green while removing the gate entirely.
+    Separate from ``main`` so ``--self-test`` can exercise the decision
+    directly; ``main`` returns on the ``--self-test`` branch before the gate.
     """
     return (
         require_signatures
@@ -495,15 +493,9 @@ def resolve_verification(
     Returns ``(verify, public_key, key_source)``; ``key_source`` is ``None``
     when no verification is required.
 
-    This exists because testing the *decision* was not enough. An earlier round
-    extracted :func:`verification_is_required` and pinned it in isolation, but
-    nothing exercised ``main``'s use of it -- neutralising the call there
-    (``verify = False and verification_is_required(...)``) left ``--self-test``
-    exiting 0, which is the original fail-open: ``--require-signatures`` would
-    again accept a ``.sig`` signed by the wrong key. Dropping the
-    ``resolve_signing_key`` call stayed green for the same reason.
-
-    So the sequence itself is the unit, and ``main`` holds no copy of it.
+    Deciding and resolving belong together: a run that requires verification
+    but resolves no key would verify nothing while reporting success. Keeping
+    both here means ``main`` holds no copy of the sequence.
     """
     verify = verification_is_required(
         require_signatures, require_production_trust, explicit_public_key
@@ -724,42 +716,77 @@ def _assert_verification_wiring(expected_key: Path) -> None:
         )
 
 
-def _assert_main_consults_the_gate(dist: Path) -> None:
-    """`main` must route its verify decision through `resolve_verification`.
+def _run_main(dist: Path, *flags: str) -> tuple[int | None, str]:
+    """Drive `main` in-process. Returns its exit code (`None` if it returned).
 
-    Pinning the helpers was not enough on its own. `--self-test` returns before
-    `main` reaches the gate, so swapping that call for constants
-    (`verify, public_key, key_source = False, None, None`) left every check
-    green while restoring the original fail-open: `--require-signatures`
-    accepting a `.sig` signed by the wrong key. So drive `main` itself. With
-    signatures required and no key resolvable, it must exit 1; the dist is
-    otherwise valid, so a `main` that skipped the gate would accept it on the
-    presence check alone and exit 0.
+    Stderr is captured so a case that expects `main` to fail does not print
+    `release readiness failed: ...` into the log of a passing run.
     """
-
-    def attempt() -> None:
-        saved_argv = sys.argv
-        sys.argv = ["release_readiness.py", "--dist", str(dist), "--require-signatures"]
-        try:
-            main()
-        finally:
-            sys.argv = saved_argv
-
+    saved_argv = sys.argv
+    sys.argv = ["release_readiness.py", "--dist", str(dist), *flags]
+    captured = io.StringIO()
     try:
-        attempt()
-    except SystemExit as exit_error:
-        if exit_error.code == 1:
-            return
-        # argparse exits 2; treat anything that is not the readiness failure as
-        # a broken test rather than a passing gate.
+        with (
+            contextlib.redirect_stderr(captured),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            try:
+                main()
+            except SystemExit as exit_error:
+                code = exit_error.code
+                return (code if isinstance(code, int) else 1), captured.getvalue()
+        return None, captured.getvalue()
+    finally:
+        sys.argv = saved_argv
+
+
+def _assert_main_refuses_without_a_key(dist: Path) -> None:
+    """`--require-signatures` with no key must fail, and say so."""
+    code, stderr = _run_main(dist, "--require-signatures")
+    if code is None:
         raise ReadinessError(
-            f"main exited {exit_error.code!r} rather than failing the readiness "
-            "check; the gate self-test is no longer exercising what it claims"
-        ) from exit_error
-    raise ReadinessError(
-        "main accepted a signature-required run with no key configured; its "
-        "verify decision no longer goes through resolve_verification"
+            "main accepted a signature-required run with no key configured; "
+            "that is the fail-open this gate exists to close"
+        )
+    # The reason matters, not just the exit code: a `main` that skipped the
+    # gate and happened to fail for some unrelated reason would otherwise pass.
+    if "requires a release signing public key" not in stderr:
+        raise ReadinessError(
+            "main failed, but not on the missing signing key -- the gate case is "
+            f"no longer exercising what it claims. stderr was: {stderr.strip()!r}"
+        )
+
+
+def _assert_main_verifies(dist: Path) -> None:
+    """`main` must reach `verify_signature`, not merely decide that it should.
+
+    Driving only the refusal path is not enough. It fails inside
+    `resolve_verification`, before `validate_release` is reached, so `main`
+    could still pass `verify=False` at that call and never verify anything --
+    the original fail-open, with the key line printed as though it had. Record
+    the call instead: with a key resolvable, a `--require-signatures` run must
+    both succeed and have asked for verification.
+    """
+    verified: list[Path] = []
+    module = sys.modules[__name__]
+    original = module.verify_signature
+    module.verify_signature = lambda archive, signature, public_key: verified.append(
+        archive
     )
+    try:
+        code, stderr = _run_main(dist, "--require-signatures")
+    finally:
+        module.verify_signature = original
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected a run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if not verified:
+        raise ReadinessError(
+            "main completed a --require-signatures run without verifying any "
+            "signature; the verify decision is not reaching validate_release"
+        )
 
 
 def run_self_test(root: Path) -> None:
@@ -1113,13 +1140,7 @@ def run_self_test(root: Path) -> None:
             )
         print("release readiness self-test: signing key resolution ok")
 
-        # The verify gate itself. Without these, dropping `require_signatures`
-        # from `verification_is_required` left `--self-test` green while
-        # removing the whole point of the gate: `--require-signatures` would
-        # accept a `.sig` signed by the wrong key whenever no key is
-        # configured. `main` returns on the `--self-test` branch before the
-        # gate, and the `validate_release` cases above pass `verify`
-        # explicitly, so nothing else reaches this decision.
+        # Each flag must force verification on, and nothing else may turn it on.
         for label, flags in (
             ("--require-signatures", (True, False, None)),
             ("--require-production-trust", (False, True, None)),
@@ -1135,13 +1156,7 @@ def run_self_test(root: Path) -> None:
                 "readiness run would demand a signing key it has no reason to need"
             )
         print("release readiness self-test: verify gate ok")
-        # The wiring, not just the decision. Pinning `verification_is_required`
-        # alone was not enough: `main` could stop using it
-        # (`verify = False and verification_is_required(...)`) or skip
-        # `resolve_signing_key` entirely and this self-test stayed green --
-        # the original fail-open, where `--require-signatures` accepts a `.sig`
-        # from the wrong key. `main` now holds no copy of the sequence, so
-        # these cases cover what it actually does.
+        # Requiring verification must also resolve a key, not just set a flag.
         run_with_env(
             {
                 SIGNING_PUBLIC_KEY_PATH_ENV: key_path,
@@ -1151,25 +1166,27 @@ def run_self_test(root: Path) -> None:
         )
         print("release readiness self-test: verify wiring ok")
 
-        # ...and `main`'s use of that wiring, which none of the above reaches.
-        # A dist that is valid on every other axis, so the only thing that can
-        # reject it is the gate.
+        # `main`'s own behaviour, on a dist that is valid on every other axis so
+        # the verify gate is the only thing either case can turn on.
         gate_dist = root / "gate-dist"
         gate_dist.mkdir()
         gate_archive = gate_dist / "rocm-cli-test-linux-amd64.tar.gz"
         create_test_tar(gate_archive, "rocm-cli-test-linux-amd64")
         write_sha(gate_archive)
         Path(f"{gate_archive}.sig").write_bytes(b"detached signature placeholder\n")
+        no_key_env = {
+            SIGNING_PUBLIC_KEY_PATH_ENV: None,
+            SIGNING_PUBLIC_KEY_ENV: None,
+            "ROCM_CLI_REQUIRE_SIGNATURE": None,
+            "ROCM_CLI_REQUIRE_PRODUCTION_TRUST": None,
+        }
+        run_with_env(no_key_env, lambda: _assert_main_refuses_without_a_key(gate_dist))
+        print("release readiness self-test: main refuses without a key ok")
         run_with_env(
-            {
-                SIGNING_PUBLIC_KEY_PATH_ENV: None,
-                SIGNING_PUBLIC_KEY_ENV: None,
-                "ROCM_CLI_REQUIRE_SIGNATURE": None,
-                "ROCM_CLI_REQUIRE_PRODUCTION_TRUST": None,
-            },
-            lambda: _assert_main_consults_the_gate(gate_dist),
+            {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: key_path},
+            lambda: _assert_main_verifies(gate_dist),
         )
-        print("release readiness self-test: main consults the verify gate ok")
+        print("release readiness self-test: main actually verifies ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
@@ -1248,7 +1265,14 @@ def main() -> None:
             require_signatures, require_production_trust, args.public_key
         )
         if key_source is not None:
-            messages.append(f"signature verification key: {key_source}")
+            # Printed now rather than collected into `messages`, which is only
+            # flushed on success: a run that fails verification is exactly when
+            # you need to know which key it used. Flushed so it cannot be
+            # reordered after the unbuffered stderr of `fail()` when piped.
+            print(
+                f"release readiness: signature verification key: {key_source}",
+                flush=True,
+            )
         messages.extend(
             validate_release(
                 Path(args.dist),
