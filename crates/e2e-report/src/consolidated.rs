@@ -162,7 +162,15 @@ impl RunMeta {
 ///
 /// One of these corresponds to one uploaded `*-report` artifact (a
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
-pub(crate) struct PlatformReport {
+///
+/// `pub` (with no `pub` fields) so a caller producing both the HTML report and
+/// the markdown summary in one process — see [`load_platform_reports`] — can
+/// hold a `Vec<PlatformReport>` and pass it to both
+/// [`generate_consolidated_from_reports`]/[`consolidated_summary_markdown_from_reports`]
+/// without reparsing every platform's files twice (ROCMAI-484). The type stays
+/// opaque from outside this crate: nothing outside `consolidated.rs` needs to
+/// construct one or read its fields.
+pub struct PlatformReport {
     desc: Descriptor,
     /// Precomputed column label (platform, OS and effective channel) kept
     /// for the per-platform detail sections, exposed so `command_coverage.rs`
@@ -844,39 +852,71 @@ impl PlatformReport {
     }
 }
 
+/// Order platforms by platform/OS, then known-bugs flag, then channel —
+/// shared by every caller that sorts a `Vec<PlatformReport>` so a future
+/// ordering tweak can't land in only one of them.
+fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
+    (
+        &r.desc.platform,
+        &r.desc.os,
+        r.desc.known_bugs,
+        r.effective_channel(),
+    )
+}
+
+/// Parse and sort every platform's `report.json`/`platform.json`/
+/// `commands.jsonl` once.
+///
+/// [`generate_consolidated`] and [`consolidated_summary_markdown`] each used
+/// to do this independently, so a caller producing both outputs from the same
+/// `inputs` in one process (e.g. `xtask`'s `e2e_report::run`) reparsed every
+/// platform's on-disk files twice. A caller that wants both outputs should
+/// call this once and pass the result to
+/// [`generate_consolidated_from_reports`] and
+/// [`consolidated_summary_markdown_from_reports`] instead (ROCMAI-484).
+pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
+    let mut reports: Vec<PlatformReport> = inputs
+        .iter()
+        .map(|(label, path)| PlatformReport::load(label.clone(), path))
+        .collect();
+    // Group each platform's rows together and order tiers expect-pass → known
+    // bugs, instead of the alphabetical mash of the old single-label sort.
+    reports.sort_by(|a, b| report_sort_key(a).cmp(&report_sort_key(b)));
+    reports
+}
+
 /// Build one consolidated HTML report from several per-platform `report.json`
 /// files.
 ///
 /// `inputs` is `(label, json_path)` pairs; the label identifies the
 /// platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms need no
 /// code change — the caller just passes more inputs.
+///
+/// Thin wrapper around [`generate_consolidated_from_reports`] for a caller
+/// that only needs the HTML output. A caller that also wants
+/// [`consolidated_summary_markdown`] from the same `inputs` should call
+/// [`load_platform_reports`] once and use the `_from_reports` entry points
+/// directly instead, to avoid reparsing every platform twice.
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
     html_out: &Path,
     meta: &RunMeta,
 ) -> std::io::Result<()> {
-    let mut reports: Vec<PlatformReport> = inputs
-        .iter()
-        .map(|(label, path)| PlatformReport::load(label.clone(), path))
-        .collect();
+    generate_consolidated_from_reports(&load_platform_reports(inputs), inputs, html_out, meta)
+}
 
-    // Group each platform's rows together and order tiers expect-pass → known
-    // bugs, instead of the alphabetical mash of the old single-label sort.
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
-
+/// Same as [`generate_consolidated`], but takes already-parsed `reports`.
+///
+/// `reports` comes from [`load_platform_reports`], used instead of reparsing
+/// `inputs` itself. `inputs` is still needed for the expectation grid, which
+/// is keyed differently and parses its own sidecars independently of
+/// `reports`.
+pub fn generate_consolidated_from_reports(
+    reports: &[PlatformReport],
+    inputs: &[(String, PathBuf)],
+    html_out: &Path,
+    meta: &RunMeta,
+) -> std::io::Result<()> {
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
     let overall = if reports.is_empty() {
@@ -918,14 +958,14 @@ pub fn generate_consolidated(
                     p { "No per-platform report.json files were found to consolidate." }
                 } @else {
                     h2 { "Platforms" }
-                    (matrix_table(&reports))
+                    (matrix_table(reports))
                     (legend())
 
                     (expectation_grid_html(inputs))
 
                     h2 { "Per-platform Details" }
                     div.details {
-                        @for report in &reports {
+                        @for report in reports {
                             (platform_section(report))
                         }
                     }
@@ -940,29 +980,28 @@ pub fn generate_consolidated(
 /// Render the consolidated result as a GitHub-flavoured markdown table, for
 /// piping into `$GITHUB_STEP_SUMMARY`. Same inputs as
 /// [`generate_consolidated`].
+///
+/// Thin wrapper around [`consolidated_summary_markdown_from_reports`] for a
+/// caller that only needs the markdown output. A caller that also wants
+/// [`generate_consolidated`] from the same `inputs` should call
+/// [`load_platform_reports`] once and use the `_from_reports` entry points
+/// directly instead, to avoid reparsing every platform twice.
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
+    consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
+}
+
+/// Same as [`consolidated_summary_markdown`], but takes already-parsed
+/// `reports`.
+///
+/// `reports` comes from [`load_platform_reports`], used instead of reparsing
+/// `inputs` itself. `inputs` is still needed for the expectation grid and
+/// scenario reference sections, which are keyed differently and parse their
+/// own sidecars independently of `reports`.
+pub fn consolidated_summary_markdown_from_reports(
+    reports: &[PlatformReport],
+    inputs: &[(String, PathBuf)],
+) -> String {
     use std::fmt::Write as _;
-
-    let reports: Vec<PlatformReport> = inputs
-        .iter()
-        .map(|(label, path)| PlatformReport::load(label.clone(), path))
-        .collect();
-
-    let mut reports = reports;
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
 
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
@@ -973,7 +1012,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     out.push_str("| Platform | OS | Total | Pass | Fail | Skip | Xfail | Status |\n");
     out.push_str("|---|---|--:|--:|--:|--:|--:|:--|\n");
     let (mut t_total, mut t_pass, mut t_fail, mut t_skip, mut t_xfail) = (0, 0, 0, 0, 0);
-    for r in &reports {
+    for r in reports {
         let (total, pass, fail, skip, xf) = r.display_counts();
         // Xfail column only applies where there are known bugs to invert; a plain
         // expect-pass platform (no xfail entries) shows N/A.
@@ -1045,7 +1084,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     // Call out anything that needs a human: XPASS (fixed bug, stale tag) and
     // untagged failures in a known-bugs run.
     let mut notes = Vec::new();
-    for r in &reports {
+    for r in reports {
         for name in &r.xfail.xpass {
             notes.push(format!(
                 "- **XPASS** in _{}_: `{}` is tagged `@expected-failure` but passed — remove the tag.",
@@ -1080,7 +1119,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     // "where should each test pass / not matter / not run".
     out.push_str(&expectation_grid_markdown(inputs, &scenarios));
 
-    out.push_str(&command_coverage_markdown(&reports));
+    out.push_str(&command_coverage_markdown(reports));
 
     // Scenario reference LAST (after command coverage): each id's actual Gherkin
     // scenario, anchored so the grid's id links resolve here.
@@ -1648,6 +1687,45 @@ mod tests {
     fn consolidated_summary_markdown_empty_inputs() {
         let md = consolidated_summary_markdown(&[]);
         assert!(md.contains("No per-platform report.json files"));
+    }
+
+    #[test]
+    fn from_reports_entry_points_match_their_reparsing_wrappers() {
+        // ROCMAI-484: generate_consolidated/consolidated_summary_markdown now
+        // delegate to the *_from_reports entry points via load_platform_reports.
+        // Calling the _from_reports path directly with a separately-built
+        // `reports` must produce byte-for-byte identical output to the
+        // convenience wrappers — proving the shared-parse path is a pure
+        // refactor, not a behavior change.
+        let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
+        let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
+        let inputs = vec![
+            ("e2e-report".to_string(), a.path().to_path_buf()),
+            (
+                "e2e-gpu-known-bugs-report".to_string(),
+                b.path().to_path_buf(),
+            ),
+        ];
+
+        let md_via_wrapper = consolidated_summary_markdown(&inputs);
+        let reports = load_platform_reports(&inputs);
+        let md_via_reports = consolidated_summary_markdown_from_reports(&reports, &inputs);
+        assert_eq!(md_via_wrapper, md_via_reports);
+
+        let out_via_wrapper = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated(&inputs, out_via_wrapper.path(), &RunMeta::default())
+            .expect("generate via wrapper");
+        let out_via_reports = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated_from_reports(
+            &reports,
+            &inputs,
+            out_via_reports.path(),
+            &RunMeta::default(),
+        )
+        .expect("generate via reports");
+        let html_via_wrapper = std::fs::read_to_string(out_via_wrapper.path()).expect("read");
+        let html_via_reports = std::fs::read_to_string(out_via_reports.path()).expect("read");
+        assert_eq!(html_via_wrapper, html_via_reports);
     }
 
     #[test]
