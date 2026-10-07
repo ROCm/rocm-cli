@@ -56,21 +56,26 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
     (cur.cast_signed() + delta).rem_euclid(n) as usize
 }
 
+/// Resolve a quit request (issue #145): a model still being served gets a
+/// confirm prompt first — opening it, not quitting, is this fn's whole job;
+/// the event loop's dedicated `quit_confirm_pending` arm owns the actual exit
+/// once the prompt resolves. Returns `true` to request immediate exit the
+/// same way `apply_action` does, so every quit entry point — the `q` key, the
+/// Esc main menu's "Quit" row — shares this one gate rather than each
+/// re-deciding (and risking re-deciding wrong) whether to ask first.
+fn request_quit(state: &mut AppState) -> bool {
+    if state.has_live_instance() {
+        state.open_quit_confirm();
+        return false;
+    }
+    true
+}
+
 /// Apply a `KeyAction` to mutable state. Returns `true` when the action
 /// requests application exit (Quit).
 pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
-        // A model still being served gets a confirm prompt first (issue
-        // #145) — opening it, not quitting, is this arm's whole job; the
-        // event loop's dedicated `quit_confirm_pending` arm owns the actual
-        // exit once the prompt resolves.
-        KeyAction::Quit => {
-            if state.has_live_instance() {
-                state.open_quit_confirm();
-                return false;
-            }
-            return true;
-        }
+        KeyAction::Quit => return request_quit(state),
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
@@ -262,7 +267,11 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 1 => {
                     state.modal = Modal::GlobalHelp;
                 }
-                _ => return true, // Quit
+                // Issue #145: this must share `KeyAction::Quit`'s own gate —
+                // choosing "Quit" from the Esc menu is a second, independent
+                // entry point to the same decision, not a separate one that
+                // gets to skip the confirm prompt.
+                _ => return request_quit(state),
             },
             Modal::Palette => {
                 if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
@@ -818,6 +827,26 @@ mod tests {
             },
         );
         assert!(!apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn quitting_from_the_esc_menu_opens_the_same_confirm_prompt() {
+        // Regression: choosing "Quit" from the Esc main menu (Modal::Menu's
+        // last row) used to `return true` directly, a second quit entry
+        // point that completely bypassed the confirm-before-quit gate.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2; // the "Quit" row
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
         assert!(s.quit_confirm.is_some());
     }
 
