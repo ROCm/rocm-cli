@@ -344,3 +344,4 @@ Feature: Interactive dashboard
     Then the managed model is displayed
     When the user quits the dashboard
     Then the dashboard exits successfully
+    And the managed model is still listed as running

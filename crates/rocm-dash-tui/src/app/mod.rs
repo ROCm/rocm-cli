@@ -644,6 +644,16 @@ impl AppState {
         self.has_open_overlay() || self.approval_pending() || self.quit_confirm_pending()
     }
 
+    /// Whether a modal that owns the body absolutely — no console, nothing to
+    /// pan or fall through to — is open: the chat approval or the quit-confirm
+    /// prompt. Unlike [`overlay_or_approval`](Self::overlay_or_approval), this
+    /// deliberately excludes [`has_open_overlay`](Self::has_open_overlay): a
+    /// manager overlay's job console is still a legitimate scroll/drag target,
+    /// where these two never are.
+    pub(crate) const fn blocks_body_absolutely(&self) -> bool {
+        self.approval_pending() || self.quit_confirm_pending()
+    }
+
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
     /// overlay is closed (no manager is `Some`).
     ///
@@ -1043,9 +1053,27 @@ impl AppState {
     /// Open the approval modal for a surfaced mutating-tool intent (Phase 4).
     /// Closes any operational overlay first so the modal owns focus alone.
     pub(crate) fn open_approval(&mut self, intent: crate::tool_exec::ApprovalIntent) {
+        // Also refuse while a quit-confirm prompt is open (issue #145): it is
+        // delivered asynchronously off a chat-agent event, independent of any
+        // keypress, so it can otherwise arrive after the user already asked
+        // to quit. Letting it through would silently race the two modals —
+        // `quit_confirm` would still be what's drawn (rendered last), but the
+        // approval would be what every keystroke actually resolves, so a `y`
+        // meant to confirm the quit would instead approve an unreviewed
+        // mutating tool call. The already-open, user-initiated quit decision
+        // wins; the model already got its "surfaced for approval" tool
+        // result regardless (`agent/tools.rs`), so discarding here — same as
+        // the second-approval-while-one-pending case below — never leaves it
+        // waiting on a reply that won't come.
         if self.approval.is_some() {
             self.chat.push(ChatTurn::error(
                 "An action is already awaiting approval; the new request was discarded. Resolve the open approval first.",
+            ));
+            return;
+        }
+        if self.quit_confirm_pending() {
+            self.chat.push(ChatTurn::error(
+                "An action was proposed while quitting was being confirmed; the request was discarded.",
             ));
             return;
         }
@@ -3035,6 +3063,33 @@ mod tests {
         let pa = s.approval.as_ref().expect("first approval still pending");
         assert_eq!(pa.name, "install_sdk");
         assert_eq!(pa.arguments["prefix"], "~/rocm");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn approval_request_is_discarded_while_quit_confirm_is_pending() {
+        // Issue #145 regression: a chat-agent tool call surfacing for
+        // approval must not land while the user is already mid-decision on
+        // quitting — the quit-confirm prompt is what's drawn (rendered
+        // last), but without this guard every keystroke would still resolve
+        // the approval instead, so a `y` meant to confirm the quit would
+        // silently approve an unreviewed mutating tool call.
+        let mut s = st();
+        s.open_quit_confirm();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "Install ROCm".to_string(),
+            body: vec!["rocm install sdk".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(
+            s.approval.is_none(),
+            "approval must be discarded, not opened"
+        );
+        assert!(
+            s.quit_confirm.is_some(),
+            "quit-confirm must still own the screen"
+        );
         assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 

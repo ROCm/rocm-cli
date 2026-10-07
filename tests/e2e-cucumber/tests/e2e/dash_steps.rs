@@ -557,6 +557,20 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
 }
 
+/// Proves the prompt's own claim ("it keeps running in the background after
+/// you quit") against actual state, not just its wording (AGENTS.md §3) — a
+/// plain CLI check against the managed-service registry, run after the TUI
+/// process has already exited.
+#[then("the managed model is still listed as running")]
+async fn managed_model_still_listed_as_running(world: &mut E2eWorld) {
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--all"]);
+    let model = world.model_name.as_deref().unwrap_or("");
+    assert!(
+        stdout.to_lowercase().contains(&model.to_lowercase()),
+        "model no longer listed after quitting — quitting must not stop it:\n{stdout}"
+    );
+}
+
 #[when("the user quits interactive chat")]
 async fn quit_interactive_chat(world: &mut E2eWorld) {
     quit_tui(world, "interactive chat").await;

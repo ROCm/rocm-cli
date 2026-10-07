@@ -508,14 +508,17 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
         Seg::Sep(" jump  "),
     ];
     // Exactly one Esc chip is shown at all times, and it must match what Esc
-    // actually does — the real routing priority (highest first) is: a pending
-    // chat approval owns every key; then an open manager overlay backs itself
-    // out; then a `Modal::*` overlay closes; then a focused/gating Chat tab
-    // absorbs Esc; only once none of those apply does Esc fall through to the
-    // uniform "menu" fallback (item #35). Mirror that order here so the chip
-    // never advertises `menu` while a click on it would actually do something
-    // else.
-    if state.approval_pending() {
+    // actually does — the real routing priority (highest first) is: the
+    // quit-confirm prompt (issue #145) or a pending chat approval owns every
+    // key; then an open manager overlay backs itself out; then a `Modal::*`
+    // overlay closes; then a focused/gating Chat tab absorbs Esc; only once
+    // none of those apply does Esc fall through to the uniform "menu"
+    // fallback (item #35). Mirror that order here so the chip never
+    // advertises `menu` while a click on it would actually do something else
+    // — including, for quit-confirm, dispatching `PaneEscape` underneath the
+    // still-open prompt, since footer-chip clicks bypass the later
+    // `overlay_or_approval()` body swallow by design.
+    if state.blocks_body_absolutely() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" cancel  "));
     } else if state.has_open_overlay() && state.active_overlay_at_root() {
@@ -883,6 +886,49 @@ mod tests {
         assert!(
             !row.contains("Esc  close"),
             "sub-popup Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn footer_esc_chip_is_noninteractive_while_quit_confirm_is_pending() {
+        // Issue #145 regression: the Esc-chip label chain checked
+        // `approval_pending()` but not `quit_confirm_pending()`, so with
+        // nothing else open it fell to the generic `PaneEscape` arm — making
+        // the chip genuinely clickable (and mislabeled "menu") while the
+        // quit-confirm prompt was still open on top of it.
+        use crate::ui::theme::Theme;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::from_name("default-dark");
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.open_quit_confirm();
+        assert!(!state.has_open_overlay());
+        assert_eq!(state.modal, Modal::None);
+
+        let backend = TestBackend::new(90, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut chips = Vec::new();
+        term.draw(|f| chips = draw_footer(f, f.area(), &state, &theme))
+            .unwrap();
+
+        for chip in &chips {
+            assert_ne!(
+                chip.action,
+                KeyAction::PaneEscape,
+                "no chip may dispatch PaneEscape while quit-confirm owns Esc"
+            );
+        }
+        let row: String = (0..90)
+            .map(|x| term.backend().buffer().cell((x, 0)).unwrap().symbol())
+            .collect();
+        assert!(
+            row.contains("Esc  cancel"),
+            "quit-confirm Esc chip should say cancel: {row:?}"
+        );
+        assert!(
+            !row.contains("Esc  menu"),
+            "quit-confirm Esc chip must not advertise menu: {row:?}"
         );
     }
 

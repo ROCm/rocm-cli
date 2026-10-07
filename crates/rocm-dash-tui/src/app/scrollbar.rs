@@ -59,15 +59,16 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     // A held drag on a scrollbar keeps updating that offset until release, even
     // when the pointer slides off the narrow track.
     if me.kind == MouseEventKind::Drag(MouseButton::Left) {
-        // A drag can start before an approval becomes pending (it's only
-        // gated at the click that starts it, via `scrollbar_hit`'s own
-        // `approval_pending()` check below) and then have an approval land
-        // asynchronously mid-drag. Swallow it here too, or the drag would
-        // keep mutating a scroll position hidden behind the approval modal —
-        // "a pending approval owns the body with no exception" (see the
-        // wheel-scroll swallow further down) applies to an in-flight drag
-        // just as much as to input that starts fresh.
-        if state.approval_pending() {
+        // A drag can start before an approval or quit-confirm prompt becomes
+        // pending (it's only gated at the click that starts it, via
+        // `scrollbar_hit`'s own `blocks_body_absolutely()` check below) and
+        // then have one land asynchronously mid-drag. Swallow it here too, or
+        // the drag would keep mutating a scroll position hidden behind the
+        // modal — "a pending approval owns the body with no exception" (see
+        // the wheel-scroll swallow further down) applies to an in-flight drag
+        // just as much as to input that starts fresh, and to the quit-confirm
+        // prompt the same way (issue #145).
+        if state.blocks_body_absolutely() {
             return KeyAction::Nothing;
         }
         if let Some(drag) = state.scroll_drag
@@ -99,11 +100,12 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
         // Scrollbar tracks win over a plain open overlay (incl. its console
         // bar), so a click on the bar grabs it instead of falling through —
-        // but NOT over a pending approval: nothing registers a scrollbar for
-        // the approval modal itself, so any handle on screen while one is
-        // pending belongs to content underneath it, which the swallow below
-        // must still catch rather than let a scrollbar drag bypass it.
-        if !state.approval_pending()
+        // but NOT over a pending approval or quit-confirm prompt (issue
+        // #145): nothing registers a scrollbar for either modal itself, so
+        // any handle on screen while one is pending belongs to content
+        // underneath it, which the swallow below must still catch rather
+        // than let a scrollbar drag bypass it.
+        if !state.blocks_body_absolutely()
             && let Some(a) = scrollbar_hit(state, me.column, me.row)
         {
             return a;
@@ -161,10 +163,11 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         _ => return KeyAction::Nothing,
     };
 
-    // A pending approval owns the body with no exception (mirrors the click
-    // swallow a few lines above) — unlike a plain manager overlay, it never
-    // has its own console to pan, so there is nothing to fall through to.
-    if state.approval_pending() {
+    // A pending approval or quit-confirm prompt (issue #145) owns the body
+    // with no exception (mirrors the click swallow a few lines above) —
+    // unlike a plain manager overlay, neither has its own console to pan, so
+    // there is nothing to fall through to.
+    if state.blocks_body_absolutely() {
         return KeyAction::Nothing;
     }
     // An open manager owns the body. When it is showing its job console, the
@@ -567,6 +570,29 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_hit_is_swallowed_while_quit_confirm_is_pending() {
+        // Issue #145: the quit-confirm prompt owns the body the same way an
+        // approval does — this is the same scenario as
+        // `scrollbar_hit_is_swallowed_while_an_approval_is_pending` with the
+        // other gate.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::ScrollGrab(ScrollTarget::Console, 90, 0)
+        );
+        s.open_quit_confirm();
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
     fn drag_is_swallowed_once_an_approval_becomes_pending_mid_drag() {
         // A drag can only start while no approval is pending (the click that
         // starts it goes through `scrollbar_hit`, which is itself gated), but
@@ -601,6 +627,32 @@ mod tests {
             resolve_mouse(drag, &s),
             KeyAction::Nothing,
             "a drag in flight when an approval becomes pending must be swallowed"
+        );
+    }
+
+    #[test]
+    fn drag_is_swallowed_once_quit_confirm_becomes_pending_mid_drag() {
+        // Issue #145 counterpart to `drag_is_swallowed_once_an_approval_becomes_pending_mid_drag`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.scrollbars.borrow_mut().push(ScrollbarHandle {
+            track: Rect::new(60, 0, 1, 10),
+            horizontal: false,
+            content_len: 100,
+            viewport_len: 10,
+            target: ScrollTarget::Console,
+        });
+        let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 9);
+        let a = resolve_mouse(down, &s);
+        apply_action(&mut s, a);
+        assert!(s.scroll_drag.is_some(), "drag must have started");
+
+        s.open_quit_confirm();
+
+        let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 40, 0);
+        assert_eq!(
+            resolve_mouse(drag, &s),
+            KeyAction::Nothing,
+            "a drag in flight when quit-confirm becomes pending must be swallowed"
         );
     }
 
@@ -881,6 +933,20 @@ mod tests {
         // instead of falling through to whatever's obscured underneath, the
         // same gap the click path was already fixed for (see
         // `body_clicks_are_swallowed_while_an_approval_is_pending`).
+        assert!(!s.has_open_overlay());
+        assert_eq!(
+            resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),
+            KeyAction::Nothing
+        );
+    }
+
+    #[test]
+    fn wheel_is_swallowed_while_quit_confirm_is_pending() {
+        // Issue #145 counterpart to `wheel_is_swallowed_while_an_approval_is_pending`.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.last_body_area = Some(Rect::new(2, 4, 150, 30));
+        s.open_quit_confirm();
         assert!(!s.has_open_overlay());
         assert_eq!(
             resolve_mouse(wheel(MouseEventKind::ScrollDown, 10, 12), &s),

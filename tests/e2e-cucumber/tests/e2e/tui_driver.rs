@@ -672,17 +672,20 @@ impl TuiSession {
     /// process has already exited by the first check and nothing is resent.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Demo data and several fixtures leave a model serving, which opens
-        // the dash's quit-confirm prompt (issue #145) on `q` instead of
-        // exiting straight away. Once it's open, `q`/`Q` are read as Cancel
-        // (see `approval_key`), so blindly resending the same gesture below
-        // would flip the prompt open/closed forever instead of ever
-        // confirming it. The chat quit path (`/quit`) has no such prompt
-        // today, so this is a no-op there.
+        // the quit-confirm prompt (issue #145) instead of exiting straight
+        // away — on `q`, and on `/quit` too: `rocm chat` is the same
+        // dashboard with the Chat tab focused (`run_chat` calls the same
+        // `run_async`), so it renders and is gated by the identical prompt.
+        // Once it's open, `q`/`Q` are read as Cancel (see `approval_key`) and
+        // the prompt owns every key ahead of chat-input focus, so blindly
+        // resending the normal gesture below would — for `q` — flip the
+        // prompt open/closed forever instead of ever confirming it, and —
+        // for `/quit\r` — type "uit" into chat as a message once the leading
+        // `q` cancels the prompt. Either way it never exits.
         let gesture = if self.is_chat { "/quit\r" } else { "q" };
         let deadline = Instant::now() + timeout;
         loop {
-            let confirming =
-                !self.is_chat && self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
+            let confirming = self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
             self.send(if confirming { "y" } else { gesture })?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             let attempt = KEY_RESEND_INTERVAL.min(remaining);
