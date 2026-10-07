@@ -80,9 +80,12 @@ through *different* rows: they pin different vLLM minors and read vLLM from
 different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
 host from 10.0's production index. Both rows take their torch stack from the
 same `whl-next` index, which is where `rocm install sdk` resolves either SDK's
-own `+rocmX.Y` torch from, so vLLM realigns onto the builds the SDK already
-installed. Patch and any dev/pre-release suffix are still ignored within a row,
-since AMD rotates those constantly.
+own `+rocmX.Y` torch from, but vLLM's discovery is independent of that: it
+resolves its own torch/torchvision/torchaudio pins fresh from the row's own
+static version prefixes, rather than reusing whatever the SDK install
+resolved, which may be a different torch version than this row pins. Patch
+and any dev/pre-release suffix are still ignored within a row, since AMD
+rotates those constantly.
 
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
@@ -102,10 +105,9 @@ generated `uv.toml` sets `ignore-error-codes = [403]` for that index so `uv`
 falls through to PyPI for those instead of treating the index's 403 as fatal.
 That same full-dependency resolve can also pull in an unconstrained `torch`
 from PyPI, undoing the exact ROCm pin just installed, and transitively an
-unconstrained `torchvision`/`torchaudio` with it; the install re-pins torch,
-plus whatever of torchvision/torchaudio was already installed by the SDK
-install, back to their prior exact builds immediately afterwards. That same
-realign also covers AMD's per-GPU-architecture device-kernel plugins
+unconstrained `torchvision`/`torchaudio` with it; the install re-pins all
+three back to the exact builds discovered above immediately afterwards. That
+same realign also covers AMD's per-GPU-architecture device-kernel plugins
 (`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`): each is versioned in
 lockstep with its own base package but resolved independently of it, so the
 full-dependency install can leave one ahead of the base package it ships
