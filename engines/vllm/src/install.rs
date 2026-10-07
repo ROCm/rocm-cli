@@ -146,11 +146,17 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         torch_version_prefix: "2.13",
         torchvision_version_prefix: "0.28",
         // Exact, not `2.11.*`: `whl-next` publishes three `+rocm10.1.0`
-        // torchaudio builds, `2.11.0`, `2.11.0.2` and `2.11.0.3`, alongside
-        // torch 2.12, 2.13 and 2.14. A series match resolves the newest,
-        // `2.11.0.3`, whose native library does not load against torch 2.12
-        // or 2.13 (AMD's own image pins torchaudio to plain `2.11.0` too).
-        torchaudio_version: DiscoverVersion::Exact("2.11.0"),
+        // torchaudio builds, `2.11.0`, `2.11.0.2` and `2.11.0.3`. `2.11.0` is
+        // a CPU-only rebuild (no `libamdhip64`/`libc10_hip`/`libtorch_hip`
+        // in its `.so`s) that predates torch's stable-ABI split and does not
+        // reference the `torch_exception_get_what` / `torch_new_stable_ivalue`
+        // symbols torch 2.13 exports. `2.11.0.2` and `2.11.0.3` are both HIP
+        // builds against that same stable ABI (confirmed on a live Strix Halo
+        // box: torch 2.13.0+rocm10.1.0 exports both symbols as `T`, and
+        // torchaudio 2.11.0.2 imports them as `U`); a series match would
+        // resolve the newest, `2.11.0.3`, so pin the lower of the two
+        // confirmed-working builds instead.
+        torchaudio_version: DiscoverVersion::Exact("2.11.0.2"),
     },
 ];
 /// Looks up the discovery build recipe for a ROCm SDK version, if any.
@@ -1060,15 +1066,21 @@ fn install_vllm_rocm10_discover(
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
-    // force the whole stack back to the coherent trio discovered above. It
-    // can also pull in an AMD device-kernel plugin for any of the three
-    // (`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`, ...) pinned to
-    // whatever the index's newest release is, unconstrained by -- and so
-    // routinely ahead of -- the base package version just realigned; the
-    // mismatch doesn't fail here, it fails at serve time as a HIP "Cannot
-    // find Symbol" crash. Realign any such installed device package to the
-    // exact version of its own base package: a device package always shares
-    // its base package's version number, not any other package's.
+    // force the whole stack back to the coherent trio discovered above. This
+    // must run unconditionally, before the device-plugin discovery below: a
+    // `uv pip freeze` failure there must not skip restoring the trio too.
+    let trio_realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    run_uv_pip_install(uv, paths, python, trio_realign_args)?;
+
+    // The full-dependency resolve can also pull in an AMD device-kernel
+    // plugin for any of the three (`amd-torch-device-gfx*`,
+    // `amd-torchvision-device-gfx*`, ...) pinned to whatever the index's
+    // newest release is, unconstrained by -- and so routinely ahead of --
+    // the base package version just realigned above; the mismatch doesn't
+    // fail here, it fails at serve time as a HIP "Cannot find Symbol" crash.
+    // Realign any such installed device package to the exact version of its
+    // own base package: a device package always shares its base package's
+    // version number, not any other package's.
     let installed = installed_package_names(uv, paths, python)?;
     let mut device_pins: Vec<String> = Vec::new();
     for pin in &pins[..3] {
@@ -1084,9 +1096,11 @@ fn install_vllm_rocm10_discover(
                 .map(|name| format!("{name}=={release}")),
         );
     }
-    let realign_pins: Vec<String> = pins[..3].iter().chain(&device_pins).cloned().collect();
-    let realign_args = vllm_rocm10_discover_realign_install_args(python, build, &realign_pins);
-    run_uv_pip_install(uv, paths, python, realign_args)?;
+    if !device_pins.is_empty() {
+        let device_realign_args =
+            vllm_rocm10_discover_realign_install_args(python, build, &device_pins);
+        run_uv_pip_install(uv, paths, python, device_realign_args)?;
+    }
 
     let mut pins = pins;
     pins.extend(device_pins);
@@ -1906,6 +1920,31 @@ mod tests {
         );
         Ok(())
     }
+    /// The prefix boundary (`-device-gfx`, not a bare `starts_with` of
+    /// `amd-{base_pkg}`) must stop `torch`'s match from also catching
+    /// `torchvision`'s device package: `amd-torchvision-...` does start with
+    /// `amd-torch`, just not with `amd-torch-device-gfx`.
+    #[test]
+    fn is_amd_device_package_for_does_not_cross_match_prefixed_base_packages() {
+        assert!(is_amd_device_package_for(
+            "amd-torch-device-gfx1151",
+            "torch"
+        ));
+        assert!(!is_amd_device_package_for(
+            "amd-torchvision-device-gfx1151",
+            "torch"
+        ));
+        assert!(is_amd_device_package_for(
+            "amd-torchvision-device-gfx1151",
+            "torchvision"
+        ));
+        // Real `uv pip freeze` output is PEP 503 canonical (hyphenated), but
+        // the check normalizes underscores too.
+        assert!(is_amd_device_package_for(
+            "amd_torch_device_gfx1151",
+            "torch"
+        ));
+    }
     /// A series renders with the `.*` that lets `uv` take the newest release
     /// in it; an exact release renders bare, so it cannot.
     #[test]
@@ -1923,10 +1962,13 @@ mod tests {
     }
     /// The 10.1 row must reach the staging host for vLLM, which is only
     /// published there, but takes its torch stack from `whl-next` just like
-    /// 10.0, the index the 10.1 SDK itself installs its `+rocm10.1.0` torch
-    /// stack from. Its torchaudio is pinned exactly: a `2.11.*` match
-    /// resolved `2.11.0.3`, the rebuild for a newer torch, whose
-    /// `libtorchaudio.abi3.so` then failed to load against torch 2.12 or 2.13
+    /// 10.0, the same index `rocm install sdk` resolves its own
+    /// `+rocm10.1.0` torch stack from (though the SDK's resolve and this
+    /// row's discovery are independent: this row pins its own version
+    /// prefixes rather than matching whatever the SDK happened to install).
+    /// Its torchaudio is pinned exactly: a `2.11.*` match resolves the
+    /// newest rebuild, `2.11.0.3`; `2.11.0.2` is the lower of the two builds
+    /// confirmed (on a live Strix Halo box) to load against torch 2.13
     /// (therock-next-09). 10.0 keeps the production frameworks index for
     /// vLLM. The live half of this is therock-next-09.
     #[test]
@@ -1958,9 +2000,13 @@ mod tests {
         assert_eq!(ten_one.torch_version_prefix, "2.13");
         assert_eq!(ten_one.torchvision_version_prefix, "0.28");
         // `whl-next` carries `2.11.0`, `2.11.0.2` and `2.11.0.3` for
-        // `+rocm10.1.0`; only `2.11.0` pairs with this row's torch, matching
-        // AMD's own image's pin, so this must stay exact and never a series.
-        assert_eq!(ten_one.torchaudio_version, DiscoverVersion::Exact("2.11.0"));
+        // `+rocm10.1.0`; `2.11.0` is CPU-only, and a series match would
+        // resolve the newest, `2.11.0.3`, not the confirmed-working
+        // `2.11.0.2`, so this must stay exact and never a series.
+        assert_eq!(
+            ten_one.torchaudio_version,
+            DiscoverVersion::Exact("2.11.0.2")
+        );
 
         // An unpublished line must not borrow another line's wheels.
         assert!(vllm_rocm_discover_build("10.2.0").is_none());
@@ -2063,12 +2109,12 @@ exit 0
             [
                 "torch==2.13.*",
                 "torchvision==0.28.*",
-                "torchaudio==2.11.0",
+                "torchaudio==2.11.0.2",
                 "vllm==0.29.*",
                 "flash-attn==2.8.*",
                 "amd-aiter==0.1.*",
             ],
-            "discovery must ask uv for exactly torchaudio 2.11.0 on 10.1: {calls:?}"
+            "discovery must ask uv for exactly torchaudio 2.11.0.2 on 10.1: {calls:?}"
         );
         let real_installs: Vec<&Vec<String>> = calls
             .iter()
@@ -2175,6 +2221,21 @@ exit 0
             pins.contains(&"amd_torchvision_device_gfx1151==8.8.8".to_owned()),
             "the stale torchvision device package must be realigned to torchvision's own \
              resolved release, not torch's: {pins:?}"
+        );
+        // Guards the prefix-boundary check in `is_amd_device_package_for`: a
+        // weakened boundary (e.g. matching on a bare `starts_with` of
+        // `amd-torch`, which `amd-torchvision-device-gfx1151` also satisfies)
+        // would add a second, wrongly-cross-matched pin alongside the
+        // correct one above, invisible to a `.contains()`-only check.
+        assert!(
+            !pins.contains(&"amd_torchvision_device_gfx1151==9.9.9".to_owned()),
+            "torchvision's device package must not be cross-matched under torch's base \
+             package and pinned to torch's release: {pins:?}"
+        );
+        assert_eq!(
+            pins.len(),
+            8,
+            "expected the 6 discovered pins plus exactly one device pin per base package: {pins:?}"
         );
 
         let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
