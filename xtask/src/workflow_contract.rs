@@ -1705,6 +1705,27 @@ esac
     }
 
     #[test]
+    fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
+        let nightly = read_workflow("nightly.yml");
+        let report = job_block(&nightly, "e2e-report-nightly");
+        assert!(
+            report.contains("consolidated/support-matrix.md"),
+            "the consolidated report job must keep the markdown matrix as a file for the wiki job"
+        );
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        assert_eq!(
+            job_scalar(publish, "needs"),
+            "e2e-report-nightly",
+            "the wiki job must publish the consolidated report, so it must wait for it"
+        );
+        assert!(
+            publish.contains("name: e2e-consolidated-report-nightly")
+                && publish.contains(".wiki.git"),
+            "the wiki job must download the nightly consolidated artifact and push to the wiki repo"
+        );
+    }
+
+    #[test]
     fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
         let self_hosted = read_workflow("e2e-selfhosted.yml");
         let nightly = read_workflow("nightly.yml");
