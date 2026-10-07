@@ -22096,6 +22096,26 @@ const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`read_drm_vram_usage`] for why the sysfs fallback withholds telemetry on a
 /// multi-GPU one). Returns `None` only when neither source is readable
 /// (callers then fall back to service-state-only auto-selection).
+fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(forced) = simulated_low_vram_usage() {
+        return Some(forced);
+    }
+    gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
+}
+
+/// E2E hook: when `ROCM_E2E_FORCE_LOW_VRAM` names a GPU ordinal, report that GPU
+/// as almost entirely occupied, overriding the real telemetry.
+///
+/// The serve-plan low-VRAM OOM warning (and, for vLLM, its
+/// `--gpu-memory-utilization` note) only fires when a *selected* GPU is below
+/// [`AUTO_FREE_VRAM_FRACTION`] free. The GPU lane's real cards are comfortably
+/// free, so without this seam the branch is unreachable in E2E and the note has
+/// no live coverage. Synthesizing one near-full single-GPU reading makes that
+/// path deterministic on the vLLM GPU lane (a non-APU host, so
+/// [`vram_capacity_is_meaningful`] still holds) without touching the device the
+/// engine actually launches on. Compiled only into the `e2e-test-hooks` binary;
+/// production builds never see it.
 #[cfg(feature = "e2e-test-hooks")]
 fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
     let index: u32 = std::env::var("ROCM_E2E_FORCE_LOW_VRAM")
@@ -22112,14 +22132,6 @@ fn simulated_low_vram_usage() -> Option<Vec<GpuVramUsage>> {
         used_mb: total_mb - 512,
         total_mb,
     }])
-}
-
-fn gpu_vram_usage() -> Option<Vec<GpuVramUsage>> {
-    #[cfg(feature = "e2e-test-hooks")]
-    if let Some(forced) = simulated_low_vram_usage() {
-        return Some(forced);
-    }
-    gpu_vram_usage_amd_smi().or_else(gpu_vram_usage_sysfs)
 }
 
 /// The `amd-smi` half of [`gpu_vram_usage`], routed through the guarded
