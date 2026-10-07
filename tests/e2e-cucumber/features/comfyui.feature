@@ -118,10 +118,10 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # this mutates only its own isolated runtime prefix, not the OS.
   @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly
   Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
-    Given an isolated machine with a managed ROCm runtime
+    Given a machine with a managed ROCm runtime
     And the runtime's torch is not a CUDA build
-    When the user installs ComfyUI into the isolated runtime
+    When the user installs ComfyUI without choosing a runtime
     Then the install succeeds
     And ComfyUI's dependencies were installed into the runtime
-    And the runtime's torch is unchanged
+    And the runtime's torch stack is unchanged
     And no CUDA nvidia packages were added to the runtime

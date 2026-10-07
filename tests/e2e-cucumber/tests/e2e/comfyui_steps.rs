@@ -49,8 +49,7 @@
 //! `comfyui-05` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
 //! isolated managed runtime and asserts the runtime's torch is unchanged, no
 //! `nvidia-*` distributions appeared, and the install really added packages. It
-//! reuses the planted-runtime scenarios' argument-less `comfyui install` When step
-//! under a second phrase.
+//! reuses `comfyui-03`'s argument-less `comfyui install` When step.
 //!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
@@ -381,7 +380,6 @@ async fn plant_two_ready_runtimes(world: &mut E2eWorld) {
 }
 
 #[when("the user installs ComfyUI without choosing a runtime")]
-#[when("the user installs ComfyUI into the isolated runtime")]
 async fn install_comfyui_without_runtime(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install"]);
     world.cli_output = Some(stdout);
@@ -596,8 +594,8 @@ const TORCH_DIST_PROBE: &str = "import json,sys\n\
 /// Locate the managed runtime's venv interpreter. `rocm runtimes list` prints an
 /// `install_root: <path>` line for each installed runtime; the interpreter lives
 /// under a `bin/python` (Unix) / `Scripts/python.exe` (Windows) inside that tree.
-/// The exact env sub-layout is an internal detail, so search for the interpreter
-/// rather than reconstruct the path — black-box, and tolerant of layout changes.
+/// The interpreter is expected at `<install_root>/bin/python`; see
+/// [`find_venv_python`].
 ///
 /// Reads `runtimes list` rather than `examine`: examine only prints a `Folder:`
 /// line for the *active* runtime and takes a different branch when none is marked
@@ -625,12 +623,10 @@ fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
 
 /// Locate a `bin/python` (Unix) or `Scripts/python.exe` (Windows) under `root`.
 ///
-/// The documented layout is probed FIRST: `root` itself is the initial frontier
-/// entry, so a managed runtime — whose interpreter is exactly `<install_root>/bin/
-/// python` — is found on the first iteration with no directory traversal at all.
-/// The depth-first walk below is only a fallback for a tree that does not match, and
-/// is depth-capped so a pathological one cannot hang the scenario rather than
-/// being a cost the normal path pays.
+/// The interpreter is expected exactly at `<install_root>/bin/python` (the product
+/// creates the venv at `install_root`). `root` is the initial frontier entry, so
+/// that layout is found on the first iteration with no traversal. The depth-first
+/// walk below is only a depth-capped tolerance fallback for a tree that differs.
 fn find_venv_python(root: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     let (bin, exe) = ("Scripts", "python.exe");
@@ -685,6 +681,39 @@ fn torch_version(python: &Path) -> Result<String, String> {
             .unwrap_or("probe reported no version and no error")
             .to_owned()),
     }
+}
+
+const TORCH_STACK_PROBE: &str = "import json,sys\n\
+     from importlib import metadata\n\
+     out={}\n\
+     for n in ('torch','torchvision','torchaudio'):\n\
+     \x20 try:\n\
+     \x20   out[n]=metadata.version(n)\n\
+     \x20 except metadata.PackageNotFoundError:\n\
+     \x20   out[n]=None\n\
+     sys.stdout.write(json.dumps(out))\n";
+
+/// Exact versions of the whole torch stack (`torch`, `torchvision`, `torchaudio`),
+/// formatted `name=version` (or `name=absent`), one per line. The product pins all
+/// three, so the scenario compares all three.
+fn torch_stack_versions(python: &Path) -> String {
+    let output = std::process::Command::new(python)
+        .args(["-c", TORCH_STACK_PROBE])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("torch stack probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    ["torch", "torchvision", "torchaudio"]
+        .iter()
+        .map(|n| {
+            let v = data.get(*n).and_then(serde_json::Value::as_str);
+            format!("{n}={}", v.unwrap_or("absent"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). Used
@@ -755,7 +784,7 @@ fn nvidia_distributions(python: &Path) -> Vec<String> {
         .collect()
 }
 
-#[given("an isolated machine with a managed ROCm runtime")]
+#[given("a machine with a managed ROCm runtime")]
 async fn setup_isolated_runtime(world: &mut E2eWorld) {
     // DELIBERATELY do NOT call `world.use_shared_runtimes()`: this scenario may
     // corrupt the runtime (that is the bug it pins), so it must own a private,
@@ -793,7 +822,7 @@ async fn assert_baseline_torch_not_cuda(world: &mut E2eWorld) {
     // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
     // it can require the install to have actually added something (see
     // `assert_dependencies_installed`).
-    world.comfyui_baseline_torch = version.ok();
+    world.comfyui_baseline_torch = Some(torch_stack_versions(&python));
     world.comfyui_baseline_distributions = Some(distributions);
 }
 
@@ -849,19 +878,19 @@ async fn assert_dependencies_installed(world: &mut E2eWorld) {
     );
 }
 
-#[then("the runtime's torch is unchanged")]
+#[then("the runtime's torch stack is unchanged")]
 async fn assert_torch_unchanged(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
-    let version = torch_version(&python);
+    let after = torch_stack_versions(&python);
     let baseline = world
         .comfyui_baseline_torch
         .as_deref()
-        .expect("no baseline torch version was captured");
+        .expect("no baseline torch stack was captured");
     assert_eq!(
-        version.as_deref(),
-        Ok(baseline),
-        "ComfyUI install replaced the managed runtime's torch \
-         (before: {baseline}, after: {version:?}, python: {})",
+        after,
+        baseline,
+        "ComfyUI install replaced part of the managed runtime's torch stack \
+         (before: [{baseline}], after: [{after}], python: {})",
         python.display()
     );
 }
