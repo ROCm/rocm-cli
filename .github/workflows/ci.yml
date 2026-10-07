@@ -1395,6 +1395,26 @@ jobs:
         if: steps.sccache_probe.outputs.active == 'true'
         run: sccache --show-stats
 
+  docs-links:
+    name: Markdown links resolve (lychee)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Deliberately NOT gated by the `changes` path filter, for the same reason
+    # as architecture-doc above: a markdown link can go stale when the file or
+    # heading it points at moves, without the markdown file itself changing.
+    # Run unconditionally instead.
+    #
+    # A manual E2E dispatch only exercises the E2E jobs; skip the rest.
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check markdown links
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --config lychee.toml './**/*.md'
+          fail: true
+
   docs-build:
     name: Sphinx docs build (-W)
     runs-on: ubuntu-latest
