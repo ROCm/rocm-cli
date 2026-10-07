@@ -368,6 +368,11 @@ If the workspace is already built:
 cargo xtask smoke --skip-build
 ```
 
+`--profile release` builds and smokes release binaries; it builds only the four
+binaries the gate runs (`rocm`, `rocmd`, and the two engines), not the whole
+workspace. `--target-dir <dir>` builds into that directory and looks for the
+binaries there; without it, a configured `CARGO_TARGET_DIR` is honoured.
+
 ### Property tests
 
 `proptest` properties run with the rest of `cargo test`. One on proptest's
