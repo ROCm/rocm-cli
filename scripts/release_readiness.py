@@ -716,33 +716,36 @@ def _assert_verification_wiring(expected_key: Path) -> None:
         )
 
 
-def _run_main(dist: Path, *flags: str) -> tuple[int | None, str]:
-    """Drive `main` in-process. Returns its exit code (`None` if it returned).
+def _run_main(dist: Path, *flags: str) -> tuple[int | None, str, str]:
+    """Drive `main` in-process.
 
-    Stderr is captured so a case that expects `main` to fail does not print
-    `release readiness failed: ...` into the log of a passing run.
+    Returns ``(exit code or None if it returned, stdout, stderr)``. Both streams
+    are captured: stderr so a case expecting failure does not print
+    ``release readiness failed: ...`` into the log of a passing run, and stdout
+    so cases can assert on what the run claimed it did.
     """
     saved_argv = sys.argv
     sys.argv = ["release_readiness.py", "--dist", str(dist), *flags]
-    captured = io.StringIO()
+    out, err = io.StringIO(), io.StringIO()
     try:
-        with (
-            contextlib.redirect_stderr(captured),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             try:
                 main()
             except SystemExit as exit_error:
                 code = exit_error.code
-                return (code if isinstance(code, int) else 1), captured.getvalue()
-        return None, captured.getvalue()
+                return (
+                    (code if isinstance(code, int) else 1),
+                    out.getvalue(),
+                    err.getvalue(),
+                )
+        return None, out.getvalue(), err.getvalue()
     finally:
         sys.argv = saved_argv
 
 
 def _assert_main_refuses_without_a_key(dist: Path) -> None:
     """`--require-signatures` with no key must fail, and say so."""
-    code, stderr = _run_main(dist, "--require-signatures")
+    code, _stdout, stderr = _run_main(dist, "--require-signatures")
     if code is None:
         raise ReadinessError(
             "main accepted a signature-required run with no key configured; "
@@ -757,35 +760,66 @@ def _assert_main_refuses_without_a_key(dist: Path) -> None:
         )
 
 
-def _assert_main_verifies(dist: Path) -> None:
-    """`main` must reach `verify_signature`, not merely decide that it should.
+def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
+    """`main` must verify, against the resolved key, and say which key that was.
 
-    Driving only the refusal path is not enough. It fails inside
-    `resolve_verification`, before `validate_release` is reached, so `main`
-    could still pass `verify=False` at that call and never verify anything --
-    the original fail-open, with the key line printed as though it had. Record
-    the call instead: with a key resolvable, a `--require-signatures` run must
-    both succeed and have asked for verification.
+    Three things have to hold together, because each is separately silent:
+    verification has to happen at all; it has to use the key
+    `resolve_signing_key` chose, since `cargo xtask verify` falls back to the
+    inline PEM when `--public-key` is omitted and would then check a different
+    key than the run reports; and the `signature verification key:` line has to
+    name that same key, or the log makes a claim nothing backs.
     """
-    verified: list[Path] = []
+    # Intercept at the subprocess boundary rather than stubbing
+    # `verify_signature`, so the real argv is built and the `--public-key`
+    # handoff is covered too. Stubbing the function instead leaves `key_args`
+    # unexercised: dropping it stays green while verification silently falls
+    # back to whatever the inline PEM holds.
+    argvs: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = ""
+
     module = sys.modules[__name__]
-    original = module.verify_signature
-    module.verify_signature = lambda archive, signature, public_key: verified.append(
-        archive
+    original_run, original_which = module.subprocess.run, module.shutil.which
+    module.subprocess.run = lambda argv, **_kwargs: (
+        argvs.append(list(argv)),
+        _Completed(),
+    )[1]
+    module.shutil.which = lambda name: (
+        "/fake/cargo" if name == "cargo" else original_which(name)
     )
     try:
-        code, stderr = _run_main(dist, "--require-signatures")
+        code, stdout, stderr = _run_main(dist, "--require-signatures")
     finally:
-        module.verify_signature = original
+        module.subprocess.run, module.shutil.which = original_run, original_which
     if code is not None:
         raise ReadinessError(
             f"main rejected a run it should have accepted (exit {code}): "
             f"{stderr.strip()!r}"
         )
-    if not verified:
+    if not argvs:
         raise ReadinessError(
             "main completed a --require-signatures run without verifying any "
             "signature; the verify decision is not reaching validate_release"
+        )
+    resolved = str(expected_key.resolve())
+    for argv in argvs:
+        if "--public-key" not in argv or resolved not in argv:
+            raise ReadinessError(
+                f"verification ran without --public-key {resolved}: {argv!r}. "
+                "`cargo xtask verify` falls back to the inline PEM when the flag "
+                "is omitted, so this would check a different key than the run "
+                "reports."
+            )
+    expected_line = (
+        f"signature verification key: ${SIGNING_PUBLIC_KEY_PATH_ENV} ({expected_key})"
+    )
+    if expected_line not in stdout:
+        raise ReadinessError(
+            f"the run did not report the key it used; expected {expected_line!r} "
+            f"in stdout, got {stdout.strip()!r}"
         )
 
 
@@ -1182,9 +1216,15 @@ def run_self_test(root: Path) -> None:
         }
         run_with_env(no_key_env, lambda: _assert_main_refuses_without_a_key(gate_dist))
         print("release readiness self-test: main refuses without a key ok")
+        # A key that exists on disk, because this case lets the real
+        # `verify_signature` run and it rejects a named key that is not a file.
+        # `key_path` above stays absent on purpose, to pin that a named-but-
+        # missing key still wins resolution rather than falling through.
+        real_key = root / "present-public-key.pem"
+        real_key.write_text(inline_pem, encoding="ascii")
         run_with_env(
-            {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: key_path},
-            lambda: _assert_main_verifies(gate_dist),
+            {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: real_key},
+            lambda: _assert_main_verifies(gate_dist, real_key),
         )
         print("release readiness self-test: main actually verifies ok")
     finally:
