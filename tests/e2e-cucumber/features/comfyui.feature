@@ -111,15 +111,15 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
   # @nightly, against this scenario's own isolated runtime prefix (it must never
   # share a runtime tree with other scenarios — it may corrupt it). Gated
-  # @requires-gpu @nightly, matching runtime-install-sdk-active, the other scenario
-  # that does a real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
+  # @requires-gpu @nightly, like runtime-install-sdk-active, which also does a
+  # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
   # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
   # combining it with @nightly would make this scenario unreachable on every lane;
   # this mutates only its own isolated runtime prefix, not the OS.
   @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly
   Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given an isolated machine with a managed ROCm runtime
-    And the runtime's torch is a ROCm build
+    And the runtime's torch is not a CUDA build
     When the user installs ComfyUI into the isolated runtime
     Then the install succeeds
     And ComfyUI's dependencies were installed into the runtime

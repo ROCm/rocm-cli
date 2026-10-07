@@ -49,8 +49,8 @@
 //! `comfyui-05` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
 //! isolated managed runtime and asserts the runtime's torch is unchanged, no
 //! `nvidia-*` distributions appeared, and the install really added packages. It
-//! uses its own When phrase because the planted-runtime step above hard-codes
-//! `--runtime-id`.
+//! reuses the planted-runtime scenarios' argument-less `comfyui install` When step
+//! under a second phrase.
 //!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
@@ -381,6 +381,7 @@ async fn plant_two_ready_runtimes(world: &mut E2eWorld) {
 }
 
 #[when("the user installs ComfyUI without choosing a runtime")]
+#[when("the user installs ComfyUI into the isolated runtime")]
 async fn install_comfyui_without_runtime(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install"]);
     world.cli_output = Some(stdout);
@@ -573,17 +574,16 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 // --- comfyui-05: installing ComfyUI must not damage the managed ROCm runtime ---
 
 /// Report the installed torch distribution's version string via `importlib.metadata`
-/// — WITHOUT importing torch. Emits JSON `{version}` (e.g. `2.7.0+rocm6.4` for a
-/// ROCm build, `2.7.0+cu128` for a CUDA build) or `{error}` when no torch
+/// — WITHOUT importing torch. Emits JSON `{version}` (e.g. `2.11.0+gitd0c8b1f` for
+/// TheRock's ROCm build, `2.7.0+cu128` for a CUDA build) or `{error}` when no torch
 /// distribution is installed.
 ///
 /// Deliberately does not `import torch`: importing it loads the ROCm/CUDA shared
 /// libraries, which need the runtime's `LD_LIBRARY_PATH`/`ROCM_PATH` set up (the
 /// product runs its own torch probe *with* that env, ours runs the interpreter
-/// bare). The `+rocm` / `+cu` local-version label in the dist metadata is the
-/// definitive ROCm-vs-CUDA discriminator and is readable with no native load — so
-/// a bare interpreter suffices, and a runtime whose torch is present but whose
-/// native libs aren't on our env no longer reads as "not a ROCm build".
+/// bare). The version string in the dist metadata is readable with no native
+/// load, so a bare interpreter suffices. Only a `+cu` label reliably marks a CUDA
+/// build; TheRock's ROCm torch is labelled with a git hash, not `+rocm`.
 const TORCH_DIST_PROBE: &str = "import json,sys\n\
      from importlib import metadata\n\
      out={}\n\
@@ -604,7 +604,7 @@ const TORCH_DIST_PROBE: &str = "import json,sys\n\
 /// active, so it is not a reliable source for the install root (this cost a GPU
 /// dispatch — the scenario panicked on a missing `Folder:` there). `runtimes list`
 /// prints `install_root:` for every installed runtime unconditionally.
-fn active_runtime_python(world: &E2eWorld) -> PathBuf {
+fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
     let (listing, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     let roots: Vec<&str> = listing
         .lines()
@@ -763,18 +763,18 @@ async fn setup_isolated_runtime(world: &mut E2eWorld) {
     // so a plain `install sdk` here lands in this scenario's own tree.
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk"]);
+        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
     }
     let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
     assert!(
         !stdout.contains("installed: none"),
-        "no managed runtime is active after install:\n{stdout}"
+        "no managed runtime is installed after `install sdk`:\n{stdout}"
     );
 }
 
-#[given("the runtime's torch is a ROCm build")]
-async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
-    let python = active_runtime_python(world);
+#[given("the runtime's torch is not a CUDA build")]
+async fn assert_baseline_torch_not_cuda(world: &mut E2eWorld) {
+    let python = sole_runtime_python(world);
     let version = torch_version(&python);
     assert!(
         version.as_ref().is_ok_and(|v| !is_cuda_torch(v)),
@@ -790,22 +790,11 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
         "runtime already has nvidia-* distributions before ComfyUI install; premise absent"
     );
     // Record the exact baseline version so the post-install step can require it to
-    // be unchanged (see `assert_torch_still_rocm`), and the baseline package set so
+    // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
     // it can require the install to have actually added something (see
     // `assert_dependencies_installed`).
     world.comfyui_baseline_torch = version.ok();
     world.comfyui_baseline_distributions = Some(distributions);
-}
-
-#[when("the user installs ComfyUI into the isolated runtime")]
-async fn user_installs_comfyui(world: &mut E2eWorld) {
-    // Capture the outcome rather than asserting here: the exit code is checked by
-    // its own Then step, so a failure is reported as that step failing rather than
-    // as a mid-scenario panic in the action.
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "install"]);
-    world.cli_output = Some(stdout);
-    world.cli_stderr = Some(stderr);
-    world.cli_rc = Some(rc);
 }
 
 #[then("the install succeeds")]
@@ -844,7 +833,7 @@ async fn assert_dependencies_installed(world: &mut E2eWorld) {
     // dependency: ComfyUI's requirements drift upstream independently of this
     // contract, so a named package would rot, while "the install put something in
     // the runtime" is exactly the premise the invariants need and cannot go stale.
-    let python = active_runtime_python(world);
+    let python = sole_runtime_python(world);
     let baseline = world
         .comfyui_baseline_distributions
         .as_ref()
@@ -861,8 +850,8 @@ async fn assert_dependencies_installed(world: &mut E2eWorld) {
 }
 
 #[then("the runtime's torch is unchanged")]
-async fn assert_torch_still_rocm(world: &mut E2eWorld) {
-    let python = active_runtime_python(world);
+async fn assert_torch_unchanged(world: &mut E2eWorld) {
+    let python = sole_runtime_python(world);
     let version = torch_version(&python);
     let baseline = world
         .comfyui_baseline_torch
@@ -879,7 +868,7 @@ async fn assert_torch_still_rocm(world: &mut E2eWorld) {
 
 #[then("no CUDA nvidia packages were added to the runtime")]
 async fn assert_no_nvidia_packages(world: &mut E2eWorld) {
-    let python = active_runtime_python(world);
+    let python = sole_runtime_python(world);
     let nvidia = nvidia_distributions(&python);
     assert!(
         nvidia.is_empty(),
