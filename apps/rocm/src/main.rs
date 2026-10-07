@@ -23987,7 +23987,11 @@ mod tests {
         );
         let error = plan.refusal_error().expect("a refusal error");
         assert!(
-            error.contains("data folder / is the top of the filesystem"),
+            // The root prints in the host's own spelling (`\\` on Windows).
+            error.contains(&format!(
+                "data folder {} is the top of the filesystem",
+                plan.refused[0].path.display()
+            )),
             "{error}"
         );
         assert!(error.contains("--keep-data"), "{error}");
@@ -23999,7 +24003,10 @@ mod tests {
             },
         );
         assert!(
-            rendered.contains("  - data: / is the top of the filesystem"),
+            rendered.contains(&format!(
+                "  - data: {} is the top of the filesystem",
+                plan.refused[0].path.display()
+            )),
             "{rendered}"
         );
         assert!(!rendered.contains("Choose Review uninstall"), "{rendered}");
@@ -24135,9 +24142,10 @@ mod tests {
         let plan = refused_plan(&root);
         let error = plan.refusal_error().expect("refused");
         assert!(
-            error.contains(
-                "the data folder / is the top of the filesystem (set by ROCM_CLI_DATA_DIR)"
-            ),
+            error.contains(&format!(
+                "the data folder {} is the top of the filesystem (set by ROCM_CLI_DATA_DIR)",
+                plan.refused[0].path.display()
+            )),
             "{error}"
         );
         assert!(
