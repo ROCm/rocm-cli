@@ -1558,24 +1558,36 @@ const MANAGED_ENGINE_STARTUP_FAILURE_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTU
 
 #[then("serving fails and names the engine's own log")]
 async fn assert_startup_death_names_log(world: &mut E2eWorld) {
+    assert_startup_death_reported(world, "serve");
+}
+
+/// The claim both managed-spawn paths make when their engine dies on the way up:
+/// the command fails, says the engine exited immediately, and names the engine's
+/// own log. Shared by serve-24 (launch) and serve-25 (restart) so the two paths
+/// are held to one assertion rather than two that can drift apart — the whole
+/// reason the restart path's copy of this check went uncovered.
+///
+/// `action` names the command under test, so a failure report says which of the
+/// two paths produced the output.
+fn assert_startup_death_reported(world: &E2eWorld, action: &str) {
     let output = serve_output(world);
     assert_ne!(
         world.cli_rc,
         Some(0),
-        "an engine that died at startup must fail the serve:\n{output}"
+        "an engine that died at startup must fail the {action}:\n{output}"
     );
     // See the note in assert_lemonade_preparation_retry_is_bounded: the seam that
     // scripts the death also waives the no-GPU pre-flight, so this refusal can
     // only appear when the binary under test was built without the feature.
     assert!(
         !output.contains("no usable AMD GPU detected"),
-        "serve stopped at the no-GPU pre-flight, so the binary under test was \
-         built without the `rocm/e2e-test-hooks` feature and never reached the \
-         engine launch:\n{output}"
+        "the {action} stopped at the no-GPU pre-flight, so the binary under test \
+         was built without the `rocm/e2e-test-hooks` feature and never reached \
+         the engine launch:\n{output}"
     );
     assert!(
         output.contains("managed engine exited immediately"),
-        "expected the launch to report the engine's immediate exit:\n{output}"
+        "expected the {action} to report the engine's immediate exit:\n{output}"
     );
     // The child is detached, so its own log is the only account of why it died —
     // the user has to be told where it is. The path is read off the record the
@@ -1605,7 +1617,7 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         .collect();
     assert!(
         !log_paths.is_empty(),
-        "the failed launch left no lemonade service record in {}",
+        "the failed {action} left no lemonade service record in {}",
         services.display()
     );
     assert!(
@@ -1643,5 +1655,120 @@ async fn assert_failed_launch_does_not_block_retry(world: &mut E2eWorld) {
         output.contains("managed engine exited immediately"),
         "the retry must reach the engine launch again rather than being turned \
          away by the previous failed launch:\n{output}"
+    );
+}
+
+// ── serve-25: the restart path's own startup death ──────────────────
+
+/// Establish the premise serve-25 restarts: a real managed service record,
+/// created by a real `rocm serve --managed` whose engine was scripted to die.
+///
+/// The record has to come from the product, not be planted: `rocm services
+/// restart` rebuilds the engine's whole argument vector out of the record's own
+/// fields (engine, canonical model id, device policy, runtime/env ids, recipe),
+/// so a hand-written record would be testing the fixture's plausibility rather
+/// than the restart. Arming the scripted death is what lets that serve run to a
+/// real spawn here — it also waives the no-GPU pre-flight and engine
+/// preparation, so no GPU and no installed runtime are needed.
+///
+/// That the serve fails is incidental to this step; serve-24 is what asserts
+/// how. All this step needs is the record it leaves behind.
+#[given("a Lemonade service whose engine dies during startup")]
+async fn setup_lemonade_service_that_dies_at_startup(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push((MANAGED_ENGINE_STARTUP_FAILURE_ENV, "1".into()));
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            "Qwen3-0.6B-GGUF",
+            "--engine",
+            "lemonade",
+            "--managed",
+        ],
+    );
+    assert_ne!(
+        rc, 0,
+        "the premise is a service whose engine dies, but the serve succeeded:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        !lemonade_service_ids(world).is_empty(),
+        "the serve left no lemonade service record to restart; if it stopped at \
+         the no-GPU pre-flight the binary under test was built without the \
+         `rocm/e2e-test-hooks` feature:\n{stdout}\n{stderr}"
+    );
+}
+
+/// Ids of the lemonade services the CLI itself reports, newest first.
+///
+/// Read through `rocm services list --all --json` — the CLI's own
+/// machine-readable view — rather than off the records in the data dir, so the
+/// id a step restarts is one a user could have obtained the same way.
+fn lemonade_service_ids(world: &E2eWorld) -> Vec<String> {
+    let listed = crate::run_rocm_ok(world, &["services", "list", "--all", "--json"]);
+    serde_json::from_str::<serde_json::Value>(&listed)
+        .unwrap_or_else(|e| panic!("`services list --all --json` is not JSON: {e}\n{listed}"))
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter(|record| record["engine"] == "lemonade")
+        .filter_map(|record| record["service_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[when("the user restarts that service")]
+async fn user_restarts_that_service(world: &mut E2eWorld) {
+    let service_id = lemonade_service_ids(world)
+        .into_iter()
+        .next()
+        .expect("no lemonade service to restart");
+    // Re-arm the seam: the runner consumes the scenario env on each invocation,
+    // and the Given's serve already spent it. Without this the restart would
+    // spawn a *real* engine and the scenario would be testing nothing.
+    world
+        .command_env
+        .push((MANAGED_ENGINE_STARTUP_FAILURE_ENV, "1".into()));
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["services", "restart", &service_id, "--yes"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the restart fails and names the engine's own log")]
+async fn assert_restart_startup_death_names_log(world: &mut E2eWorld) {
+    assert_startup_death_reported(world, "restart");
+}
+
+#[then("the service is retired rather than left claiming to be running")]
+async fn assert_restart_retires_the_service(world: &mut E2eWorld) {
+    // A restart that dies at startup must not leave the record claiming to be
+    // up. The default `services list` view shows only records the CLI considers
+    // live, so a service still listed there after the restart failed is the
+    // wedge itself, stated in the user's own terms.
+    let live = crate::run_rocm_ok(world, &["services", "list"]);
+    assert!(
+        live.contains("No local servers are running."),
+        "a restart whose engine died at startup left a service listed as \
+         running:\n{live}"
+    );
+    // And it is retired as *failed*, not merely demoted to stopped. The
+    // difference is not cosmetic: `rocmd`'s server-recover watcher acts on a
+    // `failed` record on its next tick, so a restart that dies is picked back up
+    // instead of being left down, where a `stopped` one is left alone. `--all`
+    // is the view that shows records the default one hides.
+    let all = crate::run_rocm_ok(world, &["services", "list", "--all"]);
+    let service_id = lemonade_service_ids(world)
+        .into_iter()
+        .next()
+        .expect("the failed restart left no lemonade service record");
+    assert!(
+        all.contains(&service_id),
+        "the restarted service {service_id} is missing from the full list:\n{all}"
+    );
+    assert!(
+        all.contains("  status: failed"),
+        "expected the failed restart to retire {service_id} as `failed`:\n{all}"
     );
 }
