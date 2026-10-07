@@ -261,6 +261,13 @@ pub(crate) fn run_rocm_capture_for_paths(
     })
 }
 
+pub(crate) fn optional_arg(flag: &str, value: Option<&str>) -> Vec<String> {
+    match value {
+        Some(value) => vec![flag.to_owned(), value.to_owned()],
+        None => Vec::new(),
+    }
+}
+
 pub(crate) fn engine_healthcheck_response(
     paths: &AppPaths,
     engine: &str,
