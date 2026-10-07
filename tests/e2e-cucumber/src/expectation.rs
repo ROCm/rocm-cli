@@ -1214,6 +1214,44 @@ serve_timeout_secs = 90
         }
     }
 
+    /// The two scenarios that script a managed engine's death at startup
+    /// (serve-24, launch; serve-25, restart) carry no capability tag on purpose,
+    /// so they run on every lane — the seam that scripts the death also waives
+    /// the host preconditions, so their premise holds regardless of hardware.
+    ///
+    /// The Windows lane is the one that matters most: both startup checks are
+    /// newest there, and a plausible-looking `@requires-no-gpu` would skip
+    /// exactly the hosts that HAVE a GPU, that lane among them. A comment in the
+    /// feature file says so; this resolves the file's REAL tag lines so adding a
+    /// gate to either scenario fails a test rather than quietly retiring the
+    /// coverage on the lane it was written for.
+    #[test]
+    fn the_scripted_startup_death_scenarios_run_on_every_lane() {
+        let feature = include_str!("../features/model_serving.feature");
+        let m = Expectations::default();
+        for id in [
+            "serve-managed-engine-dies-at-startup",
+            "serve-managed-engine-dies-at-restart",
+        ] {
+            let d = ScenarioDecl::from_tags(&feature_tags(feature, id));
+            for host in [
+                "mi300x",
+                "strix-ubuntu",
+                "strix-windows",
+                "wsl2",
+                "wsl",
+                "wsl-no-passthrough",
+                "mock",
+            ] {
+                assert_eq!(
+                    resolve(&d, &cap(host), &m, Included::default()),
+                    Expectation::ExpectPass,
+                    "{host} must run {id}"
+                );
+            }
+        }
+    }
+
     /// The single-GPU skip must name the count, not just repeat the `@requires-gpu`
     /// reason: on Strix Halo a GPU *is* present, so "none detected" would send a
     /// reader of the report looking for a missing device that is right there.
