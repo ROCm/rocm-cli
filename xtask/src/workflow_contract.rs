@@ -2279,8 +2279,12 @@ esac
     /// and silently reopen that gap.
     #[test]
     fn license_headers_hook_has_no_file_type_filter() {
+        // CRLF-normalize: `.pre-commit-config.yaml` isn't forced to `eol=lf` in
+        // .gitattributes, so a Windows checkout can give `\r\n` line endings,
+        // which `hook_block`'s `\n`-anchored marker would otherwise miss.
         let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
-            .expect("reading .pre-commit-config.yaml");
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
         let block = hook_block(&config, "license-headers");
         assert!(
             block.contains("always_run: true"),
