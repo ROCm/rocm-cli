@@ -46,7 +46,7 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
 
 The manifest hooks only run when you change the dependency graph, and they *rewrite* the generated file rather than just reporting it stale — when that happens the commit stops so you can re-stage the refreshed file. `THIRD_PARTY_NOTICES.txt` additionally needs the pinned generator; without it that hook skips and CI remains the gate:
 
@@ -54,11 +54,13 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
-The license-headers hook (`hawkeye`) runs on both commit and push for matching files. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard rather than skipping when the binary is missing:
+The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged — it has no file-type filter, because hawkeye always scans the whole repo per `licenserc.toml` regardless of which files changed. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard rather than skipping when the binary is missing:
 
 ```bash
 cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
 ```
+
+To commit or push without it (for example, while iterating without the binary installed), skip it explicitly: `SKIP=license-headers git commit ...`. CI's `license-headers` job still enforces the check either way.
 
 ### Workspace layout
 

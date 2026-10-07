@@ -2145,38 +2145,39 @@ esac
         );
     }
 
-    /// Extract the version token right after `{tool}@` in `line`, up to the
-    /// next whitespace. `cargo install hawkeye@7.0.0 --locked` yields `7.0.0`.
-    /// Compared for exact equality (not `contains`) so neither a stale
-    /// duplicate pin nor a version sharing a prefix (`0.9.10` satisfying a
-    /// check for `0.9.1`) can false-pass.
-    fn pin_token<'a>(line: &'a str, tool: &str) -> Option<&'a str> {
-        let marker = format!("{tool}@");
-        let (_, rest) = line.split_once(&marker)?;
+    /// Extract the version token right after `marker` in `line`, up to the
+    /// next whitespace. With marker `"hawkeye@"`, `cargo install hawkeye@7.0.0
+    /// --locked` yields `7.0.0`. The line is comment-stripped first, so a pin
+    /// mentioned only inside a `# ...` comment can't satisfy a check meant
+    /// for the real line beside it. Compared for exact equality (not
+    /// `contains`) so neither a stale duplicate pin nor a version sharing a
+    /// prefix (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
+    fn pin_token<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        let (_, rest) = strip_comment(line).split_once(marker)?;
         Some(rest.split_whitespace().next().unwrap_or(rest))
     }
 
-    /// Every `{tool}@` line in `text` — not just the first — must pin exactly
-    /// `expected`: a stale duplicate left behind by a previous bump must not
-    /// go unnoticed.
-    fn assert_pins_match(tool: &str, expected: &str, path: &Path, text: &str) {
+    /// Every `marker` occurrence in `text` — not just the first — must pin
+    /// exactly `expected`: a stale duplicate left behind by a previous bump
+    /// must not go unnoticed.
+    fn assert_pins_match(marker: &str, expected: &str, path: &Path, text: &str) {
         let mut found = false;
         for line in text.lines() {
-            let Some(token) = pin_token(line, tool) else {
+            let Some(token) = pin_token(line, marker) else {
                 continue;
             };
             found = true;
             assert_eq!(
                 token,
                 expected,
-                "{} pins `{tool}@{token}`, which does not match the pinned version \
+                "{} pins `{marker}{token}`, which does not match the pinned version \
                  `{expected}`:\n{line}",
                 path.display()
             );
         }
         assert!(
             found,
-            "{} has no `{tool}@` pin; expected `{tool}@{expected}`",
+            "{} has no `{marker}` pin; expected `{marker}{expected}`",
             path.display()
         );
     }
@@ -2195,7 +2196,15 @@ esac
     /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
     /// here — see the comment at its definition. cargo-about's canonical
     /// version is the `ABOUT_VERSION` constant in `tpn.rs`, which is what
-    /// `cargo xtask tpn` itself builds against.
+    /// `cargo xtask tpn` itself builds against. A cargo-about bump needs six
+    /// edits across four files — the four `cargo-about@` install lines
+    /// (CONTRIBUTING.md, MANIFEST.md, ci.yml, dependabot-manifests.yml) and
+    /// the two `${{ runner.os }}-cargo-about-<version>` cache keys in ci.yml
+    /// and dependabot-manifests.yml — and this test guards all six: the
+    /// cache keys use a `-` instead of `@`, so they need their own marker row
+    /// rather than the `cargo-about@` one. A forgotten cache-key bump would
+    /// otherwise cache-hit the OLD binary while `tpn --check` enforces the
+    /// NEW version, failing loudly but in a confusing place.
     ///
     /// One table, one check: a new pinned tool, or a new file that mentions
     /// an existing one, costs a row here rather than another ~30-line test.
@@ -2212,6 +2221,7 @@ esac
             .strip_prefix('v')
             .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{hawkeye_installed}` must be `v`-prefixed"))
             .to_owned();
+        let about_version = crate::tpn::ABOUT_VERSION.to_owned();
 
         let root = repo_root();
         let read = |rel: &str| {
@@ -2219,11 +2229,11 @@ esac
             std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
         };
 
-        let table: [(&str, String, &[&str]); 2] = [
-            ("hawkeye", hawkeye_version, &["CONTRIBUTING.md"]),
+        let table: [(&str, String, &[&str]); 3] = [
+            ("hawkeye@", hawkeye_version, &["CONTRIBUTING.md"]),
             (
-                "cargo-about",
-                crate::tpn::ABOUT_VERSION.to_owned(),
+                "cargo-about@",
+                about_version.clone(),
                 &[
                     "CONTRIBUTING.md",
                     "MANIFEST.md",
@@ -2231,17 +2241,93 @@ esac
                     ".github/workflows/dependabot-manifests.yml",
                 ],
             ),
+            (
+                "cargo-about-",
+                about_version,
+                &[
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
         ];
 
-        for (tool, expected, files) in table {
+        for (marker, expected, files) in table {
             for file in files {
-                assert_pins_match(tool, &expected, &root.join(file), &read(file));
+                assert_pins_match(marker, &expected, &root.join(file), &read(file));
             }
         }
     }
 
+    /// Extract one prek hook's complete YAML block by its `- id:` value, up to
+    /// the blank line that separates it from the next hook.
+    fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
+        let marker = format!("- id: {id}\n");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!(".pre-commit-config.yaml defines hook `{id}`"));
+        let rest = &text[start + marker.len()..];
+        let end = rest.find("\n\n").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Regression guard for the gap this PR closed: the `license-headers`
+    /// hook must have no `types_or` file-type filter, because hawkeye scans
+    /// the whole repo per `licenserc.toml` (`pass_filenames: false`)
+    /// regardless of which files changed — a filter only ever decides
+    /// whether the hook *fires*, and can never track `licenserc.toml`'s own
+    /// include list. Without this, a future edit could reintroduce a filter
+    /// and silently reopen that gap.
+    #[test]
+    fn license_headers_hook_has_no_file_type_filter() {
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml");
+        let block = hook_block(&config, "license-headers");
+        assert!(
+            block.contains("always_run: true"),
+            "license-headers hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            !block.contains("types_or:"),
+            "license-headers hook must not have a `types_or` filter — hawkeye already \
+             scans the whole repo regardless of which files changed, so a filter only \
+             gates whether the hook fires and can reopen the `licenserc.toml` gap this \
+             test guards against:\n{block}"
+        );
+    }
+
     // Extractor guards: prove the helpers actually parse multiline forms, so the
     // contract tests above can't silently false-pass on a shape they don't handle.
+    #[test]
+    fn pin_token_rejects_prefixes_and_comment_only_mentions() {
+        assert_eq!(
+            pin_token("cargo install cargo-about@0.9.1 --locked", "cargo-about@"),
+            Some("0.9.1")
+        );
+        // A version sharing a prefix must not compare equal to the one it shares
+        // a prefix with — `contains` would wrongly let this satisfy `"0.9.1"`.
+        assert_ne!(
+            pin_token("cargo install cargo-about@0.9.10 --locked", "cargo-about@"),
+            Some("0.9.1")
+        );
+        // A pin mentioned only after a trailing ` #` comment (the real line
+        // changed to something else) must not be seen.
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about --version 0.9.0  # was cargo-about@0.9.1",
+                "cargo-about@"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.8.0`")]
+    fn assert_pins_match_flags_a_stale_duplicate_pin() {
+        let text = "cargo install cargo-about@0.9.1 --locked\n\
+                     cargo install cargo-about@0.8.0 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
     #[test]
     fn runs_on_extractor_flattens_multiline_forms() {
         let yaml = "\
