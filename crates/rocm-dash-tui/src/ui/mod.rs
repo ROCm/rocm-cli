@@ -164,6 +164,49 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
         modal::grey_overlay(f);
         approval::draw_approval(f, body, &pa.req, pa.choice, &theme);
     }
+
+    // Quit-confirm prompt (issue #145): a quit attempted while a model is
+    // still serving. Same reuse of the approval seam, same "drawn last, owns
+    // the screen" rule — `apply_action`/the event loop never let it be open
+    // at the same time as the chat approval above (see `quit_confirm`'s doc
+    // comment on `AppState`), so render order between the two never matters.
+    if let Some(choice) = state.quit_confirm {
+        modal::grey_overlay(f);
+        let req = approval::ApprovalRequest::new(
+            "Still serving — quit anyway?",
+            quit_confirm_body(state),
+        );
+        approval::draw_approval(f, body, &req, choice, &theme);
+    }
+}
+
+/// Body text for the quit-confirm prompt: name the models still serving
+/// (mirroring the Serving tab's "Running now" listing in
+/// `tabs::pane::detail_body`'s `OpenServices` arm, as plain lines instead of
+/// styled spans) and how to stop them first.
+fn quit_confirm_body(state: &AppState) -> Vec<String> {
+    let running: Vec<_> = state
+        .instances
+        .values()
+        .filter(|i| i.status.is_serving())
+        .collect();
+    let mut body = Vec::new();
+    if running.is_empty() {
+        // Can change between opening the prompt and this render (e.g. the
+        // model exits on its own while the prompt is up) — not dead code.
+        body.push("Nothing is being served anymore.".to_string());
+    } else {
+        for i in running.iter().take(5) {
+            body.push(format!("• {}", i.model_name));
+        }
+        if running.len() > 5 {
+            body.push(format!("  …and {} more", running.len() - 5));
+        }
+    }
+    body.push(String::new());
+    body.push("It keeps running in the background after you quit.".to_string());
+    body.push("Stop it first: rocm services stop <id> --yes".to_string());
+    body
 }
 
 /// Render a *focused-host* frame: theme background plus exactly ONE overlay.

@@ -49,7 +49,15 @@ impl AppState {
             "gpu" => self.active_tab = ActiveTab::Observe,
             "help" | "?" => self.modal = Modal::Help,
             "clear" => self.chat.clear(),
-            "quit" | "exit" => self.should_quit = true,
+            // A model still being served gets the same confirm prompt the
+            // `q` key opens (issue #145) instead of quitting outright.
+            "quit" | "exit" => {
+                if self.has_live_instance() {
+                    self.open_quit_confirm();
+                } else {
+                    self.should_quit = true;
+                }
+            }
             // --- Group B: read-only overlays (mirror the keybind handlers) ---
             "doctor" => {
                 self.close_overlays();

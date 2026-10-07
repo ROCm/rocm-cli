@@ -12,7 +12,7 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
+use crate::e2e::tui_driver::{QUIT_CONFIRM_MARKER, TermSignal, TuiSession, default_timeout};
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
@@ -530,6 +530,31 @@ async fn quit_tui(world: &mut E2eWorld, surface: &str) {
 #[when("the user quits the dashboard")]
 async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
+}
+
+/// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,
+/// this does not wait for (or resolve) the quit-confirm prompt that may open
+/// (issue #145), since the point of this step is to observe that prompt.
+#[when("the user tries to quit the dashboard")]
+async fn try_quit_dashboard(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+#[then("the dashboard asks whether to quit while a model is still being served")]
+async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
+#[when("the user declines the quit prompt")]
+async fn decline_quit_prompt(world: &mut E2eWorld) {
+    session(world)
+        .send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
 }
 
 #[when("the user quits interactive chat")]

@@ -60,7 +60,17 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 /// requests application exit (Quit).
 pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
-        KeyAction::Quit => return true,
+        // A model still being served gets a confirm prompt first (issue
+        // #145) — opening it, not quitting, is this arm's whole job; the
+        // event loop's dedicated `quit_confirm_pending` arm owns the actual
+        // exit once the prompt resolves.
+        KeyAction::Quit => {
+            if state.has_live_instance() {
+                state.open_quit_confirm();
+                return false;
+            }
+            return true;
+        }
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
@@ -785,6 +795,51 @@ mod tests {
         assert_eq!(with_modal(&Modal::Menu), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Palette), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Options), KeyAction::Quit);
+    }
+
+    #[test]
+    fn quit_exits_immediately_when_nothing_is_serving() {
+        // Regression guard (issue #145): the overwhelmingly common case —
+        // nothing running — must stay a one-keystroke quit, no prompt.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn quit_opens_a_confirm_prompt_when_a_model_is_serving() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(!apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn quit_confirm_key_approves_denies_and_cancels() {
+        use crate::ui::approval::ApprovalVerdict;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.open_quit_confirm();
+        assert_eq!(
+            s.on_quit_confirm_key(KeyCode::Char('y')),
+            Some(ApprovalVerdict::Approve)
+        );
+        s.open_quit_confirm();
+        assert_eq!(
+            s.on_quit_confirm_key(KeyCode::Char('n')),
+            Some(ApprovalVerdict::Deny)
+        );
+        s.open_quit_confirm();
+        assert_eq!(
+            s.on_quit_confirm_key(KeyCode::Esc),
+            Some(ApprovalVerdict::Cancel)
+        );
     }
 
     #[test]

@@ -255,6 +255,10 @@ pub struct AppState {
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
+    /// A quit attempted (`q`, or `/quit`/`/exit` in chat) while a managed
+    /// instance was still serving. `Some` ⇒ the confirm-before-quit prompt is
+    /// open and owns keyboard focus, the same way `approval` does.
+    pub(crate) quit_confirm: Option<crate::ui::approval::ApprovalChoice>,
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
     /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
@@ -366,6 +370,7 @@ impl AppState {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            quit_confirm: None,
             active_provider: ChatProvider::default(),
             provider_switch: None,
             update_status: UpdateStatus::Unknown,
@@ -594,14 +599,49 @@ impl AppState {
         self.approval.is_some()
     }
 
-    /// Whether *either* gating layer owns the screen: an open manager overlay
-    /// or a pending chat approval. This exact `||` is what every input path
-    /// that swallows for one must also swallow for the other — two call sites
-    /// wrote it out by hand before this existed, each with its own copy of
-    /// this same reasoning; a third forgetting one half would reopen the
-    /// class of bug `approval_pending`'s own doc comment describes.
+    /// True when a managed instance is actively serving from the user's point
+    /// of view — the gate for the confirm-before-quit prompt.
+    pub(crate) fn has_live_instance(&self) -> bool {
+        self.instances.values().any(|i| i.status.is_serving())
+    }
+
+    /// Whether the confirm-before-quit prompt is open. Mirrors
+    /// [`approval_pending`](Self::approval_pending): the event loop gives it
+    /// its own match arm above the normal per-tab dispatch, so no overlay can
+    /// pre-empt the decision.
+    pub(crate) const fn quit_confirm_pending(&self) -> bool {
+        self.quit_confirm.is_some()
+    }
+
+    /// Open the confirm-before-quit prompt with the shared default choice
+    /// (Approve — the user already asked to quit; this just confirms it).
+    pub(crate) fn open_quit_confirm(&mut self) {
+        self.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+    }
+
+    /// Route a key to the open quit-confirm prompt: move the cursor and
+    /// return a verdict if the key resolved one. No-op returning `None` when
+    /// no prompt is open.
+    pub(crate) fn on_quit_confirm_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> Option<crate::ui::approval::ApprovalVerdict> {
+        let choice = self.quit_confirm.as_mut()?;
+        let (new_choice, verdict) = crate::ui::approval::approval_key(code, *choice);
+        *choice = new_choice;
+        verdict
+    }
+
+    /// Whether *any* gating layer owns the screen: an open manager overlay, a
+    /// pending chat approval, or a pending quit-confirm prompt. This exact
+    /// `||` is what every input path that swallows for one must also swallow
+    /// for the others — call sites wrote it out by hand before this existed,
+    /// each with its own copy of this same reasoning; forgetting one would
+    /// reopen the class of bug `approval_pending`'s own doc comment
+    /// describes. The name predates the quit-confirm prompt; kept as-is to
+    /// avoid rippling a rename through every call site's comments.
     pub(crate) const fn overlay_or_approval(&self) -> bool {
-        self.has_open_overlay() || self.approval_pending()
+        self.has_open_overlay() || self.approval_pending() || self.quit_confirm_pending()
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -1937,6 +1977,23 @@ mod tests {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/exit"), SlashOutcome::Handled);
         assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_quit_opens_confirm_prompt_instead_when_a_model_is_serving() {
+        // Issue #145: `/quit` is gated the same way the `q` key is — it must
+        // not bypass the confirm prompt just because it came from chat.
+        let mut s = st();
+        s.instances.insert(
+            "vllm-1".into(),
+            rocm_dash_core::metrics::Instance {
+                status: rocm_dash_core::metrics::InstanceStatus::Ready,
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.handle_slash_command("/quit"), SlashOutcome::Handled);
+        assert!(!s.should_quit);
+        assert!(s.quit_confirm.is_some());
     }
 
     #[test]

@@ -328,3 +328,19 @@ Feature: Interactive dashboard
     Then the dashboard reports live GPU telemetry
     When the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #145: quitting used to leave a served model running in the background
+  # with no warning at all. Declining first, then confirming, in the same
+  # scenario pins both halves of the fix with one launch.
+  @id:dash-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-25 - Quitting while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    Then the managed model is displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

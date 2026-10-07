@@ -123,6 +123,11 @@ impl TermSignal {
     }
 }
 
+/// Marker text from the dash's quit-confirm prompt (issue #145), drawn as
+/// part of its title when a model is still serving. Shared with
+/// `dash_steps`'s `Then` step for the prompt so the two can't drift apart.
+pub(crate) const QUIT_CONFIRM_MARKER: &str = "quit anyway";
+
 /// A running `rocm` TUI attached to a pseudo-terminal.
 pub struct TuiSession {
     child: Box<dyn Child + Send + Sync>,
@@ -666,10 +671,19 @@ impl TuiSession {
     /// screen markers: if the first attempt landed (the common case), the
     /// process has already exited by the first check and nothing is resent.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
+        // Demo data and several fixtures leave a model serving, which opens
+        // the dash's quit-confirm prompt (issue #145) on `q` instead of
+        // exiting straight away. Once it's open, `q`/`Q` are read as Cancel
+        // (see `approval_key`), so blindly resending the same gesture below
+        // would flip the prompt open/closed forever instead of ever
+        // confirming it. The chat quit path (`/quit`) has no such prompt
+        // today, so this is a no-op there.
         let gesture = if self.is_chat { "/quit\r" } else { "q" };
         let deadline = Instant::now() + timeout;
         loop {
-            self.send(gesture)?;
+            let confirming =
+                !self.is_chat && self.screen_snapshot().0.contains(QUIT_CONFIRM_MARKER);
+            self.send(if confirming { "y" } else { gesture })?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             let attempt = KEY_RESEND_INTERVAL.min(remaining);
             match self.wait_for_exit_code_within(attempt).await {

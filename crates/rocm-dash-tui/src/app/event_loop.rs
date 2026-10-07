@@ -1131,6 +1131,21 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                             None => { /* cursor moved or key ignored — modal stays open */ }
                         }
                     }
+                    // The quit-confirm prompt (issue #145), when open, owns
+                    // every remaining key the same way the approval modal
+                    // above does — nothing behind it can pre-empt the
+                    // decision. Only the Ctrl-C arm above outranks it, for
+                    // the same reason it outranks the approval modal.
+                    Some(Ok(CtEvent::Key(k))) if state.quit_confirm_pending() => {
+                        use crate::ui::approval::ApprovalVerdict;
+                        match state.on_quit_confirm_key(k.code) {
+                            Some(ApprovalVerdict::Approve) => break,
+                            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => {
+                                state.quit_confirm = None;
+                            }
+                            None => { /* cursor moved or key ignored — prompt stays open */ }
+                        }
+                    }
                     // De-modal back-out: on any tab, when an inline manager is
                     // open at its root screen, Esc closes it and returns focus
                     // to the Actions list — intercepted BEFORE the per-manager
