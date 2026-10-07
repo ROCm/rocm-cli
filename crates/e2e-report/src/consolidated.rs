@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{Markup, html};
 use serde::Deserialize;
 
 use crate::command_coverage::command_coverage_markdown;
-use crate::components::{STYLE, feature_group, now_utc, stats_bar};
+use crate::components::{feature_group, now_utc, page_shell, stats_bar};
 use crate::parse::{
     EXPECTED_FAILURE_TAG, Feature, Stats, XfailReport, evaluate_xfail_features, parse_features,
     scenario_id, scenario_passed, stats_of,
@@ -844,6 +844,18 @@ impl PlatformReport {
     }
 }
 
+/// Order platforms by platform/OS, then known-bugs flag, then channel — shared
+/// between the HTML report and the markdown summary so a future ordering
+/// tweak can't land in only one of them.
+fn platform_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
+    (
+        &r.desc.platform,
+        &r.desc.os,
+        r.desc.known_bugs,
+        r.effective_channel(),
+    )
+}
+
 /// Build one consolidated HTML report from several per-platform `report.json`
 /// files.
 ///
@@ -862,20 +874,7 @@ pub fn generate_consolidated(
 
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
+    reports.sort_by(|a, b| platform_sort_key(a).cmp(&platform_sort_key(b)));
 
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
@@ -888,51 +887,42 @@ pub fn generate_consolidated(
         ("status-fail", format!("{bad} platform(s) need attention"))
     };
 
-    let markup = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "Consolidated E2E Report" }
-                style { (PreEscaped(STYLE)) }
+    let body = html! {
+        div.header {
+            h1 { "Consolidated E2E Report" }
+            div.generated {
+                @if let Some(line) = meta.line() { (line) br; }
+                "Generated " (now)
             }
-            body {
-                div.header {
-                    h1 { "Consolidated E2E Report" }
-                    div.generated {
-                        @if let Some(line) = meta.line() { (line) br; }
-                        "Generated " (now)
-                    }
-                }
+        }
 
-                h2 { "Summary Information" }
-                table.summary-table {
-                    tr {
-                        td { "Status:" }
-                        td class=(overall.0) { (overall.1) }
-                    }
-                    tr { td { "Rows:" } td { (reports.len()) } }
-                }
+        h2 { "Summary Information" }
+        table.summary-table {
+            tr {
+                td { "Status:" }
+                td class=(overall.0) { (overall.1) }
+            }
+            tr { td { "Rows:" } td { (reports.len()) } }
+        }
 
-                @if reports.is_empty() {
-                    p { "No per-platform report.json files were found to consolidate." }
-                } @else {
-                    h2 { "Platforms" }
-                    (matrix_table(&reports))
-                    (legend())
+        @if reports.is_empty() {
+            p { "No per-platform report.json files were found to consolidate." }
+        } @else {
+            h2 { "Platforms" }
+            (matrix_table(&reports))
+            (legend())
 
-                    (expectation_grid_html(inputs))
+            (expectation_grid_html(inputs))
 
-                    h2 { "Per-platform Details" }
-                    div.details {
-                        @for report in &reports {
-                            (platform_section(report))
-                        }
-                    }
+            h2 { "Per-platform Details" }
+            div.details {
+                @for report in &reports {
+                    (platform_section(report))
                 }
             }
         }
     };
+    let markup = page_shell("Consolidated E2E Report", body);
 
     std::fs::write(html_out, markup.into_string())
 }
@@ -949,20 +939,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         .collect();
 
     let mut reports = reports;
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
+    reports.sort_by(|a, b| platform_sort_key(a).cmp(&platform_sort_key(b)));
 
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {

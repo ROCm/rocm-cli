@@ -8,9 +8,29 @@
 
 use std::time::SystemTime;
 
-use maud::{Markup, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parse::{Element, Feature, Stats, Step, scenario_duration, scenario_status};
+
+/// Shared HTML page shell (doctype, head with the common style sheet, body
+/// wrapper) for both the single-platform and consolidated report generators,
+/// so a future head-level change (viewport meta, favicon, CSP) only has to
+/// land once.
+pub(crate) fn page_shell(title: &str, body: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                (body)
+            }
+        }
+    }
+}
 
 pub(crate) fn stats_bar(stats: &Stats) -> Markup {
     html! {
