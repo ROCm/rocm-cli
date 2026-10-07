@@ -933,9 +933,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 api_key: launched_key,
                 notes,
             };
-            // codeql[rust/cleartext-logging]: intentional one-time display of a freshly
-            // generated API key to the terminal so the user can copy it — the designed
-            // delivery channel, not a log; see `serve_summary::render_summary`.
+            // Same intentional one-time key display as `print_managed_launch_plain`
+            // in main.rs; see its rationale for why the tag below is currently inert.
+            // codeql[rust/cleartext-logging]
             print!("{}", serve_summary::render_summary(&summary));
         } else {
             spinner.clear();

@@ -4545,11 +4545,8 @@ fn run_attached_service(
     println!("  service_id: {service_id}");
     println!("  endpoint: {endpoint}");
     if let Some(key) = endpoint_api_key {
-        // Intentional one-time display of a freshly generated API key to the
-        // terminal so the user can copy it — the designed delivery channel
-        // documented on `render_endpoint_client_config`, not a log. See the
-        // rationale on the sibling call site in `print_managed_launch_plain`
-        // for why the tag below is currently inert.
+        // Same intentional one-time key display as `print_managed_launch_plain`
+        // above; see its rationale for why the tag below is currently inert.
         // codeql[rust/cleartext-logging]
         print!("{}", render_endpoint_client_config(&endpoint, key));
     }
@@ -6818,7 +6815,7 @@ pub(crate) fn read_os_release() -> Result<String> {
 ///
 /// Used for [`run_system_package_install_plan`], whose commands are modeled as
 /// argv vectors so no shell quoting or `sudo`-prefix string handling is needed.
-pub(crate) fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
+fn run_argv_with_stdin(argv: &[String], stdin: Stdio) -> Result<()> {
     let (program, args) = argv
         .split_first()
         .context("install command has no program to run")?;
