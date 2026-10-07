@@ -10438,6 +10438,29 @@ exit 1
         }
     }
 
+    /// The reuse check alone already refuses a Python without `pyvenv.cfg`;
+    /// this order is the second layer `VENV_OWNED_ENTRIES` documents, and no
+    /// convergence test can see it because the first layer holds. Pin it here.
+    #[test]
+    fn a_clear_removes_the_interpreter_first_and_pyvenv_cfg_last() {
+        let position = |name: &str| {
+            VENV_OWNED_ENTRIES
+                .iter()
+                .position(|entry| *entry == name)
+                .unwrap_or_else(|| panic!("{name} is not a venv-owned entry"))
+        };
+        assert_eq!(position("bin"), 0, "{VENV_OWNED_ENTRIES:?}");
+        assert!(
+            position("Scripts") < position("lib"),
+            "{VENV_OWNED_ENTRIES:?}"
+        );
+        assert_eq!(
+            VENV_OWNED_ENTRIES.last(),
+            Some(&"pyvenv.cfg"),
+            "{VENV_OWNED_ENTRIES:?}"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn every_point_a_clear_can_stop_at_converges_on_the_next_run() {
