@@ -15,6 +15,7 @@ use crate::ui;
 #[cfg(test)]
 use super::actions::apply_action;
 use super::actions::{KeyAction, handle_mouse, tab_bar_hit};
+use super::types::ScrollTarget;
 use super::{ActiveTab, AppState, Modal};
 
 /// Convert a displayed position to the target's own offset units. Dock logs are
@@ -222,17 +223,6 @@ fn footer_chip_hit(chips: &[FooterChip], col: u16, row: u16) -> Option<KeyAction
         .map(|c| c.action)
 }
 
-/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
-/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PaneFocus {
-    /// Browsing the Actions list (left column).
-    #[default]
-    Actions,
-    /// Inside the Details pane (right column), ready to start the operation.
-    Detail,
-}
-
 /// A clickable footer-legend chip: an absolute screen span on the footer row
 /// plus the action a left-click should dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,22 +239,6 @@ pub struct FooterChip {
 pub struct ScrollDrag {
     pub target: ScrollTarget,
     pub grab_offset: u16,
-}
-
-/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
-/// scrollbar track write the right offset field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScrollTarget {
-    /// Job console vertical (`console_scroll`).
-    Console,
-    /// Job console horizontal (`console_hscroll`).
-    ConsoleH,
-    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
-    DockLogs,
-    /// Chat transcript (`chat_scroll`).
-    Chat,
-    /// Instance detail modal's launch_args/env_vars panes (`instance_detail_scroll`).
-    InstanceDetail,
 }
 
 /// A scrollbar drawn this frame, recorded so a mouse click/drag can hit-test it.

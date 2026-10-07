@@ -36,11 +36,11 @@ use super::chat::{
     self, StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
     discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
 };
-use super::scrollbar::{PaneFocus, resolve_mouse};
+use super::scrollbar::resolve_mouse;
 use super::summary::{parse_plan_result, summarize_slash_tool};
 use super::types::{
-    ChatKeyCtx, ChatProvider, ChatTurn, ConnState, Focus, NO_CHAT_BACKEND_MSG, ReplayState,
-    ResolvedArgs, UpdateStatus,
+    ChatKeyCtx, ChatProvider, ChatTurn, ConnState, Focus, NO_CHAT_BACKEND_MSG, PaneFocus,
+    ReplayState, ResolvedArgs, UpdateStatus,
 };
 use super::{AppState, ProviderSwitch};
 

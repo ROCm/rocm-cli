@@ -48,10 +48,10 @@ pub use event_loop::{run, spawn_termination_watcher};
 // if that caller ever disappears.
 #[cfg(test)]
 pub(crate) use event_loop::restore_after_session;
-pub use scrollbar::{FooterChip, PaneFocus, ScrollDrag, ScrollTarget, ScrollbarHandle};
+pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PlannedAction,
-    ReplayState, ResolvedArgs, UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PaneFocus,
+    PlannedAction, ReplayState, ResolvedArgs, ScrollTarget, UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 

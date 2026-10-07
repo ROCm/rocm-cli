@@ -434,6 +434,42 @@ pub enum UpdateStatus {
     Error,
 }
 
+/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
+/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
+///
+/// Lives here (not in `scrollbar.rs`, despite being mouse-set there too) so
+/// `actions.rs`'s `KeyAction` dispatch and `scrollbar.rs`'s hit-testing can
+/// each depend on this type without depending on each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    /// Browsing the Actions list (left column).
+    #[default]
+    Actions,
+    /// Inside the Details pane (right column), ready to start the operation.
+    Detail,
+}
+
+/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
+/// scrollbar track write the right offset field.
+///
+/// Lives here (not in `scrollbar.rs`) for the same reason as [`PaneFocus`]:
+/// `actions.rs`'s `KeyAction::ScrollGrab` variant carries one, so the type has
+/// to be visible to both `actions.rs` and `scrollbar.rs` without either
+/// depending on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// Job console vertical (`console_scroll`).
+    Console,
+    /// Job console horizontal (`console_hscroll`).
+    ConsoleH,
+    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
+    DockLogs,
+    /// Chat transcript (`chat_scroll`).
+    Chat,
+    /// Instance detail modal's launch_args/env_vars panes (`instance_detail_scroll`).
+    InstanceDetail,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
