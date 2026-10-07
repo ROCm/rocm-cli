@@ -1677,7 +1677,7 @@ jobs:
           # saved in the web UI, so a never-used wiki cannot be cloned or
           # pushed to. Fail with the prerequisite rather than a bare 128.
           if ! git clone --depth 1 "$wiki" wiki; then
-            echo "::error::Cannot clone the wiki. Enable the wiki in repo settings and create its first page once in the web UI; GitHub does not create the wiki git repo until then."
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
             exit 1
           fi
           cp "/tmp/${page}" "wiki/${page}"
