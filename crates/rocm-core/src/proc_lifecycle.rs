@@ -13,9 +13,10 @@
 //! have actually exited within a bounded grace period, escalating to `SIGKILL`
 //! only when the caller opts into a forced stop.
 //!
-//! **The recycling defence is Linux-only in practice.** [`process_start_ticks`]
-//! reads the start-time from `/proc` and is a compile-time `None` everywhere
-//! else, so on Windows and macOS every record *captured there* carries no
+//! **The recycling defence needs a readable start-time.** [`process_start_ticks`]
+//! reads it from `/proc` on Linux and from the process creation time
+//! (`GetProcessTimes`) on Windows, and is a compile-time `None` everywhere
+//! else, so on other platforms (macOS) every record *captured there* carries no
 //! identity, and [`identity_state`] degrades to best-effort
 //! [`IdentityState::Matches`] — the paragraph above describes what this module
 //! enforces *where the platform can answer*. (A record reconstructed with a

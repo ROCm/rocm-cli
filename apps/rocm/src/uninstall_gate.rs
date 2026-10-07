@@ -81,7 +81,8 @@ impl StopFailureRemedy {
             ),
             Self::StopTheDaemon => "The background helper restarts managed services on its own, \
                                     so it has to be stopped before uninstall can safely remove \
-                                    anything: kill that pid, then re-run uninstall."
+                                    anything: kill that pid (`kill <pid>` on Linux, `Stop-Process -Id <pid> -Force` \
+                                    on Windows), then re-run uninstall."
                 .to_owned(),
             Self::RepairTheDaemonState => format!(
                 "The background helper's runtime state does not parse, so no pid could be read \

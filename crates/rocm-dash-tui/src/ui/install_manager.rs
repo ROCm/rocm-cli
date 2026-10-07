@@ -22,7 +22,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
@@ -282,7 +282,7 @@ fn request_launch(i: &mut InstallManagerState, jobs: &mut State) -> Vec<SideEffe
     let request = ApprovalRequest::new(
         "install ROCm SDK".to_string(),
         vec![
-            format!("{} {}", exe_label(&cmd), args.join(" ")),
+            format!("{} {}", exe_label(&cmd), display_args(&args)),
             String::new(),
             "This downloads and installs TheRock ROCm wheels on this machine.".to_string(),
         ],

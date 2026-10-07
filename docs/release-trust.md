@@ -244,6 +244,35 @@ the override *logic* does not exist at all in a build without
 environment entirely and unconditionally returns the hardcoded default URL, so
 a stray environment variable can never redirect a production install.
 
+## Dashboard Test Clock File
+
+`rocm dash` checks for one test-only input that, unlike the override above, is
+**not** compiled out of release builds:
+
+```text
+<data dir>/telemetry/test-clock-offset
+```
+
+When the file exists, the embedded telemetry daemon takes its observation clock
+from the directive in it instead of wall time. That is deliberate: it lets the
+E2E suite drive the dashboard across metric-validity boundaries
+deterministically while testing the same binary that ships, rather than one
+built with a test-only feature.
+
+Nothing in rocm-cli creates this file; only the E2E harness plants it, inside
+its own isolated data root. If one is found, `rocm dash` logs a WARN naming the
+path. Its effect is not limited to displayed timestamps: the clock drives
+generation throughput, latency averages and metric freshness, and the
+timestamps written into persisted session records. To return to wall time,
+remove the file **and restart `rocm dash`** — the path is resolved once per
+launch, and deleting the file mid-run leaves the clock pinned at its last
+directive.
+
+The directive is an integer offset in seconds, `hold`, or `hold <int>`; it can
+skew telemetry but cannot select code or redirect a download. The data directory it lives in
+already holds the runtime registry and service records, so write access to it
+is already trusted.
+
 ## Remaining Owner Step
 
 The repo still needs a real project-owned public signing key and matching
