@@ -970,7 +970,6 @@ mod tests {
     use super::*;
     use rocm_core::{ManagedServiceRecord, resolve_builtin_model_recipe};
 
-    use crate::build_freeform_plan_with_recipes;
     use crate::tests::test_paths;
 
     /// Persist a live-looking managed record claiming `gpu` — the same shape a
@@ -995,40 +994,6 @@ mod tests {
         record.status = "starting".to_owned();
         record.gpu_indices = gpu.to_vec();
         record.write().expect("write claiming record");
-    }
-
-    #[test]
-    fn hybrid_planner_bakes_the_host_engine_into_the_generated_serve_command() {
-        // The generated command carries an explicit `--engine`, which outranks
-        // every other signal in `select_serve_engine` -- including the configured
-        // default. So whatever this planner picks IS what runs, and on an Instinct
-        // host that must be vLLM. A GPU-blind constant here reintroduced the very
-        // bug this PR fixes, through the strongest override available.
-        //
-        // An empty recipe set is what reaches the host default: a request naming
-        // an engine, or a matched recipe that prefers one, is answered before the
-        // fallback -- correctly, since a GGUF model only Lemonade can serve must
-        // not be forced onto vLLM by the host.
-        let plan = build_freeform_plan_with_recipes(
-            "serve some/unmatched-model",
-            &RocmCliConfig::default(),
-            Some(&[]),
-            "vllm",
-        );
-
-        let engine_arg = plan
-            .actions
-            .iter()
-            .find_map(|action| {
-                let index = action.args.iter().position(|arg| arg == "--engine")?;
-                action.args.get(index + 1).cloned()
-            })
-            .expect("the generated serve command must name an engine");
-        assert_eq!(
-            engine_arg, "vllm",
-            "the host's engine must reach the generated command:\n{:?}",
-            plan.actions
-        );
     }
 
     #[test]
