@@ -10323,24 +10323,26 @@ exit 1
     #[cfg(unix)]
     #[derive(Debug, Clone, Copy)]
     enum ClearStop {
-        /// Only `pyvenv.cfg` gone: on Linux the `bin/python` symlink now runs
-        /// as the base interpreter.
-        CfgRemoved,
-        CfgAndCacheTagRemoved,
-        /// Part of `bin` gone, the interpreter among it.
-        MidBinPythonRemoved,
-        /// Part of `bin` gone, the interpreter still there.
-        MidBinActivateRemoved,
-        BinRemoved,
+        /// Only `pyvenv.cfg` removed: on Linux the `bin/python` symlink now
+        /// runs as the base interpreter.
+        Cfg,
+        /// `pyvenv.cfg` and `CACHEDIR.TAG` removed.
+        CfgAndCacheTag,
+        /// Part of `bin` removed, the interpreter among it.
+        PartOfBinWithPython,
+        /// Part of `bin` removed, the interpreter still there.
+        PartOfBinKeepingPython,
+        /// All of `bin` removed.
+        WholeBin,
     }
 
     #[cfg(unix)]
     const CLEAR_STOPS: [ClearStop; 5] = [
-        ClearStop::CfgRemoved,
-        ClearStop::CfgAndCacheTagRemoved,
-        ClearStop::MidBinPythonRemoved,
-        ClearStop::MidBinActivateRemoved,
-        ClearStop::BinRemoved,
+        ClearStop::Cfg,
+        ClearStop::CfgAndCacheTag,
+        ClearStop::PartOfBinWithPython,
+        ClearStop::PartOfBinKeepingPython,
+        ClearStop::WholeBin,
     ];
 
     #[cfg(unix)]
@@ -10349,12 +10351,12 @@ exit 1
             let _ = remove_venv_entry(&install_root.join(name));
         };
         match stop {
-            ClearStop::CfgRemoved => remove("pyvenv.cfg"),
-            ClearStop::CfgAndCacheTagRemoved => {
+            ClearStop::Cfg => remove("pyvenv.cfg"),
+            ClearStop::CfgAndCacheTag => {
                 remove("pyvenv.cfg");
                 remove("CACHEDIR.TAG");
             }
-            ClearStop::MidBinPythonRemoved => {
+            ClearStop::PartOfBinWithPython => {
                 for entry in fs::read_dir(install_root.join("bin")).unwrap() {
                     let path = entry.unwrap().path();
                     if path
@@ -10367,10 +10369,10 @@ exit 1
                     }
                 }
             }
-            ClearStop::MidBinActivateRemoved => {
+            ClearStop::PartOfBinKeepingPython => {
                 let _ = remove_venv_entry(&install_root.join("bin").join("activate"));
             }
-            ClearStop::BinRemoved => remove("bin"),
+            ClearStop::WholeBin => remove("bin"),
         }
     }
 
