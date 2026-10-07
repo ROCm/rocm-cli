@@ -95,9 +95,12 @@ pub(crate) struct VllmRocmDiscoverBuild {
     /// here is always coherent with the torch version this row actually pins
     /// (see `install_vllm_rocm10_discover`).
     torchvision_version_prefix: &'static str,
-    /// A [`DiscoverVersion::Series`] only where the index carries a single
-    /// torchaudio build per series for this ROCm line; otherwise the exact
-    /// release built against this row's torch (see [`DiscoverVersion::Exact`]).
+    /// [`DiscoverVersion::Exact`] wherever the row's index publishes more than
+    /// one rebuild of a torchaudio series, which `whl-next` does (`2.11.0`,
+    /// `2.11.0.2`, `2.11.0.3`, each paired with a different torch): a series
+    /// match takes the newest, i.e. the rebuild for some *other* row's torch.
+    /// [`DiscoverVersion::Series`] is only safe on an index that serves one
+    /// build per series.
     torchaudio_version: DiscoverVersion,
 }
 
@@ -112,6 +115,13 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         amd_aiter_version_prefix: "0.1",
         torch_version_prefix: "2.12",
         torchvision_version_prefix: "0.27",
+        // Still a series match, unlike the 10.1 row below, and unverified
+        // against `whl-next` now that both rows read from it: that index is
+        // flat across ROCm lines, so a series match here can resolve a
+        // `+rocm10.1.0` wheel, which `ensure_rocm_local_version_matches`
+        // rejects. Left as-is rather than pinned blind -- which torchaudio
+        // rebuild pairs with 10.0's torch 2.12 needs a live 10.0 box to
+        // establish, and this row has no coverage on the self-hosted lanes.
         torchaudio_version: DiscoverVersion::Series("2.11"),
     },
     VllmRocmDiscoverBuild {
@@ -1060,22 +1070,21 @@ fn install_vllm_rocm10_discover(
     // exact version of its own base package: a device package always shares
     // its base package's version number, not any other package's.
     let installed = installed_package_names(uv, paths, python)?;
-    let device_pins: Vec<String> = pins[..3]
-        .iter()
-        .flat_map(|pin| {
-            let (base_pkg, release) = pin.split_once("==").unwrap_or((pin.as_str(), ""));
+    let mut device_pins: Vec<String> = Vec::new();
+    for pin in &pins[..3] {
+        // Fail closed rather than emit a `name==` with an empty release: every
+        // other surprise on this install path bails too.
+        let (base_pkg, release) = pin.split_once("==").with_context(|| {
+            format!("discovered pin `{pin}` is not a `name==version` requirement")
+        })?;
+        device_pins.extend(
             installed
                 .iter()
                 .filter(|name| is_amd_device_package_for(name, base_pkg))
-                .map(|name| format!("{name}=={release}"))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    let realign_pins: Vec<String> = pins[..3]
-        .iter()
-        .cloned()
-        .chain(device_pins.clone())
-        .collect();
+                .map(|name| format!("{name}=={release}")),
+        );
+    }
+    let realign_pins: Vec<String> = pins[..3].iter().chain(&device_pins).cloned().collect();
     let realign_args = vllm_rocm10_discover_realign_install_args(python, build, &realign_pins);
     run_uv_pip_install(uv, paths, python, realign_args)?;
 
@@ -1897,14 +1906,8 @@ mod tests {
         );
         Ok(())
     }
-    /// The 10.1 row must reach the staging host for vLLM, which is only
-    /// published there, but takes its torch stack from `whl-next` just like
-    /// 10.0, the index the 10.1 SDK itself installs its `+rocm10.1.0` torch
-    /// stack from. Its torchaudio is pinned exactly: a `2.11.*` match
-    /// resolved `2.11.0.3`, the rebuild for a newer torch, whose
-    /// `libtorchaudio.abi3.so` then failed to load against torch 2.12
-    /// (therock-next-09). 10.0 keeps the production frameworks index for
-    /// vLLM. The live half of this is therock-next-09.
+    /// A series renders with the `.*` that lets `uv` take the newest release
+    /// in it; an exact release renders bare, so it cannot.
     #[test]
     fn discover_version_renders_series_and_exact_requirements() {
         assert_eq!(
@@ -1918,6 +1921,14 @@ mod tests {
             "torchaudio==2.11.0"
         );
     }
+    /// The 10.1 row must reach the staging host for vLLM, which is only
+    /// published there, but takes its torch stack from `whl-next` just like
+    /// 10.0, the index the 10.1 SDK itself installs its `+rocm10.1.0` torch
+    /// stack from. Its torchaudio is pinned exactly: a `2.11.*` match
+    /// resolved `2.11.0.3`, the rebuild for a newer torch, whose
+    /// `libtorchaudio.abi3.so` then failed to load against torch 2.12 or 2.13
+    /// (therock-next-09). 10.0 keeps the production frameworks index for
+    /// vLLM. The live half of this is therock-next-09.
     #[test]
     fn discover_rows_select_their_own_indexes() {
         let ten_zero = vllm_rocm_discover_build("10.0.0").expect("10.0.0 has a discover row");
@@ -1942,11 +1953,13 @@ mod tests {
             "https://stable.repo.amd.com/rocm/whl-next/"
         );
         assert_eq!(ten_one.vllm_version_prefix, "0.29");
-        // `whl-next` carries `2.11.0`, `2.11.0.2` and `2.11.0.3` for
-        // `+rocm10.1.0`; only `2.11.0` pairs with this row's torch, matching
-        // AMD's own `rocm/vllm:...vllm-0.29.0` image's pin.
+        // 2.13/0.28, not 2.12/0.27: the pair AMD's own
+        // `rocm/vllm:...vllm-0.29.0` image builds this vllm release against.
         assert_eq!(ten_one.torch_version_prefix, "2.13");
         assert_eq!(ten_one.torchvision_version_prefix, "0.28");
+        // `whl-next` carries `2.11.0`, `2.11.0.2` and `2.11.0.3` for
+        // `+rocm10.1.0`; only `2.11.0` pairs with this row's torch, matching
+        // AMD's own image's pin, so this must stay exact and never a series.
         assert_eq!(ten_one.torchaudio_version, DiscoverVersion::Exact("2.11.0"));
 
         // An unpublished line must not borrow another line's wheels.

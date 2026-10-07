@@ -76,10 +76,13 @@ as ROCm CLI's managed Python is rejected if it is not `cp314`, with a message
 naming the required tag.
 
 This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
-through *different* rows: they use different index URLs and different vLLM
-minors, because AMD stages ROCm 10.1's frameworks on a separate host from
-10.0's production index. Patch and any dev/pre-release suffix are still
-ignored within a row, since AMD rotates those constantly.
+through *different* rows: they pin different vLLM minors and read vLLM from
+different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
+host from 10.0's production index. Both rows take their torch stack from the
+same `whl-next` index, which is where `rocm install sdk` resolves either SDK's
+own `+rocmX.Y` torch from, so vLLM realigns onto the builds the SDK already
+installed. Patch and any dev/pre-release suffix are still ignored within a row,
+since AMD rotates those constantly.
 
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
@@ -101,7 +104,15 @@ That same full-dependency resolve can also pull in an unconstrained `torch`
 from PyPI, undoing the exact ROCm pin just installed, and transitively an
 unconstrained `torchvision`/`torchaudio` with it; the install re-pins torch,
 plus whatever of torchvision/torchaudio was already installed by the SDK
-install, back to their prior exact builds immediately afterwards.
+install, back to their prior exact builds immediately afterwards. That same
+realign also covers AMD's per-GPU-architecture device-kernel plugins
+(`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`): each is versioned in
+lockstep with its own base package but resolved independently of it, so the
+full-dependency install can leave one ahead of the base package it ships
+kernels for. The install reads `uv pip freeze`, and re-pins every such plugin
+it finds to its own base package's resolved release. The mismatch is invisible
+at install time and only surfaces at serve time, as a HIP "Cannot find Symbol"
+crash.
 Every other
 ROCm SDK version, including 7.2.3, keeps using the static pin table; an SDK
 version with no matching row there falls back to the table's default pin,
