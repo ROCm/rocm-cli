@@ -5,7 +5,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{
     AppPaths, DependencyViolation, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_command_env, uv_pip_install_base, violation_subject, violations_requiring,
+    uv_command_env, uv_pip_freeze_args, uv_pip_install_base, violation_subject,
+    violations_requiring,
 };
 use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
@@ -925,6 +926,35 @@ fn ensure_discover_python_tag(python: &Path, build: &VllmRocmDiscoverBuild) -> R
         build.rocm_sdk_version
     )
 }
+/// Lists every package `uv pip freeze` reports as installed in `python`'s
+/// environment, as bare names (no version).
+fn installed_package_names(uv: &Path, paths: &AppPaths, python: &Path) -> Result<Vec<String>> {
+    let output = ProcessCommand::new(uv)
+        .args(uv_pip_freeze_args(python))
+        .envs(uv_command_env(paths))
+        .output()
+        .context("failed to launch `uv pip freeze` to find installed packages")?;
+    if !output.status.success() {
+        bail!(
+            "`uv pip freeze` failed for {}: {}",
+            python.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once("==").map(|(name, _)| name.to_owned()))
+        .collect())
+}
+/// Whether `name` is one of AMD's per-GPU-architecture device-kernel plugin
+/// packages for `base_pkg` (e.g. `amd-torch-device-gfx1151` or
+/// `amd-torchvision-device-gfx115x` for `base_pkg` `torch`/`torchvision`).
+/// Each is versioned in lockstep with its own `base_pkg`, not with torch.
+fn is_amd_device_package_for(name: &str, base_pkg: &str) -> bool {
+    name.to_ascii_lowercase()
+        .replace('_', "-")
+        .starts_with(&format!("amd-{base_pkg}-device-gfx"))
+}
 /// Discovers and installs the current vLLM/flash-attn/amd-aiter wheels for a
 /// [`VllmRocmDiscoverBuild`] row, pinning each to the exact version `uv pip
 /// install --dry-run` resolved so the real install can never silently drift
@@ -1012,10 +1042,37 @@ fn install_vllm_rocm10_discover(
 
     // The full-dependency resolve above can replace torch (and, pulling it in
     // transitively, torchvision/torchaudio) with unconstrained PyPI builds;
-    // force the whole stack back to the coherent trio discovered above.
-    let realign_args = vllm_rocm10_discover_realign_install_args(python, build, &pins[..3]);
+    // force the whole stack back to the coherent trio discovered above. It
+    // can also pull in an AMD device-kernel plugin for any of the three
+    // (`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`, ...) pinned to
+    // whatever the index's newest release is, unconstrained by -- and so
+    // routinely ahead of -- the base package version just realigned; the
+    // mismatch doesn't fail here, it fails at serve time as a HIP "Cannot
+    // find Symbol" crash. Realign any such installed device package to the
+    // exact version of its own base package: a device package always shares
+    // its base package's version number, not any other package's.
+    let installed = installed_package_names(uv, paths, python)?;
+    let device_pins: Vec<String> = pins[..3]
+        .iter()
+        .flat_map(|pin| {
+            let (base_pkg, release) = pin.split_once("==").unwrap_or((pin.as_str(), ""));
+            installed
+                .iter()
+                .filter(|name| is_amd_device_package_for(name, base_pkg))
+                .map(|name| format!("{name}=={release}"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let realign_pins: Vec<String> = pins[..3]
+        .iter()
+        .cloned()
+        .chain(device_pins.clone())
+        .collect();
+    let realign_args = vllm_rocm10_discover_realign_install_args(python, build, &realign_pins);
     run_uv_pip_install(uv, paths, python, realign_args)?;
 
+    let mut pins = pins;
+    pins.extend(device_pins);
     Ok(pins)
 }
 /// Wheel index and exact requirement for one `uv pip install vllm`.
@@ -1954,6 +2011,9 @@ case "$*" in
     pkg=${{last%%==*}}
     echo " + ${{pkg}}==9.9.9" >&2
     ;;
+  *"pip freeze"*)
+    true
+    ;;
 esac
 exit 0
 "#,
@@ -1990,6 +2050,7 @@ exit 0
         let real_installs: Vec<&Vec<String>> = calls
             .iter()
             .filter(|args| !args.contains(&"--dry-run".to_owned()))
+            .filter(|args| args.get(1).map(String::as_str) != Some("freeze"))
             .collect();
         assert_eq!(
             real_installs.len(),
@@ -2027,6 +2088,96 @@ exit 0
         assert!(stack_realign.contains(&"--index-url".to_owned()));
         assert!(!stack_realign.contains(&"--extra-index-url".to_owned()));
         assert!(!stack_realign.contains(&"--config-file".to_owned()));
+
+        Ok(())
+    }
+    /// The full-dependency install can leave an AMD torch device-kernel
+    /// plugin pinned to whatever the index's newest release is, ahead of the
+    /// torch version realigned alongside it -- a mismatch that doesn't fail
+    /// install, only serving. Whichever such package `uv pip freeze` reports
+    /// installed must be realigned to torch's exact release too.
+    #[test]
+    #[cfg(unix)]
+    fn install_vllm_rocm10_discover_realigns_stale_device_packages_per_base_package() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let paths = AppPaths {
+            config_dir: root.path().join("config"),
+            data_dir: root.path().join("data"),
+            cache_dir: root.path().join("cache"),
+        };
+        let log = root.path().join("uv-calls.log");
+
+        let python = root.path().join("python");
+        std::fs::write(&python, "#!/bin/sh\necho cp314\n")?;
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))?;
+
+        let uv = root.path().join("uv");
+        std::fs::write(
+            &uv,
+            format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+last=""
+for a in "$@"; do last="$a"; done
+case "$*" in
+  *--dry-run*)
+    pkg=${{last%%==*}}
+    case "$pkg" in
+      torchvision) echo " + ${{pkg}}==8.8.8" >&2 ;;
+      *) echo " + ${{pkg}}==9.9.9" >&2 ;;
+    esac
+    ;;
+  *"pip freeze"*)
+    echo "amd_torch_device_gfx1151==2.14.0+rocm10.1.0"
+    echo "amd_torchvision_device_gfx1151==1.1.1+rocm10.1.0"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display()
+            ),
+        )?;
+        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))?;
+
+        let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
+        let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
+        assert!(
+            pins.contains(&"amd_torch_device_gfx1151==9.9.9".to_owned()),
+            "the stale torch device package must be realigned to torch's own resolved release: {pins:?}"
+        );
+        assert!(
+            pins.contains(&"amd_torchvision_device_gfx1151==8.8.8".to_owned()),
+            "the stale torchvision device package must be realigned to torchvision's own \
+             resolved release, not torch's: {pins:?}"
+        );
+
+        let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)?
+            .lines()
+            .map(|line| line.split_whitespace().map(ToOwned::to_owned).collect())
+            .collect();
+        let stack_realign = calls
+            .iter()
+            .rfind(|args| {
+                !args.contains(&"--dry-run".to_owned())
+                    && args.get(1).map(String::as_str) != Some("freeze")
+            })
+            .expect("a stack realign call must have run");
+        assert!(
+            stack_realign.contains(&"--reinstall-package".to_owned())
+                && stack_realign.contains(&"amd_torch_device_gfx1151".to_owned())
+                && stack_realign.contains(&"amd_torch_device_gfx1151==9.9.9".to_owned()),
+            "the realign call must reinstall the stale torch device package pinned to torch's \
+             resolved release: {stack_realign:?}"
+        );
+        assert!(
+            stack_realign.contains(&"amd_torchvision_device_gfx1151".to_owned())
+                && stack_realign.contains(&"amd_torchvision_device_gfx1151==8.8.8".to_owned()),
+            "the realign call must reinstall the stale torchvision device package pinned to \
+             torchvision's resolved release: {stack_realign:?}"
+        );
 
         Ok(())
     }
