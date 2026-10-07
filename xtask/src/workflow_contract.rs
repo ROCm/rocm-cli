@@ -2258,25 +2258,44 @@ esac
         }
     }
 
-    /// Extract one prek hook's complete YAML block by its `- id:` value, up to
-    /// the blank line that separates it from the next hook.
+    /// Extract one prek hook's complete YAML block by its `- id:` value, up
+    /// to the next hook (`- id:` at the same 6-space indent) or the next
+    /// `repo:` entry (2-space indent) — whichever comes first. Hooks inside
+    /// one `repo:` block sit back to back with no blank line between them
+    /// (see `.pre-commit-config.yaml`'s `cargo-fmt`/`cargo-clippy`/... run),
+    /// so a blank-line-anchored end would silently fold a following
+    /// sibling hook's lines into this one's block whenever this hook is not
+    /// the last in its `repo:` block.
     fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
         let marker = format!("- id: {id}\n");
         let start = text
             .find(&marker)
             .unwrap_or_else(|| panic!(".pre-commit-config.yaml defines hook `{id}`"));
         let rest = &text[start + marker.len()..];
-        let end = rest.find("\n\n").unwrap_or(rest.len());
+        let end = ["\n      - id:", "\n  - repo:"]
+            .into_iter()
+            .filter_map(|needle| rest.find(needle))
+            .min()
+            .unwrap_or(rest.len());
         &rest[..end]
     }
 
-    /// Regression guard for the gap this PR closed: the `license-headers`
-    /// hook must have no `types_or` file-type filter, because hawkeye scans
-    /// the whole repo per `licenserc.toml` (`pass_filenames: false`)
-    /// regardless of which files changed — a filter only ever decides
-    /// whether the hook *fires*, and can never track `licenserc.toml`'s own
-    /// include list. Without this, a future edit could reintroduce a filter
-    /// and silently reopen that gap.
+    /// True if `block` has a line that, after stripping any trailing `#`
+    /// comment, is exactly `flag` once trimmed — so `flag` mentioned only
+    /// inside a comment, or commented out with the real line changed to
+    /// something else, can't satisfy the check.
+    fn hook_block_sets(block: &str, flag: &str) -> bool {
+        block.lines().any(|line| strip_comment(line).trim() == flag)
+    }
+
+    /// Regression guard for the gap closed above: a `types_or` filter that
+    /// let a `licenserc.toml`- or Markdown-only commit skip the
+    /// `license-headers` hook. The hook must have no `types_or` file-type
+    /// filter, because hawkeye scans the whole repo per `licenserc.toml`
+    /// (`pass_filenames: false`) regardless of which files changed — a
+    /// filter only ever decides whether the hook *fires*, and can never
+    /// track `licenserc.toml`'s own include list. Without this, a future
+    /// edit could reintroduce a filter and silently reopen that gap.
     #[test]
     fn license_headers_hook_has_no_file_type_filter() {
         // CRLF-normalize: `.pre-commit-config.yaml` isn't forced to `eol=lf` in
@@ -2287,7 +2306,7 @@ esac
             .replace("\r\n", "\n");
         let block = hook_block(&config, "license-headers");
         assert!(
-            block.contains("always_run: true"),
+            hook_block_sets(block, "always_run: true"),
             "license-headers hook must set `always_run: true`:\n{block}"
         );
         assert!(
@@ -2297,6 +2316,67 @@ esac
              gates whether the hook fires and can reopen the `licenserc.toml` gap this \
              test guards against:\n{block}"
         );
+    }
+
+    #[test]
+    fn hook_block_stops_at_next_hook_in_the_same_repo_block() {
+        // license-headers is NOT last in its `hooks:` list here, unlike in the
+        // real file today — this is exactly the shape that let a sibling
+        // hook's `always_run: true` leak into license-headers' block.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_the_next_repo_entry() {
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next repo block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_sets_rejects_comment_only_and_falsified_mentions() {
+        assert!(hook_block_sets(
+            "        always_run: true",
+            "always_run: true"
+        ));
+        // Trailing comment after the real value is still read.
+        assert!(hook_block_sets(
+            "        always_run: true  # hawkeye ignores pass_filenames",
+            "always_run: true"
+        ));
+        // The flag mentioned only inside a comment, with the real line
+        // changed to something else, must not satisfy the check.
+        assert!(!hook_block_sets(
+            "        # always_run: true\n        always_run: false",
+            "always_run: true"
+        ));
     }
 
     // Extractor guards: prove the helpers actually parse multiline forms, so the
@@ -2309,9 +2389,9 @@ esac
         );
         // A version sharing a prefix must not compare equal to the one it shares
         // a prefix with — `contains` would wrongly let this satisfy `"0.9.1"`.
-        assert_ne!(
+        assert_eq!(
             pin_token("cargo install cargo-about@0.9.10 --locked", "cargo-about@"),
-            Some("0.9.1")
+            Some("0.9.10")
         );
         // A pin mentioned only after a trailing ` #` comment (the real line
         // changed to something else) must not be seen.
