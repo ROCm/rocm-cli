@@ -46,6 +46,12 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
+//! `comfyui-05` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
+//! isolated managed runtime and asserts the runtime's torch is unchanged, no
+//! `nvidia-*` distributions appeared, and the install really added packages. It
+//! uses its own When phrase because the planted-runtime step above hard-codes
+//! `--runtime-id`.
+//!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
 
@@ -600,13 +606,18 @@ const TORCH_DIST_PROBE: &str = "import json,sys\n\
 /// prints `install_root:` for every installed runtime unconditionally.
 fn active_runtime_python(world: &E2eWorld) -> PathBuf {
     let (listing, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    let root = listing
+    let roots: Vec<&str> = listing
         .lines()
-        .find_map(|l| l.trim().strip_prefix("install_root:"))
-        .map_or_else(
-            || panic!("no 'install_root:' line in `runtimes list`:\n{listing}"),
-            str::trim,
-        );
+        .filter_map(|l| l.trim().strip_prefix("install_root:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        roots.len(),
+        1,
+        "expected exactly one installed runtime in the isolated world, found {}:\n{listing}",
+        roots.len()
+    );
+    let root = roots[0];
     find_venv_python(Path::new(root)).unwrap_or_else(|| {
         panic!("could not locate a venv python under the runtime install_root {root}")
     })
@@ -617,7 +628,7 @@ fn active_runtime_python(world: &E2eWorld) -> PathBuf {
 /// The documented layout is probed FIRST: `root` itself is the initial frontier
 /// entry, so a managed runtime — whose interpreter is exactly `<install_root>/bin/
 /// python` — is found on the first iteration with no directory traversal at all.
-/// The breadth walk below is only a fallback for a tree that does not match, and
+/// The depth-first walk below is only a fallback for a tree that does not match, and
 /// is depth-capped so a pathological one cannot hang the scenario rather than
 /// being a cost the normal path pays.
 fn find_venv_python(root: &Path) -> Option<PathBuf> {
@@ -656,7 +667,7 @@ fn find_venv_python(root: &Path) -> Option<PathBuf> {
 /// (`2.11.0+gitd0c8b1f`, measured on the MI300X lane), so callers judge "ROCm" as
 /// "torch is present and is NOT a CUDA build", which is exactly the flip the
 /// EAI-8051 corruption would cause.
-fn torch_version(python: &Path) -> Option<String> {
+fn torch_version(python: &Path) -> Result<String, String> {
     let output = std::process::Command::new(python)
         .args(["-c", TORCH_DIST_PROBE])
         .output()
@@ -666,9 +677,14 @@ fn torch_version(python: &Path) -> Option<String> {
     let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
         panic!("torch version probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
     });
-    data.get("version")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+    match data.get("version").and_then(serde_json::Value::as_str) {
+        Some(v) => Ok(v.to_owned()),
+        None => Err(data
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("probe reported no version and no error")
+            .to_owned()),
+    }
 }
 
 /// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). Used
@@ -761,7 +777,7 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
     let version = torch_version(&python);
     assert!(
-        version.as_deref().is_some_and(|v| !is_cuda_torch(v)),
+        version.as_ref().is_ok_and(|v| !is_cuda_torch(v)),
         "baseline runtime torch is absent or already a CUDA build; scenario premise absent \
          (torch version: {version:?}, python: {})",
         python.display()
@@ -777,7 +793,7 @@ async fn assert_baseline_rocm_torch(world: &mut E2eWorld) {
     // be unchanged (see `assert_torch_still_rocm`), and the baseline package set so
     // it can require the install to have actually added something (see
     // `assert_dependencies_installed`).
-    world.comfyui_baseline_torch = version;
+    world.comfyui_baseline_torch = version.ok();
     world.comfyui_baseline_distributions = Some(distributions);
 }
 
@@ -798,8 +814,10 @@ async fn assert_install_succeeded(world: &mut E2eWorld) {
     // several paths (no managed runtime, a runtime that isn't `ready`, a non-wheel
     // format, a failed source download or `uv` acquisition); on any of those the
     // runtime is TRIVIALLY unchanged and the torch/nvidia assertions would pass
-    // having exercised nothing. Since #298 the install exits 0 on the measured
-    // MI300X lane, so requiring that is what makes the rest evidence of anything.
+    // having exercised nothing. It is also the check that catches a revert of
+    // #298: without the torch constraint, the post-install GPU probe in
+    // `comfyui::install` bails, so the install exits non-zero and the torch and
+    // nvidia steps never run. Do not relax it as "just a premise".
     let rc = world.cli_rc.expect("no ComfyUI install was run");
     assert_eq!(
         rc,
@@ -842,7 +860,7 @@ async fn assert_dependencies_installed(world: &mut E2eWorld) {
     );
 }
 
-#[then("the runtime's torch is still a ROCm build")]
+#[then("the runtime's torch is unchanged")]
 async fn assert_torch_still_rocm(world: &mut E2eWorld) {
     let python = active_runtime_python(world);
     let version = torch_version(&python);
@@ -852,7 +870,7 @@ async fn assert_torch_still_rocm(world: &mut E2eWorld) {
         .expect("no baseline torch version was captured");
     assert_eq!(
         version.as_deref(),
-        Some(baseline),
+        Ok(baseline),
         "ComfyUI install replaced the managed runtime's torch \
          (before: {baseline}, after: {version:?}, python: {})",
         python.display()
