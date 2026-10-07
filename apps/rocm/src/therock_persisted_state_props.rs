@@ -371,6 +371,12 @@ fn root_name() -> BoxedStrategy<RootName> {
 
 fn install_root_under(base: &Path, name: &RootName) -> PathBuf {
     match name {
+        // Windows also strips trailing dots from a folder name it creates, so
+        // there a name ending in `.` gets a suffix to stay storable as given.
+        #[cfg(windows)]
+        RootName::Ascii(name) if name != "." && name != ".." && name.ends_with('.') => {
+            base.join(format!("{name}x"))
+        }
         RootName::Ascii(name) if name != "." && name != ".." => base.join(name),
         RootName::Ascii(_) => base.join("dot"),
         RootName::Unicode => base.join("ROCm-é-日本"),
