@@ -153,12 +153,13 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 /// Drive a built rig prompt request to completion under the shared
 /// [`REQUEST_TIMEOUT`], then annotate the reply with the Skills that fired.
 ///
-/// The shared `complete()` tail for all three backends (RigAgentClient,
-/// ChatGptAgentClient, AnthropicAgentClient): their `req` types differ (rig
+/// The shared `complete()` tail, called from [`run_agent_request`] — the one
+/// call site all three backends (RigAgentClient, ChatGptAgentClient,
+/// AnthropicAgentClient) now go through. Their `req` types differ (rig
 /// typestate), so this is generic over `IntoFuture<Output = Result<String, E>>`
 /// with a `Display` error. A timeout maps to [`AgentError::Timeout`]; a backend
 /// error maps to [`AgentError::Request`]; success is annotated with the fired
-/// Skills. ONE definition of the tail, used by all three.
+/// Skills. ONE definition of the tail.
 ///
 /// `backend` tags the lifecycle trace events (request-start / completion /
 /// error / timeout) so a hung or failing chat is traceable to a specific
@@ -209,16 +210,6 @@ where
     Ok(annotate_reply(reply, &skills))
 }
 
-/// The seam fields every real `AgentClient` backend carries identically:
-/// sampling controls, the bin-injected tool executor, and the approval
-/// channel. Bundled so [`run_agent_request`] stays under clippy's
-/// too-many-arguments limit; each backend builds one from its own fields.
-struct BackendSeam<'a> {
-    params: &'a InferenceParams,
-    executor: Option<&'a SharedRocmToolExecutor>,
-    approval_tx: Option<&'a UnboundedSender<ClientMsg>>,
-}
-
 /// Drive one `complete()` call from a preamble'd `AgentBuilder` through to a
 /// reply string: apply the sampling knobs, register the SAME three tool sets
 /// (telemetry/skill, ROCm read, ROCm mutating) in the SAME order, build the
@@ -231,9 +222,12 @@ struct BackendSeam<'a> {
 /// own agent (client/model construction and any backend-specific setup, e.g.
 /// ChatGPT's device-code auth, differ) and still owns its own empty-history
 /// check and backend tag — only the shared middle is here.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_request<M, P>(
     agent: rig::agent::AgentBuilder<M, P>,
-    seam: BackendSeam<'_>,
+    params: &InferenceParams,
+    executor: Option<&SharedRocmToolExecutor>,
+    approval_tx: Option<&UnboundedSender<ClientMsg>>,
     last: &str,
     prior: &[ChatTurn],
     snapshot: StateSnapshot,
@@ -248,14 +242,13 @@ where
     let snap = Arc::new(snapshot);
     let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
-    let agent = apply_inference_params(agent, seam.params);
+    let agent = apply_inference_params(agent, params);
     // Telemetry + skill registry tools (shared registration site).
     let agent = register_telemetry_tools(agent, &snap, &fired);
     // Read-only ROCm machine-inspection tools (forward across the seam).
-    let agent = register_rocm_read_tools(agent, seam.executor, &fired);
+    let agent = register_rocm_read_tools(agent, executor, &fired);
     // Mutating ROCm tools (surface approval; never execute in the rig loop).
-    let agent =
-        register_rocm_mutating_tools(agent, seam.executor, seam.approval_tx, &fired).build();
+    let agent = register_rocm_mutating_tools(agent, executor, approval_tx, &fired).build();
 
     let req = agent
         .prompt(last.to_string())
@@ -352,12 +345,17 @@ impl AgentClient for RigAgentClient {
             return Err(AgentError::Empty);
         };
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let seam = BackendSeam {
-            params: &self.params,
-            executor: self.executor.as_ref(),
-            approval_tx: self.approval_tx.as_ref(),
-        };
-        run_agent_request(agent, seam, &last.content, prior, snapshot, "rig-openai").await
+        run_agent_request(
+            agent,
+            &self.params,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &last.content,
+            prior,
+            snapshot,
+            "rig-openai",
+        )
+        .await
     }
 }
 
@@ -487,12 +485,17 @@ impl AgentClient for ChatGptAgentClient {
 
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model).preamble(&self.preamble);
-        let seam = BackendSeam {
-            params: &self.params,
-            executor: self.executor.as_ref(),
-            approval_tx: self.approval_tx.as_ref(),
-        };
-        run_agent_request(agent, seam, &last.content, prior, snapshot, "chatgpt-oauth").await
+        run_agent_request(
+            agent,
+            &self.params,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &last.content,
+            prior,
+            snapshot,
+            "chatgpt-oauth",
+        )
+        .await
     }
 }
 
@@ -568,16 +571,23 @@ impl AgentClient for AnthropicAgentClient {
             return Err(AgentError::Empty);
         };
 
-        // Identical tool registration to RigAgentClient / ChatGptAgentClient:
-        // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
-        // capability and approval behavior are uniform across backends.
+        // Tool registration is delegated to run_agent_request, the single
+        // shared site all three backends (RigAgentClient, ChatGptAgentClient,
+        // AnthropicAgentClient) now call: the SAME telemetry/skill tools +
+        // every ROCm read + mutating tool, so capability and approval
+        // behavior are uniform across backends.
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let seam = BackendSeam {
-            params: &self.params,
-            executor: self.executor.as_ref(),
-            approval_tx: self.approval_tx.as_ref(),
-        };
-        run_agent_request(agent, seam, &last.content, prior, snapshot, "anthropic").await
+        run_agent_request(
+            agent,
+            &self.params,
+            self.executor.as_ref(),
+            self.approval_tx.as_ref(),
+            &last.content,
+            prior,
+            snapshot,
+            "anthropic",
+        )
+        .await
     }
 }
 
@@ -1092,8 +1102,11 @@ mod tests {
         // (register_rocm_read_tools), and mutating ROCm
         // (register_rocm_mutating_tools) — so capability + approval parity holds
         // across local/openai/anthropic. This enumerates the canonical sets that
-        // those shared helpers register; the helper call sites are identical in
-        // RigAgentClient, ChatGptAgentClient, and AnthropicAgentClient.
+        // those shared helpers register; the helper call sites now live in one
+        // place, `run_agent_request`, which RigAgentClient, ChatGptAgentClient,
+        // and AnthropicAgentClient all call into.
+        // `run_agent_request_registers_tool_sets_and_enforces_turn_limit` below
+        // asserts those tools are actually sent on the wire from that one site.
         //
         // Telemetry/skill set: register_telemetry_tools registers exactly the
         // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
