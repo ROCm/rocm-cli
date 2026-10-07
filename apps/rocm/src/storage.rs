@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
+use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal};
 use serde::Serialize;
 
 use crate::{
@@ -663,10 +663,11 @@ pub(crate) fn build_prune_plan(
         // Belt and braces on top of `should_remove_runtime_install_root`: prune
         // acts on a set the user never typed out, so a runtime whose folder sits
         // in a protected system location is refused outright.
-        if runtime_install_root_is_protected(&manifest.install_root) {
+        if let Some(why) = rocm_core::runtime_protected_location(&manifest.install_root) {
             plan.skipped.push(format!(
-                "{runtime_key}: folder {} is in a protected system location",
-                manifest.install_root.display()
+                "{runtime_key}: folder {} is {}, so it is left in place",
+                manifest.install_root.display(),
+                why.describe()
             ));
             continue;
         }
@@ -814,7 +815,11 @@ pub(crate) fn build_downloads_plan(paths: &AppPaths) -> UninstallPlan {
                     stack.push(path);
                 } else {
                     found = true;
-                    plan.actions.push(UninstallPlanEntry { kind, path });
+                    plan.actions.push(UninstallPlanEntry {
+                        kind,
+                        path,
+                        planned: crate::PlannedAs::Unchecked,
+                    });
                 }
             }
         }

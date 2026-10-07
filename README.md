@@ -816,6 +816,55 @@ rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
 ```
 
+On Linux, if a config, data, or cache folder is a link to somewhere else (for
+example a cache moved to a bigger disk), `rocm uninstall` removes the link and
+leaves the folder it points to alone, whether or not the setting ends in a `/`.
+
+`rocm uninstall` removes a config, data, or cache folder inside your home
+folder as usual. It never removes:
+
+- `/`, your home folder, or a folder that contains it;
+- `/usr`, `/etc`, `/boot`, `/bin`, `/sbin`, `/lib*`, `/sys`, `/proc`, `/dev`,
+  `/run`, `/media`, `/snap`, or anything inside them — on Windows, `Windows`,
+  `Program Files`, `Program Files (x86)` and `ProgramData` on the system drive,
+  and the same folders on a drive WSL mounts at `/mnt/<drive>`;
+- a folder other programs share: anything directly under `/` (`/opt`, `/srv`,
+  `/tmp`, ...), `/var/lib`, `/var/cache`, `/var/log`, `/var/tmp`, or a mounted
+  drive itself (`/mnt/c`);
+- another user's home folder (anything under `/home`, `/Users`, `C:\Users`
+  or a WSL drive's `Users`, or beside your own home, that is not inside yours).
+
+Anywhere else outside your home folder — `/opt/rocm-cli`, `/srv/rocm`,
+`/mnt/d/rocm`, another disk — it removes a folder only if it carries a
+`.rocm-cli-root` file. ROCm CLI writes that file only into a folder it creates
+itself: the config, data and cache folders it sets up, the data folder its log
+is first written to, and an SDK `--prefix` it creates. A folder that already
+existed, one made by hand, or one made by a release before this one is not
+marked. The check looks at where a folder really is as well as how it is
+written, so `ROCM_CLI_DATA_DIR=.` run from your home folder, a home reached
+through a linked parent folder, or a system folder reached through a link is
+caught too.
+
+If a folder is refused (for example `ROCM_CLI_DATA_DIR=/`, or an SDK installed
+with `--prefix ~`), the review lists it under "Refused" with why and the
+setting it came from, the command exits with an error, and nothing is removed.
+The message says what clears it: re-run with the `--keep-config`,
+`--keep-data`, or `--keep-cache` flag to leave that folder in place; point the
+`ROCM_CLI_*_DIR` variable it came from elsewhere; or, for an unmarked folder
+that is ROCm CLI's, create the `.rocm-cli-root` file it names. For a folder
+set by `setup.therock_venv`, use `--keep-data`: moving that setting would leave
+the SDK installed there behind. The same flags work in the dashboard's
+`/uninstall` and in the assistant's preview, and their refusals name the same
+setting. Between the review and the removal, each folder is resolved again;
+if it now points somewhere else, the uninstall stops instead.
+`rocm runtimes uninstall` and `rocm storage remove-old-installs` keep their own
+rule for runtime folders.
+
+The review also names the shared uv and Hugging Face caches. Normally they are
+left in place; if one sits inside a folder being removed (for example
+`ROCM_CLI_CACHE_DIR=~/.cache`), the review says it WILL BE DELETED before you
+confirm, and which `--keep-` flag keeps it.
+
 ### Shell completions
 
 `rocm completions <shell>` prints a completion script for the given shell to

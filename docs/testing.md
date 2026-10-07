@@ -549,6 +549,53 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
 ```
 
+## Uninstall And Download Removal
+
+`rocm uninstall` and `rocm storage remove-downloads` both end in the same
+removal helper. Their property tests build a real sandbox tree with planted
+symlinks (live, dangling, and spelled with a trailing `/` or `/.`), sibling
+folders whose names are prefixes of a removed root, and sentinel files outside
+it. Each case runs the real plan and removal code, then compares the tree by
+`(dev, ino)` against what the review listed:
+
+```bash
+cargo test -p rocm --bin rocm deletion_properties
+ROCM_DELETION_PROP_CASES=4096 cargo test -p rocm --bin rocm deletion_properties
+```
+
+The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
+local run. They are Unix-only because they plant symlinks.
+
+The uninstall properties also point roots at the sandbox's own home folder
+(directly, relative to the working directory, through `..`, and through a
+symlinked parent folder) and plant shared caches inside and outside the
+removed roots. They check that a
+protected root refuses the whole uninstall and removes nothing, that no file
+ROCm CLI did not create is deleted, and that the review says a shared cache
+WILL BE DELETED exactly when the removal deletes it.
+
+The protected-location rules live in `rocm-core` and are property-tested
+there against oracles restated from each policy, over seeds that include other
+users' homes, `/mnt`, `/run`, `/srv`, `/usr/local` and deeper system
+descendants, for several homes (including `/`). Runtime folders are refused
+inside the runtime system list; `rocm uninstall`'s roots are refused inside its
+own list (checked before any home allowance), at shared top-level folders and
+mounted drives, and in other users' homes, and need the `.rocm-cli-root`
+marker anywhere else outside home:
+
+```bash
+cargo test -p rocm-core --lib runtime::tests::delete_guard_properties
+cargo test -p rocm --bin rocm uninstall_
+cargo test -p rocm --bin rocm shared_cache
+```
+
+The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
+behaviour through the built binary, confined to the scenario's own folder:
+
+```bash
+cargo xtask e2e -- -n "uninstall-"
+```
+
 ## Provider-Assisted Planning
 
 The deterministic planner remains the default. Optional LLM/provider ambiguity

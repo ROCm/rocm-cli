@@ -375,3 +375,99 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall Safety
+
+Run these in a throwaway home on Linux or WSL, never against your real one, and
+only with `--dry-run` where the step says so. Each block starts a fresh sandbox:
+
+```bash
+export SANDBOX=$(mktemp -d)
+export HOME=$SANDBOX/users/home ROCM_CLI_CONFIG_DIR=$SANDBOX/users/home/.rocm/config \
+  ROCM_CLI_DATA_DIR=$SANDBOX/users/home/.rocm/data ROCM_CLI_CACHE_DIR=$SANDBOX/users/home/.rocm/cache
+mkdir -p "$HOME/Documents" "$ROCM_CLI_CONFIG_DIR"
+echo keep > "$HOME/Documents/keep.txt"
+```
+
+A protected data folder is refused (dry run only):
+
+```bash
+ROCM_CLI_DATA_DIR=/ rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the review lists `data: / is the top of the filesystem (set
+by ROCM_CLI_DATA_DIR)` under "Refused", never under the items to remove, ends
+with `This uninstall would be refused. Point ROCM_CLI_DATA_DIR at a folder of
+ROCm CLI's own, or re-run with --keep-data ...`, and the command exits
+non-zero.
+
+The home folder as the data folder is refused for real, and the advised flag
+works:
+
+```bash
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries
+ROCM_CLI_DATA_DIR=$HOME rocm uninstall --yes --keep-binaries --keep-data
+```
+
+Expected result: the first command exits non-zero with `uninstall refused,
+nothing was removed: the data folder <home> is your home folder (set by
+ROCM_CLI_DATA_DIR) ...`, and `$HOME/Documents/keep.txt` and the config folder
+are both still there. The second exits 0, removes the config folder, and leaves
+`keep.txt` alone.
+
+The same holds when the setting does not spell out the home folder:
+
+```bash
+(cd "$HOME" && ROCM_CLI_DATA_DIR=. rocm uninstall --yes --keep-binaries)
+```
+
+Expected result: exit non-zero with `the data folder . is your home folder
+(set by ROCM_CLI_DATA_DIR; resolves to <home>)`, and `keep.txt` is still there.
+
+In the dashboard, `/uninstall --keep-data` previews and `/uninstall --apply
+--keep-data` runs the uninstall with the data folder left out; with
+`ROCM_CLI_DATA_DIR=$HOME` the preview no longer reports a refusal. With
+`setup.therock_venv` pointing at the home folder instead (and
+`ROCM_CLI_DATA_DIR` unset), the dashboard's refusal names
+`setup.therock_venv`, not `ROCM_CLI_DATA_DIR`, and leads with `--keep-data`.
+
+A folder outside the home folder needs ROCm CLI's marker:
+
+```bash
+mkdir -p "$SANDBOX/srv/rocm"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+touch "$SANDBOX/srv/rocm/.rocm-cli-root"
+ROCM_CLI_DATA_DIR=$SANDBOX/srv/rocm rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: the first preview refuses the data folder as `outside your
+home folder and not marked as ROCm CLI's own` and names the
+`.rocm-cli-root` file to create; after creating it, the second lists the data
+folder for removal. A system folder such as `/usr/local`, or a shared one such
+as `/var/lib` or `/opt`, is refused in a dry run whatever is in it, and the
+refusal does not offer the marker.
+
+A shared cache inside the cache folder is named as deleted (dry run):
+
+```bash
+mkdir -p "$HOME/.cache/uv" "$HOME/.cache/huggingface/hub"
+ROCM_CLI_CACHE_DIR=$HOME/.cache rocm uninstall --dry-run --keep-binaries
+```
+
+Expected result: under "Please review", `the uv package cache WILL BE DELETED`
+and `downloaded model files WILL BE DELETED`, each naming the cache folder and
+`--keep-cache`. With the default cache folder the same two caches are reported
+as `not removed` instead.
+
+A symlinked cache folder written with a trailing slash is unlinked, not
+emptied:
+
+```bash
+mkdir -p "$SANDBOX/real-cache" && touch "$SANDBOX/real-cache/keep"
+ln -s "$SANDBOX/real-cache" "$SANDBOX/rocm-cache"
+ROCM_CLI_CACHE_DIR=$SANDBOX/rocm-cache/ \
+  rocm uninstall --yes --keep-binaries --keep-config --keep-data
+```
+
+Expected result: exit 0, `removed cache <sandbox>/rocm-cache`, the link is
+gone, and `real-cache/keep` is still there.
