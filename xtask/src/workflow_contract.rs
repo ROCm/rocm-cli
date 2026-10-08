@@ -2296,7 +2296,16 @@ esac
     /// last in its `repo:` block — and a needle that fails to match (e.g. a
     /// reformat, or this hook ending up last with only a trailing comment
     /// after it) would silently run the block to the end of the file
-    /// instead of failing loudly.
+    /// instead of failing loudly. A comment line at or below the hook's own
+    /// indent doesn't end the block by itself: it only does when it turns
+    /// out to head the next sibling, i.e. nothing deeper follows it before
+    /// the next such line — a comment with real indent-8 content still
+    /// after it (`hook_block_does_not_end_at_a_comment_only_line`) is just
+    /// an annotation inside this hook's own mapping, not a boundary, while
+    /// one immediately followed by the next `- id:`/`- repo:` (as
+    /// `.pre-commit-config.yaml` has between `license-headers` and the
+    /// `cargo-fmt` repo block today) is the next block's header comment and
+    /// must not be folded into this one's.
     fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
         let marker = format!("- id: {id}\n");
         let start = text
@@ -2305,14 +2314,32 @@ esac
         let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
         let marker_indent = indent_of(&text[line_start..start]);
         let rest = &text[start + marker.len()..];
-        let end = rest
-            .match_indices('\n')
-            .find_map(|(i, _)| {
-                let next_line = rest[i + 1..].lines().next().unwrap_or("");
-                (!next_line.trim().is_empty() && indent_of(next_line) <= marker_indent).then_some(i)
-            })
-            .unwrap_or(rest.len());
-        &rest[..end]
+
+        let mut offset = 0usize;
+        let mut pending_comment: Option<usize> = None;
+        for line in rest.split_inclusive('\n') {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let trimmed = content.trim_start();
+            if trimmed.is_empty() {
+                offset += line.len();
+                continue;
+            }
+            if indent_of(content) > marker_indent {
+                // Real content deeper than the hook's own indent proves any
+                // dedented comment seen so far was just an annotation inside
+                // this hook's mapping, not a sibling's header.
+                pending_comment = None;
+                offset += line.len();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                pending_comment.get_or_insert(offset);
+                offset += line.len();
+                continue;
+            }
+            return &rest[..pending_comment.unwrap_or(offset)];
+        }
+        rest
     }
 
     /// True if `block` has a line that, after stripping any trailing `#`
@@ -2323,14 +2350,18 @@ esac
         block.lines().any(|line| strip_comment(line).trim() == flag)
     }
 
-    /// Regression guard for the gap closed above: a `types_or` filter that
-    /// let a `licenserc.toml`- or Markdown-only commit skip the
-    /// `license-headers` hook. The hook must have no `types_or` file-type
-    /// filter, because hawkeye scans the whole repo per `licenserc.toml`
-    /// (`pass_filenames: false`) regardless of which files changed — a
-    /// filter only ever decides whether the hook *fires*, and can never
-    /// track `licenserc.toml`'s own include list. Without this, a future
-    /// edit could reintroduce a filter and silently reopen that gap.
+    /// Regression guard: the `license-headers` hook once had a `types_or`
+    /// filter (`types_or: [rust, python, shell]`) that let a
+    /// `licenserc.toml`- or Markdown-only commit skip it entirely, while
+    /// CI's hawkeye check still enforced it. `always_run: true` is what
+    /// actually closes that gap: it fires the hook on every commit/push
+    /// regardless of any file-type filter, and hawkeye then scans the
+    /// whole repo per `licenserc.toml` (`pass_filenames: false`) however
+    /// it was triggered. The filter-key checks below guard the next step:
+    /// `always_run: true` already makes any of them inert, so none of
+    /// these alone can reopen the gap, but leaving one in place is
+    /// misleading maintenance debt that could let a later edit drop
+    /// `always_run` while assuming the filter still gates correctly.
     #[test]
     fn license_headers_hook_has_no_file_type_filter() {
         // CRLF-normalize: `.pre-commit-config.yaml` isn't forced to `eol=lf` in
@@ -2344,15 +2375,21 @@ esac
             hook_block_sets(block, "always_run: true"),
             "license-headers hook must set `always_run: true`:\n{block}"
         );
-        assert!(
-            !block.contains("types_or:"),
-            "license-headers hook must not have a `types_or` filter — hawkeye already \
-             scans the whole repo regardless of which files changed, so a filter only \
-             gates whether the hook fires and can reopen the `licenserc.toml` gap this \
-             test guards against:\n{block}"
-        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "license-headers hook must not have a file-type filter (`{filter_key}`) — \
+                 `always_run: true` above already makes it inert, but leaving one in place \
+                 is misleading maintenance debt that could let a later edit drop \
+                 `always_run` while assuming the filter still gates correctly:\n{block}"
+            );
+        }
     }
 
+    // Extractor guards: prove the helpers above actually parse the shapes they
+    // claim to — multiline hook blocks, comment-stripping, and single-line pin
+    // tokens alike — so the contract tests above can't silently false-pass on a
+    // shape they don't handle.
     #[test]
     fn hook_block_stops_at_next_hook_in_the_same_repo_block() {
         // license-headers is NOT last in its `hooks:` list here, unlike in the
@@ -2396,6 +2433,62 @@ esac
     }
 
     #[test]
+    fn hook_block_does_not_end_at_a_comment_only_line() {
+        // The comment sits at the hook's own `- id:` indent — exactly the
+        // indent that used to end the block — with a real filter key after
+        // it. A reformat could leave a repo looking like this; the filter
+        // key must still be visible to the contract test above.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+      # a comment at the hook's own indent must not end the block
+        types_or: [rust]
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            block.contains("types_or:"),
+            "hook_block ended at a comment-only line, hiding a types_or filter that \
+             comes after it:\n{block}"
+        );
+        assert!(
+            !block.contains("cargo-fmt") && !block.contains("always_run"),
+            "hook_block still must not leak into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_a_dedented_comment_heading_the_next_repo_block() {
+        // Unlike the comment in the test above, this one sits right before the
+        // next `repo:` entry with nothing deeper in between — it heads that
+        // entry rather than annotating `license-headers`' own mapping, exactly
+        // the shape `.pre-commit-config.yaml` has between `license-headers`
+        // and the `cargo-fmt` repo block today.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # Rust + PowerShell: mirror the CI checks using the local toolchain.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("Rust + PowerShell") && !block.contains("always_run"),
+            "hook_block folded the next repo block's header comment into this hook's \
+             block:\n{block}"
+        );
+    }
+
+    #[test]
     fn hook_block_sets_rejects_comment_only_and_falsified_mentions() {
         assert!(hook_block_sets(
             "        always_run: true",
@@ -2414,8 +2507,6 @@ esac
         ));
     }
 
-    // Extractor guards: prove the helpers actually parse multiline forms, so the
-    // contract tests above can't silently false-pass on a shape they don't handle.
     #[test]
     fn pin_token_rejects_prefixes_and_comment_only_mentions() {
         assert_eq!(
@@ -2460,6 +2551,17 @@ esac
         // check for `0.9.1` — proven end to end through the real comparison
         // path, not just through extraction.
         let text = "cargo install cargo-about@0.9.10 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no `cargo-about@` pin")]
+    fn assert_pins_match_flags_a_marker_with_no_pin_at_all() {
+        // A file whose pin was reworded out of the marker's shape (e.g. split
+        // onto `--version` instead of `cargo-about@<version>`) must not
+        // silently drop out of the drift guard — deleting the `found` check
+        // this fixture pins would otherwise leave every other test green.
+        let text = "cargo install cargo-about --version 0.9.1 --locked\n";
         assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
     }
 
