@@ -26517,6 +26517,104 @@ install therock";
         Ok(())
     }
 
+    /// Persist a live-looking managed record claiming `gpu` — the same shape a
+    /// real launch writes, with the current process id as the supervisor so the
+    /// liveness refresh in `load_managed_services` keeps it "starting" (and thus
+    /// counted by `busy_gpu_indices`).
+    fn write_claiming_record(paths: &AppPaths, service_id: &str, port: u16, gpu: &[u32]) {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            std::process::id(),
+            Some("therock-release".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "starting".to_owned();
+        record.gpu_indices = gpu.to_vec();
+        record.write().expect("write claiming record");
+    }
+
+    #[test]
+    fn launch_lock_makes_gpu_select_and_claim_atomic() {
+        // Regression for the serve read-select-launch race: the busy-GPU read and
+        // the claiming record write must happen under one lock, or two concurrent
+        // `--gpu auto` serves both read the same GPU as free and land on it.
+        //
+        // The test does NOT take the lock itself — that would only prove
+        // `FileLock` excludes (already covered by
+        // `file_lock_serializes_concurrent_holders` in rocm-core). It calls
+        // `select_gpu_indices_under_launch_lock`, the production helper `serve()`
+        // uses, whose contract is that it returns the guard *it* acquired together
+        // with the selection; the test holds that guard across the claim exactly
+        // as `serve()` holds it until `spawn_managed_engine_child` persists the
+        // record. Delete the `FileLock::acquire` from that helper and this test
+        // goes red: both threads then select GPU 0.
+        //
+        // Determinism: the barrier releases both threads together and each sleeps
+        // between select and claim, so an unlocked helper double-books GPU 0
+        // regardless of scheduling skew, while the locked helper forces the second
+        // thread to observe the first thread's claim.
+        let (root, paths) = test_paths("launch-lock-atomic-claim");
+        paths.ensure().expect("prepare paths");
+        let detected = Some(2_usize);
+
+        let barrier = std::sync::Barrier::new(2);
+        let selections = std::thread::scope(|scope| {
+            let handles: Vec<_> = [("svc-race-a", 21001_u16), ("svc-race-b", 21002_u16)]
+                .into_iter()
+                .map(|(service_id, port)| {
+                    let paths = &paths;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        // The exact call `serve()` makes: the helper acquires the
+                        // launch lock and selects under it, handing the guard back.
+                        // `None` visibility keeps selection mask-unaware for the
+                        // test host; `pinned` `None` + `cpu_only` false is the
+                        // `--gpu auto` path that reads live busy-GPU state.
+                        let (gpu, lock) = select_gpu_indices_under_launch_lock(
+                            paths,
+                            false,
+                            None,
+                            || detected,
+                            None,
+                            None,
+                        )
+                        .expect("auto GPU selection under launch lock");
+                        // Widen the select→claim window so an unlocked helper
+                        // deterministically double-books GPU 0; under the lock the
+                        // second thread cannot enter until we claim.
+                        std::thread::sleep(Duration::from_millis(50));
+                        write_claiming_record(paths, service_id, port, &gpu);
+                        drop(lock);
+                        gpu
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("selection thread joins"))
+                .collect::<Vec<_>>()
+        });
+
+        let mut picked: Vec<u32> = selections.into_iter().flatten().collect();
+        picked.sort_unstable();
+        assert_eq!(
+            picked,
+            vec![0, 1],
+            "serialized select-then-claim must hand out distinct GPUs, got {picked:?}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn services_prune_dry_run_reports_the_plan_and_removes_nothing() -> Result<()> {
         let (root, paths) = test_paths("services-prune-dry-run");
