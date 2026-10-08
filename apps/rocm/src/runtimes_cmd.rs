@@ -469,7 +469,7 @@ impl ActivationSnapshot {
                     .context("active runtime marker path has no parent directory")?;
                 fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create {}", parent.display()))?;
-                therock::write_file_atomically(&path, &bytes)
+                rocm_core::atomic_write::write_file_atomically(&path, &bytes)
                     .with_context(|| format!("failed to restore {}", path.display()))?;
             }
             // Only a regular file is removed: whatever else may sit at that
@@ -1812,7 +1812,7 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // retention holds both read as "nothing is active" — and a failed publish
     // takes its temp file with it, so a retried activation cannot strand one in
     // the folder `rocm runtimes` reads.
-    therock::write_file_atomically(
+    rocm_core::atomic_write::write_file_atomically(
         &path,
         &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
     )
