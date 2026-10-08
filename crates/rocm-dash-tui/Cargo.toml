@@ -67,9 +67,11 @@ libc.workspace = true
 # binary.
 proptest = { version = "1", default-features = false, features = ["std"] }
 # Same rig-core as [dependencies], with its `test-utils` feature (gives
-# `MockCompletionModel`/`MockTurn`) added for test builds only. Cargo unifies
-# features for one crate across [dependencies]/[dev-dependencies] per build
-# unit, so this does not enable test-utils in the shipped binary.
+# `MockCompletionModel`/`MockTurn`) added for test builds only. The root
+# workspace's resolver = "2" (see Cargo.toml) does not turn on dev-dependency
+# features for a build that has no test/example/bench target, so a release
+# build of the shipped binary never enables test-utils; `cargo test` does.
+# Keep this `=0.38.1` pin in sync with the [dependencies] one above.
 rig = { package = "rig-core", version = "=0.38.1", default-features = false, features = [
     "test-utils",
 ] }
