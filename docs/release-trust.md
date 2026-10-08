@@ -69,7 +69,12 @@ still records which trust root it used.
 
 Verification is driven by what the run asks for, not by what happens to be in
 the environment: `--require-signatures`, `--require-production-trust` or an
-explicit `--public-key`. Previously a key present in
+explicit `--public-key` — or the environment equivalents of the first two,
+`ROCM_CLI_REQUIRE_SIGNATURE` and `ROCM_CLI_REQUIRE_PRODUCTION_TRUST`, which
+`release.yml` and `nightly.yml` set in the same step that runs the gate. Note
+that exporting `ROCM_CLI_REQUIRE_SIGNATURE=1` for packaging therefore also
+requires a resolvable signing key, where before it needed only a `.sig`.
+Previously a key present in
 `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` was enough to opportunistically verify even
 without those flags; that trigger was removed when the flags began to imply
 verification, so a readiness run that asks for neither now checks neither

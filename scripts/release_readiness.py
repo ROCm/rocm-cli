@@ -535,7 +535,10 @@ def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
     raise ReadinessError(
         "signature verification requires a release signing public key: pass "
         f"--public-key or set {SIGNING_PUBLIC_KEY_PATH_ENV} or "
-        f"{SIGNING_PUBLIC_KEY_ENV}"
+        f"{SIGNING_PUBLIC_KEY_ENV}. Verification is requested by "
+        "--require-signatures, --require-production-trust, --public-key, or the "
+        "ROCM_CLI_REQUIRE_SIGNATURE / ROCM_CLI_REQUIRE_PRODUCTION_TRUST "
+        "environment variables -- the last of which packaging steps export."
     )
 
 
@@ -760,26 +763,27 @@ def _assert_main_refuses_without_a_key(dist: Path) -> None:
         )
 
 
-def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
-    """`main` must verify, against the resolved key, and say which key that was.
+def _run_main_verifying(
+    dist: Path, *flags: str, verification_fails: bool = False
+) -> tuple[int | None, str, str, list[list[str]]]:
+    """Drive `main` with `cargo xtask verify` intercepted at the subprocess call.
 
-    Three things have to hold together, because each is separately silent:
-    verification has to happen at all; it has to use the key
-    `resolve_signing_key` chose, since `cargo xtask verify` falls back to the
-    inline PEM when `--public-key` is omitted and would then check a different
-    key than the run reports; and the `signature verification key:` line has to
-    name that same key, or the log makes a claim nothing backs.
+    Returns `(exit code, stdout, stderr, argvs)`, where `argvs` holds every
+    command verification actually ran.
+
+    Interception sits at the subprocess boundary rather than stubbing
+    `verify_signature`, so the real argv is built and the `--public-key` handoff
+    is exercised; stubbing the function leaves `key_args` unreachable, and
+    dropping it would stay green while verification silently fell back to
+    whatever the inline PEM holds.
     """
-    # Intercept at the subprocess boundary rather than stubbing
-    # `verify_signature`, so the real argv is built and the `--public-key`
-    # handoff is covered too. Stubbing the function instead leaves `key_args`
-    # unexercised: dropping it stays green while verification silently falls
-    # back to whatever the inline PEM holds.
     argvs: list[list[str]] = []
+    returncode = 1 if verification_fails else 0
 
     class _Completed:
-        returncode = 0
-        stdout = ""
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stdout = "stub: signature did not verify" if returncode else ""
 
     module = sys.modules[__name__]
     original_run, original_which = module.subprocess.run, module.shutil.which
@@ -791,9 +795,23 @@ def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
         "/fake/cargo" if name == "cargo" else original_which(name)
     )
     try:
-        code, stdout, stderr = _run_main(dist, "--require-signatures")
+        code, stdout, stderr = _run_main(dist, *flags)
     finally:
         module.subprocess.run, module.shutil.which = original_run, original_which
+    return code, stdout, stderr, argvs
+
+
+def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
+    """`main` must verify, against the resolved key, and say which key that was.
+
+    Three things have to hold together, because each is separately silent:
+    verification has to happen at all; it has to use the key
+    `resolve_signing_key` chose, since `cargo xtask verify` falls back to the
+    inline PEM when `--public-key` is omitted and would then check a different
+    key than the run reports; and the `signature verification key:` line has to
+    name that same key, or the log makes a claim nothing backs.
+    """
+    code, stdout, stderr, argvs = _run_main_verifying(dist, "--require-signatures")
     if code is not None:
         raise ReadinessError(
             f"main rejected a run it should have accepted (exit {code}): "
@@ -820,6 +838,76 @@ def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
         raise ReadinessError(
             f"the run did not report the key it used; expected {expected_line!r} "
             f"in stdout, got {stdout.strip()!r}"
+        )
+
+
+def _assert_key_line_survives_a_failed_verification(dist: Path) -> None:
+    """The key line must appear on the run that fails, not only on the one that passes.
+
+    `docs/release-trust.md` promises it names the key the run actually used; a
+    failed verification is when that matters most. Collecting the line into
+    `messages`, which is flushed only on success, would keep every other case
+    green while deleting it from exactly that run.
+    """
+    code, stdout, _stderr, argvs = _run_main_verifying(
+        dist, "--require-signatures", verification_fails=True
+    )
+    if code is None or not argvs:
+        raise ReadinessError(
+            "main accepted a run whose signature verification failed "
+            f"(exit {code!r}, {len(argvs)} verification call(s))"
+        )
+    if "signature verification key:" not in stdout:
+        raise ReadinessError(
+            "the key line is missing from a run that failed verification, which "
+            "is the run that most needs it; it must not be deferred to the "
+            f"success-only message flush. stdout was {stdout.strip()!r}"
+        )
+
+
+def _assert_inline_pem_run_omits_the_key_flag(dist: Path) -> None:
+    """With only the inline PEM set, the run must say so and pass no `--public-key`.
+
+    This is the source release and nightly actually use. `cargo xtask verify`
+    reads the PEM itself, so materialising a key file would be wrong -- but the
+    label still has to name the PEM, and gating the line on a resolved path
+    would silently drop it for every real CI run.
+    """
+    code, stdout, stderr, argvs = _run_main_verifying(dist, "--require-signatures")
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected an inline-PEM run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if not argvs:
+        raise ReadinessError("an inline-PEM run verified nothing")
+    for argv in argvs:
+        if "--public-key" in argv:
+            raise ReadinessError(
+                f"an inline-PEM run passed --public-key: {argv!r}; `cargo xtask "
+                "verify` reads the PEM itself and no key file exists to name"
+            )
+    expected_line = f"signature verification key: ${SIGNING_PUBLIC_KEY_ENV}"
+    if expected_line not in stdout:
+        raise ReadinessError(
+            f"an inline-PEM run did not report its key source; expected "
+            f"{expected_line!r}, got {stdout.strip()!r}"
+        )
+
+
+def _assert_main_honours_trigger(dist: Path, *flags: str) -> None:
+    """Each trigger must force verification *through `main`*, not just in the helper.
+
+    `verification_is_required` is pinned directly, but `main` chooses what to
+    feed it. Passing a literal `False` for production trust, or `None` for
+    `--public-key`, leaves those helper cases green while the flag stops doing
+    anything.
+    """
+    _code, _stdout, _stderr, argvs = _run_main_verifying(dist, *flags)
+    if not argvs:
+        raise ReadinessError(
+            f"{' '.join(flags)} did not make main verify anything; the flag is no "
+            "longer reaching resolve_verification"
         )
 
 
@@ -1222,11 +1310,36 @@ def run_self_test(root: Path) -> None:
         # missing key still wins resolution rather than falling through.
         real_key = root / "present-public-key.pem"
         real_key.write_text(inline_pem, encoding="ascii")
-        run_with_env(
-            {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: real_key},
-            lambda: _assert_main_verifies(gate_dist, real_key),
-        )
+        path_env = {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: real_key}
+        run_with_env(path_env, lambda: _assert_main_verifies(gate_dist, real_key))
         print("release readiness self-test: main actually verifies ok")
+
+        run_with_env(
+            path_env, lambda: _assert_key_line_survives_a_failed_verification(gate_dist)
+        )
+        print("release readiness self-test: key line survives a failed verify ok")
+
+        # The source release and nightly actually use.
+        run_with_env(
+            {**no_key_env, SIGNING_PUBLIC_KEY_ENV: inline_pem},
+            lambda: _assert_inline_pem_run_omits_the_key_flag(gate_dist),
+        )
+        print("release readiness self-test: inline-PEM run reports its source ok")
+
+        # The other two triggers, driven through `main` rather than the helper.
+        run_with_env(
+            path_env,
+            lambda: _assert_main_honours_trigger(
+                gate_dist, "--require-production-trust"
+            ),
+        )
+        run_with_env(
+            no_key_env,
+            lambda: _assert_main_honours_trigger(
+                gate_dist, "--public-key", str(real_key)
+            ),
+        )
+        print("release readiness self-test: production-trust and --public-key ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
