@@ -85,9 +85,9 @@ New subcommands and subsystems default to their own file from day one — don't 
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
 
-Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which neither check walks — is checked by the `docs-links` CI job and by the `lychee` prek hook above, both configured by [`lychee.toml`](lychee.toml) (which lists the current exclusions). Both run offline only, so they don't catch broken external `https://` links.
+Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which neither check walks — is checked by the `docs-links` CI job and by the `lychee` prek hook above, both configured by `lychee.toml` (which lists the current exclusions). Both run offline only, so they don't catch broken external `https://` links.
 
-Since only links are checked, cite a specific repo file as a link relative to the citing file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, `docs/rocm-docs/`, links leaving a `skills/` folder), is in [AGENTS.md §5](AGENTS.md#5-investigate-rocm-cli-before-editing); it applies to citations you add or edit.
+Since only links are checked, cite a specific repo file as a link relative to the citing file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, `docs/rocm-docs/` and the files it includes — this one and README.md — and links leaving a `skills/` folder), is in AGENTS.md §5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
 
 ### Test commands
 

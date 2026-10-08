@@ -193,7 +193,9 @@ Keep docs and behavior claims in sync while editing:
   `report.json` — and where the rule does not reach: `.github/` (its
   templates become issue and PR bodies, where a relative link breaks),
   `docs/rocm-docs/` (Sphinx source built into a separate site, excluded
-  from `docs-links`), and a link leaving a skill folder in `skills/`
+  from `docs-links`), README.md and CONTRIBUTING.md (`{include}`d into
+  that site, where `docs-build`'s `sphinx-build -W` fails on a link to a
+  file outside it), and a link leaving a skill folder in `skills/`
   (published or embedded elsewhere, §7). This covers citations you add or
   edit, not converting existing bare paths in an unrelated change
 
