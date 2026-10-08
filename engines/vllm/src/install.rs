@@ -124,7 +124,10 @@ pub(crate) fn vllm_rocm_discover_build(
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share
 /// a ROCm SDK major version, ignoring minor, patch, and any dev/pre-release
-/// suffix. See [`vllm_rocm_discover_build`] for why major alone is enough here.
+/// suffix. Major alone is enough here because this only chooses which
+/// fail-closed error message to bail with when no static pin matches — it
+/// does not select a build to install, so it doesn't need the narrower
+/// `major.minor` match [`vllm_rocm_discover_build`] uses for that.
 fn rocm_sdk_major_matches(recorded: &str, table_key: &str) -> bool {
     fn major(version: &str) -> Option<u64> {
         version.trim().split('.').next()?.parse().ok()

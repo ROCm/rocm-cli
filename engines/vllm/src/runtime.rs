@@ -95,6 +95,13 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
+/// The ROCm SDK 10.0 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
+/// The ROCm SDK 10.1 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
+
 /// ROCm SDK versions keyed by a row in `install.rs`'s discover-build table
 /// (see [`crate::install::vllm_rocm_discover_build`] for the recipe each one
 /// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
@@ -106,8 +113,6 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
 /// `install.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
 /// test, not by construction — a new table row needs a matching entry here,
 /// and that test is what catches it if one is missed.
-pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
-pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
 pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
 
 /// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
