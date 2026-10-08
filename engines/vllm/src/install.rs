@@ -4,9 +4,9 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use rocm_core::{
-    AppPaths, DependencyViolation, check_dependencies, ensure_uv_binary, split_local_version,
-    uv_command_env, uv_pip_freeze_args, uv_pip_install_base, violation_subject,
-    violations_requiring,
+    AppPaths, DependencyViolation, check_dependencies, command_failure_detail, ensure_uv_binary,
+    split_local_version, uv_command_env, uv_pip_freeze_args, uv_pip_install_base,
+    violation_subject, violations_requiring,
 };
 use rocm_engine_protocol::{InstallRequest, InstallResponse};
 use std::path::{Path, PathBuf};
@@ -611,10 +611,7 @@ fn install_vllm_with_uv(
             if output.status.success() {
                 return Ok(Vec::new());
             }
-            let detail = command_failure_detail(
-                &String::from_utf8_lossy(&output.stdout),
-                &String::from_utf8_lossy(&output.stderr),
-            );
+            let detail = command_failure_detail(&output);
             bail!(
                 "`uv pip install {} --extra-index-url {}` failed for {}: {}",
                 requirement,
@@ -623,19 +620,6 @@ fn install_vllm_with_uv(
                 detail
             )
         }
-    }
-}
-/// Picks the best available detail string from a failed `uv` subprocess's
-/// output: stderr if non-empty, else stdout, else a literal "no output".
-fn command_failure_detail(stdout: &str, stderr: &str) -> String {
-    let stderr = stderr.trim();
-    let stdout = stdout.trim();
-    if !stderr.is_empty() {
-        stderr.to_owned()
-    } else if !stdout.is_empty() {
-        stdout.to_owned()
-    } else {
-        "no output".to_owned()
     }
 }
 /// Resolves the exact requirement `uv` would install for `pkg` constrained
@@ -687,7 +671,7 @@ fn discover_pinned_requirement(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
-        let detail = command_failure_detail(&stdout, &stderr);
+        let detail = command_failure_detail(&output);
         bail!("`uv pip install --dry-run {requirement}` from {index_url} failed: {detail}");
     }
     dry_run_resolved_pin(&stderr, pkg)
@@ -865,10 +849,7 @@ fn run_uv_pip_install(uv: &Path, paths: &AppPaths, python: &Path, args: Vec<Stri
     if output.status.success() {
         return Ok(());
     }
-    let detail = command_failure_detail(
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
+    let detail = command_failure_detail(&output);
     bail!(
         "`uv pip install {}` failed for {}: {}",
         args.join(" "),
