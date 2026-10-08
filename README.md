@@ -203,11 +203,17 @@ rocm install sdk
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
 environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it. Running the command when a
-managed runtime is already the active default asks first, because the new
-install takes over as the active default; see
+creates a separate managed runtime alongside it.
+
+By default, `rocm install sdk` installs ROCm 7.14. For ROCm 10.0 or newer, add
+`--version` and `--family` with the exact GPU arch from `rocm examine`, for
+example `--version 10.1.0 --family gfx1200`.
+
+Running the command when a managed runtime is already the active default asks
+first, because the new install takes over as the active default; see
 [ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
-for that gate and the flags that approve it without a prompt.
+for that gate, the flags that approve it without a prompt, and the ROCm 10 and
+newer requirements.
 
 Then serve a model:
 
@@ -348,7 +354,8 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli.
+by rocm-cli. It can install ROCm 7.14, 10.0, or 10.1. To install 10.0 or newer,
+follow the steps under ROCm 10 and newer, below.
 
 #### Compiler toolchain (--devel)
 
@@ -403,6 +410,31 @@ already there no longer runs its own Python, it is removed outright and rebuilt.
 The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
+#### ROCm 10 and newer
+
+ROCm 10 and newer ship from a different source layout. You opt in by passing two
+things together: pin the version with `--version`, and name the exact GPU arch,
+using the raw `gfx` code rather than a family label:
+
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
+```
+
+A family label such as `--family gfx120X-all` is rejected for those versions
+rather than resolved to a guess, because the ROCm 10 packages publish one
+payload per exact arch and there is no bucket payload to fall back to. Run
+`rocm examine` to see the arch this machine reports.
+
+For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
+torchaudio from their published dependency metadata, then validates that every
+selected framework package carries the same ROCm build identifier before it
+creates or changes a managed runtime.
+
+Nothing about this happens on its own. Without a `--version` of 10 or newer,
+`install sdk` resolves the same release and nightly sources as before. It doesn't
+quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
+you what it couldn't find instead.
+
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
@@ -420,31 +452,6 @@ package.
 | `--json` | Prints the check result as a single line of JSON instead of text. Conflicts with `--apply` and `--dry-run`. |
 | `--timeout-secs` | Bounds the network calls of the check. Requires `--json`. Conflicts with `--apply`. |
 | `--yes` | Accepted for consistency with other mutating commands, but grants nothing on `update`. The approval line the update path prints never credits it. |
-
-#### ROCm 10 and newer
-
-ROCm 10 and newer ship from a different source layout. You opt in by passing two
-things together: pin the version with `--version`, and name the exact GPU arch,
-using the raw `gfx` code rather than a family label:
-
-```
-rocm install sdk --version 10.0.0 --family gfx1200 --dry-run
-```
-
-A family label such as `--family gfx120X-all` is rejected for those versions
-rather than resolved to a guess, because the ROCm 10 packages publish one
-payload per exact arch and there is no bucket payload to fall back to. Run
-`rocm examine` to see the arch this machine reports.
-
-For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
-torchaudio from their published dependency metadata, then validates that every
-selected framework package carries the same ROCm build identifier before it
-creates or changes a managed runtime.
-
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
-quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead.
 
 ### Runtime management
 

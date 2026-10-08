@@ -19,16 +19,16 @@ SPDX-License-Identifier: MIT
 ```
 
 <!-- The prose below is a deliberate copy of the README sentence, with the
-     cross-reference retargeted to this site. The link text is then reused as
-     the `:start-after:` anchor for the next include, which also matches the
-     original sentence in README.md; edit both together. -->
+     cross-reference retargeted to this site. The end of the sentence is then
+     reused as the `:start-after:` anchor for the next include, which also
+     matches the original sentence in README.md; edit both together. -->
 Running the command when a managed runtime is already the active default asks
 first, because the new install takes over as the active default; see
-[ROCm installation](commands.md#rocm-installation) for that gate and the flags
-that approve it without a prompt.
+[ROCm installation](commands.md#rocm-installation) for that gate, the flags
+that approve it without a prompt, and the ROCm 10 and newer requirements.
 
 ```{include} ../../README.md
-:start-after: "for that gate and the flags that approve it without a prompt."
+:start-after: "newer requirements."
 :end-before: "You can also serve any compatible Hugging Face model directly"
 ```
 
