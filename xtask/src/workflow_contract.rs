@@ -1713,6 +1713,10 @@ esac
             "the consolidated report job must redirect the markdown matrix into \
              consolidated/support-matrix.md for the wiki job"
         );
+        assert!(
+            report.contains("cat consolidated/support-matrix.md >> \"$GITHUB_STEP_SUMMARY\""),
+            "the nightly step summary must still receive the matrix"
+        );
         let publish = job_block(&nightly, "publish-e2e-wiki");
         assert_eq!(
             job_scalar(publish, "needs"),
@@ -1788,21 +1792,17 @@ esac
         let guard = lines[start..=end].join("\n");
 
         let run = |matrix: &str| -> String {
-            let dir = std::env::temp_dir().join(format!(
-                "wiki-guard-{}-{}",
-                std::process::id(),
-                matrix.len()
-            ));
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
             std::fs::create_dir_all(dir.join("consolidated")).unwrap();
             std::fs::write(dir.join("consolidated/support-matrix.md"), matrix).unwrap();
             let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
             let out = std::process::Command::new("bash")
                 .arg("-c")
                 .arg(script)
-                .current_dir(&dir)
+                .current_dir(dir)
                 .output()
                 .expect("run bash");
-            let _ = std::fs::remove_dir_all(&dir);
             assert!(out.status.success(), "guard script failed: {out:?}");
             String::from_utf8_lossy(&out.stdout).into_owned()
         };
