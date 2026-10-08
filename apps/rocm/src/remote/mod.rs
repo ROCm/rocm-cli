@@ -1286,9 +1286,8 @@ mod tests {
     /// endpoint key.
     fn temp_paths(tag: &str) -> (std::path::PathBuf, AppPaths) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-remote-unwind-{tag}-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
+            "rocm-remote-unwind-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
@@ -1300,6 +1299,11 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_paths("same-label").0);
     }
 
     fn sample_record() -> RemoteSessionRecord {

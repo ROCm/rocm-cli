@@ -17,6 +17,8 @@ mod providers;
 mod remote;
 mod serve_summary;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod therock;
 mod uninstall;
 
@@ -39189,9 +39191,8 @@ ID_LIKE="suse opensuse"
             .join("tests")
             .join("main")
             .join(format!(
-                "rocm-cli-main-test-{name}-{}-{}",
-                std::process::id(),
-                rocm_core::unix_time_millis()
+                "rocm-cli-main-test-{name}-{}",
+                crate::test_support::unique_suffix()
             ));
         let _ = fs::remove_dir_all(&root);
         (
@@ -39202,6 +39203,11 @@ ID_LIKE="suse opensuse"
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
