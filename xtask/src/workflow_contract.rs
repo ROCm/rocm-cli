@@ -2146,20 +2146,26 @@ esac
     }
 
     /// Extract the version token right after `marker` in `line`, up to the
-    /// next whitespace. With marker `"hawkeye@"`, `cargo install hawkeye@7.0.0
-    /// --locked` yields `7.0.0`. The line is comment-stripped first, so a pin
-    /// mentioned only inside a `# ...` comment can't satisfy a check meant
-    /// for the real line beside it. Compared for exact equality (not
-    /// `contains`) so neither a stale duplicate pin nor a version sharing a
-    /// prefix (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
+    /// next whitespace (trailing sentence punctuation is trimmed too, so a
+    /// doc sentence ending right after the version with no space, e.g.
+    /// `cargo-about@0.9.1.`, doesn't glue the period onto the token). With
+    /// marker `"hawkeye@"`, `cargo install hawkeye@7.0.0 --locked` yields
+    /// `7.0.0`. The line is comment-stripped first, so a pin mentioned only
+    /// inside a `# ...` comment can't satisfy a check meant for the real
+    /// line beside it. Compared for exact equality (not `contains`) so
+    /// neither a stale duplicate pin nor a version sharing a prefix
+    /// (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
     fn pin_token<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         let (_, rest) = strip_comment(line).split_once(marker)?;
-        Some(rest.split_whitespace().next().unwrap_or(rest))
+        let token = rest.split_whitespace().next().unwrap_or(rest);
+        Some(token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']))
     }
 
-    /// Every `marker` occurrence in `text` — not just the first — must pin
-    /// exactly `expected`: a stale duplicate left behind by a previous bump
-    /// must not go unnoticed.
+    /// Every `marker` occurrence on its own line — not just the first line
+    /// that has one — must pin exactly `expected`: a stale duplicate left
+    /// behind by a previous bump must not go unnoticed. (`pin_token` itself
+    /// only reads the first occurrence within a single line; today's pins
+    /// are each one per line, so this doesn't miss anything in practice.)
     fn assert_pins_match(marker: &str, expected: &str, path: &Path, text: &str) {
         let mut found = false;
         for line in text.lines() {
@@ -2228,6 +2234,24 @@ esac
             let p = root.join(rel);
             std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
         };
+        // Each file below is read once here rather than once per table row
+        // that names it: CONTRIBUTING.md and dependabot-manifests.yml each
+        // appear in two rows, and ci.yml appears in a row on top of the read
+        // already done above for HAWKEYE_VERSION.
+        let contributing = read("CONTRIBUTING.md");
+        let manifest = read("MANIFEST.md");
+        let dependabot = read(".github/workflows/dependabot-manifests.yml");
+        let file_text = |rel: &str| -> &str {
+            match rel {
+                "CONTRIBUTING.md" => &contributing,
+                "MANIFEST.md" => &manifest,
+                ".github/workflows/ci.yml" => &ci,
+                ".github/workflows/dependabot-manifests.yml" => &dependabot,
+                other => panic!(
+                    "pinned_tool_versions_match_across_docs_and_workflows: unexpected file `{other}`"
+                ),
+            }
+        };
 
         let table: [(&str, String, &[&str]); 3] = [
             ("hawkeye@", hawkeye_version, &["CONTRIBUTING.md"]),
@@ -2253,29 +2277,39 @@ esac
 
         for (marker, expected, files) in table {
             for file in files {
-                assert_pins_match(marker, &expected, &root.join(file), &read(file));
+                assert_pins_match(marker, &expected, &root.join(file), file_text(file));
             }
         }
     }
 
     /// Extract one prek hook's complete YAML block by its `- id:` value, up
-    /// to the next hook (`- id:` at the same 6-space indent) or the next
-    /// `repo:` entry (2-space indent) — whichever comes first. Hooks inside
-    /// one `repo:` block sit back to back with no blank line between them
-    /// (see `.pre-commit-config.yaml`'s `cargo-fmt`/`cargo-clippy`/... run),
-    /// so a blank-line-anchored end would silently fold a following
-    /// sibling hook's lines into this one's block whenever this hook is not
-    /// the last in its `repo:` block.
+    /// to the next line at or above this hook's own `- id:` indent — the
+    /// same indent-based termination `job_block` and `nested_block` already
+    /// use, rather than two needles hardcoded to the exact text that
+    /// happens to follow today (`- id:`/`- repo:`). Hooks inside one
+    /// `repo:` block sit back to back with no blank line between them (see
+    /// `.pre-commit-config.yaml`'s `cargo-fmt`/`cargo-clippy`/... run), so a
+    /// blank-line-anchored end would silently fold a following sibling
+    /// hook's lines into this one's block whenever this hook is not the
+    /// last in its `repo:` block — and a needle that fails to match (e.g. a
+    /// reformat, or this hook ending up last with only a trailing comment
+    /// after it) would silently run the block to the end of the file
+    /// instead of failing loudly.
     fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
         let marker = format!("- id: {id}\n");
         let start = text
             .find(&marker)
             .unwrap_or_else(|| panic!(".pre-commit-config.yaml defines hook `{id}`"));
+        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let marker_indent = indent_of(&text[line_start..start]);
         let rest = &text[start + marker.len()..];
-        let end = ["\n      - id:", "\n  - repo:"]
-            .into_iter()
-            .filter_map(|needle| rest.find(needle))
-            .min()
+        let end = rest
+            .match_indices('\n')
+            .find_map(|(i, _)| {
+                let next_line = rest[i + 1..].lines().next().unwrap_or("");
+                (!next_line.trim().is_empty() && indent_of(next_line) <= marker_indent)
+                    .then_some(i)
+            })
             .unwrap_or(rest.len());
         &rest[..end]
     }
@@ -2402,6 +2436,12 @@ esac
             ),
             None
         );
+        // Prose that ends the sentence right after the version, with no
+        // separating whitespace, must not glue the punctuation onto the token.
+        assert_eq!(
+            pin_token("pinned to cargo-about@0.9.1.", "cargo-about@"),
+            Some("0.9.1")
+        );
     }
 
     #[test]
@@ -2409,6 +2449,16 @@ esac
     fn assert_pins_match_flags_a_stale_duplicate_pin() {
         let text = "cargo install cargo-about@0.9.1 --locked\n\
                      cargo install cargo-about@0.8.0 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.9.10`, which does not match")]
+    fn assert_pins_match_flags_a_version_sharing_a_prefix() {
+        // The property `pin_token` guarantees — `0.9.10` must not satisfy a
+        // check for `0.9.1` — proven end to end through the real comparison
+        // path, not just through extraction.
+        let text = "cargo install cargo-about@0.9.10 --locked\n";
         assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
     }
 

@@ -54,7 +54,7 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
-The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged — it has no file-type filter, because hawkeye always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, so an unrelated unheadered file can block an otherwise-unrelated commit. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing *or* isn't the pinned version:
+The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged — it has no file-type filter, because hawkeye always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, so an unrelated unheadered file can block an otherwise-unrelated commit. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version runs whatever that version's own license-header rules happen to be, which may disagree with CI:
 
 ```bash
 cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
