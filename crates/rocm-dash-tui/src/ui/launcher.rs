@@ -383,11 +383,7 @@ enum LauncherKeyOutcome {
 /// (issue #145) instead of quitting outright — the launcher is a second,
 /// independent quit entry point and must not get to skip the confirm prompt
 /// a model still serving requires.
-fn handle_launcher_key(
-    state: &mut AppState,
-    sel: &mut usize,
-    code: KeyCode,
-) -> LauncherKeyOutcome {
+fn handle_launcher_key(state: &mut AppState, sel: &mut usize, code: KeyCode) -> LauncherKeyOutcome {
     if state.quit_confirm_pending() {
         return match state.resolve_quit_confirm_key(code) {
             Some(true) => LauncherKeyOutcome::Exit(None),

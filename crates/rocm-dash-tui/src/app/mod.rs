@@ -35,8 +35,8 @@ mod types;
 // `pub(crate)` item with no caller through that path isn't re-exported just
 // because it was reachable there pre-split (see the removed
 // `NO_CHAT_BACKEND_MSG` re-export this rule cost).
-pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use actions::request_quit;
+pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use event_loop::{
     HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
     restore_terminal, shutdown_claimed_on,
@@ -656,7 +656,10 @@ impl AppState {
     /// (`app::event_loop`) and the pre-dashboard launcher
     /// (`ui::launcher::handle_launcher_key`) so the two can't drift apart on
     /// what a quit-confirm verdict actually does.
-    pub(crate) fn resolve_quit_confirm_key(&mut self, code: crossterm::event::KeyCode) -> Option<bool> {
+    pub(crate) fn resolve_quit_confirm_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> Option<bool> {
         use crate::ui::approval::ApprovalVerdict;
         match self.on_quit_confirm_key(code)? {
             ApprovalVerdict::Approve => Some(true),
@@ -3089,9 +3092,15 @@ mod tests {
         // stale, undismissable prompt.
         let mut s = st();
         s.open_quit_confirm();
-        assert!(s.quit_confirm.is_some(), "quit_confirm pending before close");
+        assert!(
+            s.quit_confirm.is_some(),
+            "quit_confirm pending before close"
+        );
         s.close_overlays();
-        assert!(s.quit_confirm.is_none(), "close_overlays must clear quit_confirm");
+        assert!(
+            s.quit_confirm.is_none(),
+            "close_overlays must clear quit_confirm"
+        );
     }
 
     #[test]

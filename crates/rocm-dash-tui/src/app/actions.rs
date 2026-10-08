@@ -916,7 +916,10 @@ mod tests {
         s.modal = Modal::Menu;
         s.menu_sel = 2;
         assert!(!apply_action(&mut s, KeyAction::MenuActivate));
-        assert_eq!(s.on_quit_confirm_key(KeyCode::Char('n')), Some(ApprovalVerdict::Deny));
+        assert_eq!(
+            s.on_quit_confirm_key(KeyCode::Char('n')),
+            Some(ApprovalVerdict::Deny)
+        );
         s.quit_confirm = None;
         assert_eq!(s.modal, Modal::None);
     }
