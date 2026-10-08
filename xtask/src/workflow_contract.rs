@@ -2394,6 +2394,13 @@ esac
             hook_block_sets(block, "always_run: true"),
             "license-headers hook must set `always_run: true`:\n{block}"
         );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "license-headers hook must set `pass_filenames: false` — hawkeye scans \
+             the whole repo per `licenserc.toml` regardless of trigger only because \
+             of this flag; without it, pre-commit would narrow the scan to changed \
+             files instead:\n{block}"
+        );
         for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
             assert!(
                 !block.contains(filter_key),

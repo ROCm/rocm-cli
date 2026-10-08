@@ -118,6 +118,11 @@ fn forces_full_workspace(file: &str) -> bool {
     file == "Cargo.lock"
         || file == "Cargo.toml" // workspace root manifest
         || file == "MANIFEST.md" // clippy job runs `xtask manifest --check`
+        // pinned_tool_versions_match_across_docs_and_workflows (xtask) reads this
+        // file's hawkeye/cargo-about pins; without this, `is_ignorable` below
+        // would mark it as ordinary Markdown and a pin-only edit here would
+        // resolve to `Selection::Empty`, skipping the test this job itself runs.
+        || file == "CONTRIBUTING.md"
         || file.starts_with("rust-toolchain")
         || file.starts_with(".github/workflows/")
 }
@@ -432,6 +437,19 @@ mod tests {
         );
         assert_eq!(
             select(&[".github/workflows/ci.yml".to_string()], &g),
+            Selection::Workspace
+        );
+    }
+
+    #[test]
+    fn select_contributing_md_forces_workspace() {
+        // CONTRIBUTING.md carries the hawkeye/cargo-about pins that
+        // pinned_tool_versions_match_across_docs_and_workflows asserts against;
+        // unlike ordinary Markdown (see select_docs_only_is_empty) it must
+        // force a full run, not resolve to `Selection::Empty`.
+        let g = graph();
+        assert_eq!(
+            select(&["CONTRIBUTING.md".to_string()], &g),
             Selection::Workspace
         );
     }

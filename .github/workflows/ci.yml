@@ -120,8 +120,14 @@ jobs:
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
               # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
-              # this file's hawkeye/cargo-about pins; a pin-only edit here must
-              # still run that test, not just the forced full run on main.
+              # this file's hawkeye/cargo-about pins. This entry only gates
+              # whether the rust-flagged jobs run at all; `cargo xtask affected`
+              # treats Markdown as ignorable by default and would otherwise skip
+              # the `Test (nextest)` step for a pin-only edit here (the coverage
+              # job isn't affected-narrowed, so it alone would still catch a
+              # drift, but invisibly). CONTRIBUTING.md is listed in
+              # `forces_full_workspace` (xtask/src/affected.rs) for the same
+              # reason MANIFEST.md already is, so nextest runs too.
               - 'CONTRIBUTING.md'
               # license_headers_hook_has_no_file_type_filter (xtask) reads this
               # file's license-headers hook config; an edit here that reopens the
