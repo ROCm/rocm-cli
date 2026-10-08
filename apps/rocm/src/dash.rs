@@ -254,6 +254,7 @@ pub fn resolved_args(
     initial_tab: ActiveTab,
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
+    let service_records = rocm_dash_daemon::registry::load_service_records(&paths.services_dir());
     ResolvedArgs {
         connect: t.connect.clone(),
         token: config.dashboard.daemon.token.clone(),
@@ -288,16 +289,67 @@ pub fn resolved_args(
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
         bench_results_dir: config.dashboard.daemon.bench_results_dir.clone(),
-        // Records for local servers that are no longer running. The overlay
-        // renders only the live instances the daemon surfaces, so nothing there
-        // would otherwise admit that a failed server was ever recorded.
-        services_past_attempts: services_past_attempts(paths),
+        // One read of the managed-service registry, shared by the two
+        // derived fields below rather than each re-reading it (both are
+        // launch-cheap by design; collapsing the `read_dir` + per-file parse
+        // into one pays that cost once instead of twice).
+        services_past_attempts: services_past_attempts(&service_records),
+        // Whether anything is already serving (issue #145's startup-race fix
+        // — see the doc comment on `ResolvedArgs::startup_has_live_service`).
+        startup_has_live_service: startup_has_live_service(&service_records),
     }
 }
 
+/// Whether any managed-service record on disk is already `ready`/`running` at
+/// launch — the same statuses `Instance::status.is_serving()` treats as
+/// "actively serving" on the TUI side. The daemon's own first instance
+/// snapshot is the authoritative live view and normally arrives within one
+/// tick of the TUI starting, but `AppState::instances` is empty until it
+/// does, so without this a `q` pressed in that window — or at any point the
+/// daemon connection never succeeds at all — saw no live instance and exited
+/// with no confirm prompt even though a model actually was being served.
+///
+/// Mirrors `instance_status_for_record`'s own `running`+`startup_phase`
+/// overlap (`rocm_dash_daemon::registry`, not `pub`, so re-derived here rather
+/// than called): the supervisor flips a record to `running` immediately after
+/// spawning the engine child, before it starts polling `startup_phase` from
+/// the serve log, so a `running` record with a *recognized* phase token
+/// (`downloading`/`loading`/`warmup`) is still coming up, not actually
+/// serving yet, in the authoritative live view. Treating it as live here too
+/// would be the wrong direction to diverge in — over-prompting in a tiny
+/// startup window is harmless, but the doc claim above ("the same statuses
+/// `is_serving()` treats as live") would be a lie if it didn't hold.
+///
+/// `starting`/`recovering` records are excluded for the same reason — neither
+/// is *actively serving* yet — matching `is_serving()` rather than the
+/// broader `is_scrapeable_status`/`managed_service_is_live` set those two
+/// statuses are part of elsewhere.
+///
+/// Also mirrors `discovered_from_record`'s `port == 0` exclusion: a record
+/// with no bound port never becomes a live `Instance` in the authoritative
+/// view either (`registry.rs`), so counting it here would diverge from the
+/// real snapshot this stands in for rather than merely preceding it.
+fn startup_has_live_service(records: &[rocm_dash_daemon::registry::ServiceRecord]) -> bool {
+    use rocm_dash_core::metrics::StartupPhase;
+    records.iter().any(|record| {
+        if record.port == 0 {
+            return false;
+        }
+        match record.status.trim().to_ascii_lowercase().as_str() {
+            "ready" => true,
+            "running" => record
+                .startup_phase
+                .as_deref()
+                .and_then(StartupPhase::from_token)
+                .is_none(),
+            _ => false,
+        }
+    })
+}
+
 /// Managed-service records that are no longer running, read from the same
-/// registry `rocm services` reads. A status-only file read: no readiness
-/// probes, no daemon.
+/// registry `rocm services` reads. A status-only read over already-loaded
+/// records: no readiness probes, no daemon, no disk I/O of its own.
 ///
 /// **Known divergence — this can read lower than `rocm services list --all`,
 /// which is the command the overlay's own note points at.** The CLI path goes
@@ -336,10 +388,9 @@ pub fn resolved_args(
 /// liveness classification in a second place that could drift from it. Reading
 /// low is the safer failure: the note under this count invites the user to run
 /// `rocm services list --all`, which then shows them the true figure.
-fn services_past_attempts(paths: &AppPaths) -> usize {
-    use rocm_dash_daemon::registry::{discover_managed_services, load_service_records};
-    let records = load_service_records(&paths.services_dir());
-    discover_managed_services(&records).past_attempts
+fn services_past_attempts(records: &[rocm_dash_daemon::registry::ServiceRecord]) -> usize {
+    use rocm_dash_daemon::registry::discover_managed_services;
+    discover_managed_services(records).past_attempts
 }
 
 /// Build the multi-thread tokio runtime the async daemon/TUI run on. Shared by
@@ -1069,6 +1120,155 @@ mod tests {
             "the overlay count is a raw status snapshot; refreshing it here \
              would put per-service endpoint probes on the dashboard launch path"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Issue #145 startup-race fix: paired with
+    /// `has_live_instance_trusts_startup_snapshot_before_first_real_one_lands`
+    /// in `rocm-dash-tui` — this is the half that proves the bin side actually
+    /// reads something off the registry rather than always returning `false`.
+    #[test]
+    fn resolved_args_reports_a_live_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("live.json"),
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(args.startup_has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `ready`/`running` record with no bound port never becomes a live
+    /// `Instance` in the authoritative view either (`discovered_from_record`'s
+    /// own `port == 0` exclusion, `registry.rs`), so it must not count here —
+    /// otherwise this startup read would diverge from, rather than merely
+    /// precede, the real snapshot it stands in for.
+    #[test]
+    fn resolved_args_does_not_count_a_record_with_no_bound_port() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-noport-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("unbound.json"),
+            br#"{"service_id":"svc-unbound","engine":"vllm","port":0,"status":"ready","created_at_unix_ms":6}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!args.startup_has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `starting`/`recovering` records exist on disk but neither counts as
+    /// "actively serving" here — matching `Instance::status.is_serving()`
+    /// (`Ready`/`Running` only) rather than the broader `is_scrapeable_status`
+    /// set `managed_service_is_live` elsewhere in this file uses.
+    #[test]
+    fn resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-none-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!args.startup_has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `running` record still carrying a recognized `startup_phase`
+    /// (`downloading`/`loading`/`warmup`) is the supervisor's own cold-start
+    /// window — it flips the record to `running` before it starts polling
+    /// `startup_phase` from the serve log (`registry.rs::instance_status_for_record`'s
+    /// own doc comment). That record is `Starting`, not serving, in the
+    /// authoritative live view, so it must not count here either — matching
+    /// `is_serving()` exactly, not just the bare status string.
+    #[test]
+    fn resolved_args_does_not_count_a_running_record_still_in_a_startup_phase() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-phase-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("loading.json"),
+            br#"{"service_id":"svc-loading","engine":"vllm","port":8004,"status":"running","startup_phase":"loading","created_at_unix_ms":5}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!args.startup_has_live_service);
 
         let _ = std::fs::remove_dir_all(&root);
     }

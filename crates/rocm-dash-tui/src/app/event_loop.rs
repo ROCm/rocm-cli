@@ -802,6 +802,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.bench_results_dir = args.bench_results_dir.clone();
     // Managed-service records that are no longer running, counted by the bin.
     state.services_past_attempts = args.services_past_attempts;
+    // Pre-launch disk read of whether anything is already serving (issue
+    // #145): covers the startup window before the daemon's first instance
+    // snapshot lands, and the case where the daemon connection never
+    // succeeds at all. `has_live_instance` stops consulting it once a real
+    // snapshot arrives.
+    state.startup_has_live_service = args.startup_has_live_service;
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.

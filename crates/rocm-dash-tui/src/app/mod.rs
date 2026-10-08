@@ -69,6 +69,12 @@ pub struct AppState {
     pub history: VecDeque<Snapshot>,
     pub bench_rows: VecDeque<BenchmarkRow>,
     pub instances: HashMap<String, Instance>,
+    /// Set once the daemon's first instance snapshot has landed (see
+    /// `push_snapshot`). Until then, `instances` being empty says nothing
+    /// about whether anything is actually serving — it may simply not have
+    /// arrived yet — which is what `has_live_instance` consults
+    /// `startup_has_live_service` for (issue #145).
+    pub(crate) has_received_snapshot: bool,
     pub active_tab: ActiveTab,
     pub modal: Modal,
     /// Cursor into the Esc main-menu rows (Options / Help / Quit).
@@ -190,6 +196,11 @@ pub struct AppState {
     /// registry read at launch (see `ResolvedArgs::services_past_attempts`).
     /// Rendered by the services overlay so failed servers are not invisible.
     pub services_past_attempts: usize,
+    /// Set from `ResolvedArgs::startup_has_live_service`: whether a managed
+    /// service was already serving at launch, per the same pre-TUI registry
+    /// read. Consulted by `has_live_instance` only until `has_received_snapshot`
+    /// flips (issue #145).
+    pub startup_has_live_service: bool,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -302,6 +313,7 @@ impl AppState {
             history: VecDeque::with_capacity(HISTORY_CAP),
             bench_rows: VecDeque::with_capacity(BENCH_CAP),
             instances: HashMap::new(),
+            has_received_snapshot: false,
             active_tab: ActiveTab::default(),
             modal: Modal::None,
             menu_sel: 0,
@@ -345,6 +357,7 @@ impl AppState {
             replay: None,
             simulated: false,
             services_past_attempts: 0,
+            startup_has_live_service: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -603,8 +616,20 @@ impl AppState {
 
     /// True when a managed instance is actively serving from the user's point
     /// of view — the gate for the confirm-before-quit prompt.
+    ///
+    /// ORs in `startup_has_live_service` until the daemon's first instance
+    /// snapshot lands (`has_received_snapshot`): `instances` starts empty and
+    /// is only populated once that snapshot arrives (see `push_snapshot`), so
+    /// a `q` pressed in that startup window — or at any point the daemon
+    /// connection never succeeds at all — would otherwise see this return
+    /// `false` even though a model actually was being served, simply because
+    /// the live state hadn't arrived yet (issue #145). Once a snapshot lands,
+    /// `instances` is authoritative and the pre-launch disk read is never
+    /// consulted again, so a model that legitimately stops later in the
+    /// session is still reflected correctly.
     pub(crate) fn has_live_instance(&self) -> bool {
         self.instances.values().any(|i| i.status.is_serving())
+            || (!self.has_received_snapshot && self.startup_has_live_service)
     }
 
     /// Whether the confirm-before-quit prompt is open. Mirrors
@@ -1280,7 +1305,11 @@ impl AppState {
     }
 
     fn push_snapshot(&mut self, snap: Snapshot) {
-        // Snapshots carry the daemon's current instance set — treat them as truth.
+        // Snapshots carry the daemon's current instance set — treat them as
+        // truth, and from here on `instances` alone is authoritative for
+        // `has_live_instance` (issue #145's startup-race fallback stops
+        // mattering the moment real data exists).
+        self.has_received_snapshot = true;
         self.instances.clear();
         for inst in &snap.instances {
             self.instances
@@ -2212,6 +2241,7 @@ mod tests {
             tool_executor: None,
             bench_results_dir: None,
             services_past_attempts: 0,
+            startup_has_live_service: false,
         }
     }
 
@@ -3114,6 +3144,40 @@ mod tests {
         assert!(
             s.runtime_manager.is_none(),
             "open_quit_confirm must close any open overlay first"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_trusts_startup_snapshot_before_first_real_one_lands() {
+        // Issue #145 startup race: `instances` starts empty and is only
+        // populated once the daemon's first snapshot arrives, so without the
+        // pre-launch disk read a `q` pressed in that window saw no live
+        // instance and quit with no confirm prompt even if a model actually
+        // was being served.
+        let mut s = st();
+        assert!(s.instances.is_empty());
+        assert!(!s.has_live_instance(), "nothing seeded, nothing serving");
+
+        s.startup_has_live_service = true;
+        assert!(
+            s.has_live_instance(),
+            "the pre-launch disk read must stand in before the first snapshot"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_stops_trusting_startup_snapshot_once_a_real_one_lands() {
+        // The fallback must not outlive its own staleness: once a real
+        // snapshot arrives (even an empty one — nothing is serving anymore),
+        // `instances` is authoritative and the startup read is retired.
+        let mut s = st();
+        s.startup_has_live_service = true;
+        assert!(s.has_live_instance());
+
+        s.apply_event(Event::Snapshot(Snapshot::default()));
+        assert!(
+            !s.has_live_instance(),
+            "a real (even empty) snapshot must retire the startup fallback"
         );
     }
 

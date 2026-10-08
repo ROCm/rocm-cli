@@ -98,6 +98,18 @@ pub struct ResolvedArgs {
     /// a host whose servers had all failed showed an empty overlay and no sign
     /// that any record existed. 0 when there are none.
     pub services_past_attempts: usize,
+    /// Whether any managed-service record on disk was already `ready`/`running`
+    /// at launch — the same statuses `Instance::status.is_serving()` treats as
+    /// "actively serving" — read the same way `services_past_attempts` is:
+    /// synchronously, from the same registry, before the TUI starts.
+    /// `AppState::instances` starts empty and is only populated once the
+    /// daemon's first instance snapshot lands, so
+    /// without this a `q` pressed in that startup window (or at any point the
+    /// daemon connection never succeeds) saw no live instance and exited with
+    /// no confirm prompt even though a model actually was being served (issue
+    /// #145). `AppState::has_live_instance` ORs this in only until that first
+    /// snapshot arrives, so it never outlives its own staleness.
+    pub startup_has_live_service: bool,
 }
 
 impl ResolvedArgs {
