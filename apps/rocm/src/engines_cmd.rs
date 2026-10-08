@@ -15,9 +15,10 @@
 //! only caller is `serve_cmd.rs`; `env_root_for_engine_install`,
 //! `env_root_for_service`, `runtime_key_for_python`, and
 //! `runtime_manifest_for_selector` are used only from other root-level
-//! commands in `main.rs` — all stay `pub(crate)` rather than private either
-//! way. `render_engine_inventory_text` is the one exception: its only caller
-//! is `engines()` in this same file, not `main.rs`.
+//! commands in `main.rs`, and all stay `pub(crate)` rather than private.
+//! `render_engine_inventory_text` is also `pub(crate)`, but its caller is an
+//! exception to the others: its only caller is `engines()` in this same
+//! file, not `main.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
