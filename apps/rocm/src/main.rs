@@ -40575,13 +40575,14 @@ ID_LIKE="suse opensuse"
     /// every Linux test green — which is exactly what happened to this test's
     /// previous version. Off Linux the same call is a compile-time stub that
     /// always answers `None`, so the conjunct decides the result, and this
-    /// assertion fails the moment it is dropped. It is the only assertion
-    /// anywhere that does.
+    /// assertion fails the moment it is dropped. It compiles only where no
+    /// start-time is readable (macOS), which has no CI lane, so in practice the
+    /// platform conjunct is not exercised by any lane.
     ///
     /// The behaviour it protects: with no start-time readable on this platform,
     /// a record carrying none is NOT evidence of a pre-upgrade record — it is
     /// just what every record looks like here. Treating it as pre-upgrade would
-    /// abort every uninstall that finds a live daemon on Windows and macOS.
+    /// abort every uninstall that finds a live daemon on macOS.
     #[cfg(not(any(target_os = "linux", windows)))]
     #[test]
     fn without_readable_start_times_a_bare_record_is_not_a_legacy_record() {
@@ -40612,8 +40613,8 @@ ID_LIKE="suse opensuse"
         // `process_start_ticks` always answers for a live process, so the
         // conjunct is constantly true and this test cannot tell the predicate
         // from a bare `is_none()`. `without_readable_start_times_a_bare_record_\
-        // is_not_a_legacy_record` is what pins it, and only the non-Linux lanes
-        // run that.
+        // is_not_a_legacy_record` targets it, but compiles only on macOS, which
+        // has no CI lane.
         //
         // The guard's end-to-end behaviour is pinned separately, by
         // `uninstall_never_kills_a_daemon_pid_from_a_state_file_that_predates_\
