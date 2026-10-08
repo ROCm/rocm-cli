@@ -538,7 +538,8 @@ def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
         f"{SIGNING_PUBLIC_KEY_ENV}. Verification is requested by "
         "--require-signatures, --require-production-trust, --public-key, or the "
         "ROCM_CLI_REQUIRE_SIGNATURE / ROCM_CLI_REQUIRE_PRODUCTION_TRUST "
-        "environment variables -- the last of which packaging steps export."
+        "environment variables; the packaging steps export "
+        "ROCM_CLI_REQUIRE_SIGNATURE=1, so a packaging run needs a key too."
     )
 
 
@@ -892,6 +893,24 @@ def _assert_inline_pem_run_omits_the_key_flag(dist: Path) -> None:
         raise ReadinessError(
             f"an inline-PEM run did not report its key source; expected "
             f"{expected_line!r}, got {stdout.strip()!r}"
+        )
+
+
+def _assert_env_trigger_reaches_the_gate(dist: Path, name: str) -> None:
+    """The environment equivalents must force verification through `main` too.
+
+    `main` reads them with `truthy(os.environ.get(...))` and ors them into the
+    flags. Nothing covered that, so dropping either term left the suite green
+    while a packaging run that exports the variable stopped verifying -- the
+    very consequence `docs/release-trust.md` spells out.
+    """
+    _code, _stdout, _stderr, argvs = run_with_env(
+        {name: "1"}, lambda: _run_main_verifying(dist)
+    )
+    if not argvs:
+        raise ReadinessError(
+            f"{name}=1 did not make main verify anything; the environment "
+            "trigger is no longer reaching resolve_verification"
         )
 
 
@@ -1340,6 +1359,19 @@ def run_self_test(root: Path) -> None:
             ),
         )
         print("release readiness self-test: production-trust and --public-key ok")
+
+        # ...and the environment equivalents, which packaging steps export.
+        for trigger in (
+            "ROCM_CLI_REQUIRE_SIGNATURE",
+            "ROCM_CLI_REQUIRE_PRODUCTION_TRUST",
+        ):
+            run_with_env(
+                path_env,
+                lambda trigger=trigger: _assert_env_trigger_reaches_the_gate(
+                    gate_dist, trigger
+                ),
+            )
+        print("release readiness self-test: environment triggers reach the gate ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")

@@ -30,10 +30,13 @@
 //!   named by `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, else the inline
 //!   `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` release/nightly CI wires from the secret —
 //!   it must equal the canonical *current* release key, so the key CI verifies
-//!   against is exactly the one users pin. Both sources are resolved in the same
-//!   order `scripts/release_readiness.py` uses, so the key cross-checked here is
-//!   always the key that gate verified with.
+//!   against is exactly the one users pin. Both environment sources are resolved
+//!   in the same order `scripts/release_readiness.py` uses (path before PEM). An
+//!   explicit `--public-key` passed to the gate is not visible here, and this
+//!   runs as its own workflow step, so a *relative* path would resolve against
+//!   each process's own working directory. No workflow does either today.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -42,6 +45,10 @@ const PEM_BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
 const PEM_END: &str = "-----END PUBLIC KEY-----";
 
 const CURRENT_RELEASE_KEY: &str = "release-current";
+
+/// The key sources, in the order `scripts/release_readiness.py` resolves them.
+const CI_PUBLIC_KEY_PATH_ENV: &str = "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH";
+const CI_PUBLIC_KEY_PEM_ENV: &str = "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM";
 
 /// How a pinned constant embeds its PEM string, so its value span can be isolated.
 #[derive(Clone, Copy)]
@@ -307,27 +314,42 @@ fn check_ci_public_key(
 /// against that very key — a trust root nobody compared with `docs/keys/`, and
 /// reported in the log as "not configured".
 ///
-/// A named path that cannot be read is an error, not a fall-through to the PEM:
-/// cross-checking a different key than the operator named is the failure this
-/// check exists to catch. Blank counts as absent, because an unset GitHub secret
-/// expands to the empty string.
-fn resolve_ci_public_key(path_var: Option<&str>, pem_var: Option<&str>) -> Result<Option<String>> {
-    if let Some(path) = path_var.filter(|value| !value.trim().is_empty()) {
-        // The raw value rather than a trimmed one, so this and
-        // `release_readiness.py` always mean the same file.
-        let path = Path::new(path);
-        let pem = std::fs::read_to_string(path).with_context(|| {
-            format!(
-                "failed to read the CI signing public key named by \
-                 ROCM_CLI_SIGNING_PUBLIC_KEY_PATH: {}",
-                path.display()
-            )
-        })?;
-        return Ok(Some(pem));
+/// A named path that cannot be read, or that holds nothing, is an error rather
+/// than a fall-through: the operator named a key, so reporting "not configured"
+/// and exiting 0 would be the exact confusion the doc on
+/// [`check_ci_public_key`] forbids. Only an *unset* variable counts as absent,
+/// because an unset GitHub secret expands to the empty string.
+///
+/// `lookup` is injected so the variable names themselves are covered: reading
+/// them directly here left `run()` free to query a misspelled name with every
+/// test still green.
+fn resolve_ci_public_key(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Option<String>> {
+    if let Some(raw) = lookup(CI_PUBLIC_KEY_PATH_ENV) {
+        // `OsString`, not `String`: a non-UTF-8 path must still name the file the
+        // operator meant, not silently fall through to the inline PEM.
+        let path = PathBuf::from(&raw);
+        if !path.as_os_str().is_empty() {
+            let pem = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "failed to read the CI signing public key named by \
+                     {CI_PUBLIC_KEY_PATH_ENV}: {}",
+                    path.display()
+                )
+            })?;
+            if pem.trim().is_empty() {
+                bail!(
+                    "the CI signing public key named by {CI_PUBLIC_KEY_PATH_ENV} is \
+                     empty: {}; a configured key that holds nothing must not be \
+                     reported as 'not configured'",
+                    path.display()
+                );
+            }
+            return Ok(Some(pem));
+        }
     }
-    Ok(pem_var
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned))
+    Ok(lookup(CI_PUBLIC_KEY_PEM_ENV)
+        .map(|raw| raw.to_string_lossy().into_owned())
+        .filter(|value| !value.trim().is_empty()))
 }
 
 fn repo_root() -> PathBuf {
@@ -340,9 +362,9 @@ fn repo_root() -> PathBuf {
 }
 
 pub fn run() -> Result<()> {
-    let path_var = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH").ok();
-    let pem_var = std::env::var("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM").ok();
-    let ci_public_key = resolve_ci_public_key(path_var.as_deref(), pem_var.as_deref())?;
+    // Wrapped rather than passed as `std::env::var_os` directly: the generic fn
+    // item cannot satisfy the higher-ranked `Fn(&str)` bound.
+    let ci_public_key = resolve_ci_public_key(|name: &str| std::env::var_os(name))?;
     for message in check_pinned_keys(&repo_root(), ci_public_key.as_deref())? {
         println!("pinned key check: {message}");
     }
@@ -451,6 +473,26 @@ mod tests {
         assert!(check_ci_public_key(Some("not a pem"), Some(&current)).is_err());
     }
 
+    /// The variable names must be the ones the release gate actually reads.
+    ///
+    /// The lookup test below matches on these same constants, so it cannot see a
+    /// wrong *value*: misspelling one leaves every case green while `run()`
+    /// queries a variable nothing ever sets, and the cross-check silently skips.
+    /// Checking them against `release_readiness.py` pins the value and the
+    /// cross-language agreement at once.
+    #[test]
+    fn ci_public_key_env_names_match_the_release_gate() {
+        let gate = std::fs::read_to_string(repo_root().join("scripts/release_readiness.py"))
+            .expect("read scripts/release_readiness.py");
+        for name in [CI_PUBLIC_KEY_PATH_ENV, CI_PUBLIC_KEY_PEM_ENV] {
+            assert!(
+                gate.contains(&format!("\"{name}\"")),
+                "{name} is not a key source in release_readiness.py, so this \
+                 cross-check would read a variable the gate never resolves"
+            );
+        }
+    }
+
     /// The cross-check must see a key supplied by path, not just the inline PEM.
     ///
     /// `release_readiness.py` prefers `ROCM_CLI_SIGNING_PUBLIC_KEY_PATH` and
@@ -462,11 +504,24 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_file = dir.path().join("ci-public-key.pem");
         std::fs::write(&key_file, SAMPLE).expect("write key");
-        let named = key_file.to_str().expect("utf-8 path");
         let other = SAMPLE.replace("test", "diff");
 
+        // A lookup over a fixed map, so the *names* queried are covered too: with
+        // the variables read directly, `run()` could query a misspelled name and
+        // every case here would still pass.
+        let env = |path: Option<&str>, pem: Option<&str>| {
+            let path = path.map(OsString::from);
+            let pem = pem.map(OsString::from);
+            move |name: &str| match name {
+                CI_PUBLIC_KEY_PATH_ENV => path.clone(),
+                CI_PUBLIC_KEY_PEM_ENV => pem.clone(),
+                other => panic!("unexpected variable queried: {other}"),
+            }
+        };
+        let named = key_file.to_str().expect("utf-8 path");
+
         // Path wins over the PEM, so the key cross-checked is the key verified with.
-        let resolved = resolve_ci_public_key(Some(named), Some(&other))
+        let resolved = resolve_ci_public_key(env(Some(named), Some(&other)))
             .expect("readable key")
             .expect("a key");
         assert_eq!(pem_body(&resolved).unwrap(), pem_body(SAMPLE).unwrap());
@@ -477,33 +532,52 @@ mod tests {
         assert!(check_ci_public_key(Some(&resolved), Some(&canonical)).is_err());
 
         // The PEM is still used when no path is named.
-        let from_pem = resolve_ci_public_key(None, Some(SAMPLE))
-            .expect("inline pem")
-            .expect("a key");
-        assert_eq!(from_pem, SAMPLE);
+        assert_eq!(
+            resolve_ci_public_key(env(None, Some(SAMPLE)))
+                .expect("inline pem")
+                .as_deref(),
+            Some(SAMPLE)
+        );
 
-        // Blank counts as absent on both, which is the shape of an unset secret.
+        // Unset counts as absent -- the shape of an unset GitHub secret, which
+        // expands to the empty string.
         for blank in [None, Some(""), Some("   ")] {
             assert!(
-                resolve_ci_public_key(blank, blank)
+                resolve_ci_public_key(env(None, blank))
                     .expect("no key")
                     .is_none(),
-                "blank {blank:?} should resolve to no key"
+                "blank PEM {blank:?} should resolve to no key"
             );
         }
         assert_eq!(
-            resolve_ci_public_key(Some("  "), Some(SAMPLE))
+            resolve_ci_public_key(env(Some(""), Some(SAMPLE)))
                 .expect("falls through to pem")
                 .as_deref(),
-            Some(SAMPLE)
+            Some(SAMPLE),
+            "an unset path variable should fall through to the PEM"
         );
 
         // A named key that cannot be read is an error, never a quiet fall-through
         // to a different key than the operator named.
         let missing = dir.path().join("absent.pem");
         assert!(
-            resolve_ci_public_key(missing.to_str(), Some(SAMPLE)).is_err(),
+            resolve_ci_public_key(env(missing.to_str(), Some(SAMPLE))).is_err(),
             "an unreadable named key must fail rather than fall back to the PEM"
         );
+
+        // A named key that exists but holds nothing must be an error too. Passing
+        // it on as `Some("")` made `check_ci_public_key` trim it away and report
+        // "not configured" while a key was in fact configured -- exactly the
+        // confusion that check's own doc forbids.
+        for empty in ["", "   \n\t "] {
+            let blank_file = dir.path().join("blank.pem");
+            std::fs::write(&blank_file, empty).expect("write blank key");
+            let error = resolve_ci_public_key(env(blank_file.to_str(), Some(SAMPLE)))
+                .expect_err("an empty named key must be an error");
+            assert!(
+                error.to_string().contains("is empty"),
+                "unexpected error for an empty named key: {error}"
+            );
+        }
     }
 }
