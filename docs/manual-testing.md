@@ -299,6 +299,28 @@ Expected result:
   and reports that nothing would be removed. That is the only thing a preview
   writes.
 
+With a model still managed-serving (`rocm serve --managed ...`), open the
+dashboard or the pre-dashboard launcher and press `q` (or the Esc menu's
+`Quit` row, or `/quit` from chat):
+
+```powershell
+rocm dash
+rocm
+```
+
+Expected result:
+
+- A prompt appears naming the serving model and warning that it keeps
+  running in the background after you quit, with the `rocm services stop
+  <id> --yes` command to stop it first.
+- Declining (`n`/Esc) returns to exactly where you were, with the model
+  still shown as serving.
+- Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
+  afterward still shows the model as `ready`/`running` — quitting never
+  stops it.
+- With nothing being served, `q` exits immediately with no prompt, same as
+  before this behavior existed.
+
 ## 5. ComfyUI Verification
 
 ComfyUI is managed as an app surface. It should start a local web server and

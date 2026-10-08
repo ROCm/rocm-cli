@@ -198,24 +198,31 @@ pub(crate) fn quit_confirm_request(state: &AppState) -> approval::ApprovalReques
 fn quit_confirm_body(state: &AppState) -> Vec<String> {
     let running = || state.instances.values().filter(|i| i.status.is_serving());
     let total = running().count();
+    // The startup-race fallback (issue #145): a model was recorded live on
+    // disk at launch, but `instances` is still empty because the daemon's
+    // first snapshot hasn't landed yet (or never will, if the connection
+    // never succeeds). Distinct from a genuine "nothing is serving" below —
+    // this is "don't know yet", not "confirmed gone".
+    let startup_fallback = !state.has_received_snapshot && state.startup_has_live_service;
+    if total == 0 && !startup_fallback {
+        // A real snapshot is authoritative here (or there was never a
+        // startup fallback to begin with) and it says nothing is serving.
+        // Can change between opening the prompt and this render (e.g. the
+        // model exits on its own while the prompt is up) — not dead code.
+        // The trailer below ("it keeps running" / "stop it first") would be
+        // a direct, printed lie in this state — a prior round's fix handled
+        // the startup-fallback trigger for that same contradiction but
+        // missed this one, where a real snapshot confirms the model already
+        // stopped while the prompt sat open awaiting a keypress — so return
+        // before appending it rather than widening the gate below.
+        return vec!["Nothing is being served anymore.".to_string()];
+    }
     let mut body = Vec::new();
     if total == 0 {
-        if !state.has_received_snapshot && state.startup_has_live_service {
-            // The prompt opened from the pre-launch disk read (issue #145's
-            // startup-race fix), not from `instances` — which is still
-            // empty because the daemon's first snapshot, the only thing
-            // that could name the model, hasn't landed yet (or never will,
-            // if the connection never succeeds). Saying "nothing is being
-            // served anymore" here would be a direct, printed contradiction
-            // of the "it keeps running" line two below — a model *was*
-            // recorded live at launch — so this stays honest about not
-            // knowing which instead of claiming to know it's gone.
-            body.push("A model was serving when this started.".to_string());
-        } else {
-            // Can change between opening the prompt and this render (e.g. the
-            // model exits on its own while the prompt is up) — not dead code.
-            body.push("Nothing is being served anymore.".to_string());
-        }
+        // startup_fallback: see above — a model *was* recorded live at
+        // launch, so this stays honest about not knowing whether it still
+        // is, instead of claiming to know either way.
+        body.push("A model was serving when this started.".to_string());
     } else {
         for i in running().take(5) {
             body.push(format!("• {}", i.model_name));
@@ -941,7 +948,15 @@ mod tests {
     fn quit_confirm_body_says_nothing_is_being_served_once_a_snapshot_confirms_it() {
         // Once a real (even empty) snapshot has landed, the startup fallback
         // is retired (`AppState::has_live_instance`'s own doc comment) and
-        // the plain "nothing anymore" line is accurate again.
+        // the plain "nothing anymore" line is accurate again. Second closing-
+        // review regression: this same trigger (a model that was serving
+        // stops on its own while the prompt sits open awaiting a keypress —
+        // the event loop drains daemon snapshots on its own `select!` arm
+        // independent of the pending prompt) used to still print the
+        // unconditional "It keeps running in the background" trailer right
+        // after "Nothing is being served anymore." — the same class of
+        // self-contradiction the prior round fixed for the startup-fallback
+        // trigger, reached via its sibling instead.
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.startup_has_live_service = true;
         state.has_received_snapshot = true;
@@ -950,6 +965,14 @@ mod tests {
         assert!(
             body.iter()
                 .any(|line| line.contains("Nothing is being served"))
+        );
+        assert!(
+            !body.iter().any(|line| line.contains("It keeps running")),
+            "must not claim anything keeps running once a snapshot confirms nothing is serving: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains("Stop it first")),
+            "must not point at a stop command for a service that isn't running: {body:?}"
         );
     }
 
