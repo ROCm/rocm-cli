@@ -1028,6 +1028,37 @@ mod tests {
         );
     }
 
+    /// `ChatGptAgentClient::complete`'s empty-history guard (clients.rs, ahead
+    /// of its param validation and device-code `authorize()`) is otherwise
+    /// protected only by a comment. Pin it: an empty history must return
+    /// `AgentError::Empty` without the device-code callback ever firing,
+    /// proving no network/auth round trip was attempted.
+    #[tokio::test]
+    async fn chatgpt_empty_history_is_empty_error_without_auth() {
+        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = fired.clone();
+        let client = ChatGptAgentClient::new(
+            None,
+            InferenceParams::default(),
+            move |url, code| {
+                sink.lock().unwrap().push(format!("{url}|{code}"));
+            },
+            None,
+            None,
+        )
+        .expect("build chatgpt oauth client");
+
+        let err = client
+            .complete(&[], fixture_snapshot())
+            .await
+            .expect_err("empty history must be rejected");
+        assert!(matches!(err, AgentError::Empty));
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "device-code callback must not fire on the empty-history short-circuit"
+        );
+    }
+
     #[test]
     fn anthropic_backend_constructs_and_is_agentclient() {
         // Offline construction with a dummy key (no network until complete()).
