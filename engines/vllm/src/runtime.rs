@@ -101,10 +101,14 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
 /// here, in the lower layer, as the single source for which versions count —
 /// `install.rs`'s table literally uses these constants for its
 /// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
-/// matches against the same two strings, so the two can't drift apart.
+/// matches against the same two strings. This list and that table are still
+/// two separate pieces of data, kept in agreement only by
+/// `install.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
+/// test, not by construction — a new table row needs a matching entry here,
+/// and that test is what catches it if one is missed.
 pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
 pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
-const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
+pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
 
 /// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
 /// ignoring patch and any dev/pre-release suffix. See
@@ -731,5 +735,42 @@ mod tests {
             rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
             None
         );
+    }
+    fn runtime_with_sdk_version(version: Option<&str>) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "nightly-wheel-gfx94x-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: version.map(ToOwned::to_owned),
+        }
+    }
+    #[test]
+    fn runtime_has_discover_build_matches_both_discover_lines() {
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.0.0"
+        ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.1.0a20260611"
+        ))));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("10.2.0")
+        )));
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("7.2.3")
+        )));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_no_recorded_version() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(None)));
     }
 }

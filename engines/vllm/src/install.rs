@@ -1098,8 +1098,38 @@ fn vllm_rocm_build_from_index_url(index_url: &str) -> Option<(String, String)> {
 mod tests {
     use super::*;
     use crate::runtime::{
-        RocmSdkRuntimeProbe, TheRockRuntimeManifest, sdk_torch_build_from_manifest,
+        ROCM_DISCOVER_BUILD_VERSIONS, RocmSdkRuntimeProbe, TheRockRuntimeManifest,
+        sdk_torch_build_from_manifest,
     };
+
+    #[test]
+    fn vllm_rocm_discover_build_table_matches_the_discover_version_list() {
+        // `ROCM_DISCOVER_BUILD_VERSIONS` (runtime.rs) and
+        // `VLLM_ROCM_DISCOVER_BUILD_TABLE` (here) are two separate pieces of data that
+        // must name the same ROCm SDK versions — the list drives launch-time env setup
+        // (`apply_therock_env`), the table drives install routing, and a row present in
+        // only one of them means a runtime gets installed one way and launched another.
+        // See the doc comment on `ROCM_DISCOVER_BUILD_VERSIONS` for why nothing but this
+        // test enforces the agreement.
+        for build in VLLM_ROCM_DISCOVER_BUILD_TABLE {
+            assert!(
+                ROCM_DISCOVER_BUILD_VERSIONS.contains(&build.rocm_sdk_version),
+                "{} is a VLLM_ROCM_DISCOVER_BUILD_TABLE row but missing from \
+                 ROCM_DISCOVER_BUILD_VERSIONS; launch-time env setup would silently skip it",
+                build.rocm_sdk_version
+            );
+        }
+        for version in ROCM_DISCOVER_BUILD_VERSIONS {
+            assert!(
+                VLLM_ROCM_DISCOVER_BUILD_TABLE
+                    .iter()
+                    .any(|build| build.rocm_sdk_version == *version),
+                "{version} is in ROCM_DISCOVER_BUILD_VERSIONS but has no \
+                 VLLM_ROCM_DISCOVER_BUILD_TABLE row; install routing has nothing to install \
+                 for a runtime launch-time env setup now treats as a discover build"
+            );
+        }
+    }
 
     fn install_target(
         index: Option<&str>,
