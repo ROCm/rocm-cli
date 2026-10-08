@@ -55,6 +55,10 @@ url = "2"
 vt100 = "0.16"
 
 [dev-dependencies]
+# Reads a printed command line back the way a POSIX shell splits words, so a
+# scenario can assert what a `tool_call:` line denotes rather than one spelling
+# of it.
+shlex.workspace = true
 # `FileLock`, so the service-cleanup lane can hold the managed-launch lock that a
 # real `rocm serve` holds and watch a real `rocm services prune` *process* block
 # on it. Using the production type rather than a hand-rolled `flock` is the
