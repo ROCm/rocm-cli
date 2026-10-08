@@ -96,7 +96,9 @@ Feature: ComfyUI install reports progress and makes failures actionable
   #
   # The contract: after installing an optional app, the machine's ROCm runtime must
   # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
-  # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
+  # no `nvidia-*` CUDA distributions appear in it (that last check only has teeth on
+  # Linux: PyPI's Windows torch wheels are CPU builds with no `nvidia-*` dependencies,
+  # so on Windows the exit code and the torch-stack comparison are the guards). Since #298 the install exits 0,
   # so the scenario also requires that. It is also the step that catches a revert
   # of #298 (the post-install GPU probe then bails and the install exits non-zero),
   # so do not relax it as a mere premise: a bail-out (no runtime, download failure)

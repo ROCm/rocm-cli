@@ -601,36 +601,16 @@ fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
     })
 }
 
-/// Locate a `bin/python` (Unix) or `Scripts/python.exe` (Windows) under `root`.
-///
-/// The interpreter is expected exactly at `<install_root>/bin/python` (the product
-/// creates the venv at `install_root`). `root` is the initial frontier entry, so
-/// that layout is found on the first iteration with no traversal. The depth-first
-/// walk below is only a depth-capped tolerance fallback for a tree that differs.
+/// The runtime's interpreter, expected exactly at `<install_root>/bin/python`
+/// (`Scripts/python.exe` on Windows): the product creates the venv at `install_root`.
+/// No fallback search, so a missing interpreter is reported rather than replaced by
+/// an unrelated one.
 fn find_venv_python(root: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
-    let (bin, exe) = ("Scripts", "python.exe");
+    let candidate = root.join("Scripts").join("python.exe");
     #[cfg(not(windows))]
-    let (bin, exe) = ("bin", "python");
-    let mut frontier = vec![(root.to_path_buf(), 0usize)];
-    while let Some((dir, depth)) = frontier.pop() {
-        let candidate = dir.join(bin).join(exe);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if depth >= 6 {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                frontier.push((entry.path(), depth + 1));
-            }
-        }
-    }
-    None
+    let candidate = root.join("bin").join("python");
+    candidate.is_file().then_some(candidate)
 }
 
 const TORCH_STACK_PROBE: &str = "import json,sys\n\
