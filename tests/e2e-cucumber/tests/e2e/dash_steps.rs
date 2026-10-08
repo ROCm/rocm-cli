@@ -604,7 +604,11 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
 #[then("the managed model is still listed as running")]
 async fn managed_model_still_listed_as_running(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--json"]);
-    let model = world.model_name.as_deref().unwrap_or("").to_lowercase();
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_lowercase();
     let records: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
     let found = records.as_array().into_iter().flatten().any(|record| {

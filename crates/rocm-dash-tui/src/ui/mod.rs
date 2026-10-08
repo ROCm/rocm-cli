@@ -200,9 +200,22 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     let total = running().count();
     let mut body = Vec::new();
     if total == 0 {
-        // Can change between opening the prompt and this render (e.g. the
-        // model exits on its own while the prompt is up) — not dead code.
-        body.push("Nothing is being served anymore.".to_string());
+        if !state.has_received_snapshot && state.startup_has_live_service {
+            // The prompt opened from the pre-launch disk read (issue #145's
+            // startup-race fix), not from `instances` — which is still
+            // empty because the daemon's first snapshot, the only thing
+            // that could name the model, hasn't landed yet (or never will,
+            // if the connection never succeeds). Saying "nothing is being
+            // served anymore" here would be a direct, printed contradiction
+            // of the "it keeps running" line two below — a model *was*
+            // recorded live at launch — so this stays honest about not
+            // knowing which instead of claiming to know it's gone.
+            body.push("A model was serving when this started.".to_string());
+        } else {
+            // Can change between opening the prompt and this render (e.g. the
+            // model exits on its own while the prompt is up) — not dead code.
+            body.push("Nothing is being served anymore.".to_string());
+        }
     } else {
         for i in running().take(5) {
             body.push(format!("• {}", i.model_name));
@@ -896,6 +909,47 @@ mod tests {
         assert!(
             !row.contains("Esc  close"),
             "sub-popup Esc chip should not say close: {row:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_does_not_contradict_itself_during_the_startup_fallback() {
+        // Closing-review regression: with `instances` still empty (no daemon
+        // snapshot has landed yet) but the prompt open via
+        // `startup_has_live_service`, the body used to say "Nothing is being
+        // served anymore." two lines above "It keeps running in the
+        // background after you quit." — a printed self-contradiction.
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.startup_has_live_service = true;
+        assert!(state.instances.is_empty());
+        assert!(!state.has_received_snapshot);
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            !body
+                .iter()
+                .any(|line| line.contains("Nothing is being served")),
+            "must not claim nothing is being served when the startup read said otherwise: {body:?}"
+        );
+        assert!(
+            body.iter().any(|line| line.contains("A model was serving")),
+            "must say a model was serving instead: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_says_nothing_is_being_served_once_a_snapshot_confirms_it() {
+        // Once a real (even empty) snapshot has landed, the startup fallback
+        // is retired (`AppState::has_live_instance`'s own doc comment) and
+        // the plain "nothing anymore" line is accurate again.
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.startup_has_live_service = true;
+        state.has_received_snapshot = true;
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line.contains("Nothing is being served"))
         );
     }
 

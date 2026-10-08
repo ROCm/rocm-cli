@@ -1159,6 +1159,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Isolated `ready`-only fixture: the sibling test above pairs `running`
+    /// with other records, so nothing there actually exercises the `"ready"
+    /// => true` arm on its own — a mutation collapsing it to `false` would
+    /// still pass that test via the `running` record.
+    #[test]
+    fn resolved_args_reports_a_ready_managed_service_at_startup() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "startup-live-ready-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("ready.json"),
+            br#"{"service_id":"svc-ready","engine":"vllm","port":8005,"status":"ready","created_at_unix_ms":7}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(args.startup_has_live_service);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A `ready`/`running` record with no bound port never becomes a live
     /// `Instance` in the authoritative view either (`discovered_from_record`'s
     /// own `port == 0` exclusion, `registry.rs`), so it must not count here —
