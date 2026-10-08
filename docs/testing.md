@@ -670,8 +670,13 @@ happens before anything is stopped, so it cannot take down a running service. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
-that later observes the process dead. There is no e2e coverage of `services
-stop`/`restart` or endpoint auth; these paths are unit-tested only.
+that later observes the process dead. `services stop` and endpoint auth have no
+e2e coverage; those paths are unit-tested only. `services restart` has exactly
+one e2e scenario, `serve-25` in `features/model_serving.feature`: it covers the
+restart that spawns an engine which dies on the way up — the failure the user
+sees, and the record the restart leaves retired rather than wedged. Everything
+else about `restart`, the endpoint-key preservation above included, is still
+unit tests only.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
