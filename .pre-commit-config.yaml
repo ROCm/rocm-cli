@@ -103,27 +103,20 @@ repos:
   # relative link (e.g. a docs/architecture.md path citation) still resolves.
   # Optional: lychee, pinned version documented in CONTRIBUTING.md. When it is
   # not installed the hook warns and passes, so a missing tool never blocks a
-  # commit; `docs-links` stays the hard gate. Unlike cargo-tpn it does not
-  # check the version: a different lychee still runs.
+  # commit; `docs-links` stays the hard gate. See xtask/src/lychee.rs for why
+  # it walks `.` rather than using CI's glob.
   - repo: local
     hooks:
       - id: lychee
         name: markdown links resolve (lychee)
-        # Walks `.` rather than using CI's './**/*.md' glob: lychee's glob
-        # ignores .gitignore, so gitignored scratch markdown (plans/, target/,
-        # ...) would fail every commit here while CI never sees it. Both skip
-        # hidden dirs (.github, .claude), so for tracked files the two check
-        # the same set. This still checks the working tree, not the commit:
-        # an untracked, non-ignored .md is checked here but not in CI, and a
-        # link to a file you haven't `git add`ed passes here but fails in CI.
-        entry: python scripts/lychee_if_available.py --config lychee.toml --extensions md .
-        language: python
-        verbose: true # surfaces the skip warning; the script is silent on a pass
+        entry: cargo xtask lychee --if-available
+        language: system
+        verbose: true # surfaces the skip/version warnings; silent on a pass
         # A rename or deletion anywhere can break a link without touching any
         # .md, and a delete-only commit has no changed files to match a filter.
         always_run: true
         pass_filenames: false
-        stages: [pre-commit] # offline, whole repo in well under a second
+        stages: [pre-commit]
         groups: [local-tools] # runs in the dedicated `docs-links` CI job
 
   # Rust + PowerShell: mirror the CI checks using the local toolchain.

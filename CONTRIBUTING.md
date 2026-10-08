@@ -62,7 +62,7 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 
 To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
 
-The markdown-links hook (`lychee`) runs on every commit, over the whole repo rather than just the changed files, since moving or deleting a file can break a link in a markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. prek doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate:
+The markdown-links hook (`lychee`) runs on every commit, over the whole repo rather than just the changed files, since moving or deleting a file can break a link in a markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. prek doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
 
 ```bash
 cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
