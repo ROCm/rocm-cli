@@ -18,6 +18,7 @@ use serde_json::Value;
 use serde_json::json;
 #[cfg(test)]
 use sha2::Digest;
+#[cfg(any(test, target_os = "linux"))]
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
