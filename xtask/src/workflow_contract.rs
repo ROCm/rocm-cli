@@ -1761,7 +1761,8 @@ esac
             "a failed wiki clone must fail the job with the prerequisite, not be ignored"
         );
         assert!(
-            script.contains("No per-platform report.json files were found")
+            script
+                .contains("if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then")
                 && script.contains("leaving the wiki page unchanged"),
             "an empty consolidation must leave the last good page in place"
         );
@@ -1782,7 +1783,10 @@ esac
         let lines: Vec<&str> = publish.lines().collect();
         let start = lines
             .iter()
-            .position(|l| l.trim_start().starts_with("if grep -q 'No per-platform"))
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if ! grep -q '^| Platform | OS |'")
+            })
             .expect("publish job has the empty-report guard");
         let end = start
             + lines[start..]
@@ -1811,6 +1815,10 @@ esac
         assert!(
             !run(&empty).contains("REACHED_PUBLISH"),
             "the generator's empty output must stop the publish"
+        );
+        assert!(
+            !run("").contains("REACHED_PUBLISH"),
+            "a zero-byte matrix must not be published"
         );
         assert!(
             run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),

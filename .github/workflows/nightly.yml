@@ -1660,10 +1660,11 @@ jobs:
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
         run: |
           set -euo pipefail
-          # An empty consolidation exits 0 upstream; do not replace the last
-          # good page with a matrix that has no platforms in it.
-          if grep -q 'No per-platform report.json files were found' consolidated/support-matrix.md; then
-            echo "::warning::No platform reports were consolidated; leaving the wiki page unchanged."
+          # An empty consolidation exits 0 upstream; publish only when the
+          # matrix table is present, so any degenerate output (empty file,
+          # reworded message) leaves the last good page in place.
+          if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then
+            echo "::warning::No platform table in the consolidated report; leaving the wiki page unchanged."
             exit 0
           fi
           page=E2E-Support-Matrix.md
@@ -1692,9 +1693,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$page"
-          if git diff --cached --quiet; then
-            echo "Wiki page already up to date."
-            exit 0
-          fi
           git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
