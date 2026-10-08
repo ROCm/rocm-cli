@@ -963,8 +963,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 };
                 assert!(
                     run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
-                    "{workflow} job `{job}` names a GPU preflight step but it has no \
-                     `run: |` script, so it waits for nothing"
+                    "{workflow} job `{job}` names a GPU preflight step but no non-empty \
+                     `run: |` block was found in it, so as far as this check can tell it \
+                     waits for nothing. Only the literal `run: |` form is recognised: a \
+                     `run: |-`, `run: >` or one-line `run:` script reads as missing here"
                 );
             }
         }
@@ -1416,33 +1418,56 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The `name:` of `step`, a block as `step_block` returns it (its first
     /// line is the step's `- ` item line); empty when the step has none.
+    ///
+    /// A block scalar (`name: >`, `name: |-`, …) is read from the
+    /// more-indented lines that follow, joined with single spaces, so a
+    /// wrapped name is not mistaken for the indicator.
     fn step_name(step: &str) -> String {
-        step_key(step, "name")
+        let Some((at, value)) = step_key_line(step, "name") else {
+            return String::new();
+        };
+        let value = strip_comment(value).trim();
+        if !value.starts_with(['>', '|']) {
+            return strip_quotes(value);
+        }
+        let key_indent = step.lines().next().map_or(0, indent_of) + 2;
+        step.lines()
+            .skip(at + 1)
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > key_indent)
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The one-line value of `step`'s own `{key}:`, unquoted and without a
     /// trailing comment; empty when the step has no such key.
+    fn step_key(step: &str, key: &str) -> String {
+        step_key_line(step, key)
+            .map(|(_, value)| strip_quotes(strip_comment(value).trim()))
+            .unwrap_or_default()
+    }
+
+    /// Where `step`'s own `{key}:` is: the index of its line within `step`,
+    /// and the raw text after the colon.
     ///
     /// The key is either the item's own first key (`- name: …`) or one of
     /// its sibling keys, two columns in from the dash. Keys any deeper — a
     /// `with:` input called `name`, a `name:` line inside the step's script —
     /// are not the step's.
-    fn step_key(step: &str, key: &str) -> String {
+    fn step_key_line<'a>(step: &'a str, key: &str) -> Option<(usize, &'a str)> {
         let marker = format!("{key}:");
         let item_indent = step.lines().next().map_or(0, indent_of);
-        step.lines()
-            .find_map(|l| {
-                let key_line = if indent_of(l) == item_indent {
-                    l.trim_start().strip_prefix("- ")?
-                } else if indent_of(l) == item_indent + 2 {
-                    l.trim_start()
-                } else {
-                    return None;
-                };
-                key_line.strip_prefix(&marker)
-            })
-            .map(|value| strip_quotes(strip_comment(value).trim()))
-            .unwrap_or_default()
+        step.lines().enumerate().find_map(|(at, l)| {
+            let key_line = if indent_of(l) == item_indent {
+                l.trim_start().strip_prefix("- ")?
+            } else if indent_of(l) == item_indent + 2 {
+                l.trim_start()
+            } else {
+                return None;
+            };
+            Some((at, key_line.strip_prefix(&marker)?))
+        })
     }
 
     /// Every `GPU preflight` step block in `text`, in file order.
@@ -1476,6 +1501,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Only the literal `run: |` form is recognised. `run: |-`, `run: >` and a
+    /// one-line `run: cmd` all read as no block, so a check that asserts a step
+    /// *has* a script relies on every workflow in this repo using `run: |`, and
+    /// has to say so in its failure message rather than claim the step is empty.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
@@ -5443,6 +5473,34 @@ permissions:
             unchecked_native_commands(&mismatched).is_empty(),
             "{:?}",
             pwsh_statements(&mismatched)
+        );
+    }
+
+    /// A wrapped step name must not read as its block-scalar indicator: with
+    /// `name: >` taken literally, the GPU-preflight lookup would report the
+    /// step missing from a job that has it.
+    #[test]
+    fn a_block_scalar_step_name_is_read_from_its_wrapped_lines() {
+        let block = "    steps:\n\
+                     \x20     - name: >-\n\
+                     \x20         GPU preflight\n\
+                     \x20         (bounded wait)\n\
+                     \x20       run: |\n\
+                     \x20         echo wait\n\
+                     \x20     - uses: actions/checkout@v4\n\
+                     \x20       name: |\n\
+                     \x20         Check out\n\
+                     \x20     - name: Plain # trailing comment\n\
+                     \x20       run: |\n\
+                     \x20         echo plain\n";
+        let names: Vec<String> = job_steps(block)
+            .expect("the block has a steps: list")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            ["GPU preflight (bounded wait)", "Check out", "Plain"]
         );
     }
 }
