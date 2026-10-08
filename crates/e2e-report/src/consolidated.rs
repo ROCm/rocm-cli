@@ -856,6 +856,15 @@ fn platform_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
     )
 }
 
+/// Platform cell for a table that renders OS in its own column (so this omits
+/// `desc.os`, unlike `PlatformReport::label`) — shared between the markdown
+/// summary and `matrix_table` so the two can't drift the way they already
+/// have once (see the command-coverage columns below, and the markdown/HTML
+/// drift fixed by #460).
+fn platform_cell(r: &PlatformReport) -> String {
+    with_channel_suffix(&r.desc.platform, r.effective_channel())
+}
+
 /// Build one consolidated HTML report from several per-platform `report.json`
 /// files.
 ///
@@ -967,7 +976,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         // Component versions in the Platform/OS cells: ROCm/vLLM/lemonade under the
         // platform, the OS version under the OS. Absent components are omitted (mock
         // has no runtime; a not-yet-probed source is simply skipped).
-        let plat_base = with_channel_suffix(&r.desc.platform, r.effective_channel());
+        let plat_base = platform_cell(r);
         let plat_cell = match r.versions.platform_stack() {
             s if s.is_empty() => plat_base,
             s => format!("{plat_base}<br><sub>{s}</sub>"),
@@ -1360,7 +1369,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
             @for r in reports {
                 @let (total, pass, fail, skip, xf) = r.display_counts();
                 tr {
-                    td { (with_channel_suffix(&r.desc.platform, r.effective_channel())) }
+                    td { (platform_cell(r)) }
                     td { (r.desc.os) }
                     td.num { (total) }
                     td.num { (pass) }
@@ -1981,6 +1990,62 @@ mod tests {
         assert!(
             labels.contains(&"mi300x (nightly)".to_string()),
             "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn platform_sort_key_orders_by_platform_then_os_then_known_bugs() {
+        // Only the channel element of the 4-tuple is pinned elsewhere
+        // (generate_consolidated_writes_html). Here, three platforms that share
+        // no channel distinguish the other three: "Strix Halo"/Ubuntu before
+        // "Strix Halo"/Windows pins os; the two Ubuntu rows, identical except
+        // for the known-bugs artifact suffix, pin known_bugs ordering
+        // (false < true) once os and channel are held equal. No platform.json
+        // sidecar, so display_counts falls back to raw junit stats and each
+        // row's distinct scenario count (1/2/3) tells the rows apart in the
+        // rendered table.
+        let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let ubuntu_known_bugs_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let windows_plain_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let inputs = vec![
+            (
+                "e2e-gpu-strix-windows-report".to_string(),
+                windows_plain_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-known-bugs-report".to_string(),
+                ubuntu_known_bugs_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-report".to_string(),
+                ubuntu_plain_report.path().to_path_buf(),
+            ),
+        ];
+
+        let md = consolidated_summary_markdown(&inputs);
+        let ubuntu_plain_pos = md
+            .find("| Strix Halo | Ubuntu | 1 |")
+            .expect("plain Ubuntu row");
+        let ubuntu_known_bugs_pos = md
+            .find("| Strix Halo | Ubuntu | 2 |")
+            .expect("known-bugs Ubuntu row");
+        let windows_pos = md
+            .find("| Strix Halo | Windows | 3 |")
+            .expect("Windows row");
+        assert!(
+            ubuntu_plain_pos < ubuntu_known_bugs_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true:\n{md}"
+        );
+        assert!(
+            ubuntu_known_bugs_pos < windows_pos,
+            "same platform: Ubuntu must sort before Windows regardless of known_bugs:\n{md}"
         );
     }
 
