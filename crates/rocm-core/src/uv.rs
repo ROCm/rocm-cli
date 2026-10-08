@@ -579,6 +579,7 @@ mod test_hooks {
 
     /// Run `hook` whenever an install into `install_dir` has committed to
     /// downloading. Keyed by directory so concurrent tests do not see each other's.
+    #[cfg_attr(not(unix), allow(dead_code))] // its only user is a unix-only test
     pub(super) fn set_before_download(install_dir: &Path, hook: Hook) {
         BEFORE_DOWNLOAD
             .lock()
@@ -586,6 +587,7 @@ mod test_hooks {
             .push((install_dir.to_path_buf(), hook));
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))] // its only user is a unix-only test
     pub(super) fn clear_before_download(install_dir: &Path) {
         BEFORE_DOWNLOAD
             .lock()
@@ -1140,6 +1142,7 @@ All installed packages are compatible
     }
 
     /// Serves `body` to every `GET` until `stop` is set, counting the requests.
+    #[cfg(unix)]
     fn spawn_counting_archive_server(
         body: Vec<u8>,
         requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
