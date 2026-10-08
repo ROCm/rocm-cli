@@ -145,7 +145,7 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
             "  ROCm runtime: {}",
             therock::runtime_version_display(&manifest.runtime_version)
         )?;
-        writeln!(output, "  folder: {}", manifest.runtime_root.display())?;
+        writeln!(output, "  folder: {}", manifest.source_path.display())?;
         writeln!(
             output,
             "  models path: {}",
@@ -300,7 +300,7 @@ pub(crate) fn install(
         "  ROCm runtime: {}",
         therock::runtime_version_display(&runtime.manifest.version)
     )?;
-    writeln!(output, "  folder: {}", app_root.display())?;
+    writeln!(output, "  folder: {}", source_path.display())?;
     writeln!(output, "  models path: {}", models_folder.display())?;
 
     if options.dry_run {
@@ -2115,6 +2115,14 @@ mod tests {
             !rendered.contains("ROCm install"),
             "status must not reintroduce the `ROCm install` label, got: {rendered}"
         );
+        assert!(
+            rendered.contains(&format!("  folder: {}\n", source_path(&paths).display())),
+            "status `folder:` should report the ComfyUI source checkout, not the runtime root, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("  folder: {}\n", runtime.install_root.display())),
+            "status `folder:` must not report the bare runtime root, got: {rendered}"
+        );
         Ok(())
     }
 
@@ -2207,6 +2215,18 @@ mod tests {
         assert!(
             !rendered.contains("ROCm install:"),
             "install output must not reintroduce the `ROCm install:` label, got: {rendered}"
+        );
+        let expected_folder_line = format!(
+            "  folder: {}\n",
+            source_path_from_app_root(&runtime_app).display()
+        );
+        assert!(
+            rendered.contains(&expected_folder_line),
+            "install `folder:` should report the ComfyUI source checkout, not the app root, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("  folder: {}\n", runtime_app.display())),
+            "install `folder:` must not report the bare app root, got: {rendered}"
         );
         Ok(())
     }
