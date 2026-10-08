@@ -21,7 +21,7 @@ There is no file-line-count CI gate enforcing this — `too_many_lines = "allow"
 
 ## Module map
 
-Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surface, plus `crates/e2e-report` (a shared exception: it's HTML/markdown reporting consumed only by `xtask` and `tests/e2e-cucumber`, but it's still one of the modularization effort's target files, so it's mapped below). Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber` themselves) are otherwise out of scope — they're not part of the modularization effort's inventory, and both are bare directory names rather than file citations, so they sit outside the per-crate-inventory link guarantee above.
+Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surface, plus `crates/e2e-report` (a shared exception: it's HTML/markdown reporting consumed only by `xtask` and `tests/e2e-cucumber`, but it's still one of the modularization effort's target files, so it's mapped below). Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber` themselves) are otherwise out of scope — they're not part of the modularization effort's inventory.
 
 ### `apps/rocm` — main CLI binary
 
