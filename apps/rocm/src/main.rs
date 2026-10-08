@@ -39414,7 +39414,11 @@ ID_LIKE="suse opensuse"
         assert!(report.failed.is_empty(), "nothing should fail: {report:?}");
         assert_eq!(
             report.stopped,
-            vec!["rocmd (background helper)".to_owned()],
+            Vec::<String>::new(),
+            "the helper is not a service: {report:?}"
+        );
+        assert!(
+            report.helper_stopped,
             "a verified daemon is stopped and reported: {report:?}"
         );
         let mut child = child;
@@ -39628,6 +39632,7 @@ ID_LIKE="suse opensuse"
                 remedy: StopFailureRemedy::StopTheService,
             }],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let error = uninstall_removal_gate(&report)
             .expect_err("a non-empty `failed` must abort uninstall")
@@ -39663,6 +39668,7 @@ ID_LIKE="suse opensuse"
                 remedy: StopFailureRemedy::StopTheService,
             }],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let error = uninstall_removal_gate(&report)
             .expect_err("a non-empty `failed` must abort uninstall")
@@ -39723,6 +39729,7 @@ ID_LIKE="suse opensuse"
                 },
             ],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
 
         let error = uninstall_removal_gate(&report)
@@ -40503,6 +40510,139 @@ ID_LIKE="suse opensuse"
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn a_survivor_behind_an_already_stopped_record_dooms_the_run_before_anything_is_stopped() {
+        // The retry the abort message asks for: last run's survivor reads as an
+        // already-stopped record whose endpoint still serves its own model. That
+        // verdict needs nothing this pass stops, so it must land before the live
+        // server is touched.
+        let endpoint = ServingEndpoint::serving("amd/survivor-model");
+        let server = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn managed server"),
+        );
+        let pid = server.0.id();
+        let (root, paths) = test_paths("uninstall-doomed-by-stopped-record");
+        let mut survivor = ManagedServiceRecord::new(
+            &paths,
+            "svc-survivor",
+            "vllm",
+            "amd/survivor-model",
+            "amd/survivor-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        survivor.status = "stopped".to_owned();
+        survivor.write().expect("write survivor record");
+        let mut live = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        live.status = "ready".to_owned();
+        live.write().expect("write live record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report.stopped.is_empty(),
+            "nothing may be stopped: {report:?}"
+        );
+        assert!(
+            rocm_core::process_is_running(pid),
+            "the live server must be left running by a run that aborts anyway"
+        );
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.service_id == "svc-survivor"),
+            "{report:?}"
+        );
+        assert!(uninstall_removal_gate(&report).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_helper_is_reported_apart_from_services_and_worded_as_a_helper() {
+        let failed_after = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![FailedManagedServiceStop {
+                service_id: "svc".to_owned(),
+                reason: "still ready".to_owned(),
+                remedy: StopFailureRemedy::StopTheService,
+            }],
+            warnings: Vec::new(),
+            helper_stopped: true,
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&failed_after).unwrap_err());
+        assert!(
+            message.contains("background helper (rocmd) was stopped"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("endpoint keys"),
+            "the helper has no endpoint key, and no services were stopped: {message}"
+        );
+
+        let ok = ManagedServiceStopReport {
+            stopped: vec!["a".to_owned()],
+            failed: Vec::new(),
+            warnings: Vec::new(),
+            helper_stopped: true,
+        };
+        assert_eq!(
+            uninstall_removal_gate(&ok).unwrap().as_deref(),
+            Some(
+                "stopped 1 managed service(s) before removal; stopped the background helper (rocmd)"
+            )
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_answers_without_a_usable_listing_discloses_the_fail_open() {
+        // `ProceedUnidentified`: the port still accepts connections, the record is
+        // already stopped, and uninstall proceeds. The warning is the only thing
+        // that makes that a disclosed tradeoff.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (root, paths) = test_paths("uninstall-unidentified-listener");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-wedged",
+            "vllm",
+            "amd/m",
+            "amd/m",
+            "127.0.0.1",
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(
+            report.warnings.iter().any(
+                |w| w.contains("did not answer the identity probe") && w.contains("svc-wedged")
+            ),
+            "{report:?}"
+        );
+        drop(listener);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn an_unparseable_manifest_aborts_before_any_service_is_stopped() {
         // Same shape as the daemon case and worse: a manifest that cannot be
         // parsed may itself describe a live, GPU-holding server, so collecting
@@ -40897,6 +41037,7 @@ ID_LIKE="suse opensuse"
             stopped: vec!["a".to_owned(), "b".to_owned()],
             failed: Vec::new(),
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let line = uninstall_removal_gate(&report).expect("all stopped must proceed");
         assert_eq!(
@@ -41550,7 +41691,10 @@ ID_LIKE="suse opensuse"
             rocm_core::TerminationOutcome::Graceful
         });
         assert!(report.failed.is_empty(), "{report:?}");
-        assert_eq!(report.stopped, vec!["rocmd (background helper)".to_owned()]);
+        assert!(
+            report.helper_stopped && report.stopped.is_empty(),
+            "{report:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -41565,6 +41709,7 @@ ID_LIKE="suse opensuse"
             stopped: Vec::new(),
             failed: vec![failure("svc-a"), failure("svc-b")],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert_eq!(
@@ -41597,6 +41742,7 @@ ID_LIKE="suse opensuse"
                     remedy,
                 }],
                 warnings: Vec::new(),
+                helper_stopped: false,
             };
             let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
             assert_eq!(
@@ -41617,6 +41763,7 @@ ID_LIKE="suse opensuse"
                 remedy: StopFailureRemedy::RepairTheRecord,
             }],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let message = format!("{:#}", uninstall_removal_gate(&repair_only).unwrap_err());
         assert!(!message.contains("may still be serving"), "{message}");
@@ -41629,6 +41776,7 @@ ID_LIKE="suse opensuse"
                 remedy: StopFailureRemedy::StopTheService,
             }],
             warnings: Vec::new(),
+            helper_stopped: false,
         };
         let message = format!("{:#}", uninstall_removal_gate(&service).unwrap_err());
         assert!(message.contains("may still be serving"), "{message}");

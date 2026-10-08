@@ -173,6 +173,7 @@ mod tests {
                     remedy: StopFailureRemedy::StopTheService,
                 }],
                 warnings: Vec::new(),
+                helper_stopped: false,
             })
         })
         .expect_err("an unconfirmed stop must abort uninstall");
@@ -221,6 +222,7 @@ mod tests {
                     remedy: StopFailureRemedy::StopTheDaemon,
                 }],
                 warnings: Vec::new(),
+                helper_stopped: false,
             })
         })
         .expect_err("an unstopped background helper must abort uninstall");
@@ -377,6 +379,7 @@ mod tests {
                 stopped: vec!["svc-stopped".to_owned()],
                 failed: Vec::new(),
                 warnings: Vec::new(),
+                helper_stopped: false,
             })
         })
         .expect("a confirmed stop must let uninstall proceed");

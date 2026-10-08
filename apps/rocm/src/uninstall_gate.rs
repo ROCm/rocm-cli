@@ -149,6 +149,11 @@ pub(crate) struct ManagedServiceStopReport {
     /// disclosure part of this function's answer, and `stderr` the caller's
     /// business.
     pub(crate) warnings: Vec<String>,
+    /// The background helper (`rocmd`) was stopped by this pass. Kept apart from
+    /// `stopped` because it is not a service: it has no endpoint key, and the
+    /// consequence of its being down is that nothing supervises or recovers
+    /// services until it is restarted.
+    pub(crate) helper_stopped: bool,
 }
 
 /// The failure recorded when the background helper is live but cannot be proven
@@ -354,7 +359,7 @@ pub(crate) fn stop_background_helper_with(
     println!("stopping the background helper (rocmd)");
     let outcome = terminate(&identity);
     if outcome.stopped() {
-        report.stopped.push("rocmd (background helper)".to_owned());
+        report.helper_stopped = true;
     } else {
         report.failed.push(FailedManagedServiceStop {
             service_id: format!("rocmd (pid {})", state.daemon_pid),
@@ -429,11 +434,22 @@ pub(crate) fn stop_managed_services_with(
     if !report.failed.is_empty() {
         return Ok(report);
     }
+    // A record already stopped before this run needs no stop to be judged, and a
+    // survivor from the previous run reads exactly like that: probe those first,
+    // so a run that is going to abort anyway has stopped nothing on the way.
+    let records = load_managed_services(paths)?;
+    let already_stopped: Vec<&ManagedServiceRecord> = records
+        .iter()
+        .filter(|record| !managed_service_is_live(record))
+        .collect();
+    probe_records_for_survivors(paths, &already_stopped, &[], &mut report);
+    if !report.failed.is_empty() {
+        return Ok(report);
+    }
     stop_background_helper_before_uninstall(paths, &mut report);
     if !report.failed.is_empty() {
         return Ok(report);
     }
-    let records = load_managed_services(paths)?;
     let mut attempted: Vec<&ManagedServiceRecord> = Vec::new();
     for record in &records {
         if !managed_service_is_live(record) {
@@ -491,7 +507,21 @@ pub(crate) fn stop_managed_services_with(
     //   * already stopped before this run — a listener alone proves nothing, so
     //     it has to identify itself as this record's own model before it counts.
     //     An unrelated service on a recycled port does not, and is not blocked.
-    for record in &records {
+    let stopped_this_pass: Vec<&ManagedServiceRecord> = attempted.clone();
+    probe_records_for_survivors(paths, &stopped_this_pass, &attempted, &mut report);
+    Ok(report)
+}
+
+/// Probe the endpoints of `to_probe` for a survivor, recording any that should
+/// block the removal. `attempted` is the set this pass stopped; for those any
+/// listener blocks, for the rest it has to identify itself as the record's own.
+fn probe_records_for_survivors(
+    paths: &AppPaths,
+    to_probe: &[&ManagedServiceRecord],
+    attempted: &[&ManagedServiceRecord],
+    report: &mut ManagedServiceStopReport,
+) {
+    for &record in to_probe {
         if report
             .failed
             .iter()
@@ -639,7 +669,6 @@ pub(crate) fn stop_managed_services_with(
             remedy: StopFailureRemedy::StopWhatHoldsThePort,
         });
     }
-    Ok(report)
 }
 
 /// The addresses to probe for a service recorded on `host`, in order.
@@ -850,15 +879,26 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
         // it dropped its endpoint key, which cannot be re-minted — a public
         // service must be served again with `--allow-public-bind` to come back.
         // "No files were removed" alone would read as "nothing happened".
-        let already_stopped = if report.stopped.is_empty() {
+        let services_note = if report.stopped.is_empty() {
             String::new()
         } else {
             format!(
-                " No files were removed, but these services were stopped before the failure and \
-                 stay stopped: {}. Stopping them dropped their endpoint keys, so a publicly bound \
-                 one has to be served again with `rocm serve --allow-public-bind` to return.",
+                " These services were stopped before the failure and stay stopped: {}. Stopping \
+                 them dropped their endpoint keys, so a publicly bound one has to be served \
+                 again with `rocm serve --allow-public-bind` to return.",
                 report.stopped.join(", ")
             )
+        };
+        let helper_note = if report.helper_stopped {
+            " The background helper (rocmd) was stopped and stays stopped: nothing supervises or \
+             recovers managed services until it is started again."
+        } else {
+            ""
+        };
+        let already_stopped = if services_note.is_empty() && helper_note.is_empty() {
+            String::new()
+        } else {
+            format!(" No files were removed, but:{services_note}{helper_note}")
         };
         // Advice per failure class. A record that will not parse cannot be
         // stopped by `rocm services stop` — that command loads the same file and
@@ -908,11 +948,21 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
             }
         );
     }
-    if report.stopped.is_empty() {
+    if report.stopped.is_empty() && !report.helper_stopped {
         return Ok(None);
     }
-    Ok(Some(format!(
-        "stopped {} managed service(s) before removal",
-        report.stopped.len()
-    )))
+    let mut line = String::new();
+    if !report.stopped.is_empty() {
+        line = format!(
+            "stopped {} managed service(s) before removal",
+            report.stopped.len()
+        );
+    }
+    if report.helper_stopped {
+        if !line.is_empty() {
+            line.push_str("; ");
+        }
+        line.push_str("stopped the background helper (rocmd)");
+    }
+    Ok(Some(line))
 }
