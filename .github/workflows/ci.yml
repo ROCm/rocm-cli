@@ -1332,7 +1332,6 @@ jobs:
           args: --config lychee.toml './**/*.md'
           fail: true
 
-
   docs-build:
     name: Sphinx docs build (-W)
     runs-on: ubuntu-latest
