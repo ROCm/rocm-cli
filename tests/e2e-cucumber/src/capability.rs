@@ -123,6 +123,10 @@ pub struct HostCapability {
     /// Stable platform identity derived from hardware, not from an artifact name:
     /// "mock" (no AMD GPU), else the family/target (e.g. "mi300x", "strix-halo").
     pub platform_slug: String,
+    /// Whether two file names differing only in letter case are two files under
+    /// the temp root the scenarios' isolated roots are created in. Gates
+    /// `@requires-case-sensitive-fs`; see [`probe_case_sensitive_fs`].
+    pub case_sensitive_fs: bool,
 }
 
 impl HostCapability {
@@ -372,6 +376,7 @@ fn probe_host_capability() -> HostCapability {
     let effective_serve_engine = effective_serve_engine(gfx_target.as_deref(), &os_family);
     let platform_slug =
         derive_platform_slug(has_amd_gpu, gfx_target.as_deref(), &os_family, is_wsl);
+    let case_sensitive_fs = probe_case_sensitive_fs(root);
 
     HostCapability {
         os_family,
@@ -382,7 +387,33 @@ fn probe_host_capability() -> HostCapability {
         available_engines,
         effective_serve_engine,
         platform_slug,
+        case_sensitive_fs,
     }
+}
+
+/// Whether `dir`'s filesystem keeps two names that differ only in letter case
+/// apart.
+///
+/// Probed rather than inferred from the OS: the scenarios' isolated roots are
+/// `TempDir`s, which follow `$TMPDIR`, and on Linux that can be a casefolded
+/// directory or a mounted Windows/exFAT path — still `os_family` `linux`. The
+/// probe's own temp dir is created the same way, so it answers for the same
+/// filesystem the scenarios write to.
+///
+/// Writes a lower-case and an upper-case name, then re-reads the lower-case
+/// one: on a case-insensitive filesystem the second write landed on the first
+/// file. Checking only that the upper-case path exists would not do, because
+/// there it resolves to the lower-case file. Any I/O error answers `false`: the
+/// premise has not been shown to hold.
+fn probe_case_sensitive_fs(dir: &std::path::Path) -> bool {
+    let probe = || -> std::io::Result<bool> {
+        let dir = dir.join("case-probe");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("case-twin"), "lower")?;
+        std::fs::write(dir.join("CASE-TWIN"), "upper")?;
+        Ok(std::fs::read_to_string(dir.join("case-twin"))? == "lower")
+    };
+    probe().unwrap_or(false)
 }
 
 /// Run `rocm <args>` with an isolated config/data/cache root, returning stdout
@@ -766,6 +797,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "lemonade".to_owned(),
             platform_slug: "strix-halo".to_owned(),
+            case_sensitive_fs: false,
         };
         assert!(strix.engine_available("lemonade"));
         // vLLM adapter is "built-in" but cannot start on Windows / non-dcgpu.
@@ -780,6 +812,7 @@ mod tests {
             available_engines: vec!["lemonade".to_owned(), "vllm".to_owned()],
             effective_serve_engine: "vllm".to_owned(),
             platform_slug: "mi300x".to_owned(),
+            case_sensitive_fs: true,
         };
         assert!(mi300x.engine_available("vllm"));
         assert!(mi300x.engine_available("lemonade"));
@@ -1054,5 +1087,34 @@ Local model engines
         write_manifest(dir, "release-wheel-multi-arch-7-14-0", "7.14.0");
 
         assert!(active_runtime_install_root(dir).is_none());
+    }
+
+    /// The answer the scenarios rely on wherever they normally run: a Linux temp
+    /// dir keeps case twins apart. Native Windows temp dirs fold case, so this
+    /// has no premise there.
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "needs a case-sensitive temp dir, which only Linux provides by default"
+    )]
+    fn case_probe_reports_a_case_sensitive_temp_dir() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        assert!(probe_case_sensitive_fs(tmp.path()));
+        // Both twins were written as separate files, which is the exact premise
+        // the gated scenario needs.
+        let entries = std::fs::read_dir(tmp.path().join("case-probe"))
+            .expect("probe dir")
+            .count();
+        assert_eq!(entries, 2);
+    }
+
+    /// A probe that cannot write has not shown the premise holds, so the gate
+    /// must skip rather than let the scenario fail on a fixture it never had.
+    #[test]
+    fn case_probe_answers_false_when_it_cannot_write() {
+        let tmp = tempfile::TempDir::with_prefix("capability-").expect("temp dir");
+        let not_a_dir = tmp.path().join("plain-file");
+        std::fs::write(&not_a_dir, "").expect("write file");
+        assert!(!probe_case_sensitive_fs(&not_a_dir));
     }
 }

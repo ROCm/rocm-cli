@@ -122,7 +122,9 @@ rocm runtimes activate <runtime_key>
 rocm examine
 ```
 
-Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`.
+Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`. Keys
+are matched exactly first; a selector that matches two installed keys only by
+letter case is refused with both keys listed, so copy the key as printed.
 Omit `--prefix` if you want rocm-cli to choose its standard managed folder.
 
 Section 1 has already made a managed runtime the active default, so the
