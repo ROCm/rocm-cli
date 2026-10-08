@@ -2005,10 +2005,8 @@ mod tests {
         // row's distinct scenario count (1/2/3) tells the rows apart in the
         // rendered table.
         let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
-        let ubuntu_known_bugs_report = write_report(&feature_json(&[
-            (&[], &["passed"]),
-            (&[], &["passed"]),
-        ]));
+        let ubuntu_known_bugs_report =
+            write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let windows_plain_report = write_report(&feature_json(&[
             (&[], &["passed"]),
             (&[], &["passed"]),
