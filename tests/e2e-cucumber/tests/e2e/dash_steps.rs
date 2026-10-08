@@ -578,19 +578,50 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
     session(world)
         .send("n")
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
+    // The prompt's own body names the serving model (`quit_confirm_body` in
+    // `ui/mod.rs`), so the very next assertion in both scenarios — "the
+    // managed model is displayed" — could pass on the prompt's own text even
+    // if `n` did nothing and the prompt never actually closed. Wait for it to
+    // actually leave the screen so that assertion proves the decline worked,
+    // not just that the model's name is on screen somewhere.
+    session(world)
+        .wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never closed after declining: {e}"));
 }
 
 /// Proves the prompt's own claim ("it keeps running in the background after
 /// you quit") against actual state, not just its wording (AGENTS.md §3) — a
 /// plain CLI check against the managed-service registry, run after the TUI
 /// process has already exited.
+///
+/// `--json` (no `--all`) rather than the plain `--all` table: `--all` also
+/// keeps stopped/failed records around, so a substring match against it would
+/// pass even if quitting had stopped the service and merely left its record
+/// behind. The JSON records carry a `status` field, so this checks the model
+/// is both present AND actually `ready`/`running` — the same statuses
+/// `Instance::status.is_serving()` treats as live on the TUI side.
 #[then("the managed model is still listed as running")]
 async fn managed_model_still_listed_as_running(world: &mut E2eWorld) {
-    let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--all"]);
-    let model = world.model_name.as_deref().unwrap_or("");
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--json"]);
+    let model = world.model_name.as_deref().unwrap_or("").to_lowercase();
+    let records: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
+    let found = records.as_array().into_iter().flatten().any(|record| {
+        let names_model = [record.get("model_ref"), record.get("canonical_model_id")]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|v| v.to_lowercase().contains(&model));
+        let is_running = record
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| matches!(s, "ready" | "running"));
+        names_model && is_running
+    });
     assert!(
-        stdout.to_lowercase().contains(&model.to_lowercase()),
-        "model no longer listed after quitting — quitting must not stop it:\n{stdout}"
+        found,
+        "model not listed as ready/running after quitting — quitting must not stop it:\n{stdout}"
     );
 }
 
