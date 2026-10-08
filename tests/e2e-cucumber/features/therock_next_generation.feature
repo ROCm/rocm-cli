@@ -140,9 +140,10 @@ Feature: TheRock "next" ROCm 10 install layout
   #
   # Not `@nightly`: `install_vllm_rocm10_discover` always runs its 403-tolerant
   # `--config-file` install and forced torch realignment regardless of which
-  # row (10.0.x production, 10.1.x staging) the live preview index currently
-  # serves as newest, so this is the live per-PR regression guard for both
-  # fixes (ROCMAI-439) as well as the discovery mechanism itself — accepted as
+  # row (10.0.x production vLLM, 10.1.x staging vLLM; both take their torch
+  # stack from `whl-next`) the live preview index currently serves as newest,
+  # so this is the live per-PR regression guard for both fixes (ROCMAI-439)
+  # as well as the discovery mechanism itself — accepted as
   # a real fresh-SDK-install cost on every vLLM-capable self-hosted GPU lane.
   #
   # The serve+inference tail matters because `serve-vllm-inference`

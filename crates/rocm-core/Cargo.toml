@@ -34,6 +34,10 @@ ureq = { version = "2.12", features = ["native-certs"] }
 # spelling of that path, which is exactly the shape an example test misses: the
 # pre-existing example used `/etc/rocm-cli-test-runtime`, the one shape that
 # happened to work, while `/etc/` and `$HOME/../../etc` sailed through.
+#
+# Also used by `disk_space`, for the same reason: its unit formatting, margin
+# arithmetic and mount selection are small total functions whose contracts are
+# easy to state over ALL inputs and awkward to cover with examples.
 # Test-only, so it adds nothing to any shipped binary.
 proptest = { version = "1", default-features = false, features = ["std"] }
 
