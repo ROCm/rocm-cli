@@ -139,7 +139,7 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 - [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery, install execution, and runtime-repair assessment.
 - [`process.rs`](../engines/vllm/src/process.rs) — spawn/env/path setup and readiness polling.
-- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution.
+- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution and TheRock library/bin path derivation.
 - [`state.rs`](../engines/vllm/src/state.rs) — service state file I/O.
 
 [`lib.rs`](../engines/vllm/src/lib.rs) keeps only CLI/envelope dispatch and the few items shared across those modules.
