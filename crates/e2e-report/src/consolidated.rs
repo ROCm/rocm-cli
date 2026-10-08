@@ -865,7 +865,8 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
 }
 
 /// Build the per-platform `PlatformReport` set once, from every platform's
-/// `report.json`/`platform.json`/`commands.jsonl`, sorted by [`report_sort_key`].
+/// `report.json`/`platform.json`/`commands.jsonl`, sorted by platform/OS,
+/// then known-bugs flag, then channel.
 ///
 /// [`generate_consolidated`] and [`consolidated_summary_markdown`] each used
 /// to build their own `Vec<PlatformReport>` independently, so a caller
@@ -896,7 +897,9 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// that only needs the HTML output. A caller that also wants
 /// [`consolidated_summary_markdown`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead, to avoid reparsing every platform twice.
+/// directly instead, to share the `PlatformReport` build instead of
+/// building it twice. The expectation grid still parses `inputs` itself
+/// either way.
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
     html_out: &Path,
@@ -985,7 +988,9 @@ pub fn generate_consolidated_from_reports(
 /// caller that only needs the markdown output. A caller that also wants
 /// [`generate_consolidated`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead, to avoid reparsing every platform twice.
+/// directly instead, to share the `PlatformReport` build instead of
+/// building it twice. The scenario reference section still parses `inputs`
+/// itself either way.
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
 }
@@ -1743,6 +1748,11 @@ mod tests {
         .expect("generate via reports");
         let html_via_wrapper = std::fs::read_to_string(out_via_wrapper.path()).expect("read");
         let html_via_reports = std::fs::read_to_string(out_via_reports.path()).expect("read");
+        // If the "Generated " marker were ever renamed, strip_generated_timestamp
+        // would return its input unchanged and this test would go back to being
+        // flaky (see the comment on strip_generated_timestamp) without saying why.
+        assert!(html_via_wrapper.contains("Generated "));
+        assert!(html_via_reports.contains("Generated "));
         assert_eq!(
             strip_generated_timestamp(&html_via_wrapper),
             strip_generated_timestamp(&html_via_reports)
@@ -1795,6 +1805,80 @@ mod tests {
         assert_eq!(keys, sorted_keys);
         assert_eq!(reports[0].desc.platform, "MI300X");
         assert_eq!(reports[1].desc.platform, "Mock");
+    }
+
+    #[test]
+    fn load_platform_reports_sorts_by_every_key_dimension() {
+        // `keys == sorted(keys)` (the test above) derives its expectation from
+        // `report_sort_key` itself, so it can't catch a change to the key — e.g.
+        // dropping or swapping one of its fields — because the expectation would
+        // drift along with it. This test instead hard-codes the expected order,
+        // from fixtures that each isolate one dimension of the tuple:
+        //
+        //   A (MI300X, Linux, known_bugs=false, channel=None)
+        //   B (MI300X, Linux, known_bugs=true,  channel=None)      — vs A: known_bugs
+        //   C (MI300X, Linux, known_bugs=true,  channel=nightly)   — vs B: channel
+        //   D (Strix Halo, Ubuntu,  known_bugs=false, channel=None)
+        //   E (Strix Halo, Windows, known_bugs=false, channel=None) — vs D: os
+        //
+        // so swapping or dropping any single field breaks at least one adjacent
+        // pair's order.
+        let mi300x_base = write_report(&feature_json(&[(&[], &["passed"])]));
+        let mi300x_known_bugs =
+            write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
+        let (_nightly_dir, mi300x_known_bugs_nightly) = write_platform(
+            &feature_json(&[(&["expected-failure"], &["failed"])]),
+            r#"{"versions": {"channel": "nightly"}}"#,
+        );
+        let strix_ubuntu = write_report(&feature_json(&[(&[], &["passed"])]));
+        let strix_windows = write_report(&feature_json(&[(&[], &["passed"])]));
+
+        // Fed in an order that is neither the expected order nor its reverse.
+        let inputs = vec![
+            (
+                "e2e-gpu-strix-windows-report".to_string(),
+                strix_windows.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-known-bugs-report".to_string(),
+                mi300x_known_bugs_nightly,
+            ),
+            (
+                "e2e-gpu-report".to_string(),
+                mi300x_base.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-report".to_string(),
+                strix_ubuntu.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-known-bugs-report".to_string(),
+                mi300x_known_bugs.path().to_path_buf(),
+            ),
+        ];
+
+        let reports = load_platform_reports(&inputs);
+        let actual: Vec<_> = reports
+            .iter()
+            .map(|r| {
+                (
+                    r.desc.platform.as_str(),
+                    r.desc.os.as_str(),
+                    r.desc.known_bugs,
+                    r.effective_channel(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("MI300X", "Linux", false, None),
+                ("MI300X", "Linux", true, None),
+                ("MI300X", "Linux", true, Some("nightly")),
+                ("Strix Halo", "Ubuntu", false, None),
+                ("Strix Halo", "Windows", false, None),
+            ]
+        );
     }
 
     #[test]
