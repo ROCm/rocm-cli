@@ -1028,26 +1028,82 @@ mod tests {
         );
     }
 
+    // Serializes HOME-dependent tests against each other: `ChatGptAgentClient::new`
+    // derives its OAuth token-cache path from `$HOME`, and process env is shared
+    // across test threads. Only this test mutates the key today, but the lock
+    // protects every reader for as long as it is held.
+    static CHATGPT_HOME_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// `ChatGptAgentClient::complete`'s empty-history guard (clients.rs, ahead
     /// of its param validation and device-code `authorize()`) is otherwise
     /// protected only by a comment. Pin it: an empty history must return
-    /// `AgentError::Empty` without the device-code callback ever firing,
-    /// proving no network/auth round trip was attempted.
+    /// `AgentError::Empty` without the device-code callback ever firing.
+    ///
+    /// Builds the client with `$HOME` pointed at a fresh, token-free directory
+    /// (restored immediately after construction and the call): `ChatGptAgentClient::new`
+    /// derives its token-cache path from the real `$HOME`, and a developer
+    /// machine already signed in to ChatGPT has a cached token there. Against
+    /// that real cache, deleting the guard entirely would still short-circuit
+    /// to `Empty` via the cached-token fast path without ever calling
+    /// `authorize()`, so this test would pass for the wrong reason and miss
+    /// the regression it exists to catch.
+    ///
+    /// This closes that gap but not a second one: rig-core's device-code
+    /// endpoints (`auth.openai.com`) are compile-time constants with no
+    /// override hook, so on a host with real internet access and the guard
+    /// removed, this test would reach OpenAI's real auth service and poll for
+    /// up to 15 minutes before failing, rather than failing fast.
     #[tokio::test]
     async fn chatgpt_empty_history_is_empty_error_without_auth() {
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
-        let client = ChatGptAgentClient::new(
-            None,
-            InferenceParams::default(),
-            move |url, code| {
-                sink.lock().unwrap().push(format!("{url}|{code}"));
-            },
-            None,
-            None,
-        )
-        .expect("build chatgpt oauth client");
 
+        // $HOME is only read during construction (token_dir derivation); the
+        // empty-history guard this test pins returns before `complete()`
+        // touches the filesystem again, so the override and its restoration
+        // stay in this synchronous block and never span an `.await`.
+        let build_result = {
+            let _lock = CHATGPT_HOME_ENV_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let home_dir = std::env::temp_dir().join(format!(
+                "rocm-dash-chatgpt-empty-history-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&home_dir).expect("create isolated HOME for test");
+            let previous_home = std::env::var_os("HOME");
+            // SAFETY: serialized by `CHATGPT_HOME_ENV_TEST_LOCK`; restored
+            // below, before any assertion that could panic runs.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("HOME", &home_dir);
+            }
+
+            let build_result = ChatGptAgentClient::new(
+                None,
+                InferenceParams::default(),
+                move |url, code| {
+                    sink.lock().unwrap().push(format!("{url}|{code}"));
+                },
+                None,
+                None,
+            );
+
+            // SAFETY: as above -- restored before the lock above is
+            // released, and before any assertion below can panic.
+            #[allow(unsafe_code)]
+            unsafe {
+                match previous_home.as_ref() {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            std::fs::remove_dir_all(&home_dir).ok();
+            build_result
+        };
+
+        let client = build_result.expect("build chatgpt oauth client");
         let err = client
             .complete(&[], fixture_snapshot())
             .await
