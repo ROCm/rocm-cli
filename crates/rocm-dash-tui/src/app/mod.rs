@@ -1244,6 +1244,20 @@ mod tests {
     use super::types::NO_CHAT_BACKEND_MSG;
 
     #[test]
+    fn actions_does_not_import_from_scrollbar() {
+        // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit).
+        // A `use super::scrollbar::...` in actions.rs would reintroduce the
+        // module cycle this file's split from scrollbar.rs exists to remove —
+        // the compiler accepts such a cycle, so nothing else catches it.
+        let src = include_str!("actions.rs");
+        let needle = ["super", "::", "scrollbar"].concat();
+        assert!(
+            !src.contains(&needle),
+            "actions.rs must not import from scrollbar.rs"
+        );
+    }
+
+    #[test]
     fn back_out_requires_an_open_manager_on_any_tab() {
         let mut s = AppState::new("t".into(), "default-dark".into());
         // No manager open → never backs out, even on a domain tab.

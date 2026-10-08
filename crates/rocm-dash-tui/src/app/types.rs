@@ -439,8 +439,8 @@ pub enum UpdateStatus {
 /// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
 ///
 /// Lives here, not in `scrollbar.rs`: `scrollbar.rs` defined this type but
-/// never used it, so moving it out removes `actions.rs`'s only import from
-/// `scrollbar.rs`.
+/// never used it. Moving it out, together with [`ScrollTarget`], removes
+/// `actions.rs`'s only import from `scrollbar.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneFocus {
     /// Browsing the Actions list (left column).
@@ -453,10 +453,11 @@ pub enum PaneFocus {
 /// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
 /// scrollbar track write the right offset field.
 ///
-/// Lives here (not in `scrollbar.rs`) for the same reason as [`PaneFocus`]:
-/// `actions.rs`'s `KeyAction::ScrollGrab` variant carries one, so the type has
-/// to be visible to both `actions.rs` and `scrollbar.rs` without either
-/// depending on the other.
+/// Lives here, not in `scrollbar.rs`: `actions.rs`'s `KeyAction::ScrollGrab`
+/// variant carries one, so the type has to be visible to `actions.rs` without
+/// `actions.rs` depending on `scrollbar.rs`. The reverse edge stays —
+/// `scrollbar.rs` still imports `KeyAction`/`handle_mouse`/`tab_bar_hit` from
+/// `actions.rs` — that's the one edge this module boundary keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollTarget {
     /// Job console vertical (`console_scroll`).
