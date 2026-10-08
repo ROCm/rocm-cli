@@ -11,9 +11,10 @@
 //!
 //! The selection is deliberately **conservative**: any changed file that cannot
 //! be confidently attributed to a single crate (the lockfile, the toolchain
-//! file, the workspace root manifest, CI config, or any unrecognized path) makes
-//! the command fall back to `--workspace`. Skipping a test that should have run
-//! is the failure mode this guards against, so when in doubt it runs everything.
+//! file, the workspace root manifest, CI config, a doc an xtask test reads, or
+//! any unrecognized path) makes the command fall back to `--workspace`.
+//! Skipping a test that should have run is the failure mode this guards
+//! against, so when in doubt it runs everything.
 //!
 //! As with [`crate::verify_commits`], the decision logic ([`select`],
 //! [`owning_crate`], [`reverse_closure`]) is pure and unit-tested without git or
@@ -113,16 +114,23 @@ pub fn reverse_closure(
 }
 
 /// True for changed files that force a full-workspace run: anything that can
-/// affect resolution, the build for every crate, or CI itself.
+/// affect resolution, the build for every crate, CI itself, or a doc an xtask
+/// test reads (MANIFEST.md, CONTRIBUTING.md, docs/ci-hardware-testing.md).
 fn forces_full_workspace(file: &str) -> bool {
     file == "Cargo.lock"
         || file == "Cargo.toml" // workspace root manifest
-        || file == "MANIFEST.md" // clippy job runs `xtask manifest --check`
-        // pinned_tool_versions_match_across_docs_and_workflows (xtask) reads this
-        // file's hawkeye/cargo-about pins; without this, `is_ignorable` below
-        // would mark it as ordinary Markdown and a pin-only edit here would
-        // resolve to `Selection::Empty`, skipping the test this job itself runs.
+        // clippy runs `xtask manifest --check` against MANIFEST.md; it and
+        // CONTRIBUTING.md also carry the hawkeye/cargo-about pins that
+        // pinned_tool_versions_match_across_docs_and_workflows (xtask) reads.
+        // Without this, `is_ignorable` below would mark them as ordinary
+        // Markdown and a pin-only edit would resolve to `Selection::Empty`,
+        // skipping the test this job itself runs.
+        || file == "MANIFEST.md"
         || file == "CONTRIBUTING.md"
+        // hardware_testing_docs_cover_all_self_hosted_platforms (xtask) reads
+        // this file; same `Selection::Empty`/invisible-coverage failure mode
+        // as the pin docs above.
+        || file == "docs/ci-hardware-testing.md"
         || file.starts_with("rust-toolchain")
         || file.starts_with(".github/workflows/")
 }
@@ -450,6 +458,19 @@ mod tests {
         let g = graph();
         assert_eq!(
             select(&["CONTRIBUTING.md".to_string()], &g),
+            Selection::Workspace
+        );
+    }
+
+    #[test]
+    fn select_hardware_testing_docs_forces_workspace() {
+        // docs/ci-hardware-testing.md is read by
+        // hardware_testing_docs_cover_all_self_hosted_platforms; unlike
+        // ordinary docs/ Markdown (see select_docs_only_is_empty) it must
+        // force a full run, not resolve to `Selection::Empty`.
+        let g = graph();
+        assert_eq!(
+            select(&["docs/ci-hardware-testing.md".to_string()], &g),
             Selection::Workspace
         );
     }
