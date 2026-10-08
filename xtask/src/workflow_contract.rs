@@ -2150,13 +2150,25 @@ esac
     /// doc sentence ending right after the version with no space, e.g.
     /// `cargo-about@0.9.1.`, doesn't glue the period onto the token). With
     /// marker `"hawkeye@"`, `cargo install hawkeye@7.0.0 --locked` yields
-    /// `7.0.0`. The line is comment-stripped first, so a pin mentioned only
-    /// inside a `# ...` comment can't satisfy a check meant for the real
-    /// line beside it. Compared for exact equality (not `contains`) so
+    /// `7.0.0`.
+    ///
+    /// `strip_comments` must be true only for YAML lines: there, a pin
+    /// mentioned only inside a trailing `# ...` comment must not satisfy a
+    /// check meant for the real line beside it. It must be false for
+    /// Markdown prose, where `strip_comment`'s `" #"` delimiter also matches
+    /// an issue reference (`see #474, install hawkeye@7.0.1`) that is not a
+    /// comment at all — stripping there would silently drop that line's pin
+    /// from the check, which is the exact stale-duplicate case this helper
+    /// exists to catch. Compared for exact equality (not `contains`) so
     /// neither a stale duplicate pin nor a version sharing a prefix
     /// (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
-    fn pin_token<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-        let (_, rest) = strip_comment(line).split_once(marker)?;
+    fn pin_token<'a>(line: &'a str, marker: &str, strip_comments: bool) -> Option<&'a str> {
+        let line = if strip_comments {
+            strip_comment(line)
+        } else {
+            line
+        };
+        let (_, rest) = line.split_once(marker)?;
         let token = rest.split_whitespace().next().unwrap_or(rest);
         Some(token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']))
     }
@@ -2166,10 +2178,17 @@ esac
     /// behind by a previous bump must not go unnoticed. (`pin_token` itself
     /// only reads the first occurrence within a single line; today's pins
     /// are each one per line, so this doesn't miss anything in practice.)
+    ///
+    /// Comment-stripping (see `pin_token`'s doc) is scoped by `path`'s
+    /// extension: on for `.yml`/`.yaml`, off for everything else (our
+    /// Markdown callers).
     fn assert_pins_match(marker: &str, expected: &str, path: &Path, text: &str) {
+        let strip_comments = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
         let mut found = false;
         for line in text.lines() {
-            let Some(token) = pin_token(line, marker) else {
+            let Some(token) = pin_token(line, marker, strip_comments) else {
                 continue;
             };
             found = true;
@@ -2489,6 +2508,37 @@ esac
     }
 
     #[test]
+    fn hook_block_stops_at_the_first_of_several_header_comment_lines() {
+        // A multi-line header comment, still heading the next repo block (nothing
+        // deeper follows before it). The boundary must be the FIRST of these
+        // lines, not the last: `pending_comment` has to keep the earliest offset
+        // it saw, because every line in the run belongs to the next sibling's
+        // header, not to `license-headers`' own block. Keeping the last offset
+        // instead would fold every comment line but the last into this block —
+        // undetectable with only one header-comment line, which is why this test
+        // needs at least two.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # First header line: types_or: [rust]
+  # Second header line, right before the next repo entry.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("First header line") && !block.contains("Second header line"),
+            "hook_block folded a multi-line header comment into this hook's block:\n{block}"
+        );
+    }
+
+    #[test]
     fn hook_block_sets_rejects_comment_only_and_falsified_mentions() {
         assert!(hook_block_sets(
             "        always_run: true",
@@ -2510,29 +2560,47 @@ esac
     #[test]
     fn pin_token_rejects_prefixes_and_comment_only_mentions() {
         assert_eq!(
-            pin_token("cargo install cargo-about@0.9.1 --locked", "cargo-about@"),
+            pin_token(
+                "cargo install cargo-about@0.9.1 --locked",
+                "cargo-about@",
+                true
+            ),
             Some("0.9.1")
         );
         // A version sharing a prefix must not compare equal to the one it shares
         // a prefix with — `contains` would wrongly let this satisfy `"0.9.1"`.
         assert_eq!(
-            pin_token("cargo install cargo-about@0.9.10 --locked", "cargo-about@"),
+            pin_token(
+                "cargo install cargo-about@0.9.10 --locked",
+                "cargo-about@",
+                true
+            ),
             Some("0.9.10")
         );
         // A pin mentioned only after a trailing ` #` comment (the real line
-        // changed to something else) must not be seen.
+        // changed to something else) must not be seen, when comment-stripping
+        // is on (the YAML case).
         assert_eq!(
             pin_token(
                 "cargo install cargo-about --version 0.9.0  # was cargo-about@0.9.1",
-                "cargo-about@"
+                "cargo-about@",
+                true,
             ),
             None
         );
         // Prose that ends the sentence right after the version, with no
         // separating whitespace, must not glue the punctuation onto the token.
         assert_eq!(
-            pin_token("pinned to cargo-about@0.9.1.", "cargo-about@"),
+            pin_token("pinned to cargo-about@0.9.1.", "cargo-about@", true),
             Some("0.9.1")
+        );
+        // With comment-stripping off (the Markdown case), an issue reference
+        // like `#474` must not be mistaken for a `# ...` comment that hides the
+        // real pin after it — the exact shape CONTRIBUTING.md/MANIFEST.md prose
+        // can take.
+        assert_eq!(
+            pin_token("see #474, install hawkeye@7.0.1", "hawkeye@", false),
+            Some("7.0.1")
         );
     }
 
