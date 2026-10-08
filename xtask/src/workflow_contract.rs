@@ -931,16 +931,93 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // day it lands. Any lane that genuinely should not wait for a GPU needs
         // an exemption added here with the reason — which is the point: it
         // becomes a decision someone makes, not one a copy-paste makes for them.
+        //
+        // The step is looked up by NAME among the job's own `steps:` items, not
+        // found as a substring of the job: the comments around these steps talk
+        // about the preflight at length, and a comment — or another step's
+        // script — that happened to carry the old `- name:` text would keep a
+        // substring match satisfied after the step itself was gone. Presence
+        // only: nothing here pins where in the job it runs.
         for (workflow, text) in self_hosted_workflows() {
             for (job, _) in self_hosted_e2e_jobs(&text) {
+                let steps = job_steps(job_block(&text, &job))
+                    .unwrap_or_else(|| panic!("{workflow} job `{job}` has no `steps:` list"));
+                let Some((_, step)) = steps
+                    .iter()
+                    .find(|(name, _)| name.starts_with("GPU preflight"))
+                else {
+                    let names: Vec<&str> = steps
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    panic!(
+                        "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
+                         step named `GPU preflight …`: on a wedged or occupied GPU it hangs \
+                         to the job timeout instead of failing fast with a reason. Its named \
+                         steps are: {names:?}"
+                    );
+                };
                 assert!(
-                    job_block(&text, &job).contains("- name: GPU preflight"),
-                    "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
-                     GPU preflight step: on a wedged or occupied GPU it hangs to the job \
-                     timeout instead of failing fast with a reason"
+                    run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
+                    "{workflow} job `{job}` names a GPU preflight step but it has no \
+                     `run: |` script, so it waits for nothing"
                 );
             }
         }
+    }
+
+    /// A job's `steps:` items as `(name, whole step)` pairs, in file order;
+    /// `None` when the job has no `steps:` list. `block` is what `job_block`
+    /// returns.
+    ///
+    /// Only the list's own items count — lines at exactly the item indent that
+    /// open with `- ` — so a comment, or a `- name:` line inside some step's
+    /// script, can never pass for a step. A step without a `name:` key is
+    /// listed with an empty name.
+    fn job_steps(block: &str) -> Option<Vec<(String, String)>> {
+        let lines: Vec<&str> = block.lines().collect();
+        let steps_at = lines
+            .iter()
+            .position(|l| strip_comment(l).trim() == "steps:")?;
+        let steps_indent = indent_of(lines[steps_at]);
+        let item_indent = lines[steps_at + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter(|l| l.trim_start().starts_with("- "))
+            .map(|l| indent_of(l))?;
+        let mut steps = Vec::new();
+        for (i, line) in lines.iter().enumerate().skip(steps_at + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if indent_of(line) <= steps_indent {
+                break;
+            }
+            if indent_of(line) != item_indent || !trimmed.starts_with("- ") {
+                continue;
+            }
+            let step = step_block(&lines, i);
+            // `name:` is either the item's own first key (`- name: …`) or one
+            // of its sibling keys, two columns in from the dash.
+            let name = step
+                .lines()
+                .find_map(|l| {
+                    let key_line = if indent_of(l) == item_indent {
+                        l.trim_start().strip_prefix("- ")?
+                    } else if indent_of(l) == item_indent + 2 {
+                        l.trim_start()
+                    } else {
+                        return None;
+                    };
+                    key_line.strip_prefix("name:")
+                })
+                .map(|value| strip_quotes(strip_comment(value).trim()))
+                .unwrap_or_default();
+            steps.push((name, step));
+        }
+        Some(steps)
     }
 
     /// Every `GPU preflight` step block in `text`, in file order.
