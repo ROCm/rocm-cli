@@ -121,19 +121,30 @@ mod tests {
     /// because constructing a unit struct has none, so a plain substring match
     /// would also flag `UnsetKeyOnExitHelper`, `MyUnsetKeyOnExit` and
     /// `Option<UnsetKeyOnExit>`. A bare name therefore counts as any whole
-    /// identifier EXCEPT in a type position: right after `<`, right after a
-    /// type-ascription `:` (not `::`), or right before `>`, blanks between
-    /// ignored. That flags every way a value of it is built — `let _g =
-    /// UnsetKeyOnExit;`, `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`,
-    /// `vec![UnsetKeyOnExit]`, a tuple of them, `g = Some(UnsetKeyOnExit);` —
-    /// and rejects the longer and prefixed names, `Option<..>`/`Vec<..>`
-    /// arguments and `_x: UnsetKeyOnExit` signatures, none of which holds
-    /// anything. It is a deny-list of type positions because a miss here is an
-    /// unguarded mutation, whereas an over-report (say, a `-> UnsetKeyOnExit`
-    /// return type inside a test body) is visible and rewordable. The
-    /// definition and `impl Drop for .. {` also match, but sit outside any test
-    /// body, where the scan does not look. Both directions are pinned by
-    /// [`a_bare_type_entry_matches_a_whole_name_outside_type_positions`] and
+    /// identifier EXCEPT in a type position: right after `<` or right before
+    /// `>`, anywhere inside a `struct`/`enum` declaration body, or right after
+    /// a `:` (not `::`) that is an ascription rather than a struct-literal
+    /// field initializer, blanks between ignored. A colon initializes a field
+    /// when the innermost open bracket is a `{` that is not a declaration and
+    /// the field name follows `{`, `,` or the start of the line — which takes
+    /// the bracket context [`BracketContext`] carries across lines, because
+    /// `guard: UnsetKeyOnExit,` on a line of its own reads the same in a split
+    /// literal, a split `struct` and a split parameter list. That flags every
+    /// way a value of it is built — `let _g = UnsetKeyOnExit;`,
+    /// `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`, `vec![UnsetKeyOnExit]`,
+    /// a tuple of them, `g = Some(UnsetKeyOnExit);`, `Holder { guard:
+    /// UnsetKeyOnExit }` on one line or split — and rejects the longer and
+    /// prefixed names, `Option<..>`/`Vec<..>` arguments, `_x: UnsetKeyOnExit`
+    /// parameters, `let`/`const` ascriptions and field declarations, none of
+    /// which holds anything. It is a deny-list of type positions because a
+    /// miss here is an unguarded mutation, whereas an over-report is visible
+    /// and rewordable; the known ones are a `-> UnsetKeyOnExit` return type
+    /// inside a test body, a struct pattern, and a later parameter of a typed
+    /// closure (see [`initializes_a_field`]). The definition and `impl Drop
+    /// for .. {` also match, but sit outside any test body, where the scan
+    /// does not look. Both directions are pinned by
+    /// [`a_bare_type_entry_matches_a_whole_name_outside_type_positions`],
+    /// [`a_field_value_builds_the_guard_and_a_field_declaration_does_not`] and
     /// [`holding_a_mutating_guard_still_needs_the_lock`].
     const MUTATIONS: [&str; 4] = [
         "set_var(",
@@ -233,7 +244,7 @@ mod tests {
     /// An entry ending in `(` is a call and is matched as text. A bare type
     /// name is matched by [`names_a_value`], for the reasons given on
     /// [`MUTATIONS`].
-    fn mutation_column(line: &str) -> Option<(usize, &'static str)> {
+    fn mutation_column(line: &str, brackets: &BracketContext) -> Option<(usize, &'static str)> {
         MUTATIONS
             .iter()
             .filter_map(|needle| {
@@ -242,7 +253,7 @@ mod tests {
                 } else {
                     line.match_indices(needle)
                         .map(|(at, _)| at)
-                        .find(|&at| names_a_value(line, at, needle.len()))
+                        .find(|&at| names_a_value(line, at, needle.len(), brackets))
                 };
                 at.map(|at| (at, *needle))
             })
@@ -251,25 +262,167 @@ mod tests {
 
     /// Whether the `len`-byte identifier at `line[at..]` can stand for a value.
     ///
-    /// It must be a whole identifier, and it must not sit in one of the three
-    /// TYPE positions: right after `<` (`Option<T>`), right after a type
-    /// ascription `:` that is not half of a `::` path separator
-    /// (`fn f(_x: T)`, `let g: T`), or right before `>` (`Vec<T>`,
-    /// `HashMap<K, T>`). Blanks between the name and that neighbour are
-    /// skipped, so rustfmt-hostile spellings like `Option< T >` and `_x : T`
-    /// are type positions too. Everything else counts — a deny-list of type
-    /// positions rather than an allow-list of value positions, because a value
-    /// of a unit struct can be built in more places than any allow-list will
-    /// name: `drop(T)`, `Some(T)`, `vec![T]`, `(T, T)`, `mem::forget(T)`,
-    /// `g = Some(T);`. A missed construction is an unguarded mutation; an
-    /// over-report is a type mention the author can see and reword.
-    fn names_a_value(line: &str, at: usize, len: usize) -> bool {
+    /// It must be a whole identifier, and it must not sit in a TYPE position.
+    /// Those are:
+    ///
+    /// * right after `<` (`Option<T>`) or right before `>` (`Vec<T>`,
+    ///   `HashMap<K, T>`);
+    /// * anywhere inside a `struct`/`enum` DECLARATION body, braced or tuple —
+    ///   `struct H { g: T }`, `struct H(T);`, `enum E { A(T), B { g: T } }` —
+    ///   because a declaration holds no values at all (see [`BracketContext`]);
+    /// * right after a `:` that is not half of a `::` path separator, UNLESS
+    ///   that colon initializes a field — see [`initializes_a_field`].
+    ///
+    /// Blanks between the name and its neighbour are skipped, so
+    /// rustfmt-hostile spellings like `Option< T >` and `_x : T` are type
+    /// positions too. Everything else counts — a deny-list of type positions
+    /// rather than an allow-list of value positions, because a value of a unit
+    /// struct can be built in more places than any allow-list will name:
+    /// `drop(T)`, `Some(T)`, `vec![T]`, `(T, T)`, `mem::forget(T)`,
+    /// `g = Some(T);`, `Holder { g: T }`. A missed construction is an
+    /// unguarded mutation; an over-report is a type mention the author can see
+    /// and reword.
+    fn names_a_value(line: &str, at: usize, len: usize, brackets: &BracketContext) -> bool {
         let before = line[..at].trim_end();
         let after = line[at + len..].trim_start();
         let whole = !line[..at].ends_with(is_identifier_char)
             && !line[at + len..].starts_with(is_identifier_char);
-        let ascribed = before.ends_with(':') && !before.ends_with("::");
-        whole && !before.ends_with('<') && !ascribed && !after.starts_with('>')
+        if !whole || before.ends_with('<') || after.starts_with('>') {
+            return false;
+        }
+        let mut here = brackets.clone();
+        here.advance(&line[..at]);
+        if here.innermost() == Some(Opener::Declaration) {
+            return false;
+        }
+        match before.strip_suffix(':') {
+            Some(lhs) if !lhs.ends_with(':') => {
+                here.innermost() == Some(Opener::Block) && initializes_a_field(lhs)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the `:` that `lhs` precedes separates a struct-literal field
+    /// from its value, given that the innermost open bracket is a `{` that
+    /// does not open a declaration.
+    ///
+    /// Inside such a brace a colon is either a field initializer —
+    /// `Holder { g: v }`, `Holder { n: 1, g: v }`, or `g: v,` on a line of its
+    /// own once rustfmt splits the literal — or an ascription introduced by a
+    /// keyword: `let x: T`, `const C: T`, `static S: T`. So it initializes a
+    /// field when the identifier before it follows `{`, `,` or the start of the
+    /// line. The enclosing bracket is what separates the split literal's
+    /// `g: v,` from a split parameter list's `_x: T,`, which is textually the
+    /// same line: the parameter's innermost bracket is a `(`.
+    ///
+    /// Two shapes over-report, both deliberately: a struct PATTERN
+    /// (`let Holder { g: UnsetKeyOnExit } = h;`, a match arm) reads as a
+    /// literal, and so does a later parameter of a typed closure
+    /// (`|a, g: UnsetKeyOnExit|`), whose `,` sits in the block the closure is
+    /// written in. Both are visible and rewordable; telling them apart needs
+    /// the parser this scan is not.
+    fn initializes_a_field(lhs: &str) -> bool {
+        let rest = lhs
+            .trim_end()
+            .trim_end_matches(is_identifier_char)
+            .trim_end();
+        rest.is_empty() || rest.ends_with('{') || rest.ends_with(',')
+    }
+
+    /// What an open bracket was opened by, as far as [`names_a_value`] cares.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Opener {
+        /// The body of a `struct` or `enum` declaration, or any bracket nested
+        /// inside one. Nothing in it is a value.
+        Declaration,
+        /// Any other `{`: a block, an `impl`, a module, a struct literal.
+        Block,
+        /// A `(` or `[` outside a declaration.
+        Group,
+    }
+
+    /// The brackets open at some point in a file, carried across lines.
+    ///
+    /// Line-local text cannot tell `struct Holder {` + `guard: T,` from
+    /// `let h = Holder {` + `guard: T,` — the second line is identical — so
+    /// this is the smallest piece of context that can: which brackets are
+    /// open, and whether each was opened by a declaration.
+    ///
+    /// A bracket opens a declaration when `struct` or `enum` appeared as a
+    /// whole word since the last `;`, `{` or `}`. Spanning lines matters for
+    /// rustfmt's `where` layout, which puts the `{` on a line of its own:
+    ///
+    /// ```text
+    /// struct Holder<T>
+    /// where
+    ///     T: Copy,
+    /// {
+    /// ```
+    ///
+    /// Both words are strict keywords, so neither can be an identifier that
+    /// happens to precede a call. `union` is deliberately absent: it is only a
+    /// contextual keyword, and `a.union(&b)` would otherwise mark that call's
+    /// arguments as a declaration and hide a guard built inside them.
+    ///
+    /// Only `{`, `(` and `[` are tracked. `<`/`>` cannot be — they are also
+    /// comparison operators and half of `->`/`=>` — and the type positions
+    /// they create are handled by adjacency in [`names_a_value`] instead.
+    #[derive(Clone, Debug, Default)]
+    struct BracketContext {
+        open: Vec<Opener>,
+        declaring: bool,
+    }
+
+    impl BracketContext {
+        /// Consume `code`, which has already been stripped of literals and
+        /// comments, so no bracket or keyword in it is text.
+        fn advance(&mut self, code: &str) {
+            let mut word_start = None;
+            for (i, c) in code
+                .char_indices()
+                .chain(std::iter::once((code.len(), ' ')))
+            {
+                if is_identifier_char(c) {
+                    word_start.get_or_insert(i);
+                    continue;
+                }
+                if let Some(start) = word_start.take()
+                    && matches!(&code[start..i], "struct" | "enum")
+                {
+                    self.declaring = true;
+                }
+                let in_declaration =
+                    self.declaring || self.innermost() == Some(Opener::Declaration);
+                match c {
+                    '{' => {
+                        self.open.push(if in_declaration {
+                            Opener::Declaration
+                        } else {
+                            Opener::Block
+                        });
+                        self.declaring = false;
+                    }
+                    '(' | '[' => self.open.push(if in_declaration {
+                        Opener::Declaration
+                    } else {
+                        Opener::Group
+                    }),
+                    '}' | ')' | ']' => {
+                        self.open.pop();
+                        if c == '}' {
+                            self.declaring = false;
+                        }
+                    }
+                    ';' => self.declaring = false,
+                    _ => {}
+                }
+            }
+        }
+
+        fn innermost(&self) -> Option<Opener> {
+            self.open.last().copied()
+        }
     }
 
     /// The rest of the statement beginning at `lines[index]`.
@@ -627,6 +780,7 @@ mod tests {
         let mut depth: usize = 0;
         let mut pending_test_attr = false;
         let mut current: Option<OpenTest> = None;
+        let mut brackets = BracketContext::default();
 
         for index in 0..lines.len() {
             let line = lines[index];
@@ -665,7 +819,7 @@ mod tests {
                 {
                     open.serialized_at = Some((index + 1, column));
                 }
-                if let Some((column, found)) = mutation_column(code) {
+                if let Some((column, found)) = mutation_column(code, &brackets) {
                     open.hits.push(Offense {
                         line: index + 1,
                         column,
@@ -685,6 +839,7 @@ mod tests {
             // returns no offenses. Pinned by
             // `an_unbalanced_close_returns_nothing_rather_than_panicking`.
             depth = (depth + opens).saturating_sub(closes);
+            brackets.advance(code);
 
             if let Some(open) = current.as_ref()
                 && depth <= open.open_depth
@@ -972,6 +1127,46 @@ mod tests {
         ] {
             let hits = env_mutations_in_unserialized_tests(&unguarded_test(line));
             assert!(hits.is_empty(), "`{line}` holds no such guard: {hits:?}");
+        }
+    }
+
+    /// A colon is not always a type ascription: in a struct LITERAL it
+    /// separates a field from the value that initializes it, and that value
+    /// builds the guard. The holder below drops at the end of the test and its
+    /// field's `Drop` removes the variable, exactly as `let _g =
+    /// UnsetKeyOnExit;` would.
+    ///
+    /// The flagged half is the literal on one line and split by rustfmt, plus
+    /// a literal whose earlier field puts a `,` before the guard. The other
+    /// half is the same field written in a DECLARATION, on one line and split,
+    /// a tuple struct, an enum variant, and the colons that are ascriptions
+    /// in a block or an argument list: `let` (initialized and not), `const`,
+    /// and a parameter rustfmt has put on a line of its own, whose line looks
+    /// exactly like a split literal's field and differs only in the bracket
+    /// that encloses it.
+    #[test]
+    fn a_field_value_builds_the_guard_and_a_field_declaration_does_not() {
+        for body in [
+            "let _holder = Holder { guard: UnsetKeyOnExit };",
+            "let _holder = Holder {\n            guard: UnsetKeyOnExit,\n        };",
+            "let _holder = Holder { n: 1, guard: UnsetKeyOnExit };",
+        ] {
+            let hits = env_mutations_in_unserialized_tests(&unguarded_test(body));
+            assert_eq!(hits.len(), 1, "`{body}` builds the guard: {hits:?}");
+            assert_eq!(hits[0].call, "UnsetKeyOnExit");
+        }
+        for body in [
+            "struct Holder { guard: UnsetKeyOnExit }",
+            "struct Holder {\n            guard: UnsetKeyOnExit,\n        }",
+            "struct Holder<T>\n        where\n            T: Copy,\n        {\n            guard: UnsetKeyOnExit,\n            n: T,\n        }",
+            "struct Holder(UnsetKeyOnExit);",
+            "enum Held {\n            Guard { guard: UnsetKeyOnExit },\n            Bare(UnsetKeyOnExit),\n        }",
+            "let _deferred: UnsetKeyOnExit;",
+            "const _C: UnsetKeyOnExit = make();",
+            "fn f(\n            _x: UnsetKeyOnExit,\n        ) {\n        }",
+        ] {
+            let hits = env_mutations_in_unserialized_tests(&unguarded_test(body));
+            assert!(hits.is_empty(), "`{body}` holds no such guard: {hits:?}");
         }
     }
 
