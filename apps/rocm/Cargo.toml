@@ -46,6 +46,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

@@ -710,15 +710,38 @@ fn read_close_delimited_sse_body<R: Read>(
 ) -> Result<()> {
     let mut buffer = [0_u8; 1024];
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("failed to read local provider SSE body")?;
-        if read == 0 {
-            break;
-        }
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            // A signal delivered to this thread aborts the socket read with
+            // `EINTR`, and Linux never restarts a read that has a receive
+            // timeout set (see signal(7)), which this socket has. Nothing is
+            // wrong with the connection, so read again. (`read_line` and
+            // `read_exact`, used by the other body framings, retry internally;
+            // a bare `read` does not.)
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read local provider SSE body"),
+        };
         emitter.push_bytes(&buffer[..read])?;
     }
-    Ok(())
+}
+
+const LOCAL_STREAM_TRUNCATED: &str = "local provider closed the connection before the final chunk; \
+     the streamed response is incomplete";
+
+/// Report an end-of-stream inside a chunk (its size line, data or CRLF) the
+/// same way as one between chunks: either way the engine went away mid-answer.
+fn chunked_body_truncated_at_eof(error: anyhow::Error) -> anyhow::Error {
+    let at_eof = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+    });
+    if at_eof {
+        error.context(LOCAL_STREAM_TRUNCATED)
+    } else {
+        error
+    }
 }
 
 fn read_chunked_sse_body<R: BufRead>(
@@ -727,9 +750,16 @@ fn read_chunked_sse_body<R: BufRead>(
 ) -> Result<()> {
     loop {
         let mut size_line = String::new();
-        reader
+        let read = reader
             .read_line(&mut size_line)
             .context("failed to read local provider chunk size")?;
+        // `Ok(0)` is end-of-stream, not a blank line: the engine closed the
+        // connection (it crashed, was killed, or was stopped) before sending the
+        // terminating zero-length chunk. Reading again would return `Ok(0)`
+        // immediately, forever.
+        if read == 0 {
+            bail!("{LOCAL_STREAM_TRUNCATED}");
+        }
         if size_line.trim().is_empty() {
             continue;
         }
@@ -746,11 +776,12 @@ fn read_chunked_sse_body<R: BufRead>(
             let _ = reader.read_line(&mut trailer);
             break;
         }
-        read_fixed_sse_body(reader, size, emitter)?;
+        read_fixed_sse_body(reader, size, emitter).map_err(chunked_body_truncated_at_eof)?;
         let mut crlf = [0_u8; 2];
         reader
             .read_exact(&mut crlf)
-            .context("failed to read local provider chunk terminator")?;
+            .context("failed to read local provider chunk terminator")
+            .map_err(chunked_body_truncated_at_eof)?;
         if crlf != *b"\r\n" {
             bail!("invalid local provider chunk terminator");
         }
@@ -1560,6 +1591,9 @@ fn parse_anthropic_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
         _ => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod proptests;
 
 #[cfg(test)]
 mod tests {
@@ -2688,6 +2722,162 @@ mod tests {
                 }
             ]
         );
+        Ok(())
+    }
+
+    /// A ready local service whose engine sends one complete chunk of a chunked
+    /// streaming chat response and then closes the connection without the
+    /// terminating zero chunk — what a crashed, OOM-killed or stopped engine
+    /// leaves behind.
+    fn ready_service_that_dies_mid_chunked_stream(
+        name: &str,
+    ) -> Result<(PathBuf, AppPaths, thread::JoinHandle<Result<String>>)> {
+        let (root, paths) = temp_app_paths(name);
+        paths.ensure()?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let server = spawn_local_provider_test_server(
+            listener,
+            "Qwen/Qwen3.5",
+            move |stream, _request| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )?;
+                let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"chunk\"}}]}\n\n";
+                write!(stream, "{:X}\r\n{}\r\n", chunk.len(), chunk)?;
+                stream.flush()?;
+                // Returning drops the stream: the client sees EOF on a chunk boundary.
+                Ok(())
+            },
+        );
+        let mut ready = ManagedServiceRecord::new(
+            &paths,
+            "svc-ready",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            port,
+            "managed",
+            123,
+            None,
+            None,
+            None,
+        );
+        ready.status = "ready".to_owned();
+        ready.inference_verified_at_unix_ms = Some(1);
+        ready.write()?;
+        Ok((root, paths, server))
+    }
+
+    /// How long a client may take to notice the closed connection. A spinning
+    /// reader never returns, so the bound keeps a regression from hanging the
+    /// test run; a fixed reader returns as soon as it reads EOF.
+    const TRUNCATED_STREAM_BOUND: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn local_provider_stream_chat_fails_when_engine_dies_mid_chunked_stream() -> Result<()> {
+        let (root, paths, server) =
+            ready_service_that_dies_mid_chunked_stream("local-provider-chunked-truncated")?;
+        let client_paths = paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut received = Vec::new();
+            let result = provider_stream_chat_with_callback(
+                &client_paths,
+                "local",
+                &ChatRequest {
+                    model: Some("Qwen/Qwen3.5".to_owned()),
+                    messages: vec![ChatMessage {
+                        role: "user".to_owned(),
+                        content: "hello".to_owned(),
+                    }],
+                    max_tokens: Some(16),
+                    rocm_tools: false,
+                    ..Default::default()
+                },
+                &mut |event| {
+                    received.push(event);
+                    Ok(())
+                },
+            );
+            let _ = sender.send((result.map_err(|error| format!("{error:#}")), received));
+        });
+        let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
+        if outcome.is_ok() {
+            // Joined only after the client returned: the server blocks in
+            // `accept` with no timeout, so a client that never connected would
+            // otherwise hang the test instead of failing it.
+            server.join().expect("server thread should not panic")?;
+        }
+        let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
+        fs::remove_dir_all(root).ok();
+
+        let (result, received) = outcome.map_err(|_| {
+            anyhow::anyhow!("chat stream never returned after the engine closed the connection")
+        })?;
+        let error = result.expect_err("a stream cut off before its final chunk is not a success");
+        assert!(
+            error.contains(LOCAL_STREAM_TRUNCATED),
+            "unexpected error: {error}"
+        );
+        // The text that did arrive was delivered, but the stream was never
+        // reported finished and no "completed" audit record was written.
+        assert_eq!(
+            received,
+            vec![ProviderStreamEvent {
+                content: "chunk".to_owned(),
+                done: false
+            }]
+        );
+        assert!(
+            !audit_text.contains("stream chat completed"),
+            "a truncated stream was audited as completed: {audit_text}"
+        );
+        Ok(())
+    }
+
+    /// `rocm serve`'s post-launch smoke test is the CLI's streaming consumer. An
+    /// engine that dies mid-answer must leave the deployment summary showing no
+    /// measurements (`n/a`) instead of hanging the command or reporting
+    /// throughput for an answer that never finished.
+    #[test]
+    fn serve_smoke_test_reports_no_metrics_when_engine_dies_mid_chunked_stream() -> Result<()> {
+        let (root, paths, server) =
+            ready_service_that_dies_mid_chunked_stream("serve-smoke-chunked-truncated")?;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
+        });
+        let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
+        if outcome.is_ok() {
+            // See the chat-stream test above for why this joins only now.
+            server.join().expect("server thread should not panic")?;
+        }
+        fs::remove_dir_all(root).ok();
+
+        let metrics = outcome.map_err(|_| {
+            anyhow::anyhow!(
+                "the serve smoke test never returned after the engine closed the connection"
+            )
+        })?;
+        assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
+        let rendered =
+            crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
+                engine: "vllm".to_owned(),
+                requested_model: "Qwen/Qwen3.5".to_owned(),
+                api_model: "Qwen/Qwen3.5".to_owned(),
+                chat_endpoint: "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+                service_id: "svc-ready".to_owned(),
+                status: "ready".to_owned(),
+                already_running: false,
+                metrics,
+                api_key: None,
+                notes: Vec::new(),
+            });
+        assert!(rendered.contains("time to first token  n/a"));
+        assert!(rendered.contains("throughput (approx)  n/a"));
         Ok(())
     }
 
