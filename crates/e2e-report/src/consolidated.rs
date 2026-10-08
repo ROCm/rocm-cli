@@ -165,11 +165,11 @@ impl RunMeta {
 ///
 /// `pub` (with no `pub` fields) so a caller producing both the HTML report and
 /// the markdown summary in one process — see [`load_platform_reports`] — can
-/// hold a `Vec<PlatformReport>` and pass it to both
-/// [`generate_consolidated_from_reports`]/[`consolidated_summary_markdown_from_reports`]
-/// without reparsing every platform's files twice (ROCMAI-484). The type stays
-/// opaque from outside this crate: nothing outside `consolidated.rs` needs to
-/// construct one or read its fields.
+/// build the per-platform `PlatformReport` set once and pass it to both
+/// [`generate_consolidated_from_reports`]/[`consolidated_summary_markdown_from_reports`],
+/// instead of each output function building its own set independently
+/// (ROCMAI-484). The type stays opaque from outside this crate: nothing
+/// outside `consolidated.rs` needs to construct one or read its fields.
 pub struct PlatformReport {
     desc: Descriptor,
     /// Precomputed column label (platform, OS and effective channel) kept
@@ -864,15 +864,15 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
     )
 }
 
-/// Parse and sort every platform's `report.json`/`platform.json`/
-/// `commands.jsonl` once.
+/// Build the per-platform `PlatformReport` set once, from every platform's
+/// `report.json`/`platform.json`/`commands.jsonl`, sorted by [`report_sort_key`].
 ///
 /// [`generate_consolidated`] and [`consolidated_summary_markdown`] each used
-/// to do this independently, so a caller producing both outputs from the same
-/// `inputs` in one process (e.g. `xtask`'s `e2e_report::run`) reparsed every
-/// platform's on-disk files twice. A caller that wants both outputs should
-/// call this once and pass the result to
-/// [`generate_consolidated_from_reports`] and
+/// to build their own `Vec<PlatformReport>` independently, so a caller
+/// producing both outputs from the same `inputs` in one process (e.g.
+/// `xtask`'s `e2e_report::run`) built it — and read each platform's on-disk
+/// files — twice. A caller that wants both outputs should call this once and
+/// pass the result to [`generate_consolidated_from_reports`] and
 /// [`consolidated_summary_markdown_from_reports`] instead (ROCMAI-484).
 pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
     let mut reports: Vec<PlatformReport> = inputs
@@ -1689,14 +1689,32 @@ mod tests {
         assert!(md.contains("No per-platform report.json files"));
     }
 
+    /// Replace the `now_utc()` timestamp embedded after `"Generated "` in
+    /// rendered HTML with nothing, so two renders taken a second apart (each
+    /// has 1-second resolution, see `components::now_utc`) still compare
+    /// equal. The timestamp runs up to the closing `<` of its containing tag.
+    fn strip_generated_timestamp(html: &str) -> String {
+        const MARK: &str = "Generated ";
+        let Some(mark_at) = html.find(MARK) else {
+            return html.to_string();
+        };
+        let ts_start = mark_at + MARK.len();
+        let ts_end = html[ts_start..]
+            .find('<')
+            .map_or(html.len(), |i| ts_start + i);
+        format!("{}{}", &html[..ts_start], &html[ts_end..])
+    }
+
     #[test]
     fn from_reports_entry_points_match_their_reparsing_wrappers() {
         // ROCMAI-484: generate_consolidated/consolidated_summary_markdown now
         // delegate to the *_from_reports entry points via load_platform_reports.
-        // Calling the _from_reports path directly with a separately-built
-        // `reports` must produce byte-for-byte identical output to the
-        // convenience wrappers — proving the shared-parse path is a pure
-        // refactor, not a behavior change.
+        // Calling the _from_reports path directly with the same `reports` that
+        // load_platform_reports(inputs) would produce must render identically to
+        // the convenience wrappers — this only shows the two call shapes compose
+        // the same way; it does not show `_from_reports` actually uses `reports`
+        // rather than re-deriving it from `inputs` (see
+        // from_reports_entry_points_follow_reports_not_inputs for that).
         let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
         let inputs = vec![
@@ -1725,7 +1743,58 @@ mod tests {
         .expect("generate via reports");
         let html_via_wrapper = std::fs::read_to_string(out_via_wrapper.path()).expect("read");
         let html_via_reports = std::fs::read_to_string(out_via_reports.path()).expect("read");
-        assert_eq!(html_via_wrapper, html_via_reports);
+        assert_eq!(
+            strip_generated_timestamp(&html_via_wrapper),
+            strip_generated_timestamp(&html_via_reports)
+        );
+    }
+
+    #[test]
+    fn from_reports_entry_points_follow_reports_not_inputs() {
+        // `inputs` points at a real, non-empty report, but `reports` is passed
+        // as empty. If `*_from_reports` silently ignored `reports` and
+        // re-derived it from `inputs` (e.g. by calling load_platform_reports
+        // itself), this would render a one-row report instead of "no reports".
+        let a = write_report(&feature_json(&[(&[], &["passed"])]));
+        let inputs = vec![("e2e-report".to_string(), a.path().to_path_buf())];
+        let empty_reports: Vec<PlatformReport> = Vec::new();
+
+        let md = consolidated_summary_markdown_from_reports(&empty_reports, &inputs);
+        assert!(md.contains("No per-platform report.json files"));
+        assert!(!md.contains("e2e-report"));
+
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated_from_reports(
+            &empty_reports,
+            &inputs,
+            out.path(),
+            &RunMeta::default(),
+        )
+        .expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        assert!(html.contains("No per-platform report.json files were found to consolidate."));
+        assert!(!html.contains("Per-platform Details"));
+    }
+
+    #[test]
+    fn load_platform_reports_sorts_regardless_of_input_order() {
+        // "Mock" (e2e-report) sorts after "MI300X" (e2e-gpu-report) — ASCII
+        // 'I' < 'o' — but feed them in the opposite order and confirm
+        // load_platform_reports still returns report_sort_key order.
+        let mock = write_report(&feature_json(&[(&[], &["passed"])]));
+        let mi300x = write_report(&feature_json(&[(&[], &["passed"])]));
+        let inputs = vec![
+            ("e2e-report".to_string(), mock.path().to_path_buf()),
+            ("e2e-gpu-report".to_string(), mi300x.path().to_path_buf()),
+        ];
+
+        let reports = load_platform_reports(&inputs);
+        let keys: Vec<_> = reports.iter().map(report_sort_key).collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+        assert_eq!(reports[0].desc.platform, "MI300X");
+        assert_eq!(reports[1].desc.platform, "Mock");
     }
 
     #[test]
