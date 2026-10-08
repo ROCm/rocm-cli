@@ -12,10 +12,12 @@
 //! remains in the crate root and is reached via `use crate::EnginesCommand`;
 //! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
 //! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
-//! only caller is `serve_cmd.rs`; `env_root_for_engine_install`,
-//! `env_root_for_service`, `runtime_key_for_python`, and
-//! `runtime_manifest_for_selector` are used only from other root-level
-//! commands in `main.rs`, and all stay `pub(crate)` rather than private.
+//! only caller is `serve_cmd.rs`; `env_root_for_service` and
+//! `runtime_key_for_python` are used only from other root-level commands in
+//! `main.rs`, while `env_root_for_engine_install` and
+//! `runtime_manifest_for_selector` are also called within this file, in
+//! addition to other root-level commands in `main.rs`; all four stay
+//! `pub(crate)` rather than private.
 //! `render_engine_inventory_text` is also `pub(crate)`, but its caller is an
 //! exception to the others: its only caller is `engines()` in this same
 //! file, not `main.rs`.

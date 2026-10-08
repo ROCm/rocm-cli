@@ -4265,8 +4265,8 @@ fn print_managed_launch_plain(report: &ManagedLaunchReport, endpoint_api_key: Op
         // is currently inert (Rust's CodeQL pack has no AlertSuppression.ql yet —
         // github/codeql#21637) but will start working once that lands, since the
         // tag must be the single line immediately before the flagged code.
-        // codeql[rust/cleartext-logging]
         print!(
+            // codeql[rust/cleartext-logging]
             "{}",
             render_endpoint_client_config(&report.endpoint_url, key)
         );
