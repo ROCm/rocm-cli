@@ -44,9 +44,10 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
         event: std::env::var("GITHUB_EVENT_NAME").ok(),
     };
 
-    // Parsed once and shared between the HTML and markdown outputs below,
-    // instead of each independently reparsing every platform's on-disk files
-    // (ROCMAI-484).
+    // The `PlatformReport` build + sort is shared between the HTML and
+    // markdown outputs below, instead of each building it independently
+    // (ROCMAI-484). The expectation grid and scenario reference inside each
+    // output still parse `inputs` on their own.
     let reports = e2e_report::load_platform_reports(&inputs);
 
     e2e_report::generate_consolidated_from_reports(&reports, &inputs, html_out, &meta)
