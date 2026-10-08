@@ -160,11 +160,12 @@ from the launcher and the dashboard alike and restores your terminal — to quit
 The one exception is the dashboard's console for a **running** job, where
 `Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
 that job finishes, `Ctrl-C` quits there too. If a model is still being served
-when you press `q` in the dashboard, it asks first — quitting leaves the model
-running in the background either way, the same as today, it just won't happen
-by surprise. `Ctrl-C` is the one gesture that always quits immediately, even
-then. On a non-interactive terminal (or piped output), `rocm` prints a one-shot
-status summary instead of opening the launcher.
+when you press `q`, it asks first — from the launcher or the dashboard alike —
+quitting leaves the model running in the background either way, the same as
+today, it just won't happen by surprise. `Ctrl-C` is the one gesture that
+always quits immediately, even then. On a non-interactive terminal (or piped
+output), `rocm` prints a one-shot status summary instead of opening the
+launcher.
 
 ## Interactive interfaces
 

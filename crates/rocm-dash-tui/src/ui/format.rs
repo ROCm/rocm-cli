@@ -337,6 +337,17 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
     }
 }
 
+/// The "…and N more" summary line for a list capped to its first `cap`
+/// items, or `None` when `len` doesn't exceed `cap`.
+///
+/// Shared by every capped list (`tabs::pane::live_lines`'s
+/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm_body`) so a cap
+/// bump in one place can't quietly leave another's overflow arithmetic
+/// behind.
+pub fn overflow_line(len: usize, cap: usize) -> Option<String> {
+    (len > cap).then(|| format!("  …and {} more", len - cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +802,16 @@ mod tests {
     fn gen_tps_detail_freshness_legacy_says_unknown() {
         let out = gen_tps_detail_freshness(None, None);
         assert_eq!(out, "unknown");
+    }
+
+    #[test]
+    fn overflow_line_none_when_not_exceeding_cap() {
+        assert_eq!(overflow_line(0, 5), None);
+        assert_eq!(overflow_line(5, 5), None);
+    }
+
+    #[test]
+    fn overflow_line_reports_the_remainder() {
+        assert_eq!(overflow_line(7, 5), Some("  …and 2 more".to_string()));
     }
 }

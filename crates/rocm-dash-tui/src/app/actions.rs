@@ -61,9 +61,11 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 /// the event loop's dedicated `quit_confirm_pending` arm owns the actual exit
 /// once the prompt resolves. Returns `true` to request immediate exit the
 /// same way `apply_action` does, so every quit entry point — the `q` key, the
-/// Esc main menu's "Quit" row — shares this one gate rather than each
-/// re-deciding (and risking re-deciding wrong) whether to ask first.
-fn request_quit(state: &mut AppState) -> bool {
+/// Esc main menu's "Quit" row, `/quit`/`/exit` (`app::slash`), and the
+/// pre-dashboard launcher's own `q`/Esc (`ui::launcher`) — shares this one
+/// gate rather than each re-deciding (and risking re-deciding wrong) whether
+/// to ask first.
+pub(crate) fn request_quit(state: &mut AppState) -> bool {
     if state.has_live_instance() {
         state.open_quit_confirm();
         return false;
@@ -270,7 +272,10 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 // Issue #145: this must share `KeyAction::Quit`'s own gate —
                 // choosing "Quit" from the Esc menu is a second, independent
                 // entry point to the same decision, not a separate one that
-                // gets to skip the confirm prompt.
+                // gets to skip the confirm prompt. `request_quit` →
+                // `open_quit_confirm` closes the Esc menu itself when a
+                // prompt opens, so a decline doesn't strand the user back in
+                // it (same as every other row here already does on success).
                 _ => return request_quit(state),
             },
             Modal::Palette => {
@@ -831,6 +836,42 @@ mod tests {
     }
 
     #[test]
+    fn quit_key_while_a_modal_is_open_closes_it_instead_of_stranding_the_user() {
+        // Regression: `q` reaches the shared `KeyAction::Quit` arm from
+        // inside every per-modal match (ThemePicker, Detail, Help,
+        // GlobalHelp, Menu, Palette, Options — see those arms above), not
+        // just the Esc-menu's "Quit" row. `open_quit_confirm` used to close
+        // overlays but never `modal`, so declining left the user stuck back
+        // inside whatever modal was open when they pressed `q`.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for modal in [
+            Modal::ThemePicker,
+            Modal::Detail,
+            Modal::Help,
+            Modal::GlobalHelp,
+            Modal::Palette,
+            Modal::Options,
+        ] {
+            let mut s = AppState::new("t".into(), "default-dark".into());
+            s.instances.insert(
+                "vllm-1".into(),
+                Instance {
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+            s.modal = modal.clone();
+            assert!(!apply_action(&mut s, KeyAction::Quit), "modal: {modal:?}");
+            assert!(s.quit_confirm.is_some(), "modal: {modal:?}");
+            assert_eq!(
+                s.modal,
+                Modal::None,
+                "quit-confirm must close {modal:?} so a decline doesn't strand the user in it"
+            );
+        }
+    }
+
+    #[test]
     fn quitting_from_the_esc_menu_opens_the_same_confirm_prompt() {
         // Regression: choosing "Quit" from the Esc main menu (Modal::Menu's
         // last row) used to `return true` directly, a second quit entry
@@ -848,6 +889,36 @@ mod tests {
         s.menu_sel = 2; // the "Quit" row
         assert!(!apply_action(&mut s, KeyAction::MenuActivate));
         assert!(s.quit_confirm.is_some());
+        assert_eq!(
+            s.modal,
+            Modal::None,
+            "choosing Quit must close the Esc menu like every other row, \
+             not strand it open behind the confirm prompt"
+        );
+    }
+
+    #[test]
+    fn declining_quit_from_the_esc_menu_returns_to_the_dashboard_not_the_menu() {
+        // Regression: `request_quit` opened the confirm prompt without
+        // clearing `Modal::Menu`, so declining from the Esc-menu "Quit" row
+        // used to strand the user back in the Esc menu, unlike declining via
+        // the plain `q` key (where `modal` was already `None`).
+        use crate::ui::approval::ApprovalVerdict;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.on_quit_confirm_key(KeyCode::Char('n')), Some(ApprovalVerdict::Deny));
+        s.quit_confirm = None;
+        assert_eq!(s.modal, Modal::None);
     }
 
     #[test]

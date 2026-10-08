@@ -36,6 +36,7 @@ mod types;
 // because it was reachable there pre-split (see the removed
 // `NO_CHAT_BACKEND_MSG` re-export this rule cost).
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
+pub(crate) use actions::request_quit;
 pub(crate) use event_loop::{
     HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
     restore_terminal, shutdown_claimed_on,
@@ -397,6 +398,7 @@ impl AppState {
         self.config_manager = None;
         self.bench_run = None;
         self.approval = None;
+        self.quit_confirm = None;
         // A fresh overlay starts its console at the top.
         self.console_scroll = 0;
         self.console_hscroll = 0;
@@ -615,7 +617,18 @@ impl AppState {
 
     /// Open the confirm-before-quit prompt with the shared default choice
     /// (Approve — the user already asked to quit; this just confirms it).
+    /// Closes any operational overlay first, mirroring `open_approval`, so the
+    /// prompt owns focus alone. Also closes any open `modal` (Esc menu,
+    /// Options, Detail, ThemePicker, Help, …): `q` reaches `KeyAction::Quit`
+    /// from inside every one of those (see their per-modal arms above this
+    /// impl in `actions.rs`), and declining must land back on the plain
+    /// dashboard, not strand the user inside whatever was open when they
+    /// pressed `q`. `close_overlays` also resets console scroll position —
+    /// accepted here the same way it already is for `open_approval`, which
+    /// has called it for exactly this reason since before issue #145.
     pub(crate) fn open_quit_confirm(&mut self) {
+        self.close_overlays();
+        self.modal = Modal::None;
         self.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
     }
 
@@ -632,16 +645,26 @@ impl AppState {
         verdict
     }
 
-    /// Whether *any* gating layer owns the screen: an open manager overlay, a
-    /// pending chat approval, or a pending quit-confirm prompt. This exact
-    /// `||` is what every input path that swallows for one must also swallow
-    /// for the others — call sites wrote it out by hand before this existed,
-    /// each with its own copy of this same reasoning; forgetting one would
-    /// reopen the class of bug `approval_pending`'s own doc comment
-    /// describes. The name predates the quit-confirm prompt; kept as-is to
-    /// avoid rippling a rename through every call site's comments.
-    pub(crate) const fn overlay_or_approval(&self) -> bool {
-        self.has_open_overlay() || self.approval_pending() || self.quit_confirm_pending()
+    /// Resolve a key against the open quit-confirm prompt to completion:
+    /// routes it via [`on_quit_confirm_key`](Self::on_quit_confirm_key), and
+    /// on a verdict also applies the verdict's side effect — clearing the
+    /// prompt on Deny/Cancel (Approve leaves it for the caller, which is
+    /// about to exit anyway). Returns `Some(true)` on Approve (caller should
+    /// exit), `Some(false)` on Deny/Cancel (prompt closed, caller continues),
+    /// or `None` while the cursor merely moved / an irrelevant key arrived
+    /// (prompt stays open). Shared by the dashboard event loop
+    /// (`app::event_loop`) and the pre-dashboard launcher
+    /// (`ui::launcher::handle_launcher_key`) so the two can't drift apart on
+    /// what a quit-confirm verdict actually does.
+    pub(crate) fn resolve_quit_confirm_key(&mut self, code: crossterm::event::KeyCode) -> Option<bool> {
+        use crate::ui::approval::ApprovalVerdict;
+        match self.on_quit_confirm_key(code)? {
+            ApprovalVerdict::Approve => Some(true),
+            ApprovalVerdict::Deny | ApprovalVerdict::Cancel => {
+                self.quit_confirm = None;
+                Some(false)
+            }
+        }
     }
 
     /// Whether a modal that owns the body absolutely — no console, nothing to
@@ -652,6 +675,23 @@ impl AppState {
     /// where these two never are.
     pub(crate) const fn blocks_body_absolutely(&self) -> bool {
         self.approval_pending() || self.quit_confirm_pending()
+    }
+
+    /// Whether *any* gating layer owns the screen: an open manager overlay, a
+    /// pending chat approval, or a pending quit-confirm prompt. This exact
+    /// `||` is what every input path that swallows for one must also swallow
+    /// for the others — call sites wrote it out by hand before this existed,
+    /// each with its own copy of this same reasoning; forgetting one would
+    /// reopen the class of bug `approval_pending`'s own doc comment
+    /// describes. Composed from [`has_open_overlay`](Self::has_open_overlay)
+    /// and [`blocks_body_absolutely`](Self::blocks_body_absolutely) rather
+    /// than repeating their two sub-conditions by hand, so a future third
+    /// "owns-the-screen" gate only has to be added to one of the two
+    /// functions, not to both. The name predates the quit-confirm prompt;
+    /// kept as-is to avoid rippling a rename through every call site's
+    /// comments.
+    pub(crate) const fn overlay_or_approval(&self) -> bool {
+        self.has_open_overlay() || self.blocks_body_absolutely()
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -3039,6 +3079,33 @@ mod tests {
         assert!(s.approval.is_some(), "approval pending before close");
         s.close_overlays();
         assert!(s.approval.is_none(), "close_overlays must clear the modal");
+    }
+
+    #[test]
+    fn close_overlays_clears_pending_quit_confirm() {
+        // Mirrors close_overlays_clears_pending_approval: quit_confirm is the
+        // sibling gating layer and must be cleared the same way, or a future
+        // path that reaches close_overlays() while it's open would leave a
+        // stale, undismissable prompt.
+        let mut s = st();
+        s.open_quit_confirm();
+        assert!(s.quit_confirm.is_some(), "quit_confirm pending before close");
+        s.close_overlays();
+        assert!(s.quit_confirm.is_none(), "close_overlays must clear quit_confirm");
+    }
+
+    #[test]
+    fn open_quit_confirm_closes_other_overlays() {
+        // Mirrors open_approval's own close_overlays() call: the
+        // confirm-before-quit prompt owns focus alone, the same way chat
+        // approval does.
+        let mut s = st();
+        s.runtime_manager = Some(crate::ui::runtime_manager::RuntimeManagerState::default());
+        s.open_quit_confirm();
+        assert!(
+            s.runtime_manager.is_none(),
+            "open_quit_confirm must close any open overlay first"
+        );
     }
 
     #[test]

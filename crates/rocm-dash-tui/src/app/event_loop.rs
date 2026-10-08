@@ -1137,13 +1137,10 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                     // decision. Only the Ctrl-C arm above outranks it, for
                     // the same reason it outranks the approval modal.
                     Some(Ok(CtEvent::Key(k))) if state.quit_confirm_pending() => {
-                        use crate::ui::approval::ApprovalVerdict;
-                        match state.on_quit_confirm_key(k.code) {
-                            Some(ApprovalVerdict::Approve) => break,
-                            Some(ApprovalVerdict::Deny | ApprovalVerdict::Cancel) => {
-                                state.quit_confirm = None;
-                            }
-                            None => { /* cursor moved or key ignored — prompt stays open */ }
+                        // `Some(false)`: Deny/Cancel already closed the prompt.
+                        // `None`: cursor moved or key ignored — prompt stays open.
+                        if state.resolve_quit_confirm_key(k.code) == Some(true) {
+                            break;
                         }
                     }
                     // De-modal back-out: on any tab, when an inline manager is

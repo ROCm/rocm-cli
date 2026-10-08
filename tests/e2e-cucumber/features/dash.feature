@@ -345,3 +345,20 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running
+
+  # #145: the launcher front door is a second, independent quit entry point
+  # from the dashboard's own — same bug (quitting silently left a served
+  # model running), same fix. Mirrors dash-25 for the launcher's copy of the
+  # prompt: declining first, then confirming, pins both halves with one launch.
+  @id:dash-launcher-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-26 - Quitting the launcher while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    Then the launcher shows the model serving
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running

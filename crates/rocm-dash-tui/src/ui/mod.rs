@@ -172,35 +172,43 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
     // comment on `AppState`), so render order between the two never matters.
     if let Some(choice) = state.quit_confirm {
         modal::grey_overlay(f);
-        let req = approval::ApprovalRequest::new(
-            "Still serving — quit anyway?",
-            quit_confirm_body(state),
-        );
-        approval::draw_approval(f, body, &req, choice, &theme);
+        approval::draw_approval(f, body, &quit_confirm_request(state), choice, &theme);
     }
+}
+
+/// Build the quit-confirm prompt's request (title + body) once, so the
+/// dashboard's own render arm above and the pre-dashboard launcher's
+/// (`ui::launcher::draw`) call the same construction instead of each
+/// hand-copying the title string — the exact launcher/dashboard drift this
+/// round's other refactors (`quit_confirm_body`, `resolve_quit_confirm_key`,
+/// `is_running`) all set out to close.
+pub(crate) fn quit_confirm_request(state: &AppState) -> approval::ApprovalRequest {
+    approval::ApprovalRequest::new("Still serving — quit anyway?", quit_confirm_body(state))
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
 /// (mirroring the Serving tab's "Running now" listing in
-/// `tabs::pane::detail_body`'s `OpenServices` arm, as plain lines instead of
+/// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
 /// styled spans) and how to stop them first.
+///
+/// Two passes over `state.instances.values()` (count, then take(5)) rather
+/// than collecting into a `Vec` first: nothing here needs random access, and
+/// a `HashMap`'s `values()` is cheap to re-create, so this avoids a
+/// per-render-frame allocation while the prompt is open.
 fn quit_confirm_body(state: &AppState) -> Vec<String> {
-    let running: Vec<_> = state
-        .instances
-        .values()
-        .filter(|i| i.status.is_serving())
-        .collect();
+    let running = || state.instances.values().filter(|i| i.status.is_serving());
+    let total = running().count();
     let mut body = Vec::new();
-    if running.is_empty() {
+    if total == 0 {
         // Can change between opening the prompt and this render (e.g. the
         // model exits on its own while the prompt is up) — not dead code.
         body.push("Nothing is being served anymore.".to_string());
     } else {
-        for i in running.iter().take(5) {
+        for i in running().take(5) {
             body.push(format!("• {}", i.model_name));
         }
-        if running.len() > 5 {
-            body.push(format!("  …and {} more", running.len() - 5));
+        if let Some(line) = format::overflow_line(total, 5) {
+            body.push(line);
         }
     }
     body.push(String::new());

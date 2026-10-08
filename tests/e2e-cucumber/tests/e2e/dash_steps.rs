@@ -550,6 +550,29 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
 }
 
+/// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
+/// is a second, independent quit entry point (issue #145) and must not wait
+/// for (or resolve) the prompt it may open, since the point of this step is
+/// to observe that prompt.
+#[when("the user tries to quit the launcher")]
+async fn try_quit_launcher(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+/// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
+/// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
+/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// instead of the dashboard's.
+#[then("the launcher asks whether to quit while a model is still being served")]
+async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
 #[when("the user declines the quit prompt")]
 async fn decline_quit_prompt(world: &mut E2eWorld) {
     session(world)
