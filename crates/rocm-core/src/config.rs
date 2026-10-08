@@ -1043,7 +1043,7 @@ last_installed_runtime_id = "therock-release"
     /// A directory at the destination is what makes the rename fail on both
     /// supported platforms without needing permissions a root CI lane ignores —
     /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
-    /// uses in `apps/rocm`.
+    /// uses in `rocm_core::atomic_write`.
     #[test]
     fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
         let (root, paths) = temp_app_paths("config-save-rename-fails");
