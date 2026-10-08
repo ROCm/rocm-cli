@@ -1707,10 +1707,11 @@ esac
     #[test]
     fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
         let nightly = read_workflow("nightly.yml");
-        let report = job_block(&nightly, "e2e-report-nightly");
+        let report = normalized_whitespace(job_block(&nightly, "e2e-report-nightly"));
         assert!(
-            report.contains("consolidated/support-matrix.md"),
-            "the consolidated report job must keep the markdown matrix as a file for the wiki job"
+            report.contains("--html-out consolidated/index.html > consolidated/support-matrix.md"),
+            "the consolidated report job must redirect the markdown matrix into \
+             consolidated/support-matrix.md for the wiki job"
         );
         let publish = job_block(&nightly, "publish-e2e-wiki");
         assert_eq!(
@@ -1718,14 +1719,51 @@ esac
             "e2e-report-nightly",
             "the wiki job must publish the consolidated report, so it must wait for it"
         );
+        let condition = job_scalar(publish, "if");
+        for required in [
+            "!cancelled()",
+            "needs.e2e-report-nightly.result == 'success'",
+            "github.repository == 'ROCm/rocm-cli'",
+            "github.ref == 'refs/heads/main'",
+        ] {
+            assert!(
+                condition.contains(required),
+                "the wiki job's `if:` must require `{required}`: {condition}"
+            );
+        }
         assert!(
-            publish.contains("name: e2e-consolidated-report-nightly")
-                && publish.contains(".wiki.git"),
+            !condition.contains("always()"),
+            "always() would publish from a cancelled run: {condition}"
+        );
+        let permissions = job_mapping(publish, "permissions");
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("write"),
+            "pushing to the wiki needs contents: write on this job"
+        );
+        let script = normalized_whitespace(publish);
+        assert!(
+            script.contains("name: e2e-consolidated-report-nightly")
+                && script.contains(".wiki.git"),
             "the wiki job must download the nightly consolidated artifact and push to the wiki repo"
         );
         assert!(
+            script.contains("git push origin HEAD"),
+            "the wiki job must push the page"
+        );
+        assert!(
+            script.contains("if ! git clone --depth 1 \"$wiki\" wiki; then")
+                && script.contains("exit 1 fi"),
+            "a failed wiki clone must fail the job with the prerequisite, not be ignored"
+        );
+        assert!(
+            script.contains("No per-platform report.json files were found")
+                && script.contains("leaving the wiki page unchanged"),
+            "an empty consolidation must leave the last good page in place"
+        );
+        assert!(
             !publish.contains("git init"),
-            "git init cannot create the remote wiki; a missing wiki must fail with the prerequisite"
+            "no `git init` fallback: it cannot create a remote wiki"
         );
     }
 

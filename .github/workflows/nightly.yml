@@ -1633,7 +1633,8 @@ jobs:
   # Publishes the consolidated nightly matrix to the repo wiki so the latest
   # support matrix is readable without opening a run's artifacts. The page is
   # overwritten each night; the run link, commit and date in its header say
-  # which run it came from.
+  # which run it came from. Main-branch runs only, so a dispatch from another
+  # branch cannot overwrite the page, and never from an empty or cancelled run.
   publish-e2e-wiki:
     name: Publish E2E support matrix to wiki
     runs-on: ubuntu-latest
@@ -1641,7 +1642,7 @@ jobs:
     permissions:
       contents: write
     needs: e2e-report-nightly
-    if: always() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli'
+    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
     concurrency:
       group: publish-e2e-wiki
       cancel-in-progress: false
@@ -1659,6 +1660,12 @@ jobs:
           COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
         run: |
           set -euo pipefail
+          # An empty consolidation exits 0 upstream; do not replace the last
+          # good page with a matrix that has no platforms in it.
+          if grep -q 'No per-platform report.json files were found' consolidated/support-matrix.md; then
+            echo "::warning::No platform reports were consolidated; leaving the wiki page unchanged."
+            exit 0
+          fi
           page=E2E-Support-Matrix.md
           {
             echo "# E2E support matrix (latest nightly)"
