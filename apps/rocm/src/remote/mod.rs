@@ -1545,6 +1545,13 @@ mod tests {
             error.contains("already serving on port 11434"),
             "the refusal must say what it found: {error}"
         );
+        // The printed hint must be the exact, directly-runnable command: `main.rs`'s
+        // `service_actions_require_yes_and_render_sandbox_result` proves this exact
+        // form (`rocm services stop <id> --yes`) is the one the approval gate itself
+        // recommends on the local side, and this message tells the user to run the
+        // same CLI's own `services stop` on the remote; `stop_managed_services` in
+        // `tests/e2e-cucumber/tests/e2e.rs` is what actually runs this exact
+        // invocation as a subprocess and relies on it succeeding.
         assert!(
             error.contains("services stop already-there --yes"),
             "the refusal must name the way out, directly runnable with --yes: {error}"

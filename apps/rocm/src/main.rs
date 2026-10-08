@@ -27550,6 +27550,12 @@ install therock";
             message.contains("without authentication"),
             "the refusal must say why it refused: {message}"
         );
+        // The printed hint must be the exact, directly-runnable command: this
+        // same file's `service_actions_require_yes_and_render_sandbox_result`
+        // proves this exact form (`rocm services stop <id> --yes`) is the one
+        // the approval gate itself recommends; `stop_managed_services` in
+        // `tests/e2e-cucumber/tests/e2e.rs` is what actually runs this exact
+        // invocation as a subprocess and relies on it succeeding.
         assert!(
             message.contains("rocm services stop lemonade-qwen-3000 --yes"),
             "the refusal must name the way out, with the service to stop, directly runnable with --yes: {message}"
