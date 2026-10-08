@@ -121,14 +121,13 @@ pub(crate) fn service_files(service_id: &str) -> Result<ServiceFiles> {
 }
 
 /// Assembles the JSON payload persisted as a running service's state and
-/// writes it. Kept here, paired with the readers that rebuild a [`VllmRuntime`]
-/// identity from it ([`pid_from_state`], [`identity_from_state`],
-/// [`endpoint_url_from_state`]) and with [`write_terminal_state`], rather than
-/// split across this module and `process.rs` the way `write_running_state`'s
-/// equivalent payload assembly used to be — see `engines/lemonade/src/state.rs`
-/// for the sibling engine's matching layout. The `VllmRuntime`-derived fields
-/// come from `crate::runtime`, never from `process.rs`, so this module still
-/// never reaches back into it.
+/// writes it. Kept here, paired with the readers that reconstruct the PID,
+/// process identity, and endpoint from it ([`pid_from_state`],
+/// [`identity_from_state`], [`endpoint_url_from_state`]) and with
+/// [`write_terminal_state`] — see `engines/lemonade/src/state.rs` for the
+/// sibling engine's matching layout. The `VllmRuntime`-derived fields come
+/// from `crate::runtime`, never from `process.rs`, so this module still never
+/// reaches back into it.
 pub(crate) fn write_running_state(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
@@ -188,7 +187,7 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
 /// through `rocm_core::merge_json_state_file` instead (see
 /// [`inference_verified`]), which patches the file directly rather than
 /// routing through here.
-pub(crate) fn write_state(path: &Path, value: &Value) -> Result<()> {
+fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -561,6 +560,12 @@ mod tests {
     }
     #[test]
     fn write_running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
+        // Uses the test's own live PID rather than a fixed placeholder so the
+        // `start_ticks` assertion below exercises the real
+        // `rocm_core::process_start_ticks` lookup instead of a value `json!`
+        // would write regardless (a prior version of this test asserted only
+        // `is_some()`, which `Some(Value::Null)` also satisfies).
+        let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
         let request = ServeHttpRequest {
             service_id: "svc-vllm".to_owned(),
@@ -609,11 +614,18 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        write_running_state(&request, &runtime, 12345)?;
+        write_running_state(&request, &runtime, own_pid)?;
         let state = read_service_state(&state_path)?;
         fs::remove_file(&state_path).ok();
 
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(own_pid))
+        );
+        assert_eq!(
+            state.get("service_id").and_then(Value::as_str),
+            Some("svc-vllm")
+        );
         assert_eq!(
             state.get("runtime_id").and_then(Value::as_str),
             Some("therock-release:gfx120X-all")
@@ -621,6 +633,20 @@ mod tests {
         assert_eq!(
             state.get("requested_runtime_id").and_then(Value::as_str),
             Some("runtime-key-gfx120x")
+        );
+        assert_eq!(
+            state.get("endpoint_url").and_then(Value::as_str),
+            Some("http://127.0.0.1:11439/v1")
+        );
+        assert_eq!(
+            state.get("env_id").and_then(Value::as_str),
+            Some("external-vllm-therock")
+        );
+        assert!(
+            state
+                .get("engine_recipe_required_flags")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
         );
         let runtime_env = state
             .get("therock_runtime_env")
@@ -647,56 +673,24 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
-        // The identity token must be recorded so a later stop can verify it.
-        assert!(state.get("start_ticks").is_some());
-        Ok(())
-    }
-    #[test]
-    fn write_running_state_round_trip_preserves_identity_and_core_fields() -> Result<()> {
+        // The identity token must be recorded so a later stop can verify it
+        // against the live process, not merely be present in the JSON.
+        assert_eq!(
+            state.get("start_ticks").and_then(Value::as_u64),
+            rocm_core::process_start_ticks(own_pid)
+        );
+
         // Round-trips through disk via `write_running_state` and
         // `read_service_state`, then checks that the reader side
         // (`identity_from_state`) reconstructs the PID this writer recorded —
         // the contract the split between the two sides of this module depends
         // on.
-        let state_path = probe_state_path("round-trip");
-        let request = ServeHttpRequest {
-            service_id: "svc-vllm".to_owned(),
-            model_ref: "facebook/opt-125m".to_owned(),
-            host: "127.0.0.1".to_owned(),
-            port: 11439,
-            device_policy: DevicePolicy::GpuRequired,
-            gpu_indices: Vec::new(),
-            runtime_id: Some("runtime-key-gfx120x".to_owned()),
-            env_id: None,
-            state_path: state_path.clone(),
-            log_path: None,
-            engine_recipe: None,
-        };
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
-        };
-
-        write_running_state(&request, &runtime, 12345)?;
-        let state = read_service_state(&state_path)?;
-        fs::remove_file(&state_path).ok();
-
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
-        assert_eq!(
-            state.get("service_id").and_then(Value::as_str),
-            Some("svc-vllm")
-        );
         let identity = identity_from_state(&state).expect("identity");
-        assert_eq!(identity.pid, 12345);
+        assert_eq!(identity.pid, own_pid);
+        assert_eq!(
+            identity.start_ticks,
+            rocm_core::process_start_ticks(own_pid)
+        );
         Ok(())
     }
     #[test]

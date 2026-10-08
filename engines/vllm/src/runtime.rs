@@ -812,11 +812,12 @@ mod tests {
     }
     #[test]
     fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
-        let root = PathBuf::from(if cfg!(windows) {
-            r"C:\rocm-sdk"
-        } else {
-            "/tmp/rocm-sdk"
-        });
+        // `sdk_root` must be a real, scratch directory: on Linux this function
+        // can materialize a `libmpi_cxx.so.40` compat stub under it (see
+        // `ensure_mpi_cxx_compat`), and a fixed `/tmp/rocm-sdk` would leave that
+        // file behind after the test runs.
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let root = scratch.path().to_path_buf();
         let runtime = VllmRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             env_id: "external-vllm-therock".to_owned(),
