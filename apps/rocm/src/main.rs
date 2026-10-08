@@ -3991,7 +3991,7 @@ fn spawn_managed_engine_child(
             bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` \
                  without authentication, and a running server cannot be given a key it did not \
-                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 start with; stop it with `rocm services stop {} --yes` and run the command again to \
                  serve it with `--require-api-key`",
                 existing.service_id,
                 resolve.canonical_model_id,
@@ -27551,8 +27551,8 @@ install therock";
             "the refusal must say why it refused: {message}"
         );
         assert!(
-            message.contains("rocm services stop lemonade-qwen-3000"),
-            "the refusal must name the way out, with the service to stop: {message}"
+            message.contains("rocm services stop lemonade-qwen-3000 --yes"),
+            "the refusal must name the way out, with the service to stop, directly runnable with --yes: {message}"
         );
         Ok(())
     }

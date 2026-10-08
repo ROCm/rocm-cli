@@ -729,7 +729,7 @@ fn discover_started_service(
              A running server cannot be given a key it did not start with, so publishing this \
              endpoint would expose it on the tailnet while printing a key it would reject.\n\
              Stop it and run this again: ssh into the machine and run \
-             `{remote_cli} services stop {service_id}`."
+             `{remote_cli} services stop {service_id} --yes`."
         );
     }
     Ok(service_id)
@@ -1546,8 +1546,8 @@ mod tests {
             "the refusal must say what it found: {error}"
         );
         assert!(
-            error.contains("services stop already-there"),
-            "the refusal must name the way out: {error}"
+            error.contains("services stop already-there --yes"),
+            "the refusal must name the way out, directly runnable with --yes: {error}"
         );
     }
 
