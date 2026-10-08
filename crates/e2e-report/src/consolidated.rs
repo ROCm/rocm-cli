@@ -164,9 +164,13 @@ impl RunMeta {
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 pub(crate) struct PlatformReport {
     desc: Descriptor,
-    /// Precomputed column label (platform, OS and effective channel) kept
-    /// for the per-platform detail sections, exposed so `command_coverage.rs`
-    /// reuses it rather than reaching into `desc`/`versions`.
+    /// Human label for the per-platform detail sections. Also the
+    /// de-duplication key for command-coverage columns across a platform's
+    /// tiers (see `command_coverage.rs`) — a display-only change to this
+    /// field (e.g. a known-bugs marker) would silently split or merge those
+    /// columns, so keep that consumer in mind alongside the detail sections.
+    /// `pub(crate)` so `command_coverage.rs` can reuse it rather than
+    /// reaching into `desc`/`versions` itself.
     pub(crate) label: String,
     features: Vec<Feature>,
     stats: Stats,
@@ -859,8 +863,7 @@ fn platform_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
 /// Platform cell for a table that renders OS in its own column (so this omits
 /// `desc.os`, unlike `PlatformReport::label`) — shared between the markdown
 /// summary and `matrix_table` so the two can't drift the way they already
-/// have once (see the command-coverage columns below, and the markdown/HTML
-/// drift fixed by #460).
+/// have once (the markdown/HTML drift fixed by #460).
 fn platform_cell(r: &PlatformReport) -> String {
     with_channel_suffix(&r.desc.platform, r.effective_channel())
 }
@@ -1996,18 +1999,33 @@ mod tests {
     #[test]
     fn platform_sort_key_orders_by_platform_then_os_then_known_bugs() {
         // Only the channel element of the 4-tuple is pinned elsewhere
-        // (generate_consolidated_writes_html). Here, three platforms that share
-        // no channel distinguish the other three: "Strix Halo"/Ubuntu before
-        // "Strix Halo"/Windows pins os; the two Ubuntu rows, identical except
-        // for the known-bugs artifact suffix, pin known_bugs ordering
+        // (generate_consolidated_writes_html and
+        // command_coverage_distinguishes_channels_on_same_platform). The other
+        // three elements are pinned here. Three Strix Halo rows alone can't
+        // pin `platform` — they all share it, so dropping or swapping that
+        // element would not change their order — so a fourth row on a
+        // different platform ("Unknown"/"Unknown", via the explicit
+        // "e2e-unknown-report" artifact name) is added: "Strix Halo" sorts
+        // before "Unknown" by platform, but "Unknown" alone (as an OS) sorts
+        // before "Windows", so dropping the platform element from the key, or
+        // swapping it with os, both move this row ahead of the Windows row
+        // instead of after it. Within the Strix Halo rows: "Strix Halo"/Ubuntu
+        // before "Strix Halo"/Windows pins os; the two Ubuntu rows, identical
+        // except for the known-bugs artifact suffix, pin known_bugs ordering
         // (false < true) once os and channel are held equal. No platform.json
         // sidecar, so display_counts falls back to raw junit stats and each
-        // row's distinct scenario count (1/2/3) tells the rows apart in the
+        // row's distinct scenario count (1/2/3/4) tells the rows apart in the
         // rendered table.
         let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
         let ubuntu_known_bugs_report =
             write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let windows_plain_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let unknown_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
             (&[], &["passed"]),
             (&[], &["passed"]),
             (&[], &["passed"]),
@@ -2025,6 +2043,10 @@ mod tests {
                 "e2e-gpu-strix-ubuntu-report".to_string(),
                 ubuntu_plain_report.path().to_path_buf(),
             ),
+            (
+                "e2e-unknown-report".to_string(),
+                unknown_report.path().to_path_buf(),
+            ),
         ];
 
         let md = consolidated_summary_markdown(&inputs);
@@ -2037,6 +2059,9 @@ mod tests {
         let windows_pos = md
             .find("| Strix Halo | Windows | 3 |")
             .expect("Windows row");
+        let unknown_pos = md
+            .find("| Unknown | Unknown | 4 |")
+            .expect("Unknown-platform row");
         assert!(
             ubuntu_plain_pos < ubuntu_known_bugs_pos,
             "same platform/os: known_bugs=false must sort before known_bugs=true:\n{md}"
@@ -2044,6 +2069,10 @@ mod tests {
         assert!(
             ubuntu_known_bugs_pos < windows_pos,
             "same platform: Ubuntu must sort before Windows regardless of known_bugs:\n{md}"
+        );
+        assert!(
+            windows_pos < unknown_pos,
+            "\"Strix Halo\" must sort before \"Unknown\" by platform, even though \"Unknown\" as an OS sorts before \"Windows\":\n{md}"
         );
     }
 
