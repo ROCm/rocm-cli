@@ -1232,6 +1232,95 @@ mod tests {
         );
     }
 
+    /// Offline coverage for the parts of `run_agent_request`'s wiring the test
+    /// above does not reach: it drives a default-params, single-turn history
+    /// through the turn-limit error path, so it would still pass with
+    /// `apply_inference_params` dropped, the wrong end of `history` split off,
+    /// a swapped prompt source, or the wrong `fired` log handed to
+    /// `finish_agent_request` — none of those change a default `InferenceParams`
+    /// or an empty `prior` slice.
+    ///
+    /// This test instead scripts a successful run: a history with two prior
+    /// turns plus the live prompt, and non-default temperature/top_p/max_tokens.
+    /// It asserts directly on the `CompletionRequest` `MockCompletionModel`
+    /// recorded — chat history (order and content), the prompt, and every
+    /// sampling field `apply_inference_params` sets — plus that a successful
+    /// reply carries the `fired`-log annotation for the tool the script calls.
+    #[tokio::test]
+    async fn run_agent_request_forwards_history_and_params_and_annotates_reply() {
+        use rig::completion::Message;
+        use rig::completion::message::UserContent;
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("call_0", "gpu_status", json!({})),
+            MockTurn::text("GPU 0 is healthy."),
+        ]);
+        let recorded = model.clone();
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+
+        let params = InferenceParams {
+            temperature: Some(0.4),
+            top_p: Some(0.2),
+            max_tokens: Some(256),
+        };
+        let history = [
+            ChatTurn::user("first, check gpu 0"),
+            ChatTurn::agent("checked once already"),
+            ChatTurn::user("check gpu 0 again"),
+        ];
+
+        let reply = run_agent_request(
+            agent,
+            &params,
+            None,
+            None,
+            &history,
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect("scripted tool call then text turn should succeed");
+
+        assert!(
+            reply.contains("⚙ via: gpu_status"),
+            "reply should carry the fired-skill annotation: {reply}"
+        );
+
+        let requests = recorded.requests();
+        let first = requests.first().expect("at least one request was sent");
+
+        // Sampling knobs: all three of apply_inference_params's branches ran.
+        assert_eq!(first.temperature, Some(f64::from(0.4_f32)));
+        assert_eq!(first.max_tokens, Some(256));
+        let top_p = first
+            .additional_params
+            .as_ref()
+            .and_then(|v| v.get("top_p"))
+            .and_then(serde_json::Value::as_f64);
+        assert_eq!(top_p, Some(f64::from(0.2_f32)));
+
+        // History: the preamble (rig's own leading system message), then
+        // build_messages(prior) (the first two turns), then the live prompt
+        // (the third turn, `last.content`) appended by rig itself — proves
+        // `history.split_last()` split the right way and `last.content` (not
+        // `prior`) became the prompt.
+        let chat_history: Vec<Message> = first.chat_history.iter().cloned().collect();
+        assert_eq!(chat_history.len(), 4, "got: {chat_history:?}");
+        assert_eq!(chat_history[1], Message::user("first, check gpu 0"));
+        assert_eq!(chat_history[2], Message::assistant("checked once already"));
+        let Message::User { content } = &chat_history[3] else {
+            panic!(
+                "expected the live prompt as a trailing user message, got {:?}",
+                chat_history[3]
+            );
+        };
+        assert!(matches!(
+            content.first(),
+            UserContent::Text(t) if t.text == "check gpu 0 again"
+        ));
+    }
+
     /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
     /// a real key). Run with:
     /// `ANTHROPIC_API_KEY=… cargo test -p rocm-dash-tui --lib anthropic_round_trip -- --ignored --nocapture`
