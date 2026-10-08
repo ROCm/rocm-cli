@@ -13,7 +13,6 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-pulldown-cmark.workspace = true
 e2e-report = { path = "../crates/e2e-report" }
 rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
