@@ -164,9 +164,9 @@ impl RunMeta {
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 pub(crate) struct PlatformReport {
     desc: Descriptor,
-    /// Human label kept for the per-platform detail sections, and the only
-    /// piece of `desc` the command-coverage table needs — exposed instead of
-    /// widening `desc`/`Descriptor` so a second module can't recompute it.
+    /// Precomputed column label (platform, OS and effective channel) kept
+    /// for the per-platform detail sections, exposed so `command_coverage.rs`
+    /// reuses it rather than reaching into `desc`/`versions`.
     pub(crate) label: String,
     features: Vec<Feature>,
     stats: Stats,
@@ -2440,8 +2440,9 @@ mod tests {
     }
 
     // Pure helper unit tests live with their code in `command_coverage.rs`;
-    // the command-coverage tests here exercise the `consolidated_summary_markdown`
-    // integration pipeline instead.
+    // the command-coverage tests here stay because they build `PlatformReport`
+    // through the private `PlatformReport::load` and the shared `feature_json`
+    // helper, both local to this module.
 
     #[test]
     fn command_coverage_counts_against_known_surface() {
