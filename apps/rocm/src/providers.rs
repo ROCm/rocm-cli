@@ -3063,3 +3063,6 @@ mod tests {
         )
     }
 }
+
+#[cfg(test)]
+mod sse_emitter_proptests;

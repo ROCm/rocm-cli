@@ -65,5 +65,7 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # every unit boundary, and the narrow band where `{:.1}` rounding reaches 1024.0
 # is exactly the input a hand-picked example misses. Same version and features
 # as rocm-core's, so no new crate or feature enters the lockfile.
-# Test-only, so it adds nothing to any shipped binary.
+# Test-only, so it adds nothing to any shipped binary. Also drives the
+# `--gpu` selection properties (`gpu_selection_proptests.rs`) and the SSE
+# line-emitter properties (`providers/sse_emitter_proptests.rs`).
 proptest = { version = "1", default-features = false, features = ["std"] }
