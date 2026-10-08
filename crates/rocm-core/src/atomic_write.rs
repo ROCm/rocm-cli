@@ -60,8 +60,10 @@ pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     )
 }
 
-/// [`write_file_atomically`] with the temp-name suffix for each attempt and a
-/// hook that runs after the temp file is fully written and before it is
+/// [`write_file_atomically`] with test seams for the temp name and publish point.
+///
+/// `suffix_for_attempt` names the temp file for each attempt, and
+/// `before_publish` runs after the temp file is fully written and before it is
 /// published. Both exist so tests can force a temp-name collision and hold
 /// writers at the publish point; production code calls
 /// [`write_file_atomically`].
@@ -84,10 +86,11 @@ where
     )
 }
 
-/// [`write_file_atomically_with`] with the publish step injected as well, so
-/// tests can observe the staged file and the destination at the moment of
-/// publication, or make the publication fail. Pass [`publish_temp_file`] for
-/// the real one.
+/// [`write_file_atomically_with`] with the publish step injected as well.
+///
+/// Tests use it to observe the staged file and the destination at the moment
+/// of publication, or to make the publication fail. Pass
+/// [`publish_temp_file`] for the real one.
 pub fn write_file_atomically_with_publish<S, P, F>(
     path: &Path,
     bytes: &[u8],
