@@ -47,7 +47,7 @@
 //! dependency install already covered above.
 //!
 //! `comfyui-05` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
-//! isolated managed runtime and asserts the runtime's torch is unchanged, no
+//! isolated managed runtime and asserts the runtime's torch stack is unchanged, no
 //! `nvidia-*` distributions appeared, and the install really added packages. It
 //! reuses `comfyui-03`'s argument-less `comfyui install` When step.
 //!
@@ -572,10 +572,8 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 // --- comfyui-05: installing ComfyUI must not damage the managed ROCm runtime ---
 
 /// Locate the managed runtime's venv interpreter. `rocm runtimes list` prints an
-/// `install_root: <path>` line for each installed runtime; the interpreter lives
-/// under a `bin/python` (Unix) / `Scripts/python.exe` (Windows) inside that tree.
-/// The interpreter is expected at `<install_root>/bin/python`; see
-/// [`find_venv_python`].
+/// `install_root: <path>` line for each installed runtime; the interpreter is
+/// resolved from it by [`find_venv_python`].
 ///
 /// Reads `runtimes list` rather than `examine`: examine only prints a `Folder:`
 /// line for the *active* runtime and takes a different branch when none is marked
@@ -583,7 +581,7 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 /// dispatch — the scenario panicked on a missing `Folder:` there). `runtimes list`
 /// prints `install_root:` for every installed runtime unconditionally.
 fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
-    let (listing, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
     let roots: Vec<&str> = listing
         .lines()
         .filter_map(|l| l.trim().strip_prefix("install_root:"))
@@ -702,7 +700,11 @@ fn installed_distributions(python: &Path) -> Vec<String> {
 /// A ROCm runtime should have none; ComfyUI's install dragging any in is the
 /// EAI-8051 defect.
 fn nvidia_distributions(python: &Path) -> Vec<String> {
-    installed_distributions(python)
+    nvidia_only(installed_distributions(python))
+}
+
+fn nvidia_only(distributions: Vec<String>) -> Vec<String> {
+    distributions
         .into_iter()
         .filter(|name| name.to_ascii_lowercase().starts_with("nvidia-"))
         .collect()
@@ -728,13 +730,14 @@ async fn assert_baseline_torch_present(world: &mut E2eWorld) {
         python.display()
     );
     let distributions = installed_distributions(&python);
+    let nvidia = nvidia_only(distributions.clone());
     assert!(
-        !distributions
-            .iter()
-            .any(|name| name.to_ascii_lowercase().starts_with("nvidia-")),
-        "runtime already has nvidia-* distributions before ComfyUI install; premise absent"
+        nvidia.is_empty(),
+        "runtime already has nvidia-* distributions before ComfyUI install; premise \
+         absent: {}",
+        nvidia.join(", ")
     );
-    // Record the exact baseline version so the post-install step can require it to
+    // Record the exact baseline torch stack so the post-install step can require it to
     // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
     // it can require the install to have actually added something (see
     // `assert_dependencies_installed`).

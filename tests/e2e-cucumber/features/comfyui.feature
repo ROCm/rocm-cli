@@ -1,4 +1,4 @@
-Feature: ComfyUI install reports progress and makes failures actionable
+Feature: ComfyUI install reports progress, makes failures actionable and preserves the runtime
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
   # dependencies. A failed resolve (a version conflict, a yanked release, a
