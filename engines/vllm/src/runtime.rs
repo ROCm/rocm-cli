@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, split_local_version};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -546,6 +546,128 @@ print(json.dumps({"present": spec is not None, "version": version}))
     }
 }
 
+/// Describes a resolved runtime's TheRock SDK layout for the running-state
+/// payload, or `None` when the runtime is not backed by a TheRock SDK root.
+pub(crate) fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
+    let root = runtime.sdk_root.as_ref()?;
+    Some(json!({
+        "runtime_id": runtime.runtime_id,
+        "env_id": runtime.env_id,
+        "root": root.display().to_string(),
+        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
+        "bin_paths": runtime_bin_paths(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "library_paths": therock_library_path_entries(runtime)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "source": runtime.source,
+    }))
+}
+
+pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Some(bin) = runtime.sdk_bin.as_ref() {
+        entries.push(bin.clone());
+    }
+    entries.extend(runtime.sdk_bin_paths.iter().cloned());
+    dedupe_paths(entries)
+}
+
+pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
+    let Some(root) = runtime.sdk_root.as_ref() else {
+        return dedupe_paths(runtime.sdk_library_paths.clone());
+    };
+    let mut entries = runtime.sdk_library_paths.clone();
+    entries.extend([
+        root.join("lib"),
+        root.join("lib64"),
+        root.join("lib").join("rocm_sysdeps").join("lib"),
+    ]);
+    if cfg!(target_os = "linux") {
+        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
+        if wsl_dxcore_lib.is_dir() {
+            entries.push(wsl_dxcore_lib);
+        }
+        // OpenMPI is installed outside the default loader path on some distros
+        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
+        // load libmpi.so at launch when it lives there.
+        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
+
+        if let Some(compat_dir) = runtime_compat_dir(runtime) {
+            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
+            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
+            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
+            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
+            // rocm-core's build.rs) into a runtime-owned directory and add it to
+            // the loader path. The stub only *defines* the legacy C++ binding
+            // symbols torch needs; they are never called in single-node serving,
+            // so this is safe.
+            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
+                entries.push(dir);
+            }
+            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
+            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
+            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
+            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
+            // satisfy that binding. An older rocm-cli release symlinked
+            // `libnuma.so.1` to that bundled library; on the loader path it
+            // shadowed any real system libnuma and broke `import torch` with
+            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
+            // the real numactl runtime (installed via the package manager) wins;
+            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
+            remove_stale_numa_shim(&compat_dir);
+        }
+    }
+    dedupe_paths(entries)
+}
+/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
+/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
+/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
+/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
+/// path would shadow a correctly installed system libnuma. No-op when absent or
+/// when the entry is not a symlink.
+fn remove_stale_numa_shim(compat_dir: &Path) {
+    let link = compat_dir.join("libnuma.so.1");
+    if let Ok(meta) = link.symlink_metadata()
+        && meta.file_type().is_symlink()
+    {
+        let _ = fs::remove_file(&link);
+    }
+}
+/// A writable, runtime-owned directory for managed-runtime library compatibility
+/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
+/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
+/// when no Python launcher is recorded.
+fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
+    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
+    if let Some(env_root) = runtime
+        .python_executable
+        .as_ref()
+        .and_then(|python| python.parent())
+        .and_then(|bin| bin.parent())
+    {
+        return Some(env_root.join(COMPAT_DIR_NAME));
+    }
+    runtime
+        .sdk_root
+        .as_ref()
+        .map(|root| root.join(COMPAT_DIR_NAME))
+}
+
+fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for entry in entries {
+        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
+            deduped.push(entry);
+        }
+    }
+    deduped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -686,6 +808,35 @@ mod tests {
         assert_eq!(
             rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
             None
+        );
+    }
+    #[test]
+    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
+        let root = PathBuf::from(if cfg!(windows) {
+            r"C:\rocm-sdk"
+        } else {
+            "/tmp/rocm-sdk"
+        });
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(root.clone()),
+            sdk_bin: Some(root.join("bin")),
+            sdk_bin_paths: vec![root.join("runtime").join("bin")],
+            sdk_library_paths: vec![root.join("runtime").join("lib")],
+            rocm_sdk_version: None,
+        };
+        let entries = therock_library_path_entries(&runtime);
+        assert!(entries.contains(&root.join("runtime").join("lib")));
+        assert!(entries.contains(&root.join("lib")));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
         );
     }
 }

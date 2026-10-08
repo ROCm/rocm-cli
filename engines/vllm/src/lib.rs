@@ -87,6 +87,32 @@ enum CommandKind {
     },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ServeHttpRequest {
+    pub(crate) service_id: String,
+    pub(crate) model_ref: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) device_policy: DevicePolicy,
+    pub(crate) gpu_indices: Vec<u32>,
+    pub(crate) runtime_id: Option<String>,
+    pub(crate) env_id: Option<String>,
+    pub(crate) state_path: PathBuf,
+    pub(crate) log_path: Option<PathBuf>,
+    pub(crate) engine_recipe: Option<EngineRecipeHint>,
+}
+
+/// Required launch flags an accepted engine recipe carries for `vllm serve`.
+///
+/// Shared by `process.rs` (building the actual argv) and `state.rs` (mirroring
+/// those flags into the running-state payload) so neither has to depend on the
+/// other for it.
+pub(crate) fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
+    engine_recipe
+        .map(|hint| hint.required_flags.clone())
+        .unwrap_or_default()
+}
+
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -158,7 +184,7 @@ pub fn run_cli() -> Result<()> {
             let log_path = AppPaths::discover()?
                 .engine_logs_dir(ENGINE_NAME)
                 .join(format!("{service_id}.log"));
-            crate::process::serve_http(crate::process::ServeHttpRequest {
+            crate::process::serve_http(ServeHttpRequest {
                 service_id,
                 model_ref,
                 host,
@@ -194,7 +220,7 @@ pub fn builtin_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    crate::process::serve_http(crate::process::ServeHttpRequest {
+    crate::process::serve_http(ServeHttpRequest {
         service_id,
         model_ref,
         host,

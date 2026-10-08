@@ -11,14 +11,15 @@ use rocm_engine_protocol::{
     DevicePolicy, ENGINE_RECIPE_CONTRACT_VERSION, EngineRecipeHint, GpuSelection, LaunchRequest,
     LaunchResponse, ResolveModelRequest, ResolveModelResponse, StopRequest, StopResponse,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::runtime::VllmRuntime;
+use crate::runtime::{VllmRuntime, runtime_bin_paths, therock_library_path_entries};
+use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
@@ -116,8 +117,7 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     };
     let child = spawn_vllm_server(&serve_request, &runtime, Some(&log_path))?;
     let pid = child.id();
-    let payload = running_state_payload(&serve_request, &runtime, pid);
-    crate::state::write_state(&serve_request.state_path, &payload)?;
+    crate::state::write_running_state(&serve_request, &runtime, pid)?;
     Ok(LaunchResponse {
         service_id: request.service_id,
         pid,
@@ -127,81 +127,11 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
     })
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ServeHttpRequest {
-    pub service_id: String,
-    pub model_ref: String,
-    pub host: String,
-    pub port: u16,
-    pub device_policy: DevicePolicy,
-    pub gpu_indices: Vec<u32>,
-    pub runtime_id: Option<String>,
-    pub env_id: Option<String>,
-    pub state_path: PathBuf,
-    pub log_path: Option<PathBuf>,
-    pub engine_recipe: Option<EngineRecipeHint>,
-}
-
-/// Assembles the JSON payload persisted as a running service's state.
-///
-/// Built here rather than in `state.rs` because every field but `pid` comes
-/// from data this module already owns (the launch request, the resolved
-/// runtime, and process-launch helpers like [`engine_recipe_launch_args`]/
-/// [`runtime_bin_paths`]/[`therock_library_path_entries`]). `state.rs` only
-/// ever receives the finished [`Value`] to serialize — it never reaches back
-/// into this module to compute any of it.
-fn running_state_payload(request: &ServeHttpRequest, runtime: &VllmRuntime, pid: u32) -> Value {
-    json!({
-        "service_id": request.service_id,
-        "engine": crate::ENGINE_NAME,
-        "status": "running",
-        "pid": pid,
-        "model_ref": request.model_ref,
-        "host": request.host,
-        "port": request.port,
-        "endpoint_url": crate::state::endpoint_url(&request.host, request.port),
-        "device_policy": "gpu_required",
-        "runtime_id": runtime.runtime_id,
-        "requested_runtime_id": request.runtime_id,
-        "env_id": request.env_id.as_deref().unwrap_or(runtime.env_id.as_str()),
-        "runtime_executable": runtime.command,
-        "server_pid": pid,
-        "engine_recipe": request.engine_recipe,
-        "engine_recipe_required_flags": engine_recipe_launch_args(request.engine_recipe.as_ref()),
-        "therock_runtime_env": therock_runtime_env_payload(runtime),
-        "started_at_unix_ms": crate::state::current_unix_millis(),
-        // Kernel start-time of the launcher PID, captured while it is alive.
-        // Paired with `pid`, it identifies this exact process across PID
-        // recycling so a later stop never signals a reused PID.
-        "start_ticks": rocm_core::process_start_ticks(pid)
-    })
-}
-
-fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
-    let root = runtime.sdk_root.as_ref()?;
-    Some(json!({
-        "runtime_id": runtime.runtime_id,
-        "env_id": runtime.env_id,
-        "root": root.display().to_string(),
-        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
-        "bin_paths": runtime_bin_paths(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "library_paths": therock_library_path_entries(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "source": runtime.source,
-    }))
-}
-
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     request.gpu_indices = resolve_serve_gpu_indices(&request.gpu_indices)?;
     let runtime = crate::runtime::resolve_vllm_runtime(request.runtime_id.as_deref())?;
     let mut child = spawn_vllm_server(&request, &runtime, request.log_path.as_deref())?;
-    let payload = running_state_payload(&request, &runtime, child.id());
-    crate::state::write_state(&request.state_path, &payload)?;
+    crate::state::write_running_state(&request, &runtime, child.id())?;
 
     // Wait for the server to become ready, with comprehensive error logging
     if let Err(e) = wait_for_vllm_ready(
@@ -613,12 +543,6 @@ fn vllm_serve_args(
     args.extend(engine_recipe_launch_args(engine_recipe));
     args
 }
-
-pub(crate) fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
-    engine_recipe
-        .map(|hint| hint.required_flags.clone())
-        .unwrap_or_default()
-}
 /// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
 ///
 /// Defaults to enabled because FULL CUDA-graph replay hangs ROCm gfx94x GPUs
@@ -649,107 +573,6 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
-}
-
-pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
-    if let Some(bin) = runtime.sdk_bin.as_ref() {
-        entries.push(bin.clone());
-    }
-    entries.extend(runtime.sdk_bin_paths.iter().cloned());
-    dedupe_paths(entries)
-}
-
-pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let Some(root) = runtime.sdk_root.as_ref() else {
-        return dedupe_paths(runtime.sdk_library_paths.clone());
-    };
-    let mut entries = runtime.sdk_library_paths.clone();
-    entries.extend([
-        root.join("lib"),
-        root.join("lib64"),
-        root.join("lib").join("rocm_sysdeps").join("lib"),
-    ]);
-    if cfg!(target_os = "linux") {
-        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
-        if wsl_dxcore_lib.is_dir() {
-            entries.push(wsl_dxcore_lib);
-        }
-        // OpenMPI is installed outside the default loader path on some distros
-        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
-        // load libmpi.so at launch when it lives there.
-        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
-
-        if let Some(compat_dir) = runtime_compat_dir(runtime) {
-            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
-            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
-            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
-            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
-            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
-            // rocm-core's build.rs) into a runtime-owned directory and add it to
-            // the loader path. The stub only *defines* the legacy C++ binding
-            // symbols torch needs; they are never called in single-node serving,
-            // so this is safe.
-            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
-                entries.push(dir);
-            }
-            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
-            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
-            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
-            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
-            // satisfy that binding. An older rocm-cli release symlinked
-            // `libnuma.so.1` to that bundled library; on the loader path it
-            // shadowed any real system libnuma and broke `import torch` with
-            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
-            // the real numactl runtime (installed via the package manager) wins;
-            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
-            remove_stale_numa_shim(&compat_dir);
-        }
-    }
-    dedupe_paths(entries)
-}
-/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
-/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
-/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
-/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
-/// path would shadow a correctly installed system libnuma. No-op when absent or
-/// when the entry is not a symlink.
-fn remove_stale_numa_shim(compat_dir: &Path) {
-    let link = compat_dir.join("libnuma.so.1");
-    if let Ok(meta) = link.symlink_metadata()
-        && meta.file_type().is_symlink()
-    {
-        let _ = fs::remove_file(&link);
-    }
-}
-/// A writable, runtime-owned directory for managed-runtime library compatibility
-/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
-/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
-/// when no Python launcher is recorded.
-fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
-    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
-    if let Some(env_root) = runtime
-        .python_executable
-        .as_ref()
-        .and_then(|python| python.parent())
-        .and_then(|bin| bin.parent())
-    {
-        return Some(env_root.join(COMPAT_DIR_NAME));
-    }
-    runtime
-        .sdk_root
-        .as_ref()
-        .map(|root| root.join(COMPAT_DIR_NAME))
-}
-
-fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
-    for entry in entries {
-        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
-            deduped.push(entry);
-        }
-    }
-    deduped
 }
 
 fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Result<OsString> {
@@ -1554,144 +1377,6 @@ mod tests {
         assert!(error.to_string().contains("unsupported"));
     }
     #[test]
-    fn running_state_payload_records_managed_therock_env_for_gpu_verification() -> Result<()> {
-        let request = ServeHttpRequest {
-            service_id: "svc-vllm".to_owned(),
-            model_ref: "facebook/opt-125m".to_owned(),
-            host: "127.0.0.1".to_owned(),
-            port: 11439,
-            device_policy: DevicePolicy::GpuRequired,
-            gpu_indices: Vec::new(),
-            runtime_id: Some("runtime-key-gfx120x".to_owned()),
-            env_id: None,
-            state_path: PathBuf::new(),
-            log_path: None,
-            engine_recipe: None,
-        };
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from(if cfg!(windows) {
-                r"C:\venv\Scripts\vllm.exe"
-            } else {
-                "/home/user/.venv/bin/vllm"
-            }),
-            python_executable: None,
-            version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk"
-            } else {
-                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
-            })),
-            sdk_bin: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk\bin"
-            } else {
-                "/home/user/.venv/lib/python/site-packages/rocm_sdk/bin"
-            })),
-            sdk_bin_paths: vec![PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk\extra-bin"
-            } else {
-                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/bin"
-            })],
-            sdk_library_paths: vec![PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk\extra-lib"
-            } else {
-                "/home/user/.venv/lib/python/site-packages/_rocm_sdk_libraries/lib"
-            })],
-            rocm_sdk_version: None,
-        };
-
-        let state = running_state_payload(&request, &runtime, 12345);
-
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
-        assert_eq!(
-            state.get("runtime_id").and_then(Value::as_str),
-            Some("therock-release:gfx120X-all")
-        );
-        assert_eq!(
-            state.get("requested_runtime_id").and_then(Value::as_str),
-            Some("runtime-key-gfx120x")
-        );
-        let runtime_env = state
-            .get("therock_runtime_env")
-            .expect("runtime env should be recorded");
-        assert_eq!(
-            runtime_env.get("runtime_id").and_then(Value::as_str),
-            Some("therock-release:gfx120X-all")
-        );
-        assert!(
-            runtime_env
-                .get("root")
-                .and_then(Value::as_str)
-                .is_some_and(|root| root.contains("rocm"))
-        );
-        assert!(
-            runtime_env
-                .get("bin_paths")
-                .and_then(Value::as_array)
-                .is_some_and(|paths| paths.len() >= 2)
-        );
-        assert!(
-            runtime_env
-                .get("library_paths")
-                .and_then(Value::as_array)
-                .is_some_and(|paths| !paths.is_empty())
-        );
-        // The identity token must be recorded so a later stop can verify it.
-        assert!(state.get("start_ticks").is_some());
-        Ok(())
-    }
-    #[test]
-    fn running_state_payload_round_trips_through_disk_via_state_write_and_read() -> Result<()> {
-        // Characterizes the seam with state.rs: this module assembles the
-        // payload and hands the finished `Value` to `crate::state::write_state`,
-        // which never reaches back into this module to compute any of it.
-        let state_path = std::env::temp_dir().join(format!(
-            "rocm-vllm-state-{}-{}.json",
-            std::process::id(),
-            current_unix_millis()
-        ));
-        let request = ServeHttpRequest {
-            service_id: "svc-vllm".to_owned(),
-            model_ref: "facebook/opt-125m".to_owned(),
-            host: "127.0.0.1".to_owned(),
-            port: 11439,
-            device_policy: DevicePolicy::GpuRequired,
-            gpu_indices: Vec::new(),
-            runtime_id: Some("runtime-key-gfx120x".to_owned()),
-            env_id: None,
-            state_path: state_path.clone(),
-            log_path: None,
-            engine_recipe: None,
-        };
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: Some("test".to_owned()),
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: None,
-            sdk_bin: None,
-            sdk_bin_paths: Vec::new(),
-            sdk_library_paths: Vec::new(),
-            rocm_sdk_version: None,
-        };
-
-        let payload = running_state_payload(&request, &runtime, 12345);
-        crate::state::write_state(&state_path, &payload)?;
-        let state = crate::state::read_service_state(&state_path)?;
-        fs::remove_file(&state_path).ok();
-
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
-        assert_eq!(
-            state.get("service_id").and_then(Value::as_str),
-            Some("svc-vllm")
-        );
-        Ok(())
-    }
-    #[test]
     fn vllm_ready_timeout_uses_default_without_override() {
         assert_eq!(resolve_vllm_ready_timeout(None), DEFAULT_VLLM_READY_TIMEOUT);
     }
@@ -1711,35 +1396,6 @@ mod tests {
         assert_eq!(
             resolve_vllm_ready_timeout(Some("not-a-number".to_owned())),
             DEFAULT_VLLM_READY_TIMEOUT
-        );
-    }
-    #[test]
-    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
-        let root = PathBuf::from(if cfg!(windows) {
-            r"C:\rocm-sdk"
-        } else {
-            "/tmp/rocm-sdk"
-        });
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(root.clone()),
-            sdk_bin: Some(root.join("bin")),
-            sdk_bin_paths: vec![root.join("runtime").join("bin")],
-            sdk_library_paths: vec![root.join("runtime").join("lib")],
-            rocm_sdk_version: None,
-        };
-        let entries = therock_library_path_entries(&runtime);
-        assert!(entries.contains(&root.join("runtime").join("lib")));
-        assert!(entries.contains(&root.join("lib")));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
         );
     }
     #[test]
