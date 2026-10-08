@@ -1356,6 +1356,31 @@ case "$*" in
 esac
 "#;
 
+    /// Stands in for `scripts/reclaim-gpu.sh`, which a native lane runs with
+    /// `--report-holders` when it gives up, and says so in the log. Without it
+    /// the call resolves against whatever directory the test runs from, fails,
+    /// and the holder-reporting path is never exercised at all.
+    #[cfg(unix)]
+    const RECLAIM_STUB: &str = "#!/bin/sh\necho \"reclaim-gpu.sh stub called: $*\"\n";
+
+    /// What a lane logs when it reached the step that names what holds the GPU.
+    #[cfg(unix)]
+    const REPORTED_HOLDERS: &str = "reclaim-gpu.sh stub called: --report-holders";
+
+    /// A preflight's exit code, or a panic naming the signal that killed it:
+    /// `code()` is `None` exactly when there is no code to report.
+    #[cfg(unix)]
+    fn exit_code(status: std::process::ExitStatus, what: &str) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+
+        status.code().unwrap_or_else(|| {
+            panic!(
+                "{what} exited with no status code: killed by signal {:?}",
+                status.signal()
+            )
+        })
+    }
+
     /// Run a preflight script against fixture `rocm-smi` output, returning its
     /// exit code and everything it logged. `rocm-smi` is stubbed on `PATH`;
     /// nothing touches a real GPU.
@@ -1380,6 +1405,11 @@ esac
         std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("make the stub executable");
+        // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
+        // run from a directory that has one.
+        std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
+        std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), RECLAIM_STUB)
+            .expect("write reclaim-gpu.sh stub");
 
         let path = format!(
             "{}:{}",
@@ -1392,6 +1422,7 @@ esac
         }
         let out = cmd
             .arg(&script_path)
+            .current_dir(dir.path())
             .env("PATH", path)
             .env("FIXTURE", &fixture_path)
             .env("COUNTER", dir.path().join("calls"))
@@ -1403,12 +1434,7 @@ esac
             .expect("running the preflight script");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "preflight"), log)
     }
 
     /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
@@ -1493,12 +1519,7 @@ esac
             .expect("running the preflight script under pwsh");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "pwsh preflight"), log)
     }
 
     /// One host reading, and what each lane must make of it.
@@ -1681,6 +1702,16 @@ esac
             for handle in handles {
                 let (case, native, advisory, windows) =
                     handle.join().expect("preflight case thread");
+                // A native lane that gives up must also say what holds the card.
+                if case.native.0 == 1 {
+                    assert!(
+                        native.1.contains(REPORTED_HOLDERS),
+                        "native preflight, {}: failed without reporting the GPU's \
+                         holders, logged:\n{}",
+                        case.label,
+                        native.1
+                    );
+                }
                 assert_gate("native", case.label, native, case.native);
                 assert_gate("advisory", case.label, advisory, case.advisory);
                 // The Windows block guards the same hardware class with the
@@ -1715,7 +1746,12 @@ esac
         // Two polls: one at t=0, one after the script's own 5s backoff. The
         // first spends two calls (combined, then GTT alone); everything after
         // that fails, so the second poll reads nothing.
-        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "6")];
+        //
+        // The ceiling is counted in bash's whole-second `$SECONDS`, so a
+        // ceiling of N buys between N-1 and N real seconds. 7 keeps the second
+        // check, at just over 5s, inside the budget; 6 left it a coin toss, and
+        // a skipped second poll passes this test without exercising it.
+        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "7")];
         let fixture = smi_fixture(512 * MIB, 200 * MIB, None);
         let (native, advisory) = apu_lanes();
 
@@ -1733,6 +1769,91 @@ esac
             run_preflight(&native, PreflightShell::DefaultRunStep, &fixture, &env),
             (1, &["reported no GTT pool"]),
         );
+    }
+
+    /// A `BASH_ENV` file that stalls the script once, for just over a second,
+    /// as soon as its `deadline` is set — before anything else runs.
+    ///
+    /// That is the descheduling a loaded host can impose at the same spot.
+    /// `$SECONDS` ticks on whole wall-clock seconds, so with a 1s ceiling the
+    /// deadline is already past when the script resumes.
+    #[cfg(unix)]
+    const STALL_AFTER_DEADLINE: &str = "trap '[ -z \"${__stalled:-}\" ] && [ -n \"${deadline:-}\" ] \
+         && { __stalled=1; sleep 1.05; } || true' DEBUG\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn every_shell_preflight_polls_at_least_once_whatever_the_ceiling() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // A lane whose deadline expires before its first poll reports a verdict
+        // no reading produced: the native lanes "rocm-smi never returned within
+        // its timeout", the advisory ones "no VRAM figures under WSL". This
+        // flaked the gate test above whenever the second boundary passed
+        // between computing the deadline and the loop's first check. Every
+        // shell copy in both workflows is driven, not just the APU twins the
+        // drift test pins, because each was written with the same loop.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let trap_dir = tempfile::tempdir().expect("temp dir");
+        let bash_env = trap_dir.path().join("stall.sh");
+        std::fs::write(&bash_env, STALL_AFTER_DEADLINE).expect("write BASH_ENV");
+        let bash_env = bash_env.to_str().expect("utf-8 temp path");
+
+        let mut lanes = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
+                let Some(script) = preflight_shell_script(step) else {
+                    continue;
+                };
+                let shell = if step.contains("-Script @'") {
+                    PreflightShell::WslBareBash
+                } else {
+                    PreflightShell::DefaultRunStep
+                };
+                lanes.push((format!("{workflow} shell lane #{i}"), script, shell));
+            }
+        }
+        assert_eq!(
+            lanes.len(),
+            8,
+            "expected 8 shell GPU preflight blocks across both workflows — if a \
+             lane was added or removed, update this count"
+        );
+
+        // A card held by a leftover serve: every lane, native or advisory,
+        // discrete or APU, must take a reading and fail on it.
+        let fixture = smi_fixture(192 * GIB, 191 * GIB, None);
+        let env = [("BASH_ENV", bash_env), ("GPU_PREFLIGHT_CEILING_SECS", "1")];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = lanes
+                .iter()
+                .map(|(label, script, shell)| {
+                    let (fixture, env) = (&fixture, &env);
+                    scope.spawn(move || (label, shell, run_preflight(script, *shell, fixture, env)))
+                })
+                .collect();
+            for handle in handles {
+                let (label, shell, got) = handle.join().expect("preflight lane thread");
+                // The advisory lanes `cd` to the runner's absolute checkout
+                // path first, so only the native ones reach the stub here.
+                if matches!(shell, PreflightShell::DefaultRunStep) {
+                    assert!(
+                        got.1.contains(REPORTED_HOLDERS),
+                        "{label}: failed without reporting the GPU's holders, logged:\n{}",
+                        got.1
+                    );
+                }
+                assert_gate(
+                    label,
+                    "deadline already past at the first check",
+                    got,
+                    (1, &["VRAM never dropped below the floor"]),
+                );
+            }
+        });
     }
 
     #[test]
