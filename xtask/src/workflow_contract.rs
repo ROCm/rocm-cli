@@ -2202,15 +2202,17 @@ esac
     /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
     /// here — see the comment at its definition. cargo-about's canonical
     /// version is the `ABOUT_VERSION` constant in `tpn.rs`, which is what
-    /// `cargo xtask tpn` itself builds against. A cargo-about bump needs six
-    /// edits across four files — the four `cargo-about@` install lines
-    /// (CONTRIBUTING.md, MANIFEST.md, ci.yml, dependabot-manifests.yml) and
-    /// the two `${{ runner.os }}-cargo-about-<version>` cache keys in ci.yml
-    /// and dependabot-manifests.yml — and this test guards all six: the
-    /// cache keys use a `-` instead of `@`, so they need their own marker row
-    /// rather than the `cargo-about@` one. A forgotten cache-key bump would
-    /// otherwise cache-hit the OLD binary while `tpn --check` enforces the
-    /// NEW version, failing loudly but in a confusing place.
+    /// `cargo xtask tpn` itself builds against. A cargo-about bump needs
+    /// seven edits across five files: `ABOUT_VERSION` itself, plus six
+    /// mirror pins — the four `cargo-about@` install lines (CONTRIBUTING.md,
+    /// MANIFEST.md, ci.yml, dependabot-manifests.yml) and the two
+    /// `${{ runner.os }}-cargo-about-<version>` cache keys in ci.yml and
+    /// dependabot-manifests.yml — and this test guards all six mirrors
+    /// against the `ABOUT_VERSION` canonical: the cache keys use a `-`
+    /// instead of `@`, so they need their own marker row rather than the
+    /// `cargo-about@` one. A forgotten cache-key bump would otherwise
+    /// cache-hit the OLD binary while `tpn --check` enforces the NEW
+    /// version, failing loudly but in a confusing place.
     ///
     /// One table, one check: a new pinned tool, or a new file that mentions
     /// an existing one, costs a row here rather than another ~30-line test.
