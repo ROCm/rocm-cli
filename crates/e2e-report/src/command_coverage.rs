@@ -6,13 +6,13 @@
 //! least one platform's E2E run, and whether they passed where they ran.
 //!
 //! Consumes [`crate::consolidated::PlatformReport`] but shares no type with
-//! the `Grid`/`PlatformReport` reconciliation model itself — this is a
-//! separate concern bolted onto the same consolidated markdown output.
+//! the `Grid`/reconciliation model itself — this is a separate concern
+//! bolted onto the same consolidated markdown output.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::consolidated::{PlatformReport, with_channel_suffix};
+use crate::consolidated::PlatformReport;
 
 /// A command signature: what we group invocations by in the coverage table.
 ///
@@ -27,14 +27,6 @@ struct CommandKey {
     engine: String,
 }
 
-/// Build the "which rocm commands are exercised, with which models/engines, on
-/// which platform, and do they work" coverage table.
-///
-/// For each (command, model, engine) × platform cell: ✅ if every scenario that
-/// ran that command on that platform passed, ❌ if any failed, blank if the
-/// command was never run there. "Passed" follows the scenario's own result, so a
-/// command that is *supposed* to be rejected (its scenario asserts the failure)
-/// still reads as ✅ — the tested behaviour held.
 /// The `rocm` command surface we measure coverage against — the denominator.
 ///
 /// Curated from the CLI's own `--help` tree (top-level subcommands and their
@@ -147,14 +139,19 @@ pub(crate) fn command_coverage_summary(
     (total - uncovered.len(), total, uncovered)
 }
 
+/// Build the "which rocm commands are exercised, with which models/engines, on
+/// which platform, and do they work" coverage table.
+///
+/// For each (command, model, engine) × platform cell: ✅ if every scenario that
+/// ran that command on that platform passed, ❌ if any failed, `n/a` if the
+/// command was never run there. "Passed" follows the scenario's own result, so a
+/// command that is *supposed* to be rejected (its scenario asserts the failure)
+/// still reads as ✅ — the tested behaviour held.
 pub(crate) fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     // Platform columns in matrix order (platform+os), de-duplicated across tiers.
     let mut columns: Vec<String> = Vec::new();
     for r in reports {
-        let col = with_channel_suffix(
-            &format!("{} {}", r.desc.platform, r.desc.os),
-            r.effective_channel(),
-        );
+        let col = r.label.clone();
         if !columns.contains(&col) {
             columns.push(col);
         }
@@ -163,10 +160,7 @@ pub(crate) fn command_coverage_markdown(reports: &[PlatformReport]) -> String {
     // key → (column → all-passed-so-far). Absent column = not run there.
     let mut cells: BTreeMap<CommandKey, BTreeMap<String, bool>> = BTreeMap::new();
     for r in reports {
-        let col = with_channel_suffix(
-            &format!("{} {}", r.desc.platform, r.desc.os),
-            r.effective_channel(),
-        );
+        let col = r.label.clone();
         let passed = r.scenario_pass_map();
         for c in &r.commands {
             // Full command as executed; fall back to the stripped signature for

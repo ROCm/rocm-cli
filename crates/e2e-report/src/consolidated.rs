@@ -24,9 +24,9 @@ use crate::parse::{
 /// Splitting these into separate fields (rather than one mashed
 /// "Gpu Strix Ubuntu" label) is what lets the matrix show distinct
 /// Platform / OS columns.
-pub(crate) struct Descriptor {
-    pub(crate) platform: String,
-    pub(crate) os: String,
+struct Descriptor {
+    platform: String,
+    os: String,
     /// True for a legacy `known-bugs` artifact (xfail-inverted). With the
     /// one-job-per-platform model these no longer exist, but the flag is retained
     /// as a stable secondary sort key so old artifacts still order predictably.
@@ -163,9 +163,11 @@ impl RunMeta {
 /// One of these corresponds to one uploaded `*-report` artifact (a
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 pub(crate) struct PlatformReport {
-    pub(crate) desc: Descriptor,
-    /// Human label kept for the per-platform detail sections.
-    label: String,
+    desc: Descriptor,
+    /// Human label kept for the per-platform detail sections, and the only
+    /// piece of `desc` the command-coverage table needs — exposed instead of
+    /// widening `desc`/`Descriptor` so a second module can't recompute it.
+    pub(crate) label: String,
     features: Vec<Feature>,
     stats: Stats,
     xfail: XfailReport,
@@ -435,7 +437,7 @@ struct GridColumn {
 }
 
 /// Append a "(channel)" suffix to `base` when known.
-pub(crate) fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
+fn with_channel_suffix(base: &str, channel: Option<&str>) -> String {
     match channel {
         Some(c) => format!("{base} ({c})"),
         None => base.to_string(),
@@ -766,7 +768,7 @@ impl PlatformReport {
     /// `versions.channel` when known, falling back to the channel captured
     /// from the artifact name for the errored-run case where no
     /// `platform.json` was ever written.
-    pub(crate) fn effective_channel(&self) -> Option<&str> {
+    fn effective_channel(&self) -> Option<&str> {
         self.versions
             .channel
             .as_deref()
@@ -2437,11 +2439,9 @@ mod tests {
         assert!(md.contains("[`ran-here`](#ran-here) | ✅ |"));
     }
 
-    // `command_base`/`matched_surface_command` are pure-function unit tests
-    // for the moved cluster; they now live with their code in
-    // `command_coverage.rs`. The two tests below stay here because they
-    // exercise the `consolidated_summary_markdown` integration pipeline, not
-    // just the extracted helpers.
+    // Pure helper unit tests live with their code in `command_coverage.rs`;
+    // the command-coverage tests here exercise the `consolidated_summary_markdown`
+    // integration pipeline instead.
 
     #[test]
     fn command_coverage_counts_against_known_surface() {
