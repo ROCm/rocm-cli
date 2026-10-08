@@ -95,16 +95,48 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
-/// Whether `runtime`'s recorded ROCm SDK version matches a ROCm 10.x
-/// discover-build row (see [`crate::install::vllm_rocm_discover_build`]).
-/// Exposed as runtime metadata so callers outside `install` — the vLLM
+/// ROCm SDK versions keyed by a row in `install.rs`'s discover-build table
+/// (see [`crate::install::vllm_rocm_discover_build`] for the recipe each one
+/// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
+/// here, in the lower layer, as the single source for which versions count —
+/// `install.rs`'s table literally uses these constants for its
+/// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
+/// matches against the same two strings, so the two can't drift apart.
+pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
+pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
+const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
+
+/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
+/// ignoring patch and any dev/pre-release suffix. See
+/// [`crate::install::vllm_rocm_discover_build`] for why the line, not the
+/// exact release, is what a discover row covers. Lives here, not in
+/// `install.rs`, alongside [`ROCM_DISCOVER_BUILD_VERSIONS`] so
+/// [`runtime_has_discover_build`] can match without calling into `install`.
+pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
+    fn series(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor.parse().ok()?))
+    }
+    series(recorded).is_some_and(|version| Some(version) == series(table_key))
+}
+
+/// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
+/// recipe. Exposed as runtime metadata, matched directly against
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `install` — the vLLM
 /// launch path in `process.rs`, specifically — don't need to reach into
-/// `install`'s build-selection table directly for a plain yes/no check.
-pub(crate) fn runtime_is_rocm10_discover_build(runtime: &VllmRuntime) -> bool {
-    runtime
-        .rocm_sdk_version
-        .as_deref()
-        .is_some_and(|version| crate::install::vllm_rocm_discover_build(version).is_some())
+/// `install`'s build-selection table for a plain yes/no check.
+pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
+    runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
+        ROCM_DISCOVER_BUILD_VERSIONS
+            .iter()
+            .any(|key| rocm_sdk_series_matches(version, key))
+    })
 }
 
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {

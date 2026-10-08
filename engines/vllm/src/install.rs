@@ -13,9 +13,9 @@ use std::process::Command as ProcessCommand;
 
 use crate::ENGINE_NAME;
 use crate::runtime::{
-    VllmRuntime, assessed_python_for_repair, describe_skipped_managed_runtimes,
-    recorded_sdk_torch_build, resolve_managed_runtime_python, resolve_vllm_runtime,
-    runtime_is_managed, vllm_runtime_warnings,
+    ROCM_SDK_10_0, ROCM_SDK_10_1, VllmRuntime, assessed_python_for_repair,
+    describe_skipped_managed_runtimes, recorded_sdk_torch_build, resolve_managed_runtime_python,
+    resolve_vllm_runtime, rocm_sdk_series_matches, runtime_is_managed, vllm_runtime_warnings,
 };
 use crate::state::runtime_lock_hash;
 
@@ -76,7 +76,7 @@ pub(crate) struct VllmRocmDiscoverBuild {
 
 const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
     VllmRocmDiscoverBuild {
-        rocm_sdk_version: "10.0.0",
+        rocm_sdk_version: ROCM_SDK_10_0,
         python_tag: "cp314",
         vllm_index_url: "https://rocm.frameworks.amd.com/whl-multi-arch/vllm/",
         torch_index_url: "https://stable.repo.amd.com/rocm/whl-next/",
@@ -88,7 +88,7 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         torchaudio_version_prefix: "2.11",
     },
     VllmRocmDiscoverBuild {
-        rocm_sdk_version: "10.1.0",
+        rocm_sdk_version: ROCM_SDK_10_1,
         python_tag: "cp314",
         vllm_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/vllm/",
         torch_index_url: "https://rocm.frameworks-prereleases.amd.com/whl-multi-arch-staging/",
@@ -120,23 +120,6 @@ pub(crate) fn vllm_rocm_discover_build(
     VLLM_ROCM_DISCOVER_BUILD_TABLE
         .iter()
         .find(|build| rocm_sdk_series_matches(rocm_sdk_version, build.rocm_sdk_version))
-}
-/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
-/// ignoring patch and any dev/pre-release suffix. See
-/// [`vllm_rocm_discover_build`] for why the line, not the exact release, is
-/// what a discover row covers.
-fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
-    fn series(version: &str) -> Option<(u64, u64)> {
-        let mut parts = version.trim().split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor: String = parts
-            .next()?
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        Some((major, minor.parse().ok()?))
-    }
-    series(recorded).is_some_and(|version| Some(version) == series(table_key))
 }
 /// Whether `recorded` (a runtime manifest's live `rocm_sdk.__version__` probe)
 /// and `table_key` (a literal key in [`VLLM_ROCM_DISCOVER_BUILD_TABLE`]) share

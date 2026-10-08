@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::runtime::{VllmRuntime, runtime_is_rocm10_discover_build};
+use crate::runtime::{VllmRuntime, runtime_has_discover_build};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
@@ -412,7 +412,7 @@ pub(crate) fn parse_gpu_indices_arg(value: Option<&str>) -> Result<Vec<u32>> {
 
 pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRuntime) -> Result<()> {
     command.env("VLLM_TARGET_DEVICE", "rocm");
-    if runtime_is_rocm10_discover_build(runtime) {
+    if runtime_has_discover_build(runtime) {
         apply_vllm_rocm10_discover_env(command, runtime)?;
     }
     let Some(root) = runtime.sdk_root.as_ref() else {
