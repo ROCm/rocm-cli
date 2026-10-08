@@ -4,8 +4,9 @@
 
 //! Shared type and enum definitions for the dashboard reducer: `Focus`,
 //! `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`,
-//! and the slash/plan/approval payload types. No `AppState` access — split
-//! out of `app/mod.rs` to keep the core reducer focused.
+//! `PaneFocus`, `ScrollTarget`, and the slash/plan/approval payload types. No
+//! `AppState` access — split out of `app/mod.rs` to keep the core reducer
+//! focused.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -437,9 +438,9 @@ pub enum UpdateStatus {
 /// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
 /// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
 ///
-/// Lives here (not in `scrollbar.rs`, despite being mouse-set there too) so
-/// `actions.rs`'s `KeyAction` dispatch and `scrollbar.rs`'s hit-testing can
-/// each depend on this type without depending on each other.
+/// Lives here, not in `scrollbar.rs`: `scrollbar.rs` defined this type but
+/// never used it, so moving it out removes `actions.rs`'s only import from
+/// `scrollbar.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneFocus {
     /// Browsing the Actions list (left column).
