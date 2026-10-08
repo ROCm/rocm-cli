@@ -10,16 +10,20 @@ This page describes each `rocm` command, its options, and what it does. For a
 short list of the commands and what each is for, see
 [Getting started](getting-started.md).
 
+## Commands
+
 ```{include} ../../README.md
-:start-after: "## Commands"
-:end-before: "and a chat tab backed by any configured provider."
+:start-after: "<!-- docs-site: commands-start -->"
+:end-before: "<!-- docs-site: interactive-link-start -->"
 ```
 
-and a chat tab backed by any configured provider. See
-[Interactive interfaces](getting-started.md#interactive-interfaces) for the
+<!-- Deliberate copy of the paragraph between the interactive-link markers in
+README.md, with the cross-reference retargeted to this site. Edit both
+together. -->
+See [Interactive interfaces](getting-started.md#interactive-interfaces) for the
 tab breakdown.
 
 ```{include} ../../README.md
-:start-after: "for the tab breakdown."
+:start-after: "<!-- docs-site: interactive-link-end -->"
 :end-before: "## Contributing"
 ```
