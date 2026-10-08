@@ -9,10 +9,11 @@ use crate::persistence::load_managed_services;
 use crate::service::stop_managed_service;
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
+use rocm_core::command_failure_detail;
 use rocm_core::{
     AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
-    command_failure_detail, model_artifact_cache_status, resolve_model_recipe_artifact,
-    unix_time_millis,
+    model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
 };
 use serde_json::Value;
 use serde_json::json;
