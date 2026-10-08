@@ -1167,7 +1167,7 @@ mod tests {
     async fn run_agent_request_registers_tool_sets_and_enforces_turn_limit() {
         use rig::test_utils::{MockCompletionModel, MockTurn};
 
-        let turns: Vec<MockTurn> = (0..MAX_TOOL_TURNS + 2)
+        let turns: Vec<MockTurn> = (0..MAX_TOOL_TURNS + 5)
             .map(|i| MockTurn::tool_call(format!("call_{i}"), "gpu_status", json!({})))
             .collect();
         let model = MockCompletionModel::new(turns);
@@ -1220,8 +1220,11 @@ mod tests {
 
         // Sanity bound on the request count: enough to have tried every
         // scripted turn up to the limit, not an early bail-out or a runaway
-        // loop. Not pinned to rig-core's exact internal +1/-1 boundary, which
-        // this test does not mean to assert.
+        // loop. The script above is deliberately longer than this bound
+        // (MAX_TOOL_TURNS + 5 turns scripted, vs. MAX_TOOL_TURNS + 2 expected
+        // requests) so the turn limit — not running out of scripted turns —
+        // is what ends the loop; rig-core 0.38.1's own +1/-1 internal
+        // bookkeeping is what fixes the request count at MAX_TOOL_TURNS + 2.
         assert!(
             (MAX_TOOL_TURNS..=MAX_TOOL_TURNS + 2).contains(&recorded.request_count()),
             "expected roughly MAX_TOOL_TURNS requests, got {}",
