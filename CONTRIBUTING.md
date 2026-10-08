@@ -46,7 +46,7 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
 
 The manifest hooks only run when you change the dependency graph, and they *rewrite* the generated file rather than just reporting it stale — when that happens the commit stops so you can re-stage the refreshed file. `THIRD_PARTY_NOTICES.txt` additionally needs the pinned generator; without it that hook skips and CI remains the gate:
 
@@ -61,6 +61,12 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 ```
 
 To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
+
+The markdown-links hook (`lychee`) runs on every commit, over the whole repo rather than just the changed files, since moving or deleting a file can break a link in a markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. Like `hawkeye`, prek doesn't provision the binary and the hook fails hard when it's missing:
+
+```bash
+cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
+```
 
 ### Workspace layout
 
@@ -79,7 +85,7 @@ New subcommands and subsystems default to their own file from day one — don't 
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
 
-Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead — is checked by the `docs-links` CI job (`lychee.toml`); it runs offline only, so it doesn't catch broken external `https://` links (see `lychee.toml` for the current exclusions).
+Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which the `./**/*.md` glob skips — is checked by the `docs-links` CI job (`lychee.toml`) and by the `lychee` prek hook above; both run offline only, so they don't catch broken external `https://` links (see `lychee.toml` for the current exclusions).
 
 ### Test commands
 

@@ -1,7 +1,9 @@
-# Config for the `docs-links` CI job (.github/workflows/ci.yml), which checks
-# every markdown link in the repo resolves, including docs/architecture.md's
-# path citations — see issue #578. Replaces the hand-rolled path-citation
-# checker that used to live in xtask/src/architecture_doc.rs, now deleted.
+# Config for the `docs-links` CI job (.github/workflows/ci.yml) and the matching
+# `lychee` prek hook (.pre-commit-config.yaml), which check every markdown link
+# in the repo outside hidden directories resolves, including
+# docs/architecture.md's path citations — see issue #578. Replaces the
+# hand-rolled path-citation checker that used to live in
+# xtask/src/architecture_doc.rs, now deleted.
 
 # Only check local file/anchor links, no network requests. Keeps this gate
 # immune to external-host flakiness (rate limits, transient DNS) — see the
@@ -23,6 +25,11 @@ exclude = [
 # time from `{include}` directives lychee doesn't evaluate, so it reports
 # false positives there. That tree's correctness is already covered by the
 # `docs-build` (Sphinx -W) CI job, which does understand MyST.
+#
+# The optional `./` matches the prek hook, which walks the directory `.` (so
+# .gitignore is honoured) and sees paths as `./docs/...`; the CI glob sees
+# `docs/...`. Either separator is accepted because the hook also runs on
+# Windows.
 exclude_path = [
-  '^docs/rocm-docs/',
+  '^(\.[/\\])?docs[/\\]rocm-docs[/\\]',
 ]
