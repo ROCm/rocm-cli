@@ -225,7 +225,6 @@ where
 /// shared site. A backend with ordering constraints (ChatGPT's auth must not
 /// run on an empty history) does its own cheap `history.is_empty()` guard
 /// first — see `ChatGptAgentClient::complete` — without needing the split.
-#[allow(clippy::too_many_arguments)]
 async fn run_agent_request<M, P>(
     agent: rig::agent::AgentBuilder<M, P>,
     params: &InferenceParams,
