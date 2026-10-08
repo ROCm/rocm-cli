@@ -522,10 +522,12 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
     // overlay closes; then a focused/gating Chat tab absorbs Esc; only once
     // none of those apply does Esc fall through to the uniform "menu"
     // fallback (item #35). Mirror that order here so the chip never
-    // advertises `menu` while a click on it would actually do something else
-    // — including, for quit-confirm, dispatching `PaneEscape` underneath the
-    // still-open prompt, since footer-chip clicks bypass the later
-    // `overlay_or_approval()` body swallow by design.
+    // advertises `menu` while the Esc *key* would actually do something else.
+    // A click on the chip itself can no longer disagree with this label for
+    // quit-confirm/approval: `resolve_mouse`'s `blocks_body_absolutely()`
+    // guard swallows a footer-chip click there before `footer_chip_hit` ever
+    // resolves one (issue #145) — this label logic still has to track the
+    // manager-overlay case, where a chip click does dispatch.
     if state.blocks_body_absolutely() {
         segs.push(Seg::Key("Esc", None));
         segs.push(Seg::Sep(" cancel  "));

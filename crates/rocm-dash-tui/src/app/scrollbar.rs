@@ -98,16 +98,20 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     }
 
     if me.kind == MouseEventKind::Down(MouseButton::Left) {
+        // A pending approval or quit-confirm prompt (issue #145) owns the
+        // body with no exception — including the tab bar and footer-legend
+        // chips below, not just the scrollbar track: neither modal registers
+        // any of the three for itself, so a hit on any of them belongs to
+        // content underneath it. Swallowing only the scrollbar check here
+        // once let a tab-bar click still land `SwitchTab` and change tabs
+        // behind the open prompt, bypassing it entirely (mirrors the
+        // wheel-scroll swallow further down).
+        if state.blocks_body_absolutely() {
+            return KeyAction::Nothing;
+        }
         // Scrollbar tracks win over a plain open overlay (incl. its console
-        // bar), so a click on the bar grabs it instead of falling through —
-        // but NOT over a pending approval or quit-confirm prompt (issue
-        // #145): nothing registers a scrollbar for either modal itself, so
-        // any handle on screen while one is pending belongs to content
-        // underneath it, which the swallow below must still catch rather
-        // than let a scrollbar drag bypass it.
-        if !state.blocks_body_absolutely()
-            && let Some(a) = scrollbar_hit(state, me.column, me.row)
-        {
+        // bar), so a click on the bar grabs it instead of falling through.
+        if let Some(a) = scrollbar_hit(state, me.column, me.row) {
             return a;
         }
         if let Some(area) = state.last_tab_bar_area
@@ -119,14 +123,16 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
         if let Some(chip) = footer_chip_hit(&state.last_footer_chips, me.column, me.row) {
             return chip;
         }
-        // While an operational manager is open — or a chat tool-call approval
-        // is pending — it owns the body: swallow body clicks so they can't
-        // fall THROUGH to the obscured Actions/Details list (which would
-        // silently change the selection, re-open a verb, or switch tabs
-        // underneath the approval modal). Tab-bar and footer-chip clicks
-        // above still work, matching the manager-overlay swallow this
-        // mirrors (see the analogous `overlay_or_approval()` check in
-        // ui/mod.rs's footer-chip gating).
+        // While an operational manager is open it owns the body: swallow body
+        // clicks so they can't fall THROUGH to the obscured Actions/Details
+        // list (which would silently change the selection or re-open a
+        // verb). The approval/quit-confirm half of `overlay_or_approval()`
+        // never actually reaches here — the `blocks_body_absolutely()` return
+        // above already caught it, tab bar and footer chips included — so by
+        // the time this check runs it has reduced to `has_open_overlay()`;
+        // written via `overlay_or_approval()` anyway so this can't silently
+        // drift from the manager-overlay swallow it mirrors (see the
+        // analogous check in ui/mod.rs's footer-chip gating).
         if state.overlay_or_approval() {
             return KeyAction::Nothing;
         }
@@ -589,6 +595,45 @@ mod tests {
             KeyAction::ScrollGrab(ScrollTarget::Console, 90, 0)
         );
         s.open_quit_confirm();
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn tab_bar_click_is_swallowed_while_quit_confirm_is_pending() {
+        // A click on the tab bar was never gated by `blocks_body_absolutely()`
+        // the way the scrollbar check above is — it still resolved to
+        // `SwitchTab` and `apply_action` applied it, changing tabs/focus
+        // behind the open quit-confirm prompt (issue #145).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.last_tab_bar_area = Some(Rect::new(0, 0, 80, 1));
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 15, 0);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::SwitchTab(ActiveTab::Rocm)
+        );
+        s.open_quit_confirm();
+        assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn tab_bar_click_is_swallowed_while_an_approval_is_pending() {
+        // Twin of the quit-confirm case above: `blocks_body_absolutely()` is
+        // `approval_pending() || quit_confirm_pending()`, so the same gap
+        // applied to a pending chat-tool-call approval too, not just
+        // quit-confirm — the fix is the same one `if` for both.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.last_tab_bar_area = Some(Rect::new(0, 0, 80, 1));
+        let click = wheel(MouseEventKind::Down(MouseButton::Left), 15, 0);
+        assert_eq!(
+            resolve_mouse(click, &s),
+            KeyAction::SwitchTab(ActiveTab::Rocm)
+        );
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "run a command".into(),
+            body: vec!["echo hi".into()],
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        });
         assert_eq!(resolve_mouse(click, &s), KeyAction::Nothing);
     }
 
