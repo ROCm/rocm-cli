@@ -101,7 +101,10 @@ repos:
 
   # Markdown links: mirrors the `docs-links` CI job, the only check that a
   # relative link (e.g. a docs/architecture.md path citation) still resolves.
-  # Requires: lychee, pinned version documented in CONTRIBUTING.md
+  # Optional: lychee, pinned version documented in CONTRIBUTING.md. When it is
+  # not installed the hook warns and passes, so a missing tool never blocks a
+  # commit; `docs-links` stays the hard gate. Unlike cargo-tpn it does not
+  # check the version: a different lychee still runs.
   - repo: local
     hooks:
       - id: lychee
@@ -113,8 +116,9 @@ repos:
         # the same set. This still checks the working tree, not the commit:
         # an untracked, non-ignored .md is checked here but not in CI, and a
         # link to a file you haven't `git add`ed passes here but fails in CI.
-        entry: lychee --config lychee.toml --extensions md .
-        language: system
+        entry: python scripts/lychee_if_available.py --config lychee.toml --extensions md .
+        language: python
+        verbose: true # surfaces the skip warning; the script is silent on a pass
         # A rename or deletion anywhere can break a link without touching any
         # .md, and a delete-only commit has no changed files to match a filter.
         always_run: true
