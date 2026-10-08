@@ -1255,6 +1255,9 @@ All installed packages are compatible
         );
 
         let start = Arc::new(Barrier::new(2));
+        // Collected on purpose: joining the lazy iterator would spawn and join one
+        // thread at a time, and the bootstraps would never overlap.
+        #[allow(clippy::needless_collect)]
         let bootstraps: Vec<_> = (0..2)
             .map(|_| {
                 let paths = paths.clone();
@@ -1275,7 +1278,7 @@ All installed packages are compatible
         stop.store(true, Ordering::SeqCst);
         server.join().expect("server thread");
         let leftovers: Vec<String> = std::fs::read_dir(&uv_root)?
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name != "9.9.9" && name != "9.9.9.lock")
             .collect();
