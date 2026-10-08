@@ -27,6 +27,11 @@ use crate::state::{
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
+/// Default time to wait for packaged llama-server to report the model on
+/// `/v1/models` before giving up.
+const DEFAULT_LEMONADE_READY_TIMEOUT: Duration = Duration::from_mins(2);
+/// Overrides [`DEFAULT_LEMONADE_READY_TIMEOUT`] (a positive integer number of seconds).
+const LEMONADE_READY_TIMEOUT_ENV: &str = "ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LemonadeProcessEnvironment {
@@ -539,7 +544,7 @@ pub(crate) fn serve_direct_llama_server(
             &request.host,
             request.port,
             &request.model_ref,
-            Duration::from_mins(2),
+            lemonade_ready_timeout(),
         )?;
         if !query_chat_smoke_endpoint(&request.host, request.port, &request.model_ref)? {
             bail!("Lemonade packaged llama-server did not pass a chat-completion smoke test");
@@ -615,9 +620,29 @@ fn wait_for_openai_models_ready(
         std::thread::sleep(Duration::from_millis(500));
     }
     bail!(
-        "Lemonade packaged llama-server did not become ready: {}",
+        "Lemonade packaged llama-server did not become ready within {}s: {}; \
+         a large model on a slower GPU can take longer to load — set \
+         {LEMONADE_READY_TIMEOUT_ENV} to a larger number of seconds and retry",
+        timeout.as_secs(),
         last_error.unwrap_or_else(|| "not checked".to_owned())
     )
+}
+
+/// Time to wait for packaged llama-server to become ready before terminating it.
+///
+/// Defaults to [`DEFAULT_LEMONADE_READY_TIMEOUT`]. llama-server answers 503 while it
+/// is still loading weights, and a large model on a slower GPU can stay in that
+/// state well past the default, so the timeout is configurable via
+/// `ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS` (a positive integer number of seconds).
+fn lemonade_ready_timeout() -> Duration {
+    resolve_lemonade_ready_timeout(std::env::var(LEMONADE_READY_TIMEOUT_ENV).ok())
+}
+
+fn resolve_lemonade_ready_timeout(override_value: Option<String>) -> Duration {
+    override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(DEFAULT_LEMONADE_READY_TIMEOUT, Duration::from_secs)
 }
 
 fn parse_models_ready(body: &str, model_ref: &str) -> Result<bool> {
@@ -799,6 +824,109 @@ fn lemonade_backend_matches(value: &str, backend: &str) -> bool {
 mod tests {
     use super::*;
     use crate::DEFAULT_MODEL;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::Instant;
+
+    /// Stand in for a packaged llama-server on a loopback port: answer `/v1/models`
+    /// with 503 (still loading weights) until `load_time` has elapsed, then report
+    /// `model_ref`. Serves until `serve_for` has elapsed.
+    fn spawn_loading_llama_server(
+        model_ref: &'static str,
+        load_time: Duration,
+        serve_for: Duration,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < serve_for {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                stream.set_nonblocking(false).ok();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer);
+                let (status_line, body) = if started.elapsed() < load_time {
+                    (
+                        "HTTP/1.1 503 Service Unavailable",
+                        r#"{"error":{"message":"Loading model","code":503}}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        "HTTP/1.1 200 OK",
+                        json!({"data": [{"id": model_ref}]}).to_string(),
+                    )
+                };
+                let _ = write!(
+                    stream,
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn lemonade_ready_timeout_uses_default_without_override() {
+        assert_eq!(
+            resolve_lemonade_ready_timeout(None),
+            DEFAULT_LEMONADE_READY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn lemonade_ready_timeout_honors_positive_override() {
+        assert_eq!(
+            resolve_lemonade_ready_timeout(Some(" 900 ".to_owned())),
+            Duration::from_mins(15)
+        );
+    }
+
+    #[test]
+    fn lemonade_ready_timeout_ignores_invalid_or_zero_override() {
+        for value in ["0", "-5", "not-a-number", ""] {
+            assert_eq!(
+                resolve_lemonade_ready_timeout(Some(value.to_owned())),
+                DEFAULT_LEMONADE_READY_TIMEOUT,
+                "override {value:?} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn slow_model_load_times_out_and_the_named_override_lets_it_finish() {
+        // A model still loading (503) when the window closes fails readiness, and
+        // the error names the override that fixes it.
+        let model = "unsloth/gemma-3-27b-it-GGUF:Q4_K_M";
+        let port =
+            spawn_loading_llama_server(model, Duration::from_mins(1), Duration::from_secs(3));
+        let error = wait_for_openai_models_ready("127.0.0.1", port, model, Duration::from_secs(1))
+            .expect_err("a server still answering 503 must not be reported ready");
+        let message = error.to_string();
+        assert!(message.contains("within 1s"), "{message}");
+        assert!(message.contains("503"), "{message}");
+        assert!(message.contains(LEMONADE_READY_TIMEOUT_ENV), "{message}");
+
+        // The remediation is real: a load that outlasts that 1s window reaches ready
+        // once the override supplies a longer one.
+        let port =
+            spawn_loading_llama_server(model, Duration::from_millis(1500), Duration::from_secs(10));
+        let timeout = resolve_lemonade_ready_timeout(Some("8".to_owned()));
+        let started = Instant::now();
+        wait_for_openai_models_ready("127.0.0.1", port, model, timeout)
+            .expect("the override's longer window lets the load finish");
+        assert!(
+            started.elapsed() > Duration::from_secs(1),
+            "the load must have outlasted the 1s window that failed above"
+        );
+    }
 
     #[test]
     fn models_ready_accepts_direct_serve_and_gates_router_backend() {

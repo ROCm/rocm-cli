@@ -596,6 +596,17 @@ with an explicit quantization variant, for example,
 safetensors-only id has no GGUF build, so serving it through Lemonade fails
 rather than silently substituting a different model.
 
+`rocm serve` gives the engine a fixed window to load the model and report it
+ready, then stops the server and marks the service failed. When Lemonade runs
+its packaged llama-server directly (a Hugging Face `owner/repo:variant` model, or
+any model on Linux) the window is 2 minutes; for vLLM it is 5 minutes. A large
+model on a slower GPU can need longer — raise the window, in seconds, with
+`ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS` or `ROCM_CLI_VLLM_READY_TIMEOUT_SECS`:
+
+```bash
+ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS=900 rocm serve unsloth/gemma-3-27b-it-GGUF:Q4_K_M
+```
+
 Some models (such as Llama) are gated and require HuggingFace authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
