@@ -6,13 +6,18 @@
 //!
 //! Mechanically relocated from `main.rs` with no behavior change — the
 //! `dispatch()` call site stays byte-identical (`engines(command)`,
-//! re-imported via `use crate::engines_cmd::engines;`). `EnginesCommand`
+//! re-imported via `use crate::engines_cmd::{engine_manages_own_runtime,
+//! engines, env_root_for_engine_install, env_root_for_service,
+//! runtime_key_for_python, runtime_manifest_for_selector};`). `EnginesCommand`
 //! remains in the crate root and is reached via `use crate::EnginesCommand`;
 //! `Cli` is not referenced from this file. `engine_manages_own_runtime` is
 //! called from `main.rs` and also from `serve_cmd.rs`; `ensure_self_managed_engine_ready`'s
-//! only caller is `serve_cmd.rs`; the remaining env-root/runtime helpers here
-//! are used only from other root-level commands in `main.rs` — all stay
-//! `pub(crate)` rather than private either way.
+//! only caller is `serve_cmd.rs`; `env_root_for_engine_install`,
+//! `env_root_for_service`, `runtime_key_for_python`, and
+//! `runtime_manifest_for_selector` are used only from other root-level
+//! commands in `main.rs` — all stay `pub(crate)` rather than private either
+//! way. `render_engine_inventory_text` is the one exception: its only caller
+//! is `engines()` in this same file, not `main.rs`.
 
 use std::fs;
 use std::path::{Path, PathBuf};

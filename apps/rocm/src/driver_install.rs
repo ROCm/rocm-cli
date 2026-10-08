@@ -10,8 +10,10 @@
 //! `use crate::driver_install::{install_driver, reconcile_driver_install};`).
 //! `InstallTarget`/`Cli` remain in the crate root; neither is referenced
 //! from this file. Unlike `automations.rs`/`uninstall.rs`, this cluster owns
-//! private types (`DriverInstallPlan` and friends) used nowhere else, so
-//! those moved here too rather than staying in `main.rs`.
+//! private types (`DriverInstallPlan` and friends), so those moved here too
+//! rather than staying in `main.rs`. `DriverInstallResult`/`DriverInstallError`
+//! are the exception: they're `pub(crate)` and read from `main.rs`'s
+//! `install()` (`result.output`/`result.executed`, `error.source`/`error.executed`).
 
 use std::fmt::Write as _;
 use std::fs;

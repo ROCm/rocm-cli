@@ -26,9 +26,12 @@ mod uninstall;
 // Per-command handlers mechanically relocated into modules — fns, plus the
 // types (e.g. `ServeArgs`, driver-plan types) that moved with their cluster.
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
-// mergeability); the exception is `select_serve_engine` (a fn, not a type),
-// re-imported because `assess_model_for_host` calls it directly, not because
-// dispatch needs it.
+// mergeability); several helpers are re-imported for reasons other than
+// dispatch: `select_serve_engine` because `assess_model_for_host` calls it
+// directly, and `env_root_for_service`, `env_root_for_engine_install`,
+// `runtime_manifest_for_selector`, `engine_manages_own_runtime`, and
+// `runtime_key_for_python` because other root-level commands outside
+// `dispatch()` call them directly.
 use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{
