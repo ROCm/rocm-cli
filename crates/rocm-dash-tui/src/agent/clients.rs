@@ -220,16 +220,18 @@ where
 /// `RigAgentClient::complete`, `ChatGptAgentClient::complete`, and
 /// `AnthropicAgentClient::complete` (ROCMAI-200). Each backend still builds its
 /// own agent (client/model construction and any backend-specific setup, e.g.
-/// ChatGPT's device-code auth, differ) and still owns its own empty-history
-/// check and backend tag — only the shared middle is here.
+/// ChatGPT's device-code auth, differ) and still owns its own backend tag; the
+/// `history` split (and its `AgentError::Empty` case) lives here, the one
+/// shared site. A backend with ordering constraints (ChatGPT's auth must not
+/// run on an empty history) does its own cheap `history.is_empty()` guard
+/// first — see `ChatGptAgentClient::complete` — without needing the split.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_request<M, P>(
     agent: rig::agent::AgentBuilder<M, P>,
     params: &InferenceParams,
     executor: Option<&SharedRocmToolExecutor>,
     approval_tx: Option<&UnboundedSender<ClientMsg>>,
-    last: &str,
-    prior: &[ChatTurn],
+    history: &[ChatTurn],
     snapshot: StateSnapshot,
     backend: &'static str,
 ) -> Result<String, AgentError>
@@ -238,6 +240,10 @@ where
     P: rig::agent::PromptHook<M> + 'static,
 {
     use rig::completion::Prompt;
+
+    let Some((last, prior)) = history.split_last() else {
+        return Err(AgentError::Empty);
+    };
 
     let snap = Arc::new(snapshot);
     let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
@@ -251,7 +257,7 @@ where
     let agent = register_rocm_mutating_tools(agent, executor, approval_tx, &fired).build();
 
     let req = agent
-        .prompt(last.to_string())
+        .prompt(last.content.clone())
         .max_turns(MAX_TOOL_TURNS)
         .with_history(build_messages(prior));
 
@@ -341,17 +347,13 @@ impl AgentClient for RigAgentClient {
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
 
-        let Some((last, prior)) = history.split_last() else {
-            return Err(AgentError::Empty);
-        };
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
         run_agent_request(
             agent,
             &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &last.content,
-            prior,
+            history,
             snapshot,
             "rig-openai",
         )
@@ -467,9 +469,13 @@ impl AgentClient for ChatGptAgentClient {
         use rig::agent::AgentBuilder;
         use rig::providers::chatgpt::ResponsesCompletionModel;
 
-        let Some((last, prior)) = history.split_last() else {
+        // Cheap pre-check: reject an empty history before device login or
+        // network I/O. `run_agent_request` re-derives this from `history`
+        // itself (the one shared split site); this guard only exists for the
+        // ordering, not the check.
+        if history.is_empty() {
             return Err(AgentError::Empty);
-        };
+        }
 
         // OpenAI's Responses API defines temperature and top_p as mutually
         // exclusive. Reject the combination before device login or network I/O.
@@ -490,8 +496,7 @@ impl AgentClient for ChatGptAgentClient {
             &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &last.content,
-            prior,
+            history,
             snapshot,
             "chatgpt-oauth",
         )
@@ -567,10 +572,6 @@ impl AgentClient for AnthropicAgentClient {
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
 
-        let Some((last, prior)) = history.split_last() else {
-            return Err(AgentError::Empty);
-        };
-
         // Tool registration is delegated to run_agent_request, the single
         // shared site all three backends (RigAgentClient, ChatGptAgentClient,
         // AnthropicAgentClient) now call: the SAME telemetry/skill tools +
@@ -582,8 +583,7 @@ impl AgentClient for AnthropicAgentClient {
             &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &last.content,
-            prior,
+            history,
             snapshot,
             "anthropic",
         )
@@ -1177,17 +1177,13 @@ mod tests {
 
         let params = InferenceParams::default();
         let history = [ChatTurn::user("loop forever")];
-        let Some((last, prior)) = history.split_last() else {
-            unreachable!("history is non-empty");
-        };
 
         let err = run_agent_request(
             agent,
             &params,
             None,
             None,
-            &last.content,
-            prior,
+            &history,
             fixture_snapshot(),
             "mock-test",
         )
