@@ -1767,6 +1767,57 @@ esac
         );
     }
 
+    /// Runs the publish job's real empty-report guard against the generator's
+    /// real empty output, so rewording either side (or breaking the guard's
+    /// exit) is caught by behavior rather than by pinning strings.
+    #[cfg(unix)]
+    #[test]
+    fn wiki_publish_guard_stops_on_the_generators_empty_output() {
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.trim_start().starts_with("if grep -q 'No per-platform"))
+            .expect("publish job has the empty-report guard");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.trim() == "fi")
+                .expect("guard is closed by fi");
+        let guard = lines[start..=end].join("\n");
+
+        let run = |matrix: &str| -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "wiki-guard-{}-{}",
+                std::process::id(),
+                matrix.len()
+            ));
+            std::fs::create_dir_all(dir.join("consolidated")).unwrap();
+            std::fs::write(dir.join("consolidated/support-matrix.md"), matrix).unwrap();
+            let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(&dir)
+                .output()
+                .expect("run bash");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let empty = e2e_report::consolidated_summary_markdown(&[]);
+        assert!(
+            !run(&empty).contains("REACHED_PUBLISH"),
+            "the generator's empty output must stop the publish"
+        );
+        assert!(
+            run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),
+            "a matrix with platforms must reach the publish step"
+        );
+    }
+
     #[test]
     fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
         let self_hosted = read_workflow("e2e-selfhosted.yml");
