@@ -81,7 +81,7 @@ cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (
 
 ### Module organization
 
-New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full — its path citations are relative markdown links, checked for resolution (not prose accuracy) by the `docs-links` job below.
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full — the file citations in its per-crate inventories are relative markdown links, checked for resolution (not prose accuracy) by the `docs-links` job below.
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
 

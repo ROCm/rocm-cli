@@ -1,8 +1,9 @@
 # Config for the `docs-links` CI job (.github/workflows/ci.yml) and the matching
 # `lychee` prek hook (.pre-commit-config.yaml), which check every markdown link
-# in the repo outside hidden directories resolves, including
-# docs/architecture.md's path citations — see issue #578. Replaces the
-# hand-rolled path-citation checker that used to live in
+# in the repo outside hidden directories resolves, including the file
+# citations in docs/architecture.md's per-crate inventories — see issue #578
+# (its section headings and directory names stay bare and unchecked). Replaces
+# the hand-rolled path-citation checker that used to live in
 # xtask/src/architecture_doc.rs, now deleted.
 
 # Only check local file/anchor links, no network requests. Keeps this gate
