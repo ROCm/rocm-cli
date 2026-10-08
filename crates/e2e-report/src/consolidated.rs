@@ -1711,15 +1711,13 @@ mod tests {
     }
 
     #[test]
-    fn from_reports_entry_points_match_their_reparsing_wrappers() {
+    fn wrapper_entry_points_delegate_through_from_reports() {
         // ROCMAI-484: generate_consolidated/consolidated_summary_markdown now
         // delegate to the *_from_reports entry points via load_platform_reports.
-        // Calling the _from_reports path directly with the same `reports` that
-        // load_platform_reports(inputs) would produce must render identically to
-        // the convenience wrappers — this only shows the two call shapes compose
-        // the same way; it does not show `_from_reports` actually uses `reports`
-        // rather than re-deriving it from `inputs` (see
-        // from_reports_entry_points_follow_reports_not_inputs for that).
+        // This is a delegation check only: it shows the two call shapes compose
+        // without diverging, not that `_from_reports` actually uses `reports`
+        // rather than re-deriving it from `inputs` — that behavior is covered by
+        // from_reports_entry_points_follow_reports_not_inputs instead.
         let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
         let inputs = vec![
