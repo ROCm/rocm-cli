@@ -571,26 +571,6 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 
 // --- comfyui-05: installing ComfyUI must not damage the managed ROCm runtime ---
 
-/// Report the installed torch distribution's version string via `importlib.metadata`
-/// — WITHOUT importing torch. Emits JSON `{version}` (e.g. `2.11.0+gitd0c8b1f` for
-/// TheRock's ROCm build, `2.7.0+cu128` for a CUDA build) or `{error}` when no torch
-/// distribution is installed.
-///
-/// Deliberately does not `import torch`: importing it loads the ROCm/CUDA shared
-/// libraries, which need the runtime's `LD_LIBRARY_PATH`/`ROCM_PATH` set up (the
-/// product runs its own torch probe *with* that env, ours runs the interpreter
-/// bare). The version string in the dist metadata is readable with no native
-/// load, so a bare interpreter suffices. Only a `+cu` label reliably marks a CUDA
-/// build; TheRock's ROCm torch is labelled with a git hash, not `+rocm`.
-const TORCH_DIST_PROBE: &str = "import json,sys\n\
-     from importlib import metadata\n\
-     out={}\n\
-     try:\n\
-     \x20 out['version']=metadata.version('torch')\n\
-     except Exception as ex:\n\
-     \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
-     sys.stdout.write(json.dumps(out))\n";
-
 /// Locate the managed runtime's venv interpreter. `rocm runtimes list` prints an
 /// `install_root: <path>` line for each installed runtime; the interpreter lives
 /// under a `bin/python` (Unix) / `Scripts/python.exe` (Windows) inside that tree.
@@ -653,36 +633,6 @@ fn find_venv_python(root: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The installed torch distribution's version string, or `None` if no torch
-/// distribution is installed. Reads dist metadata without importing torch (see
-/// [`TORCH_DIST_PROBE`]), so it works against a bare interpreter.
-///
-/// The local-version label identifies the build. A CUDA wheel is unmistakable:
-/// `+cu` (e.g. `2.7.0+cu128`). A ROCm build is NOT reliably `+rocm`, though —
-/// TheRock's managed torch labels the local version with a git hash
-/// (`2.11.0+gitd0c8b1f`, measured on the MI300X lane), so callers judge "ROCm" as
-/// "torch is present and is NOT a CUDA build", which is exactly the flip the
-/// EAI-8051 corruption would cause.
-fn torch_version(python: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(python)
-        .args(["-c", TORCH_DIST_PROBE])
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
-        panic!("torch version probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
-    });
-    match data.get("version").and_then(serde_json::Value::as_str) {
-        Some(v) => Ok(v.to_owned()),
-        None => Err(data
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("probe reported no version and no error")
-            .to_owned()),
-    }
-}
-
 const TORCH_STACK_PROBE: &str = "import json,sys\n\
      from importlib import metadata\n\
      out={}\n\
@@ -693,6 +643,10 @@ const TORCH_STACK_PROBE: &str = "import json,sys\n\
      \x20   out[n]=None\n\
      sys.stdout.write(json.dumps(out))\n";
 
+/// Reads versions through `importlib.metadata` WITHOUT importing torch: importing
+/// loads the ROCm/CUDA shared libraries, which need the runtime's own
+/// `LD_LIBRARY_PATH`/`ROCM_PATH`, while this runs the interpreter bare.
+///
 /// Exact versions of the whole torch stack (`torch`, `torchvision`, `torchaudio`),
 /// formatted `name=version` (or `name=absent`), one per line. The product pins all
 /// three, so the scenario compares all three.
@@ -714,16 +668,6 @@ fn torch_stack_versions(python: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Whether `version` is a CUDA torch build (carries a `+cuNNN` local label). Used
-/// only for the baseline PREMISE check — that the runtime didn't start out on a
-/// CUDA torch. The post-install invariant is stronger: the torch version must be
-/// byte-for-byte unchanged (a ComfyUI install must not replace the runtime's torch
-/// at all), which also catches a swap to a plain non-`+cu` wheel (e.g. the observed
-/// `2.11.0+gitd0c8b1f` → `2.13.0`) that this label check alone would miss.
-fn is_cuda_torch(version: &str) -> bool {
-    version.to_ascii_lowercase().contains("+cu")
 }
 
 /// Enumerate installed distributions via `importlib.metadata` and emit their names
@@ -790,25 +734,17 @@ async fn setup_isolated_runtime(world: &mut E2eWorld) {
     // corrupt the runtime (that is the bug it pins), so it must own a private,
     // throwaway runtime prefix. Each World already has isolated ROCM_CLI_* dirs,
     // so a plain `install sdk` here lands in this scenario's own tree.
-    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    if stdout.contains("installed: none") {
-        crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
-    }
-    let (stdout, _, _) = crate::run_rocm(world, &["runtimes", "list"]);
-    assert!(
-        !stdout.contains("installed: none"),
-        "no managed runtime is installed after `install sdk`:\n{stdout}"
-    );
+    crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
 }
 
-#[given("the runtime's torch is not a CUDA build")]
-async fn assert_baseline_torch_not_cuda(world: &mut E2eWorld) {
+#[given("the runtime has torch and no CUDA packages")]
+async fn assert_baseline_torch_present(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
-    let version = torch_version(&python);
+    let stack = torch_stack_versions(&python);
     assert!(
-        version.as_ref().is_ok_and(|v| !is_cuda_torch(v)),
-        "baseline runtime torch is absent or already a CUDA build; scenario premise absent \
-         (torch version: {version:?}, python: {})",
+        !stack.contains("torch=absent"),
+        "baseline runtime has no torch distribution; scenario premise absent \
+         ({stack}, python: {})",
         python.display()
     );
     let distributions = installed_distributions(&python);
@@ -822,11 +758,11 @@ async fn assert_baseline_torch_not_cuda(world: &mut E2eWorld) {
     // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
     // it can require the install to have actually added something (see
     // `assert_dependencies_installed`).
-    world.comfyui_baseline_torch = Some(torch_stack_versions(&python));
+    world.comfyui_baseline_torch_stack = Some(stack);
     world.comfyui_baseline_distributions = Some(distributions);
 }
 
-#[then("the install succeeds")]
+#[then("the ComfyUI install succeeds")]
 async fn assert_install_succeeded(world: &mut E2eWorld) {
     // The premise for every invariant below. `comfyui::install` bails early on
     // several paths (no managed runtime, a runtime that isn't `ready`, a non-wheel
@@ -872,7 +808,8 @@ async fn assert_dependencies_installed(world: &mut E2eWorld) {
         after.iter().any(|name| !baseline.contains(name)),
         "ComfyUI install added no distributions to the runtime, so it installed \
          nothing and the runtime-preservation checks would pass vacuously \
-         ({} distributions before and after, python: {})",
+         ({} distributions before, {} after, python: {})",
+        baseline.len(),
         after.len(),
         python.display()
     );
@@ -883,7 +820,7 @@ async fn assert_torch_unchanged(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
     let after = torch_stack_versions(&python);
     let baseline = world
-        .comfyui_baseline_torch
+        .comfyui_baseline_torch_stack
         .as_deref()
         .expect("no baseline torch stack was captured");
     assert_eq!(

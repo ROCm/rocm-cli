@@ -88,14 +88,14 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the final terminal screen shows no ComfyUI download spinner line
 
   # EAI-8051: `rocm comfyui install` installs ComfyUI's dependencies INTO the
-  # machine's managed ROCm runtime. Before #298 nothing scoped the package index,
+  # machine's managed ROCm runtime. Before #298 nothing constrained the torch stack,
   # so a transitive dependency could pull CUDA `nvidia-*` wheels into the runtime
   # and displace its ROCm torch, leaving a CUDA build with no AMD GPU support --
   # installing an optional app broke the base. #298 now pins the torch stack with
   # a `uv --constraint` file; this scenario guards against that regressing.
   #
   # The contract: after installing an optional app, the machine's ROCm runtime must
-  # still be a ROCm runtime — its torch is byte-for-byte the build it was before and
+  # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
   # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
   # so the scenario also requires that. It is also the step that catches a revert
   # of #298 (the post-install GPU probe then bails and the install exits non-zero),
@@ -119,9 +119,9 @@ Feature: ComfyUI install reports progress and makes failures actionable
   @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly
   Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given a machine with a managed ROCm runtime
-    And the runtime's torch is not a CUDA build
+    And the runtime has torch and no CUDA packages
     When the user installs ComfyUI without choosing a runtime
-    Then the install succeeds
+    Then the ComfyUI install succeeds
     And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch stack is unchanged
     And no CUDA nvidia packages were added to the runtime
