@@ -125,6 +125,42 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+## Coverage floors
+
+Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
+floor in `coverage-floors.toml`. CI fails when a crate drops more than a small tolerance
+below its floor, so deleting a test is a check failure rather than a silent loss.
+
+Check the floors locally. This needs both the instrumentation tooling and the LLVM
+tools the toolchain ships separately — CI installs the same two:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo xtask coverage
+```
+
+After adding tests, ratchet the floors up to the new measurement:
+
+```bash
+cargo xtask coverage --bless
+```
+
+`--bless` rewrites `coverage-floors.toml`; commit the result. Lowering a floor is
+allowed but deliberate — it shows up as a diff a reviewer has to approve, so say in the
+commit why coverage legitimately dropped (a crate shrank, tests moved elsewhere) rather
+than re-blessing to make a red check go away.
+
+Adding a workspace crate fails the check until that crate has a floor, so a new crate
+cannot land outside the gate. A crate that no test binary compiles at all never shows up
+in the coverage report; both the check and `--bless` fail on it by name, and the way out
+is tests or an entry in `EXCLUDED` in `xtask/src/coverage.rs` with the reason — there is
+no measurement to bless a floor from.
+
+These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules as
+covered source. That inflates the numbers and damps the gate — see the module comment in
+`xtask/src/coverage.rs` for what the measurement is and is not good for.
+
 ## Remote control-channel checks
 
 `rocm remote` drives `ssh`, `scp`, and the remote machine's own tooling. Its unit
@@ -463,6 +499,17 @@ the CLI does not fall back to a built-in TheRock selector.
 Normal user testing should switch versions by activating the exact runtime key
 printed by `rocm runtimes list`. The TUI equivalent is `/runtimes`, then arrow
 to an installed ROCm entry and press Enter.
+
+A runtime selector is matched against keys exactly first. If it matches no key
+exactly but more than one key ignoring letter case — possible on a
+case-sensitive filesystem, where `Foo` and `foo` are separate registry entries —
+every command that resolves a runtime selector through the shared resolver
+refuses and lists the matching keys instead of picking one. Two exceptions
+remain: ComfyUI's installer (`comfyui install --runtime-id`) keeps its own lookup
+and still takes the first case-insensitive match, and `config set-default-runtime`
+and `config set-engine --runtime-id` store a selector without resolving it. For
+`runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
+checks that nothing became active and that naming one key exactly then works.
 
 Developer-only previous-runtime regression check:
 

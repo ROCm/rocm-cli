@@ -26,6 +26,14 @@ use crate::E2eWorld;
 // `:` form only in `runtime_id`, which is a manifest field value, never a filename.
 const FIRST_KEY: &str = "release-tarball-gfx942";
 const SECOND_KEY: &str = "release-tarball-gfx1100";
+/// Two keys that differ only in letter case. Each is its own `<key>.json` in the
+/// registry, so the pair can only coexist on a case-sensitive filesystem — which
+/// is why the scenario using them carries `@requires-case-sensitive-fs`.
+const LOWER_TWIN_KEY: &str = "release-tarball-gfx942";
+const UPPER_TWIN_KEY: &str = "RELEASE-TARBALL-GFX942";
+/// Matches neither twin exactly and both case-insensitively — the shape the
+/// resolver used to settle silently by picking one.
+const CASE_ONLY_SELECTOR: &str = "Release-Tarball-Gfx942";
 const IMPORT_KEY: &str = "release-tarball-gfx1151";
 
 /// Write a read-only `tarball` runtime manifest into the isolated registry and
@@ -43,12 +51,26 @@ fn plant_runtime(world: &E2eWorld, key: &str, family: &str) -> PathBuf {
     std::fs::write(install_root.join("payload.txt"), "payload")
         .expect("failed to write runtime payload");
 
-    let registry = root.path().join("data").join("runtimes").join("registry");
+    let registry = registry_dir(world);
     std::fs::create_dir_all(&registry).expect("failed to create registry dir");
     let manifest = runtime_manifest_json(key, family, &install_root);
     std::fs::write(registry.join(format!("{key}.json")), manifest)
         .expect("failed to write runtime manifest");
     install_root
+}
+
+/// The runtime registry under the scenario's isolated data dir — where the CLI
+/// reads `<key>.json` manifests from. One definition, so a layout change cannot
+/// leave the planting and the counting looking in different places.
+fn registry_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("runtimes")
+        .join("registry")
 }
 
 /// A minimal valid read-only tarball runtime manifest (matches the CLI's on-disk
@@ -107,6 +129,35 @@ async fn two_runtimes_second_active(world: &mut E2eWorld) {
     crate::run_rocm_ok(world, &["runtimes", "activate", SECOND_KEY]);
 }
 
+#[given("two registered runtimes whose keys differ only in letter case")]
+async fn two_case_twin_runtimes(world: &mut E2eWorld) {
+    // Distinct families only so each twin gets its own install root.
+    plant_runtime(world, LOWER_TWIN_KEY, "gfx942");
+    plant_runtime(world, UPPER_TWIN_KEY, "gfx1100");
+
+    // The two keys are two registry files only on a case-sensitive filesystem.
+    // `@requires-case-sensitive-fs` skips hosts whose temp root folds case, so
+    // this guard should never fire — except that cucumber's own `-n`/`--tags`
+    // selection replaces the suite's filter and with it every gate. Should the
+    // twins collapse anyway, the second write overwrote the first, activation
+    // would succeed on a single case-insensitive match, and the refusal step
+    // would blame the resolver for a fixture that never existed. Counting the
+    // entries proves the premise; testing for the lower-case file would not,
+    // because on such a filesystem that path resolves to the upper-case one.
+    let registry = registry_dir(world);
+    let planted = std::fs::read_dir(&registry)
+        .unwrap_or_else(|err| panic!("cannot read the registry at {}: {err}", registry.display()))
+        .count();
+    assert_eq!(
+        planted,
+        2,
+        "the case twins collapsed into one registry entry in {}: this filesystem is \
+         case-insensitive, so the @requires-case-sensitive-fs gate should have skipped \
+         this scenario on this host (cucumber's -n/--tags selection bypasses the gates)",
+        registry.display()
+    );
+}
+
 #[given("a registered read-only runtime")]
 async fn one_readonly_runtime(world: &mut E2eWorld) {
     let install_root = plant_runtime(world, FIRST_KEY, "gfx942");
@@ -143,6 +194,19 @@ async fn activate_second_again(world: &mut E2eWorld) {
 #[when("the user rolls back")]
 async fn rollback(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user activates a runtime with a selector that matches both only by letter case")]
+async fn activate_by_case_only_selector(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "activate", CASE_ONLY_SELECTOR]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user activates one of them by its exact key")]
+async fn activate_upper_twin_exactly(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", UPPER_TWIN_KEY]);
     record(world, stdout, stderr, rc);
 }
 
@@ -267,13 +331,7 @@ async fn registry_removed(world: &mut E2eWorld) {
         out.contains("runtime removed") && out.contains("registry_removed:"),
         "expected the registry entry removed, got:\n{out}"
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         !entry.exists(),
         "registry entry still present: {}",
@@ -337,6 +395,60 @@ async fn listing_explains_markers(world: &mut E2eWorld) {
     );
 }
 
+#[then("the CLI refuses and names both runtimes")]
+async fn refuses_naming_both_twins(world: &mut E2eWorld) {
+    let out = combined(world);
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "a selector matching two runtimes only by letter case must not succeed:\n{out}"
+    );
+    assert!(
+        out.contains("differ only in letter case"),
+        "expected the case-ambiguity refusal, got:\n{out}"
+    );
+    // The advice is "name one of them exactly", so both exact keys must be on
+    // screen for the user to follow it.
+    for key in [LOWER_TWIN_KEY, UPPER_TWIN_KEY] {
+        assert!(
+            out.contains(key),
+            "the refusal must name `{key}` so the user can pick it exactly:\n{out}"
+        );
+    }
+}
+
+/// The refusal has to leave the registry as it was. Read back through
+/// `runtimes list` rather than trusting the error alone: a refusal printed after
+/// a partial activation would still read as a refusal.
+#[then("no runtime is active")]
+async fn no_runtime_active(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert_eq!(rc, 0, "runtimes list failed:\n{stdout}\n{stderr}");
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("* ")),
+        "the refused activation must not have activated anything:\n{stdout}"
+    );
+}
+
+/// The remediation the refusal names actually works: the exact key activates
+/// that runtime, and only that one.
+#[then("that exact runtime becomes active")]
+async fn exact_twin_active(world: &mut E2eWorld) {
+    let _ = ok_output(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "list"]);
+    assert_eq!(rc, 0, "runtimes list failed:\n{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("* {UPPER_TWIN_KEY}")),
+        "expected {UPPER_TWIN_KEY} active after naming it exactly:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("* {LOWER_TWIN_KEY}")),
+        "its case twin must not be the active one:\n{stdout}"
+    );
+}
+
 #[then("the first runtime is marked active")]
 async fn first_marked_active(world: &mut E2eWorld) {
     let out = ok_output(world);
@@ -364,13 +476,7 @@ async fn uninstall_refused_without_yes(world: &mut E2eWorld) {
         "expected a --yes-required error, got:\n{}",
         combined(world)
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         entry.exists(),
         "registry entry must survive a refused uninstall: {}",
@@ -385,13 +491,7 @@ async fn uninstall_dry_run_reports_plan(world: &mut E2eWorld) {
         out.contains("runtime uninstall plan") && out.contains("dry run: no changes made"),
         "expected a dry-run plan with no changes made, got:\n{out}"
     );
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let entry = root
-        .path()
-        .join("data")
-        .join("runtimes")
-        .join("registry")
-        .join(format!("{FIRST_KEY}.json"));
+    let entry = registry_dir(world).join(format!("{FIRST_KEY}.json"));
     assert!(
         entry.exists(),
         "registry entry must survive a dry-run uninstall: {}",

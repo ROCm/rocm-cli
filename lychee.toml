@@ -1,0 +1,30 @@
+# Config for the `docs-links` CI job (.github/workflows/ci.yml), which checks
+# every markdown link in the repo resolves. First step toward replacing
+# xtask/src/architecture_doc.rs's hand-rolled path-citation checker: that
+# checker stays in place, running alongside this gate, until a follow-up PR
+# rewrites docs/architecture.md's citations as markdown links and removes it
+# — see issue #578 for why.
+
+# Only check local file/anchor links, no network requests. Keeps this gate
+# immune to external-host flakiness (rate limits, transient DNS) — see the
+# "Offline-only" tradeoff recorded in issue #578.
+offline = true
+
+# Check that `#anchor` fragments resolve too, not just the file path.
+include_fragments = "anchor-only"
+
+# GitHub's private-vulnerability-reporting links in SECURITY.md
+# (../../security/advisories/new) are relative-looking but meant to resolve
+# on GitHub's web UI, not as a local file — offline mode can't follow them.
+exclude = [
+  'security/advisories/new',
+]
+
+# docs/rocm-docs/ is Sphinx/MyST source, not plain markdown: its cross-doc
+# anchors (e.g. `commands.md#model-serving`) are generated at Sphinx build
+# time from `{include}` directives lychee doesn't evaluate, so it reports
+# false positives there. That tree's correctness is already covered by the
+# `docs-build` (Sphinx -W) CI job, which does understand MyST.
+exclude_path = [
+  '^docs/rocm-docs/',
+]
