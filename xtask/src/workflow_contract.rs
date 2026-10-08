@@ -2307,8 +2307,7 @@ esac
             .match_indices('\n')
             .find_map(|(i, _)| {
                 let next_line = rest[i + 1..].lines().next().unwrap_or("");
-                (!next_line.trim().is_empty() && indent_of(next_line) <= marker_indent)
-                    .then_some(i)
+                (!next_line.trim().is_empty() && indent_of(next_line) <= marker_indent).then_some(i)
             })
             .unwrap_or(rest.len());
         &rest[..end]
