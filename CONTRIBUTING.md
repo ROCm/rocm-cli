@@ -46,7 +46,7 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
 
 The manifest hooks only run when you change the dependency graph, and they *rewrite* the generated file rather than just reporting it stale — when that happens the commit stops so you can re-stage the refreshed file. `THIRD_PARTY_NOTICES.txt` additionally needs the pinned generator; without it that hook skips and CI remains the gate:
 
@@ -54,11 +54,13 @@ The manifest hooks only run when you change the dependency graph, and they *rewr
 cargo install cargo-about@0.9.1 --locked --features cli   # optional, for THIRD_PARTY_NOTICES.txt
 ```
 
-The license-headers hook (`hawkeye`) runs on both commit and push for matching files. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard rather than skipping when the binary is missing:
+The license-headers hook (`hawkeye`) runs on every commit and push, whatever is staged — it has no file-type filter, because hawkeye always scans the whole working tree per `licenserc.toml` regardless of which files changed or are staged, including untracked files that aren't gitignored, so an unrelated unheadered file (even one not yet committed) can block an otherwise-unrelated commit. A clean CI checkout never has untracked files, so this hook can be stricter locally than CI is. prek runs it like the others, but doesn't provision the `hawkeye` binary — and, unlike the manifest hooks above, it fails hard (not just skips) when the binary is missing. It does not check that an installed binary is the pinned version; a mismatched version may run whatever that version's own license-header rules happen to be, which may disagree with CI, or may reject `licenserc.toml` outright — for example, hawkeye 6.x rejects this repo's config with `unknown field 'files'`, which blocks every commit and push, not just ones touching code:
 
 ```bash
 cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers job
 ```
+
+To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
 
 ### Workspace layout
 
@@ -73,11 +75,9 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 
 ### Module organization
 
-New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full.
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full — its path citations are relative markdown links, checked for resolution (not prose accuracy) by the `docs-links` job below.
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
-
-`docs/architecture.md`'s path citations are enforced by `cargo xtask check-architecture-doc` (`xtask/src/architecture_doc.rs`) — it fails CI if a citation isn't found where it's cited, naming the expected location per citation (exactly where depends on its shape: a slash path, a bare filename, or a bare directory name; see `citation_exists`'s doc comment in that file for the full rule) — though it doesn't check the accuracy of the surrounding prose.
 
 Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead — is checked by the `docs-links` CI job (`lychee.toml`); it runs offline only, so it doesn't catch broken external `https://` links (see `lychee.toml` for the current exclusions).
 

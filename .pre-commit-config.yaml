@@ -91,7 +91,11 @@ repos:
         name: license header check (hawkeye)
         entry: hawkeye check --config licenserc.toml
         language: system
-        types_or: [rust, python, shell]
+        always_run: true # hawkeye always scans licenserc.toml's full file list regardless
+                          # of what changed (pass_filenames: false below); a file-type
+                          # filter here only gated whether the hook fired, so it could
+                          # never fully track licenserc.toml's own include list —
+                          # always_run removes that gap instead of chasing it
         pass_filenames: false
         groups: [local-tools] # runs in the dedicated `license-headers` CI job (pinned prebuilt binary, no Action)
 
@@ -122,19 +126,6 @@ repos:
         pass_filenames: false
         stages: [pre-push]
         groups: [local-tools] # runs in the dedicated build-and-test CI job
-      - id: architecture-doc
-        name: architecture doc path citations are current
-        # No `types:`/`files:` filter, unlike its siblings above: the CI job
-        # this mirrors runs unconditionally too, because a change anywhere in
-        # the tracked tree (not just a Rust file, and not just
-        # docs/architecture.md itself) can make a citation stale without
-        # touching the doc that cites it — see the CI job's own comment in
-        # ci.yml for why gating this on a path filter would be unsound.
-        entry: cargo xtask check-architecture-doc
-        language: system
-        pass_filenames: false
-        stages: [pre-push] # compiles xtask; too slow for every commit
-        groups: [local-tools] # runs in the dedicated `architecture-doc` CI job
       - id: powershell-script-analyzer
         name: PSScriptAnalyzer
         # Lints every .ps1 with PSScriptAnalyzer, which also covers syntax (a file

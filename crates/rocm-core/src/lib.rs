@@ -5122,13 +5122,17 @@ mod tests {
 
     fn download_scratch(tag: &str) -> PathBuf {
         let dir = workspace_test_artifact_dir().join(format!(
-            "download-{tag}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "download-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("failed to create scratch dir");
         dir
+    }
+
+    #[test]
+    fn download_scratch_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| download_scratch("same-label"));
     }
 
     #[test]
