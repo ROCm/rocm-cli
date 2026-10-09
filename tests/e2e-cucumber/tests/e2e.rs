@@ -351,14 +351,19 @@ impl E2eWorld {
         }
         // When a scenario declares a longer serve-readiness window (via a
         // `@serve-timeout:<secs>` tag → serve_timeout_override), also raise the
-        // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
-        // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
-        // EAI-7393), which a large model's cold load legitimately exceeds — so
+        // CLI's OWN vLLM and Lemonade readiness caps to match. `rocm serve
+        // --managed` otherwise kills a server that isn't ready within its default
+        // (vLLM 5 min, EAI-7393; Lemonade's packaged llama-server 2 min), which a
+        // large model's cold load legitimately exceeds — so
         // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
         // would kill the server first. Keeping the two in lockstep makes the
         // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
         if let Some(secs) = self.serve_timeout_override {
             env.push(("ROCM_CLI_VLLM_READY_TIMEOUT_SECS", secs.to_string().into()));
+            env.push((
+                "ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS",
+                secs.to_string().into(),
+            ));
         }
         env
     }

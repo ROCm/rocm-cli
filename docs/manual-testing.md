@@ -210,6 +210,15 @@ While the log stream is attached, verify detach and stop behave differently:
 - Re-run the serve command and press `Ctrl+C` instead. The server shuts down and
   `rocm services` no longer lists it as running.
 
+Check the readiness window on a model that loads slowly (a large GGUF on an
+integrated or smaller GPU):
+
+- With the default window, a load longer than 2 minutes fails with
+  `did not become ready within 120s`, naming `ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS`,
+  and `rocm services` records the attempt as failed.
+- Re-run with `ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS=900` set. The same model
+  reaches ready and answers a chat request.
+
 ## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:
