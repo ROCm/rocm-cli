@@ -95,6 +95,59 @@ pub(crate) fn runtime_is_managed(runtime: &VllmRuntime) -> bool {
     runtime.source.starts_with("managed_runtime_manifest")
 }
 
+/// The ROCm SDK 10.0 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_0: &str = "10.0.0";
+/// The ROCm SDK 10.1 release line, as it appears in both
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`] and `install.rs`'s discover-build table.
+pub(crate) const ROCM_SDK_10_1: &str = "10.1.0";
+
+/// ROCm SDK versions keyed by a row in `install.rs`'s discover-build table
+/// (see [`crate::install::vllm_rocm_discover_build`] for the recipe each one
+/// resolves to: wheel indexes, version prefixes, interpreter tag). Defined
+/// here, in the lower layer, as the single source for which versions count —
+/// `install.rs`'s table literally uses these constants for its
+/// `rocm_sdk_version` fields, and [`runtime_has_discover_build`] below
+/// matches against the same two strings. This list and that table are still
+/// two separate pieces of data, kept in agreement only by
+/// `install.rs`'s `vllm_rocm_discover_build_table_matches_the_discover_version_list`
+/// test, not by construction — a new table row needs a matching entry here,
+/// and that test is what catches it if one is missed.
+pub(crate) const ROCM_DISCOVER_BUILD_VERSIONS: &[&str] = &[ROCM_SDK_10_0, ROCM_SDK_10_1];
+
+/// Whether `recorded` and `table_key` name the same ROCm `major.minor` line,
+/// ignoring patch and any dev/pre-release suffix. See
+/// [`crate::install::vllm_rocm_discover_build`] for why the line, not the
+/// exact release, is what a discover row covers. Lives here, not in
+/// `install.rs`, alongside [`ROCM_DISCOVER_BUILD_VERSIONS`] so
+/// [`runtime_has_discover_build`] can match without calling into `install`.
+pub(crate) fn rocm_sdk_series_matches(recorded: &str, table_key: &str) -> bool {
+    fn series(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim().split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor: String = parts
+            .next()?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        Some((major, minor.parse().ok()?))
+    }
+    series(recorded).is_some_and(|version| Some(version) == series(table_key))
+}
+
+/// Whether `runtime`'s recorded ROCm SDK version has a live discover-build
+/// recipe. Exposed as runtime metadata, matched directly against
+/// [`ROCM_DISCOVER_BUILD_VERSIONS`], so callers outside `install` — the vLLM
+/// launch path in `process.rs`, specifically — don't need to reach into
+/// `install`'s build-selection table for a plain yes/no check.
+pub(crate) fn runtime_has_discover_build(runtime: &VllmRuntime) -> bool {
+    runtime.rocm_sdk_version.as_deref().is_some_and(|version| {
+        ROCM_DISCOVER_BUILD_VERSIONS
+            .iter()
+            .any(|key| rocm_sdk_series_matches(version, key))
+    })
+}
+
 pub(crate) fn vllm_runtime_warnings(runtime: &VllmRuntime) -> Vec<String> {
     let runtime_scope = if runtime_is_managed(runtime) {
         "rocm-cli records this vLLM command from a managed TheRock runtime; `rocm engines install vllm` can install vLLM into that runtime"
@@ -687,5 +740,42 @@ mod tests {
             rocm_sdk_version_from_manifest(&TheRockRuntimeManifest::default()),
             None
         );
+    }
+    fn runtime_with_sdk_version(version: Option<&str>) -> VllmRuntime {
+        VllmRuntime {
+            runtime_id: "nightly-wheel-gfx94x-dcgpu".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("/rocm/runtimes/wheel/nightly-gfx94x/bin/vllm"),
+            python_executable: None,
+            version: None,
+            source: "managed_runtime_manifest:nightly-wheel-gfx94x-dcgpu".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: version.map(ToOwned::to_owned),
+        }
+    }
+    #[test]
+    fn runtime_has_discover_build_matches_both_discover_lines() {
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.0.0"
+        ))));
+        assert!(runtime_has_discover_build(&runtime_with_sdk_version(Some(
+            "10.1.0a20260611"
+        ))));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_a_line_with_no_discover_row() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("10.2.0")
+        )));
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(
+            Some("7.2.3")
+        )));
+    }
+    #[test]
+    fn runtime_has_discover_build_rejects_no_recorded_version() {
+        assert!(!runtime_has_discover_build(&runtime_with_sdk_version(None)));
     }
 }
