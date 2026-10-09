@@ -1288,7 +1288,7 @@ mod tests {
     /// `starting`/`recovering` records exist on disk but neither counts as
     /// "actively serving" here — matching `Instance::status.is_serving()`
     /// (`Ready`/`Running` only) rather than the broader `is_scrapeable_status`
-    /// set `managed_service_is_live` elsewhere in this file uses.
+    /// set `managed_service_is_live` (`apps/rocm/src/main.rs`) uses.
     #[test]
     fn resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

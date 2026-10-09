@@ -582,6 +582,45 @@ async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("{e}"));
 }
 
+/// Issue #145's actual stop action, not just the warning: `s` on the
+/// dashboard's quit-confirm prompt is meant to close it and open the Services
+/// overlay instead of resolving an Approve/Deny/Cancel verdict
+/// (`AppState::quit_confirm_open_services_key`). Sent exactly once — the
+/// prompt is already confirmed open by the preceding `Then` step, so there is
+/// no startup race to retry through, the same reasoning `open_services_overlay`
+/// gives for its own single send.
+#[when("the user presses s to manage the serving model")]
+async fn quit_confirm_presses_s_to_manage(world: &mut E2eWorld) {
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to send the manage-service key: {e}"));
+}
+
+/// Proves `s` actually did something, not just that it was sent: the
+/// quit-confirm prompt's own marker must be gone (it closed, rather than
+/// merely sitting underneath whatever rendered), the Services overlay's own
+/// title must be on screen (`SERVICES_OVERLAY_TITLE`, drawn only by that
+/// overlay), and the overlay must show the specific model this scenario is
+/// about — not just that some overlay opened.
+#[then("the services overlay opens showing the managed model")]
+async fn services_overlay_opens_showing_managed_model(world: &mut E2eWorld) {
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_string();
+    let tui = session(world);
+    tui.wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the quit prompt never closed after `s`: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("`s` never opened the services overlay: {e}"));
+    tui.wait_for_screen(&model, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services overlay did not show {model:?}: {e}"));
+}
+
 /// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
 /// is a second, independent quit entry point (issue #145) and must not wait
 /// for (or resolve) the prompt it may open, since the point of this step is

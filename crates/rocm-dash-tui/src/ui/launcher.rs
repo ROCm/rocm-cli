@@ -282,11 +282,24 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// Build the launcher's render state, seeding `instances` from the serving
 /// models the caller discovered in the managed-service registry.
 ///
+/// Also seeds `managed_service_ids` with every one of those ids: unlike the
+/// full dashboard's live daemon connection, which can also surface Docker- or
+/// Lemonade-discovered instances from an external daemon, every entry here
+/// came from `apps/rocm::dash::launcher_serving_instances`'s own
+/// `discover_managed_services` call, so all of them are genuinely reachable
+/// with `rocm services stop <id> --yes` — without this, the launcher's own
+/// copy of the quit-confirm prompt (`ui::quit_confirm_body`) would gate that
+/// remediation line on an always-empty set and warn with nothing actionable.
+///
 /// Kept separate from the terminal loop so the seeding is unit-testable without
 /// a real terminal: an empty `serving` yields the idle front door, a non-empty
 /// one makes `is_running` report the running model.
 fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
     let mut state = AppState::new(String::new(), theme_name.to_string());
+    state.managed_service_ids = serving
+        .iter()
+        .map(|inst| inst.container_id.clone())
+        .collect();
     state.instances = serving
         .into_iter()
         .map(|inst| (inst.container_id.clone(), inst))
@@ -723,6 +736,34 @@ mod tests {
         // With no serving instances the front door stays honestly idle.
         let idle = launcher_state("default-dark", Vec::new());
         assert!(!is_running(&idle), "empty seed must render idle");
+    }
+
+    #[test]
+    fn launcher_state_marks_every_seeded_instance_as_managed() {
+        // Regression: `launcher_state` seeded `instances` but never
+        // `managed_service_ids`, so the launcher's own copy of the
+        // quit-confirm prompt (`ui::quit_confirm_body`) gated its
+        // `rocm services stop <id> --yes` line on an always-empty set and
+        // warned with nothing actionable — even though every instance here
+        // comes from `launcher_serving_instances`'s own
+        // `discover_managed_services` call and is genuinely stoppable.
+        let serving = vec![
+            Instance {
+                container_id: "vllm-ready".into(),
+                status: InstanceStatus::Ready,
+                ..Default::default()
+            },
+            Instance {
+                container_id: "vllm-second".into(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        ];
+        let state = launcher_state("default-dark", serving);
+        assert_eq!(
+            state.managed_service_ids,
+            std::collections::HashSet::from(["vllm-ready".to_string(), "vllm-second".to_string()])
+        );
     }
 
     #[test]

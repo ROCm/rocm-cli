@@ -343,6 +343,11 @@ Feature: Interactive dashboard
     And the quit prompt shows the real stop command for the managed model
     When the user declines the quit prompt
     Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user presses s to manage the serving model
+    Then the services overlay opens showing the managed model
+    When the user closes the managed services overlay
     When the user quits the dashboard
     Then the dashboard exits successfully
     And the managed model is still listed as running

@@ -259,15 +259,18 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
         return vec!["Nothing is being served anymore.".to_string()];
     }
     let mut body = Vec::new();
-    if total == 0 {
+    let trailer = if total == 0 {
         // `total == 0` here only because `nothing_is_currently_being_served`
         // returned `false` above: the startup-race fallback (issue #145) is
         // active — a model was recorded live on disk at launch, but
         // `instances` is still empty because the daemon's first snapshot
         // hasn't landed yet (or never will, if the connection never
         // succeeds). So this stays honest about not knowing whether it still
-        // is serving, instead of claiming to know either way.
+        // is serving, instead of claiming to know either way — the trailer
+        // below is hedged to match, rather than asserting present-tense that
+        // it does keep running.
         body.push("A model was serving when this started.".to_string());
+        "It may still be running in the background after you quit."
     } else {
         for i in running().take(5) {
             // The stop command is only ever printed next to a service this
@@ -288,9 +291,10 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
         if let Some(line) = format::overflow_line(total, 5) {
             body.push(line);
         }
-    }
+        "It keeps running in the background after you quit."
+    };
     body.push(String::new());
-    body.push("It keeps running in the background after you quit.".to_string());
+    body.push(trailer.to_string());
     body
 }
 
@@ -998,6 +1002,20 @@ mod tests {
         assert!(
             body.iter().any(|line| line.contains("A model was serving")),
             "must say a model was serving instead: {body:?}"
+        );
+        // The trailer must be hedged to match: this branch doesn't know
+        // whether the model is still serving, so a present-tense "It keeps
+        // running" would itself be the same class of overclaim the body line
+        // above is careful to avoid.
+        assert!(
+            !body.iter().any(|line| line.contains("It keeps running")),
+            "must not assert present-tense that it keeps running when this \
+             branch doesn't know: {body:?}"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.contains("may still be running")),
+            "must hedge the trailer the same way the body line above does: {body:?}"
         );
     }
 
