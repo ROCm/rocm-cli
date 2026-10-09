@@ -27,7 +27,7 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 
 ### `apps/rocm` — main CLI binary
 
-[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
+[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
 
 - [`automations.rs`](../apps/rocm/src/automations.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`bootstrap.rs`](../apps/rocm/src/bootstrap.rs) — a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in [`main.rs`](../apps/rocm/src/main.rs).
@@ -45,7 +45,8 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 - [`providers.rs`](../apps/rocm/src/providers.rs) — full domain extraction (no dedicated command enum; invoked from the existing chat/config command flows).
 - [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs) — mechanical relocation, owns private types (Phase 6a): `serve()`, plus engine-recipe overrides.
 - [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) — full domain extraction.
-- [`service_hints.rs`](../apps/rocm/src/service_hints.rs) — shared CLI-output component: the `rocm services <action> <id> --yes` hint text, shared by [`main.rs`](../apps/rocm/src/main.rs), [`remote/mod.rs`](../apps/rocm/src/remote/mod.rs), and [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) so the three cannot go out of sync with each other, as `serve_summary.rs`'s stop row did from the day it was added — #417.
+- [`service_hints.rs`](../apps/rocm/src/service_hints.rs) — shared CLI-output component: the `rocm services <action> <id> --yes` hint text, shared by [`main.rs`](../apps/rocm/src/main.rs), [`remote/mod.rs`](../apps/rocm/src/remote/mod.rs), [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs), and [`service_launch.rs`](../apps/rocm/src/service_launch.rs) so they cannot go out of sync with each other, as `serve_summary.rs`'s stop row did from the day it was added — #417.
+- [`service_launch.rs`](../apps/rocm/src/service_launch.rs) — mechanical relocation, owns private types (Phase 6b, ROCMAI-91): spawning/attaching to a managed service process and streaming its log, plus the endpoint-key/auth checks that gate a public bind — `AttachOutcome`/`RawModeGuard`/`ManagedLaunchReport`/`ManagedSpawn`/`AutostartClaim` are its private types; most of its functions are `pub(crate)` since `main.rs`, `serve_cmd.rs`, and `automations.rs` all call into it. `ServicesCommand`/`services()` stayed in [`main.rs`](../apps/rocm/src/main.rs) rather than moving alongside — the service-record-management helpers `services()` dispatches to (stop/restart/remove/prune) are entangled with the chat/LLM sandbox tool-calling path, out of scope for Phase 6b.
 - [`storage.rs`](../apps/rocm/src/storage.rs) — full domain extraction.
 - [`therock.rs`](../apps/rocm/src/therock.rs) — full domain extraction; owns TheRock SDK install/update and the runtime-manifest model/loaders. The `runtimes` subcommand's own command enum, dispatch fn, and most of its domain logic — rendering, activation, and manifest import — stay in [`main.rs`](../apps/rocm/src/main.rs).
 - [`uninstall.rs`](../apps/rocm/src/uninstall.rs) — mechanical relocation, dispatch-adjacent, no owned types.
