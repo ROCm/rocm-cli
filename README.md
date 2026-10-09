@@ -820,12 +820,15 @@ rocm chat [--provider local|openai|anthropic] [--model NAME] [--prompt TEXT] [--
           [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
-Chat with an AI provider from the terminal. The command reads from stdin when
-you omit `--prompt`.
+Chat with an AI provider from the terminal. In an interactive terminal,
+`rocm chat` without `--prompt` opens the dashboard chat, where you switch
+providers with `/provider <name>`. With `--prompt`, or with input piped to
+standard input, it sends one prompt and prints the reply.
 
-- `--provider` selects `local` (a model that `rocm serve` runs on this machine),
-  `openai`, or `anthropic`. A cloud provider needs setup first: run
-  `rocm config enable-provider <provider>` and
+- `--provider` selects `local` (a model that `rocm serve` runs on this machine,
+  the default), `openai`, or `anthropic`. It applies to the one-prompt form; the
+  dashboard chat ignores it and prints a note. A cloud provider needs setup
+  first: run `rocm config enable-provider <provider>` and
   `rocm config set-provider-key <provider>`. See [Configuration](#configuration).
 - `--tools` lets an OpenAI-compatible provider request ROCm tool calls.
 - `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
