@@ -46,6 +46,11 @@ pub(crate) enum StopFailureRemedy {
     /// grandchild outlived its supervisor. `rocm services stop` has nothing left
     /// to kill, so the process holding the port has to be found and stopped.
     StopWhatHoldsThePort,
+    /// A record already stopped before this run, whose old port now answers with
+    /// an authentication refusal. That is not evidence of a survivor of ours (a
+    /// keyed server of someone else's looks identical), and the record is what
+    /// keeps tripping the check, so removing it is the way out if it isn't ours.
+    RemoveTheStoppedRecord,
     /// The record does not parse, so no `rocm` command can act on it — the file
     /// itself has to be repaired or removed.
     RepairTheRecord,
@@ -89,11 +94,18 @@ impl StopFailureRemedy {
                                     anything: kill that pid (`kill <pid>` on Linux, `Stop-Process -Id <pid> -Force` \
                                     on Windows), then re-run uninstall."
                 .to_owned(),
+            Self::RemoveTheStoppedRecord => format!(
+                "An authenticated server answers on the old port of a record that was already \
+                 stopped. If that server is not one of yours, delete the stale record with \
+                 `rocm services remove <id> --yes` and re-run uninstall; if it is, stop it first: \
+                 {}.",
+                ids.join(", ")
+            ),
             Self::ConfirmTheDaemonPid => format!(
-                "That pid could not be proven to be the background helper, so it was left alone. \
-                 Check what pid {} is: if it is `rocmd`, stop it; if it is something else (the \
-                 state file may predate a reboot), delete the stale runtime state file, then \
-                 re-run uninstall.",
+                "The recorded pid could not be proven to be the background helper, so it was left \
+                 alone. Check what that pid is ({}): if it is `rocmd`, stop it; if it is something \
+                 else (the state file may predate a reboot), delete the runtime state file named \
+                 there, then re-run uninstall.",
                 ids.join(", ")
             ),
             Self::RepairTheDaemonState => format!(
@@ -126,6 +138,7 @@ impl StopFailureRemedy {
         match self {
             Self::StopTheService => 0,
             Self::StopWhatHoldsThePort => 1,
+            Self::RemoveTheStoppedRecord => 1,
             Self::StopTheDaemon => 2,
             Self::ConfirmTheDaemonPid => 2,
             Self::RepairTheDaemonState => 3,
@@ -171,9 +184,15 @@ pub(crate) struct ManagedServiceStopReport {
 
 /// The failure recorded when the background helper is live but cannot be proven
 /// to be `rocmd`, so it was deliberately left alone.
-pub(crate) fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServiceStop {
+pub(crate) fn daemon_identity_unverified(
+    daemon_pid: u32,
+    state_file: &std::path::Path,
+) -> FailedManagedServiceStop {
     FailedManagedServiceStop {
-        service_id: format!("rocmd (pid {daemon_pid})"),
+        service_id: format!(
+            "rocmd (pid {daemon_pid}; state file {})",
+            state_file.display()
+        ),
         reason: "the background helper's identity could not be verified, so it was left running \
                  rather than risk signalling an unrelated process that inherited its pid"
             .to_owned(),
@@ -346,9 +365,10 @@ pub(crate) fn stop_background_helper_with(
     ) {
         DaemonIdentityOutcome::NothingOfOurs => return,
         DaemonIdentityOutcome::Unverifiable => {
-            report
-                .failed
-                .push(daemon_identity_unverified(state.daemon_pid));
+            report.failed.push(daemon_identity_unverified(
+                state.daemon_pid,
+                &paths.automation_state_path(),
+            ));
             return;
         }
         DaemonIdentityOutcome::Stop => {}
@@ -440,29 +460,41 @@ pub(crate) fn stop_managed_services_with(
     // the same model again after a stop leaves exactly that pair, and the live
     // record's own server answers there. That answer says nothing about the
     // stopped record until the live one has been stopped, so it is probed after.
-    let live_endpoints: Vec<(Vec<String>, u16)> = records
+    let live_endpoints: Vec<(String, Vec<String>, u16)> = records
         .iter()
         .filter(|record| managed_service_is_live(record))
-        .map(|record| (probe_hosts(&record.host), record.port))
+        .map(|record| {
+            (
+                record.service_id.clone(),
+                probe_hosts(&record.host),
+                record.port,
+            )
+        })
         .collect();
     // Overlap, not equality: `0.0.0.0`, `localhost` and `127.0.0.1` can all name
     // the one listener, so any shared probe address on the same port counts.
-    let shares_a_live_endpoint = |record: &ManagedServiceRecord| {
+    let live_partners = |record: &ManagedServiceRecord| -> Vec<String> {
         let mine = probe_hosts(&record.host);
-        live_endpoints.iter().any(|(hosts, port)| {
-            *port == record.port
-                && mine
-                    .iter()
-                    .any(|a| hosts.iter().any(|b| hosts_name_one_listener(a, b)))
-        })
+        live_endpoints
+            .iter()
+            .filter(|(_, hosts, port)| {
+                *port == record.port
+                    && mine
+                        .iter()
+                        .any(|a| hosts.iter().any(|b| hosts_name_one_listener(a, b)))
+            })
+            .map(|(id, _, _)| id.clone())
+            .collect()
     };
+    let shares_a_live_endpoint = |record: &ManagedServiceRecord| !live_partners(record).is_empty();
     let already_stopped: Vec<&ManagedServiceRecord> = records
         .iter()
         .filter(|record| !managed_service_is_live(record) && !shares_a_live_endpoint(record))
         .collect();
-    let deferred: Vec<&ManagedServiceRecord> = records
+    let deferred_partners: Vec<(&ManagedServiceRecord, Vec<String>)> = records
         .iter()
         .filter(|record| !managed_service_is_live(record) && shares_a_live_endpoint(record))
+        .map(|record| (record, live_partners(record)))
         .collect();
     probe_records_for_survivors(paths, &already_stopped, &[], &mut report);
     if !report.failed.is_empty() {
@@ -531,6 +563,18 @@ pub(crate) fn stop_managed_services_with(
     //     An unrelated service on a recycled port does not, and is not blocked.
     let stopped_this_pass: Vec<&ManagedServiceRecord> = attempted.clone();
     probe_records_for_survivors(paths, &stopped_this_pass, &attempted, &mut report);
+    // A deferred record whose live partner failed to stop is already explained by
+    // the partner's own failure: the listener there IS the partner, so judging the
+    // stopped record too would name one survivor twice, under the wrong remedy.
+    let deferred: Vec<&ManagedServiceRecord> = deferred_partners
+        .iter()
+        .filter(|(_, partners)| {
+            !partners
+                .iter()
+                .any(|id| report.failed.iter().any(|f| &f.service_id == id))
+        })
+        .map(|(record, _)| *record)
+        .collect();
     probe_records_for_survivors(paths, &deferred, &attempted, &mut report);
     Ok(report)
 }
@@ -654,11 +698,10 @@ fn probe_records_for_survivors(
                 report.failed.push(FailedManagedServiceStop {
                     service_id: record.service_id.clone(),
                     reason: format!(
-                        "{}:{} refused the identity probe's credentials, so an authenticated \
-                         server is still serving there",
+                        "an authenticated server answers on {}:{}, this record's old port",
                         record.host, record.port
                     ),
-                    remedy: StopFailureRemedy::StopWhatHoldsThePort,
+                    remedy: StopFailureRemedy::RemoveTheStoppedRecord,
                 });
                 continue;
             }
@@ -713,7 +756,7 @@ fn probe_records_for_survivors(
 /// grandchild. Records do carry bracketed spellings (`loopback_host_key`
 /// normalizes them too) because `--host` is free-form.
 /// Whether two probe addresses can reach the same listener on one port.
-fn hosts_name_one_listener(a: &str, b: &str) -> bool {
+pub(crate) fn hosts_name_one_listener(a: &str, b: &str) -> bool {
     let canonical = |h: &str| match h {
         "localhost" => "127.0.0.1".to_owned(),
         other => other.to_owned(),

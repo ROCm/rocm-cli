@@ -33953,10 +33953,10 @@ install therock";
         // the advice it prints is the operator's only way out; a class that
         // reaches the abort with no advice turns the refusal into a dead end.
         // `StopFailureRemedy::advice` and `advice_rank` are exhaustive matches,
-        // so a sixth variant cannot compile without being given text and a
+        // so a new variant cannot compile without being given text and a
         // place in the order — but the compiler cannot check that the text is
         // the *right* text, or that the three id-carrying classes still name
-        // their ids. That is what this asserts, across all five at once.
+        // their ids. That is what this asserts, across every class at once.
         // Listed in REVERSE `advice_rank` order, and that is load-bearing
         // rather than arbitrary. Listing them in rank order makes insertion
         // order and rank order coincide, so the ordering assertion below holds
@@ -33991,6 +33991,16 @@ install therock";
                     reason: "still ready".to_owned(),
                     remedy: StopFailureRemedy::StopTheService,
                 },
+                FailedManagedServiceStop {
+                    service_id: "svc-oldport".to_owned(),
+                    reason: "an authenticated server answers".to_owned(),
+                    remedy: StopFailureRemedy::RemoveTheStoppedRecord,
+                },
+                FailedManagedServiceStop {
+                    service_id: "rocmd (pid 4321; state file /x/runtime-state.json)".to_owned(),
+                    reason: "identity unverified".to_owned(),
+                    remedy: StopFailureRemedy::ConfirmTheDaemonPid,
+                },
             ],
             warnings: Vec::new(),
             helper_stopped: false,
@@ -34007,6 +34017,8 @@ install therock";
             "restarts managed services on its own",
             "cannot tell whether the helper is running",
             "No `rocm` command can act on an unparseable record",
+            "rocm services remove <id> --yes",
+            "delete the runtime state file named there",
         ] {
             assert!(
                 error.contains(expected),
@@ -34016,7 +34028,13 @@ install therock";
         // The three classes whose advice is useless without the ids must name
         // them — "find what holds that port" for an unnamed service is not a
         // way out. The other two are general instructions and name nothing.
-        for expected in ["svc-orphaned", "runtime.json", "svc-corrupt.json"] {
+        for expected in [
+            "svc-orphaned",
+            "runtime.json",
+            "svc-corrupt.json",
+            "svc-oldport",
+            "/x/runtime-state.json",
+        ] {
             assert!(
                 error.contains(expected),
                 "id-carrying remedies must name their ids; missing {expected:?} in: {error}"
@@ -34708,12 +34726,12 @@ install therock";
             });
         assert_eq!(
             failure.remedy,
-            StopFailureRemedy::StopWhatHoldsThePort,
-            "its recorded processes are gone, so the port holder is the remedy"
+            StopFailureRemedy::RemoveTheStoppedRecord,
+            "an authenticated answer on an old record's port is cleared by removing the record"
         );
         assert!(
-            failure.reason.contains("refused"),
-            "the abort has to say the endpoint refused the probe, not that it was silent: {}",
+            failure.reason.contains("authenticated server answers"),
+            "the abort has to say an authenticated server answers there: {}",
             failure.reason
         );
         assert!(
@@ -34938,6 +34956,75 @@ install therock";
             "a differently spelled host for the same listener must not doom the run: {report:?}"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_live_partner_is_not_named_twice_through_its_stopped_twin() {
+        // Same port, one record stopped and one live. When the live one's stop
+        // fails, its own failure explains the listener there; the stopped twin
+        // must not add a second, wrong "the port holder" failure.
+        let endpoint = ServingEndpoint::serving("amd/reused-model");
+        let (root, paths) = test_paths("uninstall-failed-partner");
+        let make = |id: &str, status: &str| {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                id,
+                "vllm",
+                "amd/reused-model",
+                "amd/reused-model",
+                "127.0.0.1",
+                endpoint.port,
+                "managed",
+                0,
+                None,
+                None,
+                None,
+            );
+            record.status = status.to_owned();
+            record.write().expect("write record");
+        };
+        make("svc-a", "stopped");
+        make("svc-b", "ready");
+
+        let report = stop_managed_services_with(&paths, |_, _| anyhow::bail!("stop blew up"))
+            .expect("the pass succeeds");
+
+        let ids: Vec<&str> = report
+            .failed
+            .iter()
+            .map(|f| f.service_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["svc-b"], "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::StopTheService);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_daemon_stop_skips_pid_zero_and_its_own_pid() {
+        for pid in [0, std::process::id()] {
+            let (root, paths) = test_paths("uninstall-daemon-self-pid");
+            let mut state = runtime_state(true, pid);
+            state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+            state.write(&paths).expect("write runtime state");
+            let mut report = ManagedServiceStopReport::default();
+            stop_background_helper_with(&paths, &mut report, |_| {
+                panic!("pid {pid} must never be signalled")
+            });
+            assert!(
+                report.failed.is_empty() && !report.helper_stopped,
+                "{report:?}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn localhost_and_loopback_name_one_listener_but_other_hosts_do_not() {
+        assert!(hosts_name_one_listener("localhost", "127.0.0.1"));
+        assert!(hosts_name_one_listener("127.0.0.1", "127.0.0.1"));
+        assert!(!hosts_name_one_listener("localhost", "::1"));
+        assert!(!hosts_name_one_listener("10.0.0.5", "127.0.0.1"));
     }
 
     #[test]
@@ -36073,6 +36160,7 @@ install therock";
         for (remedy, expected) in [
             (StopFailureRemedy::StopTheService, true),
             (StopFailureRemedy::StopWhatHoldsThePort, true),
+            (StopFailureRemedy::RemoveTheStoppedRecord, false),
             (StopFailureRemedy::StopTheDaemon, false),
             (StopFailureRemedy::ConfirmTheDaemonPid, false),
             (StopFailureRemedy::RepairTheDaemonState, false),
