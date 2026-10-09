@@ -242,16 +242,36 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
+        // The pid alone repeats for every test in one `cargo test` process, so
+        // two tests sharing a label would wipe each other's directory; the
+        // counter makes every call unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
             .join(".rocm-work")
             .join("tests")
             .join("daemon-registry")
-            .join(format!("{name}-{}", std::process::id()));
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn test_dir_gives_each_call_its_own_directory_even_for_one_label() {
+        let first = test_dir("same-label");
+        let second = test_dir("same-label");
+        let _ = fs::remove_dir_all(&first);
+        let _ = fs::remove_dir_all(&second);
+        assert_ne!(
+            first, second,
+            "two calls with one label must not share a root"
+        );
     }
 
     /// A `ManagedServiceRecord`-shaped JSON object (extra rocm-cli fields the

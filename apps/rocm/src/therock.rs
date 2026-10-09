@@ -8779,9 +8779,8 @@ mod tests {
     #[cfg(unix)]
     fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-cli-linked-runtimes-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-linked-runtimes-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
@@ -8794,6 +8793,14 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (root, paths, real)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_runtimes_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            linked_runtimes_paths("same-label").0
+        });
     }
 
     #[test]
@@ -10148,8 +10155,10 @@ exit 1
     #[cfg(windows)]
     #[test]
     fn install_sdk_rejects_tarball_on_windows_before_resolution() {
-        let root = workspace_test_artifact_dir()
-            .join(format!("rocm-cli-therock-test-{}", unix_time_millis()));
+        let root = workspace_test_artifact_dir().join(format!(
+            "rocm-cli-therock-test-{}",
+            crate::test_support::unique_suffix()
+        ));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -10947,9 +10956,8 @@ exit 1
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = workspace_test_artifact_dir().join(format!(
-            "rocm-cli-therock-test-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-therock-test-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         (
             root.clone(),
@@ -10959,6 +10967,11 @@ exit 1
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     fn workspace_test_artifact_dir() -> PathBuf {

@@ -1234,7 +1234,8 @@ jobs:
       # `SystemTime`. See that job's copy of this step for the full reasoning.
       # Kept in sync by hand until the two lanes are deduplicated (#294);
       # `both_wsl_lanes_settle_the_clock_before_running_the_suite` in
-      # xtask/src/workflow_contract.rs fails if either copy goes missing.
+      # xtask/src/workflow_contract.rs fails if either copy goes missing, moves
+      # after the suite, or drifts from the other.
       - name: Settle the clock before anything times a scenario
         shell: powershell
         run: |
@@ -1619,7 +1620,8 @@ jobs:
           mkdir -p consolidated
           cargo xtask e2e-report \
             --artifacts-dir e2e-artifacts \
-            --html-out consolidated/index.html >> "$GITHUB_STEP_SUMMARY"
+            --html-out consolidated/index.html > consolidated/support-matrix.md
+          cat consolidated/support-matrix.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload consolidated report
         if: always()
@@ -1627,3 +1629,69 @@ jobs:
         with:
           name: e2e-consolidated-report-nightly
           path: consolidated/
+
+  # Publishes the consolidated nightly matrix to the repo wiki so the latest
+  # support matrix is readable without opening a run's artifacts. The page is
+  # overwritten each night; the run link, commit and date in its header say
+  # which run it came from. Main-branch runs only, so a dispatch from another
+  # branch cannot overwrite the page, and never from an empty or cancelled run.
+  publish-e2e-wiki:
+    name: Publish E2E support matrix to wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs: e2e-report-nightly
+    if: ${{ !cancelled() && needs.e2e-report-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: publish-e2e-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Download consolidated nightly report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-consolidated-report-nightly
+          path: consolidated
+
+      - name: Push page to the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # An empty consolidation exits 0 upstream; publish only when the
+          # matrix table is present, so any degenerate output (empty file,
+          # reworded message) leaves the last good page in place.
+          if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then
+            echo "::warning::No platform table in the consolidated report; leaving the wiki page unchanged."
+            exit 0
+          fi
+          page=E2E-Support-Matrix.md
+          {
+            echo "# E2E support matrix (latest nightly)"
+            echo
+            echo "_Overwritten by the nightly workflow; do not edit by hand._"
+            echo
+            echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+            echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+            echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo
+            cat consolidated/support-matrix.md
+          } > "/tmp/${page}"
+
+          wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
+          if ! git clone --depth 1 "$wiki" wiki; then
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
+            exit 1
+          fi
+          cp "/tmp/${page}" "wiki/${page}"
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$page"
+          git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD

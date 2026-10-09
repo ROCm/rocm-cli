@@ -11,8 +11,8 @@
 //! alias `cargo xtask <command>`.
 
 mod affected;
-mod architecture_doc;
 mod catalog;
+mod coverage;
 mod crate_edges;
 mod demos;
 mod e2e;
@@ -37,13 +37,13 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "rocm-cli repository tasks")]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Generate a 2048-bit RSA signing keypair (PKCS#8 private + SPKI public PEM).
     Keygen {
         /// Path to write the PKCS#8 private-key PEM.
@@ -103,19 +103,25 @@ enum Command {
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
-    /// Fail, naming every one, if a path cited (in backticks) in
-    /// `docs/architecture.md` isn't found where it's cited. Exactly where a
-    /// citation is checked depends on its shape (a slash path, a bare
-    /// filename, a bare directory name) — the failure message names the
-    /// expected location per citation; see `citation_exists`'s doc comment
-    /// in `xtask/src/architecture_doc.rs` for the full rule.
-    CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
         /// non-zero if it would change.
         #[arg(long)]
         check: bool,
+    },
+    /// Verify every workspace crate's line coverage against the per-crate
+    /// floors committed in `coverage-floors.toml`.
+    ///
+    /// Fails naming each crate that dropped below its floor, each crate with no
+    /// floor at all (so a new workspace member cannot land outside the gate),
+    /// and each floor whose crate no longer reports coverage. Requires
+    /// `cargo-llvm-cov`.
+    Coverage {
+        /// Rewrite `coverage-floors.toml` from the current measurement instead
+        /// of checking against it. Use after adding tests to ratchet a floor up.
+        #[arg(long)]
+        bless: bool,
     },
     /// Regenerate the Cargo dependency table in MANIFEST.md from `cargo metadata`.
     Manifest {
@@ -264,8 +270,8 @@ fn run() -> Result<()> {
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
-        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
+        Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
             check,
