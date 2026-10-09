@@ -1247,24 +1247,36 @@ mod tests {
     fn actions_does_not_import_from_scrollbar() {
         // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit,
         // plus apply_action under cfg(test)).
-        // A `use`/`pub use`/`pub(crate) use` in actions.rs naming the scrollbar
-        // module -- directly, through `crate::app::scrollbar`, or by one of the
-        // names app/mod.rs re-exports from it (ScrollbarHandle, ScrollDrag,
-        // FooterChip) -- would reintroduce the module cycle that moving
-        // PaneFocus/ScrollTarget into types.rs removes. The compiler accepts
-        // such a cycle, so nothing else catches it.
+        // A `use` in actions.rs naming the scrollbar module -- directly,
+        // through `crate::app::scrollbar`, or by one of the names app/mod.rs
+        // re-exports from it (ScrollbarHandle, ScrollDrag, FooterChip) --
+        // would reintroduce the module cycle that moving PaneFocus/
+        // ScrollTarget into types.rs removes. The compiler accepts such a
+        // cycle, so nothing else catches it.
         //
-        // This joins the source into whole statements (splitting on `;`) so a
-        // rustfmt-wrapped multi-line `use super::{ ... }` group is one match
-        // candidate, not several innocuous lines, and matches whole identifier
-        // tokens rather than a bare substring, so `vertical_scrollbar` doesn't
-        // false-positive on `scrollbar`. A leading `#[cfg(test)]` (or any other
-        // attribute) on the `use` is stripped before the check, since e.g.
-        // `scrollbar.rs` itself gates its `use super::actions::apply_action;`
-        // this way. It does NOT catch a fully-qualified path referenced
-        // directly in an expression or type position with no `use` statement
-        // at all (e.g. a bare `super::scrollbar::resolve_mouse(..)` call) --
-        // that would need real parsing, not a source scan, and is the test's
+        // `use` is a reserved keyword with no other syntactic role in Rust,
+        // so every whole-word `use` outside a comment or string literal is a
+        // `use` item: this finds each one directly by keyword, then reads
+        // forward (brace-depth aware, so a brace-grouped `use super::{ ... }`
+        // is captured whole) to its own terminating top-level `;`. That
+        // sidesteps an earlier version of this test, which instead tried to
+        // delimit "statements" by splitting the whole file on `;` -- that
+        // breaks whenever a `use` isn't itself preceded by a semicolon, e.g.
+        // the first statement in a function body, which then gets silently
+        // merged into an unrelated, non-`use`-shaped chunk of code and
+        // missed. Scanning by keyword instead catches a `use` in any
+        // position or form -- top-level or function-local, attribute-gated,
+        // `pub`/`pub(crate)`, brace-grouped, rustfmt-wrapped across multiple
+        // lines -- uniformly, and matches whole identifier tokens rather
+        // than a bare substring, so `vertical_scrollbar` doesn't
+        // false-positive on `scrollbar`.
+        //
+        // Known gaps: a `use` named only inside a `/* */` block comment
+        // (unlike `//`, not stripped below) would false-positive; a
+        // fully-qualified path referenced directly in an expression or type
+        // position with no `use` statement at all (e.g. a bare
+        // `super::scrollbar::resolve_mouse(..)` call) isn't caught -- that
+        // would need real parsing, not a source scan, and is the test's
         // accepted scope limit.
         const SCROLLBAR_NAMES: [&str; 4] =
             ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
@@ -1274,42 +1286,64 @@ mod tests {
                 .filter(|t| !t.is_empty())
         }
 
-        fn strip_attributes(mut s: &str) -> &str {
-            loop {
-                s = s.trim_start();
-                if !s.starts_with("#[") {
-                    return s;
-                }
-                let mut depth = 0i32;
-                let mut end = None;
-                for (i, c) in s.char_indices() {
-                    match c {
-                        '[' => depth += 1,
-                        ']' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                end = Some(i + 1);
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                match end {
-                    Some(e) => s = &s[e..],
-                    None => return s,
-                }
-            }
+        fn is_ident_char(c: char) -> bool {
+            c.is_alphanumeric() || c == '_'
         }
 
-        fn is_use_statement(stmt: &str) -> bool {
-            let s = strip_attributes(stmt);
-            let s = s
-                .strip_prefix("pub(crate)")
-                .or_else(|| s.strip_prefix("pub"))
-                .map_or(s, str::trim_start);
-            s.starts_with("use ")
+        /// Every `use ... ;` item in `src`, found by locating each whole-word
+        /// `use` keyword and reading forward, brace-depth aware, to its own
+        /// terminating top-level `;`.
+        fn use_statements(src: &str) -> Vec<&str> {
+            let bytes = src.as_bytes();
+            let mut found = Vec::new();
+            let mut search_from = 0;
+            while let Some(rel) = src[search_from..].find("use") {
+                let idx = search_from + rel;
+                let before_ok = idx == 0 || !is_ident_char(bytes[idx - 1] as char);
+                let after_ok = bytes
+                    .get(idx + 3)
+                    .is_none_or(|&c| !is_ident_char(c as char));
+                if before_ok && after_ok {
+                    let mut depth = 0i32;
+                    let mut end = None;
+                    for (offset, c) in src[idx..].char_indices() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' => depth -= 1,
+                            ';' if depth == 0 => {
+                                end = Some(idx + offset + 1);
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(end) = end {
+                        found.push(src[idx..end].trim());
+                    }
+                }
+                search_from = idx + 3;
+            }
+            found
         }
+
+        fn offenders_in(src: &str) -> Vec<String> {
+            use_statements(src)
+                .into_iter()
+                .filter(|stmt| tokens(stmt).any(|t| SCROLLBAR_NAMES.contains(&t)))
+                .map(|stmt| stmt.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        }
+
+        // Positive control: prove the detector actually flags a known-bad
+        // case -- specifically the one an earlier version of this test
+        // missed (an attribute-gated `use` as the first statement in a
+        // function body) -- so a future regression in `use_statements`
+        // doesn't stay invisible the way that one did.
+        let known_bad = "fn f() {\n    #[cfg(test)]\n    use super::scrollbar::resolve_mouse;\n}";
+        assert!(
+            !offenders_in(known_bad).is_empty(),
+            "sanity check failed: the detector itself doesn't flag a known-bad `use`"
+        );
 
         let without_comments: String = include_str!("actions.rs")
             .lines()
@@ -1317,14 +1351,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let offenders: Vec<String> = without_comments
-            .split(';')
-            .map(str::trim)
-            .filter(|stmt| {
-                is_use_statement(stmt) && tokens(stmt).any(|t| SCROLLBAR_NAMES.contains(&t))
-            })
-            .map(|stmt| stmt.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
+        let offenders = offenders_in(&without_comments);
         assert!(
             offenders.is_empty(),
             "actions.rs must not import from scrollbar.rs, directly or through \
