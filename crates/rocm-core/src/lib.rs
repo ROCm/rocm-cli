@@ -4434,10 +4434,30 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
 /// `CUDA out of memory`, `hipErrorOutOfMemory`, or `torch.OutOfMemoryError`
 /// corroborated by an allocator message) still clears it.
 pub fn vllm_log_shows_oom(log: &str) -> bool {
-    log.lines().any(|line| {
-        let line = line.trim();
-        !line.is_empty() && diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {line}"))
-    })
+    vllm_log_segments(log)
+        .any(|segment| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {segment}")))
+}
+
+/// The log tail split the way the diagnostic will split it.
+///
+/// [`diagnose::vllm_oom_symptom_is_diagnosable`] re-splits with
+/// [`terminal::rendered_lines`], which ends a line on a bare `\r` as well as on
+/// `\n`, and then keeps only the segments carrying the `vllm` anchor. Anchoring
+/// a whole physical line once is therefore not enough: vLLM draws its progress
+/// bar with carriage returns, so a real failure arrives as
+/// `Loading weights: 90%\rtorch.OutOfMemoryError: ...` on a single `\n` line.
+/// The anchor lands on the progress segment, the allocator exception becomes an
+/// unanchored segment and is dropped, and the tail reads as "no OOM here" --
+/// silently withdrawing both the engine hint and the serve-summary note for the
+/// most common shape of the failure they exist to explain.
+///
+/// Splitting here the same way, and anchoring each segment separately, keeps
+/// the two sides agreeing on where a line ends.
+fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
+    log.lines()
+        .flat_map(|line| terminal::rendered_lines(line))
+        .map(|segment| segment.trim().to_owned())
+        .filter(|segment| !segment.is_empty())
 }
 
 /// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to, or
@@ -4476,12 +4496,12 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// pasted anywhere.
 #[must_use]
 pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
-    log_tail
-        .lines()
+    vllm_log_segments(log_tail)
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && vllm_log_shows_oom(line))
-        .map(|line| format!("vllm: {line}"))
+        .find(|segment| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {segment}")))
+        .map(|segment| format!("vllm: {segment}"))
 }
 
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
@@ -7720,6 +7740,31 @@ last_installed_runtime_id = "therock-release"
                 .as_deref(),
             Some("vllm: HIP OUT OF MEMORY")
         );
+        // A progress bar repaints with a bare `\r`, so vLLM's own output puts
+        // the repaint and the exception that follows it on ONE `\n` line. The
+        // diagnostic re-splits on `\r` and keeps only anchored segments, so
+        // anchoring the physical line once left the exception unanchored and
+        // discarded: the tail read as "no OOM" and both the engine hint and the
+        // serve-summary note vanished for the commonest shape of this failure.
+        let repainted = "Loading weights: 90%\rtorch.OutOfMemoryError: HIP out of memory. \
+                         Tried to allocate 7.21 GiB.\n";
+        assert!(
+            vllm_log_shows_oom(repainted),
+            "an allocator exception after a progress-bar carriage return is still an OOM"
+        );
+        let repainted_symptom =
+            vllm_oom_diagnose_symptom(repainted).expect("the CR-split tail still selects a line");
+        assert_eq!(
+            repainted_symptom,
+            "vllm: torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            "the exception segment must be quoted, not the progress-bar segment that \
+             happened to carry the anchor"
+        );
+        // ...and what comes back is still diagnosable, so the printed command
+        // reports a cause rather than reading as "checked, found nothing".
+        assert!(diagnose::vllm_oom_symptom_is_diagnosable(
+            &repainted_symptom
+        ));
         // No OOM line, no symptom — including the sub-threshold shapes the
         // shared classifier rejects, which must not be reported as a cause.
         assert_eq!(
