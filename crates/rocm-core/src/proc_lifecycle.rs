@@ -487,6 +487,27 @@ fn parse_start_ticks(stat: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_exited_pid_reads_as_gone_whatever_start_time_is_observed() {
+        // The liveness check comes first: a pid that has exited must be `Gone`
+        // even when a start-time reading is supplied that would otherwise match.
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap the child");
+        let id = ProcessIdentity::new(pid, Some(42));
+        assert_eq!(
+            identity_state_with_observed(&id, Some(42)),
+            IdentityState::Gone
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_start_time_is_readable_and_stable_for_our_own_pid() {

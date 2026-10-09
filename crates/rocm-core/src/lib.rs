@@ -4943,6 +4943,54 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_state_write_never_shows_a_reader_a_truncated_file() {
+        // The uninstall gate reads this file to decide whether a daemon is live; a
+        // torn write makes it unparseable and aborts the run. Same property as
+        // the service record: a reader holding the old inode must keep seeing a
+        // whole document across a rewrite.
+        use std::io::{Read, Seek, SeekFrom};
+
+        let root = atomic_write_root("runtime-state-reader-safety");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        paths.ensure().expect("create the app directories");
+        let mut state = AutomationRuntimeState {
+            running: true,
+            automations_enabled: true,
+            daemon_pid: 1,
+            daemon_start_ticks: None,
+            started_at_unix_ms: 1,
+            last_tick_unix_ms: 1,
+            local_webhook_endpoint: None,
+            active_watchers: Vec::new(),
+        };
+        state.write(&paths).expect("seed the state file");
+        let mut reader =
+            fs::File::open(paths.automation_state_path()).expect("open the state file");
+
+        state.running = false;
+        state.write(&paths).expect("rewrite the state file");
+
+        reader.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).expect("read the open file");
+        let parsed: AutomationRuntimeState = serde_json::from_slice(&seen)
+            .expect("a reader holding the file open must never see a truncated document");
+        assert!(
+            parsed.running,
+            "the open descriptor must see the pre-write state"
+        );
+        let published = AutomationRuntimeState::load(&paths)
+            .expect("load")
+            .expect("present");
+        assert!(!published.running, "the rewrite must have landed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn a_service_record_write_leaves_no_scratch_sibling() {
         // This pins scratch-file hygiene, NOT atomic publishing: a plain
         // `fs::write` creates no scratch file at all and would pass too. The

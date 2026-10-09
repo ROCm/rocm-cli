@@ -438,9 +438,26 @@ pub(crate) fn stop_managed_services_with(
     // survivor from the previous run reads exactly like that: probe those first,
     // so a run that is going to abort anyway has stopped nothing on the way.
     let records = load_managed_services(paths)?;
+    //
+    // Except a stopped record that shares its host:port with a live one: serving
+    // the same model again after a stop leaves exactly that pair, and the live
+    // record's own server answers there. That answer says nothing about the
+    // stopped record until the live one has been stopped, so it is probed after.
+    let live_endpoints: Vec<(String, u16)> = records
+        .iter()
+        .filter(|record| managed_service_is_live(record))
+        .map(|record| (probe_hosts(&record.host).join("|"), record.port))
+        .collect();
+    let shares_a_live_endpoint = |record: &ManagedServiceRecord| {
+        live_endpoints.contains(&(probe_hosts(&record.host).join("|"), record.port))
+    };
     let already_stopped: Vec<&ManagedServiceRecord> = records
         .iter()
-        .filter(|record| !managed_service_is_live(record))
+        .filter(|record| !managed_service_is_live(record) && !shares_a_live_endpoint(record))
+        .collect();
+    let deferred: Vec<&ManagedServiceRecord> = records
+        .iter()
+        .filter(|record| !managed_service_is_live(record) && shares_a_live_endpoint(record))
         .collect();
     probe_records_for_survivors(paths, &already_stopped, &[], &mut report);
     if !report.failed.is_empty() {
@@ -509,6 +526,7 @@ pub(crate) fn stop_managed_services_with(
     //     An unrelated service on a recycled port does not, and is not blocked.
     let stopped_this_pass: Vec<&ManagedServiceRecord> = attempted.clone();
     probe_records_for_survivors(paths, &stopped_this_pass, &attempted, &mut report);
+    probe_records_for_survivors(paths, &deferred, &attempted, &mut report);
     Ok(report)
 }
 
@@ -885,7 +903,8 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
             format!(
                 " These services were stopped before the failure and stay stopped: {}. Stopping \
                  them dropped their endpoint keys, so a publicly bound one has to be served \
-                 again with `rocm serve --allow-public-bind` to return.",
+                 again with `rocm serve --host <host> --allow-public-bind` (add `--api-key <key>`) \
+                 to return.",
                 report.stopped.join(", ")
             )
         };
