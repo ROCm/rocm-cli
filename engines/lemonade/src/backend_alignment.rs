@@ -939,21 +939,10 @@ fn resolve_rocm_llamacpp_backend_dirs_aside(
 mod tests {
     use super::*;
     use crate::install::platform_binary_name;
+    use crate::test_support::scratch_dir;
     use anyhow::anyhow;
     use serde_json::json;
     use std::fs;
-
-    /// A fresh scratch directory under the crate's `target/`. The base is
-    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
-    /// runtime environment read.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn backend_install_succeeds_without_retry() {
