@@ -325,17 +325,11 @@ mod tests {
     /// This is what lets the docs guard assert against the workflow instead of
     /// against a list copied into the test source: add a lane and the derived
     /// list grows, so the documentation assertions fail until the docs follow.
-    ///
-    /// The job-id scan is scoped to the `jobs:` block, because top-level keys
-    /// like `push:` (under `on:`) and `group:` (under `concurrency:`) sit at the
-    /// same indent and would otherwise read as job ids.
     fn self_hosted_e2e_jobs(text: &str) -> Vec<(String, String)> {
-        let jobs = top_level_block(text, "jobs");
-        jobs.lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
+        job_ids(text)
+            .into_iter()
             .filter_map(|job| {
-                let mut values = runs_on_values(job_block(text, job));
+                let mut values = runs_on_values(job_block(text, &job));
                 assert!(
                     values.len() <= 1,
                     "job `{job}` declares more than one runs-on"
@@ -347,8 +341,22 @@ mod tests {
                 SELF_HOSTED_LABELS
                     .iter()
                     .any(|self_hosted| labels.iter().any(|label| label == self_hosted))
-                    .then_some((job.to_owned(), runs_on))
+                    .then_some((job, runs_on))
             })
+            .collect()
+    }
+
+    /// Every job id in `text`'s `jobs:` block, in file order.
+    ///
+    /// Scoped to the `jobs:` block, because top-level keys like `push:` (under
+    /// `on:`) and `group:` (under `concurrency:`) sit at the same indent and
+    /// would otherwise read as job ids.
+    fn job_ids(text: &str) -> Vec<String> {
+        top_level_block(text, "jobs")
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .map(str::to_owned)
             .collect()
     }
 
@@ -1045,14 +1053,19 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         String::new()
     }
 
-    /// Every `GPU preflight` step block in `text`, in file order.
+    /// Every `GPU preflight` step block in `text`, in file order: each job's
+    /// `steps:` items whose name starts `GPU preflight`, jobs in file order.
+    ///
+    /// Found through `job_steps`/`step_name` like every other step lookup here,
+    /// so a name wrapped into a block scalar (`name: >-`) is found exactly like
+    /// a one-line one, and a `- name: GPU preflight` line in a comment or some
+    /// step's script is not a step.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
-            .map(|(i, _)| step_block(&lines, i))
+        job_ids(text)
+            .into_iter()
+            .flat_map(|job| job_steps(job_block(text, &job)).unwrap_or_default())
+            .filter(|(name, _)| name.starts_with("GPU preflight"))
+            .map(|(_, step)| step)
             .collect()
     }
 
@@ -2785,5 +2798,35 @@ permissions:
             names,
             ["GPU preflight (bounded wait)", "Check out", "Plain"]
         );
+    }
+
+    /// The preflight lookup every script check reads from must see a wrapped
+    /// name exactly like a one-line one: matched on the raw `- name:` text, a
+    /// preflight named through `name: >-` drops out of the APU, twin-drift and
+    /// script-extraction checks without any of them noticing.
+    #[test]
+    fn a_gpu_preflight_with_a_block_scalar_name_is_still_found() {
+        let workflow = "on: push\n\
+                        jobs:\n\
+                        \x20 wrapped:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: >-\n\
+                        \x20         GPU preflight\n\
+                        \x20         (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo wrapped\n\
+                        \x20 plain:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: GPU preflight (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo plain\n";
+        let scripts: Vec<String> = gpu_preflight_steps(workflow)
+            .iter()
+            .filter_map(|step| run_block(step))
+            .map(|body| body.join("\n").trim().to_owned())
+            .collect();
+        assert_eq!(scripts, ["echo wrapped", "echo plain"]);
     }
 }
