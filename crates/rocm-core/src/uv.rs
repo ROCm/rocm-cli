@@ -1127,8 +1127,9 @@ mod archive_properties {
     fn generator_catches_a_traversing_extractor() {
         let error = property("naive", ESCAPES_ONLY, naive_unpack)
             .expect_err("an extractor that honours `..` must be caught");
-        // Caught for writing outside the root, not for some harness failure.
-        assert!(error.contains("outside the root"), "{error}");
+        // Caught for a write outside the root (an escape, not a harness
+        // failure or a link the escape check does not judge).
+        assert!(error.contains("outside the root: "), "{error}");
     }
 
     /// Calibration for the two-step link shape: an extractor that sanitises
@@ -1138,6 +1139,6 @@ mod archive_properties {
     fn generator_catches_a_link_following_extractor() {
         let error = property("naive-links", ESCAPES_ONLY, naive_sanitizing_unpack)
             .expect_err("an extractor that writes through planted links must be caught");
-        assert!(error.contains("outside the root"), "{error}");
+        assert!(error.contains("outside the root: "), "{error}");
     }
 }
