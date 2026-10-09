@@ -1062,17 +1062,17 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "error message naming the command, not advice",
     ),
     (
-        "apps/rocmd/src/lib.rs",
+        "apps/rocmd/src/sandbox.rs",
         "rocmd executable has no parent directory",
         "error message",
     ),
     (
-        "apps/rocmd/src/lib.rs",
+        "apps/rocmd/src/service.rs",
         "rocmd automation supervisor started",
         "log line",
     ),
     (
-        "apps/rocmd/src/lib.rs",
+        "apps/rocmd/src/service.rs",
         "rocmd automation supervisor stopped",
         "log line",
     ),
@@ -1120,7 +1120,7 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "remediation-flag wording (`rocm fix can run it`), not a command",
     ),
     (
-        "crates/rocm-core/src/lib.rs",
+        "crates/rocm-core/src/host_gpu.rs",
         "rocm debug: command capture {stage} failed for {}: {detail}",
         "debug log line",
     ),
