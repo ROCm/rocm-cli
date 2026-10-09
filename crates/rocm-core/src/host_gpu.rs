@@ -1895,11 +1895,11 @@ fn detect_distro_name() -> Option<String> {
 }
 
 fn parse_os_release_pretty_name(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let value = line.strip_prefix("PRETTY_NAME=")?.trim();
-        let value = value.trim_matches('"').trim_matches('\'').trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
+    // Through the shared parser (see `os_release`). The `trim` and the empty
+    // check are this caller's own: a blank PRETTY_NAME falls back to "Linux".
+    crate::os_release::field(text, "PRETTY_NAME")
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn detect_cpu_model_with_windows_inventory(
@@ -4507,6 +4507,25 @@ Class Name:                Display
             parse_os_release_pretty_name("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
             Some("Ubuntu 24.04.2 LTS".to_owned())
         );
+    }
+
+    /// The distro name is read through the shared `os_release` parser, so it
+    /// names the distro `sh` would: the last assignment wins, a trailing
+    /// comment is not part of the value, and an unreadable file names nothing
+    /// (the caller then falls back to "Linux") rather than a guess.
+    #[test]
+    fn pretty_name_reads_as_sh_reads_it() {
+        assert_eq!(
+            parse_os_release_pretty_name(
+                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
+            ),
+            Some("Ubuntu 24.04 LTS".to_owned())
+        );
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"),
+            None
+        );
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME=\"  \"\n"), None);
     }
 
     #[test]

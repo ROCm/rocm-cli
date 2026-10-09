@@ -36,6 +36,7 @@ pub mod host_gpu;
 pub mod managed_runtime;
 pub mod model_readiness;
 pub mod openmpi;
+pub mod os_release;
 pub mod proc_lifecycle;
 pub mod report;
 pub mod report_delivery;

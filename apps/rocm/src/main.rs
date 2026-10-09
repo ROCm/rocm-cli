@@ -6800,19 +6800,6 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
-pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let Some((name, raw_value)) = line.split_once('=') else {
-            continue;
-        };
-        if name != key {
-            continue;
-        }
-        return Some(raw_value.trim().trim_matches('"').to_owned());
-    }
-    None
-}
-
 pub(crate) fn read_os_release() -> Result<String> {
     fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
 }
@@ -6860,8 +6847,8 @@ fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
     }
 
     let os_release = read_os_release().unwrap_or_default();
-    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
-    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let os_id = rocm_core::os_release::field(&os_release, "ID").unwrap_or_default();
+    let id_like = rocm_core::os_release::field(&os_release, "ID_LIKE").unwrap_or_default();
     let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like);
 
     println!("openmpi setup");
@@ -7035,8 +7022,8 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     }
 
     let os_release = read_os_release().unwrap_or_default();
-    let os_id = parse_os_release_field(&os_release, "ID").unwrap_or_default();
-    let id_like = parse_os_release_field(&os_release, "ID_LIKE").unwrap_or_default();
+    let os_id = rocm_core::os_release::field(&os_release, "ID").unwrap_or_default();
+    let id_like = rocm_core::os_release::field(&os_release, "ID_LIKE").unwrap_or_default();
     let plan = (dep.build_plan)(&os_id, &id_like);
 
     println!("{} setup", dep.name);

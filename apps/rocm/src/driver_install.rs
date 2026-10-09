@@ -25,7 +25,7 @@ use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::{empty_as_unknown, parse_os_release_field, read_os_release};
+use crate::{empty_as_unknown, read_os_release};
 
 pub(crate) fn install_driver(
     paths: &AppPaths,
@@ -835,13 +835,39 @@ fn build_driver_install_plan(
         return wsl_rocdxg_driver_plan(escalation);
     }
 
-    let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
-    let version_id = parse_os_release_field(os_release_text, "VERSION_ID").unwrap_or_default();
-    let codename = parse_os_release_field(os_release_text, "VERSION_CODENAME")
-        .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
+    // An unreadable file is reported as itself, naming the line, rather than
+    // falling through to "this distro is not supported" — which would send the
+    // user looking for a support matrix when the fix is one line of a file.
+    let os_release = match rocm_core::os_release::parse(os_release_text) {
+        Ok(fields) => fields,
+        Err(unreadable) => {
+            return DriverInstallPlan {
+                supported: false,
+                mutating: false,
+                policy: "unreadable_os_release".to_owned(),
+                os_id: String::new(),
+                version_id: String::new(),
+                codename: String::new(),
+                repo_version,
+                reason: format!(
+                    "/etc/os-release {unreadable}; no driver commands were planned \
+                     because the distro cannot be read."
+                ),
+                preflight_checks: Vec::new(),
+                commands: Vec::new(),
+                checks: vec!["rocm examine".to_owned()],
+                reboot_required: false,
+            };
+        }
+    };
+    let field = |key: &str| os_release.get(key).cloned();
+    let os_id = field("ID").unwrap_or_default();
+    let version_id = field("VERSION_ID").unwrap_or_default();
+    let codename = field("VERSION_CODENAME")
+        .or_else(|| field("UBUNTU_CODENAME"))
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
-    let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
+    let id_like = field("ID_LIKE").unwrap_or_default();
 
     match (os_id.as_str(), version_id.as_str()) {
         ("ubuntu", "22.04" | "24.04") => apt_driver_plan(
@@ -1736,6 +1762,119 @@ mod tests {
             .into_iter()
             .map(|command| command.command)
             .collect()
+    }
+
+    /// Rewrite every `KEY=value` / `KEY="value"` line of an os-release fixture
+    /// in single quotes, which `os-release(5)` permits just as it does double.
+    fn single_quoted(os_release: &str) -> String {
+        os_release
+            .lines()
+            .map(|line| match line.split_once('=') {
+                Some((key, value)) => format!("{key}='{}'", value.trim_matches('"')),
+                None => line.to_owned(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// How a distro quotes its `/etc/os-release` must not change the plan.
+    ///
+    /// `os-release(5)` allows single or double quotes, but the parser stripped
+    /// only `"`: `ID='ubuntu'` read as `'ubuntu'` and `VERSION_ID='24.04'` as
+    /// `'24.04'`, so a spec-valid file read as an unsupported distro. Every
+    /// supported distro, rewritten in single quotes, must plan exactly as it
+    /// does in double quotes.
+    #[test]
+    fn a_single_quoted_os_release_builds_the_same_plan() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        for (label, os_release) in dkms_planning_os_releases() {
+            let plan = |text: &str| {
+                build_driver_install_plan(
+                    &test_examine("linux", false),
+                    text,
+                    true,
+                    PrivilegeEscalation::Sudo,
+                )
+            };
+            let double = plan(os_release);
+            let single = plan(&single_quoted(os_release));
+            assert!(
+                single.supported,
+                "{label}: unsupported when single-quoted: {}\n{}",
+                single.reason,
+                single_quoted(os_release)
+            );
+            assert_eq!(
+                (single.os_id.as_str(), single.version_id.as_str()),
+                (double.os_id.as_str(), double.version_id.as_str()),
+                "{label}: quote style changed the distro read"
+            );
+            assert_eq!(
+                single.execution_commands(),
+                double.execution_commands(),
+                "{label}: quote style changed the planned commands"
+            );
+        }
+    }
+
+    /// An unreadable os-release is refused as itself: the reason names the
+    /// offending line, and it is asserted together with what it claims — no
+    /// plan, no commands — and against the reason it replaced, which blamed the
+    /// distro.
+    #[test]
+    fn an_unreadable_os_release_names_its_line_and_plans_nothing() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble\nunset ID\n",
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            plan.reason,
+            "/etc/os-release line 4 is not a plain assignment: \"unset ID\"; no driver \
+             commands were planned because the distro cannot be read."
+        );
+        assert!(!plan.supported);
+        assert!(plan.commands.is_empty(), "{:?}", plan.commands);
+        assert_eq!(plan.policy, "unreadable_os_release");
+
+        // The rendered plan says so on one line, and does not also claim the
+        // distro is unsupported.
+        let rendered = render_driver_install_plan(&plan, false, true);
+        assert!(
+            rendered.contains("reason: /etc/os-release line 4 is not a plain assignment"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("AMD-documented"), "{rendered}");
+        assert!(
+            rendered.contains("execution_commands: <none>"),
+            "{rendered}"
+        );
+    }
+
+    /// With a duplicated key, the plan is built from the last assignment — the
+    /// one a shell keeps, and the one `rocm examine` reports, since both now
+    /// read through `rocm_core::os_release`. The driver plan used to take the
+    /// first, so on this file it planned for Debian 12 while `rocm examine`
+    /// reported Ubuntu.
+    #[test]
+    fn a_duplicated_os_release_key_is_planned_from_its_last_assignment() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let text = "ID=debian\nVERSION_ID=\"12\"\nID=ubuntu\nVERSION_ID=\"24.04\"\n\
+                    VERSION_CODENAME=noble\n";
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            text,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        assert_eq!(
+            (plan.os_id.as_str(), plan.version_id.as_str()),
+            ("ubuntu", "24.04"),
+            "planned for the first assignment instead of the last"
+        );
+        assert!(plan.supported, "{}", plan.reason);
     }
 
     #[test]

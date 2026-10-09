@@ -829,7 +829,7 @@ pub fn install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
         let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
+        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
         let plan = build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
             let rendered = plan
@@ -854,7 +854,7 @@ pub fn libatomic_install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
         let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
+        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
         let plan = build_libatomic_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
             let rendered = plan
@@ -879,7 +879,7 @@ pub fn libnuma_install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
         let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| parse_os_release_field(&os_release, key).unwrap_or_default();
+        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
         let plan = build_libnuma_install_plan(&field("ID"), &field("ID_LIKE"));
         if plan.supported && !plan.commands.is_empty() {
             let rendered = plan
@@ -892,26 +892,6 @@ pub fn libnuma_install_hint() -> String {
         }
     }
     "install your distribution's numactl runtime package (providing libnuma.so.1)".to_owned()
-}
-
-/// Parse a single `KEY=VALUE` field from `/etc/os-release` contents, stripping
-/// optional surrounding quotes. Returns `None` when the key is absent.
-// Only the Linux `install_hint` path calls this at runtime; off Linux it is
-// exercised solely by cross-platform unit tests.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        if name.trim() != key {
-            continue;
-        }
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        return Some(value.to_owned());
-    }
-    None
 }
 
 /// Build a non-mutating apt invocation for a planned `apt-get install` command.
@@ -1075,22 +1055,6 @@ mod tests {
         assert!(!runtime_present(None, Some(&run)));
         // Neither -> not usable.
         assert!(!runtime_present(None, None));
-    }
-
-    #[test]
-    fn parses_os_release_fields_with_and_without_quotes() {
-        let text =
-            "NAME=\"Red Hat Enterprise Linux\"\nID=rhel\nID_LIKE=fedora\nVERSION_ID=\"9.4\"\n";
-        assert_eq!(parse_os_release_field(text, "ID").as_deref(), Some("rhel"));
-        assert_eq!(
-            parse_os_release_field(text, "ID_LIKE").as_deref(),
-            Some("fedora")
-        );
-        assert_eq!(
-            parse_os_release_field(text, "VERSION_ID").as_deref(),
-            Some("9.4")
-        );
-        assert_eq!(parse_os_release_field(text, "MISSING"), None);
     }
 
     #[test]
