@@ -107,6 +107,18 @@ $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
 
+### Verify the installation
+
+Open a new terminal so the updated `PATH` takes effect, then run:
+
+```
+rocm version
+```
+
+The output shows the ROCm CLI version with its release tag or branch and commit
+hash, the ROCm SDK this machine would use, and the GPU driver version. The SDK
+and driver lines read `not detected` when none is found.
+
 ## Build from source
 
 Building requires [Rust](https://rustup.rs/); the pinned toolchain in
@@ -861,7 +873,30 @@ rocm logs [--service <service-id>] [--search TERM ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+               [--force-dev-binaries]
 ```
+
+`rocm uninstall` removes the files ROCm CLI manages on this computer. Use
+`--dry-run` to preview what it removes, and `--yes` to skip the confirmation.
+Each `--keep-*` flag leaves one category in place:
+
+- `--keep-binaries` keeps the installed ROCm CLI binaries.
+- `--keep-config` keeps your saved settings.
+- `--keep-data` keeps app data such as logs, services, engines, and the `uv`
+  package cache.
+- `--keep-cache` keeps the caches under the cache directory. It doesn't cover
+  the `uv` package cache, which `--keep-data` controls.
+
+When you run `rocm` from a cargo `target` build, `uninstall` skips binary
+removal. Pass `--force-dev-binaries` to remove the debug and release binaries
+beside it.
+
+Before removing anything, `uninstall` notes any shared caches it leaves alone.
+It also warns when managed service records exist, because it doesn't stop their
+background processes, and when remote sessions exist. For each remote session,
+run `rocm remote stop <session>` first. Otherwise the model keeps running on the
+remote machine with its endpoint published, and the record that tracked it is
+gone.
 
 ### Shell completions
 
