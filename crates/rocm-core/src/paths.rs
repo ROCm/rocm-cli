@@ -613,6 +613,11 @@ mod tests {
             "unexpected error: {message}"
         );
         assert!(paths.config_path().is_dir(), "discovery touched the path");
+        // `load` draws the same line: the directory is not "no settings yet".
+        assert!(
+            RocmCliConfig::load(&paths).is_err(),
+            "load read an unreadable config.json as absent"
+        );
         fs::remove_dir(paths.config_path())?;
 
         // Way out: repair the file.

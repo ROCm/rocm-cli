@@ -253,6 +253,33 @@ fn no_corruption_class_is_wiped_by_managed_python_recording() {
     }
 }
 
+/// A `config.json` that cannot be read at all — here a directory, which
+/// fails the read on every platform without chmod or root — is not "no
+/// settings yet" either. Recording must refuse with the same message, and
+/// leave what is at that path alone.
+#[test]
+fn managed_python_recording_refuses_a_config_path_it_cannot_read() {
+    let (root, paths) = fresh_paths("config-unreadable-path");
+    std::fs::create_dir_all(paths.config_path()).unwrap();
+    let kept = paths.config_path().join("kept");
+    std::fs::write(&kept, b"user data").unwrap();
+
+    let error = record_managed_python_config(&paths, Path::new("/usr/bin/python3"))
+        .expect_err("recording over an unreadable config path must fail");
+    let still_a_dir = paths.config_path().is_dir();
+    let kept_after = std::fs::read(&kept);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("cannot record the managed Python")
+            && message.contains("it was left unchanged"),
+        "unexpected error: {message}"
+    );
+    assert!(still_a_dir, "the path was replaced");
+    assert_eq!(kept_after.unwrap(), b"user data");
+}
+
 /// With no `config.json` at all, recording the managed Python is the first
 /// write and must still succeed: "missing" is defaults, as `load` promises.
 #[test]

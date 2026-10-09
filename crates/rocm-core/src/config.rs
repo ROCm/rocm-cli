@@ -530,14 +530,24 @@ struct LegacyDashTui {
 }
 
 impl RocmCliConfig {
+    /// Read `config.json`, or the defaults when there is none yet.
+    ///
+    /// Only a file that is not there means "no settings yet". Anything else
+    /// that stops the read — a directory where the file should be, a
+    /// permission problem, a symlink loop — is an error, just as unparseable
+    /// contents are: answering with defaults would let the next save replace
+    /// the user's settings with them. Data-dir discovery draws the same line.
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.config_path();
-        if !path.is_file() {
-            return Ok(Self::default());
-        }
-
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
         serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", path.display()))
     }
