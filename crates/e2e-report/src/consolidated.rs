@@ -1810,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn load_platform_reports_sorts_by_every_key_dimension() {
+    fn report_sort_key_orders_by_every_dimension() {
         // `keys == sorted(keys)` (the test above) derives its expectation from
         // `report_sort_key` itself, so it can't catch a change to the key — e.g.
         // dropping or swapping one of its fields — because the expectation would
