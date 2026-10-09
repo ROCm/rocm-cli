@@ -736,6 +736,9 @@ fn build_runtime_state(
         running: automations_enabled,
         automations_enabled,
         daemon_pid: std::process::id(),
+        // Captured while this process is alive so a later `rocm uninstall` can
+        // tell this daemon from an unrelated process that inherited the PID.
+        daemon_start_ticks: rocm_core::ProcessIdentity::capture(std::process::id()).start_ticks,
         started_at_unix_ms: now,
         last_tick_unix_ms: now,
         local_webhook_endpoint: None,
@@ -863,6 +866,23 @@ fn wait_for_service_ready(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fresh_runtime_state_records_this_daemons_start_time() {
+        // `rocm uninstall` refuses to signal a daemon pid it cannot prove is
+        // rocmd, and the proof is this field: `None` here would make every
+        // record look pre-upgrade and abort every uninstall that finds a daemon.
+        let state = build_runtime_state(&RocmCliConfig::default(), true);
+        assert_eq!(state.daemon_pid, std::process::id());
+        let recorded = state
+            .daemon_start_ticks
+            .expect("a live daemon must record its own start-time on Linux");
+        assert_eq!(
+            Some(recorded),
+            rocm_core::process_start_ticks(std::process::id())
+        );
+    }
     use crate::test_support::{temp_app_paths, unique_test_root};
 
     /// Drive `supervise_service` far enough to reach the key guard, and return

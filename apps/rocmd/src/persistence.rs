@@ -91,6 +91,7 @@ mod tests {
             running: true,
             automations_enabled: true,
             daemon_pid: 1,
+            daemon_start_ticks: None,
             started_at_unix_ms: 1,
             last_tick_unix_ms: 1,
             local_webhook_endpoint: None,
