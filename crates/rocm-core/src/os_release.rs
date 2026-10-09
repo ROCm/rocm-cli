@@ -6,8 +6,8 @@
 //!
 //! The one parser every reader in the workspace uses — the driver plan, the
 //! package installs it approves (`ensure_openmpi_for_vllm`,
-//! `ensure_torch_runtime_dep`), `rocm examine`, and the OpenMPI hint — so they
-//! cannot read the same file as different distros.
+//! `ensure_torch_runtime_dep`), `rocm examine`, the OpenMPI hint, and the host
+//! distro name — so they cannot read the same file as different distros.
 //!
 //! The reference is a POSIX shell sourcing the file: `os-release(5)` defines the
 //! format as shell-compatible assignments, and the WSL probe in
