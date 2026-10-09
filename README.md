@@ -32,9 +32,11 @@ for Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
+
+For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
