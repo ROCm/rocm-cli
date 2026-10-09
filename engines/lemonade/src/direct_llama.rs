@@ -484,19 +484,8 @@ fn filter_ggufs_by_variant(mut ggufs: Vec<PathBuf>, variant: Option<&str>) -> Ve
 mod tests {
     use super::*;
     use crate::LLAMACPP_RECIPE;
+    use crate::test_support::scratch_dir;
     use std::fs;
-
-    /// A fresh scratch directory under the crate's `target/`. The base is
-    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
-    /// runtime environment read.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn parses_canonical_hugging_face_checkpoints() {

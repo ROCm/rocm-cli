@@ -345,17 +345,40 @@ mod tests {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
-    #[test]
-    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
-        // Many calls rather than two: without a counter the names differ only
-        // when the clock ticks between calls, so a pair can pass by luck.
-        let paths: Vec<PathBuf> = (0..64).map(|_| probe_state_path("same-tag")).collect();
+    /// Call `make_path` from many threads at once and assert no two calls
+    /// returned the same path.
+    ///
+    /// Concurrent rather than sequential, because that is how tests call these
+    /// helpers: calls made one after another let the clock tick between them
+    /// and can pass by luck, while threads released together all read the same
+    /// millisecond, so a name keyed on pid and time alone repeats.
+    fn assert_each_call_gets_its_own_path(make_path: impl Fn() -> PathBuf + Sync) {
+        const CALLERS: usize = 16;
+        let start = std::sync::Barrier::new(CALLERS);
+        let paths: Vec<PathBuf> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        make_path()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().expect("a caller panicked"))
+                .collect()
+        });
         let distinct: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(
             distinct.len(),
-            paths.len(),
-            "two calls with one tag shared a path"
+            CALLERS,
+            "two calls with one tag must not share a path"
         );
+    }
+    #[test]
+    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
+        assert_each_call_gets_its_own_path(|| probe_state_path("same-tag"));
     }
     #[test]
     fn inference_verification_latches_into_the_state_file() -> Result<()> {
