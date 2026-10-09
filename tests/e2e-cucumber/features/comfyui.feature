@@ -117,8 +117,10 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
   # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
   # combining it with @nightly would make this scenario unreachable on every lane;
-  # this mutates only its own isolated runtime prefix, not the OS.
-  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly
+  # it touches the OS only as much as runtime-01's `install sdk --yes` does (installing
+  # missing torch system libraries), and otherwise only its own isolated runtime
+  # prefix. Linux-only until a Windows/WSL2 run of `comfyui install` has been seen.
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux
   Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given a machine with a managed ROCm runtime
     And the runtime has torch and no CUDA packages

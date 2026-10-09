@@ -705,7 +705,11 @@ fn nvidia_distributions(python: &Path) -> Vec<String> {
 fn nvidia_only(distributions: Vec<String>) -> Vec<String> {
     distributions
         .into_iter()
-        .filter(|name| name.to_ascii_lowercase().starts_with("nvidia-"))
+        .filter(|name| {
+            name.to_ascii_lowercase()
+                .replace(['_', '.'], "-")
+                .starts_with("nvidia-")
+        })
         .collect()
 }
 
