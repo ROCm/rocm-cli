@@ -479,7 +479,7 @@ impl Fence {
 pub struct Layout {
     // Declared first so the case directory goes before a fence it owns.
     _case: tempfile::TempDir,
-    _own_fence: Option<Fence>,
+    own_fence: Option<Fence>,
     fence_dirty: std::rc::Rc<std::cell::Cell<bool>>,
     pub top: PathBuf,
     pub base: PathBuf,
@@ -492,7 +492,7 @@ impl Layout {
     pub fn new() -> Self {
         let fence = Fence::new();
         let mut layout = Self::in_fence(&fence);
-        layout._own_fence = Some(fence);
+        layout.own_fence = Some(fence);
         layout
     }
 
@@ -520,7 +520,7 @@ impl Layout {
         write(&base.join("victim"));
         Self {
             _case: case,
-            _own_fence: None,
+            own_fence: None,
             fence_dirty: fence.dirty.clone(),
             top: fence.top.clone(),
             base,
