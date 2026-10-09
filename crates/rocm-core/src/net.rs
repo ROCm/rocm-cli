@@ -1081,8 +1081,7 @@ fn http_response_is_complete(response: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    use crate::AppPaths;
-    use crate::test_support::workspace_test_artifact_dir;
+    use crate::test_support::{probe_test_record, workspace_test_artifact_dir};
     use std::io::{Read, Write};
 
     #[test]
@@ -2183,28 +2182,6 @@ mod tests {
 
         server.join().expect("server thread should not panic")?;
         Ok(())
-    }
-    fn probe_test_record(port: u16) -> ManagedServiceRecord {
-        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        ManagedServiceRecord::new(
-            &paths,
-            "svc-probe",
-            "vllm",
-            "Qwen/Qwen3-0.6B",
-            "Qwen/Qwen3-0.6B",
-            "127.0.0.1",
-            port,
-            "serve",
-            4242,
-            None,
-            None,
-            None,
-        )
     }
     #[test]
     fn inference_readiness_latches_after_the_first_successful_probe() -> Result<()> {
