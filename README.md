@@ -621,7 +621,7 @@ it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
 model simply does not fit, and printing a
 `rocm diagnose --symptom '<your failing line>'` command for the full
 busy-GPU-versus-model-too-large breakdown. See
-[docs/vllm.md](docs/vllm.md#shared-or-busy-gpus) for the flag itself and the
+[docs/vllm.md](docs/vllm.md) for the flag itself and the
 quoting rule the printed command follows.
 
 The note is deliberately narrow, so its absence is not evidence that memory was
