@@ -325,17 +325,11 @@ mod tests {
     /// This is what lets the docs guard assert against the workflow instead of
     /// against a list copied into the test source: add a lane and the derived
     /// list grows, so the documentation assertions fail until the docs follow.
-    ///
-    /// The job-id scan is scoped to the `jobs:` block, because top-level keys
-    /// like `push:` (under `on:`) and `group:` (under `concurrency:`) sit at the
-    /// same indent and would otherwise read as job ids.
     fn self_hosted_e2e_jobs(text: &str) -> Vec<(String, String)> {
-        let jobs = top_level_block(text, "jobs");
-        jobs.lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
+        job_ids(text)
+            .into_iter()
             .filter_map(|job| {
-                let mut values = runs_on_values(job_block(text, job));
+                let mut values = runs_on_values(job_block(text, &job));
                 assert!(
                     values.len() <= 1,
                     "job `{job}` declares more than one runs-on"
@@ -347,8 +341,22 @@ mod tests {
                 SELF_HOSTED_LABELS
                     .iter()
                     .any(|self_hosted| labels.iter().any(|label| label == self_hosted))
-                    .then_some((job.to_owned(), runs_on))
+                    .then_some((job, runs_on))
             })
+            .collect()
+    }
+
+    /// Every job id in `text`'s `jobs:` block, in file order.
+    ///
+    /// Scoped to the `jobs:` block, because top-level keys like `push:` (under
+    /// `on:`) and `group:` (under `concurrency:`) sit at the same indent and
+    /// would otherwise read as job ids.
+    fn job_ids(text: &str) -> Vec<String> {
+        top_level_block(text, "jobs")
+            .lines()
+            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.trim().strip_suffix(':'))
+            .map(str::to_owned)
             .collect()
     }
 
@@ -960,8 +968,10 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 };
                 assert!(
                     run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
-                    "{workflow} job `{job}` names a GPU preflight step but it has no \
-                     `run: |` script, so it waits for nothing"
+                    "{workflow} job `{job}` names a GPU preflight step but no non-empty \
+                     `run: |` block was found in it, so as far as this check can tell it \
+                     waits for nothing. Only the literal `run: |` form is recognised: a \
+                     `run: |-`, `run: >` or one-line `run:` script reads as missing here"
                 );
             }
         }
@@ -999,35 +1009,63 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 continue;
             }
             let step = step_block(&lines, i);
-            // `name:` is either the item's own first key (`- name: …`) or one
-            // of its sibling keys, two columns in from the dash.
-            let name = step
-                .lines()
-                .find_map(|l| {
-                    let key_line = if indent_of(l) == item_indent {
-                        l.trim_start().strip_prefix("- ")?
-                    } else if indent_of(l) == item_indent + 2 {
-                        l.trim_start()
-                    } else {
-                        return None;
-                    };
-                    key_line.strip_prefix("name:")
-                })
-                .map(|value| strip_quotes(strip_comment(value).trim()))
-                .unwrap_or_default();
-            steps.push((name, step));
+            steps.push((step_name(&step, item_indent), step));
         }
         Some(steps)
     }
 
-    /// Every `GPU preflight` step block in `text`, in file order.
+    /// A step's `name:` value; empty when it has none. `item_indent` is the
+    /// column of the step's `- `.
+    ///
+    /// `name:` is either the item's own first key (`- name: …`) or one of its
+    /// sibling keys, two columns in from the dash. A block scalar (`name: >`,
+    /// `name: |-`, …) is read from the more-indented lines that follow, joined
+    /// with single spaces, so a wrapped name is not mistaken for the indicator.
+    fn step_name(step: &str, item_indent: usize) -> String {
+        let lines: Vec<&str> = step.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            let key_line = if indent_of(line) == item_indent {
+                match line.trim_start().strip_prefix("- ") {
+                    Some(rest) => rest,
+                    None => continue,
+                }
+            } else if indent_of(line) == item_indent + 2 {
+                line.trim_start()
+            } else {
+                continue;
+            };
+            let Some(value) = key_line.strip_prefix("name:") else {
+                continue;
+            };
+            let value = strip_comment(value).trim();
+            if !value.starts_with(['>', '|']) {
+                return strip_quotes(value);
+            }
+            let key_indent = item_indent + 2;
+            return lines[at + 1..]
+                .iter()
+                .take_while(|l| l.trim().is_empty() || indent_of(l) > key_indent)
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        String::new()
+    }
+
+    /// Every `GPU preflight` step block in `text`, in file order: each job's
+    /// `steps:` items whose name starts `GPU preflight`, jobs in file order.
+    ///
+    /// Found through `job_steps`/`step_name` like every other step lookup here,
+    /// so a name wrapped into a block scalar (`name: >-`) is found exactly like
+    /// a one-line one, and a `- name: GPU preflight` line in a comment or some
+    /// step's script is not a step.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
-        let lines: Vec<&str> = text.lines().collect();
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
-            .map(|(i, _)| step_block(&lines, i))
+        job_ids(text)
+            .into_iter()
+            .flat_map(|job| job_steps(job_block(text, &job)).unwrap_or_default())
+            .filter(|(name, _)| name.starts_with("GPU preflight"))
+            .map(|(_, step)| step)
             .collect()
     }
 
@@ -1051,6 +1089,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Only the literal `run: |` form is recognised. `run: |-`, `run: >` and a
+    /// one-line `run: cmd` all read as no block, so a check that asserts a step
+    /// *has* a script relies on every workflow in this repo using `run: |`, and
+    /// has to say so in its failure message rather than claim the step is empty.
     ///
     /// Trailing blank lines are dropped: they are the separator `step_block`
     /// lets through, not part of the script, and keeping them would make two
@@ -3507,5 +3550,63 @@ permissions:
                  is now dead code (EAI-8751)"
             );
         }
+    }
+
+    /// A wrapped step name must not read as its block-scalar indicator: with
+    /// `name: >` taken literally, the GPU-preflight lookup would report the
+    /// step missing from a job that has it.
+    #[test]
+    fn a_block_scalar_step_name_is_read_from_its_wrapped_lines() {
+        let block = "    steps:\n\
+                     \x20     - name: >-\n\
+                     \x20         GPU preflight\n\
+                     \x20         (bounded wait)\n\
+                     \x20       run: |\n\
+                     \x20         echo wait\n\
+                     \x20     - uses: actions/checkout@v4\n\
+                     \x20       name: |\n\
+                     \x20         Check out\n\
+                     \x20     - name: Plain # trailing comment\n\
+                     \x20       run: |\n\
+                     \x20         echo plain\n";
+        let names: Vec<String> = job_steps(block)
+            .expect("the block has a steps: list")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            ["GPU preflight (bounded wait)", "Check out", "Plain"]
+        );
+    }
+
+    /// The preflight lookup every script check reads from must see a wrapped
+    /// name exactly like a one-line one: matched on the raw `- name:` text, a
+    /// preflight named through `name: >-` drops out of the APU, twin-drift and
+    /// script-extraction checks without any of them noticing.
+    #[test]
+    fn a_gpu_preflight_with_a_block_scalar_name_is_still_found() {
+        let workflow = "on: push\n\
+                        jobs:\n\
+                        \x20 wrapped:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: >-\n\
+                        \x20         GPU preflight\n\
+                        \x20         (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo wrapped\n\
+                        \x20 plain:\n\
+                        \x20   runs-on: [self-hosted]\n\
+                        \x20   steps:\n\
+                        \x20     - name: GPU preflight (bounded wait)\n\
+                        \x20       run: |\n\
+                        \x20         echo plain\n";
+        let scripts: Vec<String> = gpu_preflight_steps(workflow)
+            .iter()
+            .filter_map(|step| run_block(step))
+            .map(|body| body.join("\n").trim().to_owned())
+            .collect();
+        assert_eq!(scripts, ["echo wrapped", "echo plain"]);
     }
 }
