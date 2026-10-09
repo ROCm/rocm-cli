@@ -42,10 +42,12 @@ use crate::engines_cmd::{
     runtime_key_for_python, runtime_manifest_for_selector,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
+#[cfg(not(windows))]
 use crate::service_launch::{
-    attach_background_stdio, detach_background_command, ensure_public_service_has_endpoint_key,
-    is_loopback_host, managed_engine_startup_failure_detail, managed_service_process_command,
+    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
+    managed_service_process_command,
 };
+use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
@@ -4271,7 +4273,8 @@ fn describe_hours(hours: u64) -> String {
 ///
 /// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
 /// like: `serve` writes the 0600 `<id>.endpoint-key` before
-/// [`spawn_managed_engine_child`] writes the first `<id>.json`. Nothing about
+/// `spawn_managed_engine_child` (in `service_launch.rs`) writes the first
+/// `<id>.json`. Nothing about
 /// the file distinguishes the two cases — under `--any-age` there is no age gate
 /// left to ask — so this function does not try. It is only ever reached with the
 /// managed-launch lock held, which excludes that window outright; see
@@ -4551,7 +4554,7 @@ fn apply_service_prune_plan(
 /// leftover, and that is also what a launch looks like mid-flight: `serve`
 /// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
 /// first `<id>.json` only lands at `record.write()` inside
-/// [`spawn_managed_engine_child`]. Between those two writes a live server's
+/// `spawn_managed_engine_child` (in `service_launch.rs`). Between those two writes a live server's
 /// secret is indistinguishable from a leftover, and `--any-age` removes the age
 /// gate that used to hide the window, so a concurrent
 /// `rocm services prune --any-age --yes` deleted it.
