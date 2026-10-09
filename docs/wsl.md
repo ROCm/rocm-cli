@@ -46,14 +46,14 @@ yet.
 The `--distro` form sees less than a run from inside the distro, so prefer the
 in-distro form where you can:
 
-- It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
-  cannot honor a `$ROCM_PATH` pointing elsewhere. The probe runs under
-  `/bin/sh -c` through `wsl.exe --exec`, a non-login, non-interactive shell, so
-  nothing exported from a shell profile is set.
-- For the same reason it collects no environment, so the checks that read one
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework and ROCm version
-  pairing) do not run. It reports on the WSL GPU stack, not on the whole
-  installation.
+- The `--distro` form probes the conventional ROCm roots (`/opt/rocm*`,
+  `/usr/local/rocm*`) but cannot honor a `$ROCM_PATH` pointing elsewhere. The
+  probe runs under `/bin/sh -c` through `wsl.exe --exec`, a non-login,
+  non-interactive shell, so nothing exported from a shell profile is set.
+- For the same reason, the `--distro` form collects no environment, so the
+  checks that read one (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework
+  and ROCm version pairing) do not run. It reports on the WSL GPU stack, not on
+  the whole installation.
 
 ## Install ROCDXG In WSL
 
