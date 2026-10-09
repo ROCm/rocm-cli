@@ -91,7 +91,11 @@ repos:
         name: license header check (hawkeye)
         entry: hawkeye check --config licenserc.toml
         language: system
-        types_or: [rust, python, shell]
+        always_run: true # hawkeye always scans licenserc.toml's full file list regardless
+                          # of what changed (pass_filenames: false below); a file-type
+                          # filter here only gated whether the hook fired, so it could
+                          # never fully track licenserc.toml's own include list —
+                          # always_run removes that gap instead of chasing it
         pass_filenames: false
         groups: [local-tools] # runs in the dedicated `license-headers` CI job (pinned prebuilt binary, no Action)
 
