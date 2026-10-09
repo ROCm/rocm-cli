@@ -19,7 +19,7 @@ The AMD WSL path is:
    requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the Lemonade engine cannot
    start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
 3. ROCDXG (`librocdxg`) installed inside WSL.
-4. A TheRock runtime installed by `rocm-cli` into a managed Python venv.
+4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 
 To run a read-only preflight check from inside the distro:
 
@@ -42,12 +42,13 @@ because the distro you are checking is usually not set up yet.
 It sees less than a run from inside, so prefer the in-distro form where you can:
 
 - It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
-  cannot honor a `$ROCM_PATH` pointing elsewhere. `wsl.exe --exec` runs a
-  non-login, non-interactive shell, so nothing exported from a shell profile is
-  set.
+  cannot honor a `$ROCM_PATH` pointing elsewhere. The probe runs under
+  `/bin/sh -c` through `wsl.exe --exec`, a non-login, non-interactive shell, so
+  nothing exported from a shell profile is set.
 - For the same reason it collects no environment, so the checks that read one
   (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework and ROCm version
-  pairing) do not run. It reports on the WSL GPU stack, not on the whole installation.
+  pairing) do not run. It reports on the WSL GPU stack, not on the whole
+  installation.
 
 ## Install ROCDXG In WSL
 
@@ -75,7 +76,7 @@ it; on a mismatch the plan stops before `apt install` runs the package's
 maintainer scripts as root. Nothing needs to be set for this.
 
 To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
-Because rocm-cli has no digest for a release it predates, supply one:
+Because ROCm CLI has no digest for a release it predates, supply one:
 
 ```bash
 ROCM_CLI_ROCDXG_VERSION=<version> \
