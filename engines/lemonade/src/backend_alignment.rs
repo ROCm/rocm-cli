@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
-use rocm_core::{AppPaths, RocmCliConfig, active_managed_therock_version, runtime_is_linux};
+use rocm_core::{
+    AppPaths, RocmCliConfig, active_managed_therock_version, runtime_is_linux, runtime_is_windows,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,11 +14,15 @@ use std::time::Duration;
 
 use crate::direct_llama::find_llama_server_binary_for_backend;
 use crate::install::{LemonadeInstallManifest, read_manifest};
+#[cfg(target_os = "windows")]
+use crate::process::lemonade_process_environment_vars;
 use crate::process::{
     LemonadeProcessEnvironment, apply_lemonade_process_environment, hide_child_console_window,
     lemonade_process_environment, run_lemonade_backend_install, spawn_lemond,
     wait_for_lemonade_cli_status,
 };
+#[cfg(target_os = "windows")]
+use crate::runtime_dir::ParentRuntimeEnvironment;
 use crate::state::{free_local_port, terminate_pid};
 use crate::{DEFAULT_HOST, LLAMACPP_RECIPE, ROCM_BACKEND_NAME};
 
@@ -145,11 +151,12 @@ fn prepare_llamacpp_backend_for_active_rocm_impl(
         fallback_install(manifest, false)?;
         return Ok(None);
     }
-    // Alignment is only ever verifiable on Linux ([`rocm_backend_resolves`] always
-    // reports unresolved elsewhere), so attempting it on Windows can only burn up to
-    // three multi-GB backend installs and a network round-trip for a guaranteed-futile
-    // outcome. Skip straight to the ordinary pinned-version install.
-    if !runtime_is_linux() {
+    // Alignment is only ever verifiable on Linux (`ldd`-based) and Windows
+    // (DLL-presence-based); [`rocm_backend_resolves`] always reports unresolved
+    // everywhere else, so attempting it there can only burn up to three multi-GB
+    // backend installs and a network round-trip for a guaranteed-futile outcome.
+    // Skip straight to the ordinary pinned-version install.
+    if !runtime_is_linux() && !runtime_is_windows() {
         fallback_install(manifest, false)?;
         return Ok(None);
     }
@@ -597,9 +604,73 @@ fn rocm_backend_resolves(
         )
 }
 
-/// Off Linux, `ldd`-based verification is not exercised: a version-aligned backend is
-/// never accepted without it, so this always reports unresolved.
-#[cfg(not(target_os = "linux"))]
+/// ROCm DLL shortnames the `llamacpp:rocm` backend's `ggml-hip.dll` depends on,
+/// matched by filename *prefix* rather than an exact name: TheRock's Windows HIP
+/// runtime ships a version-suffixed `amdhip64_N.dll`, which the loader resolves by
+/// import name, not by any one literal file existing.
+#[cfg(target_os = "windows")]
+const ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES: [&str; 4] =
+    ["amdhip64", "hipblas", "rocblas", "hsa-runtime64"];
+
+/// Whether the ROCm GPU backend beside `llama_server_binary` has its required ROCm
+/// DLLs present somewhere the real process would actually search: the backend
+/// directory itself (Windows's loader always checks the loading module's own
+/// directory first) and `process_env`'s resolved `PATH`.
+///
+/// Weaker than Linux's `ldd` check: this confirms a matching file is present, not
+/// that the OS loader can actually load and link it (an architecture mismatch or a
+/// truncated download would still pass). ponytail: good enough to stop Windows from
+/// *always* skipping alignment and paying Lemonade's full redundant-download tax
+/// (ROCm/rocm-cli#392); upgrade to a real loader probe (e.g. spawning a throwaway
+/// child that calls `LoadLibraryExW`) if false positives turn up in practice.
+#[cfg(target_os = "windows")]
+fn rocm_backend_resolves(
+    llama_server_binary: &Path,
+    process_env: &LemonadeProcessEnvironment,
+) -> bool {
+    let Some(backend_dir) = llama_server_binary.parent() else {
+        return false;
+    };
+    if !backend_dir.join("ggml-hip.dll").is_file() {
+        return false;
+    }
+    let Ok(env_vars) =
+        lemonade_process_environment_vars(process_env, &ParentRuntimeEnvironment::current())
+    else {
+        return false;
+    };
+    let Some((_, path)) = env_vars.iter().find(|(key, _)| *key == "PATH") else {
+        return false;
+    };
+    let search_dirs: Vec<PathBuf> = std::iter::once(backend_dir.to_path_buf())
+        .chain(std::env::split_paths(path))
+        .collect();
+    ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES
+        .iter()
+        .all(|shortname| library_present_in(shortname, &search_dirs))
+}
+
+/// Whether some file directly inside any of `search_dirs` looks like the DLL for
+/// `shortname` -- a case-insensitive filename-prefix match, so version-suffixed
+/// names (`amdhip64_7.dll`) match alongside unsuffixed ones (`hipblas.dll`).
+#[cfg(target_os = "windows")]
+fn library_present_in(shortname: &str, search_dirs: &[PathBuf]) -> bool {
+    search_dirs.iter().any(|dir| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                name.starts_with(shortname) && name.ends_with(".dll")
+            })
+        })
+    })
+}
+
+/// Off Linux and Windows, no verification mechanism exists: a version-aligned
+/// backend is never accepted without one, so this always reports unresolved.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 const fn rocm_backend_resolves(
     _llama_server_binary: &Path,
     _process_env: &LemonadeProcessEnvironment,
@@ -1712,6 +1783,26 @@ mod tests {
             missing_one,
             &ROCM_BACKEND_REQUIRED_SONAMES
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn library_present_in_requires_prefix_match_in_some_dir() {
+        let root = scratch_dir("library-present-in");
+        let bin_dir = root.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("amdhip64_7.dll"), b"x").unwrap();
+        fs::write(bin_dir.join("hipblas.dll"), b"x").unwrap();
+
+        let search_dirs = [bin_dir.clone()];
+        assert!(library_present_in("amdhip64", &search_dirs));
+        assert!(library_present_in("hipblas", &search_dirs));
+        assert!(!library_present_in("rocblas", &search_dirs));
+
+        let other_dir = root.join("other");
+        fs::create_dir_all(&other_dir).unwrap();
+        let split_dirs = [other_dir, bin_dir];
+        assert!(library_present_in("amdhip64", &split_dirs));
     }
 
     #[test]
