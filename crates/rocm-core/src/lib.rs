@@ -4455,7 +4455,7 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// the two sides agreeing on where a line ends.
 fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
     log.lines()
-        .flat_map(|line| terminal::rendered_lines(line))
+        .flat_map(terminal::rendered_lines)
         .map(|segment| segment.trim().to_owned())
         .filter(|segment| !segment.is_empty())
 }
