@@ -39,7 +39,8 @@ Feature: ComfyUI install reports progress and makes failures actionable
     When the user installs ComfyUI
     Then the CLI succeeds and shows the install progress
     And the install output's folder: line names the ComfyUI source checkout
-    And rocm comfyui status reports the same folder: line
+    When the user checks ComfyUI status
+    Then status names the same ComfyUI source folder as the install
 
   # `rocm comfyui install` picks the ROCm runtime to install into. When more than
   # one managed runtime is ready and none is activated as the default, the CLI
