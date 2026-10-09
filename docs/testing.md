@@ -80,7 +80,9 @@ The guard accepts `ScopedTestEnv` or **any** static named `*_TEST_LOCK` taken
 inside the test body. The suffix is the rule, so a new lock
 is recognised the day it is declared rather than when someone remembers to add
 it to a list. The exemption is per test function, not per file: one test taking
-a lock does not cover its neighbours.
+a lock does not cover its neighbours. "Taken" means acquired: a `*_TEST_LOCK`
+counts only with a `.lock(` in the same statement, so `let _x = &SOME_TEST_LOCK;`
+names a lock without holding it and does not satisfy the guard.
 
 Two things the shape above gets right, both of which the guard checks only
 partly:
@@ -106,7 +108,24 @@ all of which the scan reports nothing for:
   different scope, so the scan cannot see the two together. It matches call
   text, so a wrapper hides the mutation until the wrapper itself is named in the
   scanner's `MUTATIONS` list, as `RestoredEnvVar::set(` is. Add a new restoring
-  helper to that list, or it is outside the guard.
+  helper to that list, or it is outside the guard. A guard type whose `Drop`
+  mutates the environment needs its type name listed too, as `UnsetKeyOnExit`
+  is, because the test only ever names the type and never calls a `::new(`.
+  A bare name in that list is matched as any whole identifier except in a type
+  position — right after `<` or right before `>`, anywhere inside a `struct` or
+  `enum` declaration, or right after a `:` (not `::`) that is an ascription
+  rather than a struct-literal field initializer. A colon counts as a field
+  initializer when the innermost open bracket is a non-declaration `{` and the
+  field name follows `{`, `,` or the start of the line. So every construction
+  (`let _g = UnsetKeyOnExit;`, `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`,
+  `vec![UnsetKeyOnExit]`, `Holder { guard: UnsetKeyOnExit }` on one line or
+  split) is flagged, while a longer name, `Option<UnsetKeyOnExit>`, a parameter
+  typed `_x: UnsetKeyOnExit`, `let _g: UnsetKeyOnExit;` or a field declared
+  `guard: UnsetKeyOnExit` in a `struct` is not. That errs toward reporting: a
+  struct pattern (`let Holder { guard: UnsetKeyOnExit } = h;`), a later
+  parameter of a typed closure (`|a, g: UnsetKeyOnExit|`) and a `->
+  UnsetKeyOnExit` return type in a test body are flagged although they build
+  nothing; reword them.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
