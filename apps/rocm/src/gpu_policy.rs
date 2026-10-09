@@ -981,6 +981,12 @@ pub(crate) fn detect_gpu_count() -> Option<usize> {
     if count == 0 { None } else { Some(count) }
 }
 
+/// Property tests for `--gpu` selection; a child module so it can reach the
+/// private selection functions above.
+#[cfg(test)]
+#[path = "gpu_selection_proptests.rs"]
+mod gpu_selection_proptests;
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
