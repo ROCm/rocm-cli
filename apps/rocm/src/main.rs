@@ -4569,7 +4569,7 @@ fn run_attached_service(
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
             println!("  logs: rocm logs {service_id}");
-            println!("  stop: {}", service_hints::service_stop_hint(service_id));
+            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             record_cli_audit_event(
                 &paths,
                 "service",
