@@ -374,7 +374,26 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocm_engine_protocol::ENGINE_RECIPE_CONTRACT_VERSION;
     use serde_json::json;
+
+    #[test]
+    fn engine_recipe_launch_args_forward_required_flags() {
+        let hint = EngineRecipeHint {
+            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
+            engine: ENGINE_NAME.to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            parser_settings: std::collections::BTreeMap::default(),
+            preferred_endpoint: None,
+            unsupported_combinations: Vec::new(),
+            notes: vec!["test recipe".to_owned()],
+        };
+
+        assert_eq!(
+            engine_recipe_launch_args(Some(&hint)),
+            vec!["--enable-auto-tool-choice".to_owned()]
+        );
+    }
 
     #[test]
     fn stdio_protocol_routes_all_methods_without_side_effects() {

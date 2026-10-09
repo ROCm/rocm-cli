@@ -910,15 +910,6 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn engine_recipe_launch_args_forward_required_flags() {
-        let hint = test_engine_recipe(ENGINE_NAME, ENGINE_RECIPE_CONTRACT_VERSION);
-
-        assert_eq!(
-            engine_recipe_launch_args(Some(&hint)),
-            vec!["--enable-auto-tool-choice".to_owned()]
-        );
-    }
-    #[test]
     fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {
         let response = resolve_model_response(ResolveModelRequest {
             model_ref: "facebook/opt-125m".to_owned(),
