@@ -4,6 +4,7 @@
 
 pub mod capability;
 pub mod expectation;
+pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
 pub mod loopback_http;

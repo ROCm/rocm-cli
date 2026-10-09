@@ -75,7 +75,7 @@ pub fn runner_options(
             rocm_core::is_wsl_host(),
             rocm_core::has_usable_amd_gpu(),
         ),
-        test_clock_offset_path: dash_test_clock_offset_path(),
+        test_clock_offset_path: dash_test_clock_offset_path(paths),
     }
 }
 
@@ -90,14 +90,55 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
     is_wsl_host && has_usable_gpu
 }
 
-#[cfg(feature = "e2e-test-hooks")]
-fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("ROCM_CLI_DASH_TEST_CLOCK_OFFSET_PATH").map(Into::into)
-}
-
-#[cfg(not(feature = "e2e-test-hooks"))]
-const fn dash_test_clock_offset_path() -> Option<std::path::PathBuf> {
-    None
+/// Path of the daemon's logical observation clock, or `None` to use wall time.
+///
+/// State-based, not compile-time-gated: the file simply does not exist on a
+/// user's machine, and nothing in `rocm` ever creates it — only the E2E harness
+/// plants one, in the isolated data root it hands this process via
+/// `ROCM_CLI_DATA_DIR`. That keeps the binary under test byte-identical to the
+/// binary that ships, the same way the Lemonade recovery scenario plants a
+/// runtime manifest that production code reads through its normal path. A
+/// `#[cfg(feature = ...)]` seam cannot make that claim: it makes the tested
+/// binary a different binary.
+///
+/// The existence check is load-bearing, not an optimisation. `RunnerOptions::
+/// test_clock_offset_path` selects wall time *only* on `None`; a `Some(path)`
+/// whose file is absent leaves the daemon on its default
+/// `TestClockDirective::FreeRunning(0)` logical clock. Returning the path
+/// unconditionally would therefore take production off `Utc::now()`.
+///
+/// Because this runs in every build, not just under the harness, a stray copy
+/// of the file in a real data dir would otherwise move the dashboard onto a
+/// logical clock with nothing to show for it. The clock is not display-only:
+/// its value is the cycle timestamp for counter and direct observation, the
+/// histogram average, the tracker snapshot and the snapshot's own timestamp, so
+/// it is the denominator of generation throughput, the window for latency
+/// averages and the basis of the Fresh/Held/expired verdict — and it is what
+/// gets written into persisted session records. Finding the file is therefore
+/// logged at WARN naming the path, so a user whose throughput numbers look
+/// wrong is pointed at the cause rather than having to guess. The warning says
+/// *restart* as well as remove, because the resolved path is captured once for
+/// the life of the run loop and a read that fails — including the file having
+/// been deleted — leaves the directive frozen at its last value, pinning the
+/// logical clock rather than restoring wall time. The warning goes to `tracing`, not
+/// stdout/stderr: the only caller is [`maybe_spawn_embedded_daemon`] on the
+/// `rocm dash` path, where the TUI owns the terminal (see `logging.rs`) and a
+/// stray write would corrupt the display.
+fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
+    let path = paths.dash_test_clock_file();
+    if !path.is_file() {
+        return None;
+    }
+    tracing::warn!(
+        test_clock_file = %path.display(),
+        "dashboard telemetry clock is in TEST mode, not wall time: a logical \
+         clock read from this file drives displayed timestamps, the timestamps \
+         written into persisted session records, and every figure derived from \
+         them — generation throughput, latency averages and metric freshness. \
+         Only the E2E harness creates it; remove it and restart the dashboard to \
+         return to wall time (deleting it mid-run pins the logical clock instead)."
+    );
+    Some(path)
 }
 
 /// API key precedence — sourced from the environment ONLY (never TOML/CLI/source/
@@ -1030,6 +1071,122 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A private scratch directory under `target/`, matching the convention the
+    /// bench-parent test below already uses (no `tempfile` dev-dependency in
+    /// this crate). Named per test so parallel tests cannot collide.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("{name}-{}", crate::test_support::unique_suffix()));
+        std::fs::remove_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn scratch_dir_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| scratch_dir("same-label"));
+    }
+
+    /// `AppPaths` rooted at a real directory, so the clock file's presence can
+    /// actually be varied (the shared [`paths`] fixture points at `/tmp`).
+    fn paths_at(root: &Path) -> AppPaths {
+        AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
+    /// In-memory `tracing` sink.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCapture {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` under a capturing `tracing` subscriber and return what it wrote.
+    ///
+    /// `with_default` installs the subscriber for this thread only, so a
+    /// concurrently-running test in the same binary neither sees these records
+    /// nor leaks its own into them.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        capture.contents()
+    }
+
+    /// The clock seam is state-based, so it is live in every build, not only
+    /// under the harness. A stray file in a real data dir therefore moves the
+    /// dashboard off wall time — not just in the timestamps on screen but in
+    /// throughput, latency averages, freshness and the session records written
+    /// to disk. Finding one must say so, naming the file, or a user has no way
+    /// to explain the numbers they are shown.
+    #[test]
+    fn dash_test_clock_offset_path_warns_when_the_file_is_present() {
+        let root = scratch_dir("dash-clock-warn");
+        let p = paths_at(&root);
+        std::fs::create_dir_all(p.telemetry_state_dir()).unwrap();
+        let clock = p.dash_test_clock_file();
+        std::fs::write(&clock, "0").unwrap();
+
+        let mut resolved = None;
+        let logs = captured_logs(|| resolved = dash_test_clock_offset_path(&p));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(resolved, Some(clock.clone()));
+        assert!(logs.contains("WARN"), "expected a WARN record, got: {logs}");
+        assert!(
+            logs.contains(&clock.display().to_string()),
+            "the warning must name the offending file, got: {logs}"
+        );
+    }
+
+    /// The overwhelmingly common case — no file, wall time — must stay silent.
+    /// A warning on every launch would be noise, and would drain the signal out
+    /// of the one above.
+    #[test]
+    fn dash_test_clock_offset_path_is_silent_when_the_file_is_absent() {
+        let root = scratch_dir("dash-clock-silent");
+        let p = paths_at(&root);
+        std::fs::create_dir_all(p.telemetry_state_dir()).unwrap();
+
+        let mut resolved = Some(PathBuf::new());
+        let logs = captured_logs(|| resolved = dash_test_clock_offset_path(&p));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(resolved, None, "an absent file must resolve to wall time");
+        assert!(
+            logs.is_empty(),
+            "a wall-time launch must log nothing, got: {logs}"
+        );
     }
 
     #[test]

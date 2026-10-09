@@ -931,51 +931,169 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // day it lands. Any lane that genuinely should not wait for a GPU needs
         // an exemption added here with the reason — which is the point: it
         // becomes a decision someone makes, not one a copy-paste makes for them.
+        //
+        // The step is looked up by NAME among the job's own `steps:` items, not
+        // found as a substring of the job: the comments around these steps talk
+        // about the preflight at length, and a comment — or another step's
+        // script — that happened to carry the old `- name:` text would keep a
+        // substring match satisfied after the step itself was gone. Presence
+        // only: nothing here pins where in the job it runs.
         for (workflow, text) in self_hosted_workflows() {
             for (job, _) in self_hosted_e2e_jobs(&text) {
+                let steps = job_steps(job_block(&text, &job))
+                    .unwrap_or_else(|| panic!("{workflow} job `{job}` has no `steps:` list"));
+                let Some((_, step)) = steps
+                    .iter()
+                    .find(|(name, _)| name.starts_with("GPU preflight"))
+                else {
+                    let names: Vec<&str> = steps
+                        .iter()
+                        .map(|(name, _)| name.as_str())
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    panic!(
+                        "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
+                         step named `GPU preflight …`: on a wedged or occupied GPU it hangs \
+                         to the job timeout instead of failing fast with a reason. Its named \
+                         steps are: {names:?}"
+                    );
+                };
                 assert!(
-                    job_block(&text, &job).contains("- name: GPU preflight"),
-                    "{workflow} job `{job}` runs on self-hosted GPU hardware but has no \
-                     GPU preflight step: on a wedged or occupied GPU it hangs to the job \
-                     timeout instead of failing fast with a reason"
+                    run_block(step).is_some_and(|body| body.iter().any(|l| !l.trim().is_empty())),
+                    "{workflow} job `{job}` names a GPU preflight step but it has no \
+                     `run: |` script, so it waits for nothing"
                 );
             }
         }
     }
 
+    /// A job's `steps:` items as `(name, whole step)` pairs, in file order;
+    /// `None` when the job has no `steps:` list. `block` is what `job_block`
+    /// returns.
+    ///
+    /// Only the list's own items count — lines at exactly the item indent that
+    /// open with `- ` — so a comment, or a `- name:` line inside some step's
+    /// script, can never pass for a step. A step without a `name:` key is
+    /// listed with an empty name.
+    fn job_steps(block: &str) -> Option<Vec<(String, String)>> {
+        let lines: Vec<&str> = block.lines().collect();
+        let steps_at = lines
+            .iter()
+            .position(|l| strip_comment(l).trim() == "steps:")?;
+        let steps_indent = indent_of(lines[steps_at]);
+        let item_indent = lines[steps_at + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+            .filter(|l| l.trim_start().starts_with("- "))
+            .map(|l| indent_of(l))?;
+        let mut steps = Vec::new();
+        for (i, line) in lines.iter().enumerate().skip(steps_at + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if indent_of(line) <= steps_indent {
+                break;
+            }
+            if indent_of(line) != item_indent || !trimmed.starts_with("- ") {
+                continue;
+            }
+            let step = step_block(&lines, i);
+            // `name:` is either the item's own first key (`- name: …`) or one
+            // of its sibling keys, two columns in from the dash.
+            let name = step
+                .lines()
+                .find_map(|l| {
+                    let key_line = if indent_of(l) == item_indent {
+                        l.trim_start().strip_prefix("- ")?
+                    } else if indent_of(l) == item_indent + 2 {
+                        l.trim_start()
+                    } else {
+                        return None;
+                    };
+                    key_line.strip_prefix("name:")
+                })
+                .map(|value| strip_quotes(strip_comment(value).trim()))
+                .unwrap_or_default();
+            steps.push((name, step));
+        }
+        Some(steps)
+    }
+
     /// Every `GPU preflight` step block in `text`, in file order.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         let lines: Vec<&str> = text.lines().collect();
-        let mut steps = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if !line.trim_start().starts_with("- name: GPU preflight") {
-                continue;
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("- name: GPU preflight"))
+            .map(|(i, _)| step_block(&lines, i))
+            .collect()
+    }
+
+    /// The whole step whose `- name:` line is `lines[at]`: that line and every
+    /// line below it until a non-blank one is indented no deeper than it.
+    ///
+    /// Blank lines never end a block, however they are indented — a `run: |`
+    /// body can contain them — so the blank separator before the next step is
+    /// carried along too. `run_block` drops it again.
+    fn step_block(lines: &[&str], at: usize) -> String {
+        let step_indent = indent_of(lines[at]);
+        let mut step = format!("{}\n", lines[at]);
+        for body in &lines[at + 1..] {
+            if !body.trim().is_empty() && indent_of(body) <= step_indent {
+                break;
             }
-            let step_indent = indent_of(line);
-            let mut step = format!("{line}\n");
-            for body in &lines[i + 1..] {
-                if !body.trim().is_empty() && indent_of(body) <= step_indent {
-                    break;
-                }
-                step.push_str(body);
-                step.push('\n');
-            }
-            steps.push(step);
+            step.push_str(body);
+            step.push('\n');
         }
-        steps
+        step
     }
 
     /// The lines of a step's `run: |` block, still indented.
+    ///
+    /// Trailing blank lines are dropped: they are the separator `step_block`
+    /// lets through, not part of the script, and keeping them would make two
+    /// identical scripts compare unequal over the spacing between steps.
     fn run_block(step: &str) -> Option<Vec<&str>> {
         let lines: Vec<&str> = step.lines().collect();
         let run_at = lines.iter().position(|l| l.trim() == "run: |")?;
         let run_indent = indent_of(lines[run_at]);
+        let mut body: Vec<&str> = lines[run_at + 1..]
+            .iter()
+            .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
+            .copied()
+            .collect();
+        while body.last().is_some_and(|l| l.trim().is_empty()) {
+            body.pop();
+        }
+        Some(body)
+    }
+
+    /// Where two line-oriented texts first differ, phrased for a failure
+    /// message and naming which file each side came from; `None` when they
+    /// are equal.
+    fn first_line_difference(a_name: &str, a: &str, b_name: &str, b: &str) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let a_lines: Vec<&str> = a.lines().collect();
+        let b_lines: Vec<&str> = b.lines().collect();
         Some(
-            lines[run_at + 1..]
-                .iter()
-                .take_while(|l| l.trim().is_empty() || indent_of(l) > run_indent)
-                .copied()
-                .collect(),
+            match a_lines.iter().zip(&b_lines).position(|(x, y)| x != y) {
+                Some(i) => format!(
+                    "first difference at body line {}:\n  {a_name}: {:?}\n  {b_name}: {:?}",
+                    i + 1,
+                    a_lines[i],
+                    b_lines[i]
+                ),
+                None if a_lines.len() != b_lines.len() => format!(
+                    "every shared line matches, but {a_name} has {} lines and {b_name} has {}",
+                    a_lines.len(),
+                    b_lines.len()
+                ),
+                None => "the bodies differ only in line endings".to_string(),
+            },
         )
     }
 
@@ -1087,13 +1205,21 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// nightly lane job-level `continue-on-error: true` means a regression would
     /// not even turn the run red.
     ///
-    /// Matching the step NAME rather than a substring of the job is deliberate —
-    /// the surrounding comments discuss the clock at length, so a bare substring
-    /// would stay satisfied by prose after the step itself was deleted, which is
-    /// exactly the failure this pins.
+    /// Steps are matched as WHOLE LINES, not found as substrings of the job: the
+    /// surrounding comments discuss the clock at length, and a comment line that
+    /// happened to embed the step's text would otherwise keep this satisfied after
+    /// the step itself was deleted — exactly the failure this pins.
+    ///
+    /// The two copies' `run:` bodies are also compared byte for byte, after
+    /// dedenting. They are kept in sync by hand until the lanes are deduplicated
+    /// (#294), and presence and order say nothing about what each copy runs —
+    /// the same drift `apu_preflight_twins_do_not_drift` once caught too late.
+    /// Equality pins only that the two lanes agree, not that either body still
+    /// does the work: both gutted to an identical `echo hi` would pass.
     #[test]
     fn both_wsl_lanes_settle_the_clock_before_running_the_suite() {
         const STEP: &str = "      - name: Settle the clock before anything times a scenario";
+        let mut bodies = Vec::new();
         for (workflow, job, suite_step) in [
             (
                 "e2e-selfhosted.yml",
@@ -1107,20 +1233,37 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             ),
         ] {
             let job_block = nested_block(&read_workflow(workflow), job);
-            let settle = job_block.find(STEP).unwrap_or_else(|| {
+            let lines: Vec<&str> = job_block.lines().collect();
+            let settle = lines.iter().position(|l| *l == STEP).unwrap_or_else(|| {
                 panic!(
                     "{workflow}'s `{job}` has no clock-settling step — a fresh WSL2 guest \
                      steps its clock backwards mid-run and cucumber subtracts SystemTime \
                      stamps, so the durations that lane reports become fiction"
                 )
             });
-            let suite = job_block
-                .find(suite_step)
+            let suite = lines
+                .iter()
+                .position(|l| *l == suite_step)
                 .unwrap_or_else(|| panic!("{workflow}'s `{job}` no longer runs `{suite_step}`"));
             assert!(
                 settle < suite,
                 "{workflow}'s `{job}` settles the clock AFTER starting the suite — the \
                  correction has to land while nothing is being timed"
+            );
+            let step = step_block(&lines, settle);
+            let body = run_block(&step)
+                .and_then(|block| dedent(&block))
+                .unwrap_or_else(|| panic!("{workflow}'s clock-settling step has no `run: |` body"));
+            bodies.push((workflow, body));
+        }
+        let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
+            unreachable!("exactly two lanes are checked above");
+        };
+        if let Some(difference) = first_line_difference(first, first_body, second, second_body) {
+            panic!(
+                "the clock-settling step has drifted between {first} and {second} — the \
+                 copies are kept in sync by hand until the lanes are deduplicated (#294); \
+                 {difference}"
             );
         }
     }
@@ -1159,11 +1302,14 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 "{language} APU preflight count differs"
             );
             for (i, (a, b)) in per_pr.iter().zip(nightly.iter()).enumerate() {
-                assert_eq!(
-                    a, b,
-                    "{language} APU preflight script #{i} has drifted between \
-                     e2e-selfhosted.yml and nightly.yml"
-                );
+                if let Some(difference) =
+                    first_line_difference("e2e-selfhosted.yml", a, "nightly.yml", b)
+                {
+                    panic!(
+                        "{language} APU preflight script #{i} has drifted between \
+                         e2e-selfhosted.yml and nightly.yml; {difference}"
+                    );
+                }
             }
         }
     }
@@ -1633,6 +1779,128 @@ esac
                 );
             }
         }
+    }
+
+    #[test]
+    fn nightly_publishes_the_consolidated_matrix_to_the_wiki() {
+        let nightly = read_workflow("nightly.yml");
+        let report = normalized_whitespace(job_block(&nightly, "e2e-report-nightly"));
+        assert!(
+            report.contains("--html-out consolidated/index.html > consolidated/support-matrix.md"),
+            "the consolidated report job must redirect the markdown matrix into \
+             consolidated/support-matrix.md for the wiki job"
+        );
+        assert!(
+            report.contains("cat consolidated/support-matrix.md >> \"$GITHUB_STEP_SUMMARY\""),
+            "the nightly step summary must still receive the matrix"
+        );
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        assert_eq!(
+            job_scalar(publish, "needs"),
+            "e2e-report-nightly",
+            "the wiki job must publish the consolidated report, so it must wait for it"
+        );
+        let condition = job_scalar(publish, "if");
+        for required in [
+            "!cancelled()",
+            "needs.e2e-report-nightly.result == 'success'",
+            "github.repository == 'ROCm/rocm-cli'",
+            "github.ref == 'refs/heads/main'",
+        ] {
+            assert!(
+                condition.contains(required),
+                "the wiki job's `if:` must require `{required}`: {condition}"
+            );
+        }
+        assert!(
+            !condition.contains("always()"),
+            "always() would publish from a cancelled run: {condition}"
+        );
+        let permissions = job_mapping(publish, "permissions");
+        assert_eq!(
+            permissions.get("contents").map(String::as_str),
+            Some("write"),
+            "pushing to the wiki needs contents: write on this job"
+        );
+        let script = normalized_whitespace(publish);
+        assert!(
+            script.contains("name: e2e-consolidated-report-nightly")
+                && script.contains(".wiki.git"),
+            "the wiki job must download the nightly consolidated artifact and push to the wiki repo"
+        );
+        assert!(
+            script.contains("git push origin HEAD"),
+            "the wiki job must push the page"
+        );
+        assert!(
+            script.contains("if ! git clone --depth 1 \"$wiki\" wiki; then")
+                && script.contains("exit 1 fi"),
+            "a failed wiki clone must fail the job with the prerequisite, not be ignored"
+        );
+        assert!(
+            script
+                .contains("if ! grep -q '^| Platform | OS |' consolidated/support-matrix.md; then")
+                && script.contains("leaving the wiki page unchanged"),
+            "an empty consolidation must leave the last good page in place"
+        );
+        assert!(
+            !publish.contains("git init"),
+            "no `git init` fallback: it cannot create a remote wiki"
+        );
+    }
+
+    /// Runs the publish job's real empty-report guard against the generator's
+    /// real empty output, so rewording either side (or breaking the guard's
+    /// exit) is caught by behavior rather than by pinning strings.
+    #[cfg(unix)]
+    #[test]
+    fn wiki_publish_guard_stops_on_the_generators_empty_output() {
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-e2e-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if ! grep -q '^| Platform | OS |'")
+            })
+            .expect("publish job has the empty-report guard");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.trim() == "fi")
+                .expect("guard is closed by fi");
+        let guard = lines[start..=end].join("\n");
+
+        let run = |matrix: &str| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("consolidated")).unwrap();
+            std::fs::write(dir.join("consolidated/support-matrix.md"), matrix).unwrap();
+            let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir)
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let empty = e2e_report::consolidated_summary_markdown(&[]);
+        assert!(
+            !run(&empty).contains("REACHED_PUBLISH"),
+            "the generator's empty output must stop the publish"
+        );
+        assert!(
+            !run("").contains("REACHED_PUBLISH"),
+            "a zero-byte matrix must not be published"
+        );
+        assert!(
+            run("## E2E consolidated report\n\n| Platform | OS |\n").contains("REACHED_PUBLISH"),
+            "a matrix with platforms must reach the publish step"
+        );
     }
 
     #[test]
