@@ -125,10 +125,11 @@ pub(crate) fn service_files(service_id: &str) -> Result<ServiceFiles> {
 /// process identity, and endpoint from it ([`pid_from_state`],
 /// [`identity_from_state`], [`endpoint_url_from_state`]) and with
 /// [`write_terminal_state`] — `engines/lemonade/src/state.rs`'s
-/// `write_running_state` pairs with the same readers, though lemonade has no
-/// equivalent of `pid_from_state` or `write_terminal_state`. The
-/// `VllmRuntime`-derived fields come from `crate::runtime`, never from
-/// `process.rs`, so this module still never reaches back into it.
+/// `write_running_state` pairs with matching readers, though lemonade has no
+/// `pid_from_state`, and its `write_terminal_state` counterpart is
+/// `mark_json_status`. The `VllmRuntime`-derived fields come from
+/// `crate::runtime`, never from `process.rs`, so this module still never
+/// reaches back into it.
 pub(crate) fn write_running_state(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,

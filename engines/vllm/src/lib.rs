@@ -383,10 +383,8 @@ mod tests {
             contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
             engine: ENGINE_NAME.to_owned(),
             required_flags: vec!["--enable-auto-tool-choice".to_owned()],
-            parser_settings: std::collections::BTreeMap::default(),
-            preferred_endpoint: None,
-            unsupported_combinations: Vec::new(),
             notes: vec!["test recipe".to_owned()],
+            ..EngineRecipeHint::default()
         };
 
         assert_eq!(
