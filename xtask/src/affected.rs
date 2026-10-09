@@ -113,24 +113,38 @@ pub fn reverse_closure(
     result
 }
 
+/// Markdown files an xtask test reads directly. Each belongs in this list,
+/// in ci.yml's `rust` paths-filter bucket, and in the "doc an xtask test
+/// reads" sentence in `docs/testing.md` —
+/// `forces_full_workspace_docs_are_in_the_rust_filter` (workflow_contract.rs)
+/// checks this list against ci.yml's copy.
+///
+/// Without a file also being in `forces_full_workspace` below, `is_ignorable`
+/// would mark it as ordinary Markdown and an edit to it alone would resolve
+/// to `Selection::Empty`; without the matching ci.yml filter entry, the
+/// rust-gated jobs don't run at all for that edit. Either way the test that
+/// reads the file silently never runs:
+/// - `MANIFEST.md`: clippy runs `xtask manifest --check` against it, and it
+///   carries the cargo-about pin that
+///   `pinned_tool_versions_match_across_docs_and_workflows` (xtask) reads.
+/// - `CONTRIBUTING.md`: carries the hawkeye and cargo-about pins that same
+///   test reads.
+/// - `docs/ci-hardware-testing.md` and `tests/e2e-cucumber/README.md`: both
+///   read by `hardware_testing_docs_cover_all_self_hosted_platforms` (xtask).
+pub(crate) const XTASK_READ_DOCS: &[&str] = &[
+    "MANIFEST.md",
+    "CONTRIBUTING.md",
+    "docs/ci-hardware-testing.md",
+    "tests/e2e-cucumber/README.md",
+];
+
 /// True for changed files that force a full-workspace run: anything that can
 /// affect resolution, the build for every crate, CI itself, or a doc an xtask
-/// test reads (MANIFEST.md, CONTRIBUTING.md, docs/ci-hardware-testing.md).
+/// test reads ([`XTASK_READ_DOCS`]).
 fn forces_full_workspace(file: &str) -> bool {
     file == "Cargo.lock"
         || file == "Cargo.toml" // workspace root manifest
-        // clippy runs `xtask manifest --check` against MANIFEST.md; it and
-        // CONTRIBUTING.md also carry the hawkeye/cargo-about pins that
-        // pinned_tool_versions_match_across_docs_and_workflows (xtask) reads.
-        // Without this, `is_ignorable` below would mark them as ordinary
-        // Markdown and a pin-only edit would resolve to `Selection::Empty`,
-        // skipping the test this job itself runs.
-        || file == "MANIFEST.md"
-        || file == "CONTRIBUTING.md"
-        // hardware_testing_docs_cover_all_self_hosted_platforms (xtask) reads
-        // this file; same `Selection::Empty`/invisible-coverage failure mode
-        // as the pin docs above.
-        || file == "docs/ci-hardware-testing.md"
+        || XTASK_READ_DOCS.contains(&file)
         || file.starts_with("rust-toolchain")
         || file.starts_with(".github/workflows/")
 }
@@ -471,6 +485,19 @@ mod tests {
         let g = graph();
         assert_eq!(
             select(&["docs/ci-hardware-testing.md".to_string()], &g),
+            Selection::Workspace
+        );
+    }
+
+    #[test]
+    fn select_e2e_cucumber_readme_forces_workspace() {
+        // tests/e2e-cucumber/README.md is read by the same
+        // hardware_testing_docs_cover_all_self_hosted_platforms test as
+        // docs/ci-hardware-testing.md above, for its lane lists; it must get
+        // the same treatment, not resolve to `Selection::Empty`.
+        let g = graph();
+        assert_eq!(
+            select(&["tests/e2e-cucumber/README.md".to_string()], &g),
             Selection::Workspace
         );
     }

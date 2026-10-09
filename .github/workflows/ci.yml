@@ -132,10 +132,16 @@ jobs:
               # reason MANIFEST.md already is, so nextest runs too.
               - 'CONTRIBUTING.md'
               # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
-              # reads this file; same `Selection::Empty`/invisible-coverage gap
-              # as CONTRIBUTING.md above, so it's in `forces_full_workspace`
-              # too and needs the same rust-filter entry.
+              # reads this file and the one below it; same
+              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
+              # above, so both are in `forces_full_workspace` too and need the
+              # same rust-filter entry. tests/e2e-cucumber/README.md also
+              # matches `heavy` below, so the Windows lane's full workspace
+              # run backstops this entry on its own; it's listed here anyway
+              # so the Linux `test` job (which is `rust`-gated, not
+              # `heavy`-gated) doesn't silently skip the test that reads it.
               - 'docs/ci-hardware-testing.md'
+              - 'tests/e2e-cucumber/README.md'
               # license_headers_hook_has_no_file_type_filter (xtask) reads this
               # file's license-headers hook config; an edit here that reopens the
               # file-type-filter gap must still run that test on the PR.

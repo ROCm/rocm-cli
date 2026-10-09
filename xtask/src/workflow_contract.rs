@@ -1914,6 +1914,50 @@ esac
         }
     }
 
+    /// Extract the literal glob entries from ci.yml's pull-request `rust:`
+    /// paths-filter bucket, stopping at the next sibling filter key. Scoped to
+    /// an exact `rust:` line (not a prefix match) so this doesn't also pick up
+    /// the unrelated `rust: ${{ … }}` job output a few lines above it.
+    fn rust_paths_filter_entries(ci: &str) -> Vec<String> {
+        let lines: Vec<&str> = ci.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == "rust:")
+            .unwrap_or_else(|| panic!("ci.yml declares a `rust:` paths-filter bucket"));
+        let key_indent = indent_of(lines[start]);
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indent_of(line) <= key_indent)
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines[start + 1..end]
+            .iter()
+            .filter_map(|line| strip_comment(line).trim().strip_prefix("- "))
+            .map(|item| strip_quotes(item.trim()))
+            .collect()
+    }
+
+    /// `forces_full_workspace` (xtask/src/affected.rs) names the doc paths
+    /// that fall back to a full-workspace run because an xtask test reads
+    /// them directly ([`crate::affected::XTASK_READ_DOCS`]). If one of them
+    /// isn't ALSO in ci.yml's `rust` paths-filter bucket,
+    /// `needs.changes.outputs.rust` stays false for a PR that touches only
+    /// that doc, and the `test` job's every step — including `cargo nextest
+    /// run`, which is what would have caught the drift — never runs at all.
+    #[test]
+    fn forces_full_workspace_docs_are_in_the_rust_filter() {
+        let ci = read_workflow("ci.yml");
+        let rust_filter = rust_paths_filter_entries(&ci);
+        for doc in crate::affected::XTASK_READ_DOCS {
+            assert!(
+                rust_filter.iter().any(|entry| entry == doc),
+                "`{doc}` is in `forces_full_workspace` (xtask/src/affected.rs) but \
+                 missing from ci.yml's `rust` paths-filter bucket, so an edit to it \
+                 alone skips the rust-gated jobs entirely instead of running the \
+                 test that reads it"
+            );
+        }
+    }
+
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
