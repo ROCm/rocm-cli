@@ -14,16 +14,15 @@ use rocm_engine_protocol::{
 use serde_json::json;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::runtime::VllmRuntime;
+use crate::runtime::{VllmRuntime, runtime_bin_paths, therock_library_path_entries};
+use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
 const STARTUP_FAILURE_LOG_TAIL_LINES: usize = 80;
 
-const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 /// How long a stop waits for the server to actually exit after each signal
 /// before reporting a timeout (or, under `force`, escalating to `SIGKILL`).
 const STOP_GRACE: Duration = Duration::from_secs(10);
@@ -126,21 +125,6 @@ pub(crate) fn launch_service(request: LaunchRequest) -> Result<LaunchResponse> {
         log_path: log_path.display().to_string(),
         state_path: state_path.display().to_string(),
     })
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ServeHttpRequest {
-    pub service_id: String,
-    pub model_ref: String,
-    pub host: String,
-    pub port: u16,
-    pub device_policy: DevicePolicy,
-    pub gpu_indices: Vec<u32>,
-    pub runtime_id: Option<String>,
-    pub env_id: Option<String>,
-    pub state_path: PathBuf,
-    pub log_path: Option<PathBuf>,
-    pub engine_recipe: Option<EngineRecipeHint>,
 }
 
 pub(crate) fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
@@ -559,12 +543,6 @@ fn vllm_serve_args(
     args.extend(engine_recipe_launch_args(engine_recipe));
     args
 }
-
-pub(crate) fn engine_recipe_launch_args(engine_recipe: Option<&EngineRecipeHint>) -> Vec<String> {
-    engine_recipe
-        .map(|hint| hint.required_flags.clone())
-        .unwrap_or_default()
-}
 /// Whether to launch vLLM with `--enforce-eager` (CUDA graphs disabled).
 ///
 /// Defaults to enabled because FULL CUDA-graph replay hangs ROCm gfx94x GPUs
@@ -595,107 +573,6 @@ fn resolve_vllm_ready_timeout(override_value: Option<String>) -> Duration {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
         .map_or(DEFAULT_VLLM_READY_TIMEOUT, Duration::from_secs)
-}
-
-pub(crate) fn runtime_bin_paths(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let mut entries = Vec::new();
-    if let Some(bin) = runtime.sdk_bin.as_ref() {
-        entries.push(bin.clone());
-    }
-    entries.extend(runtime.sdk_bin_paths.iter().cloned());
-    dedupe_paths(entries)
-}
-
-pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf> {
-    let Some(root) = runtime.sdk_root.as_ref() else {
-        return dedupe_paths(runtime.sdk_library_paths.clone());
-    };
-    let mut entries = runtime.sdk_library_paths.clone();
-    entries.extend([
-        root.join("lib"),
-        root.join("lib64"),
-        root.join("lib").join("rocm_sysdeps").join("lib"),
-    ]);
-    if cfg!(target_os = "linux") {
-        let wsl_dxcore_lib = PathBuf::from("/usr/lib/wsl/lib");
-        if wsl_dxcore_lib.is_dir() {
-            entries.push(wsl_dxcore_lib);
-        }
-        // OpenMPI is installed outside the default loader path on some distros
-        // (notably RHEL-family under /usr/lib64/openmpi/lib); make sure vLLM can
-        // load libmpi.so at launch when it lives there.
-        entries.extend(rocm_core::openmpi::openmpi_library_dirs());
-
-        if let Some(compat_dir) = runtime_compat_dir(runtime) {
-            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
-            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
-            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
-            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
-            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
-            // rocm-core's build.rs) into a runtime-owned directory and add it to
-            // the loader path. The stub only *defines* the legacy C++ binding
-            // symbols torch needs; they are never called in single-node serving,
-            // so this is safe.
-            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
-                entries.push(dir);
-            }
-            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
-            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
-            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
-            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
-            // satisfy that binding. An older rocm-cli release symlinked
-            // `libnuma.so.1` to that bundled library; on the loader path it
-            // shadowed any real system libnuma and broke `import torch` with
-            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
-            // the real numactl runtime (installed via the package manager) wins;
-            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
-            remove_stale_numa_shim(&compat_dir);
-        }
-    }
-    dedupe_paths(entries)
-}
-/// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
-/// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
-/// `librocm_sysdeps_numa.so.1`, whose renamed symbol versions cannot satisfy the
-/// `libnuma_1.2` symbol PyTorch's `libc10.so` binds; leaving it on the loader
-/// path would shadow a correctly installed system libnuma. No-op when absent or
-/// when the entry is not a symlink.
-fn remove_stale_numa_shim(compat_dir: &Path) {
-    let link = compat_dir.join("libnuma.so.1");
-    if let Ok(meta) = link.symlink_metadata()
-        && meta.file_type().is_symlink()
-    {
-        let _ = fs::remove_file(&link);
-    }
-}
-/// A writable, runtime-owned directory for managed-runtime library compatibility
-/// shims (see [`therock_library_path_entries`]). Prefers the managed Python
-/// environment root (`<env>/bin/python` -> `<env>`); falls back to the SDK root
-/// when no Python launcher is recorded.
-fn runtime_compat_dir(runtime: &VllmRuntime) -> Option<PathBuf> {
-    const COMPAT_DIR_NAME: &str = "rocm-cli-lib-compat";
-    if let Some(env_root) = runtime
-        .python_executable
-        .as_ref()
-        .and_then(|python| python.parent())
-        .and_then(|bin| bin.parent())
-    {
-        return Some(env_root.join(COMPAT_DIR_NAME));
-    }
-    runtime
-        .sdk_root
-        .as_ref()
-        .map(|root| root.join(COMPAT_DIR_NAME))
-}
-
-fn dedupe_paths(entries: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
-    for entry in entries {
-        if !entry.as_os_str().is_empty() && !deduped.iter().any(|seen| seen == &entry) {
-            deduped.push(entry);
-        }
-    }
-    deduped
 }
 
 fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Result<OsString> {
@@ -881,59 +758,14 @@ fn wait_for_vllm_ready(
     }
 }
 /// Reads the last N lines from a log file and returns them as a formatted string.
-/// Handles large files by seeking to near the end and reading backwards.
+/// Handles large files by seeking to the last `MAX_TAIL_READ` bytes and reading
+/// forward from there.
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
-    let lines = tail_lines(log_path, limit)?;
+    let lines = crate::state::tail_lines(log_path, limit)?;
     if lines.is_empty() {
         return Ok(String::new());
     }
     Ok(lines.join("\n"))
-}
-/// Reads the last N lines from a file efficiently by seeking.
-/// For files larger than MAX_TAIL_READ, seeks to MAX_TAIL_READ from the end.
-pub(crate) fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("failed to open log file {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
-    let file_size = metadata.len();
-
-    // For large files, seek to MAX_TAIL_READ from the end. When the seek lands in
-    // the middle of a line, the first line read back is a partial fragment that
-    // must be dropped. When it lands exactly on a line boundary (the byte before
-    // `seek_pos` is a newline) the first line is complete and must be kept.
-    let mut first_line_is_partial = false;
-    if file_size > MAX_TAIL_READ {
-        let seek_pos = file_size - MAX_TAIL_READ;
-        // Probe the byte preceding `seek_pos` to classify the first line, then
-        // leave the cursor at `seek_pos` for the buffered read below.
-        file.seek(SeekFrom::Start(seek_pos - 1))
-            .with_context(|| format!("failed to seek in log file {}", path.display()))?;
-        let mut probe = [0u8; 1];
-        file.read_exact(&mut probe)
-            .with_context(|| format!("failed to read from log file {}", path.display()))?;
-        first_line_is_partial = probe[0] != b'\n';
-    }
-
-    let buffered = BufReader::new(file);
-    let mut lines: Vec<String> = buffered
-        .lines()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to read lines from {}", path.display()))?;
-
-    // Drop the leading partial line produced by seeking into the middle of a line.
-    if first_line_is_partial && !lines.is_empty() {
-        lines.remove(0);
-    }
-
-    // Return only the last `limit` lines
-    let start_idx = if lines.len() > limit {
-        lines.len() - limit
-    } else {
-        0
-    };
-    Ok(lines.into_iter().skip(start_idx).collect())
 }
 
 #[cfg(test)]
@@ -1077,15 +909,6 @@ mod tests {
             DevicePolicy::GpuRequired
         );
         Ok(())
-    }
-    #[test]
-    fn engine_recipe_launch_args_forward_required_flags() {
-        let hint = test_engine_recipe(ENGINE_NAME, ENGINE_RECIPE_CONTRACT_VERSION);
-
-        assert_eq!(
-            engine_recipe_launch_args(Some(&hint)),
-            vec!["--enable-auto-tool-choice".to_owned()]
-        );
     }
     #[test]
     fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {
@@ -1546,84 +1369,6 @@ mod tests {
         assert!(error.to_string().contains("unsupported"));
     }
     #[test]
-    fn tail_lines_returns_suffix() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "rocm-vllm-tail-{}-{}.log",
-            std::process::id(),
-            current_unix_millis()
-        ));
-        fs::write(&path, "a\nb\nc\n")?;
-        let lines = tail_lines(&path, 2)?;
-        fs::remove_file(path).ok();
-        assert_eq!(lines, vec!["b".to_owned(), "c".to_owned()]);
-        Ok(())
-    }
-    #[test]
-    fn tail_lines_keeps_first_line_when_seek_lands_on_boundary() -> Result<()> {
-        // Build a file where the MAX_TAIL_READ window starts exactly on a line
-        // boundary: a prefix ending in '\n', followed by exactly MAX_TAIL_READ
-        // bytes of complete lines. The first windowed line must NOT be dropped.
-        let prefix = format!("{}\n", "p".repeat(63));
-        let mut tail = String::from("FIRSTLINE\n");
-        while tail.len() + 2 <= MAX_TAIL_READ as usize {
-            tail.push_str("y\n");
-        }
-        while tail.len() < MAX_TAIL_READ as usize {
-            tail.push('z');
-        }
-        assert_eq!(tail.len(), MAX_TAIL_READ as usize);
-
-        let path = std::env::temp_dir().join(format!(
-            "rocm-vllm-tail-boundary-{}-{}.log",
-            std::process::id(),
-            current_unix_millis()
-        ));
-        fs::write(&path, format!("{prefix}{tail}"))?;
-        let lines = tail_lines(&path, usize::MAX)?;
-        fs::remove_file(&path).ok();
-
-        assert_eq!(
-            lines.first().map(String::as_str),
-            Some("FIRSTLINE"),
-            "complete first line must be preserved when the seek lands on a newline boundary"
-        );
-        assert!(
-            !lines.iter().any(|line| line.contains('p')),
-            "bytes before the tail window must not appear"
-        );
-        Ok(())
-    }
-    #[test]
-    fn tail_lines_drops_partial_first_line_when_seek_lands_midline() -> Result<()> {
-        // The window starts in the middle of a line, so the leading fragment is
-        // partial and must be dropped.
-        let prefix = "p".repeat(64);
-        let mut tail = String::from("PARTIALFRAGMENT");
-        tail.push('\n');
-        tail.push_str("SECONDLINE\n");
-        while tail.len() < MAX_TAIL_READ as usize {
-            tail.push_str("y\n");
-        }
-        // Trim back to exactly MAX_TAIL_READ bytes so the window starts mid-line.
-        tail.truncate(MAX_TAIL_READ as usize);
-
-        let path = std::env::temp_dir().join(format!(
-            "rocm-vllm-tail-midline-{}-{}.log",
-            std::process::id(),
-            current_unix_millis()
-        ));
-        fs::write(&path, format!("{prefix}{tail}"))?;
-        let lines = tail_lines(&path, usize::MAX)?;
-        fs::remove_file(&path).ok();
-
-        assert_eq!(
-            lines.first().map(String::as_str),
-            Some("SECONDLINE"),
-            "partial leading fragment must be dropped when the seek lands mid-line"
-        );
-        Ok(())
-    }
-    #[test]
     fn vllm_ready_timeout_uses_default_without_override() {
         assert_eq!(resolve_vllm_ready_timeout(None), DEFAULT_VLLM_READY_TIMEOUT);
     }
@@ -1643,35 +1388,6 @@ mod tests {
         assert_eq!(
             resolve_vllm_ready_timeout(Some("not-a-number".to_owned())),
             DEFAULT_VLLM_READY_TIMEOUT
-        );
-    }
-    #[test]
-    fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
-        let root = PathBuf::from(if cfg!(windows) {
-            r"C:\rocm-sdk"
-        } else {
-            "/tmp/rocm-sdk"
-        });
-        let runtime = VllmRuntime {
-            runtime_id: "therock-release:gfx120X-all".to_owned(),
-            env_id: "external-vllm-therock".to_owned(),
-            command: PathBuf::from("vllm"),
-            python_executable: None,
-            version: None,
-            source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(root.clone()),
-            sdk_bin: Some(root.join("bin")),
-            sdk_bin_paths: vec![root.join("runtime").join("bin")],
-            sdk_library_paths: vec![root.join("runtime").join("lib")],
-            rocm_sdk_version: None,
-        };
-        let entries = therock_library_path_entries(&runtime);
-        assert!(entries.contains(&root.join("runtime").join("lib")));
-        assert!(entries.contains(&root.join("lib")));
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.ends_with(Path::new("lib").join("rocm_sysdeps").join("lib")))
         );
     }
     #[test]

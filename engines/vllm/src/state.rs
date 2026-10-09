@@ -14,13 +14,17 @@ use serde_json::{Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::process::ServeHttpRequest;
+use crate::ServeHttpRequest;
 use crate::runtime::VllmRuntime;
 
 const HEALTHCHECK_TIMEOUT_MS: u64 = 700;
+/// For files larger than this, [`tail_lines`] seeks to this many bytes from
+/// the end instead of reading the whole file.
+const MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceFiles {
@@ -97,7 +101,7 @@ pub(crate) fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
         recent_lines: if files.log_path.is_file() {
-            crate::process::tail_lines(&files.log_path, limit)?
+            tail_lines(&files.log_path, limit)?
         } else {
             Vec::new()
         },
@@ -116,6 +120,16 @@ pub(crate) fn service_files(service_id: &str) -> Result<ServiceFiles> {
     })
 }
 
+/// Assembles the JSON payload persisted as a running service's state and
+/// writes it. Kept here, paired with the readers that reconstruct the PID,
+/// process identity, and endpoint from it ([`pid_from_state`],
+/// [`identity_from_state`], [`endpoint_url_from_state`]) and with
+/// [`write_terminal_state`] — `engines/lemonade/src/state.rs`'s
+/// `write_running_state` pairs with matching readers, though lemonade has no
+/// `pid_from_state`, and its `write_terminal_state` counterpart is
+/// `mark_json_status`. The `VllmRuntime`-derived fields come from
+/// `crate::runtime`, never from `process.rs`, so this module still never
+/// reaches back into it.
 pub(crate) fn write_running_state(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
@@ -139,8 +153,8 @@ pub(crate) fn write_running_state(
             "runtime_executable": runtime.command,
             "server_pid": pid,
             "engine_recipe": request.engine_recipe,
-            "engine_recipe_required_flags": crate::process::engine_recipe_launch_args(request.engine_recipe.as_ref()),
-            "therock_runtime_env": therock_runtime_env_state(runtime),
+            "engine_recipe_required_flags": crate::engine_recipe_launch_args(request.engine_recipe.as_ref()),
+            "therock_runtime_env": crate::runtime::therock_runtime_env_payload(runtime),
             "started_at_unix_ms": current_unix_millis(),
             // Kernel start-time of the launcher PID, captured while it is alive.
             // Paired with `pid`, it identifies this exact process across PID
@@ -148,25 +162,6 @@ pub(crate) fn write_running_state(
             "start_ticks": rocm_core::process_start_ticks(pid)
         }),
     )
-}
-
-fn therock_runtime_env_state(runtime: &VllmRuntime) -> Option<Value> {
-    let root = runtime.sdk_root.as_ref()?;
-    Some(json!({
-        "runtime_id": runtime.runtime_id,
-        "env_id": runtime.env_id,
-        "root": root.display().to_string(),
-        "bin": runtime.sdk_bin.as_ref().map(|path| path.display().to_string()),
-        "bin_paths": crate::process::runtime_bin_paths(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "library_paths": crate::process::therock_library_path_entries(runtime)
-            .into_iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        "source": runtime.source,
-    }))
 }
 
 pub(crate) fn write_terminal_state(state_path: &Path, status: &str) -> Result<()> {
@@ -187,6 +182,13 @@ pub(crate) fn read_service_state(path: &Path) -> Result<Value> {
     serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+/// Serializes `value` to `path` as pretty JSON, creating the parent directory
+/// if needed. The low-level primitive [`write_running_state`] and
+/// [`write_terminal_state`] both go through — it is not the only way this
+/// module's state files are written: inference-verification latches go
+/// through `rocm_core::merge_json_state_file` instead (see
+/// [`inference_verified`]), which patches the file directly rather than
+/// routing through here.
 fn write_state(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -197,6 +199,53 @@ fn write_state(path: &Path, value: &Value) -> Result<()> {
         serde_json::to_vec_pretty(value).context("failed to serialize vLLM state")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Reads the last N lines from a file efficiently by seeking.
+/// For files larger than [`MAX_TAIL_READ`], seeks to `MAX_TAIL_READ` from the end.
+pub(crate) fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let file_size = metadata.len();
+
+    // For large files, seek to MAX_TAIL_READ from the end. When the seek lands in
+    // the middle of a line, the first line read back is a partial fragment that
+    // must be dropped. When it lands exactly on a line boundary (the byte before
+    // `seek_pos` is a newline) the first line is complete and must be kept.
+    let mut first_line_is_partial = false;
+    if file_size > MAX_TAIL_READ {
+        let seek_pos = file_size - MAX_TAIL_READ;
+        // Probe the byte preceding `seek_pos` to classify the first line, then
+        // leave the cursor at `seek_pos` for the buffered read below.
+        file.seek(SeekFrom::Start(seek_pos - 1))
+            .with_context(|| format!("failed to seek in log file {}", path.display()))?;
+        let mut probe = [0u8; 1];
+        file.read_exact(&mut probe)
+            .with_context(|| format!("failed to read from log file {}", path.display()))?;
+        first_line_is_partial = probe[0] != b'\n';
+    }
+
+    let buffered = BufReader::new(file);
+    let mut lines: Vec<String> = buffered
+        .lines()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read lines from {}", path.display()))?;
+
+    // Drop the leading partial line produced by seeking into the middle of a line.
+    if first_line_is_partial && !lines.is_empty() {
+        lines.remove(0);
+    }
+
+    // Return only the last `limit` lines
+    let start_idx = if lines.len() > limit {
+        lines.len() - limit
+    } else {
+        0
+    };
+    Ok(lines.into_iter().skip(start_idx).collect())
 }
 
 pub(crate) fn endpoint_url(host: &str, port: u16) -> String {
@@ -299,10 +348,8 @@ pub(crate) fn current_unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::ServeHttpRequest;
-    use crate::runtime::VllmRuntime;
     use rocm_engine_protocol::DevicePolicy;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     /// Answer `count` chat requests on a loopback port with the given status,
     /// reporting how many arrived.
@@ -452,12 +499,98 @@ mod tests {
         );
     }
     #[test]
-    fn running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
-        let state_path = std::env::temp_dir().join(format!(
-            "rocm-vllm-state-{}-{}.json",
+    fn tail_lines_returns_suffix() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-{}-{}.log",
             std::process::id(),
             current_unix_millis()
         ));
+        fs::write(&path, "a\nb\nc\n")?;
+        let lines = tail_lines(&path, 2)?;
+        fs::remove_file(path).ok();
+        assert_eq!(lines, vec!["b".to_owned(), "c".to_owned()]);
+        Ok(())
+    }
+    #[test]
+    fn tail_lines_keeps_first_line_when_seek_lands_on_boundary() -> Result<()> {
+        // Build a file where the MAX_TAIL_READ window starts exactly on a line
+        // boundary: a prefix ending in '\n', followed by exactly MAX_TAIL_READ
+        // bytes of complete lines. The first windowed line must NOT be dropped.
+        let prefix = format!("{}\n", "p".repeat(63));
+        let mut tail = String::from("FIRSTLINE\n");
+        while tail.len() + 2 <= MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push('z');
+        }
+        assert_eq!(tail.len(), MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-boundary-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("FIRSTLINE"),
+            "complete first line must be preserved when the seek lands on a newline boundary"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('p')),
+            "bytes before the tail window must not appear"
+        );
+        Ok(())
+    }
+    #[test]
+    fn tail_lines_drops_partial_first_line_when_seek_lands_midline() -> Result<()> {
+        // The window starts in the middle of a line, so the leading fragment is
+        // partial and must be dropped.
+        let prefix = "p".repeat(64);
+        let mut tail = String::from("PARTIALFRAGMENT");
+        tail.push('\n');
+        tail.push_str("SECONDLINE\n");
+        while tail.len() < MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        // Trim back to exactly MAX_TAIL_READ bytes so the window starts mid-line.
+        tail.truncate(MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-tail-midline-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("SECONDLINE"),
+            "partial leading fragment must be dropped when the seek lands mid-line"
+        );
+        Ok(())
+    }
+    #[test]
+    fn write_running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
+        // Uses the test's own live PID rather than a fixed placeholder so the
+        // `start_ticks` assertion below exercises the real
+        // `rocm_core::process_start_ticks` lookup instead of a value `json!`
+        // would write regardless (a prior version of this test asserted only
+        // `is_some()`, which `Some(Value::Null)` also satisfies).
+        let own_pid = std::process::id();
+        let state_path = probe_state_path("therock-env");
+        // `sdk_root` must be a real, scratch directory on Linux: this payload can
+        // materialize a `libmpi_cxx.so.40` compat stub under it (see
+        // `ensure_mpi_cxx_compat`), and a fixed `/home/user/...` path would leave
+        // that file behind after the test runs wherever it happens to be writable
+        // (for example, in root containers).
+        let scratch = tempfile::tempdir().expect("tempdir");
         let request = ServeHttpRequest {
             service_id: "svc-vllm".to_owned(),
             model_ref: "facebook/opt-125m".to_owned(),
@@ -482,11 +615,11 @@ mod tests {
             python_executable: None,
             version: Some("test".to_owned()),
             source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk"
+            sdk_root: Some(if cfg!(windows) {
+                PathBuf::from(r"C:\rocm-sdk")
             } else {
-                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
-            })),
+                scratch.path().join("rocm_sdk")
+            }),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
@@ -505,11 +638,18 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        write_running_state(&request, &runtime, 12345)?;
+        write_running_state(&request, &runtime, own_pid)?;
         let state = read_service_state(&state_path)?;
         fs::remove_file(&state_path).ok();
 
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(own_pid))
+        );
+        assert_eq!(
+            state.get("service_id").and_then(Value::as_str),
+            Some("svc-vllm")
+        );
         assert_eq!(
             state.get("runtime_id").and_then(Value::as_str),
             Some("therock-release:gfx120X-all")
@@ -517,6 +657,20 @@ mod tests {
         assert_eq!(
             state.get("requested_runtime_id").and_then(Value::as_str),
             Some("runtime-key-gfx120x")
+        );
+        assert_eq!(
+            state.get("endpoint_url").and_then(Value::as_str),
+            Some("http://127.0.0.1:11439/v1")
+        );
+        assert_eq!(
+            state.get("env_id").and_then(Value::as_str),
+            Some("external-vllm-therock")
+        );
+        assert!(
+            state
+                .get("engine_recipe_required_flags")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
         );
         let runtime_env = state
             .get("therock_runtime_env")
@@ -543,8 +697,24 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
-        // The identity token must be recorded so a later stop can verify it.
-        assert!(state.get("start_ticks").is_some());
+        // The identity token must be recorded so a later stop can verify it
+        // against the live process, not merely be present in the JSON.
+        assert_eq!(
+            state.get("start_ticks").and_then(Value::as_u64),
+            rocm_core::process_start_ticks(own_pid)
+        );
+
+        // Round-trips through disk via `write_running_state` and
+        // `read_service_state`, then checks that the reader side
+        // (`identity_from_state`) reconstructs the PID this writer recorded —
+        // the contract the split between the two sides of this module depends
+        // on.
+        let identity = identity_from_state(&state).expect("identity");
+        assert_eq!(identity.pid, own_pid);
+        assert_eq!(
+            identity.start_ticks,
+            rocm_core::process_start_ticks(own_pid)
+        );
         Ok(())
     }
     #[test]
