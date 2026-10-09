@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+pub mod atomic_write;
 pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
