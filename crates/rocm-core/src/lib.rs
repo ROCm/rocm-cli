@@ -4451,11 +4451,20 @@ pub fn vllm_log_shows_oom(log: &str) -> bool {
 /// silently withdrawing both the engine hint and the serve-summary note for the
 /// most common shape of the failure they exist to explain.
 ///
-/// Splitting here the same way, and anchoring each segment separately, keeps
-/// the two sides agreeing on where a line ends.
+/// Splitting on `\r` here, and anchoring each segment separately, keeps the two
+/// sides agreeing about where this line ends.
+///
+/// Deliberately a raw `split('\r')` and *not* [`terminal::rendered_lines`],
+/// even though that is what the diagnostic re-splits with. `rendered_lines`
+/// also discards escape sequences and other control bytes, and the segment
+/// returned here becomes the `--symptom` argument: sanitising it means
+/// [`quotable_in_single_quotes`] only ever sees clean text, never rejects it,
+/// and the canonical-symptom fallback stops firing — so a colourised OOM line
+/// would be stripped into a lookalike and printed rather than refused. Scoring
+/// is unaffected, because the diagnostic strips its own copy regardless.
 fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
     log.lines()
-        .flat_map(terminal::rendered_lines)
+        .flat_map(|line| line.split('\r'))
         .map(|segment| segment.trim().to_owned())
         .filter(|segment| !segment.is_empty())
 }
