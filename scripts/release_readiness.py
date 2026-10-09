@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import io
 import os
@@ -47,9 +48,11 @@ LINUX_EXECUTABLES = (
     "bin/rocmd",
     "install.sh",
 )
+SIGNING_PUBLIC_KEY_PATH_ENV = "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH"
+SIGNING_PUBLIC_KEY_ENV = "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
 PRODUCTION_TRUST_ENV_NAMES = (
-    "ROCM_CLI_SIGNING_PUBLIC_KEY_PATH",
-    "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM",
+    SIGNING_PUBLIC_KEY_PATH_ENV,
+    SIGNING_PUBLIC_KEY_ENV,
     "ROCM_CLI_METADATA_PUBLIC_KEY_PATH",
     "ROCM_CLI_METADATA_PUBLIC_KEY_PEM",
     "ROCM_CLI_MODEL_RECIPE_INDEX_PATH",
@@ -381,8 +384,8 @@ def validate_archive(
     archive: Path,
     *,
     require_signatures: bool,
+    verify: bool,
     public_key: Path | None,
-    verify_with_env_key: bool = False,
     require_rocm_asset_names: bool,
 ) -> list[str]:
     messages: list[str] = []
@@ -409,7 +412,6 @@ def validate_archive(
         )
     messages.append(f"checksum ok: {archive.name}")
 
-    verify = public_key is not None or verify_with_env_key
     signature = Path(f"{archive}.sig")
     if require_signatures or verify:
         if not signature.is_file():
@@ -456,6 +458,89 @@ def env_text(name: str) -> str | None:
     if value is None or not value.strip():
         return None
     return value
+
+
+def verification_is_required(
+    require_signatures: bool,
+    require_production_trust: bool,
+    explicit_public_key: Path | None,
+) -> bool:
+    """Whether this run must cryptographically verify signatures.
+
+    Requiring signatures means requiring they verify. Checking only that a
+    ``.sig`` exists would pass an artifact signed by the wrong key, truncated,
+    or corrupted -- so whenever signatures are required, so is verification,
+    and a key that cannot be resolved is a hard failure rather than a quiet
+    downgrade to the presence check.
+
+    Separate from ``main`` so ``--self-test`` can exercise the decision
+    directly; ``main`` returns on the ``--self-test`` branch before the gate.
+    """
+    return (
+        require_signatures
+        or require_production_trust
+        or explicit_public_key is not None
+    )
+
+
+def resolve_verification(
+    require_signatures: bool,
+    require_production_trust: bool,
+    explicit_public_key: Path | None,
+) -> tuple[bool, Path | None, str | None]:
+    """The whole verify wiring: decide, then resolve the key when required.
+
+    Returns ``(verify, public_key, key_source)``; ``key_source`` is ``None``
+    when no verification is required.
+
+    Deciding and resolving belong together: a run that requires verification
+    but resolves no key would verify nothing while reporting success. Keeping
+    both here means ``main`` holds no copy of the sequence.
+    """
+    verify = verification_is_required(
+        require_signatures, require_production_trust, explicit_public_key
+    )
+    if not verify:
+        return False, None, None
+    public_key, key_source = resolve_signing_key(explicit_public_key)
+    return True, public_key, key_source
+
+
+def resolve_signing_key(explicit: Path | None) -> tuple[Path | None, str]:
+    """Resolve the public key release signatures are verified against.
+
+    Returns the key path and a label naming where it came from. A ``None`` path
+    means `cargo xtask verify` reads the inline PEM from
+    ``ROCM_CLI_SIGNING_PUBLIC_KEY_PEM`` itself, so no temporary key file has to
+    be materialized here.
+
+    A key file path is preferred over the inline PEM, matching how `install.sh`
+    and `cargo xtask package` resolve their signing keys. A path that does not
+    exist is an error from `verify_signature`, not a reason to fall through to
+    the next source: silently verifying against a different key than the
+    operator named is the failure mode this gate exists to prevent.
+
+    Raises when no key resolves. That is the point of this function: GitHub
+    expands an unset secret to the empty string, so a missing key is
+    indistinguishable from a deliberately absent one. Verification has to fail
+    closed, or rotating the secret away would silently downgrade the release
+    gate to "a .sig file exists".
+    """
+    if explicit is not None:
+        return explicit, f"--public-key {explicit}"
+    if (path := env_path(SIGNING_PUBLIC_KEY_PATH_ENV)) is not None:
+        return path, f"${SIGNING_PUBLIC_KEY_PATH_ENV} ({path})"
+    if env_text(SIGNING_PUBLIC_KEY_ENV) is not None:
+        return None, f"${SIGNING_PUBLIC_KEY_ENV}"
+    raise ReadinessError(
+        "signature verification requires a release signing public key: pass "
+        f"--public-key or set {SIGNING_PUBLIC_KEY_PATH_ENV} or "
+        f"{SIGNING_PUBLIC_KEY_ENV}. Verification is requested by "
+        "--require-signatures, --require-production-trust, --public-key, or the "
+        "ROCM_CLI_REQUIRE_SIGNATURE / ROCM_CLI_REQUIRE_PRODUCTION_TRUST "
+        "environment variables; the packaging steps export "
+        "ROCM_CLI_REQUIRE_SIGNATURE=1, so a packaging run needs a key too."
+    )
 
 
 def require_any(label: str, names: list[str]) -> None:
@@ -521,14 +606,13 @@ def validate_release(
     *,
     assets: list[str],
     require_signatures: bool,
+    verify: bool,
     public_key: Path | None,
-    verify_with_env_key: bool = False,
     require_production_trust: bool,
     require_rocm_asset_names: bool,
     require_exact_assets: bool,
 ) -> list[str]:
     archives = discover_archives(dist, assets)
-    verify = public_key is not None or verify_with_env_key
     messages: list[str] = []
     if require_exact_assets:
         if not assets:
@@ -545,8 +629,8 @@ def validate_release(
             validate_archive(
                 archive,
                 require_signatures=require_signatures,
+                verify=verify,
                 public_key=public_key,
-                verify_with_env_key=verify_with_env_key,
                 require_rocm_asset_names=require_rocm_asset_names,
             )
         )
@@ -617,11 +701,286 @@ def run_with_env(values: dict[str, str | Path | None], func):
                 os.environ[name] = value
 
 
+def _assert_verification_wiring(expected_key: Path) -> None:
+    """`resolve_verification` must decide AND resolve, not just decide."""
+    verify, public_key, key_source = resolve_verification(True, False, None)
+    if not verify:
+        raise ReadinessError(
+            "--require-signatures must force verification through the wiring main uses"
+        )
+    if public_key != expected_key or not key_source:
+        raise ReadinessError(
+            f"verification was required but no key was resolved: {public_key!r} / {key_source!r}; "
+            "a required verification that silently resolves no key is the fail-open this gate closes"
+        )
+    off_verify, off_key, off_source = resolve_verification(False, False, None)
+    if off_verify or off_key is not None or off_source is not None:
+        raise ReadinessError(
+            "verification must stay off, and resolve no key, when nothing asks for it"
+        )
+
+
+def _run_main(dist: Path, *flags: str) -> tuple[int | None, str, str]:
+    """Drive `main` in-process.
+
+    Returns ``(exit code or None if it returned, stdout, stderr)``. Both streams
+    are captured: stderr so a case expecting failure does not print
+    ``release readiness failed: ...`` into the log of a passing run, and stdout
+    so cases can assert on what the run claimed it did.
+    """
+    saved_argv = sys.argv
+    sys.argv = ["release_readiness.py", "--dist", str(dist), *flags]
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            try:
+                main()
+            except SystemExit as exit_error:
+                code = exit_error.code
+                return (
+                    (code if isinstance(code, int) else 1),
+                    out.getvalue(),
+                    err.getvalue(),
+                )
+        return None, out.getvalue(), err.getvalue()
+    finally:
+        sys.argv = saved_argv
+
+
+def _assert_main_refuses_without_a_key(dist: Path) -> None:
+    """`--require-signatures` with no key must fail, and say so."""
+    code, _stdout, stderr = _run_main(dist, "--require-signatures")
+    if code is None:
+        raise ReadinessError(
+            "main accepted a signature-required run with no key configured; "
+            "that is the fail-open this gate exists to close"
+        )
+    # The reason matters, not just the exit code: a `main` that skipped the
+    # gate and happened to fail for some unrelated reason would otherwise pass.
+    if "requires a release signing public key" not in stderr:
+        raise ReadinessError(
+            "main failed, but not on the missing signing key -- the gate case is "
+            f"no longer exercising what it claims. stderr was: {stderr.strip()!r}"
+        )
+
+
+def _run_main_verifying(
+    dist: Path, *flags: str, verification_fails: bool = False
+) -> tuple[int | None, str, str, list[list[str]]]:
+    """Drive `main` with `cargo xtask verify` intercepted at the subprocess call.
+
+    Returns `(exit code, stdout, stderr, argvs)`, where `argvs` holds every
+    command verification actually ran.
+
+    Interception sits at the subprocess boundary rather than stubbing
+    `verify_signature`, so the real argv is built and the `--public-key` handoff
+    is exercised; stubbing the function leaves `key_args` unreachable, and
+    dropping it would stay green while verification silently fell back to
+    whatever the inline PEM holds.
+    """
+    argvs: list[list[str]] = []
+    returncode = 1 if verification_fails else 0
+
+    class _Completed:
+        def __init__(self) -> None:
+            self.returncode = returncode
+            self.stdout = "stub: signature did not verify" if returncode else ""
+
+    module = sys.modules[__name__]
+    original_run, original_which = module.subprocess.run, module.shutil.which
+    module.subprocess.run = lambda argv, **_kwargs: (
+        argvs.append(list(argv)),
+        _Completed(),
+    )[1]
+    module.shutil.which = lambda name: (
+        "/fake/cargo" if name == "cargo" else original_which(name)
+    )
+    try:
+        code, stdout, stderr = _run_main(dist, *flags)
+    finally:
+        module.subprocess.run, module.shutil.which = original_run, original_which
+    return code, stdout, stderr, argvs
+
+
+def _assert_main_verifies(dist: Path, expected_key: Path) -> None:
+    """`main` must verify, against the resolved key, and say which key that was.
+
+    Three things have to hold together, because each is separately silent:
+    verification has to happen at all; it has to use the key
+    `resolve_signing_key` chose, since `cargo xtask verify` falls back to the
+    inline PEM when `--public-key` is omitted and would then check a different
+    key than the run reports; and the `signature verification key:` line has to
+    name that same key, or the log makes a claim nothing backs.
+    """
+    code, stdout, stderr, argvs = _run_main_verifying(dist, "--require-signatures")
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected a run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if not argvs:
+        raise ReadinessError(
+            "main completed a --require-signatures run without verifying any "
+            "signature; the verify decision is not reaching validate_release"
+        )
+    resolved = str(expected_key.resolve())
+    for argv in argvs:
+        if "--public-key" not in argv or resolved not in argv:
+            raise ReadinessError(
+                f"verification ran without --public-key {resolved}: {argv!r}. "
+                "`cargo xtask verify` falls back to the inline PEM when the flag "
+                "is omitted, so this would check a different key than the run "
+                "reports."
+            )
+    expected_line = (
+        f"signature verification key: ${SIGNING_PUBLIC_KEY_PATH_ENV} ({expected_key})"
+    )
+    if expected_line not in stdout:
+        raise ReadinessError(
+            f"the run did not report the key it used; expected {expected_line!r} "
+            f"in stdout, got {stdout.strip()!r}"
+        )
+
+
+def _assert_key_line_survives_a_failed_verification(dist: Path) -> None:
+    """The key line must appear on the run that fails, not only on the one that passes.
+
+    `docs/release-trust.md` promises it names the key the run actually used; a
+    failed verification is when that matters most. Collecting the line into
+    `messages`, which is flushed only on success, would keep every other case
+    green while deleting it from exactly that run.
+    """
+    code, stdout, _stderr, argvs = _run_main_verifying(
+        dist, "--require-signatures", verification_fails=True
+    )
+    if code is None or not argvs:
+        raise ReadinessError(
+            "main accepted a run whose signature verification failed "
+            f"(exit {code!r}, {len(argvs)} verification call(s))"
+        )
+    if "signature verification key:" not in stdout:
+        raise ReadinessError(
+            "the key line is missing from a run that failed verification, which "
+            "is the run that most needs it; it must not be deferred to the "
+            f"success-only message flush. stdout was {stdout.strip()!r}"
+        )
+
+
+def _assert_inline_pem_run_omits_the_key_flag(dist: Path) -> None:
+    """With only the inline PEM set, the run must say so and pass no `--public-key`.
+
+    This is the source release and nightly actually use. `cargo xtask verify`
+    reads the PEM itself, so materialising a key file would be wrong -- but the
+    label still has to name the PEM, and gating the line on a resolved path
+    would silently drop it for every real CI run.
+    """
+    code, stdout, stderr, argvs = _run_main_verifying(dist, "--require-signatures")
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected an inline-PEM run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if not argvs:
+        raise ReadinessError("an inline-PEM run verified nothing")
+    for argv in argvs:
+        if "--public-key" in argv:
+            raise ReadinessError(
+                f"an inline-PEM run passed --public-key: {argv!r}; `cargo xtask "
+                "verify` reads the PEM itself and no key file exists to name"
+            )
+    expected_line = f"signature verification key: ${SIGNING_PUBLIC_KEY_ENV}"
+    if expected_line not in stdout:
+        raise ReadinessError(
+            f"an inline-PEM run did not report its key source; expected "
+            f"{expected_line!r}, got {stdout.strip()!r}"
+        )
+
+
+def _assert_env_trigger_reaches_the_gate(dist: Path, name: str) -> None:
+    """The environment equivalents must force verification through `main` too.
+
+    `main` reads them with `truthy(os.environ.get(...))` and ors them into the
+    flags. Nothing covered that, so dropping either term left the suite green
+    while a packaging run that exports the variable stopped verifying -- the
+    very consequence `docs/release-trust.md` spells out.
+    """
+    _code, _stdout, _stderr, argvs = run_with_env(
+        {name: "1"}, lambda: _run_main_verifying(dist)
+    )
+    if not argvs:
+        raise ReadinessError(
+            f"{name}=1 did not make main verify anything; the environment "
+            "trigger is no longer reaching resolve_verification"
+        )
+
+
+def _assert_the_inline_pem_alone_triggers_nothing(dist: Path) -> None:
+    """A set `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` must not, by itself, turn verification on.
+
+    Before this change, a configured PEM *was* a trigger. Removing it is a
+    promise that something will no longer happen, and `docs/release-trust.md`
+    states it: "a readiness run that asks for neither now checks neither". Only
+    a test that runs with the PEM set can tell the two behaviours apart -- every
+    other "off" case leaves it unset, so putting the old
+    ``or env_text(SIGNING_PUBLIC_KEY_ENV) is not None`` term back survives them
+    all.
+
+    Both levels are pinned, because each is silent on its own: the decision
+    helper must resolve nothing, and `main` -- which assembles the arguments fed
+    to it -- must run no verification.
+    """
+    decision = resolve_verification(False, False, None)
+    if decision != (False, None, None):
+        raise ReadinessError(
+            "a bare run with only the inline PEM configured must not verify; "
+            f"resolve_verification(False, False, None) returned {decision!r}. A "
+            "configured key is no longer a trigger -- asking for neither flag "
+            "must check neither."
+        )
+    code, _stdout, stderr, argvs = _run_main_verifying(dist)
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected a bare run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if argvs:
+        raise ReadinessError(
+            f"a bare run verified {len(argvs)} signature(s) with only the inline "
+            f"PEM set: {argvs!r}; the PEM is no longer a verification trigger"
+        )
+
+
+def _assert_main_honours_trigger(dist: Path, *flags: str) -> None:
+    """Each trigger must force verification *through `main`*, not just in the helper.
+
+    `verification_is_required` is pinned directly, but `main` chooses what to
+    feed it. Passing a literal `False` for production trust, or `None` for
+    `--public-key`, leaves those helper cases green while the flag stops doing
+    anything.
+    """
+    _code, _stdout, _stderr, argvs = _run_main_verifying(dist, *flags)
+    if not argvs:
+        raise ReadinessError(
+            f"{' '.join(flags)} did not make main verify anything; the flag is no "
+            "longer reaching resolve_verification"
+        )
+
+
 def run_self_test(root: Path) -> None:
     if root.exists():
         shutil.rmtree(root)
     root.mkdir(parents=True)
     try:
+        # The block below, down to "production trust inputs accepted", drives
+        # `validate_release` directly with `require_signatures=True, verify=False`.
+        # `main` can no longer produce that combination -- requiring signatures now
+        # implies verifying them -- so these are unit checks of the *presence* half
+        # of the signature rule: that a `.sig` must exist next to every archive, and
+        # that the surrounding asset/sha/name rules behave. They deliberately use
+        # placeholder `.sig` bytes, which the real gate would reject; nothing here
+        # claims a signature is valid. End-to-end verification, with the key handoff
+        # and the real argv, is covered further down by the `_run_main_verifying`
+        # cases.
         dist = root / "dist"
         dist.mkdir()
         linux_archive = dist / "rocm-cli-test-linux-amd64.tar.gz"
@@ -635,12 +994,13 @@ def run_self_test(root: Path) -> None:
             dist,
             assets=[],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=False,
             require_exact_assets=False,
         )
-        print("release readiness self-test: valid signed dist accepted")
+        print("release readiness self-test: dist with a .sig present accepted")
 
         exact_dist = root / "exact-dist"
         exact_dist.mkdir()
@@ -655,12 +1015,13 @@ def run_self_test(root: Path) -> None:
             exact_dist,
             assets=[exact_linux_archive.name, exact_windows_archive.name],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=True,
             require_exact_assets=True,
         )
-        print("release readiness self-test: exact signed dist accepted")
+        print("release readiness self-test: exact dist with a .sig present accepted")
 
         stale_archive = exact_dist / "rocm-cli-v9.9.9-linux-amd64.tar.gz"
         create_test_tar(stale_archive, "rocm-cli-v9.9.9-linux-amd64")
@@ -672,6 +1033,7 @@ def run_self_test(root: Path) -> None:
                 exact_dist,
                 assets=[exact_linux_archive.name, exact_windows_archive.name],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
@@ -692,6 +1054,7 @@ def run_self_test(root: Path) -> None:
                 exact_dist,
                 assets=[exact_linux_archive.name, exact_windows_archive.name],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
@@ -729,6 +1092,7 @@ def run_self_test(root: Path) -> None:
                 strict_nightly_alias.name,
             ],
             require_signatures=True,
+            verify=False,
             public_key=None,
             require_production_trust=False,
             require_rocm_asset_names=True,
@@ -743,6 +1107,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -761,6 +1126,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -775,6 +1141,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -792,6 +1159,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -809,6 +1177,7 @@ def run_self_test(root: Path) -> None:
                     dist,
                     assets=[],
                     require_signatures=True,
+                    verify=False,
                     public_key=None,
                     require_production_trust=True,
                     require_rocm_asset_names=False,
@@ -847,6 +1216,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=[],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=True,
                 require_rocm_asset_names=False,
@@ -864,6 +1234,7 @@ def run_self_test(root: Path) -> None:
                     "missing-installer-alias.tar.gz",
                 ],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -877,6 +1248,7 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=["../rocm-cli-linux-amd64.tar.gz"],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=False,
@@ -892,12 +1264,169 @@ def run_self_test(root: Path) -> None:
                 dist,
                 assets=["rocm-cli-test-linux-amd64.tar.gz"],
                 require_signatures=True,
+                verify=False,
                 public_key=None,
                 require_production_trust=False,
                 require_rocm_asset_names=True,
                 require_exact_assets=False,
             ),
         )
+
+        expect_failure(
+            "signature verification with no resolvable key",
+            lambda: run_with_env(
+                {SIGNING_PUBLIC_KEY_ENV: None, SIGNING_PUBLIC_KEY_PATH_ENV: None},
+                lambda: resolve_signing_key(None),
+            ),
+        )
+        # GitHub expands an unset secret to the empty string, so this is what an
+        # unconfigured ROCM_CLI_SIGNING_PUBLIC_KEY_PEM actually looks like in CI.
+        # It must fail exactly like an absent one rather than resolving to a key.
+        expect_failure(
+            "signature verification with an empty key",
+            lambda: run_with_env(
+                {SIGNING_PUBLIC_KEY_ENV: "", SIGNING_PUBLIC_KEY_PATH_ENV: ""},
+                lambda: resolve_signing_key(None),
+            ),
+        )
+
+        inline_pem = "-----BEGIN PUBLIC KEY-----\nself-test\n"
+        env_key, env_source = run_with_env(
+            {SIGNING_PUBLIC_KEY_ENV: inline_pem, SIGNING_PUBLIC_KEY_PATH_ENV: None},
+            lambda: resolve_signing_key(None),
+        )
+        if env_key is not None or SIGNING_PUBLIC_KEY_ENV not in env_source:
+            raise ReadinessError(
+                f"expected the environment key to resolve, got {env_source}"
+            )
+
+        # A key file the operator named must be used, not passed over in favour of
+        # the inline PEM — and never ignored in favour of failing, which would tell
+        # them to configure a key they had already configured.
+        key_path = root / "configured-public-key.pem"
+        path_key, path_source = run_with_env(
+            {SIGNING_PUBLIC_KEY_ENV: inline_pem, SIGNING_PUBLIC_KEY_PATH_ENV: key_path},
+            lambda: resolve_signing_key(None),
+        )
+        if path_key != key_path or SIGNING_PUBLIC_KEY_PATH_ENV not in path_source:
+            raise ReadinessError(
+                f"expected the key path to win over the inline PEM, got {path_source}"
+            )
+
+        explicit = root / "explicit-public-key.pem"
+        explicit_key, explicit_source = run_with_env(
+            {
+                SIGNING_PUBLIC_KEY_ENV: inline_pem,
+                SIGNING_PUBLIC_KEY_PATH_ENV: key_path,
+            },
+            lambda: resolve_signing_key(explicit),
+        )
+        if explicit_key != explicit or str(explicit) not in explicit_source:
+            raise ReadinessError(
+                f"expected --public-key to win over the environment, got {explicit_source}"
+            )
+        print("release readiness self-test: signing key resolution ok")
+
+        # Each flag must force verification on, and nothing else may turn it on.
+        for label, flags in (
+            ("--require-signatures", (True, False, None)),
+            ("--require-production-trust", (False, True, None)),
+            ("--public-key", (False, False, Path("/nonexistent/key.pem"))),
+        ):
+            if not verification_is_required(*flags):
+                raise ReadinessError(
+                    f"{label} must force cryptographic verification, not just a .sig check"
+                )
+        if verification_is_required(False, False, None):
+            raise ReadinessError(
+                "verification must stay off when nothing asks for it, or an ordinary "
+                "readiness run would demand a signing key it has no reason to need"
+            )
+        print("release readiness self-test: verify gate ok")
+        # Requiring verification must also resolve a key, not just set a flag.
+        run_with_env(
+            {
+                SIGNING_PUBLIC_KEY_PATH_ENV: key_path,
+                SIGNING_PUBLIC_KEY_ENV: None,
+            },
+            lambda: _assert_verification_wiring(key_path),
+        )
+        print("release readiness self-test: verify wiring ok")
+
+        # `main`'s own behaviour, on a dist that is valid on every other axis so
+        # the verify gate is the only thing either case can turn on.
+        gate_dist = root / "gate-dist"
+        gate_dist.mkdir()
+        gate_archive = gate_dist / "rocm-cli-test-linux-amd64.tar.gz"
+        create_test_tar(gate_archive, "rocm-cli-test-linux-amd64")
+        write_sha(gate_archive)
+        Path(f"{gate_archive}.sig").write_bytes(b"detached signature placeholder\n")
+        no_key_env = {
+            SIGNING_PUBLIC_KEY_PATH_ENV: None,
+            SIGNING_PUBLIC_KEY_ENV: None,
+            "ROCM_CLI_REQUIRE_SIGNATURE": None,
+            "ROCM_CLI_REQUIRE_PRODUCTION_TRUST": None,
+        }
+        run_with_env(no_key_env, lambda: _assert_main_refuses_without_a_key(gate_dist))
+        print("release readiness self-test: main refuses without a key ok")
+        # A key that exists on disk, because this case lets the real
+        # `verify_signature` run and it rejects a named key that is not a file.
+        # `key_path` above stays absent on purpose, to pin that a named-but-
+        # missing key still wins resolution rather than falling through.
+        real_key = root / "present-public-key.pem"
+        real_key.write_text(inline_pem, encoding="ascii")
+        path_env = {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: real_key}
+        run_with_env(path_env, lambda: _assert_main_verifies(gate_dist, real_key))
+        print("release readiness self-test: main actually verifies ok")
+
+        run_with_env(
+            path_env, lambda: _assert_key_line_survives_a_failed_verification(gate_dist)
+        )
+        print("release readiness self-test: key line survives a failed verify ok")
+
+        # The source release and nightly actually use.
+        inline_pem_env = {**no_key_env, SIGNING_PUBLIC_KEY_ENV: inline_pem}
+        run_with_env(
+            inline_pem_env,
+            lambda: _assert_inline_pem_run_omits_the_key_flag(gate_dist),
+        )
+        print("release readiness self-test: inline-PEM run reports its source ok")
+
+        # ...and the same environment with nothing asking for signatures, which
+        # is the only shape that can see the removed PEM trigger come back.
+        run_with_env(
+            inline_pem_env,
+            lambda: _assert_the_inline_pem_alone_triggers_nothing(gate_dist),
+        )
+        print("release readiness self-test: a configured PEM alone triggers nothing ok")
+
+        # The other two triggers, driven through `main` rather than the helper.
+        run_with_env(
+            path_env,
+            lambda: _assert_main_honours_trigger(
+                gate_dist, "--require-production-trust"
+            ),
+        )
+        run_with_env(
+            no_key_env,
+            lambda: _assert_main_honours_trigger(
+                gate_dist, "--public-key", str(real_key)
+            ),
+        )
+        print("release readiness self-test: production-trust and --public-key ok")
+
+        # ...and the environment equivalents, which packaging steps export.
+        for trigger in (
+            "ROCM_CLI_REQUIRE_SIGNATURE",
+            "ROCM_CLI_REQUIRE_PRODUCTION_TRUST",
+        ):
+            run_with_env(
+                path_env,
+                lambda trigger=trigger: _assert_env_trigger_reaches_the_gate(
+                    gate_dist, trigger
+                ),
+            )
+        print("release readiness self-test: environment triggers reach the gate ok")
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("release readiness self-test: ok")
@@ -917,12 +1446,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--require-signatures",
         action="store_true",
-        help="Require every archive to have a non-empty .sig sidecar.",
+        help="Require every archive to carry a detached signature that verifies "
+        "against the release signing public key.",
     )
     parser.add_argument(
         "--public-key",
         type=Path,
-        help="Verify detached signatures with this public key.",
+        help="Verify detached signatures with this public key instead of the one "
+        f"named by {SIGNING_PUBLIC_KEY_PATH_ENV} or {SIGNING_PUBLIC_KEY_ENV}.",
     )
     parser.add_argument(
         "--require-production-trust",
@@ -968,37 +1499,31 @@ def main() -> None:
     require_production_trust = args.require_production_trust or truthy(
         os.environ.get("ROCM_CLI_REQUIRE_PRODUCTION_TRUST")
     )
-    # Verify archives against the release public key whenever one is configured,
-    # not just check that a key input exists — so a private/public key mismatch
-    # fails here instead of at users' installers. Mandatory under production
-    # trust; otherwise opportunistic: if a signing public key is present in the
-    # environment (release/nightly wire it from the secret), verify against it.
-    # An explicit --public-key still wins; with neither, behavior is unchanged.
-    #
-    # When relying on the environment key, `cargo xtask verify` reads it directly
-    # from ROCM_CLI_SIGNING_PUBLIC_KEY_PEM, so no temp key file is materialized here.
-    public_key = args.public_key
-    verify_with_env_key = False
+    messages: list[str] = []
     try:
-        if public_key is None and (
-            require_production_trust
-            or env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is not None
-        ):
-            if env_text("ROCM_CLI_SIGNING_PUBLIC_KEY_PEM") is None:
-                raise ReadinessError(
-                    "production trust requires the release signing public key: set "
-                    "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM (or pass --public-key)"
-                )
-            verify_with_env_key = True
-        messages = validate_release(
-            Path(args.dist),
-            assets=args.asset,
-            require_signatures=require_signatures,
-            public_key=public_key,
-            verify_with_env_key=verify_with_env_key,
-            require_production_trust=require_production_trust,
-            require_rocm_asset_names=args.require_rocm_asset_names,
-            require_exact_assets=args.require_exact_assets,
+        verify, public_key, key_source = resolve_verification(
+            require_signatures, require_production_trust, args.public_key
+        )
+        if key_source is not None:
+            # Printed now rather than collected into `messages`, which is only
+            # flushed on success: a run that fails verification is exactly when
+            # you need to know which key it used. Flushed so it cannot be
+            # reordered after the unbuffered stderr of `fail()` when piped.
+            print(
+                f"release readiness: signature verification key: {key_source}",
+                flush=True,
+            )
+        messages.extend(
+            validate_release(
+                Path(args.dist),
+                assets=args.asset,
+                require_signatures=require_signatures,
+                verify=verify,
+                public_key=public_key,
+                require_production_trust=require_production_trust,
+                require_rocm_asset_names=args.require_rocm_asset_names,
+                require_exact_assets=args.require_exact_assets,
+            )
         )
     except ReadinessError as error:
         fail(str(error))

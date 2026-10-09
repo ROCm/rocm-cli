@@ -47,12 +47,45 @@ python scripts/release_readiness.py \
 ```
 
 The verifier confirms each named archive has the required rocm-cli bundle
-files, confirms the `.sha256` sidecar matches the archive bytes and names the
-archive being published, and confirms a non-empty `.sig` sidecar exists when
-signatures are required. If a public key is provided with `--public-key`, it
-also verifies the detached signature with `openssl`. Release CI also enables
-`--require-rocm-asset-names`, which rejects branch-like, path-like, or
-otherwise unsupported archive names before upload.
+files, and confirms the `.sha256` sidecar matches the archive bytes and names
+the archive being published.
+
+`--require-signatures` requires signatures that *verify*, not merely exist: each
+archive must have a non-empty `.sig` sidecar, and that signature must check out
+against the release signing public key via `cargo xtask verify`. The key is
+taken from `--public-key` when given, then from the key file named by
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PATH`, then from the inline
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` that release and nightly CI wire from the
+signing-key secret — the same path-before-PEM precedence `install.sh` applies to
+the public key, and `cargo xtask package` to the private one. If none resolves,
+the gate fails. It deliberately does
+not fall back to checking that a `.sig` file is present: a sidecar produced by
+the wrong key, truncated, or corrupted would pass such a check, and because an
+unset GitHub secret expands to the empty string, the fallback would be reached
+silently whenever the secret was removed or rotated away. The log line
+`signature verification key:` names the key the run actually used, and is
+printed as soon as the key resolves so that a run which then fails verification
+still records which trust root it used.
+
+Verification is driven by what the run asks for, not by what happens to be in
+the environment: `--require-signatures`, `--require-production-trust` or an
+explicit `--public-key` — or the environment equivalents of the first two,
+`ROCM_CLI_REQUIRE_SIGNATURE` and `ROCM_CLI_REQUIRE_PRODUCTION_TRUST`. The
+packaging steps set `ROCM_CLI_REQUIRE_SIGNATURE=1` on the step that runs the
+gate (`release.yml:133,228`, `nightly.yml:137,232`), while production trust is
+set once for the whole workflow from a repository variable (`release.yml:24`,
+`nightly.yml:20`). Note that exporting `ROCM_CLI_REQUIRE_SIGNATURE=1` for
+packaging therefore also requires a resolvable signing key, where before it
+needed only a `.sig`.
+Previously a key present in
+`ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` was enough to opportunistically verify even
+without those flags; that trigger was removed when the flags began to imply
+verification, so a readiness run that asks for neither now checks neither
+signature presence nor validity. Every `release.yml` and `nightly.yml`
+invocation passes `--require-signatures`, so no workflow takes that path.
+
+Release CI also enables `--require-rocm-asset-names`, which rejects branch-like,
+path-like, or otherwise unsupported archive names before upload.
 
 Release CI also enables `--require-exact-assets`. That rejects stale
 publishable files in `dist`, including old `.tar.gz`/`.zip` archives and orphan
