@@ -93,9 +93,16 @@ const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a t
 /// An override is applied post-construction rather than as a `new` parameter so
 /// the constructors keep their signatures; `None` or a blank string leaves
 /// [`DEFAULT_PREAMBLE`] in place, which is what demo/replay/`--chat-mock` pass.
+// `RigAgentClient`/`AnthropicAgentClient` carry an `H` (HTTP client) type
+// parameter, defaulted to the live provider's `reqwest::Client` for
+// production use and swapped for `rig::test_utils::RecordingHttpClient`
+// in tests (see `rig_agent_client_complete_forwards_params_to_the_wire` /
+// `anthropic_agent_client_complete_forwards_params_to_the_wire`). Neither
+// method below touches `self.client`, so no bound on `H` is needed; the
+// optional `<$h>` just reproduces whichever of the two forms `$ty` takes.
 macro_rules! impl_with_preamble {
-    ($ty:ident) => {
-        impl $ty {
+    ($ty:ident $(<$h:ident>)?) => {
+        impl $(<$h>)? $ty $(<$h>)? {
             #[must_use]
             pub fn with_preamble(mut self, preamble: Option<String>) -> Self {
                 if let Some(prompt) = preamble.filter(|p| !p.trim().is_empty()) {
@@ -114,9 +121,9 @@ macro_rules! impl_with_preamble {
     };
 }
 
-impl_with_preamble!(RigAgentClient);
+impl_with_preamble!(RigAgentClient<H>);
 impl_with_preamble!(ChatGptAgentClient);
-impl_with_preamble!(AnthropicAgentClient);
+impl_with_preamble!(AnthropicAgentClient<H>);
 
 /// Map our TUI-local turns to Rig messages, preserving role + order.
 ///
@@ -153,12 +160,13 @@ pub fn annotate_reply(reply: String, skills: &[String]) -> String {
 /// Drive a built rig prompt request to completion under the shared
 /// [`REQUEST_TIMEOUT`], then annotate the reply with the Skills that fired.
 ///
-/// The shared `complete()` tail for all three backends (RigAgentClient,
-/// ChatGptAgentClient, AnthropicAgentClient): their `req` types differ (rig
+/// The shared `complete()` tail, called from [`run_agent_request`] — the one
+/// call site all three backends (RigAgentClient, ChatGptAgentClient,
+/// AnthropicAgentClient) now go through. Their `req` types differ (rig
 /// typestate), so this is generic over `IntoFuture<Output = Result<String, E>>`
 /// with a `Display` error. A timeout maps to [`AgentError::Timeout`]; a backend
 /// error maps to [`AgentError::Request`]; success is annotated with the fired
-/// Skills. ONE definition of the tail, used by all three.
+/// Skills. ONE definition of the tail.
 ///
 /// `backend` tags the lifecycle trace events (request-start / completion /
 /// error / timeout) so a hung or failing chat is traceable to a specific
@@ -209,11 +217,69 @@ where
     Ok(annotate_reply(reply, &skills))
 }
 
+/// Drive one `complete()` call from a preamble'd `AgentBuilder` through to a
+/// reply string: apply the sampling knobs, register the SAME three tool sets
+/// (telemetry/skill, ROCm read, ROCm mutating) in the SAME order, build the
+/// prompt request with the shared history/turn-limit, and hand off to
+/// [`finish_agent_request`].
+///
+/// The ONE definition of what used to be triplicated across
+/// `RigAgentClient::complete`, `ChatGptAgentClient::complete`, and
+/// `AnthropicAgentClient::complete` (ROCMAI-200). Each backend still builds its
+/// own agent (client/model construction and any backend-specific setup, e.g.
+/// ChatGPT's device-code auth, differ) and still owns its own backend tag; the
+/// `history` split (and its `AgentError::Empty` case) lives here, the one
+/// shared site. A backend with ordering constraints (ChatGPT's auth must not
+/// run on an empty history) does its own cheap `history.is_empty()` guard
+/// first — see `ChatGptAgentClient::complete` — without needing the split.
+async fn run_agent_request<M, P>(
+    agent: rig::agent::AgentBuilder<M, P>,
+    params: &InferenceParams,
+    executor: Option<&SharedRocmToolExecutor>,
+    approval_tx: Option<&UnboundedSender<ClientMsg>>,
+    history: &[ChatTurn],
+    snapshot: StateSnapshot,
+    backend: &'static str,
+) -> Result<String, AgentError>
+where
+    M: rig::completion::CompletionModel + 'static,
+    P: rig::agent::PromptHook<M> + 'static,
+{
+    use rig::completion::Prompt;
+
+    let Some((last, prior)) = history.split_last() else {
+        return Err(AgentError::Empty);
+    };
+
+    let snap = Arc::new(snapshot);
+    let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
+
+    let agent = apply_inference_params(agent, params);
+    // Telemetry + skill registry tools (shared registration site).
+    let agent = register_telemetry_tools(agent, &snap, &fired);
+    // Read-only ROCm machine-inspection tools (forward across the seam).
+    let agent = register_rocm_read_tools(agent, executor, &fired);
+    // Mutating ROCm tools (surface approval; never execute in the rig loop).
+    let agent = register_rocm_mutating_tools(agent, executor, approval_tx, &fired).build();
+
+    let req = agent
+        .prompt(last.content.clone())
+        .max_turns(MAX_TOOL_TURNS)
+        .with_history(build_messages(prior));
+
+    finish_agent_request(backend, req, &fired).await
+}
+
 /// Live Rig-backed client for an OpenAI-compatible endpoint. The Rig client is
 /// constructed once; the agent + tools are rebuilt per request from the
 /// captured snapshot.
-pub struct RigAgentClient {
-    client: rig::providers::openai::CompletionsClient,
+///
+/// Generic over the HTTP client (`H`, defaulted to the real `reqwest::Client`)
+/// so a test can swap in `rig::test_utils::RecordingHttpClient` and drive the
+/// real `complete()` method over a scripted wire response instead of a live
+/// endpoint — see `rig_agent_client_complete_forwards_params_to_the_wire`.
+pub struct RigAgentClient<H = reqwest::Client> {
+    client: rig::providers::openai::CompletionsClient<H>,
     model: String,
     preamble: String,
     /// Optional sampling controls (temperature/top_p/max_tokens).
@@ -225,7 +291,7 @@ pub struct RigAgentClient {
     approval_tx: Option<UnboundedSender<ClientMsg>>,
 }
 
-impl RigAgentClient {
+impl RigAgentClient<reqwest::Client> {
     pub fn new(
         cfg: LlmConfig,
         params: InferenceParams,
@@ -284,42 +350,28 @@ fn auth_header_map(name: &str, value: &str) -> Result<http::HeaderMap, AgentErro
 }
 
 #[async_trait]
-impl AgentClient for RigAgentClient {
+impl<H> AgentClient for RigAgentClient<H>
+where
+    H: rig::http_client::HttpClientExt + Clone + Default + std::fmt::Debug + Send + Sync + 'static,
+{
     async fn complete(
         &self,
         history: &[ChatTurn],
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
-        use rig::completion::Prompt;
-
-        let Some((last, prior)) = history.split_last() else {
-            return Err(AgentError::Empty);
-        };
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
 
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
+        run_agent_request(
             agent,
+            &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &fired,
+            history,
+            snapshot,
+            "rig-openai",
         )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("rig-openai", req, &fired).await
+        .await
     }
 }
 
@@ -359,7 +411,6 @@ impl ChatGptAgentClient {
     where
         F: Fn(String, String) + Send + Sync + 'static,
     {
-        use rig::providers::chatgpt;
         // Store OAuth tokens in a user-owned directory so the plaintext
         // access/refresh tokens are not readable by other local users.
         // Refuse to fall back to a predictable temp path: a pre-existing
@@ -380,6 +431,35 @@ impl ChatGptAgentClient {
                         .to_string(),
                 )
             })?;
+        Self::new_in(
+            token_dir,
+            model,
+            params,
+            on_device_code,
+            executor,
+            approval_tx,
+        )
+    }
+
+    /// As [`Self::new`], but takes the token-cache directory directly instead
+    /// of deriving it from `$HOME`/`$USERPROFILE`.
+    ///
+    /// This is the test seam `xtask/src/env_mutation_contract.rs` recommends
+    /// over mutating the process environment: a test can point the OAuth
+    /// token cache at a throwaway directory without touching `$HOME` at all,
+    /// so it never races the other tests that read it via [`Self::new`].
+    pub(crate) fn new_in<F>(
+        token_dir: std::path::PathBuf,
+        model: Option<String>,
+        params: InferenceParams,
+        on_device_code: F,
+        executor: Option<SharedRocmToolExecutor>,
+        approval_tx: Option<UnboundedSender<ClientMsg>>,
+    ) -> Result<Self, AgentError>
+    where
+        F: Fn(String, String) + Send + Sync + 'static,
+    {
+        use rig::providers::chatgpt;
         #[cfg(unix)]
         {
             // Create with mode 0o700 up-front so the directory is never
@@ -429,12 +509,15 @@ impl AgentClient for ChatGptAgentClient {
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::agent::AgentBuilder;
-        use rig::completion::Prompt;
         use rig::providers::chatgpt::ResponsesCompletionModel;
 
-        let Some((last, prior)) = history.split_last() else {
+        // Cheap pre-check: reject an empty history before device login or
+        // network I/O. `run_agent_request` re-derives this from `history`
+        // itself (the one shared split site); this guard only exists for the
+        // ordering, not the check.
+        if history.is_empty() {
             return Err(AgentError::Empty);
-        };
+        }
 
         // OpenAI's Responses API defines temperature and top_p as mutually
         // exclusive. Reject the combination before device login or network I/O.
@@ -448,30 +531,18 @@ impl AgentClient for ChatGptAgentClient {
             .await
             .map_err(|e| AgentError::Auth(e.to_string()))?;
 
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
         let model = ResponsesCompletionModel::new(self.client.clone(), self.model.clone());
         let agent = AgentBuilder::new(model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
+        run_agent_request(
             agent,
+            &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &fired,
+            history,
+            snapshot,
+            "chatgpt-oauth",
         )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("chatgpt-oauth", req, &fired).await
+        .await
     }
 }
 
@@ -482,8 +553,13 @@ impl AgentClient for ChatGptAgentClient {
 /// captured snapshot, so tool + approval parity holds across every backend. The
 /// key rides in `x-api-key` (handled inside the provider) — never in `base_url`
 /// or the request path — so no key leaks into [`AgentError`] strings.
-pub struct AnthropicAgentClient {
-    client: rig::providers::anthropic::Client,
+///
+/// Generic over the HTTP client (`H`, defaulted to the real `reqwest::Client`)
+/// so a test can swap in `rig::test_utils::RecordingHttpClient` and drive the
+/// real `complete()` method over a scripted wire response instead of a live
+/// endpoint — see `anthropic_agent_client_complete_forwards_params_to_the_wire`.
+pub struct AnthropicAgentClient<H = reqwest::Client> {
+    client: rig::providers::anthropic::Client<H>,
     model: String,
     preamble: String,
     /// Optional sampling controls (temperature/top_p/max_tokens).
@@ -495,7 +571,7 @@ pub struct AnthropicAgentClient {
     approval_tx: Option<UnboundedSender<ClientMsg>>,
 }
 
-impl AnthropicAgentClient {
+impl AnthropicAgentClient<reqwest::Client> {
     /// Build the Anthropic client from an [`LlmConfig`]. `api_key` is required
     /// (env / secure-store sourced by the bin and carried in-process via the
     /// seam — never argv). `base_url` is intentionally ignored: the provider's
@@ -535,45 +611,33 @@ impl AnthropicAgentClient {
 }
 
 #[async_trait]
-impl AgentClient for AnthropicAgentClient {
+impl<H> AgentClient for AnthropicAgentClient<H>
+where
+    H: rig::http_client::HttpClientExt + Clone + Default + std::fmt::Debug + Send + Sync + 'static,
+{
     async fn complete(
         &self,
         history: &[ChatTurn],
         snapshot: StateSnapshot,
     ) -> Result<String, AgentError> {
         use rig::client::CompletionClient;
-        use rig::completion::Prompt;
 
-        let Some((last, prior)) = history.split_last() else {
-            return Err(AgentError::Empty);
-        };
-        let snap = Arc::new(snapshot);
-        let fired: FiredLog = Arc::new(Mutex::new(Vec::new()));
-
-        // Identical tool registration to RigAgentClient / ChatGptAgentClient:
-        // the SAME telemetry/skill tools + every ROCm read + mutating tool, so
-        // capability and approval behavior are uniform across backends.
+        // Tool registration is delegated to run_agent_request, the single
+        // shared site all three backends (RigAgentClient, ChatGptAgentClient,
+        // AnthropicAgentClient) now call: the SAME telemetry/skill tools +
+        // every ROCm read + mutating tool, so capability and approval
+        // behavior are uniform across backends.
         let agent = self.client.agent(&self.model).preamble(&self.preamble);
-        let agent = apply_inference_params(agent, &self.params);
-        // Telemetry + skill registry tools (shared registration site).
-        let agent = register_telemetry_tools(agent, &snap, &fired);
-        // Read-only ROCm machine-inspection tools (forward across the seam).
-        let agent = register_rocm_read_tools(agent, self.executor.as_ref(), &fired);
-        // Mutating ROCm tools (surface approval; never execute in the rig loop).
-        let agent = register_rocm_mutating_tools(
+        run_agent_request(
             agent,
+            &self.params,
             self.executor.as_ref(),
             self.approval_tx.as_ref(),
-            &fired,
+            history,
+            snapshot,
+            "anthropic",
         )
-        .build();
-
-        let req = agent
-            .prompt(last.content.clone())
-            .max_turns(MAX_TOOL_TURNS)
-            .with_history(build_messages(prior));
-
-        finish_agent_request("anthropic", req, &fired).await
+        .await
     }
 }
 
@@ -696,6 +760,21 @@ mod tests {
     use crate::agent::{
         ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, SKILL_NAMES, fixture_snapshot,
     };
+
+    /// A throwaway, never-pre-existing directory for
+    /// `ChatGptAgentClient::new_in`'s OAuth token cache, so a test builds a
+    /// ChatGPT client without ever touching the developer's real `$HOME` (and
+    /// without the "Permission denied" a read-only `$HOME` would otherwise
+    /// cause). `tag` only needs to be unique among the directories a single
+    /// test creates; callers remove it once the client no longer needs it —
+    /// `new_in` only reads it at construction time.
+    fn fresh_token_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rocm-dash-chatgpt-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
 
     #[test]
     fn build_messages_preserves_role_and_order_and_drops_errors() {
@@ -864,7 +943,9 @@ mod tests {
 
         // Same for the other two backends: grounding must not depend on which
         // provider the operator picked, so all three accept the override.
-        let chatgpt = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("grounding");
+        let chatgpt = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             None,
             InferenceParams::default(),
             |_url, _code| {},
@@ -873,6 +954,7 @@ mod tests {
         )
         .expect("build chatgpt oauth client")
         .with_preamble(Some(grounded.to_string()));
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(chatgpt.preamble(), grounded);
 
         let anthropic = AnthropicAgentClient::new(
@@ -982,7 +1064,9 @@ mod tests {
         // key invariant is structurally preserved on the no-key path.
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
-        let client = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("offline-no-key");
+        let client = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             Some("gpt-5.3-codex".to_string()),
             InferenceParams::default(),
             move |url, code| {
@@ -993,6 +1077,7 @@ mod tests {
             None,
         )
         .expect("build chatgpt oauth client");
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(client.model, "gpt-5.3-codex");
         // No network happened, so the handler has not fired yet.
         assert!(fired.lock().unwrap().is_empty());
@@ -1000,7 +1085,9 @@ mod tests {
 
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
-        let client = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("default-model");
+        let client = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             None,
             InferenceParams::default(),
             |_url, _code| {},
@@ -1008,10 +1095,65 @@ mod tests {
             None,
         )
         .expect("build chatgpt oauth client");
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(
             client.model,
             rig::providers::chatgpt::GPT_5_3_CODEX,
             "the no-key default uses the provider's Codex model"
+        );
+    }
+
+    /// `ChatGptAgentClient::complete`'s empty-history guard (clients.rs, ahead
+    /// of its param validation and device-code `authorize()`) is otherwise
+    /// protected only by a comment. Pin it: an empty history must return
+    /// `AgentError::Empty` without the device-code callback ever firing.
+    ///
+    /// Builds via [`ChatGptAgentClient::new_in`] with a fresh, token-free
+    /// directory instead of `ChatGptAgentClient::new`'s real `$HOME`: a
+    /// developer machine already signed in to ChatGPT has a cached token
+    /// there, and against that real cache, deleting the guard entirely would
+    /// still short-circuit to `Empty` via the cached-token fast path without
+    /// ever calling `authorize()`, so this test would pass for the wrong
+    /// reason and miss the regression it exists to catch. `new_in` takes the
+    /// directory directly, so no process-wide `$HOME` mutation (and no lock
+    /// against the other tests that read it via `new`) is needed at all.
+    ///
+    /// This closes that gap but not a second one: rig-core's device-code
+    /// endpoints (`auth.openai.com`) are compile-time constants with no
+    /// override hook, so on a host with real internet access and the guard
+    /// removed, this test would reach OpenAI's real auth service and poll for
+    /// up to 15 minutes before failing. The `complete()` call below is
+    /// wrapped in a 5s timeout so that regression still fails fast here.
+    #[tokio::test]
+    async fn chatgpt_empty_history_is_empty_error_without_auth() {
+        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = fired.clone();
+
+        let token_dir = fresh_token_dir("empty-history");
+        let client = ChatGptAgentClient::new_in(
+            token_dir.clone(),
+            None,
+            InferenceParams::default(),
+            move |url, code| {
+                sink.lock().unwrap().push(format!("{url}|{code}"));
+            },
+            None,
+            None,
+        )
+        .expect("build chatgpt oauth client");
+        std::fs::remove_dir_all(&token_dir).ok();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.complete(&[], fixture_snapshot()),
+        )
+        .await
+        .expect("complete() must not hang past 5s even if its empty-history guard regresses")
+        .expect_err("empty history must be rejected");
+        assert!(matches!(err, AgentError::Empty));
+        assert!(
+            fired.lock().unwrap().is_empty(),
+            "device-code callback must not fire on the empty-history short-circuit"
         );
     }
 
@@ -1088,8 +1230,11 @@ mod tests {
         // (register_rocm_read_tools), and mutating ROCm
         // (register_rocm_mutating_tools) — so capability + approval parity holds
         // across local/openai/anthropic. This enumerates the canonical sets that
-        // those shared helpers register; the helper call sites are identical in
-        // RigAgentClient, ChatGptAgentClient, and AnthropicAgentClient.
+        // those shared helpers register; the helper call sites now live in one
+        // place, `run_agent_request`, which RigAgentClient, ChatGptAgentClient,
+        // and AnthropicAgentClient all call into.
+        // `run_agent_request_registers_tool_sets_and_enforces_turn_limit` below
+        // asserts those tools are actually sent on the wire from that one site.
         //
         // Telemetry/skill set: register_telemetry_tools registers exactly the
         // SKILL_NAMES tools (GpuStatus, ListInstances, BenchSummary,
@@ -1132,6 +1277,392 @@ mod tests {
         {
             assert!(!n.is_empty(), "empty tool name in canonical set");
         }
+    }
+
+    /// Offline (no network) coverage for `run_agent_request` itself — the
+    /// helper `MockAgentClient`-backed tests above never reach, since
+    /// `MockAgentClient::complete` is independent mock logic that bypasses it
+    /// entirely. Drives it through rig-core's `test_utils::MockCompletionModel`
+    /// instead of a real provider.
+    ///
+    /// Scripts more tool-call turns than [`MAX_TOOL_TURNS`] so the agent loop
+    /// can never produce a final answer and must exhaust the turn limit —
+    /// that's what forces every registered tool set through `run_agent_request`
+    /// onto the wire (the model only ever sees tool definitions on the request
+    /// it's given) and pins `run_agent_request`'s `.max_turns(MAX_TOOL_TURNS)`
+    /// call, both of which no ignored round-trip test and no `MockAgentClient`
+    /// test exercises.
+    #[tokio::test]
+    async fn run_agent_request_registers_tool_sets_and_enforces_turn_limit() {
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        let turns: Vec<MockTurn> = (0..MAX_TOOL_TURNS + 5)
+            .map(|i| MockTurn::tool_call(format!("call_{i}"), "gpu_status", json!({})))
+            .collect();
+        let model = MockCompletionModel::new(turns);
+        let recorded = model.clone();
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+
+        let params = InferenceParams::default();
+        let history = [ChatTurn::user("loop forever")];
+
+        let err = run_agent_request(
+            agent,
+            &params,
+            None,
+            None,
+            &history,
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect_err("a tool-call-only script must exhaust the turn limit");
+        let AgentError::Request(msg) = err else {
+            panic!("expected AgentError::Request wrapping rig's MaxTurnsError, got {err:?}");
+        };
+        assert!(
+            msg.contains(&format!("limit: {MAX_TOOL_TURNS}")),
+            "error should name the configured turn limit, got: {msg}"
+        );
+
+        // The model actually received the registered tool definitions on the
+        // wire — proves run_agent_request's three register_* calls ran, not
+        // just that they type-check.
+        let requests = recorded.requests();
+        let sent_tool_names: std::collections::BTreeSet<&str> = requests
+            .first()
+            .expect("at least one request was sent before the turn limit was hit")
+            .tools
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        for expected in SKILL_NAMES
+            .iter()
+            .chain(ROCM_READ_TOOL_NAMES.iter())
+            .chain(ROCM_MUTATING_TOOL_NAMES.iter())
+        {
+            assert!(
+                sent_tool_names.contains(expected),
+                "registered tool {expected} missing from the wire request"
+            );
+        }
+
+        // Sanity bound on the request count: enough to have tried every
+        // scripted turn up to the limit, not an early bail-out or a runaway
+        // loop. The script above is deliberately longer than this bound
+        // (MAX_TOOL_TURNS + 5 turns scripted, vs. MAX_TOOL_TURNS + 2 expected
+        // requests) so the turn limit — not running out of scripted turns —
+        // is what ends the loop; rig-core 0.38.1's own +1/-1 internal
+        // bookkeeping is what fixes the request count at MAX_TOOL_TURNS + 2.
+        assert_eq!(
+            recorded.request_count(),
+            MAX_TOOL_TURNS + 2,
+            "rig-core 0.38.1 fixes the request count at MAX_TOOL_TURNS + 2"
+        );
+    }
+
+    /// Offline coverage for the parts of `run_agent_request`'s wiring the test
+    /// above does not reach: it drives a default-params, single-turn history
+    /// through the turn-limit error path, so it would still pass with
+    /// `apply_inference_params` dropped, the wrong end of `history` split off,
+    /// a swapped prompt source, or the wrong `fired` log handed to
+    /// `finish_agent_request` — none of those change a default `InferenceParams`
+    /// or an empty `prior` slice.
+    ///
+    /// This test instead scripts a successful run: a history with two prior
+    /// turns plus the live prompt, and non-default temperature/top_p/max_tokens.
+    /// It asserts directly on the `CompletionRequest` `MockCompletionModel`
+    /// recorded — chat history (order and content), the prompt, and every
+    /// sampling field `apply_inference_params` sets — plus that a successful
+    /// reply carries the `fired`-log annotation for the tool the script calls.
+    #[tokio::test]
+    async fn run_agent_request_forwards_history_and_params_and_annotates_reply() {
+        use rig::completion::Message;
+        use rig::completion::message::UserContent;
+        use rig::test_utils::{MockCompletionModel, MockTurn};
+
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("call_0", "gpu_status", json!({})),
+            MockTurn::text("GPU 0 is healthy."),
+        ]);
+        let recorded = model.clone();
+        let agent = rig::agent::AgentBuilder::new(model).preamble(DEFAULT_PREAMBLE);
+
+        let params = InferenceParams {
+            temperature: Some(0.4),
+            top_p: Some(0.2),
+            max_tokens: Some(256),
+        };
+        let history = [
+            ChatTurn::user("first, check gpu 0"),
+            ChatTurn::agent("checked once already"),
+            ChatTurn::user("check gpu 0 again"),
+        ];
+
+        let reply = run_agent_request(
+            agent,
+            &params,
+            None,
+            None,
+            &history,
+            fixture_snapshot(),
+            "mock-test",
+        )
+        .await
+        .expect("scripted tool call then text turn should succeed");
+
+        assert!(
+            reply.contains("⚙ via: gpu_status"),
+            "reply should carry the fired-skill annotation: {reply}"
+        );
+
+        let requests = recorded.requests();
+        let first = requests.first().expect("at least one request was sent");
+
+        // Sampling knobs: all three of apply_inference_params's branches ran.
+        assert_eq!(first.temperature, Some(f64::from(0.4_f32)));
+        assert_eq!(first.max_tokens, Some(256));
+        let top_p = first
+            .additional_params
+            .as_ref()
+            .and_then(|v| v.get("top_p"))
+            .and_then(serde_json::Value::as_f64);
+        assert_eq!(top_p, Some(f64::from(0.2_f32)));
+
+        // History: the preamble (rig's own leading system message), then
+        // build_messages(prior) (the first two turns), then the live prompt
+        // (the third turn, `last.content`) appended by rig itself — proves
+        // `history.split_last()` split the right way and `last.content` (not
+        // `prior`) became the prompt.
+        let chat_history: Vec<Message> = first.chat_history.iter().cloned().collect();
+        assert_eq!(chat_history.len(), 4, "got: {chat_history:?}");
+        assert_eq!(chat_history[1], Message::user("first, check gpu 0"));
+        assert_eq!(chat_history[2], Message::assistant("checked once already"));
+        let Message::User { content } = &chat_history[3] else {
+            panic!(
+                "expected the live prompt as a trailing user message, got {:?}",
+                chat_history[3]
+            );
+        };
+        assert!(matches!(
+            content.first(),
+            UserContent::Text(t) if t.text == "check gpu 0 again"
+        ));
+    }
+
+    /// Captures the `backend` field off every tracing event
+    /// `finish_agent_request` emits (`info!(backend, "chat request
+    /// start"/"chat request complete")`), for tests that need to assert
+    /// which backend tag a `complete()` call site actually used. The tag
+    /// never rides on the wire — `finish_agent_request`'s doc comment says
+    /// it only "tags the lifecycle trace events" — so a captured HTTP
+    /// request (`RecordingHttpClient`) can't see a swapped tag; this is the
+    /// one seam that can.
+    #[derive(Default)]
+    struct CapturedBackendTags(Mutex<Vec<String>>);
+
+    impl CapturedBackendTags {
+        fn snapshot(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for CapturedBackendTags {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct BackendFieldVisitor<'a>(&'a Mutex<Vec<String>>);
+            impl tracing::field::Visit for BackendFieldVisitor<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "backend" {
+                        self.0.lock().unwrap().push(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            event.record(&mut BackendFieldVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Pins `RigAgentClient::complete`'s own call site: that it forwards
+    /// `&self.params` (not a default) and the `"rig-openai"` backend tag
+    /// into `run_agent_request`. The test above drives `run_agent_request`
+    /// directly with a `MockCompletionModel`, which proves the shared helper
+    /// forwards correctly but says nothing about whether `complete()`
+    /// actually passes it `&self.params` rather than, say,
+    /// `&InferenceParams::default()`, or the right tag — a swap at that one
+    /// call site stays green under every other test in this file; only a
+    /// real `complete()` round-trip catches it.
+    ///
+    /// `RigAgentClient<H>`'s `H` (HTTP client) type parameter — defaulted to
+    /// the live `reqwest::Client` for production — exists for exactly this:
+    /// swap in `rig::test_utils::RecordingHttpClient` and drive the actual
+    /// `complete()` method over a scripted response instead of a live
+    /// endpoint.
+    #[tokio::test]
+    async fn rig_agent_client_complete_forwards_params_to_the_wire() {
+        use rig::test_utils::RecordingHttpClient;
+
+        let response_body = serde_json::to_vec(&json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test-model",
+            "system_fingerprint": null,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "GPU 0 is healthy."},
+                "logprobs": null,
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "total_tokens": 2},
+        }))
+        .expect("serialize stub OpenAI completion response");
+        let http_client = RecordingHttpClient::new(response_body);
+        let rig_client = rig::providers::openai::CompletionsClient::builder()
+            .api_key("sk-test")
+            .base_url("http://rocm-dash-tui-test.invalid")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client over the recording HTTP double");
+
+        let client = RigAgentClient {
+            client: rig_client,
+            model: "test-model".to_string(),
+            preamble: DEFAULT_PREAMBLE.to_string(),
+            params: InferenceParams {
+                temperature: Some(0.4),
+                top_p: None,
+                max_tokens: Some(256),
+            },
+            executor: None,
+            approval_tx: None,
+        };
+
+        let history = [ChatTurn::user("check gpu 0")];
+        let backend_tags = Arc::new(CapturedBackendTags::default());
+        let tracing_guard = tracing::subscriber::set_default(backend_tags.clone());
+        let reply = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("scripted single-turn reply should succeed");
+        drop(tracing_guard);
+        assert_eq!(reply, "GPU 0 is healthy.");
+
+        let requests = http_client.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request should have been sent"
+        );
+        let request = &requests[0];
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        assert_eq!(
+            body["temperature"].as_f64(),
+            Some(f64::from(0.4_f32)),
+            "complete() must forward &self.params, not a default: {body}"
+        );
+        assert_eq!(body["max_tokens"].as_u64(), Some(256));
+
+        let tags = backend_tags.snapshot();
+        assert!(
+            !tags.is_empty() && tags.iter().all(|t| t == "rig-openai"),
+            "complete() must tag its lifecycle trace events \"rig-openai\", got {tags:?}"
+        );
+    }
+
+    /// As `rig_agent_client_complete_forwards_params_to_the_wire`, for
+    /// `AnthropicAgentClient::complete`'s call site.
+    #[tokio::test]
+    async fn anthropic_agent_client_complete_forwards_params_to_the_wire() {
+        use rig::test_utils::RecordingHttpClient;
+
+        let response_body = serde_json::to_vec(&json!({
+            "type": "message",
+            "id": "msg-test",
+            "model": "test-model",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "GPU 0 is healthy."}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cache_read_input_tokens": null,
+                "cache_creation_input_tokens": null,
+            },
+        }))
+        .expect("serialize stub Anthropic completion response");
+        let http_client = RecordingHttpClient::new(response_body);
+        let anthropic_client = rig::providers::anthropic::Client::builder()
+            .api_key("sk-ant-test")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client over the recording HTTP double");
+
+        let client = AnthropicAgentClient {
+            client: anthropic_client,
+            model: "test-model".to_string(),
+            preamble: DEFAULT_PREAMBLE.to_string(),
+            params: InferenceParams {
+                temperature: Some(0.4),
+                top_p: None,
+                max_tokens: Some(256),
+            },
+            executor: None,
+            approval_tx: None,
+        };
+
+        let history = [ChatTurn::user("check gpu 0")];
+        let backend_tags = Arc::new(CapturedBackendTags::default());
+        let tracing_guard = tracing::subscriber::set_default(backend_tags.clone());
+        let reply = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect("scripted single-turn reply should succeed");
+        drop(tracing_guard);
+        assert_eq!(reply, "GPU 0 is healthy.");
+
+        let requests = http_client.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request should have been sent"
+        );
+        let request = &requests[0];
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("request body is JSON");
+        assert_eq!(
+            body["temperature"].as_f64(),
+            Some(f64::from(0.4_f32)),
+            "complete() must forward &self.params, not a default: {body}"
+        );
+        assert_eq!(body["max_tokens"].as_u64(), Some(256));
+
+        let tags = backend_tags.snapshot();
+        assert!(
+            !tags.is_empty() && tags.iter().all(|t| t == "anthropic"),
+            "complete() must tag its lifecycle trace events \"anthropic\", got {tags:?}"
+        );
     }
 
     /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
