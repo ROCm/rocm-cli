@@ -1180,6 +1180,11 @@ fn service_record_matches_recovery_event(
     record: &ManagedServiceRecord,
     event: &AutomationTriggerEvent,
 ) -> bool {
+    // Re-checked here as well as in the scan: a stop can be requested between
+    // the event being raised and it being handled.
+    if stop_requested(record) {
+        return false;
+    }
     match event.kind.as_str() {
         "service.manifest_recoverable" => {
             manifest_service_recovery_reason(record, unix_time_millis()).is_some()
@@ -1345,10 +1350,12 @@ const fn watcher_policy_action(watcher_id: &str, mode: WatcherMode) -> WatcherPo
     }
 }
 
-fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRecord, String)>> {
+pub(crate) fn find_recoverable_service(
+    paths: &AppPaths,
+) -> Result<Option<(ManagedServiceRecord, String)>> {
     let now = unix_time_millis();
     for record in crate::persistence::load_managed_services(paths)? {
-        if record.mode != "managed" {
+        if record.mode != "managed" || stop_requested(&record) {
             continue;
         }
         if let Some(reason) = manifest_service_recovery_reason(&record, now) {
@@ -1377,6 +1384,20 @@ fn find_recoverable_service(paths: &AppPaths) -> Result<Option<(ManagedServiceRe
         }
     }
     Ok(None)
+}
+
+/// Whether an operator asked for this service to stop and that stop is still
+/// standing.
+///
+/// Such a service is never a recovery candidate, whatever its status says. A
+/// stop that could not confirm every recorded process gone deliberately leaves
+/// the status at `ready`/`running` — it did not happen, so it must not be
+/// claimed — and a stop still in flight has not reached its verdict yet. Either
+/// way the endpoint has stopped answering, which on its own is exactly what
+/// recovery restarts. `stop_requested_unix_ms` is what tells the operator's
+/// stop apart from a crash; a confirmed stop, and any fresh launch, clear it.
+pub(crate) const fn stop_requested(record: &ManagedServiceRecord) -> bool {
+    record.stop_requested_unix_ms.is_some()
 }
 
 fn endpoint_service_recovery_reason(record: &ManagedServiceRecord) -> Option<String> {
@@ -1427,7 +1448,7 @@ fn manifest_service_recovery_reason(
 }
 
 pub(crate) fn restart_managed_service(
-    _paths: &AppPaths,
+    paths: &AppPaths,
     record: &mut ManagedServiceRecord,
 ) -> Result<()> {
     let rocmd_binary =
@@ -1449,7 +1470,25 @@ pub(crate) fn restart_managed_service(
     // that write can land after the child's. Clearing here keeps the invariant
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
-    record.supervisor_pid = std::process::id();
+    // No supervisor exists until the spawn below succeeds, so none is recorded.
+    // Recording this daemon's own PID here, as a stand-in, left the manifest
+    // naming the daemon as the service's supervisor whenever the spawn failed:
+    // a stop run from any other process (`rocmd sandbox-tool stop_server`,
+    // `rocm services stop`) verifies that identity, finds it live, and
+    // terminates the daemon's whole process tree. The spawned supervisor's
+    // identity is recorded right after the spawn.
+    record.supervisor_pid = 0;
+    record.supervisor_start_ticks = None;
+    // The engine PID belonged to the run being replaced, and nothing here
+    // starts an engine: the supervisor spawned below records its own, together
+    // with its token. Carried forward, the old PID would sit beside a
+    // supervisor it no longer matches — and on a record `rocm` wrote, with no
+    // token at all, so the next stop could only signal it blind.
+    record.engine_pid = None;
+    record.engine_start_ticks = None;
+    // Restarting is a request to run, so it supersedes any earlier stop request,
+    // as `rocm services restart` treats it too.
+    record.stop_requested_unix_ms = None;
     record.write()?;
 
     let mut child = detached_rocmd_command(&rocmd_binary)
@@ -1460,16 +1499,19 @@ pub(crate) fn restart_managed_service(
         .spawn()
         .context("failed to spawn recovery supervisor")?;
 
-    record.supervisor_pid = child.id();
-    record.write()?;
+    record_spawned_supervisor(paths, record, child.id())?;
 
     thread::sleep(Duration::from_millis(200));
     if let Some(status) = child
         .try_wait()
         .context("failed to check recovery supervisor startup state")?
     {
-        record.status = "failed".to_owned();
-        record.write()?;
+        // Not a write-back of `record`: a stop issued since the spawn has
+        // persisted its marker, and a `failed` record without one is what
+        // recovery restarts. Same discipline as the supervisor's own writes.
+        crate::service::update_supervised_record(paths, record, |current| {
+            current.status = "failed".to_owned();
+        })?;
         anyhow::bail!(
             "recovery supervisor exited immediately with status {status}; inspect {}",
             record.log_path.display()
@@ -1477,6 +1519,34 @@ pub(crate) fn restart_managed_service(
     }
 
     Ok(())
+}
+
+/// Record the supervisor [`restart_managed_service`] just spawned, as `pid`.
+///
+/// Between the restart's first write — which clears the recorded PIDs, since
+/// no supervisor exists yet — and this one, the record names no process at
+/// all. A stop that starts in that window persists its marker first and then
+/// finds nothing to signal; writing the restart's whole copy back here would
+/// erase that marker while the new supervisor comes up, and leave the stop's
+/// own final write comparing against a record that no longer shows the
+/// process it has to answer for. So only the supervisor's identity is applied,
+/// to the record as it is on disk now, through the same ownership guard as the
+/// supervisor's own writes: against the copy from before this assignment, so
+/// it is the cleared PID that has to still be there. If the new supervisor has
+/// already recorded itself, or the record was removed, nothing is written.
+fn record_spawned_supervisor(
+    paths: &AppPaths,
+    record: &mut ManagedServiceRecord,
+    pid: u32,
+) -> Result<()> {
+    let unrecorded = record.clone();
+    record.record_supervisor_identity(pid);
+    let (supervisor_pid, supervisor_start_ticks) =
+        (record.supervisor_pid, record.supervisor_start_ticks);
+    crate::service::update_supervised_record(paths, &unrecorded, |current| {
+        current.supervisor_pid = supervisor_pid;
+        current.supervisor_start_ticks = supervisor_start_ticks;
+    })
 }
 
 fn recovery_supervise_args(record: &ManagedServiceRecord) -> Vec<String> {
@@ -1604,7 +1674,10 @@ fn detached_rocmd_command(rocmd_binary: &std::path::Path) -> ProcessCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::identity_probe_record;
+    use crate::test_support::{
+        UNCONFIRMED_STOP_PID, seed_keyed_service, stop_with_outcome, temp_app_paths,
+    };
     use rocm_core::{AuditEventRecord, AutomationEventRecord};
 
     fn test_watcher_snapshot(
@@ -3140,5 +3213,306 @@ mod tests {
             watcher_policy_action("therock-update", WatcherMode::Contained),
             WatcherPolicyAction::RunContained
         );
+    }
+
+    /// The same guarantee for the daemon's recovery path, which records a PID of
+    /// its own. See `supervise_service_persists_the_supervisor_identity_token`
+    /// for why an unrecorded token is the defect rather than a cosmetic gap.
+    ///
+    /// The restart re-execs `rocmd supervise`, which here is the test binary:
+    /// it rejects those arguments and exits at once, so the restart reports
+    /// failure — after it has written the record this test reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_managed_service_persists_the_supervisor_identity_token() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-records-identity");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-identity";
+        let mut record = identity_probe_record(&paths, service_id, 11444);
+        record.status = "failed".to_owned();
+        record.write()?;
+        assert_eq!(
+            load_service_record(&paths, service_id)?.supervisor_start_ticks,
+            None,
+            "precondition: the seeded record carries no token"
+        );
+
+        let _ = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            persisted?.supervisor_start_ticks.is_some(),
+            "restart_managed_service must persist the supervisor's start-time token beside its PID"
+        );
+        Ok(())
+    }
+
+    /// An unconfirmed stop leaves the status at `ready` on purpose, which is
+    /// exactly what the daemon's recovery scan looks for. The stop request it
+    /// records is the only thing telling it apart from a crash, so recovery
+    /// must honour it — otherwise the `server-recover` watcher, which acts by
+    /// default, restarts the service the operator just asked to stop.
+    #[test]
+    fn recovery_does_not_restart_a_service_whose_stop_is_unconfirmed() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-skips-unconfirmed-stop");
+        paths.ensure()?;
+        let service_id = "svc-recover-skips-unconfirmed-stop";
+        seed_keyed_service(&paths, service_id, 11450)?;
+
+        let stopped =
+            stop_with_outcome(&paths, service_id, rocm_core::TerminationOutcome::TimedOut);
+        let found = find_recoverable_service(&paths);
+        let reloaded = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            stopped?.get("stopped").and_then(Value::as_bool),
+            Some(false),
+            "precondition: the stop must be unconfirmed"
+        );
+        let reloaded = reloaded?;
+        assert_eq!(
+            reloaded.status, "ready",
+            "precondition: status left as it was"
+        );
+        assert!(
+            found?.is_none(),
+            "a service with a standing stop request must not be recovered"
+        );
+        Ok(())
+    }
+
+    /// The same gate on a record recovery would otherwise pick up from its
+    /// status alone, without any endpoint probe: with a stop request it is
+    /// skipped, and the identical record without one is still recovered.
+    #[test]
+    fn recovery_skips_a_failed_service_only_while_its_stop_request_stands() -> Result<()> {
+        let (root, paths) = temp_app_paths("recover-honours-stop-request");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-recover-honours-stop-request",
+            "vllm",
+            "qwen",
+            "Qwen/Qwen3.5",
+            "127.0.0.1",
+            11451,
+            "managed",
+            UNCONFIRMED_STOP_PID,
+            None,
+            None,
+            None,
+        );
+        record.status = "failed".to_owned();
+        record.stop_requested_unix_ms = Some(1);
+        record.write()?;
+        let event = AutomationTriggerEvent {
+            at_unix_ms: unix_time_millis(),
+            kind: "service.manifest_recoverable".to_owned(),
+            source: "managed_service".to_owned(),
+            watcher_hint: Some("server-recover".to_owned()),
+            service_id: Some(record.service_id.clone()),
+            reason: Some("manifest_status_failed".to_owned()),
+            payload: json!({}),
+        };
+        let with_request = find_recoverable_service(&paths);
+        let event_with_request = service_record_matches_recovery_event(&paths, &record, &event);
+
+        record.stop_requested_unix_ms = None;
+        record.write()?;
+        let without_request = find_recoverable_service(&paths);
+        let event_without_request = service_record_matches_recovery_event(&paths, &record, &event);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            with_request?.is_none(),
+            "a standing stop request must block recovery"
+        );
+        assert!(
+            !event_with_request,
+            "a queued recovery event must not act on a service since asked to stop"
+        );
+        assert_eq!(
+            without_request?.map(|(found, reason)| (found.service_id, reason)),
+            Some((
+                "svc-recover-honours-stop-request".to_owned(),
+                "manifest_status_failed".to_owned()
+            )),
+            "without a stop request the same record must still be recovered"
+        );
+        assert!(event_without_request);
+        Ok(())
+    }
+
+    /// A restart moves the supervisor PID; the engine PID it carried belonged
+    /// to the run being replaced. On a record `rocm serve --background` wrote,
+    /// that PID has no token, so carrying it past the point where the two PIDs
+    /// diverge leaves the next stop an entry it can only signal blind.
+    ///
+    /// Linux-only for the same reason as the test above: the restart re-execs
+    /// the test binary, which is only known to reject those arguments there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_managed_service_drops_the_replaced_runs_engine_pid() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-drops-engine-pid");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-drops-engine-pid";
+        let mut record = identity_probe_record(&paths, service_id, 11455);
+        // The shape `rocm serve --background` writes: one PID in both roles.
+        record.supervisor_pid = UNCONFIRMED_STOP_PID;
+        record.engine_pid = Some(UNCONFIRMED_STOP_PID);
+        record.engine_start_ticks = None;
+        record.stop_requested_unix_ms = Some(1);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let _ = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_ne!(persisted.supervisor_pid, UNCONFIRMED_STOP_PID);
+        assert_eq!(
+            persisted.engine_pid, None,
+            "the replaced run's engine PID must not outlive the restart"
+        );
+        assert_eq!(persisted.engine_start_ticks, None);
+        assert_eq!(
+            persisted.stop_requested_unix_ms, None,
+            "a restart supersedes an earlier stop request"
+        );
+        Ok(())
+    }
+
+    /// A stop that lands while a restart waits to see whether its supervisor
+    /// survived startup must outlive the restart's `failed` write: a `failed`
+    /// record without the marker is exactly what recovery restarts.
+    ///
+    /// The restarted supervisor is the test binary, which rejects the
+    /// `supervise` arguments and exits at once, so the restart reaches that
+    /// write. A thread plays the stop: once the restart has recorded the
+    /// spawned supervisor, it persists a marker, as a stop does first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_failure_write_keeps_a_stop_marker_set_meanwhile() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-failure-keeps-marker");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-failure-marker";
+        let mut record = identity_probe_record(&paths, service_id, 11456);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let stop = {
+            let paths = paths.clone();
+            thread::spawn(move || -> Result<bool> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    // `write` is not atomic, so a read can land mid-write and
+                    // see a truncated file; just look again.
+                    let Ok(mut on_disk) = load_service_record(&paths, service_id) else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    if on_disk.supervisor_pid != 0 && on_disk.supervisor_pid != std::process::id() {
+                        on_disk.stop_requested_unix_ms = Some(1);
+                        on_disk.write()?;
+                        return Ok(true);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Ok(false)
+            })
+        };
+        let outcome = restart_managed_service(&paths, &mut record);
+        let stop_landed = stop.join().expect("stop thread");
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            stop_landed?,
+            "precondition: the stop ran during the restart"
+        );
+        assert!(outcome.is_err(), "the test binary is not a supervisor");
+        let persisted = persisted?;
+        assert_eq!(persisted.status, "failed");
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1),
+            "the restart's failure write must not withdraw a stop issued meanwhile"
+        );
+        Ok(())
+    }
+
+    /// Between a restart's first write, which clears the recorded PIDs, and the
+    /// one recording the supervisor it spawned, a stop can persist its marker.
+    /// Writing the restart's own copy back would erase it while the new
+    /// supervisor comes up — so only the identity is applied.
+    #[test]
+    fn restart_records_its_supervisor_without_erasing_a_stop_marker() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-spawn-keeps-marker");
+        paths.ensure()?;
+        let service_id = "svc-restart-spawn-marker";
+        // The restart's copy after its first write: no supervisor, no marker.
+        let mut restarting = identity_probe_record(&paths, service_id, 11457);
+        restarting.status = "recovering".to_owned();
+        restarting.supervisor_pid = 0;
+        restarting.supervisor_start_ticks = None;
+        // A stop started since: same (empty) processes, marker set.
+        let mut on_disk = restarting.clone();
+        on_disk.stop_requested_unix_ms = Some(1);
+        on_disk.write()?;
+
+        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let persisted = persisted?;
+        assert_eq!(restarting.supervisor_pid, std::process::id());
+        assert_eq!(persisted.supervisor_pid, std::process::id());
+        assert_eq!(
+            persisted.supervisor_start_ticks,
+            restarting.supervisor_start_ticks
+        );
+        assert_eq!(
+            persisted.stop_requested_unix_ms,
+            Some(1),
+            "recording the spawned supervisor must not withdraw a standing stop"
+        );
+        Ok(())
+    }
+
+    /// The spawned supervisor may record itself before the restart does, and
+    /// the record may be removed outright; either way the restart's write is
+    /// not the one to land.
+    #[test]
+    fn restart_leaves_a_record_naming_another_supervisor_or_none() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-spawn-not-owner");
+        paths.ensure()?;
+        let service_id = "svc-restart-spawn-not-owner";
+        let mut restarting = identity_probe_record(&paths, service_id, 11458);
+        restarting.supervisor_pid = 0;
+        restarting.supervisor_start_ticks = None;
+        let mut on_disk = restarting.clone();
+        on_disk.supervisor_pid = 4_242_424;
+        on_disk.write()?;
+
+        record_spawned_supervisor(&paths, &mut restarting.clone(), std::process::id())?;
+        let after_supervisor = load_service_record(&paths, service_id);
+
+        fs::remove_file(paths.service_manifest_path(service_id))?;
+        record_spawned_supervisor(&paths, &mut restarting, std::process::id())?;
+        let resurrected = paths.service_manifest_path(service_id).exists();
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(after_supervisor?.supervisor_pid, 4_242_424);
+        assert!(!resurrected, "a removed record must not be written back");
+        Ok(())
     }
 }

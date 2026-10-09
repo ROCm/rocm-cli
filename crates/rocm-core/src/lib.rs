@@ -4150,6 +4150,41 @@ impl ManagedServiceRecord {
         self.last_restart_unix_ms = Some(unix_time_millis());
     }
 
+    /// Record `pid` as the supervisor, together with its start-time token.
+    ///
+    /// Call it while the process is known to be alive — just after spawning
+    /// it. A stop verifies a recorded PID against its token before signalling
+    /// it, and [`crate::identity_state`] treats a PID recorded *without* one as
+    /// a match, so a PID written on its own is signalled on trust alone once it
+    /// has been recycled. Writing the two together is what keeps that from
+    /// happening at whichever site records a PID next.
+    pub fn record_supervisor_identity(&mut self, pid: u32) {
+        self.supervisor_pid = pid;
+        self.supervisor_start_ticks = crate::process_start_ticks(pid);
+    }
+
+    /// Whether `self` and `other` — two snapshots of one service's record —
+    /// name the same processes, token for token.
+    ///
+    /// A stop reads the record, signals what it names, and only then writes its
+    /// verdict. If the record names different processes by then — a restart
+    /// recorded its new supervisor meanwhile — the verdict does not cover them,
+    /// and both `rocm services stop` and `rocmd`'s stop gate their "stopped"
+    /// claim on this.
+    pub fn names_same_processes(&self, other: &Self) -> bool {
+        self.supervisor_pid == other.supervisor_pid
+            && self.supervisor_start_ticks == other.supervisor_start_ticks
+            && self.engine_pid == other.engine_pid
+            && self.engine_start_ticks == other.engine_start_ticks
+    }
+
+    /// Record `pid` as the engine, together with its start-time token. See
+    /// [`Self::record_supervisor_identity`].
+    pub fn record_engine_identity(&mut self, pid: u32) {
+        self.engine_pid = Some(pid);
+        self.engine_start_ticks = crate::process_start_ticks(pid);
+    }
+
     pub fn normalize_paths_for_host(&mut self) {
         self.manifest_path = normalize_runtime_path_for_host(&self.manifest_path);
         self.log_path = normalize_runtime_path_for_host(&self.log_path);
@@ -4217,10 +4252,23 @@ impl ManagedServiceRecord {
                     .map(|pid| (pid, "start_ticks"))
             });
         if let Some((pid, ticks_key)) = engine_pid
-            && let Ok(pid) = u32::try_from(pid)
+            && let Ok(engine_pid) = u32::try_from(pid)
         {
-            self.engine_pid = Some(pid);
-            self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+            self.engine_pid = Some(engine_pid);
+            // When `server_pid` names the same process as `pid`, `start_ticks`
+            // is that process's token too. vLLM wrote its state that way —
+            // `server_pid` equal to `pid`, and only `start_ticks` — before it
+            // wrote `server_start_ticks`, so without this the PID of every such
+            // service was adopted with no token, and a stop could only signal
+            // it blind once the PID had been recycled.
+            self.engine_start_ticks = state
+                .get(ticks_key)
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    (state.get("pid").and_then(serde_json::Value::as_u64) == Some(pid))
+                        .then(|| state.get("start_ticks").and_then(serde_json::Value::as_u64))
+                        .flatten()
+                });
         }
         // Adopt the engine's inference verification so the CLI side does not
         // re-probe a service the engine healthcheck already confirmed.
@@ -6052,6 +6100,104 @@ mod tests {
         );
         assert_eq!(record.restart_count, 3);
         assert!(record.last_restart_unix_ms.is_some());
+    }
+
+    /// Writes `state` as the record's engine state file and runs the refresh.
+    fn refresh_from_state(name: &str, state: &serde_json::Value) -> ManagedServiceRecord {
+        let dir = std::env::temp_dir().join(format!(
+            "rocm-core-engine-state-{name}-{}-{}",
+            std::process::id(),
+            crate::unix_time_millis()
+        ));
+        fs::create_dir_all(&dir).expect("create state dir");
+        let mut record = probe_test_record(11437);
+        record.status = "running".to_owned();
+        record.engine_state_path = dir.join("state.json");
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(state).expect("serialize state"),
+        )
+        .expect("write state");
+        record.refresh_from_engine_state().expect("refresh");
+        let _ = fs::remove_dir_all(dir);
+        record
+    }
+
+    /// vLLM records one process as both `pid` and `server_pid` with only
+    /// `start_ticks`. The refresh prefers `server_pid`, so it has to find that
+    /// process's token under `start_ticks`, or the PID is adopted with none.
+    #[test]
+    fn engine_refresh_takes_start_ticks_when_server_pid_is_the_same_process() {
+        let record = refresh_from_state(
+            "same-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 4321,
+                "server_pid": 4321,
+                "start_ticks": 987_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(4321));
+        assert_eq!(record.engine_start_ticks, Some(987));
+    }
+
+    /// The fallback is only for the same process: a distinct server PID never
+    /// borrows the launcher's token, which would make the stop's identity check
+    /// refute the server and leave it running.
+    #[test]
+    fn engine_refresh_never_gives_a_server_pid_the_launchers_token() {
+        let record = refresh_from_state(
+            "distinct-pid",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+            }),
+        );
+        assert_eq!(record.engine_pid, Some(200));
+        assert_eq!(record.engine_start_ticks, None);
+
+        let record = refresh_from_state(
+            "distinct-pid-own-token",
+            &serde_json::json!({
+                "status": "running",
+                "pid": 100,
+                "server_pid": 200,
+                "start_ticks": 111_u64,
+                "server_start_ticks": 222_u64,
+            }),
+        );
+        assert_eq!(record.engine_start_ticks, Some(222));
+    }
+
+    /// Each role is written with its own PID's token, so a stop can verify it.
+    /// A role recorded without one is signalled on trust alone once its PID has
+    /// been recycled. One live process stands in for both roles, as it does for
+    /// a `rocm serve --background` launch.
+    ///
+    /// Linux-only: `process_start_ticks` reads `/proc`, and is `None` elsewhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_a_process_identity_writes_the_pid_with_its_own_token() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let expected = crate::process_start_ticks(pid);
+        let mut record = probe_test_record(11436);
+
+        record.record_supervisor_identity(pid);
+        record.record_engine_identity(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(expected.is_some(), "precondition: a live child has a token");
+        assert_eq!(record.supervisor_pid, pid);
+        assert_eq!(record.supervisor_start_ticks, expected);
+        assert_eq!(record.engine_pid, Some(pid));
+        assert_eq!(record.engine_start_ticks, expected);
     }
 
     #[test]

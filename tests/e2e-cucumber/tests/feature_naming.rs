@@ -40,6 +40,7 @@ const FEATURE_KEYS: &[(&str, &str)] = &[
     // about the ones a managed `rocm serve` leaves behind.
     ("local_server_records.feature", "server-records"),
     ("logs.feature", "logs"),
+    ("managed_service_stop.feature", "service-stop"),
     ("model_serving.feature", "serve"),
     ("networking.feature", "networking"),
     ("remote.feature", "remote"),

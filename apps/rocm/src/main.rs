@@ -7357,11 +7357,13 @@ fn spawn_managed_engine_child(
         }
         child_pid
     };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // The child is both roles until the engine state file names a separate
+    // server process. Each role gets its own token, captured while the child is
+    // alive: a stop pairs every recorded PID with its own token, and the two
+    // PIDs diverge as soon as `rocmd` restarts the service — at which point an
+    // engine PID recorded without one could only be signalled blind.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -18520,7 +18522,12 @@ fn render_service_action_result(tool: &str, value: &serde_json::Value) -> String
     text
 }
 
-fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+/// A managed service's record exactly as it is on disk, without the engine-state
+/// and liveness refresh [`load_managed_service`] applies (and may persist).
+fn read_managed_service_manifest(
+    paths: &AppPaths,
+    service_id: &str,
+) -> Result<(ManagedServiceRecord, PathBuf)> {
     validate_service_id(service_id)?;
     let manifest_path = paths.service_manifest_path(service_id);
     let bytes = fs::read(&manifest_path).with_context(|| {
@@ -18532,6 +18539,11 @@ fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedSer
     let mut record = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
         .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
     record.normalize_paths_for_host();
+    Ok((record, manifest_path))
+}
+
+fn load_managed_service(paths: &AppPaths, service_id: &str) -> Result<ManagedServiceRecord> {
+    let (mut record, manifest_path) = read_managed_service_manifest(paths, service_id)?;
     let refreshed_from_engine = record.refresh_from_engine_state().unwrap_or(false);
     let refreshed_liveness = refresh_managed_service_runtime_liveness(paths, &mut record);
     if refreshed_from_engine || refreshed_liveness {
@@ -18680,38 +18692,76 @@ fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, 
 }
 
 fn stop_internal_managed_service(paths: &AppPaths, service_id: &str) -> Result<serde_json::Value> {
-    let mut record = load_managed_service(paths, service_id)?;
-    let engine_stop = if record.engine == "lemonade" {
-        unload_lemonade_service_model(&record).map(|()| StopResponse {
+    stop_internal_managed_service_with(paths, service_id, terminate_recorded_service_pids)
+}
+
+/// [`stop_internal_managed_service`], with the termination of the recorded
+/// processes supplied by the caller. Production passes
+/// [`terminate_recorded_service_pids`]; a test passes a stand-in that observes
+/// what is on disk at the moment the processes would be signalled. Everything
+/// else — the engine stop, the manifest writes, the key cleanup — runs for real.
+fn stop_internal_managed_service_with(
+    paths: &AppPaths,
+    service_id: &str,
+    terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
+) -> Result<serde_json::Value> {
+    let mut stopping = load_managed_service(paths, service_id)?;
+    // Record the request on disk before anything is stopped, not only after.
+    // From the engine `Stop` below until the last recorded process is confirmed
+    // gone, the record still reads `ready`/`running` while its endpoint stops
+    // answering — exactly what the daemon's `server-recover` watcher restarts.
+    // That watcher skips a record carrying this marker, so it has to be on disk
+    // for the whole stop. Same order as `rocmd`'s `stop_managed_service_with`.
+    let requested_at = rocm_core::unix_time_millis();
+    stopping.stop_requested_unix_ms = Some(requested_at);
+    stopping.write()?;
+    let engine_stop = if stopping.engine == "lemonade" {
+        unload_lemonade_service_model(&stopping).map(|()| StopResponse {
             stopped: true,
             graceful: true,
         })
     } else {
         engine_request::<_, StopResponse>(
             Some(paths),
-            &record.engine,
+            &stopping.engine,
             EngineMethod::Stop,
             &StopRequest {
-                service_id: record.service_id.clone(),
+                service_id: stopping.service_id.clone(),
                 force: true,
             },
         )
     };
-    let (signaled_pids, all_stopped) = terminate_recorded_service_pids(&record);
-    // Only claim "stopped" when every recorded process is confirmed gone. When a
-    // stop cannot confirm termination (rare: SIGKILL-resistant or unverifiable
-    // PID), leave the prior status so the standard liveness refresh reconciles it
-    // to "stopped" once the process actually dies — rather than asserting a stop
-    // that did not happen.
+    let (signaled_pids, terminated_all) = terminate(&stopping);
+    // Re-read the record rather than write back the copy loaded before the
+    // stop, which can be some forty seconds old by now: `write` replaces the
+    // whole file, and a supervisor, the daemon's restart or another stop may
+    // have written in the meantime. Only this stop's own changes are applied to
+    // what is there now — the same discipline as `rocmd`'s
+    // `stop_managed_service_with`. Read as-is: `load_managed_service`'s
+    // liveness refresh would act on this stop's own marker before the verdict
+    // below has been reached.
+    let (mut record, _) = read_managed_service_manifest(paths, service_id)?;
+    // Only claim "stopped" when every recorded process is confirmed gone, and
+    // only for the processes this stop handled. If the record names different
+    // ones now — a restart recorded its new supervisor while the stop ran —
+    // the verdict says nothing about them, and claiming the service stopped or
+    // dropping the key it serves with would both be false.
+    //
+    // When a stop cannot confirm termination (rare: SIGKILL-resistant or
+    // unverifiable PID), leave the status so the standard liveness refresh
+    // reconciles it to "stopped" once the process actually dies — rather than
+    // asserting a stop that did not happen.
+    let all_stopped = terminated_all && stopping.names_same_processes(&record);
     if all_stopped {
         record.status = "stopped".to_owned();
         record.stop_requested_unix_ms = None;
     } else {
-        // Record that a stop was *asked for* even though it could not be
-        // confirmed. `refresh_managed_service_runtime_liveness` needs this to
-        // tell a service the operator stopped from one that merely crashed: only
-        // the former should lose its endpoint key once its processes are gone.
-        record.stop_requested_unix_ms = Some(rocm_core::unix_time_millis());
+        // The marker records that a stop was *asked for* even though it could
+        // not be confirmed. `refresh_managed_service_runtime_liveness` needs it
+        // to tell a service the operator stopped from one that merely crashed:
+        // only the former should lose its endpoint key once its processes are
+        // gone. Re-stamped, because a restart that ran meanwhile clears it.
+        record.stop_requested_unix_ms = Some(requested_at);
     }
     record.write()?;
     // Drop the endpoint key with the service by deleting its 0600 key file.
@@ -18872,10 +18922,10 @@ fn restart_internal_managed_service(
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(200));
     record.status = "running".to_owned();
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Refresh the identity token in lockstep with the restarted child's PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // Both roles move to the restarted child, each with its own token — see
+    // `spawn_managed_engine_child`.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     // Counts the restart and drops the previous run's inference verification —
     // the new child has an unloaded model, so the old verdict says nothing about
     // it.
@@ -31568,6 +31618,167 @@ install therock";
         assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
         assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_records_its_marker_on_disk_before_any_process_is_signalled() {
+        // The daemon's `server-recover` watcher restarts a managed service whose
+        // endpoint stops answering unless the record carries a stop marker. A
+        // stop that wrote the marker only after terminating the processes would
+        // leave that whole window — the engine `Stop`, then up to the grace
+        // period per PID — open for the daemon to bring the service back. So at
+        // the moment the processes are signalled the marker must already be on
+        // disk, not just in the stop's in-memory copy.
+        let (root, paths) = test_paths("stop-marker-before-signal");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-marker-order";
+        // A port nothing listens on, so the lemonade unload fails fast instead
+        // of reaching a real server.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record.write().unwrap();
+
+        // Read the file as-is: `load_managed_service` runs the liveness refresh,
+        // which would consume the marker of a record whose PIDs are dead.
+        let on_disk = || {
+            serde_json::from_slice::<ManagedServiceRecord>(
+                &fs::read(paths.service_manifest_path(service_id)).unwrap(),
+            )
+            .unwrap()
+        };
+        let seen_at_signal = std::cell::Cell::new(None);
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let on_disk = on_disk();
+            seen_at_signal.set(Some(on_disk.stop_requested_unix_ms));
+            (Vec::new(), false)
+        })
+        .unwrap();
+
+        assert!(
+            matches!(seen_at_signal.get(), Some(Some(_))),
+            "the stop marker must be persisted before the processes are signalled, \
+             saw {:?}",
+            seen_at_signal.get()
+        );
+        // The final-state gating is unchanged: an unconfirmed stop keeps the
+        // marker it wrote up front.
+        assert!(on_disk().stop_requested_unix_ms.is_some());
+        assert_eq!(report["signaled_pids"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A stopped-lemonade record on a port nothing listens on, so the stop's
+    /// unload fails fast instead of reaching a real server.
+    fn stop_test_record(paths: &AppPaths, service_id: &str) -> ManagedServiceRecord {
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            "lemonade",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            port,
+            "managed",
+            999_999_999,
+            None,
+            None,
+            None,
+        );
+        record.status = "ready".to_owned();
+        record
+    }
+
+    /// The manifest as it is on disk, without `load_managed_service`'s refresh.
+    fn raw_manifest(paths: &AppPaths, service_id: &str) -> ManagedServiceRecord {
+        serde_json::from_slice(&fs::read(paths.service_manifest_path(service_id)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile() {
+        // A stop's verdict covers the processes it read and signalled. A restart
+        // landing while it ran records a new supervisor and clears the marker;
+        // claiming that service stopped, or deleting the key it serves with,
+        // would be false. Here every process the stop handled is confirmed gone,
+        // so only the re-read can tell.
+        let (root, paths) = test_paths("stop-restart-meanwhile");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-restart-meanwhile";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut restarted = raw_manifest(&paths, service_id);
+            restarted.status = "recovering".to_owned();
+            restarted.supervisor_pid = 4_242_424;
+            restarted.supervisor_start_ticks = Some(7);
+            restarted.stop_requested_unix_ms = None;
+            restarted.write().unwrap();
+            (Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["status"], "recovering", "{report}");
+        assert_eq!(on_disk.status, "recovering");
+        assert_eq!(on_disk.supervisor_pid, 4_242_424, "the restart's PID stays");
+        assert!(
+            on_disk.stop_requested_unix_ms.is_some(),
+            "an unconfirmed stop re-stamps the marker the restart cleared"
+        );
+        assert_eq!(key.as_deref(), Some("key-123"), "the key is kept");
+    }
+
+    #[test]
+    fn stop_final_write_keeps_what_others_wrote_while_it_ran() {
+        // The stop's last write applies its own fields to the record as it is
+        // now, not to the copy it loaded before the engine stop and the wait.
+        let (root, paths) = test_paths("stop-final-write-rereads");
+        paths.ensure().unwrap();
+        let service_id = "svc-stop-final-write-rereads";
+        stop_test_record(&paths, service_id).write().unwrap();
+        endpoint_keys::store_endpoint_api_key(&paths, service_id, "key-123").unwrap();
+
+        let report = stop_internal_managed_service_with(&paths, service_id, |_| {
+            let mut meanwhile = raw_manifest(&paths, service_id);
+            meanwhile.restart_count = 7;
+            meanwhile.write().unwrap();
+            (Vec::new(), true)
+        })
+        .unwrap();
+
+        let on_disk = raw_manifest(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(report["status"], "stopped", "{report}");
+        assert_eq!(on_disk.status, "stopped");
+        assert_eq!(on_disk.stop_requested_unix_ms, None);
+        assert_eq!(on_disk.restart_count, 7, "a concurrent write survives");
+        assert_eq!(key, None, "a confirmed stop drops the key");
     }
 
     #[test]
