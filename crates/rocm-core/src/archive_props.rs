@@ -1105,3 +1105,49 @@ pub fn naive_unpack(archive: &Path, destination: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// [`run_property`] reuses one [`Fence`] across cases only while it is clean:
+/// a case whose extraction changed something above its own directory gets the
+/// next case a fresh fence, and one that changed only its own directory does
+/// not.
+#[test]
+fn a_fence_is_replaced_after_a_case_changes_it_and_only_then() {
+    let tops_seen = |write_above_the_case: bool| {
+        let tops = std::cell::RefCell::new(Vec::new());
+        run_property("fence", 3, Just(Vec::new()), None, |layout, _| {
+            tops.borrow_mut().push(layout.top.clone());
+            let outcome = run_case(
+                layout,
+                "a",
+                b"",
+                &[&layout.dest],
+                &layout.dest,
+                |layout, _| {
+                    let target = if write_above_the_case {
+                        layout.base.parent().unwrap().join("x")
+                    } else {
+                        layout.outside.join("sentinel")
+                    };
+                    fs::write(target, b"changed")?;
+                    Ok(())
+                },
+            );
+            assert!(!outcome.escapes.is_empty(), "{outcome:#?}");
+            Ok(())
+        })
+        .unwrap();
+        let tops = tops.into_inner();
+        let distinct: std::collections::BTreeSet<_> = tops.iter().collect();
+        (tops.len(), distinct.len())
+    };
+    let (cases, fences) = tops_seen(false);
+    assert_eq!(
+        fences, 1,
+        "{cases} cases that stayed in their own directory"
+    );
+    let (cases, fences) = tops_seen(true);
+    assert_eq!(
+        fences, cases,
+        "every case after a fence change needs a fresh fence"
+    );
+}
