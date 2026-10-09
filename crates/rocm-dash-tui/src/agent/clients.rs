@@ -93,33 +93,16 @@ const DEFAULT_PREAMBLE: &str = "You are the rocm-dash assistant, embedded in a t
 /// An override is applied post-construction rather than as a `new` parameter so
 /// the constructors keep their signatures; `None` or a blank string leaves
 /// [`DEFAULT_PREAMBLE`] in place, which is what demo/replay/`--chat-mock` pass.
+// `RigAgentClient`/`AnthropicAgentClient` carry an `H` (HTTP client) type
+// parameter, defaulted to the live provider's `reqwest::Client` for
+// production use and swapped for `rig::test_utils::RecordingHttpClient`
+// in tests (see `rig_agent_client_complete_forwards_params_to_the_wire` /
+// `anthropic_agent_client_complete_forwards_params_to_the_wire`). Neither
+// method below touches `self.client`, so no bound on `H` is needed; the
+// optional `<$h>` just reproduces whichever of the two forms `$ty` takes.
 macro_rules! impl_with_preamble {
-    ($ty:ident) => {
-        impl $ty {
-            #[must_use]
-            pub fn with_preamble(mut self, preamble: Option<String>) -> Self {
-                if let Some(prompt) = preamble.filter(|p| !p.trim().is_empty()) {
-                    self.preamble = prompt;
-                }
-                self
-            }
-
-            /// The system prompt this client sends. Test-only: it exists so the
-            /// override can be pinned without a network round-trip.
-            #[cfg(test)]
-            pub(crate) fn preamble(&self) -> &str {
-                &self.preamble
-            }
-        }
-    };
-    // `RigAgentClient`/`AnthropicAgentClient` carry an `H` (HTTP client) type
-    // parameter, defaulted to the live provider's `reqwest::Client` for
-    // production use and swapped for `rig::test_utils::RecordingHttpClient`
-    // in tests (see `rig_agent_client_complete_forwards_params_and_tag` /
-    // `anthropic_agent_client_complete_forwards_params_and_tag`). Neither
-    // method below touches `self.client`, so no bound on `H` is needed here.
-    ($ty:ident<$h:ident>) => {
-        impl<$h> $ty<$h> {
+    ($ty:ident $(<$h:ident>)?) => {
+        impl $(<$h>)? $ty $(<$h>)? {
             #[must_use]
             pub fn with_preamble(mut self, preamble: Option<String>) -> Self {
                 if let Some(prompt) = preamble.filter(|p| !p.trim().is_empty()) {
@@ -294,7 +277,7 @@ where
 /// Generic over the HTTP client (`H`, defaulted to the real `reqwest::Client`)
 /// so a test can swap in `rig::test_utils::RecordingHttpClient` and drive the
 /// real `complete()` method over a scripted wire response instead of a live
-/// endpoint — see `rig_agent_client_complete_forwards_params_and_tag`.
+/// endpoint — see `rig_agent_client_complete_forwards_params_to_the_wire`.
 pub struct RigAgentClient<H = reqwest::Client> {
     client: rig::providers::openai::CompletionsClient<H>,
     model: String,
@@ -570,10 +553,11 @@ impl AgentClient for ChatGptAgentClient {
 /// captured snapshot, so tool + approval parity holds across every backend. The
 /// key rides in `x-api-key` (handled inside the provider) — never in `base_url`
 /// or the request path — so no key leaks into [`AgentError`] strings.
+///
 /// Generic over the HTTP client (`H`, defaulted to the real `reqwest::Client`)
 /// so a test can swap in `rig::test_utils::RecordingHttpClient` and drive the
 /// real `complete()` method over a scripted wire response instead of a live
-/// endpoint — see `anthropic_agent_client_complete_forwards_params_and_tag`.
+/// endpoint — see `anthropic_agent_client_complete_forwards_params_to_the_wire`.
 pub struct AnthropicAgentClient<H = reqwest::Client> {
     client: rig::providers::anthropic::Client<H>,
     model: String,
@@ -777,6 +761,21 @@ mod tests {
         ROCM_MUTATING_TOOL_NAMES, ROCM_READ_TOOL_NAMES, SKILL_NAMES, fixture_snapshot,
     };
 
+    /// A throwaway, never-pre-existing directory for
+    /// `ChatGptAgentClient::new_in`'s OAuth token cache, so a test builds a
+    /// ChatGPT client without ever touching the developer's real `$HOME` (and
+    /// without the "Permission denied" a read-only `$HOME` would otherwise
+    /// cause). `tag` only needs to be unique among the directories a single
+    /// test creates; callers remove it once the client no longer needs it —
+    /// `new_in` only reads it at construction time.
+    fn fresh_token_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "rocm-dash-chatgpt-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ))
+    }
+
     #[test]
     fn build_messages_preserves_role_and_order_and_drops_errors() {
         let turns = vec![
@@ -944,7 +943,9 @@ mod tests {
 
         // Same for the other two backends: grounding must not depend on which
         // provider the operator picked, so all three accept the override.
-        let chatgpt = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("grounding");
+        let chatgpt = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             None,
             InferenceParams::default(),
             |_url, _code| {},
@@ -953,6 +954,7 @@ mod tests {
         )
         .expect("build chatgpt oauth client")
         .with_preamble(Some(grounded.to_string()));
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(chatgpt.preamble(), grounded);
 
         let anthropic = AnthropicAgentClient::new(
@@ -1062,7 +1064,9 @@ mod tests {
         // key invariant is structurally preserved on the no-key path.
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
-        let client = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("offline-no-key");
+        let client = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             Some("gpt-5.3-codex".to_string()),
             InferenceParams::default(),
             move |url, code| {
@@ -1073,6 +1077,7 @@ mod tests {
             None,
         )
         .expect("build chatgpt oauth client");
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(client.model, "gpt-5.3-codex");
         // No network happened, so the handler has not fired yet.
         assert!(fired.lock().unwrap().is_empty());
@@ -1080,7 +1085,9 @@ mod tests {
 
     #[test]
     fn chatgpt_oauth_client_defaults_model_when_none() {
-        let client = ChatGptAgentClient::new(
+        let token_dir = fresh_token_dir("default-model");
+        let client = ChatGptAgentClient::new_in(
+            token_dir.clone(),
             None,
             InferenceParams::default(),
             |_url, _code| {},
@@ -1088,6 +1095,7 @@ mod tests {
             None,
         )
         .expect("build chatgpt oauth client");
+        std::fs::remove_dir_all(&token_dir).ok();
         assert_eq!(
             client.model,
             rig::providers::chatgpt::GPT_5_3_CODEX,
@@ -1121,11 +1129,7 @@ mod tests {
         let fired = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = fired.clone();
 
-        let token_dir = std::env::temp_dir().join(format!(
-            "rocm-dash-chatgpt-empty-history-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let token_dir = fresh_token_dir("empty-history");
         let client = ChatGptAgentClient::new_in(
             token_dir.clone(),
             None,
@@ -1350,10 +1354,10 @@ mod tests {
         // requests) so the turn limit — not running out of scripted turns —
         // is what ends the loop; rig-core 0.38.1's own +1/-1 internal
         // bookkeeping is what fixes the request count at MAX_TOOL_TURNS + 2.
-        assert!(
-            (MAX_TOOL_TURNS..=MAX_TOOL_TURNS + 2).contains(&recorded.request_count()),
-            "expected roughly MAX_TOOL_TURNS requests, got {}",
-            recorded.request_count()
+        assert_eq!(
+            recorded.request_count(),
+            MAX_TOOL_TURNS + 2,
+            "rig-core 0.38.1 fixes the request count at MAX_TOOL_TURNS + 2"
         );
     }
 
@@ -1446,14 +1450,67 @@ mod tests {
         ));
     }
 
+    /// Captures the `backend` field off every tracing event
+    /// `finish_agent_request` emits (`info!(backend, "chat request
+    /// start"/"chat request complete")`), for tests that need to assert
+    /// which backend tag a `complete()` call site actually used. The tag
+    /// never rides on the wire — `finish_agent_request`'s doc comment says
+    /// it only "tags the lifecycle trace events" — so a captured HTTP
+    /// request (`RecordingHttpClient`) can't see a swapped tag; this is the
+    /// one seam that can.
+    #[derive(Default)]
+    struct CapturedBackendTags(Mutex<Vec<String>>);
+
+    impl CapturedBackendTags {
+        fn snapshot(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl tracing::Subscriber for CapturedBackendTags {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct BackendFieldVisitor<'a>(&'a Mutex<Vec<String>>);
+            impl tracing::field::Visit for BackendFieldVisitor<'_> {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "backend" {
+                        self.0.lock().unwrap().push(value.to_string());
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    _field: &tracing::field::Field,
+                    _value: &dyn std::fmt::Debug,
+                ) {
+                }
+            }
+            event.record(&mut BackendFieldVisitor(&self.0));
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     /// Pins `RigAgentClient::complete`'s own call site: that it forwards
-    /// `&self.params` (not a default) into `run_agent_request`. The test
-    /// above drives `run_agent_request` directly with a
-    /// `MockCompletionModel`, which proves the shared helper forwards
-    /// correctly but says nothing about whether `complete()` actually passes
-    /// it `&self.params` rather than, say, `&InferenceParams::default()` — a
-    /// swap at that one call site stays green under every other test in this
-    /// file; only a real `complete()` round-trip catches it.
+    /// `&self.params` (not a default) and the `"rig-openai"` backend tag
+    /// into `run_agent_request`. The test above drives `run_agent_request`
+    /// directly with a `MockCompletionModel`, which proves the shared helper
+    /// forwards correctly but says nothing about whether `complete()`
+    /// actually passes it `&self.params` rather than, say,
+    /// `&InferenceParams::default()`, or the right tag — a swap at that one
+    /// call site stays green under every other test in this file; only a
+    /// real `complete()` round-trip catches it.
     ///
     /// `RigAgentClient<H>`'s `H` (HTTP client) type parameter — defaulted to
     /// the live `reqwest::Client` for production — exists for exactly this:
@@ -1501,14 +1558,22 @@ mod tests {
         };
 
         let history = [ChatTurn::user("check gpu 0")];
+        let backend_tags = Arc::new(CapturedBackendTags::default());
+        let tracing_guard = tracing::subscriber::set_default(backend_tags.clone());
         let reply = client
             .complete(&history, fixture_snapshot())
             .await
             .expect("scripted single-turn reply should succeed");
+        drop(tracing_guard);
         assert_eq!(reply, "GPU 0 is healthy.");
 
         let requests = http_client.requests();
-        let request = requests.first().expect("exactly one request was sent");
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request should have been sent"
+        );
+        let request = &requests[0];
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("request body is JSON");
         assert_eq!(
@@ -1517,6 +1582,12 @@ mod tests {
             "complete() must forward &self.params, not a default: {body}"
         );
         assert_eq!(body["max_tokens"].as_u64(), Some(256));
+
+        let tags = backend_tags.snapshot();
+        assert!(
+            !tags.is_empty() && tags.iter().all(|t| t == "rig-openai"),
+            "complete() must tag its lifecycle trace events \"rig-openai\", got {tags:?}"
+        );
     }
 
     /// As `rig_agent_client_complete_forwards_params_to_the_wire`, for
@@ -1562,14 +1633,22 @@ mod tests {
         };
 
         let history = [ChatTurn::user("check gpu 0")];
+        let backend_tags = Arc::new(CapturedBackendTags::default());
+        let tracing_guard = tracing::subscriber::set_default(backend_tags.clone());
         let reply = client
             .complete(&history, fixture_snapshot())
             .await
             .expect("scripted single-turn reply should succeed");
+        drop(tracing_guard);
         assert_eq!(reply, "GPU 0 is healthy.");
 
         let requests = http_client.requests();
-        let request = requests.first().expect("exactly one request was sent");
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one request should have been sent"
+        );
+        let request = &requests[0];
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("request body is JSON");
         assert_eq!(
@@ -1578,6 +1657,12 @@ mod tests {
             "complete() must forward &self.params, not a default: {body}"
         );
         assert_eq!(body["max_tokens"].as_u64(), Some(256));
+
+        let tags = backend_tags.snapshot();
+        assert!(
+            !tags.is_empty() && tags.iter().all(|t| t == "anthropic"),
+            "complete() must tag its lifecycle trace events \"anthropic\", got {tags:?}"
+        );
     }
 
     /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
