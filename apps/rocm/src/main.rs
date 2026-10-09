@@ -1293,6 +1293,10 @@ fn reset_sigpipe() {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
 
 /// Run `f` with SIGPIPE temporarily ignored, restoring the previous
@@ -22201,6 +22205,10 @@ fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
     None
 }

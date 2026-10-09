@@ -564,6 +564,12 @@ fn find_binary_in(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+// Off unix the body is a no-op, so Clippy's nursery `missing_const_for_fn`
+// fires there — but this is one function with `#[cfg]` blocks inside, not a
+// cfg-split pair, and the unix arm calls `set_permissions`, which is not
+// const. Making it `const` to satisfy the Windows lint would stop the unix
+// build compiling.
+#[allow(clippy::missing_const_for_fn)]
 fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
