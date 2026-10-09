@@ -682,9 +682,7 @@ at the directory. That wait lasts as long as the launch does and has no timeout,
 so it is usually imperceptible but is not bounded: on an interactive terminal
 `prune` prints `Waiting for a launch already under way…` while it waits,
 including under `--dry-run`. That notice goes to stderr and is suppressed when
-stderr is not a terminal, so a piped or scripted prune waits silently.
-
-The same
+stderr is not a terminal, so a piped or scripted prune waits silently. The same
 lock runs in the other direction, so a `rocm serve`
 started while a `prune` is scanning waits for the prune.
 

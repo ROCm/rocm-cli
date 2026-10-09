@@ -166,10 +166,11 @@ The acceptance script is Linux or WSL only. It does the following:
 - Checks `/health` and `/v1/completions`.
 - Verifies that loaded ROCm libraries come from the managed TheRock SDK wheel
   directories.
+- Rejects external vLLM command overrides.
+- Does not allow CPU fallback.
 
-It rejects external vLLM command overrides and does not allow CPU fallback. It
-defaults to the active exact runtime key. If you pass `--runtime-id`, use an
-exact runtime key or an unambiguous runtime id.
+The script defaults to the active exact runtime key. If you pass `--runtime-id`,
+use an exact runtime key or an unambiguous runtime id.
 
 ### Source build notes
 
