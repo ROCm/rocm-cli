@@ -180,6 +180,18 @@ fn install_release_tree_with(
     source: &Path,
     step: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> Result<SwapReport> {
+    install_release_tree_removing_with(new_tree, source, step, &remove_path_io)
+}
+
+/// [`install_release_tree_with`] with the removal of a release entry
+/// injectable too, so a test can make it fail the way a file held open by
+/// another program does, whoever runs the test.
+fn install_release_tree_removing_with(
+    new_tree: &Path,
+    source: &Path,
+    step: &mut dyn FnMut(&Path) -> io::Result<()>,
+    remove: &dyn Fn(&Path) -> io::Result<()>,
+) -> Result<SwapReport> {
     let new_names = release_names(new_tree)?;
     if fs::symlink_metadata(source).is_err() {
         let parent = source
@@ -228,7 +240,7 @@ fn install_release_tree_with(
                 || plan.release.contains(name)
                 || plan.set_aside.iter().any(|(planned, _)| planned == name);
             if !known && fs::symlink_metadata(source.join(name)).is_ok() {
-                let new_name = set_aside_name(source, name, &plan);
+                let new_name = set_aside_name(source, name, &plan, unix_seconds());
                 plan.set_aside.push((name.clone(), new_name));
             }
         }
@@ -286,7 +298,7 @@ fn install_release_tree_with(
     to_remove.sort_by_key(|path| !path.ends_with(ENTRY_POINT));
     for path in to_remove {
         step(&path)?;
-        remove_path_io(&path).map_err(|error| RemovalFailed {
+        remove(&path).map_err(|error| RemovalFailed {
             path: path.clone(),
             error,
         })?;
@@ -368,12 +380,16 @@ impl SwapPlan {
     }
 }
 
-/// `<name>.rocm-cli-kept-<seconds>`, with a counter added if that is taken.
-fn set_aside_name(source: &Path, name: &OsStr, plan: &SwapPlan) -> OsString {
-    let seconds = std::time::SystemTime::now()
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+}
+
+/// `<name>.rocm-cli-kept-<seconds>`, with a counter added if that is taken in
+/// `source` or by another entry this swap sets aside.
+fn set_aside_name(source: &Path, name: &OsStr, plan: &SwapPlan, seconds: u64) -> OsString {
     let mut counter = 1;
     loop {
         let mut candidate = name.to_os_string();
@@ -540,8 +556,19 @@ fn move_release_entry(
     to: &Path,
     step: &mut dyn FnMut(&Path) -> io::Result<()>,
 ) -> Result<()> {
+    move_release_entry_with(from, to, step, &rename_with_retry)
+}
+
+/// [`move_release_entry`] with the rename injectable, so a test can take the
+/// copy path without a second filesystem.
+fn move_release_entry_with(
+    from: &Path,
+    to: &Path,
+    step: &mut dyn FnMut(&Path) -> io::Result<()>,
+    rename: &dyn Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
     step(to)?;
-    match rename_with_retry(from, to) {
+    match rename(from, to) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
             let mut temp_name = OsString::from(COPY_IN_PROGRESS_PREFIX);
@@ -552,7 +579,7 @@ fn move_release_entry(
                 remove_path(&temp).ok();
                 return Err(copy_error);
             }
-            rename_with_retry(&temp, to).with_context(|| {
+            rename(&temp, to).with_context(|| {
                 format!("failed to move {} to {}", temp.display(), to.display())
             })?;
             remove_path(from)
@@ -1474,24 +1501,28 @@ mod tests {
     /// A release entry that cannot be removed stops the swap with
     /// [`RemovalFailed`] naming it, leaving the marker that makes `start`
     /// refuse; once it can be removed, running the swap again finishes it.
-    #[cfg(unix)]
+    /// The removal is made to fail by injection rather than by permissions,
+    /// which do not stop a test running as root.
     #[test]
     fn an_entry_that_cannot_be_removed_stops_the_swap_with_a_typed_error() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TestDir::new("cannot-remove");
         let source = used_source(&dir.0);
         let locked = source.join("comfy");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555))?;
-        if fs::write(locked.join("probe"), "").is_ok() {
-            // Running as root: permissions do not stop removal here.
-            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
-            return Ok(());
-        }
+        let held = |path: &Path| {
+            if path == locked {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                remove_path_io(path)
+            }
+        };
 
-        let error = install_release_tree(&new_release(&dir.0), &source)
-            .expect_err("a release entry that cannot be removed must stop the swap");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+        let error = install_release_tree_removing_with(
+            &new_release(&dir.0),
+            &source,
+            &mut |_| Ok(()),
+            &held,
+        )
+        .expect_err("a release entry that cannot be removed must stop the swap");
 
         let failed = error
             .downcast_ref::<RemovalFailed>()
@@ -1502,6 +1533,10 @@ mod tests {
             "{error:#}"
         );
         assert!(swap_interrupted(&source));
+        assert!(
+            locked.is_dir(),
+            "the entry that could not be removed is still there"
+        );
         assert_user_files_intact(&source);
 
         let rerun_tree = dir.0.join("extract-2").join("ComfyUI-master");
@@ -1510,6 +1545,153 @@ mod tests {
         assert_new_release_installed(&source);
         assert_user_files_intact(&source);
         assert_eq!(report.kept, all_preserved_present());
+        Ok(())
+    }
+
+    /// Marker lines that do not name a single entry of `source/` are dropped
+    /// when the marker is read, for the release's names and for set-aside
+    /// pairs alike.
+    #[test]
+    fn marker_lines_that_are_not_a_single_entry_are_ignored() {
+        let plan = SwapPlan::parse(
+            "models\n\
+             release\t..\n\
+             release\t/abs\n\
+             release\ta/b\n\
+             release\t.\n\
+             release\t\n\
+             release\tmain.py\n\
+             set-aside\t../outside\tx\n\
+             set-aside\tapp\t../escaped\n\
+             set-aside\t/abs\tx\n\
+             set-aside\tapp\ta/b\n\
+             set-aside\tapp\tapp.rocm-cli-kept-1",
+        );
+
+        assert_eq!(plan.kept, ["models"]);
+        assert_eq!(
+            plan.release.into_iter().collect::<Vec<_>>(),
+            [OsString::from("main.py")]
+        );
+        assert_eq!(
+            plan.set_aside,
+            [(OsString::from("app"), OsString::from("app.rocm-cli-kept-1"))]
+        );
+    }
+
+    /// An interrupted swap's marker naming paths outside `source/` (damaged or
+    /// tampered with) never makes a re-run move anything outside it.
+    #[test]
+    fn a_marker_naming_paths_outside_the_folder_moves_nothing_outside_it() -> Result<()> {
+        let dir = TestDir::new("marker-escape");
+        let source = used_source_with_colliding_entry(&dir.0);
+        write(&dir.0, &[("outside/precious.txt", "outside")]);
+        fs::write(
+            source.join(SWAP_MARKER),
+            "set-aside\t../outside\tmoved-in\n\
+             set-aside\tapp\t../escaped\n\
+             release\t../outside",
+        )?;
+
+        install_release_tree(&new_release(&dir.0), &source)?;
+
+        assert_eq!(
+            read(&dir.0.join("outside/precious.txt")).as_deref(),
+            Some("outside")
+        );
+        assert!(!source.join("moved-in").exists());
+        assert!(!dir.0.join("escaped").exists());
+        assert_eq!(user_app_locations(&source), ["app"]);
+        assert_user_files_intact(&source);
+        Ok(())
+    }
+
+    /// The name a set-aside entry gets skips names already taken in the
+    /// folder and names this swap already gave another entry.
+    #[test]
+    fn set_aside_name_skips_names_already_taken() {
+        let dir = TestDir::new("set-aside-name");
+        let source = dir.0.join("source");
+        write(
+            &source,
+            &[
+                ("app.rocm-cli-kept-100", "earlier"),
+                ("app.rocm-cli-kept-100-2/file", "earlier"),
+            ],
+        );
+        let plan = SwapPlan {
+            set_aside: vec![(
+                OsString::from("app"),
+                OsString::from("app.rocm-cli-kept-100-3"),
+            )],
+            ..SwapPlan::default()
+        };
+
+        assert_eq!(
+            set_aside_name(&source, OsStr::new("app"), &plan, 100),
+            "app.rocm-cli-kept-100-4"
+        );
+        assert_eq!(
+            set_aside_name(&source, OsStr::new("app"), &SwapPlan::default(), 101),
+            "app.rocm-cli-kept-101"
+        );
+    }
+
+    fn crosses_devices_once(first: &Path) -> impl Fn(&Path, &Path) -> io::Result<()> + use<'_> {
+        move |from: &Path, to: &Path| {
+            if from == first {
+                Err(io::Error::from(io::ErrorKind::CrossesDevices))
+            } else {
+                fs::rename(from, to)
+            }
+        }
+    }
+
+    /// When the release cannot be renamed into place because `source` is on
+    /// another filesystem, it is copied to a temporary name (replacing a copy
+    /// a crash left there), renamed into place once complete, and the staged
+    /// original is removed.
+    #[test]
+    fn a_move_across_filesystems_copies_under_a_temporary_name() -> Result<()> {
+        let dir = TestDir::new("cross-device");
+        let from = dir.0.join("extract").join("comfy");
+        write(&from, &[("a.py", "new code"), ("sub/b.py", "more code")]);
+        let into = dir.0.join("source").join("models");
+        // What a copy cut short by a crash left behind.
+        write(&into, &[(".rocm-cli-copy-comfy/a.py", "trunc")]);
+        let to = into.join("comfy");
+
+        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_once(&from))?;
+
+        assert_eq!(read(&to.join("a.py")).as_deref(), Some("new code"));
+        assert_eq!(read(&to.join("sub/b.py")).as_deref(), Some("more code"));
+        assert!(!from.exists(), "the staged original is removed once copied");
+        assert!(!into.join(".rocm-cli-copy-comfy").exists());
+        Ok(())
+    }
+
+    /// A copy that fails part-way removes its temporary copy and leaves the
+    /// target name free. A socket cannot be copied, whoever runs the test.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_across_filesystems_leaves_no_temporary_copy() -> Result<()> {
+        let dir = TestDir::new("cross-device-fail");
+        let from = dir.0.join("extract").join("comfy");
+        write(&from, &[("a.py", "new code")]);
+        let _socket = std::os::unix::net::UnixListener::bind(from.join("z.sock"))?;
+        let into = dir.0.join("source");
+        fs::create_dir_all(&into)?;
+        let to = into.join("comfy");
+
+        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_once(&from))
+            .expect_err("a socket cannot be copied");
+
+        assert!(!to.exists());
+        assert!(
+            !into.join(".rocm-cli-copy-comfy").exists(),
+            "the partial copy must be removed"
+        );
+        assert_eq!(read(&from.join("a.py")).as_deref(), Some("new code"));
         Ok(())
     }
 
