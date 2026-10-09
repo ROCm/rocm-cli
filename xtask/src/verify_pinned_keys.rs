@@ -314,21 +314,29 @@ fn check_ci_public_key(
 /// against that very key — a trust root nobody compared with `docs/keys/`, and
 /// reported in the log as "not configured".
 ///
-/// A named path that cannot be read, or that holds nothing, is an error rather
-/// than a fall-through: the operator named a key, so reporting "not configured"
-/// and exiting 0 would be the exact confusion the doc on
-/// [`check_ci_public_key`] forbids. Only an *unset* variable counts as absent,
-/// because an unset GitHub secret expands to the empty string.
+/// An empty variable counts as absent; a variable naming a missing or empty file
+/// is an error. The blank case matches the Python gate exactly: `env_path` and
+/// `env_text` both `strip()` the value and treat whatever is left of nothing as
+/// unset, which is the shape an unset GitHub secret takes when it expands to the
+/// empty string. Erroring on a whitespace-only path here while the gate fell
+/// through to the PEM would make the two disagree about which key is in use.
+///
+/// Once a path *is* named, a file that cannot be read or that holds nothing is an
+/// error rather than a fall-through: the operator named a key, so reporting "not
+/// configured" and exiting 0 would be the exact confusion the doc on
+/// [`check_ci_public_key`] forbids.
 ///
 /// `lookup` is injected so the variable names themselves are covered: reading
-/// them directly here left `run()` free to query a misspelled name with every
+/// them directly here left callers free to query a misspelled name with every
 /// test still green.
 fn resolve_ci_public_key(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Option<String>> {
     if let Some(raw) = lookup(CI_PUBLIC_KEY_PATH_ENV) {
         // `OsString`, not `String`: a non-UTF-8 path must still name the file the
-        // operator meant, not silently fall through to the inline PEM.
-        let path = PathBuf::from(&raw);
-        if !path.as_os_str().is_empty() {
+        // operator meant, not silently fall through to the inline PEM. Lossy
+        // replacement characters are not whitespace, so such a path still counts
+        // as named.
+        if !raw.to_string_lossy().trim().is_empty() {
+            let path = PathBuf::from(&raw);
             let pem = std::fs::read_to_string(&path).with_context(|| {
                 format!(
                     "failed to read the CI signing public key named by \
@@ -361,11 +369,29 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// A named shim rather than a closure in [`run`]: the generic `std::env::var_os`
+/// fn item cannot satisfy the higher-ranked `Fn(&str)` bound, and a closure
+/// spelled out at the call site is a place a wrong variable name could live
+/// where no test could reach it. Here it is a pass-through with nothing to get
+/// wrong, and `env_lookup_passes_the_name_through` pins that it stays one.
+fn env_lookup(name: &str) -> Option<OsString> {
+    std::env::var_os(name)
+}
+
+/// Resolve the CI key through `lookup`, then run every pinned-key check against
+/// `root`, returning the lines the caller should print.
+///
+/// Split out of [`run`] so the resolution-to-comparison handoff is testable: with
+/// it inlined there, a `run` that queried the wrong variable, resolved nothing,
+/// or simply handed `check_pinned_keys` a `None` left every test green while the
+/// cross-check silently degraded to "not configured".
+fn run_with(root: &Path, lookup: impl Fn(&str) -> Option<OsString>) -> Result<Vec<String>> {
+    let ci_public_key = resolve_ci_public_key(lookup)?;
+    check_pinned_keys(root, ci_public_key.as_deref())
+}
+
 pub fn run() -> Result<()> {
-    // Wrapped rather than passed as `std::env::var_os` directly: the generic fn
-    // item cannot satisfy the higher-ranked `Fn(&str)` bound.
-    let ci_public_key = resolve_ci_public_key(|name: &str| std::env::var_os(name))?;
-    for message in check_pinned_keys(&repo_root(), ci_public_key.as_deref())? {
+    for message in run_with(&repo_root(), env_lookup)? {
         println!("pinned key check: {message}");
     }
     Ok(())
@@ -473,22 +499,33 @@ mod tests {
         assert!(check_ci_public_key(Some("not a pem"), Some(&current)).is_err());
     }
 
-    /// The variable names must be the ones the release gate actually reads.
+    /// Each variable name must be the one the release gate reads *for that role*.
     ///
-    /// The lookup test below matches on these same constants, so it cannot see a
-    /// wrong *value*: misspelling one leaves every case green while `run()`
-    /// queries a variable nothing ever sets, and the cross-check silently skips.
-    /// Checking them against `release_readiness.py` pins the value and the
-    /// cross-language agreement at once.
+    /// The lookup tests below match on these same constants, so they cannot see a
+    /// wrong *value*: misspelling one leaves every case green while `run` queries
+    /// a variable nothing ever sets, and the cross-check silently skips.
+    ///
+    /// Matching the gate's assignment lines, not merely the name somewhere in the
+    /// file, is what makes this bite. Both literals also appear in
+    /// `PRODUCTION_TRUST_ENV_NAMES` and `validate_production_trust`, so a
+    /// name-anywhere search passed three real regressions: swapping the two
+    /// constants (release CI would read the PEM text as a file path), and pointing
+    /// either at `ROCM_CLI_METADATA_*` (the cross-check would quietly skip).
+    /// Pinning `BINDING = "NAME"` ties each name to the role the gate gives it.
     #[test]
     fn ci_public_key_env_names_match_the_release_gate() {
         let gate = std::fs::read_to_string(repo_root().join("scripts/release_readiness.py"))
             .expect("read scripts/release_readiness.py");
-        for name in [CI_PUBLIC_KEY_PATH_ENV, CI_PUBLIC_KEY_PEM_ENV] {
+        for (binding, name) in [
+            ("SIGNING_PUBLIC_KEY_PATH_ENV", CI_PUBLIC_KEY_PATH_ENV),
+            ("SIGNING_PUBLIC_KEY_ENV", CI_PUBLIC_KEY_PEM_ENV),
+        ] {
+            let assignment = format!("\n{binding} = \"{name}\"\n");
             assert!(
-                gate.contains(&format!("\"{name}\"")),
-                "{name} is not a key source in release_readiness.py, so this \
-                 cross-check would read a variable the gate never resolves"
+                gate.contains(&assignment),
+                "release_readiness.py does not bind {binding} to {name}; this \
+                 cross-check would resolve a different key than the gate verifies \
+                 with. Expected the line {assignment:?}"
             );
         }
     }
@@ -549,20 +586,31 @@ mod tests {
                 "blank PEM {blank:?} should resolve to no key"
             );
         }
-        assert_eq!(
-            resolve_ci_public_key(env(Some(""), Some(SAMPLE)))
-                .expect("falls through to pem")
-                .as_deref(),
-            Some(SAMPLE),
-            "an unset path variable should fall through to the PEM"
-        );
+        // Same for the path variable, and whitespace counts as blank: the Python
+        // gate's `env_path` strips the value and falls through to the PEM, so
+        // erroring here instead would make the two sides disagree about which key
+        // a release is verified with.
+        for blank in [None, Some(""), Some("   "), Some("\t\n")] {
+            assert_eq!(
+                resolve_ci_public_key(env(blank, Some(SAMPLE)))
+                    .unwrap_or_else(|e| panic!("blank path {blank:?} should not error: {e}"))
+                    .as_deref(),
+                Some(SAMPLE),
+                "a blank path variable {blank:?} should fall through to the PEM"
+            );
+        }
 
         // A named key that cannot be read is an error, never a quiet fall-through
-        // to a different key than the operator named.
+        // to a different key than the operator named. The *message* is pinned too:
+        // a failed read that fell through as an empty string would still be an
+        // error, but the operator would be told the key "is empty" and go looking
+        // at a file that is fine.
         let missing = dir.path().join("absent.pem");
+        let read_error = resolve_ci_public_key(env(missing.to_str(), Some(SAMPLE)))
+            .expect_err("an unreadable named key must fail rather than fall back to the PEM");
         assert!(
-            resolve_ci_public_key(env(missing.to_str(), Some(SAMPLE))).is_err(),
-            "an unreadable named key must fail rather than fall back to the PEM"
+            format!("{read_error:#}").contains("failed to read"),
+            "an unreadable named key should report the read failure, got: {read_error:#}"
         );
 
         // A named key that exists but holds nothing must be an error too. Passing
@@ -579,5 +627,105 @@ mod tests {
                 "unexpected error for an empty named key: {error}"
             );
         }
+    }
+
+    /// `run_with` is the whole path `run` takes, so the resolved key must reach
+    /// the comparison rather than being dropped on the way.
+    ///
+    /// Nothing previously ran through this seam. A `run` whose lookup always
+    /// queried the PEM name, always returned `None`, or simply handed
+    /// `check_pinned_keys` a `None` turned the path resolution into a silent
+    /// no-op and reported "not configured — cross-check skipped" on a run that
+    /// did have a key. Each case below fails under exactly those mutations.
+    #[test]
+    fn run_with_carries_the_resolved_key_into_the_comparison() {
+        let root = repo_root();
+        let canonical =
+            std::fs::read_to_string(root.join("docs/keys/rocm-cli-release-current-public.pem"))
+                .expect("the canonical current release key is committed");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let env = |path: Option<&str>, pem: Option<&str>| {
+            let path = path.map(OsString::from);
+            let pem = pem.map(OsString::from);
+            move |name: &str| match name {
+                CI_PUBLIC_KEY_PATH_ENV => path.clone(),
+                CI_PUBLIC_KEY_PEM_ENV => pem.clone(),
+                other => panic!("unexpected variable queried: {other}"),
+            }
+        };
+
+        // No key anywhere: the run passes, and says the cross-check was skipped.
+        // This is the only place that message is exercised through the code path
+        // that actually prints it.
+        let skipped = run_with(&root, env(None, None)).expect("no key configured is not an error");
+        assert!(
+            skipped
+                .iter()
+                .any(|m| m.contains("not configured — cross-check skipped")),
+            "a run with no key must say the cross-check was skipped, got {skipped:?}"
+        );
+
+        // A key named by path must be compared, not skipped: a wrong one fails.
+        let wrong = dir.path().join("wrong.pem");
+        std::fs::write(&wrong, SAMPLE).expect("write wrong key");
+        let error = run_with(&root, env(wrong.to_str(), None))
+            .expect_err("a path key that disagrees with docs/keys must fail the run");
+        assert!(
+            format!("{error:#}").contains("does not match the canonical current release key"),
+            "unexpected failure for a mismatched path key: {error:#}"
+        );
+
+        // ...and the right one passes, reported as a match rather than a skip.
+        let right = dir.path().join("right.pem");
+        std::fs::write(&right, &canonical).expect("write canonical key");
+        let matched = run_with(&root, env(right.to_str(), None)).expect("canonical key matches");
+        assert!(
+            matched
+                .iter()
+                .any(|m| m.contains("matches the canonical current release key")),
+            "a path key equal to docs/keys must be reported as a match, got {matched:?}"
+        );
+
+        // The PEM source still reaches the comparison too, and loses to the path.
+        let via_pem = run_with(&root, env(None, Some(&canonical))).expect("canonical pem matches");
+        assert!(
+            via_pem
+                .iter()
+                .any(|m| m.contains("matches the canonical current release key")),
+            "an inline canonical PEM must be reported as a match, got {via_pem:?}"
+        );
+        assert!(
+            run_with(&root, env(wrong.to_str(), Some(&canonical))).is_err(),
+            "the path key must win, so a wrong path key is not rescued by a good PEM"
+        );
+    }
+
+    /// `run`'s only remaining untestable surface is this shim, so pin it.
+    ///
+    /// It must pass the name it is given straight to the environment. A shim that
+    /// ignored its argument, or always answered `None`, would make `run` resolve
+    /// the wrong variable or no variable at all while every fake-lookup test above
+    /// stayed green. `PATH` is used because it is set in every environment this
+    /// runs in, so a shim that ignores the name cannot accidentally agree.
+    #[test]
+    fn env_lookup_passes_the_name_through() {
+        assert_eq!(env_lookup("PATH"), std::env::var_os("PATH"));
+        assert!(
+            env_lookup("PATH").is_some(),
+            "PATH is unset, so this test cannot tell a pass-through from a stub"
+        );
+        for name in [CI_PUBLIC_KEY_PATH_ENV, CI_PUBLIC_KEY_PEM_ENV] {
+            assert_eq!(
+                env_lookup(name),
+                std::env::var_os(name),
+                "{name} must be read from the environment under its own name"
+            );
+        }
+        assert_eq!(
+            env_lookup("ROCM_CLI_VERIFY_PINNED_KEYS_NOT_A_REAL_VARIABLE"),
+            None,
+            "an unset variable must resolve to None, not to some other variable"
+        );
     }
 }
