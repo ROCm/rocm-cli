@@ -6,16 +6,14 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-#[cfg(windows)]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(windows)]
@@ -4458,6 +4456,244 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
     "amd-smi".into()
 }
 
+/// Device node of the AMD kernel fusion driver. Bare-metal Linux only: no other
+/// platform exposes one, and WSL — which *is* `target_os = "linux"` — is not an
+/// exception to hand-wave past. It reaches the GPU through `/dev/dxg` and the
+/// Windows host driver and has no `/dev/kfd` at all, which is why the WSL
+/// diagnosis catalog skips every bare-metal driver check (see `docs/wsl.md` and
+/// [`crate::examine::WslFacts`]).
+const KFD_DEVICE: &str = "/dev/kfd";
+
+/// Whether it is safe to launch `amd-smi` on this host.
+///
+/// On Linux this is a readability check on `/dev/kfd`, and it is **mandatory**
+/// before every launch. Against a kernel fusion driver in a bad state —
+/// partially installed, version-mismatched, wedged after a GPU fault, or passed
+/// into a container from an unhealthy host — `amd-smi` blocks in uninterruptible
+/// kernel sleep. No signal escapes that state, so the process survives both
+/// Ctrl-C and `SIGKILL`, and a timeout cannot rescue it either: killing a
+/// D-state child is a no-op and the `wait` that follows blocks alongside it.
+/// Declining to launch is the only mitigation.
+///
+/// Off Linux there is no such device and no such kernel state, so this returns
+/// `true` without probing anything. That gate is load-bearing rather than
+/// pedantic: `amd-smi.exe` is a supported Windows binary (see
+/// [`managed_sdk_tool_path`]), so a check that simply failed to find `/dev/kfd`
+/// there would silently disable GPU detection on every Windows host.
+///
+/// WSL needs the same wave-through for the same reason, and cannot get it from
+/// `cfg`: it compiles as Linux yet has no `/dev/kfd` (see [`KFD_DEVICE`]), so
+/// the real open would fail on every WSL host and decline every launch. WSL is
+/// supported here — it has its own diagnosis catalog and its own GPU E2E lane —
+/// and both `serve` probes discard the error with `.ok()?`, so that would be a
+/// silent loss of GPU detection rather than a visible failure. The D-state hazard
+/// this gate exists for is an `amdgpu`/KFD one, which is precisely the stack WSL
+/// does not load.
+#[must_use]
+pub fn amd_smi_preflight_ok() -> bool {
+    kfd_readable(Path::new(KFD_DEVICE))
+}
+
+#[cfg(target_os = "linux")]
+fn kfd_readable(device: &Path) -> bool {
+    kfd_readable_with(is_wsl_host(), device)
+}
+
+/// [`kfd_readable`] with the WSL determination injected, so the wave-through can
+/// be pinned from a test on an ordinary Linux host rather than only on WSL.
+#[cfg(target_os = "linux")]
+fn kfd_readable_with(is_wsl: bool, device: &Path) -> bool {
+    if is_wsl {
+        return true;
+    }
+    fs::OpenOptions::new().read(true).open(device).is_ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kfd_readable(_device: &Path) -> bool {
+    true
+}
+
+/// Run `amd-smi <args>` and parse its stdout as JSON, declining to launch at all
+/// unless [`amd_smi_preflight_ok`] passes.
+///
+/// This is the supported way to launch `amd-smi` from a synchronous caller. The
+/// pre-flight has to happen at every launch site or it protects nothing, and
+/// routing the launch through one function is what keeps that true as sites are
+/// added.
+///
+/// `timeout` is defence in depth, not the mitigation: see
+/// [`run_command_with_timeout`], which kills the child and then waits for it,
+/// neither of which dislodges a process in uninterruptible sleep. It bounds the
+/// ordinary failures — a slow or wedged-but-signalable `amd-smi` — and nothing
+/// more.
+pub fn amd_smi_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
+    amd_smi_json_with(
+        &resolve_amd_smi_binary(),
+        Path::new(KFD_DEVICE),
+        args,
+        timeout,
+    )
+}
+
+fn amd_smi_json_with(
+    binary: &OsStr,
+    kfd_device: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    if !kfd_readable(kfd_device) {
+        bail!(
+            "declined to launch `amd-smi {}`: {} is not readable, and amd-smi can block \
+             unkillably in uninterruptible sleep against a kernel driver in that state",
+            args.join(" "),
+            kfd_device.display()
+        );
+    }
+
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = run_command_with_timeout(command, timeout)
+        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        bail!(
+            "amd-smi {} failed: {}",
+            args.join(" "),
+            if stderr.is_empty() {
+                if stdout.is_empty() {
+                    format!("exit status {}", output.status)
+                } else {
+                    stdout
+                }
+            } else {
+                stderr
+            }
+        );
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
+}
+
+/// Wait for `command` for at most `timeout`, killing it and failing if it
+/// overruns.
+///
+/// Bounds signalable children only. A child in uninterruptible sleep ignores
+/// the `kill`, so callers that can reach one must decline to spawn it in the
+/// first place — see [`amd_smi_preflight_ok`]. This function at least returns
+/// to its caller in that case rather than joining the child in its wait.
+///
+/// On timeout the calling thread returns without waiting on the child; the
+/// `wait` is handed to a detached reaper thread instead, because
+/// `std::process::Child` has no reaping `Drop` and dropping the handle here
+/// would strand a zombie for the lifetime of this process. That reap is
+/// best-effort: it completes only if the child actually dies, which is the
+/// same condition the `kill` above already depends on. See
+/// `reap_in_background`.
+pub fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut child = command.spawn().context("failed to spawn child process")?;
+    // Drain both pipes on their own threads for as long as the child runs.
+    // Polling `try_wait` alone cannot: a child that fills the pipe buffer
+    // (64 KiB on Linux) blocks mid-write and never exits, so a merely verbose
+    // command would be reported as having hung. `amd-smi metric --json` on a
+    // multi-GPU host clears 64 KiB comfortably.
+    let stdout = child.stdout.take().map(drain_on_thread);
+    let stderr = child.stderr.take().map(drain_on_thread);
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("failed to poll child process")? {
+            // The child is gone, so it has dropped its write ends and the
+            // readers see EOF. A surviving grandchild holding an inherited
+            // write end can still keep them open, exactly as the
+            // `wait_with_output` this replaces would have.
+            return Ok(std::process::Output {
+                status,
+                stdout: join_drained(stdout),
+                stderr: join_drained(stderr),
+            });
+        }
+        if started.elapsed() >= timeout {
+            // `kill` is allowed to fail — most often because the child exited
+            // between the `try_wait` above and here, in which case it is already
+            // a zombie and the reap below is exactly what is needed. Reap
+            // unconditionally rather than only on a successful kill.
+            let _ = child.kill();
+            // This thread deliberately joins neither the child nor the readers:
+            // an unkillable child would block both, which is the hang this
+            // timeout exists to bound. That costs the partial output the message
+            // used to quote; the reader threads end by themselves once the child
+            // does.
+            reap_in_background(child);
+            bail!("process exceeded {}s timeout", timeout.as_secs());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Take ownership of a killed child and `wait` for it on a detached thread.
+///
+/// `std::process::Child` has no reaping `Drop`: dropping the handle after a
+/// `kill` leaves the child a zombie occupying a PID slot for the whole lifetime
+/// of this process. That is affordable for a one-shot CLI and not for a daemon
+/// — `rocmd`'s watcher tick reaches this path on its GPU-telemetry cadence, so
+/// a host where `amd-smi` reliably overruns the probe timeout would accrue
+/// zombies until the PID table ran dry. Reaping on a *detached* thread is what
+/// lets the `wait` happen without the calling thread paying for it.
+///
+/// Guarantees:
+///
+/// - The calling thread returns immediately; it never waits on the child.
+/// - A child that does die — the normal case after `SIGKILL`, and the case
+///   where it had already exited before the `kill` — is reaped, and its PID is
+///   released, within roughly the time the kernel takes to tear it down.
+///
+/// Does not guarantee:
+///
+/// - That the child dies. A process in uninterruptible sleep ignores `SIGKILL`,
+///   so its reaper parks until the kernel lets it go, possibly forever. The
+///   resource leaked in that case is a blocked thread rather than a zombie PID
+///   — no worse than what it replaces, and better than blocking the caller, but
+///   still a leak. The only real mitigation is declining to spawn against a
+///   suspect device: see [`amd_smi_preflight_ok`].
+/// - That a reaper always exists. If the thread cannot be spawned, the child is
+///   dropped and left as a zombie, which is the pre-existing failure mode and
+///   strictly better than propagating an error from a path that is already
+///   reporting one.
+///
+/// Reaper threads do not accumulate under normal operation: one is created per
+/// timeout, and each one exits as soon as its child does. Accumulation needs a
+/// steady supply of children that never die, which is the uninterruptible-sleep
+/// case above.
+fn reap_in_background(mut child: std::process::Child) {
+    let _ = thread::Builder::new()
+        .name("rocm-reap-timed-out-child".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
+fn drain_on_thread<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+fn join_drained(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader.map_or_else(Vec::new, |handle| handle.join().unwrap_or_default())
+}
+
 /// A validated managed-service identifier that is safe to use as a single
 /// filesystem path component.
 ///
@@ -6118,6 +6354,233 @@ mod tests {
             "a protected service must not read as unready for want of its own key"
         );
         Ok(())
+    }
+
+    /// The gate has to stop the *spawn*, not merely report a failure after the
+    /// fact: the launch that already happened is the launch that hangs. The
+    /// fake `amd-smi` leaves a marker file, so its absence is direct evidence
+    /// nothing ran — and running the same fixture against a readable device
+    /// proves the fake would otherwise have executed, which is what stops the
+    /// blocked case from passing vacuously.
+    ///
+    /// Linux-only because `kfd_readable` is deliberately a no-op elsewhere;
+    /// off Linux there is no gate to exercise.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kfd_gate_stops_amd_smi_before_it_is_spawned() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // WSL compiles as Linux but is waved through deliberately (see
+        // `the_kfd_preflight_waves_through_wsl_hosts`), so there is no gate to
+        // exercise on such a host and the blocked case could never hold.
+        if is_wsl_host() {
+            return Ok(());
+        }
+
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-kfd-gate-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let marker = temp_root.join("amd-smi-ran");
+        let fake_amd_smi = temp_root.join("amd-smi");
+        fs::write(
+            &fake_amd_smi,
+            format!("#!/bin/sh\ntouch '{}'\necho '{{}}'\n", marker.display()),
+        )?;
+        fs::set_permissions(&fake_amd_smi, fs::Permissions::from_mode(0o755))?;
+        let readable_device = temp_root.join("stand-in-kfd");
+        fs::write(&readable_device, b"")?;
+
+        let timeout = Duration::from_secs(10);
+        let args = ["list", "--json"];
+
+        let blocked = amd_smi_json_with(
+            fake_amd_smi.as_os_str(),
+            &temp_root.join("absent-kfd"),
+            &args,
+            timeout,
+        );
+        let ran_while_blocked = marker.exists();
+
+        let allowed = amd_smi_json_with(fake_amd_smi.as_os_str(), &readable_device, &args, timeout);
+        let ran_while_allowed = marker.exists();
+
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert!(
+            blocked.is_err(),
+            "an unreadable KFD device must stop the launch"
+        );
+        assert!(
+            !ran_while_blocked,
+            "amd-smi was spawned even though the pre-flight failed"
+        );
+        assert!(
+            allowed.is_ok(),
+            "a readable device must let the launch through: {allowed:?}"
+        );
+        assert!(
+            ran_while_allowed,
+            "the fake amd-smi never ran at all, so the blocked case proves nothing"
+        );
+        Ok(())
+    }
+
+    /// A merely verbose child must not be mistaken for a hung one. Polling
+    /// `try_wait` without draining deadlocks the moment the child fills the
+    /// pipe buffer — 64 KiB on Linux, which `amd-smi metric --json` clears on a
+    /// multi-GPU host — and that deadlock surfaces as a spurious timeout, which
+    /// for the `serve` path means GPU auto-selection silently loses its VRAM
+    /// telemetry. Both pipes are filled because either one alone can stall the
+    /// child.
+    #[test]
+    #[cfg(unix)]
+    fn a_child_that_outgrows_the_pipe_buffer_is_not_reported_as_hung() -> Result<()> {
+        const BYTES: usize = 300_000;
+
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "yes rocm | head -c {BYTES}; yes err | head -c {BYTES} >&2"
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_command_with_timeout(command, Duration::from_secs(10))?;
+
+        assert!(output.status.success(), "the child should have exited 0");
+        assert_eq!(
+            output.stdout.len(),
+            BYTES,
+            "stdout was truncated or stalled"
+        );
+        assert_eq!(
+            output.stderr.len(),
+            BYTES,
+            "stderr was truncated or stalled"
+        );
+        Ok(())
+    }
+
+    /// Killing a timed-out child is not the same as reaping it.
+    /// `std::process::Child` has no reaping `Drop`, so dropping the handle
+    /// after the `kill` strands the corpse in state `Z` for the lifetime of
+    /// this process. `rocmd` reaches this path from its watcher tick, so on a
+    /// host where `amd-smi` reliably overruns the probe timeout that is an
+    /// unbounded PID leak rather than a one-off.
+    ///
+    /// The child records its own PID before sleeping well past the timeout, so
+    /// this watches the real process table instead of inferring anything from
+    /// the returned error. Drop `reap_in_background` and the entry sits at `Z`
+    /// until the poll below gives up.
+    ///
+    /// Linux-only: `/proc` is where a zombie is observable. The behaviour is
+    /// not Linux-specific, only the assertion is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_timed_out_child_is_reaped_rather_than_left_a_zombie() -> Result<()> {
+        /// The `stat` state field is the first token after the last `)`, which
+        /// is where parsing has to start because `comm` may itself contain
+        /// parentheses. `None` means the entry is gone, i.e. fully reaped.
+        fn process_state(pid: u32) -> Option<char> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat.rsplit_once(')')?
+                .1
+                .split_whitespace()
+                .next()?
+                .chars()
+                .next()
+        }
+
+        let temp_root = std::env::temp_dir().join(format!("rocm-cli-reap-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let pid_file = temp_root.join("child-pid");
+
+        // `$$` is this `sh`, which is our direct child whether or not the shell
+        // execs the `sleep` over itself — either way it is the process we kill
+        // and therefore the one that must be reaped. The sleep outlasts the
+        // timeout by enough that the child cannot exit on its own and make the
+        // assertion pass for the wrong reason.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("echo $$ > '{}'; sleep 30", pid_file.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let result = run_command_with_timeout(command, Duration::from_millis(300));
+        assert!(
+            result.is_err(),
+            "the child outlives the timeout, so this must have timed out: {result:?}"
+        );
+
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .context("the child never recorded its pid, so nothing was proven")?
+            .trim()
+            .parse()
+            .context("unparseable child pid")?;
+        let _ = fs::remove_dir_all(&temp_root);
+
+        // Poll until the entry is *gone*, which is the only state that proves
+        // both halves of the contract. `!= Z` would not: a timeout path that
+        // never killed the child leaves it in `S`, which satisfies `!= Z` while
+        // the child sleeps on. Two transients make this a poll rather than a
+        // single sample — the kernel tearing the child down after the `SIGKILL`
+        // (briefly still `R`/`S`) and the detached reaper waiting on the corpse
+        // (`Z`) — so anything short of `None` is retried until the deadline.
+        //
+        // No PID-reuse hazard: the loop stops at the first `None`, and the slot
+        // cannot be recycled before then because a zombie still occupies it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut state = process_state(pid);
+        while state.is_some() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            state = process_state(pid);
+        }
+
+        assert_eq!(
+            state, None,
+            "pid {pid} was never reaped: the timeout path must kill the child and wait on it \
+             (state `Z` means it was killed but not reaped; any live state means it was \
+             never killed)"
+        );
+        Ok(())
+    }
+
+    /// No host off Linux has a `/dev/kfd`, so the pre-flight must wave the
+    /// launch through instead of reading the absent node as "unsafe".
+    /// `amd-smi.exe` is a supported Windows binary, so treating its absence as
+    /// a failure would disable GPU detection on every Windows host.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn the_kfd_preflight_waves_through_hosts_that_have_no_kfd() {
+        assert!(kfd_readable(Path::new("/definitely/not/a/device/node")));
+        assert!(amd_smi_preflight_ok());
+    }
+
+    /// WSL has no `/dev/kfd` either, but unlike Windows it cannot be waved
+    /// through by `cfg`: it compiles as Linux, so the real open runs, always
+    /// fails, and declines every routed `amd-smi` launch on a supported
+    /// platform — silently, since both `serve` probes drop the error with
+    /// `.ok()?`. Same wave-through as the off-Linux case above, decided at
+    /// runtime instead.
+    ///
+    /// The bare-metal assertion is the control: without it this would still
+    /// pass with the wave-through deleted.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kfd_preflight_waves_through_wsl_hosts() {
+        let absent = Path::new("/definitely/not/a/device/node");
+        assert!(
+            kfd_readable_with(true, absent),
+            "WSL has no /dev/kfd, so its absence must not decline the launch"
+        );
+        assert!(
+            !kfd_readable_with(false, absent),
+            "a bare-metal host with no readable KFD must still be declined"
+        );
     }
 
     #[test]

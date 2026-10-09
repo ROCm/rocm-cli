@@ -5,9 +5,8 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, daemon_binary_path,
-    default_engine_for_platform, format_host_port, load_recent_automation_events,
-    resolve_amd_smi_binary, unix_time_millis,
+    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, amd_smi_json, daemon_binary_path,
+    default_engine_for_platform, format_host_port, load_recent_automation_events, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -108,34 +107,7 @@ pub(crate) fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBri
 }
 
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
-    let amd_smi_binary = resolve_amd_smi_binary();
-    let mut command = ProcessCommand::new(&amd_smi_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
-        .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        anyhow::bail!(
-            "amd-smi {} failed: {}",
-            args.join(" "),
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                format!("exit status {}", output.status)
-            }
-        );
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .with_context(|| format!("failed to parse amd-smi {} json", args.join(" ")))
+    amd_smi_json(args, AMD_SMI_PROBE_TIMEOUT)
 }
 
 pub(crate) fn bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
