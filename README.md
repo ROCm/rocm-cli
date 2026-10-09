@@ -111,13 +111,18 @@ irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 
 Open a new terminal so the updated `PATH` takes effect, then run:
 
-```
+```bash
 rocm version
 ```
 
 The output shows the ROCm CLI version with its release tag or branch and commit
-hash, the ROCm SDK this machine would use, and the GPU driver version. The SDK
-and driver lines read `not detected` when none is found.
+hash, the ROCm SDK that ROCm CLI would use on this computer, and the GPU driver
+version. A successful install prints the CLI version line. The SDK and driver
+lines read `not detected` when none is found, which is expected on a computer
+where you haven't installed ROCm or a driver yet.
+
+If the shell reports `rocm: command not found`, confirm that `~/.local/bin` is on
+your `PATH`.
 
 ## Build from source
 
@@ -876,14 +881,15 @@ rocm uninstall [--yes] [--dry-run]
                [--force-dev-binaries]
 ```
 
-`rocm uninstall` removes the files ROCm CLI manages on this computer. Use
-`--dry-run` to preview what it removes, and `--yes` to skip the confirmation.
-Each `--keep-*` flag leaves one category in place:
+`rocm uninstall` removes four categories of files that ROCm CLI manages on this
+computer: its binaries, configuration, data, and caches. Use `--dry-run` to
+preview what it removes, and `--yes` to skip the confirmation. Each `--keep-*`
+flag leaves one category in place:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
-- `--keep-data` keeps app data such as logs, services, engines, and the `uv`
-  package cache.
+- `--keep-data` keeps app data such as logs, services, engines, the managed ROCm
+  SDK installs, and the `uv` package cache.
 - `--keep-cache` keeps the caches under the cache directory. It doesn't cover
   the `uv` package cache, which `--keep-data` controls.
 
@@ -891,12 +897,17 @@ When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the debug and release binaries
 beside it.
 
-Before removing anything, `uninstall` notes any shared caches it leaves alone.
-It also warns when managed service records exist, because it doesn't stop their
-background processes, and when remote sessions exist. For each remote session,
-run `rocm remote stop <session>` first. Otherwise the model keeps running on the
-remote machine with its endpoint published, and the record that tracked it is
-gone.
+Before removing anything, `uninstall` prints warnings about two situations:
+
+- Managed service records exist. `uninstall` doesn't stop their background
+  processes.
+- Remote sessions exist. For each one, run `rocm remote stop <session>` first.
+  Otherwise the model keeps running on the remote machine with its endpoint
+  published, and the record that tracked it is gone.
+
+It also lists the shared caches it leaves in place: the `uv` package cache and the
+Hugging Face model cache, when they live outside the ROCm CLI directories. Delete
+them yourself if you no longer need them.
 
 ### Shell completions
 
