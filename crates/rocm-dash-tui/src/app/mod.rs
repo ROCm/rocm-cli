@@ -1245,7 +1245,8 @@ mod tests {
 
     #[test]
     fn actions_does_not_import_from_scrollbar() {
-        // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit).
+        // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit,
+        // plus apply_action under cfg(test)).
         // A `use`/`pub use`/`pub(crate) use` in actions.rs naming the scrollbar
         // module -- directly, through `crate::app::scrollbar`, or by one of the
         // names app/mod.rs re-exports from it (ScrollbarHandle, ScrollDrag,
@@ -1257,11 +1258,14 @@ mod tests {
         // rustfmt-wrapped multi-line `use super::{ ... }` group is one match
         // candidate, not several innocuous lines, and matches whole identifier
         // tokens rather than a bare substring, so `vertical_scrollbar` doesn't
-        // false-positive on `scrollbar`. It does NOT catch a fully-qualified
-        // path referenced directly in an expression or type position with no
-        // `use` statement at all (e.g. a bare `super::scrollbar::resolve_mouse(
-        // ..)` call) -- that would need real parsing, not a source scan, and is
-        // the test's accepted scope limit.
+        // false-positive on `scrollbar`. A leading `#[cfg(test)]` (or any other
+        // attribute) on the `use` is stripped before the check, since e.g.
+        // `scrollbar.rs` itself gates its `use super::actions::apply_action;`
+        // this way. It does NOT catch a fully-qualified path referenced
+        // directly in an expression or type position with no `use` statement
+        // at all (e.g. a bare `super::scrollbar::resolve_mouse(..)` call) --
+        // that would need real parsing, not a source scan, and is the test's
+        // accepted scope limit.
         const SCROLLBAR_NAMES: [&str; 4] =
             ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
 
@@ -1270,8 +1274,36 @@ mod tests {
                 .filter(|t| !t.is_empty())
         }
 
+        fn strip_attributes(mut s: &str) -> &str {
+            loop {
+                s = s.trim_start();
+                if !s.starts_with("#[") {
+                    return s;
+                }
+                let mut depth = 0i32;
+                let mut end = None;
+                for (i, c) in s.char_indices() {
+                    match c {
+                        '[' => depth += 1,
+                        ']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = Some(i + 1);
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                match end {
+                    Some(e) => s = &s[e..],
+                    None => return s,
+                }
+            }
+        }
+
         fn is_use_statement(stmt: &str) -> bool {
-            let s = stmt.trim_start();
+            let s = strip_attributes(stmt);
             let s = s
                 .strip_prefix("pub(crate)")
                 .or_else(|| s.strip_prefix("pub"))
