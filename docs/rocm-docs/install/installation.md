@@ -28,8 +28,10 @@ serving is Linux or WSL2 only (see
 :end-before: "See [CONTRIBUTING.md]"
 ```
 
-To remove ROCm CLI and what it manages, see
-[Logs and cleanup](../commands.md#logs-and-cleanup).
-
 See [Contributing](../about/contributing.md) for the full development setup, test
 commands, and commit-signing requirements.
+
+## Uninstall ROCm CLI
+
+To remove ROCm CLI and what it manages, see
+[Logs and cleanup](../commands.md#logs-and-cleanup).
