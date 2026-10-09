@@ -209,8 +209,8 @@ show it as `legacy_rocm_status: detected_unmanaged`. Running `rocm install sdk`
 creates a separate managed runtime alongside it.
 
 By default, `rocm install sdk` installs ROCm 7.14. For ROCm 10.0 or newer, add
-`--version` and `--family` with the exact GPU arch from `rocm examine`, for
-example `--version 10.1.0 --family gfx1200`.
+`--version` and `--family`, and give `--family` the exact GPU arch (the raw `gfx`
+code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
 Running the command when a managed runtime is already the active default asks
 first, because the new install takes over as the active default; see
@@ -289,6 +289,8 @@ Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
 are ranking positions for reading order only. `rocm fix` takes the id, not the
 position.
 
+`rocm diagnose` takes these flags:
+
 - `--symptom` takes raw error text to sharpen keyword scoring.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5). `--json` always emits the full, untruncated report.
@@ -301,27 +303,6 @@ position.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing. There is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action.
-
-  The content is deliberately narrow (a schema version, the matched entry, whether
-  a fix was offered for it, the GPU architecture and which compatibility
-  matrix snapshot it was checked against, the OS family, distribution and
-  major version, the ROCm release, the inference engine and its release, the
-  CLI version), and it carries no host name, user name, file path, or error
-  text.
-
-  The ROCm release and the inference engine's release are each cut
-  back to a release, so a build number that would narrow toward one machine
-  never appears there; the CLI's own version is the exception, since it names
-  the tool that wrote the report instead of something read off the machine.
-  The distribution is checked against a list of known names instead of
-  being repeated from the machine.
-
-  Hardware that is not on AMD's published
-  compatibility matrix produces no report at all, and the CLI says why. So
-  does a WSL machine, for a different reason: this CLI does not inspect the
-  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
-  matrix and says that instead of claiming the architecture could not be
-  read.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
@@ -329,13 +310,34 @@ position.
   `--report` is what guarantees the content is shown before the mail is
   offered.
 
-  A mail client opens only when you asked and the machine looks like
-  a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
-  set, the address and the link are printed instead, which is also what
-  happens on a machine with no mail client. It is not combinable with
-  `--json`, which exists for scripts, and a script is not a person who can
-  read a mail before sending it. Note that a mail carries your address, which
-  the report itself does not.
+The `--report` content is deliberately narrow (a schema version, the matched entry, whether
+a fix was offered for it, the GPU architecture and which compatibility
+matrix snapshot it was checked against, the OS family, distribution and
+major version, the ROCm release, the inference engine and its release, the
+CLI version), and it carries no host name, user name, file path, or error
+text.
+
+The ROCm release and the inference engine's release are each cut
+back to a release, so a build number that would narrow toward one machine
+never appears there; the CLI's own version is the exception, since it names
+the tool that wrote the report instead of something read off the machine.
+The distribution is checked against a list of known names instead of
+being repeated from the machine.
+
+Hardware that is not on AMD's published
+compatibility matrix produces no report at all, and the CLI says why. So
+does a WSL machine, for a different reason: this CLI does not inspect the
+GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+matrix and says that instead of claiming the architecture could not be
+read.
+
+With `--send`, a mail client opens only when you asked and the machine looks like
+a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
+set, the address and the link are printed instead, which is also what
+happens on a machine with no mail client. It is not combinable with
+`--json`, which exists for scripts, and a script is not a person who can
+read a mail before sending it. Note that a mail carries your address, which
+the report itself does not.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported, not the
 ranking position noted above, which isn't a stable name. Run it with no id
@@ -349,6 +351,8 @@ can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
 (no reliable fix exists, so nothing will be changed; no catalog entry
 carries this marker today, and it is reserved for a future detect-but-cannot-repair
 failure).
+
+`rocm fix` takes these flags:
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
@@ -736,6 +740,8 @@ utilization graphs, active serving instances, benchmark results, guided actions,
 and a chat tab backed by any configured provider. See
 [Interactive interfaces](#interactive-interfaces) for the tab breakdown.
 
+For `rocm dash`:
+
 - `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
   It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
@@ -754,6 +760,8 @@ throughput. It is a local smoke test, **not** an official ROCm or AMD benchmark.
 (the vLLM `benchmark_serving` shape); it does not reproduce agent-shaped,
 multi-turn, long-context tool traffic and isn't comparable to `*-agent-bench`
 quality harnesses.
+
+Flags and output for `rocm bench load`:
 
 - `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
   plain host address without `/v1` also works). Only `http://` is accepted;
