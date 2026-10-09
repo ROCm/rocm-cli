@@ -1390,6 +1390,10 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
         .output()
         .expect("failed to run rocmd bridge-snapshot");
     world.cli_output = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    // Kept rather than dropped: when the snapshot comes back degraded the
+    // reason is usually here, and a failure that quotes only the JSON leaves
+    // the next reader guessing.
+    world.cli_stderr = Some(String::from_utf8_lossy(&output.stderr).into_owned());
     world.cli_rc = Some(output.status.code().unwrap_or(-1));
 }
 
@@ -1397,23 +1401,38 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
 async fn assert_telemetry_survived_large_output(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no rocmd exit status recorded");
     let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
-    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
 
-    let snapshot: serde_json::Value =
-        serde_json::from_str(stdout).expect("bridge-snapshot did not emit JSON");
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
     let gpu = &snapshot["gpu"];
 
     assert_eq!(
         gpu["amd_smi_available"],
         serde_json::Value::Bool(true),
         "amd-smi answered with a valid document, so the only thing that can have made it \
-         unavailable is this side failing to read it: note={:?}",
+         unavailable is this side failing to read it: note={:?}\n{stderr}",
         gpu["note"]
     );
+    // Both probes, because `gather_gpu_snapshot` gives up on the first failure
+    // and reports what it already has: a `monitor` probe killed by the very
+    // defect this scenario is named for still leaves `amd_smi_available: true`
+    // with a full `static_snapshot`, and only the note and the missing
+    // `monitor_snapshot` say otherwise. Asserting the first probe alone would
+    // let half the symptom through.
+    for probe in ["static_snapshot", "monitor_snapshot"] {
+        assert_eq!(
+            gpu[probe].as_array().map(Vec::len),
+            Some(STUB_GPU_COUNT),
+            "{probe} must carry every GPU amd-smi described; a short read is the same defect \
+             arriving quietly rather than as a timeout. note={:?}\n{stderr}",
+            gpu["note"]
+        );
+    }
     assert_eq!(
-        gpu["static_snapshot"].as_array().map(Vec::len),
-        Some(STUB_GPU_COUNT),
-        "the snapshot must carry every GPU amd-smi described; a short read is the same defect \
-         arriving quietly rather than as a timeout"
+        gpu["note"],
+        serde_json::Value::Null,
+        "a snapshot that read both probes in full has nothing to explain\n{stderr}"
     );
 }

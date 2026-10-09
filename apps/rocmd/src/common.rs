@@ -61,10 +61,16 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // `{error:#}` rather than `to_string()`: the outermost context
+                // alone says "failed to launch amd-smi ...", which names the
+                // wrong thing when what actually happened was a timeout or a
+                // JSON parse failure. The note is the only account of this that
+                // reaches the bridge snapshot and the automation watcher, so it
+                // carries the causes too.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -75,10 +81,11 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // Same reasoning as the `static` probe above.
                 amd_smi_available: true,
                 static_snapshot,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };

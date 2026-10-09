@@ -281,9 +281,12 @@ Feature: GPU detection and system inspection
   # pipe buffer (~64KiB) blocked in `write`, never exited, and was killed at the
   # timeout. The probe runs under a 2s budget, so on a multi-GPU host -- where
   # `amd-smi static -a -g all --json` comfortably clears that buffer -- GPU
-  # telemetry reported `amd_smi_available: false` with a spurious timeout note,
-  # permanently. That answer feeds `bridge-snapshot`, the `examine_snapshot` and
-  # `bridge_snapshot` tools, and the automation watcher.
+  # telemetry reported `amd_smi_available: false`, permanently, with a note
+  # reading `failed to launch amd-smi static -a -g all --json`. The note blamed
+  # the launch rather than the timeout that actually happened, because
+  # `gather_gpu_snapshot` rendered only the outermost context; it now uses
+  # `{error:#}` and carries the cause. That answer feeds `bridge-snapshot`, the
+  # `examine_snapshot` and `bridge_snapshot` tools, and the automation watcher.
   #
   # The size of the output is the whole premise, so the stub emits ~150KiB --
   # over two buffers. A stub that printed a few hundred bytes would pass against
