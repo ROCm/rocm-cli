@@ -21,6 +21,8 @@ mod deletion_properties;
 mod driver_install;
 mod endpoint_keys;
 mod engines_cmd;
+#[cfg(test)]
+mod gpu_selection_proptests;
 mod logging;
 mod provider_keys;
 mod providers;
