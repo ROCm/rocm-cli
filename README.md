@@ -395,6 +395,9 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 by ROCm CLI. It can install ROCm 7.14, 10.0, or 10.1. To install 10.0 or newer,
 follow the steps under ROCm 10 and newer, below.
 
+To remove ROCm CLI and what it manages, see
+[Logs and cleanup](#logs-and-cleanup).
+
 #### Compiler toolchain (--devel)
 
 Pass `--devel` to also install the compiler and headers needed to build GPU
