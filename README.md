@@ -589,7 +589,8 @@ run here instead.
 true:
 
 - The recipe catalog could not be read.
-- This machine's GPU memory could not be measured.
+- This machine's GPU memory could not be measured. This includes an integrated
+  GPU (APU), where the CLI can't yet read the memory pool the engine uses.
 - The model is not one of the curated recipes. [`rocm model`](#curated-models)
   lists those.
 
@@ -927,10 +928,10 @@ flag leaves one category in place:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
-- `--keep-data` keeps app data such as logs, services, engines, the managed ROCm
-  SDK installs, and the `uv` package cache.
+- `--keep-data` keeps app data such as logs, services, engines, downloaded
+  models, the managed ROCm SDK installs, and the managed `uv` package cache.
 - `--keep-cache` keeps the caches under the cache directory. It doesn't cover
-  the `uv` package cache, which `--keep-data` controls.
+  the managed `uv` package cache, which `--keep-data` controls.
 
 When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the debug and release binaries
@@ -944,9 +945,10 @@ Before removing anything, `uninstall` prints warnings about two situations:
   Otherwise the model keeps running on the remote machine with its endpoint
   published, and the record that tracked it is gone.
 
-It also lists the shared caches it leaves in place: the `uv` package cache and the
-Hugging Face model cache, when they live outside the ROCm CLI directories. Delete
-them yourself if you no longer need them.
+It also lists the shared caches it leaves in place, when they live outside the
+ROCm CLI directories: a `uv` package cache that `UV_CACHE_DIR` or the default
+`~/.cache/uv` points to, and the Hugging Face model cache. Delete them yourself
+if you no longer need them.
 
 ### Shell completions
 
