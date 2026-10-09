@@ -23,7 +23,7 @@ There is no file-line-count CI gate enforcing this — `too_many_lines = "allow"
 
 Scoped to the crates that make up the shipped CLI/daemon/dashboard/engine surface, plus `crates/e2e-report` (a shared exception: it's HTML/markdown reporting consumed only by `xtask` and `tests/e2e-cucumber`, but it's still one of the modularization effort's target files, so it's mapped below). Dev-tooling and test-harness workspace members (`xtask`, `tests/e2e-cucumber` themselves) are otherwise out of scope — they're not part of the modularization effort's inventory.
 
-Each crate's modules are listed one per line, sorted alphabetically by filename, so a newly-extracted module has a predictable insertion point and doesn't force a rewrite of its neighbors.
+Each crate's modules are listed one per line. Flat per-crate inventories (every section below except `rocm-dash-tui`'s directory-split `agent/` and `app/` lists) are sorted alphabetically by filename, so a newly-extracted module has a predictable insertion point and doesn't force a rewrite of its neighbors; the `agent/` and `app/` lists instead keep `mod.rs` first, followed by the other files in the order described in the prose above each list.
 
 ### `apps/rocm` — main CLI binary
 
