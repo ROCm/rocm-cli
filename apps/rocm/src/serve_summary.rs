@@ -134,7 +134,7 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ("service", summary.service_id.clone()),
             (
                 "stop",
-                format!("rocm services stop {} --yes", summary.service_id),
+                crate::service_hints::service_stop_hint(&summary.service_id),
             ),
             (
                 "logs",

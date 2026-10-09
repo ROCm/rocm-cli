@@ -616,8 +616,8 @@ Manage background servers started with `--managed`:
 ```
 rocm services list [--all] [--json]
 rocm services logs <service-id>
-rocm services stop <service-id> [--yes]
-rocm services restart <service-id> [--yes]
+rocm services stop <service-id> --yes
+rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
