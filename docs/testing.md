@@ -672,8 +672,17 @@ happens before anything is stopped, so it cannot take down a running service. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
-that later observes the process dead. There is no e2e coverage of `services
-stop`/`restart` or endpoint auth; these paths are unit-tested only.
+that later observes the process dead. `service-stop-01`
+(`features/service_stop.feature`) covers `services stop` succeeding against a
+running record on the mock lane and the record being persisted as stopped;
+there is still no e2e coverage of the key being dropped or `services restart`,
+which remain unit-tested only. Reusing a running service for a
+`--require-api-key` request it never had is refused rather than silently
+upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane)
+covers the local refusal and that its printed stop hint actually clears it;
+`remote-15` (`features/remote.feature`, `@requires-docker`) covers the same
+refusal on `rocm remote serve`, reusing the fake remote's own deterministic
+service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being

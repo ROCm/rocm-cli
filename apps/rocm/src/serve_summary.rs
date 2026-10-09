@@ -132,7 +132,10 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
             ("time to first token", format_ttft(summary.metrics.ttft)),
             ("throughput (approx)", format_tps(summary.metrics.gen_tps)),
             ("service", summary.service_id.clone()),
-            ("stop", format!("rocm services stop {}", summary.service_id)),
+            (
+                "stop",
+                crate::service_hints::service_stop_hint(&summary.service_id),
+            ),
             (
                 "logs",
                 format!("rocm logs --service {}", summary.service_id),
@@ -295,7 +298,16 @@ mod tests {
         assert!(rendered.contains("Qwen/Qwen2.5-7B-Instruct"));
         assert!(rendered.contains("180 ms"));
         assert!(rendered.contains("42.1 tok/s"));
-        assert!(rendered.contains("rocm services stop vllm-qwen-1720000000"));
+        // The printed hint must be the exact, directly-runnable command: `main.rs`'s
+        // `service_actions_require_yes_and_render_sandbox_result` proves this exact
+        // form (`rocm services stop <id> --yes`) is the one the approval gate itself
+        // recommends. That running this form actually stops the service is proven
+        // by `@id:service-stop-yes-stops-a-running-service`
+        // (`tests/e2e-cucumber/features/service_stop.feature`), which plants a
+        // running record and asserts it is left `stopped` — not by
+        // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which runs
+        // this same invocation as best-effort teardown and never asserts success.
+        assert!(rendered.contains("rocm services stop vllm-qwen-1720000000 --yes"));
     }
 
     #[test]
