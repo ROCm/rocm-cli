@@ -9,6 +9,8 @@ use crate::persistence::load_managed_services;
 use crate::service::stop_managed_service;
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
+use rocm_core::command_failure_detail;
 use rocm_core::{
     AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
     model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
@@ -968,18 +970,10 @@ fn run_process_with_timeout(
             let output = child
                 .wait_with_output()
                 .context("failed to collect timed-out sandbox process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             bail!(
                 "sandbox process exceeded {}s timeout: {}",
                 timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
+                command_failure_detail(&output)
             );
         }
         thread::sleep(Duration::from_millis(50));

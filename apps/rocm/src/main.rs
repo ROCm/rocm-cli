@@ -56,15 +56,15 @@ use rocm_core::{
     ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    detect_host_gfx_target, detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs,
-    format_host_port, format_http_base_url, interactive_terminal, load_model_recipe_registry,
-    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
-    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
-    normalize_therock_family, platform_matches_gfx_family,
-    preferred_serve_engine_for_host_gpu_summary, process_is_running, read_http_response_bounded,
-    resolve_builtin_model_recipe, runtime_install_root_is_protected,
+    builtin_watchers, command_failure_detail, connect_tcp_stream, daemon_binary_path,
+    default_engine_for_platform, detect_host_gfx_target, detect_host_gpu_summary,
+    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
+    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
+    managed_service_endpoint_readiness, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family, preferred_serve_engine_for_host_gpu_summary, process_is_running,
+    read_http_response_bounded, resolve_builtin_model_recipe, runtime_install_root_is_protected,
     runtime_python_executable_in_env, uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
@@ -13066,18 +13066,10 @@ fn run_command_with_timeout(
             let output = child
                 .wait_with_output()
                 .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             bail!(
                 "process exceeded {}s timeout: {}",
                 timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
+                command_failure_detail(&output)
             );
         }
         thread::sleep(Duration::from_millis(50));
