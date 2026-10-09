@@ -130,7 +130,7 @@ fn check(program: &OsStr, root: &Path, if_available: bool) -> Result<()> {
         ),
         (Checker::Missing, true) => {
             eprintln!(
-                "lychee: not installed; skipping the markdown-link check (the docs-links CI \
+                "lychee: not found on PATH; skipping the markdown-link check (the docs-links CI \
                  job still runs it). Install it with: {}",
                 install_hint()
             );

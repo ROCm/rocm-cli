@@ -190,7 +190,7 @@ Keep docs and behavior claims in sync while editing:
   tree, CI only committed files. Keep a mention bare when no tracked file
   is meant — a generic "don't grow `main.rs`", a deleted file named
   historically, a glob, gitignored or generated output such as cucumber's
-  `report.json` — and where the rule does not reach: `.github/` (its
+  `report.json` — and where the rule does not apply: `.github/` (its
   templates become issue and PR bodies, where a relative link breaks),
   `docs/rocm-docs/` (Sphinx source built into a separate site, excluded
   from `docs-links`), README.md and CONTRIBUTING.md (`{include}`d into
