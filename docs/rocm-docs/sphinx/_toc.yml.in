@@ -3,6 +3,8 @@ subtrees:
   - caption: Install
     entries:
       - file: install/installation
+      - file: install/wsl
+        title: ROCm CLI on WSL2
   - caption: Getting started
     entries:
       - file: getting-started
