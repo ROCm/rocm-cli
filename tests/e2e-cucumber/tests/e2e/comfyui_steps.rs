@@ -941,6 +941,17 @@ async fn preview_command_includes_reinstall(world: &mut E2eWorld) {
 /// exits on its own if the scenario fails before stopping it.
 #[given("the ComfyUI that rocm-cli started is running from that install")]
 async fn comfyui_running_from_install(world: &mut E2eWorld) {
+    plant_running_stand_in(world);
+}
+
+/// The same stand-in, planted after a reinstall: its port does not answer,
+/// so rocm-cli sees it as still loading.
+#[when("a ComfyUI started by rocm-cli is still loading from that install")]
+async fn comfyui_loading_from_install(world: &mut E2eWorld) {
+    plant_running_stand_in(world);
+}
+
+fn plant_running_stand_in(world: &mut E2eWorld) {
     let output = std::process::Command::new("sh")
         .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
         .output()
@@ -1125,9 +1136,10 @@ async fn ask_status_in_plain_words(world: &mut E2eWorld) {
     world.cli_output = Some(answer);
 }
 
-#[then("the answer says ComfyUI is starting and does not advise starting it")]
+#[then("the answer says ComfyUI is installed and starting and does not advise starting it")]
 async fn answer_says_starting(world: &mut E2eWorld) {
     let answer = world.cli_output.clone().unwrap_or_default();
+    assert!(answer.contains("ComfyUI: installed\n"), "{answer}");
     assert!(answer.contains("Running: starting\n"), "{answer}");
     assert!(
         !answer.contains("comfyui start"),

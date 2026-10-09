@@ -128,16 +128,14 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # folder a reinstall changes, so the reinstall is refused until it is
   # stopped. The dry run says so first. The refusal names `rocm comfyui stop`;
   # the scenario runs exactly that and proves the same reinstall then goes
-  # through. The stand-in process answers on no port, so a natural-language
-  # status question gets "starting", and must not be told to start a second
-  # ComfyUI.
+  # through. Once it is reinstalled, a ComfyUI started from it that has not
+  # answered on its port yet is "starting" to a plain-words status question,
+  # which must not advise starting a second one.
   @id:comfyui-reinstall-refused-while-running @requires-os:linux
   Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
     And the ComfyUI that rocm-cli started is running from that install
-    When the user asks in plain words for ComfyUI's status
-    Then the answer says ComfyUI is starting and does not advise starting it
     When the user previews reinstalling ComfyUI
     Then the preview says the reinstall is refused until ComfyUI is stopped
     And the existing ComfyUI code and the user's files are untouched
@@ -148,6 +146,9 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
+    When a ComfyUI started by rocm-cli is still loading from that install
+    And the user asks in plain words for ComfyUI's status
+    Then the answer says ComfyUI is installed and starting and does not advise starting it
 
   # A reinstall killed while it replaces the code leaves a half-replaced
   # folder. `start` must not launch it; it names the install command that
