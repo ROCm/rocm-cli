@@ -58,7 +58,7 @@ impl UpdateAction {
     }
 
     /// `rocm` argv (after the binary) for this action.
-    fn args(self) -> Vec<String> {
+    pub(crate) fn args(self) -> Vec<String> {
         match self {
             Self::Check => vec!["update".into()],
             Self::Preview => vec!["update".into(), "--apply".into(), "--dry-run".into()],

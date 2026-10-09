@@ -482,7 +482,7 @@ updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
 ```
-rocm storage [report] [--json]
+rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```

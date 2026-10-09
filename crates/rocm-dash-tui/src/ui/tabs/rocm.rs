@@ -30,7 +30,7 @@ pub const VERBS: &[Verb] = &[
             "Pick an install folder (prefix)",
             "Dry-run to preview, then apply",
         ],
-        cmd: "rocm install --channel … --format …",
+        cmd: "rocm install sdk --channel … --format …",
         read_only: false,
         badge: None,
     },
@@ -44,7 +44,7 @@ pub const VERBS: &[Verb] = &[
             "Preview the update (dry-run)",
             "Apply the update and activate it",
         ],
-        cmd: "rocm update --check",
+        cmd: "rocm update",
         read_only: false,
         badge: None,
     },
@@ -54,11 +54,11 @@ pub const VERBS: &[Verb] = &[
         action: KeyAction::OpenExamine,
         summary: "Read-only environment check that flags what needs fixing.",
         steps: &[
-            "Run `rocm doctor` (one job, no approval)",
+            "Run `rocm examine` (one job, no approval)",
             "Review runtime / driver / permission checks",
             "Re-run after fixes with r",
         ],
-        cmd: "rocm doctor",
+        cmd: "rocm examine",
         read_only: true,
         badge: None,
     },
@@ -184,6 +184,61 @@ mod tests {
         assert!(
             out.contains("6.4.1"),
             "detected ROCm version not shown: {out:?}"
+        );
+    }
+
+    fn runs_label(action: KeyAction) -> &'static str {
+        VERBS
+            .iter()
+            .find(|verb| verb.action == action)
+            .unwrap_or_else(|| panic!("no ROCm verb opens {action:?}"))
+            .cmd
+    }
+
+    /// The detail pane prints `Runs: <cmd>`. A label that parses is not a
+    /// label that is true: each must name what its manager actually spawns,
+    /// so a user who copies it to a shell gets the same command.
+    #[test]
+    fn rocm_runs_labels_name_what_each_manager_spawns() {
+        use crate::ui::examine_manager::EXAMINE_ARGS;
+        use crate::ui::install_manager::InstallManagerState;
+        use crate::ui::update_manager::UpdateAction;
+
+        assert_eq!(
+            runs_label(KeyAction::OpenUpdate),
+            format!("rocm {}", UpdateAction::Check.args().join(" ")),
+            "the Update row's label must be the command its first action runs"
+        );
+        assert_eq!(
+            runs_label(KeyAction::OpenExamine),
+            format!("rocm {}", EXAMINE_ARGS.join(" ")),
+            "the doctor row's label must be the command the examine screen runs"
+        );
+
+        // Install takes user-chosen values, so its label shows `…` for them.
+        // Derive the label from the default form's argv: the subcommand, then
+        // each value flag with its value elided. Mode switches (`--dry-run`,
+        // or the approval flag a real install adds) depend on what the user
+        // picks in the form, so the label leaves them out.
+        let install = runs_label(KeyAction::OpenInstall);
+        let args = InstallManagerState::default()
+            .build_args()
+            .expect("the default install form builds an argv");
+        let mut expected = vec!["rocm".to_owned()];
+        let mut words = args.iter().peekable();
+        while let Some(word) = words.next() {
+            if !word.starts_with("--") {
+                expected.push(word.clone());
+            } else if words.peek().is_some_and(|next| !next.starts_with("--")) {
+                words.next();
+                expected.push(word.clone());
+                expected.push("…".to_owned());
+            }
+        }
+        assert_eq!(
+            install,
+            expected.join(" "),
+            "the Install row's label must name what the form runs, values elided"
         );
     }
 

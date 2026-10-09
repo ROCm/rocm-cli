@@ -113,6 +113,78 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Advised commands must parse
+
+`apps/rocm/src/advised_commands.rs` checks the `rocm`/`rocmd` commands that the
+CLI and its docs tell a user to run against the real parser. It is a text
+scanner: it finds commands by a leading `rocm ` or `rocmd ` word in these
+places, and checks only what it finds:
+
+- the `--help` of every visible command: lines that start with a command
+  (EXAMPLES rows) and inline backtick spans
+- production Rust string literals: backtick spans, literals that start with a
+  command, and labelled lines such as `next step: rocm …`. Comments and
+  `#[cfg(test)]` items are skipped.
+- `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
+  code-block lines
+- the VHS tapes under `docs/tapes/`
+
+Each line is split into the commands of a shell list (at `&&`, `||`, `;` and a
+`|` standing between spaces, but not inside quotes, `<…>`, `[…]` or `{…}`), and
+every command that runs `rocm` or `rocmd` is checked; commands for other tools
+are skipped. A command ends at a shell comment, a redirection, or where
+trailing prose starts (` (`, ` —`, ` → `, ` then `). A double space does not
+end it, except on an indented EXAMPLES row, where the description column
+follows one.
+
+It fills in placeholders such as `<model>` and `{}`, drops one that stands for
+options described elsewhere (`<case-appropriate options above>`), tries each
+`[--flag]` group and `a|b` alternative, then routes each command the way `rocm`
+itself does.
+These fail the test:
+
+- a command that clap rejects
+- a command that ends up at the natural-language planner, unless the advice
+  itself is a multi-word request: a quoted one (`rocm "start a local model"`)
+  or a placeholder that names one (`rocm --yes <natural language request>`). A
+  placeholder filled in with several words does not count, so a removed
+  subcommand that took a text argument (`frobnicate <TEXT>`) still fails.
+- a command that leaves out a required argument or subcommand, when it is a
+  line meant to be run as written: a fenced code line, a string literal that
+  starts with a command, a labelled `next step:`/`Try:` line, or a help
+  EXAMPLES row
+
+Only an inline backtick span in prose (``pass `rocm serve --engine` ``) may name
+a command without its values, or a command that marks the gap with `…`.
+
+`every_source_is_scanned` requires each of the four sources to still yield a
+named command (the `rocm examine` EXAMPLES row, the dashboard's `rocm update`
+literal, README's fenced `rocm install sdk` and inline `rocm examine`, the CLI
+tape's `rocm examine`) and a minimum count per source and surface, so a broken
+extractor cannot pass silently.
+
+Known gaps of the text scanner. Advice written these ways is not checked, or
+not checked as written:
+
+- a Rust raw string (`r#"…"#`) or a string literal that spans lines without a
+  trailing `\` is not read as one literal
+- a backtick span that wraps across lines in a Rust string is not seen
+  (Markdown joins wrapped spans; Rust does not)
+- a `{` or `}` inside a string in a `#[cfg(test)]` item can end the skipped
+  item early or late
+- templated advice whose verb is a format argument (the `services` retry line
+  in `main.rs`) is excluded and checked through the function that builds it
+  instead
+
+When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
+a reason, only when the text starts with `rocm` but is not advice to run
+anything, such as a log line or an error message that names the command. To see
+every command it found and the result for each:
+
+```bash
+cargo test -p rocm --bin rocm advised_commands::dump_advised_invocations -- --ignored --nocapture
+```
+
 Run the cross-platform smoke test:
 
 ```bash
