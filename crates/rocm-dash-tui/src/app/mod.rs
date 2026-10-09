@@ -1246,14 +1246,28 @@ mod tests {
     #[test]
     fn actions_does_not_import_from_scrollbar() {
         // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit).
-        // A `use super::scrollbar::...` in actions.rs would reintroduce the
-        // module cycle this file's split from scrollbar.rs exists to remove —
-        // the compiler accepts such a cycle, so nothing else catches it.
-        let src = include_str!("actions.rs");
-        let needle = ["super", "::", "scrollbar"].concat();
+        // A `use` in actions.rs naming the scrollbar module -- directly, through
+        // `crate::app::scrollbar`, or by one of the names app/mod.rs re-exports
+        // from it (ScrollbarHandle, ScrollDrag, FooterChip) -- would reintroduce
+        // the module cycle that moving PaneFocus/ScrollTarget into types.rs
+        // removes. The compiler accepts such a cycle, so nothing else catches
+        // it; this scans non-comment `use` lines instead, the way
+        // `no_checker_hand_sets_auto_applicable` (rocm-core/src/diagnose.rs)
+        // does for a similar unenforced invariant.
+        const SCROLLBAR_NAMES: [&str; 4] =
+            ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
+        let offenders: Vec<&str> = include_str!("actions.rs")
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("use ")
+                    && SCROLLBAR_NAMES.iter().any(|name| trimmed.contains(name))
+            })
+            .collect();
         assert!(
-            !src.contains(&needle),
-            "actions.rs must not import from scrollbar.rs"
+            offenders.is_empty(),
+            "actions.rs must not import from scrollbar.rs, directly or through \
+             app/mod.rs's re-exports (ScrollbarHandle, ScrollDrag, FooterChip): {offenders:#?}"
         );
     }
 
