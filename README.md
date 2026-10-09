@@ -225,10 +225,10 @@ environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged`. Running `rocm install sdk`
 creates a separate managed runtime alongside it.
 
-ROCm CLI supports ROCm 7.14, 10.0, and 10.1. By default, `rocm install sdk`
-installs the latest stable release, currently 7.14. For ROCm 10.0 or newer, add
-`--version` and `--family`, and give `--family` the exact GPU arch (the raw `gfx`
-code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
+`rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
+add `--version` and `--family`, and give `--family` the exact GPU arch (the raw
+`gfx` code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
 Running the command when a managed runtime is already the active default asks
 first, because the new install takes over as the active default; see
@@ -394,8 +394,8 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by ROCm CLI. ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
-it installs the latest stable release, currently 7.14. To install 10.0 or newer,
-follow the steps under ROCm 10 and newer, below.
+it currently installs ROCm 7.14. To install 10.0 or 10.1, follow the steps under
+ROCm 10 and newer, below.
 
 To remove ROCm CLI and what it manages, see
 [Logs and cleanup](#logs-and-cleanup).
