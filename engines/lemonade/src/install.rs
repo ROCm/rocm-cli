@@ -1979,8 +1979,9 @@ mod archive_properties {
         lemonade_root, lemond_path_in, prepare_embeddable_with, runtime_dir_in,
     };
 
-    /// The in-process extractor rejects every link kind and sets every file's
-    /// mode itself, so it promises the whole contract, not just "no escape".
+    /// The in-process extractor rejects every link kind and masks the modes
+    /// the archive carries, so it promises the whole contract, not just "no
+    /// escape".
     const FULL: Expect = Expect {
         modes: Modes::Safe,
         no_outward_links: true,
