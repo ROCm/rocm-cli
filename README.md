@@ -604,7 +604,9 @@ rocm model [--verbose]
 ```
 
 `rocm model` (alias `rocm models`) lists the recommended local models, grouped by
-the hardware they target. Pass `--verbose` to show detailed recipe diagnostics.
+the hardware they target. Pass `--verbose` to list every recipe, including ones
+hidden from the default list, with details such as aliases, data type, minimum
+GPU memory, and preferred engines.
 
 ### Model serving
 
@@ -826,11 +828,12 @@ providers with `/provider <name>`. With `--prompt`, or with input piped to
 standard input, it sends one prompt and prints the reply.
 
 - `--provider` selects `local` (a model that `rocm serve` runs on this machine,
-  the default), `openai`, or `anthropic`. It applies to the one-prompt form; the
-  dashboard chat ignores it and prints a note. A cloud provider needs setup
+  the default), `openai`, or `anthropic`. A cloud provider needs setup
   first: run `rocm config enable-provider <provider>` and
   `rocm config set-provider-key <provider>`. See [Configuration](#configuration).
 - `--tools` lets an OpenAI-compatible provider request ROCm tool calls.
+- `--provider`, `--model`, and `--tools` apply to the one-prompt form. The
+  dashboard chat ignores them.
 - `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
   forwarded to the request. Each is independent, so omit any of them to use the
   provider's default.
@@ -865,8 +868,11 @@ apply changes automatically. `list` shows the available watchers and their IDs.
 `enable` turns one on, and `--mode` sets how far it can act:
 
 - `observe` reports what it finds and changes nothing.
-- `propose` suggests a change for you to approve.
-- `contained` applies a change on its own, within a contained, reversible scope.
+- `propose` queues a suggested change for you to approve, for watchers that can
+  make one.
+- `contained` lets a watcher act on its own only where that is safe. Today only
+  `server-recover` does: it restarts a managed service that failed. The other
+  watchers stay review-gated or record only in this mode.
 
 ### Configuration
 
