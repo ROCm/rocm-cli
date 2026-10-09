@@ -600,15 +600,18 @@ async fn quit_confirm_presses_s_to_manage(world: &mut E2eWorld) {
 /// quit-confirm prompt's own marker must be gone (it closed, rather than
 /// merely sitting underneath whatever rendered), the Services overlay's own
 /// title must be on screen (`SERVICES_OVERLAY_TITLE`, drawn only by that
-/// overlay), and the overlay must show the specific model this scenario is
-/// about — not just that some overlay opened.
+/// overlay), and the overlay's own row must show the fixture's real service
+/// id (`e2e-mock` — `draw_services_manager` renders `r.id` as its own
+/// column, `services_manager.rs`).
+///
+/// The id, not the model name: the model name is already on screen from the
+/// earlier `the managed model is displayed` step and would still read true
+/// from the dimmed Observe background behind a centered modal that doesn't
+/// fully cover it (see `close_services_overlay`'s own comment on exactly
+/// this), so a model-name match alone wouldn't prove the overlay's own
+/// content, only that it rendered on top of something that already had it.
 #[then("the services overlay opens showing the managed model")]
 async fn services_overlay_opens_showing_managed_model(world: &mut E2eWorld) {
-    let model = world
-        .model_name
-        .as_deref()
-        .expect("no model name set")
-        .to_string();
     let tui = session(world);
     tui.wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
         .await
@@ -616,9 +619,9 @@ async fn services_overlay_opens_showing_managed_model(world: &mut E2eWorld) {
     tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
         .await
         .unwrap_or_else(|e| panic!("`s` never opened the services overlay: {e}"));
-    tui.wait_for_screen(&model, default_timeout())
+    tui.wait_for_screen("e2e-mock", default_timeout())
         .await
-        .unwrap_or_else(|e| panic!("the services overlay did not show {model:?}: {e}"));
+        .unwrap_or_else(|e| panic!("the services overlay did not show its own row: {e}"));
 }
 
 /// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
