@@ -6813,6 +6813,13 @@ pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The real host's `/etc/os-release`.
+///
+/// Deliberately not routed through `rocm_core::host_path`: every caller builds
+/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
+/// against the real machine, so a simulated host root must not choose its
+/// distro. The descriptive distro name `examine` reports comes from
+/// `rocm_core::detect_distro_name`, which does follow a simulated root.
 pub(crate) fn read_os_release() -> Result<String> {
     fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
 }
@@ -29194,6 +29201,47 @@ install therock";
         assert!(vram_capacity_is_meaningful(Some("gfx1151"), 2));
         // An unknown target is never treated as unified memory.
         assert!(vram_capacity_is_meaningful(None, 1));
+    }
+
+    /// The package-manager plans run against the real machine, so a simulated
+    /// host root must not change the distro they are built for: under a root
+    /// whose `/etc/os-release` names a different distro, `read_os_release`
+    /// still returns the real file.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn read_os_release_ignores_a_simulated_host_root() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-os-release-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        fs::write(
+            root.join("etc/os-release"),
+            "ID=planted-distro\nVERSION_ID=\"99.9\"\n",
+        )
+        .expect("write planted os-release");
+
+        let read = {
+            let mut env = ScopedTestEnv::new();
+            env.set(
+                rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
+                &root.to_string_lossy(),
+            );
+            read_os_release().unwrap_or_default()
+        };
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !read.contains("planted-distro"),
+            "read the simulated root's os-release: {read:?}"
+        );
+        assert_eq!(
+            read,
+            fs::read_to_string("/etc/os-release").unwrap_or_default()
+        );
     }
 
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually

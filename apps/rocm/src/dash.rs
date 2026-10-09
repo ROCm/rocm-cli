@@ -75,6 +75,11 @@ pub fn runner_options(
             rocm_core::is_wsl_host(),
             rocm_core::has_usable_amd_gpu(),
         ),
+        // The same `/dev/kfd` the rest of `rocm` probes, so a simulated E2E
+        // host can hide the GPU from the dashboard too. `host_path` is the
+        // identity outside an `e2e-test-hooks` build with a host root set, and
+        // the pre-flight still requires the real device either way.
+        amd_smi_host_kfd_device: rocm_core::host_path(rocm_dash_daemon::runner::KFD_DEVICE),
         test_clock_offset_path: dash_test_clock_offset_path(paths),
     }
 }
@@ -1223,6 +1228,21 @@ mod tests {
         let p = paths();
         let opts = runner_options(&cfg(), &p, false);
         assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Without a simulated host root the host-root view of `/dev/kfd` is the
+    /// real device, so the pre-flight is the single check it always was. A
+    /// build with `e2e-test-hooks` would honour a root set in the test
+    /// environment, so only the release configuration is pinned here.
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    #[test]
+    fn runner_options_points_the_kfd_preflight_at_the_real_device() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(
+            opts.amd_smi_host_kfd_device,
+            std::path::PathBuf::from("/dev/kfd")
+        );
     }
 
     /// Truth-tables the WSL gate as a pure function, independent of the test

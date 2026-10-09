@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -275,7 +275,7 @@ fn passive_driver_checks() -> Vec<DriverPassiveCheck> {
 fn passive_path_check(path: &str, detail: &str) -> DriverPassiveCheck {
     DriverPassiveCheck {
         name: path.to_owned(),
-        status: if Path::new(path).exists() {
+        status: if rocm_core::host_path(path).exists() {
             "present"
         } else {
             "missing"
@@ -286,7 +286,7 @@ fn passive_path_check(path: &str, detail: &str) -> DriverPassiveCheck {
 }
 
 fn passive_render_node_check() -> DriverPassiveCheck {
-    let present = fs::read_dir("/dev/dri")
+    let present = fs::read_dir(rocm_core::host_path("/dev/dri"))
         .ok()
         .into_iter()
         .flat_map(|entries| entries.filter_map(std::result::Result::ok))
@@ -1662,6 +1662,8 @@ fn driver_reboot_observed(executed_boot_id: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::tests::{ScopedTestEnv, test_paths};
+    #[cfg(unix)]
+    use std::path::Path;
 
     fn test_examine(os: &str, wsl: bool) -> ExamineSummary {
         ExamineSummary {
