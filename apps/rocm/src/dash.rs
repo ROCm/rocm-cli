@@ -121,9 +121,13 @@ const fn gpu_reachable_for_preflight(is_wsl_host: bool, has_usable_gpu: bool) ->
 /// the life of the run loop and a read that fails — including the file having
 /// been deleted — leaves the directive frozen at its last value, pinning the
 /// logical clock rather than restoring wall time. The warning goes to `tracing`, not
-/// stdout/stderr: the only caller is [`maybe_spawn_embedded_daemon`] on the
-/// `rocm dash` path, where the TUI owns the terminal (see `logging.rs`) and a
-/// stray write would corrupt the display.
+/// stdout/stderr. It is reached through [`runner_options`], which runtime code
+/// calls only from [`maybe_spawn_embedded_daemon`]; `run_async` calls that only
+/// when [`should_spawn_daemon`] holds, i.e. for a live `rocm dash` and for
+/// `rocm chat` (including the launcher's routes into them), not for a focused
+/// overlay or `rocm dash --replay`/`--demo`. On those paths the process is about
+/// to hand the terminal to the TUI, and the client log is file-only (see
+/// `logging.rs`), so a stray stdout/stderr write would corrupt the display.
 fn dash_test_clock_offset_path(paths: &AppPaths) -> Option<PathBuf> {
     let path = paths.dash_test_clock_file();
     if !path.is_file() {
