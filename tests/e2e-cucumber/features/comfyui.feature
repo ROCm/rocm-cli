@@ -1,4 +1,4 @@
-Feature: ComfyUI install reports progress and makes failures actionable
+Feature: ComfyUI install reports progress, makes failures actionable and preserves the runtime
 
   # `rocm comfyui install` shells out to `uv` to resolve ComfyUI's Python
   # dependencies. A failed resolve (a version conflict, a yanked release, a
@@ -86,3 +86,47 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the terminal shows an intermediate ComfyUI download progress frame
     And the ComfyUI install exits cleanly
     And the final terminal screen shows no ComfyUI download spinner line
+
+  # EAI-8051: `rocm comfyui install` installs ComfyUI's dependencies INTO the
+  # machine's managed ROCm runtime. Before #298 nothing constrained the torch stack,
+  # so a transitive dependency could pull CUDA `nvidia-*` wheels into the runtime
+  # and displace its ROCm torch, leaving a CUDA build with no AMD GPU support --
+  # installing an optional app broke the base. #298 now pins the torch stack with
+  # a `uv --constraint` file; this scenario guards against that regressing.
+  #
+  # The contract: after installing an optional app, the machine's ROCm runtime must
+  # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
+  # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
+  # so the scenario also requires that. It is also the step that catches a revert
+  # of #298 (the post-install GPU probe then bails and the install exits non-zero),
+  # so do not relax it as a mere premise: a bail-out (no runtime, download failure)
+  # would otherwise leave the runtime trivially unchanged and report green having
+  # installed nothing. It further requires the runtime's package set to have GROWN,
+  # because a zero exit code alone still permits an empty filtered requirement list,
+  # which skips the dependency install outright. Together those two make the
+  # runtime-health checks the ADDITIONAL contract on top of an install that really
+  # happened, not a substitute for it.
+  #
+  # Genuinely destructive and expensive: it needs a real managed runtime (a
+  # multi-GiB SDK install) and mutates it, so it runs ONLY on a GPU host, behind
+  # @nightly, against this scenario's own isolated runtime prefix (it must never
+  # share a runtime tree with other scenarios — it may corrupt it). Gated
+  # @requires-gpu @nightly, like runtime-install-sdk-active, which also does a
+  # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
+  # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
+  # combining it with @nightly would make this scenario unreachable on every lane;
+  # it touches the OS only as much as runtime-01's `install sdk --yes` does (installing
+  # missing torch system libraries), and otherwise only its own isolated runtime
+  # prefix. Native Linux only (@requires-os:linux @requires-bare-metal; WSL2 reports
+  # linux, so the first tag alone would not exclude it) until a Windows/WSL2 run of
+  # `comfyui install` has been seen. If that gate is lifted, note the `nvidia-*` check has
+  # no teeth on Windows (PyPI's Windows torch wheels are CPU builds).
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
+  Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
+    Given a machine with a managed ROCm runtime
+    And the runtime has torch and no CUDA packages
+    When the user installs ComfyUI without choosing a runtime
+    Then the ComfyUI install succeeds
+    And ComfyUI's dependencies were installed into the runtime
+    And the runtime's torch stack is unchanged
+    And no CUDA nvidia packages were added to the runtime

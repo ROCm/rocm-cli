@@ -46,6 +46,11 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
+//! `comfyui-05` is the GPU-only EAI-8051 guard: it installs ComfyUI into a real,
+//! isolated managed runtime and asserts the runtime's torch stack is unchanged, no
+//! `nvidia-*` distributions appeared, and the install really added packages. It
+//! reuses `comfyui-03`'s argument-less `comfyui install` When step.
+//!
 //! Black-box throughout: the planted registry manifests are plain JSON matching
 //! the CLI's on-disk schema, not typed imports from the product crates.
 
@@ -561,5 +566,266 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
     assert!(
         !screen.contains("Fetching ComfyUI source archive"),
         "download spinner line was not cleared on completion:\n{screen}"
+    );
+}
+
+// --- comfyui-05: installing ComfyUI must not damage the managed ROCm runtime ---
+
+/// Locate the managed runtime's venv interpreter. `rocm runtimes list` prints an
+/// `install_root: <path>` line for each installed runtime; the interpreter is
+/// resolved from it by [`find_venv_python`].
+///
+/// Reads `runtimes list` rather than `examine`: without an active runtime,
+/// examine's `Folder:` line can be the saved setup root instead of an
+/// `install_root`, and which it prints depends on the branch examine takes.
+/// `runtimes list` prints `install_root:` for every installed runtime.
+fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
+    let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
+    let roots: Vec<&str> = listing
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("install_root:"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        roots.len(),
+        1,
+        "expected exactly one installed runtime in the isolated world, found {}:\n{listing}",
+        roots.len()
+    );
+    let root = roots[0];
+    find_venv_python(Path::new(root)).unwrap_or_else(|| {
+        panic!("could not locate a venv python under the runtime install_root {root}")
+    })
+}
+
+/// The runtime's interpreter, expected exactly at `<install_root>/bin/python`
+/// (`Scripts/python.exe` on Windows): the product creates the venv at `install_root`.
+/// No fallback search, so a missing interpreter is reported rather than replaced by
+/// an unrelated one.
+fn find_venv_python(root: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidate = root.join("Scripts").join("python.exe");
+    #[cfg(not(windows))]
+    let candidate = root.join("bin").join("python");
+    candidate.is_file().then_some(candidate)
+}
+
+const TORCH_STACK_PROBE: &str = "import json,sys\n\
+     from importlib import metadata\n\
+     out={}\n\
+     for n in ('torch','torchvision','torchaudio'):\n\
+     \x20 try:\n\
+     \x20   out[n]=metadata.version(n)\n\
+     \x20 except metadata.PackageNotFoundError:\n\
+     \x20   out[n]=None\n\
+     sys.stdout.write(json.dumps(out))\n";
+
+/// Reads versions through `importlib.metadata` WITHOUT importing torch: importing
+/// loads the ROCm/CUDA shared libraries, which need the runtime's own
+/// `LD_LIBRARY_PATH`/`ROCM_PATH`, while this runs the interpreter bare.
+///
+/// Exact versions of the whole torch stack (`torch`, `torchvision`, `torchaudio`),
+/// formatted `name=version` (or `name=absent`), one per line. The product pins all
+/// three, so the scenario compares all three.
+fn torch_stack_versions(python: &Path) -> String {
+    let output = std::process::Command::new(python)
+        .args(["-c", TORCH_STACK_PROBE])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("torch stack probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    ["torch", "torchvision", "torchaudio"]
+        .iter()
+        .map(|n| {
+            let v = data.get(*n).and_then(serde_json::Value::as_str);
+            format!("{n}={}", v.unwrap_or("absent"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Enumerate installed distributions via `importlib.metadata` and emit their names
+/// as a JSON array. Used instead of `pip list` because uv-created managed runtimes
+/// have no `pip` module — `python -m pip` there exits non-zero with empty stdout,
+/// which a naive reader would misread as "no packages installed" and pass the
+/// nvidia check while the runtime is actually corrupted. `importlib.metadata` is in
+/// the stdlib, so it is always present; the probe emits `{names}` on success or
+/// `{error}` on failure so the caller can fail loudly rather than treat a broken
+/// probe as a clean result.
+const DISTRIBUTIONS_PROBE: &str = "import json,sys\n\
+     out={}\n\
+     try:\n\
+     \x20 from importlib import metadata\n\
+     \x20 out['names']=sorted({(d.metadata['Name'] or '') for d in metadata.distributions()})\n\
+     except Exception as ex:\n\
+     \x20 out['error']=type(ex).__name__+': '+str(ex)\n\
+     sys.stdout.write(json.dumps(out))\n";
+
+/// Every distribution name installed in the interpreter's environment, sorted.
+/// Panics if the interpreter cannot be run or the probe reports an error — a probe
+/// that cannot enumerate packages must NOT read as an empty environment, which
+/// would pass the nvidia check on a runtime it never actually inspected.
+fn installed_distributions(python: &Path) -> Vec<String> {
+    let output = std::process::Command::new(python)
+        .args(["-c", DISTRIBUTIONS_PROBE])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run runtime python {}: {e}", python.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|_| {
+        panic!("distributions probe returned non-JSON:\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    if let Some(error) = data.get("error").and_then(serde_json::Value::as_str) {
+        panic!(
+            "could not enumerate installed distributions on {}: {error}",
+            python.display()
+        );
+    }
+    let names = data
+        .get("names")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("distributions probe returned no 'names' array:\n{stdout}"));
+    names
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The `nvidia-*` CUDA distributions installed in the interpreter's environment.
+/// A ROCm runtime should have none; ComfyUI's install dragging any in is the
+/// EAI-8051 defect.
+fn nvidia_distributions(python: &Path) -> Vec<String> {
+    nvidia_only(installed_distributions(python))
+}
+
+fn nvidia_only(distributions: Vec<String>) -> Vec<String> {
+    distributions
+        .into_iter()
+        .filter(|name| {
+            name.to_ascii_lowercase()
+                .replace(['_', '.'], "-")
+                .starts_with("nvidia-")
+        })
+        .collect()
+}
+
+#[given("a machine with a managed ROCm runtime")]
+async fn setup_isolated_runtime(world: &mut E2eWorld) {
+    // DELIBERATELY do NOT call `world.use_shared_runtimes()`: this scenario may
+    // corrupt the runtime (that is the bug it pins), so it must own a private,
+    // throwaway runtime prefix. The runtime lands under the World's per-scenario
+    // data dir (only the download caches are shared), so a plain `install sdk` here
+    // lands in this scenario's own tree.
+    crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
+}
+
+#[given("the runtime has torch and no CUDA packages")]
+async fn assert_baseline_torch_present(world: &mut E2eWorld) {
+    let python = sole_runtime_python(world);
+    let stack = torch_stack_versions(&python);
+    assert!(
+        !stack.contains("torch=absent"),
+        "baseline runtime has no torch distribution; scenario premise absent \
+         ({stack}, python: {})",
+        python.display()
+    );
+    let distributions = installed_distributions(&python);
+    let nvidia = nvidia_only(distributions.clone());
+    assert!(
+        nvidia.is_empty(),
+        "runtime already has nvidia-* distributions before ComfyUI install; premise \
+         absent: {}",
+        nvidia.join(", ")
+    );
+    // Record the exact baseline torch stack so the post-install step can require it to
+    // be unchanged (see `assert_torch_unchanged`), and the baseline package set so
+    // it can require the install to have actually added something (see
+    // `assert_dependencies_installed`).
+    world.comfyui_baseline_torch_stack = Some(stack);
+    world.comfyui_baseline_distributions = Some(distributions);
+}
+
+#[then("the ComfyUI install succeeds")]
+async fn assert_install_succeeded(world: &mut E2eWorld) {
+    // The premise for every invariant below. `comfyui::install` bails early on
+    // several paths (no managed runtime, a runtime that isn't `ready`, a non-wheel
+    // format, a failed source download or `uv` acquisition); on any of those the
+    // runtime is TRIVIALLY unchanged and the torch/nvidia assertions would pass
+    // having exercised nothing. It is also the check that catches a revert of
+    // #298: without the torch constraint, the post-install GPU probe in
+    // `comfyui::install` bails, so the install exits non-zero and the torch and
+    // nvidia steps never run. Do not relax it as "just a premise".
+    let rc = world.cli_rc.expect("no ComfyUI install was run");
+    assert_eq!(
+        rc,
+        0,
+        "{}",
+        e2e_cucumber::cli_failure_report(
+            &["comfyui", "install"],
+            rc,
+            world.cli_output.as_deref().unwrap_or(""),
+            world.cli_stderr.as_deref().unwrap_or(""),
+        )
+    );
+}
+
+#[then("ComfyUI's dependencies were installed into the runtime")]
+async fn assert_dependencies_installed(world: &mut E2eWorld) {
+    // Closes the last vacuity path a zero exit code leaves open. `comfyui::install`
+    // guards the whole `uv` install with `if !packages.is_empty()`
+    // (`apps/rocm/src/comfyui.rs`), so an empty filtered requirement list skips it
+    // and still exits 0 — leaving the runtime untouched and every invariant below
+    // passing having installed nothing.
+    //
+    // Deliberately asserts the package set GREW rather than naming an expected
+    // dependency: ComfyUI's requirements drift upstream independently of this
+    // contract, so a named package would rot, while "the install put something in
+    // the runtime" is exactly the premise the invariants need and cannot go stale.
+    let python = sole_runtime_python(world);
+    let baseline = world
+        .comfyui_baseline_distributions
+        .as_ref()
+        .expect("no baseline distribution set was captured");
+    let after = installed_distributions(&python);
+    assert!(
+        after.iter().any(|name| !baseline.contains(name)),
+        "ComfyUI install added no distributions to the runtime, so it installed \
+         nothing and the runtime-preservation checks would pass vacuously \
+         ({} distributions before, {} after, python: {})",
+        baseline.len(),
+        after.len(),
+        python.display()
+    );
+}
+
+#[then("the runtime's torch stack is unchanged")]
+async fn assert_torch_unchanged(world: &mut E2eWorld) {
+    let python = sole_runtime_python(world);
+    let after = torch_stack_versions(&python);
+    let baseline = world
+        .comfyui_baseline_torch_stack
+        .as_deref()
+        .expect("no baseline torch stack was captured");
+    assert_eq!(
+        after,
+        baseline,
+        "ComfyUI install replaced part of the managed runtime's torch stack \
+         (before: [{baseline}], after: [{after}], python: {})",
+        python.display()
+    );
+}
+
+#[then("no CUDA nvidia packages were added to the runtime")]
+async fn assert_no_nvidia_packages(world: &mut E2eWorld) {
+    let python = sole_runtime_python(world);
+    let nvidia = nvidia_distributions(&python);
+    assert!(
+        nvidia.is_empty(),
+        "ComfyUI install added CUDA nvidia-* distributions to the ROCm runtime: {}",
+        nvidia.join(", ")
     );
 }
