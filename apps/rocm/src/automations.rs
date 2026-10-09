@@ -41,7 +41,7 @@ pub(crate) fn automations(command: Option<AutomationsCommand>) -> Result<()> {
                 println!("  policy: {note}");
             }
             println!("  config: {}", paths.config_path().display());
-            crate::ensure_background_helper_running()?;
+            crate::service_launch::ensure_background_helper_running()?;
         }
         AutomationsCommand::Disable { watcher } => {
             let Some(spec) = builtin_watcher(&watcher) else {

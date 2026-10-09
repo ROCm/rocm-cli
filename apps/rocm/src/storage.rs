@@ -480,7 +480,7 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         // `<service_id>.log` beside the manifest. `ManagedServiceRecord::new`
         // only *computes* that path (via `AppPaths::service_log_path`) - it
         // writes nothing. The file is created by the launch site,
-        // `spawn_managed_engine_child` here in `main.rs` for
+        // `spawn_managed_engine_child` (in `service_launch.rs`) for
         // `rocm serve --managed` and `supervise_service` in `rocmd` on the
         // supervised/recovery path. What *fills* it differs by platform, so the
         // redirect cannot be stated unqualified: `supervise_service` redirects

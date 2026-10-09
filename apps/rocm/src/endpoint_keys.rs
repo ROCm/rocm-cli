@@ -5,8 +5,9 @@
 //! Secure storage for per-service inference-endpoint API keys.
 //!
 //! When `rocm serve` binds a public (non-loopback) interface it protects the
-//! endpoint with an API key (see `resolve_endpoint_auth` in `main.rs`). The key
-//! is stored in a 0600 file under the services directory, keyed by service id.
+//! endpoint with an API key (see `resolve_endpoint_auth` in `service_launch.rs`).
+//! The key is stored in a 0600 file under the services directory, keyed by
+//! service id.
 //!
 //! A file — not the OS keychain — is deliberate: public binding is overwhelmingly
 //! a *headless server* action (that is what `0.0.0.0` is for), and headless Linux
@@ -35,7 +36,7 @@ pub(crate) fn endpoint_key_file_path(paths: &AppPaths, service_id: &str) -> Path
 /// existing value.
 pub(crate) fn store_endpoint_api_key(paths: &AppPaths, service_id: &str, key: &str) -> Result<()> {
     let path = endpoint_key_file_path(paths, service_id);
-    crate::write_private_file_0600(&path, key.as_bytes())
+    crate::service_launch::write_private_file_0600(&path, key.as_bytes())
         .with_context(|| format!("failed to write endpoint API key file {}", path.display()))
 }
 
