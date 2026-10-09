@@ -208,6 +208,9 @@ pub(crate) enum Command {
     /// tree stays a cache: an install happens only when nothing is present for the
     /// channel, an in-place side-by-side update only when the index is genuinely
     /// ahead, and anything unclear (an unreachable index) reuses what is there.
+    /// `--version`/`--build-date` override all of that: a pin is served if already
+    /// installed, else freshly installed side-by-side — the index's latest is
+    /// never consulted while a pin is set.
     E2ePrewarm {
         /// TheRock package channel the shared runtime should track.
         #[arg(long, default_value = "release")]
@@ -220,6 +223,13 @@ pub(crate) enum Command {
         /// `data/runtimes` is what the lanes export as `E2E_SHARED_RUNTIMES_DIR`.
         #[arg(long)]
         prewarm_dir: PathBuf,
+        /// Pin the pre-warmed SDK to this exact TheRock package version instead
+        /// of tracking the channel's latest.
+        #[arg(long, conflicts_with = "build_date")]
+        version: Option<String>,
+        /// Pin the pre-warmed SDK to the TheRock package built on this date.
+        #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
+        build_date: Option<String>,
     },
     /// Consolidate per-platform E2E `report.json` files (one per CI job/runner)
     /// into a single cross-platform HTML report, and print a summary matrix to
@@ -302,7 +312,15 @@ fn run() -> Result<()> {
             channel,
             keep,
             prewarm_dir,
-        } => e2e_prewarm::run(&channel, keep, &prewarm_dir)?,
+            version,
+            build_date,
+        } => e2e_prewarm::run(
+            &channel,
+            keep,
+            &prewarm_dir,
+            version.as_deref(),
+            build_date.as_deref(),
+        )?,
         Command::E2eReport {
             artifacts_dir,
             html_out,
