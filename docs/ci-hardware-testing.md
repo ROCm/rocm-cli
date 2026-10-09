@@ -19,7 +19,41 @@ newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
 that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`.
+`EAI-7548`. `xtask/src/workflow_contract.rs`'s
+`self_hosted_workflow_owns_the_gpu_lanes` test requires `e2e-gpu`,
+`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` to appear as job keys in
+`e2e-selfhosted.yml`, so a PR that moves one of these lanes back into
+`ci.yml` fails CI rather than merging unnoticed.
+
+## The three-stage validation ladder
+
+Three self-hosted GPU gates run at different points in a change's life. None
+are required-status checks (see "Blocking vs. non-blocking" below); what
+differs is when each runs and what hardware it covers.
+
+| Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
+|---|---|---|---|---|
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The 4 jobs in the Platforms table below (`e2e-gpu-strix-ubuntu` runs both its `[release, nightly]` channel legs per PR, ROCMAI-125) | No — absent from the required-status-check list |
+| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same 4 platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same 4 per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+
+R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
+covered, but off every PR's critical path, so they moved to the nightly-only
+rung instead of being removed outright.
+
+The release-candidate rung's `release/**` trigger merged in PR #415, so
+`e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
+"release/**"]`. `cargo xtask e2e-prewarm` has no `--version`/`--build-date`
+pin at HEAD (ROCMAI-430 adds mutually exclusive flags for that, so a
+release-branch run can hold at `n-1`/`n-2` instead of always tracking the
+latest channel index — see the pre-warm section below for its current,
+unpinned invocation). Wiring an actual `sdk_version: [current, n-1, n-2]`
+matrix axis into the release-branch trigger is a separate, not-yet-started
+step: nothing in this
+repo maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
+index-version parsers are private), so the release gate's SDK version is
+whatever `--version`/`--build-date` its caller passes, not an automatic
+3-way matrix.
 
 ## Platforms
 
@@ -151,7 +185,10 @@ platforms (it also runs `e2e-gpu-rad3` and `e2e-gpu-mi350p`, demoted from
 per-PR to nightly-only per ROCMAI-125) with the `@nightly` scenarios
 included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
-and GitHub step summary.
+and GitHub step summary. Since ROCMAI-429 the report keys each column by
+`(platform_slug, channel)` rather than platform alone, so `nightly.yml`'s
+release/nightly channel matrix renders two columns per platform instead of
+one channel's result silently overwriting the other.
 
 On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
 consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
@@ -175,6 +212,45 @@ of the same platform in separate columns. An unrecognised name renders as a
 guessed platform on Linux, which would report a Windows lane as Linux;
 `xtask`'s `every_uploaded_e2e_artifact_has_a_name_the_report_can_label` guards
 against it.
+
+## Engine is not an independently selectable axis
+
+None of the tables above vary the serve engine as a matrix dimension, because
+no workflow passes an explicit `--engine` or configures a `default_engine`,
+so hardware/OS is what drives the engine the E2E harness expects by default
+(`select_serve_engine` in `apps/rocm/src/main.rs` checks explicit/configured
+overrides first; only when neither is set does it fall back to the GPU-family
+preference). `tests/e2e-cucumber/src/capability.rs`'s `effective_serve_engine()`
+predicts what `rocm serve` would pick with no `--engine` on a given host,
+re-implementing the product's `preferred_serve_engine_for_host_gpu_summary`:
+
+```rust
+pub fn effective_serve_engine(gfx_target: Option<&str>, os_family: &str) -> String {
+    if os_family.eq_ignore_ascii_case("windows") {
+        return "lemonade".to_owned();
+    }
+    if family_prefers_vllm(gfx_target) {
+        "vllm".to_owned()
+    } else {
+        "lemonade".to_owned()
+    }
+}
+```
+
+Any Windows host resolves to `lemonade` (the vLLM adapter does not run
+there); otherwise `vllm` is only preferred for the `*-dcgpu` families and
+`gfx906`/`gfx908`/`gfx90a`. Consequences for the lanes above:
+
+- Strix Halo is `gfx1151` on every OS, so all three per-PR Strix lanes
+  (Ubuntu, Windows, WSL2) and their nightly counterparts are lemonade-only —
+  no matrix value turns a Strix lane into a vLLM lane.
+- `e2e-gpu` (MI300X) is the only per-PR lane where vLLM is the effective
+  engine.
+- Adding a vLLM lane to the default-engine lanes above means adding hardware
+  from a vLLM-eligible family, not adding an `engine:` value to a workflow
+  matrix. A scenario that needs a specific engine regardless of host pins it
+  instead with `@requires-engine:<vllm|lemonade>`, which skips where that
+  engine can't start.
 
 ## Triggers
 
@@ -283,6 +359,12 @@ Pre-warm then:
   re-downloading gigabytes or failing the lane;
 - prunes with `rocm storage remove-old-installs` after any install, update, or
   repair, so the multi-version cache stays bounded.
+
+`e2e-prewarm` has no `--version`/`--build-date` pin at HEAD — the unpinned
+invocation above is what every lane in this tree runs today. ROCMAI-430 adds
+mutually exclusive flags for that pin, letting a caller hold the SDK build
+the pre-warm resolves to instead of always tracking whatever the channel
+index currently serves (see "The three-stage validation ladder" above).
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
