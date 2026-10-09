@@ -17,9 +17,9 @@
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
 //! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
-//! `validate_bind_host` — was relocated to `service_launch.rs` in ROCMAI-91
-//! (Phase 6b), along with its test module; this file's `use` list below points
-//! there now instead of at the crate root.
+//! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
+//! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
+//! this file's `use` list below points there now instead of at the crate root.
 
 use std::fmt::Write as _;
 
