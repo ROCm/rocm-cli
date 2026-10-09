@@ -2801,7 +2801,7 @@ fn probe_shared_memory_at(e: &mut Examination, path: &str) {
 /// keep distinct from zero: a machine that could not be measured is not a
 /// machine with no space.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in process.rs
 fn filesystem_size(path: &str) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the

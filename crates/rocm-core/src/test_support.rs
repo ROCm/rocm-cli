@@ -6,11 +6,10 @@
 //! per-process directory.
 //!
 //! Used from every module split out of this crate's former `lib.rs` god file
-//! (`host_gpu`, `rocm_install`, `managed_runtime`, and `lib.rs` itself) so the
-//! naming/uniqueness scheme for test artifact directories stays in one place
-//! rather than drifting across copies.
+//! so the naming/uniqueness scheme for test artifact directories stays in one
+//! place rather than drifting across copies.
 
-use crate::{AppPaths, unix_time_millis};
+use crate::{AppPaths, ManagedServiceRecord, unix_time_millis};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,6 +48,29 @@ pub(crate) fn workspace_test_artifact_dir() -> PathBuf {
         .join(".rocm-work")
         .join("tests")
         .join("core")
+}
+
+pub(crate) fn probe_test_record(port: u16) -> ManagedServiceRecord {
+    let root = PathBuf::from("/tmp/rocm-inference-probe-test");
+    let paths = AppPaths {
+        config_dir: root.join("config"),
+        data_dir: root.join("data"),
+        cache_dir: root.join("cache"),
+    };
+    ManagedServiceRecord::new(
+        &paths,
+        "svc-probe",
+        "vllm",
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-0.6B",
+        "127.0.0.1",
+        port,
+        "serve",
+        4242,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Call `make_root` from many threads at once, remove what it made, and

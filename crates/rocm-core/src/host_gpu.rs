@@ -18,8 +18,8 @@
 
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
-    detect_managed_therock_family, discover_rocm_installs, env_flag, examine,
-    managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
+    detect_managed_therock_family, discover_rocm_installs, examine, managed_sdk_tool_path,
+    runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -263,7 +263,7 @@ fn capture_optional_command_candidate_with_timeout(
 }
 
 fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
-    if !env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
+    if !crate::paths::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
         return;
     }
     eprintln!(
