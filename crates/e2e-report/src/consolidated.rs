@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use maud::{Markup, html};
 use serde::Deserialize;
 
 use crate::command_coverage::command_coverage_markdown;
-use crate::components::{STYLE, feature_group, now_utc, stats_bar};
+use crate::components::{feature_group, now_utc, page_shell, stats_bar};
 use crate::parse::{
     EXPECTED_FAILURE_TAG, Feature, Stats, XfailReport, evaluate_xfail_features, parse_features,
     scenario_id, scenario_passed, stats_of,
@@ -164,9 +164,14 @@ impl RunMeta {
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 pub(crate) struct PlatformReport {
     desc: Descriptor,
-    /// Precomputed column label (platform, OS and effective channel) kept
-    /// for the per-platform detail sections, exposed so `command_coverage.rs`
-    /// reuses it rather than reaching into `desc`/`versions`.
+    /// Human label for the per-platform detail sections and the markdown
+    /// XPASS/Regression notes. Also the de-duplication key for
+    /// command-coverage columns across a platform's tiers (see
+    /// `command_coverage.rs`) — a display-only change to this field (e.g. a
+    /// known-bugs marker) would silently split or merge those columns, so
+    /// keep that consumer in mind alongside the other two. `pub(crate)` so
+    /// `command_coverage.rs` can reuse it rather than reaching into
+    /// `desc`/`versions` itself.
     pub(crate) label: String,
     features: Vec<Feature>,
     stats: Stats,
@@ -844,6 +849,26 @@ impl PlatformReport {
     }
 }
 
+/// Order platforms by platform/OS, then known-bugs flag, then channel — shared
+/// between the HTML report and the markdown summary so a future ordering
+/// tweak can't land in only one of them.
+fn platform_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
+    (
+        &r.desc.platform,
+        &r.desc.os,
+        r.desc.known_bugs,
+        r.effective_channel(),
+    )
+}
+
+/// Platform cell for a table that renders OS in its own column (so this omits
+/// `desc.os`, unlike `PlatformReport::label`) — shared between the markdown
+/// summary and `matrix_table` so the two can't drift the way they already
+/// have once (the markdown/HTML drift fixed by #460).
+fn platform_cell(r: &PlatformReport) -> String {
+    with_channel_suffix(&r.desc.platform, r.effective_channel())
+}
+
 /// Build one consolidated HTML report from several per-platform `report.json`
 /// files.
 ///
@@ -862,20 +887,7 @@ pub fn generate_consolidated(
 
     // Group each platform's rows together and order tiers expect-pass → known
     // bugs, instead of the alphabetical mash of the old single-label sort.
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
+    reports.sort_by(|a, b| platform_sort_key(a).cmp(&platform_sort_key(b)));
 
     let now = now_utc();
     let all_ok = reports.iter().all(PlatformReport::ok);
@@ -888,51 +900,42 @@ pub fn generate_consolidated(
         ("status-fail", format!("{bad} platform(s) need attention"))
     };
 
-    let markup = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "Consolidated E2E Report" }
-                style { (PreEscaped(STYLE)) }
+    let body = html! {
+        div.header {
+            h1 { "Consolidated E2E Report" }
+            div.generated {
+                @if let Some(line) = meta.line() { (line) br; }
+                "Generated " (now)
             }
-            body {
-                div.header {
-                    h1 { "Consolidated E2E Report" }
-                    div.generated {
-                        @if let Some(line) = meta.line() { (line) br; }
-                        "Generated " (now)
-                    }
-                }
+        }
 
-                h2 { "Summary Information" }
-                table.summary-table {
-                    tr {
-                        td { "Status:" }
-                        td class=(overall.0) { (overall.1) }
-                    }
-                    tr { td { "Rows:" } td { (reports.len()) } }
-                }
+        h2 { "Summary Information" }
+        table.summary-table {
+            tr {
+                td { "Status:" }
+                td class=(overall.0) { (overall.1) }
+            }
+            tr { td { "Rows:" } td { (reports.len()) } }
+        }
 
-                @if reports.is_empty() {
-                    p { "No per-platform report.json files were found to consolidate." }
-                } @else {
-                    h2 { "Platforms" }
-                    (matrix_table(&reports))
-                    (legend())
+        @if reports.is_empty() {
+            p { "No per-platform report.json files were found to consolidate." }
+        } @else {
+            h2 { "Platforms" }
+            (matrix_table(&reports))
+            (legend())
 
-                    (expectation_grid_html(inputs))
+            (expectation_grid_html(inputs))
 
-                    h2 { "Per-platform Details" }
-                    div.details {
-                        @for report in &reports {
-                            (platform_section(report))
-                        }
-                    }
+            h2 { "Per-platform Details" }
+            div.details {
+                @for report in &reports {
+                    (platform_section(report))
                 }
             }
         }
     };
+    let markup = page_shell("Consolidated E2E Report", body);
 
     std::fs::write(html_out, markup.into_string())
 }
@@ -949,20 +952,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         .collect();
 
     let mut reports = reports;
-    reports.sort_by(|a, b| {
-        (
-            &a.desc.platform,
-            &a.desc.os,
-            a.desc.known_bugs,
-            a.effective_channel(),
-        )
-            .cmp(&(
-                &b.desc.platform,
-                &b.desc.os,
-                b.desc.known_bugs,
-                b.effective_channel(),
-            ))
-    });
+    reports.sort_by(|a, b| platform_sort_key(a).cmp(&platform_sort_key(b)));
 
     let mut out = String::from("## E2E consolidated report\n\n");
     if reports.is_empty() {
@@ -990,7 +980,7 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
         // Component versions in the Platform/OS cells: ROCm/vLLM/lemonade under the
         // platform, the OS version under the OS. Absent components are omitted (mock
         // has no runtime; a not-yet-probed source is simply skipped).
-        let plat_base = with_channel_suffix(&r.desc.platform, r.effective_channel());
+        let plat_base = platform_cell(r);
         let plat_cell = match r.versions.platform_stack() {
             s if s.is_empty() => plat_base,
             s => format!("{plat_base}<br><sub>{s}</sub>"),
@@ -1383,7 +1373,7 @@ fn matrix_table(reports: &[PlatformReport]) -> Markup {
             @for r in reports {
                 @let (total, pass, fail, skip, xf) = r.display_counts();
                 tr {
-                    td { (with_channel_suffix(&r.desc.platform, r.effective_channel())) }
+                    td { (platform_cell(r)) }
                     td { (r.desc.os) }
                     td.num { (total) }
                     td.num { (pass) }
@@ -2004,6 +1994,154 @@ mod tests {
         assert!(
             labels.contains(&"mi300x (nightly)".to_string()),
             "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn platform_sort_key_orders_by_platform_then_os_then_known_bugs() {
+        // Pins all four elements of the sort-key tuple, in precedence order:
+        // platform, os, known_bugs, channel. Three Strix Halo rows alone
+        // can't pin `platform` — they all share it, so dropping or swapping
+        // that element would not change their order — so a fourth row on a
+        // different platform ("Unknown"/"Unknown", via the explicit
+        // "e2e-unknown-report" artifact name) is added: "Strix Halo" sorts
+        // before "Unknown" by platform, but "Unknown" alone (as an OS) sorts
+        // before "Windows", so dropping the platform element from the key, or
+        // swapping it with os, both move this row ahead of the Windows row
+        // instead of after it. Within the Strix Halo rows: "Strix Halo"/Ubuntu
+        // before "Strix Halo"/Windows pins os; the two Ubuntu rows, identical
+        // except for the known-bugs artifact suffix, pin known_bugs ordering
+        // (false < true) once os and channel are held equal. A fifth and
+        // sixth row on two more distinct platforms with opposite channels —
+        // MI300X/release and R9700/nightly — pin channel's precedence:
+        // "nightly" sorts before "release", so if channel outranked platform
+        // in the key, R9700 would sort first; "MI300X" sorts before "R9700"
+        // by platform, so the correct key keeps MI300X first regardless.
+        // generate_consolidated_writes_html and
+        // command_coverage_distinguishes_channels_on_same_platform pin channel
+        // only as a tie-breaker between two rows that already share a
+        // platform — not where it sits in this tuple, which is what the
+        // MI300X/R9700 rows pin here. A seventh row, same platform/os as the
+        // MI300X row but known_bugs=true and channel=nightly, pins that
+        // known_bugs outranks channel too: "nightly" sorts before "release",
+        // so if channel outranked known_bugs, this row would sort before the
+        // MI300X/release row despite known_bugs=false < true. No
+        // platform.json sidecar, so display_counts falls back to raw junit
+        // stats and each row's distinct scenario count (1/2/3/4/5/6/7) tells
+        // the rows apart in the rendered table.
+        let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let ubuntu_known_bugs_report =
+            write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
+        let windows_plain_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let unknown_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let mi300x_release_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let r9700_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let mi300x_known_bugs_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let inputs = vec![
+            (
+                "e2e-gpu-strix-windows-report".to_string(),
+                windows_plain_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-known-bugs-report".to_string(),
+                ubuntu_known_bugs_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-report".to_string(),
+                ubuntu_plain_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-unknown-report".to_string(),
+                unknown_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-release-report".to_string(),
+                mi300x_release_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-rad3-nightly-report".to_string(),
+                r9700_nightly_report.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-known-bugs-nightly-report".to_string(),
+                mi300x_known_bugs_nightly_report.path().to_path_buf(),
+            ),
+        ];
+
+        let md = consolidated_summary_markdown(&inputs);
+        let ubuntu_plain_pos = md
+            .find("| Strix Halo | Ubuntu | 1 |")
+            .expect("plain Ubuntu row");
+        let ubuntu_known_bugs_pos = md
+            .find("| Strix Halo | Ubuntu | 2 |")
+            .expect("known-bugs Ubuntu row");
+        let windows_pos = md
+            .find("| Strix Halo | Windows | 3 |")
+            .expect("Windows row");
+        let unknown_pos = md
+            .find("| Unknown | Unknown | 4 |")
+            .expect("Unknown-platform row");
+        let mi300x_pos = md
+            .find("| MI300X (release) | Linux | 5 |")
+            .expect("MI300X release row");
+        let r9700_pos = md
+            .find("| R9700 (nightly) | Linux | 6 |")
+            .expect("R9700 nightly row");
+        let mi300x_known_bugs_nightly_pos = md
+            .find("| MI300X (nightly) | Linux | 7 |")
+            .expect("MI300X known-bugs nightly row");
+        assert!(
+            ubuntu_plain_pos < ubuntu_known_bugs_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true:\n{md}"
+        );
+        assert!(
+            ubuntu_known_bugs_pos < windows_pos,
+            "same platform: Ubuntu must sort before Windows regardless of known_bugs:\n{md}"
+        );
+        assert!(
+            windows_pos < unknown_pos,
+            "\"Strix Halo\" must sort before \"Unknown\" by platform, even though \"Unknown\" as an OS sorts before \"Windows\":\n{md}"
+        );
+        assert!(
+            mi300x_pos < r9700_pos,
+            "\"MI300X\" must sort before \"R9700\" by platform, even though its channel \
+             (\"release\") sorts after R9700's (\"nightly\"):\n{md}"
+        );
+        assert!(
+            mi300x_pos < mi300x_known_bugs_nightly_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true, even though \
+             the known_bugs=true row's channel (\"nightly\") sorts before the known_bugs=false \
+             row's (\"release\"):\n{md}"
         );
     }
 

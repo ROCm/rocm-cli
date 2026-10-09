@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use maud::{DOCTYPE, PreEscaped, html};
+use maud::html;
 
-use crate::components::{STYLE, feature_group, now_utc, stats_table};
+use crate::components::{feature_group, now_utc, page_shell, stats_table};
 use crate::parse::{Feature, Stats, scenario_duration, scenario_status};
 
 pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
@@ -54,47 +54,38 @@ pub fn generate(json_path: &Path, html_path: &Path) -> std::io::Result<()> {
     let by_feature_rows: Vec<(String, &Stats)> =
         by_feature.iter().map(|(k, v)| (k.clone(), v)).collect();
 
-    let markup = html! {
-        (DOCTYPE)
-        html lang="en" {
-            head {
-                meta charset="utf-8";
-                title { "E2E Test Report" }
-                style { (PreEscaped(STYLE)) }
+    let body = html! {
+        div.header {
+            h1 { "E2E Test Report" }
+            div.generated { "Generated" br; (now) }
+        }
+
+        h2 { "Summary Information" }
+        table.summary-table {
+            tr {
+                td { "Status:" }
+                td class=(format!("status-{status_class}")) { (status_msg) }
             }
-            body {
-                div.header {
-                    h1 { "E2E Test Report" }
-                    div.generated { "Generated" br; (now) }
-                }
+            tr { td { "Elapsed Time:" } td { (all.elapsed_str()) } }
+            tr { td { "Features:" } td { (features.len()) } }
+            tr { td { "Scenarios:" } td { (all.total) } }
+        }
 
-                h2 { "Summary Information" }
-                table.summary-table {
-                    tr {
-                        td { "Status:" }
-                        td class=(format!("status-{status_class}")) { (status_msg) }
-                    }
-                    tr { td { "Elapsed Time:" } td { (all.elapsed_str()) } }
-                    tr { td { "Features:" } td { (features.len()) } }
-                    tr { td { "Scenarios:" } td { (all.total) } }
-                }
+        h2 { "Test Statistics" }
+        (stats_table("Total Statistics", &[("All Tests".to_string(), &all)]))
+        @if !by_tag_rows.is_empty() {
+            (stats_table("Statistics by Tag", &by_tag_rows))
+        }
+        (stats_table("Statistics by Feature", &by_feature_rows))
 
-                h2 { "Test Statistics" }
-                (stats_table("Total Statistics", &[("All Tests".to_string(), &all)]))
-                @if !by_tag_rows.is_empty() {
-                    (stats_table("Statistics by Tag", &by_tag_rows))
-                }
-                (stats_table("Statistics by Feature", &by_feature_rows))
-
-                h2 { "Test Details" }
-                div.details {
-                    @for feature in &features {
-                        (feature_group(feature))
-                    }
-                }
+        h2 { "Test Details" }
+        div.details {
+            @for feature in &features {
+                (feature_group(feature))
             }
         }
     };
+    let markup = page_shell("E2E Test Report", body);
 
     std::fs::write(html_path, markup.into_string())
 }

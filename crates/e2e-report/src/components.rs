@@ -8,9 +8,29 @@
 
 use std::time::SystemTime;
 
-use maud::{Markup, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::parse::{Element, Feature, Stats, Step, scenario_duration, scenario_status};
+
+/// Shared HTML page shell (doctype, head with the common style sheet, body
+/// wrapper) for both the single-platform and consolidated report generators,
+/// so a future head-level change (viewport meta, favicon, CSP) only has to
+/// land once.
+pub(crate) fn page_shell(title: &str, body: Markup) -> Markup {
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { (title) }
+                style { (PreEscaped(STYLE)) }
+            }
+            body {
+                (body)
+            }
+        }
+    }
+}
 
 pub(crate) fn stats_bar(stats: &Stats) -> Markup {
     html! {
@@ -141,7 +161,7 @@ fn format_utc(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
 }
 
-pub(crate) const STYLE: &str = r#"
+const STYLE: &str = r#"
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
          max-width: 1100px; margin: 0 auto; padding: 2rem; color: #1a1a1a; background: #fff; }
@@ -237,5 +257,19 @@ mod tests {
         assert_eq!(format_utc(1_609_459_200), "2021-01-01 00:00:00 UTC");
         // A time-of-day sample: 2026-07-08 13:30:45 UTC.
         assert_eq!(format_utc(1_783_517_445), "2026-07-08 13:30:45 UTC");
+    }
+
+    #[test]
+    fn page_shell_carries_title_and_style() {
+        // Both generators depend on page_shell for head-level content; pin that
+        // it actually renders the shared pieces, not just a title substring that
+        // also happens to appear in the body (see generate_consolidated_writes_html).
+        let out = page_shell("My Report Title", html! { p { "body" } }).into_string();
+        assert!(out.contains("<!DOCTYPE html>"), "{out}");
+        assert!(out.contains("<title>My Report Title</title>"), "{out}");
+        assert!(
+            out.contains(STYLE),
+            "page shell must embed the shared stylesheet"
+        );
     }
 }
