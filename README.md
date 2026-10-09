@@ -761,6 +761,48 @@ None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
 accepted on each for consistency with other mutating commands but currently
 has no effect.
 
+`install --reinstall` replaces ComfyUI's code in its `source/` folder (the
+folder that contains the `models path:` it prints):
+
+- **Deleted and replaced:** the top-level files and folders the installed
+  ComfyUI release shipped, which rocm-cli records when it installs one, plus
+  `__pycache__/`.
+- **Kept:** `models/` (the folder `models-path` prints), `user/` (saved
+  workflows and settings), `output/`, `input/`, `custom_nodes/`, `datasets/`
+  and `extra_model_paths.yaml`. They are never moved, copied or deleted. Files
+  a new release adds inside them are added alongside yours; where both have a
+  file of the same name, yours is kept, and a folder you replaced with a
+  symlink is not written into.
+- **Set aside:** an entry of yours whose name the new release starts shipping
+  (an `app/` of yours when a release adds `app/`, say) is renamed to
+  `<name>.rocm-cli-kept-<time>` rather than deleted. The reinstall lists it
+  under `set aside:` with its new name.
+- **Left in place:** anything else, such as `.git/`, a `venv/`, `styles.csv`,
+  logs or `temp/`. The reinstall lists these.
+
+An install made before rocm-cli recorded what its release shipped has nothing
+to tell release code from your entries. There, the entries with the names the
+new release ships are deleted and replaced instead, including one of yours of
+the same name, and the reinstall lists them under `replaced:`; everything else
+is left in place.
+
+The new copy is unpacked before the existing one is touched, so a failed
+download leaves the install as it was. `--reinstall --dry-run` names the folder
+whose code would be replaced, which of the kept folders it holds, and whether
+an entry of yours named like the new release's code would be set aside or
+replaced; which entries those are is only known once the new release is
+downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
+launched is running, and its dry run says so; stop it with `rocm comfyui stop`
+first. If rocm-cli's saved record of that ComfyUI cannot be read, the
+reinstall says so and is not refused, since `stop` cannot read it either. If a
+reinstall is interrupted part-way, or stops part-way (because a file it must
+delete or move is in use, say), `start` refuses to launch the half-replaced
+folder, and `start`, `status`, the answer to
+`rocm "what is the comfyui status"` and the failed reinstall name the
+`rocm comfyui install --runtime-id <key>` command that finishes it. If the
+install fails after the new code is in place (in the GPU check, say), the
+error names that command too, and what was replaced or set aside.
+
 ### Automations
 
 ```

@@ -320,6 +320,49 @@ Expected result:
 - Status shows the local URL and current state.
 - Stop shuts down the saved process.
 
+Reinstall over a used install. Put a file in the folder `rocm comfyui
+models-path` prints, save a workflow in the UI, generate one image, stop
+ComfyUI, then:
+
+```powershell
+rocm comfyui install --reinstall --dry-run
+rocm comfyui install --reinstall
+```
+
+Expected result:
+
+- The dry run prints `reinstall: replaces the ComfyUI code in <folder>`,
+  `keeps:` naming the preserved folders the install has (from `models, user,
+  output, input, custom_nodes, datasets, extra_model_paths.yaml`),
+  `leaves in place:`, and either `sets aside:` or, for an install made before
+  rocm-cli recorded what its release shipped, `replaces:`. Its
+  `install command:` ends in `--reinstall`. The ComfyUI folder is not changed.
+- The reinstall prints `kept:` naming the folders the install already had,
+  and the model file, the saved workflow and the image are all still there
+  afterwards, unchanged. Put a file such as `styles.csv` at the top of that
+  folder first: it is listed under `left in place:` and still there after.
+  For an install made before the record, the reinstall also prints
+  `replaced:` naming the code entries it deleted.
+- With the network disconnected (and no archive cached under the ComfyUI
+  folder's `downloads/`), the reinstall fails and the existing install and
+  your files are untouched.
+- With ComfyUI started (`rocm comfyui start`), the dry run prints a `note:`
+  that the reinstall is refused until `rocm comfyui stop`. The reinstall is
+  then refused and names `rocm comfyui stop`; after running that, the
+  reinstall goes ahead.
+- With ComfyUI stopped (which removes rocm-cli's saved record of it), create
+  `apps/comfyui/state/running.json` under rocm-cli's data folder containing
+  only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
+  is running, and goes ahead.
+- If the reinstall fails after the new code is in place (on a host where the
+  AMD GPU check fails, say), the error names what was replaced or set aside
+  and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
+  command finishes the install and `rocm comfyui status` shows
+  `installed: yes`.
+
+Interrupting the code swap itself is hard to time by hand; the unit test
+`interrupted_swap_converges_when_run_again` stops it at every step instead.
+
 For the stricter developer GPU test:
 
 ```powershell

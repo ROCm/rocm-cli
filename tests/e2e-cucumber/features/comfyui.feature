@@ -86,3 +86,129 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the terminal shows an intermediate ComfyUI download progress frame
     And the ComfyUI install exits cleanly
     And the final terminal screen shows no ComfyUI download spinner line
+
+  # `--reinstall` used to delete ComfyUI's whole `source/` folder before it
+  # downloaded anything. That folder is where ComfyUI keeps the user's models
+  # (the `models path:` the CLI prints), saved workflows (`user/`), generated
+  # images (`output/`), uploads (`input/`), installed custom nodes and an
+  # `extra_model_paths.yaml`, because `rocm comfyui start` runs ComfyUI from it
+  # without redirecting any of them. A reinstall now replaces only the code
+  # around those. These scenarios plant a used install, then reinstall from a
+  # loopback archive server: the success path, the path where the download
+  # fails, the dry run, a reinstall attempted while ComfyUI runs, an
+  # interrupted reinstall, a user's entry set aside, and a failure after the
+  # new code is in place. Each asserts what the CLI prints together with what
+  # is actually on disk afterwards. Linux-only because the planted runtime
+  # uses `.so` names and a POSIX-shell Python stand-in.
+  #
+  # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
+  # cannot read it either, so it must not block the reinstall; the reinstall
+  # says it could not tell.
+  @id:comfyui-reinstall-keeps-user-data @requires-os:linux
+  Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And rocm-cli's saved record of the ComfyUI it started cannot be read
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+    And the reinstall lists the code it replaced
+    And the reinstall says it could not tell whether ComfyUI was running
+
+  @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
+  Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the ComfyUI release download fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails
+    And the existing ComfyUI code and the user's files are untouched
+
+  @id:comfyui-reinstall-dry-run-names-kept-folders @requires-os:linux
+  Scenario: comfyui-07 - A ComfyUI reinstall dry run says what it replaces and keeps
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    When the user previews reinstalling ComfyUI
+    Then the preview says the ComfyUI code is replaced and names the kept folders
+    And the preview's install command includes --reinstall
+    And the existing ComfyUI code and the user's files are untouched
+
+  # The running ComfyUI keeps the old code loaded and keeps writing into the
+  # folder a reinstall changes, so the reinstall is refused until it is
+  # stopped. The dry run says so first. The refusal names `rocm comfyui stop`;
+  # the scenario runs exactly that and proves the same reinstall then goes
+  # through. Once it is reinstalled, a ComfyUI started from it that has not
+  # answered on its port yet is "starting" to a plain-words status question,
+  # which must not advise starting a second one.
+  @id:comfyui-reinstall-refused-while-running @requires-os:linux
+  Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the ComfyUI that rocm-cli started is running from that install
+    When the user previews reinstalling ComfyUI
+    Then the preview says the reinstall is refused until ComfyUI is stopped
+    And the existing ComfyUI code and the user's files are untouched
+    When the user reinstalls ComfyUI
+    Then the reinstall is refused and names rocm comfyui stop
+    And the existing ComfyUI code and the user's files are untouched
+    When the user stops ComfyUI
+    And the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
+    When a ComfyUI started by rocm-cli is still loading from that install
+    And the user asks in plain words for ComfyUI's status
+    Then the answer says ComfyUI is installed and starting and does not advise starting it
+
+  # A reinstall killed while it replaces the code leaves a half-replaced
+  # folder. `start` must not launch it; it names the install command that
+  # finishes the reinstall, and the scenario runs that exact command (read from
+  # the CLI's own message) and proves the condition is cleared. `status` and
+  # the answer to a natural-language status question both name that command
+  # rather than `start` until then.
+  @id:comfyui-interrupted-reinstall-blocks-start @requires-os:linux
+  Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    Given the reinstall was cut short while replacing ComfyUI's code
+    When the user starts ComfyUI
+    Then start refuses and names the command that finishes the reinstall
+    And ComfyUI status reports the interrupted reinstall
+    And the plain-words status answer names that command instead of start
+    When the user runs the command start named
+    Then ComfyUI status no longer reports an interrupted reinstall
+    And the plain-words status answer no longer reports an interrupted reinstall
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
+
+  # A newer release can start shipping a name the user already uses at the top
+  # of `source/`. The install recorded what its release shipped, so the
+  # reinstall knows that entry is the user's: it renames it and says where,
+  # instead of deleting it as old code.
+  @id:comfyui-reinstall-sets-aside-colliding-entry @requires-os:linux
+  Scenario: comfyui-10 - Reinstalling ComfyUI renames a folder of the user's that the new release also ships
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the user keeps an app folder there that the installed ComfyUI release did not ship
+    And a newer ComfyUI release that ships an app folder is available to download
+    When the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And the reinstall reports the user's app folder as set aside and it still holds the user's files
+    And ComfyUI's code is the newer release
+
+  # A reinstall can fail after the new code is in place: here the runtime's
+  # GPU check fails. The success report that would have listed what was
+  # replaced is never printed, so the error names it, together with the
+  # command that finishes the install. The scenario runs that command, read
+  # from the error, once the GPU check passes again.
+  @id:comfyui-reinstall-failing-after-swap-names-the-finish @requires-os:linux
+  Scenario: comfyui-11 - A ComfyUI reinstall that fails after replacing the code says what it replaced and how to finish
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the runtime's AMD GPU check fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails and names what it replaced and the command that finishes the install
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
+    When the runtime's AMD GPU check passes again
+    And the user runs the command the reinstall named
+    Then ComfyUI is installed and its AMD GPU check is ready
+    And the user's own files are untouched

@@ -909,7 +909,14 @@ enum ComfyuiCommand {
         /// ROCm runtime key or id to use (see `rocm runtimes list`).
         #[arg(long)]
         runtime_id: Option<String>,
-        /// Reinstall even if ComfyUI already exists.
+        /// Replace ComfyUI's code even if it is already installed. Only what the installed
+        /// ComfyUI release shipped is deleted. Models, user (saved workflows), output, input,
+        /// custom_nodes, datasets and extra_model_paths.yaml are kept, and anything else of
+        /// yours is left in place; an entry of yours named like code the new release adds is
+        /// renamed to `<name>.rocm-cli-kept-<time>`. An install made before rocm-cli recorded
+        /// what its release shipped instead replaces whatever has the names the new release
+        /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
+        /// running, unless rocm-cli's saved record of it cannot be read, which it then says.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.
@@ -1969,7 +1976,7 @@ fn render_freeform_read_only_answer(
             render_freeform_examine_answer(request, paths, config).map(Some)
         }
         [command, subcommand] if command == "comfyui" && subcommand == "status" => {
-            render_freeform_comfyui_status_answer(paths, config).map(Some)
+            comfyui::render_chat_status_answer(paths).map(Some)
         }
         [command, subcommand] if command == "comfyui" && subcommand == "logs" => {
             let logs = comfyui::render_logs(paths, DEFAULT_LOG_TAIL_LINES)?;
@@ -2067,47 +2074,6 @@ fn render_freeform_examine_answer(
         let _ = writeln!(
             output,
             "Note: ROCm CLI is using its managed TheRock runtime, not a global ROCm install."
-        );
-    }
-    let _ = writeln!(output);
-    let _ = writeln!(output, "Nothing was changed.");
-    Ok(output)
-}
-
-fn render_freeform_comfyui_status_answer(
-    paths: &AppPaths,
-    config: &RocmCliConfig,
-) -> Result<String> {
-    let status = comfyui::render_status(paths, config)?;
-    let installed = status.contains("  installed: yes");
-    let running = status.contains("  status: running");
-    let starting = status.contains("  status: starting");
-    let mut output = String::new();
-    let _ = writeln!(output, "ComfyUI status");
-    let _ = writeln!(output);
-    if installed {
-        let _ = writeln!(output, "ComfyUI: installed");
-    } else {
-        let _ = writeln!(output, "ComfyUI: not installed yet");
-    }
-    if running {
-        let url = chat_tool_value(&status, "url").unwrap_or_else(|| "<unknown>".to_owned());
-        let _ = writeln!(output, "Running: yes");
-        let _ = writeln!(output, "URL: {url}");
-    } else if starting {
-        let _ = writeln!(output, "Running: starting");
-    } else {
-        let _ = writeln!(output, "Running: no");
-    }
-    if !installed {
-        let _ = writeln!(
-            output,
-            "To install it, ask `can you setup ComfyUI for me` or run `rocm comfyui install`."
-        );
-    } else if !running {
-        let _ = writeln!(
-            output,
-            "To open it, ask `can you start ComfyUI` or run `rocm comfyui start`."
         );
     }
     let _ = writeln!(output);

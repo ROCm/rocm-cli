@@ -46,8 +46,26 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
-//! Black-box throughout: the planted registry manifests are plain JSON matching
-//! the CLI's on-disk schema, not typed imports from the product crates.
+//! `comfyui-05` to `comfyui-11` cover `--reinstall` over a used install: one
+//! file of the user's in every entry of `source/` a reinstall keeps, plus
+//! release code. The new release comes from the same loopback server
+//! (unpaced), at a path that 404s for the failed-download case. Each `Then`
+//! that checks a printed claim about what was kept also checks the files.
+//! `comfyui-08` plants a running stand-in in the saved state and runs the
+//! `rocm comfyui stop` the refusal names before reinstalling again.
+//! `comfyui-11` makes the runtime's GPU check fail after the swap, then pass,
+//! and runs the command the failed reinstall names.
+//! `comfyui-08` and `comfyui-09` also ask `rocm` for ComfyUI's status in plain
+//! words, which is answered without a model.
+//!
+//! The planted registry manifests are plain JSON matching the CLI's on-disk
+//! schema, not typed imports from the product crates. Two scenarios also write
+//! files the CLI keeps inside `source/`, by name and format: `comfyui-09` the
+//! marker an interrupted reinstall leaves (`.rocm-cli-reinstall-in-progress`),
+//! because a kill cannot be timed from outside, and `comfyui-10` the record of
+//! what the installed release shipped (`.rocm-cli-release-entries`), which an
+//! install made by this CLI would have. `source_swap`'s unit tests interrupt
+//! the swap for real at every step.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -562,4 +580,727 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
         !screen.contains("Fetching ComfyUI source archive"),
         "download spinner line was not cleared on completion:\n{screen}"
     );
+}
+
+/// The user's own content in a used ComfyUI install, relative to `source/`:
+/// one file in each entry a reinstall keeps.
+const USER_FILES: [(&str, &str); 9] = [
+    ("models/checkpoints/my-model.safetensors", "user model"),
+    ("user/default/workflows/my-workflow.json", "user workflow"),
+    ("output/ComfyUI_00001_.png", "user image"),
+    ("input/my-upload.png", "user upload"),
+    ("custom_nodes/my-node/__init__.py", "user node"),
+    ("datasets/my-set/0001.png", "user dataset"),
+    ("extra_model_paths.yaml", "user model paths"),
+    // No ComfyUI release ships these; a reinstall leaves them where they are.
+    (".git/HEAD", "ref: refs/heads/master"),
+    ("styles.csv", "user styles"),
+];
+
+/// The kept-entries list the CLI prints, in its order.
+const KEPT_LIST: &str =
+    "models, user, output, input, custom_nodes, datasets, extra_model_paths.yaml";
+
+/// The entries no release shipped, as the CLI lists them.
+const LEFT_IN_PLACE_LIST: &str = ".git, styles.csv";
+
+/// `source/` of the ComfyUI install that belongs to the planted runtime.
+fn comfyui_source_dir(world: &E2eWorld) -> PathBuf {
+    data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(RUNTIME_KEY)
+        .join("apps")
+        .join("comfyui")
+        .join("source")
+}
+
+fn assert_user_files_intact(world: &E2eWorld) {
+    let source = comfyui_source_dir(world);
+    for (relative, contents) in USER_FILES {
+        let path = source.join(relative);
+        assert_eq!(
+            std::fs::read_to_string(&path).ok().as_deref(),
+            Some(contents),
+            "the user's {} must survive the reinstall",
+            path.display()
+        );
+    }
+}
+
+/// `run_rocm_with_scenario_env` consumes `command_env`; a scenario that runs
+/// `rocm` more than once (`comfyui-08`) needs the archive-URL override on
+/// every run, or a later run would fetch the real ComfyUI from the network.
+fn run_keeping_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let env = world.command_env.clone();
+    let result = crate::run_rocm_with_scenario_env(world, args);
+    world.command_env = env;
+    result
+}
+
+fn run_comfyui_reinstall(world: &mut E2eWorld, extra: &[&str]) {
+    let mut args = vec![
+        "comfyui",
+        "install",
+        "--runtime-id",
+        RUNTIME_KEY,
+        "--reinstall",
+    ];
+    args.extend_from_slice(extra);
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &args);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[given("a ComfyUI install holding the user's models, workflows, images and custom nodes")]
+async fn used_comfyui_install(world: &mut E2eWorld) {
+    let data = data_dir(world);
+    plant_ready_runtime(&data, RUNTIME_KEY);
+    // Answers the post-install GPU check `install()` runs after the swap.
+    write_gpu_probe_shim(
+        &data
+            .join("runtimes")
+            .join("roots")
+            .join(RUNTIME_KEY)
+            .join("bin")
+            .join("python3"),
+    );
+    let source = comfyui_source_dir(world);
+    for (relative, contents) in [
+        ("main.py", "old release"),
+        ("requirements.txt", "torch\n"),
+        ("comfy/dropped_upstream.py", "old release"),
+    ]
+    .into_iter()
+    .chain(USER_FILES)
+    {
+        write_fixture(&source.join(relative), contents);
+    }
+}
+
+/// Serves a small release archive. Its `requirements.txt` names only the
+/// torch stack, so the dependency install is filtered down to nothing and
+/// skipped — this scenario is about the swap, not the `uv` step.
+async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str, extra: &[(&str, &str)]) {
+    let build_dir = root(world).join("comfyui-fixture").join("release-build");
+    let release = build_dir.join("ComfyUI-master");
+    for (relative, contents) in [
+        ("main.py", "new release"),
+        ("requirements.txt", "torch==2.4.0\n"),
+        ("models/checkpoints/put_checkpoints_here", ""),
+        ("output/_output_images_will_be_put_here", ""),
+        ("custom_nodes/websocket_image_save.py", "new release"),
+        ("comfy/added_upstream.py", "new release"),
+    ]
+    .iter()
+    .chain(extra)
+    {
+        write_fixture(&release.join(relative), contents);
+    }
+    let contents = build_gzip_tarball(&build_dir, "comfyui-release.tar.gz", "ComfyUI-master").await;
+    let served = root(world).join("comfyui-fixture").join("release-serve");
+    std::fs::create_dir_all(&served).expect("failed to create the archive fixture serve root");
+    world.paced_download_server = Some(PacedDownloadServer::start(
+        &served,
+        "archive/comfyui-release.tar.gz",
+        contents,
+        1 << 20,
+        Duration::ZERO,
+    ));
+    let base = world
+        .paced_download_server
+        .as_ref()
+        .expect("archive server was just started")
+        .base_url();
+    world.command_env.push((
+        "ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE",
+        format!("{base}/{served_path}").into(),
+    ));
+}
+
+#[given("a newer ComfyUI release is available to download")]
+async fn newer_comfyui_release(world: &mut E2eWorld) {
+    serve_comfyui_release(world, "archive/comfyui-release.tar.gz", &[]).await;
+}
+
+#[given("the ComfyUI release download fails")]
+async fn comfyui_release_download_fails(world: &mut E2eWorld) {
+    // The server is up but the archive is not at this path: a 404, which the
+    // downloader does not retry.
+    serve_comfyui_release(world, "archive/missing.tar.gz", &[]).await;
+}
+
+#[when("the user reinstalls ComfyUI")]
+async fn reinstall_comfyui(world: &mut E2eWorld) {
+    run_comfyui_reinstall(world, &[]);
+}
+
+#[when("the user previews reinstalling ComfyUI")]
+async fn preview_comfyui_reinstall(world: &mut E2eWorld) {
+    run_comfyui_reinstall(world, &["--dry-run"]);
+}
+
+#[then("the reinstall reports the user's folders as kept and they still hold the user's files")]
+async fn reinstall_reports_and_keeps(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "expected the reinstall to succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The claim and the state it describes, asserted together.
+    assert_user_files_intact(world);
+    assert!(
+        stdout.contains(&format!("  kept: {KEPT_LIST}\n")),
+        "the reinstall must name what it kept, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  left in place: {LEFT_IN_PLACE_LIST}\n")),
+        "the reinstall must name what it left alone, got:\n{stdout}"
+    );
+}
+
+#[then("ComfyUI's code is the newer release")]
+async fn comfyui_code_is_newer_release(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("main.py"))
+            .ok()
+            .as_deref(),
+        Some("new release")
+    );
+    assert!(
+        !source.join("comfy/dropped_upstream.py").exists(),
+        "code the new release does not ship must be gone"
+    );
+    let app_root = source.parent().expect("source has a parent");
+    let leftovers: Vec<_> = std::fs::read_dir(app_root)
+        .expect("failed to read the ComfyUI folder")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .filter(|name| name != "source" && name.to_string_lossy().starts_with("source"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the previous code must be removed once the swap is done: {leftovers:?}"
+    );
+}
+
+/// What the release the planted install came from shipped, as rocm-cli
+/// records it when it installs one.
+const INSTALLED_RELEASE_RECORD: &str = "comfy\nmain.py\nrequirements.txt";
+
+#[given("the user keeps an app folder there that the installed ComfyUI release did not ship")]
+async fn user_app_folder(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    write_fixture(&source.join("app/settings.json"), "user app");
+    write_fixture(
+        &source.join(".rocm-cli-release-entries"),
+        INSTALLED_RELEASE_RECORD,
+    );
+}
+
+#[given("a newer ComfyUI release that ships an app folder is available to download")]
+async fn newer_comfyui_release_with_app(world: &mut E2eWorld) {
+    serve_comfyui_release(
+        world,
+        "archive/comfyui-release.tar.gz",
+        &[("app/__init__.py", "new release")],
+    )
+    .await;
+}
+
+#[then(
+    "the reinstall reports the user's app folder as set aside and it still holds the user's files"
+)]
+async fn reinstall_reports_set_aside(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let renamed = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("  set aside: app (now "))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("the reinstall must say where the user's app/ went:\n{stdout}"));
+    assert!(
+        renamed.starts_with("app.rocm-cli-kept-") && !renamed.contains('/'),
+        "unexpected set-aside name {renamed:?}"
+    );
+    // The claim and the state it describes, asserted together.
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join(renamed).join("settings.json"))
+            .ok()
+            .as_deref(),
+        Some("user app"),
+        "the folder the reinstall names must hold the user's files"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("app/__init__.py"))
+            .ok()
+            .as_deref(),
+        Some("new release"),
+        "the new release's app/ is installed under its own name"
+    );
+    assert!(
+        !source.join("app/settings.json").exists(),
+        "the release's app/ must not be mixed with the user's"
+    );
+}
+
+#[then("the reinstall lists the code it replaced")]
+async fn reinstall_lists_replaced(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    // The planted install predates the release record, so the entries named
+    // like the new release's code are replaced, and listed.
+    assert!(
+        stdout.contains("  replaced: comfy, main.py, requirements.txt\n"),
+        "the reinstall must list what it replaced, got:\n{stdout}"
+    );
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("requirements.txt"))
+            .ok()
+            .as_deref(),
+        Some("torch==2.4.0\n"),
+        "requirements.txt is listed as replaced, so it is the new release's"
+    );
+    assert!(!source.join("comfy/dropped_upstream.py").exists());
+}
+
+#[then("the reinstall fails")]
+async fn comfyui_reinstall_fails(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "expected the reinstall to fail\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("404"),
+        "expected the failed download in stderr, got:\n{stderr}"
+    );
+    // Nothing was changed, so no command is named to finish anything.
+    assert!(!stderr.contains("rocm comfyui install"), "{stderr}");
+}
+
+#[then("the existing ComfyUI code and the user's files are untouched")]
+async fn existing_comfyui_untouched(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("main.py"))
+            .ok()
+            .as_deref(),
+        Some("old release"),
+        "the existing ComfyUI code must be left in place"
+    );
+    assert!(source.join("comfy/dropped_upstream.py").is_file());
+    assert_user_files_intact(world);
+}
+
+#[then("the preview says the ComfyUI code is replaced and names the kept folders")]
+async fn preview_names_replaced_and_kept(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(0), "dry run failed:\n{stdout}");
+    let source = comfyui_source_dir(world);
+    assert!(
+        stdout.contains(&format!(
+            "  reinstall: replaces the ComfyUI code in {}\n",
+            source.display()
+        )),
+        "the preview must say what is replaced, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  keeps: {KEPT_LIST}\n")),
+        "the preview must name what is kept, got:\n{stdout}"
+    );
+    // Every folder the preview promises to keep exists in this install, so
+    // the promise is about real content (the dry run itself changes nothing;
+    // `comfyui-05` proves a real reinstall keeps them).
+    for name in KEPT_LIST.split(", ") {
+        assert!(
+            source.join(name).exists(),
+            "{name} is named as kept but missing"
+        );
+    }
+}
+
+#[then("the preview's install command includes --reinstall")]
+async fn preview_command_includes_reinstall(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let command = stdout
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("install command: "))
+        .unwrap_or_else(|| panic!("no install command in the preview:\n{stdout}"));
+    assert!(
+        command.split_whitespace().any(|arg| arg == "--reinstall"),
+        "the previewed command must be the reinstall that was asked for, got: {command}"
+    );
+}
+
+/// Starts a detached long-lived process to stand in for a running ComfyUI and
+/// records it the way `rocm comfyui start` does (`<data>/apps/comfyui/state/
+/// running.json`), pointing at the planted install's `source/`. Detached via
+/// the shell so that once `rocm comfyui stop` kills it, init reaps it and it
+/// does not linger as a zombie the CLI's liveness check would still see. It
+/// exits on its own if the scenario fails before stopping it.
+#[given("the ComfyUI that rocm-cli started is running from that install")]
+async fn comfyui_running_from_install(world: &mut E2eWorld) {
+    plant_running_stand_in(world);
+}
+
+/// The same stand-in, planted after a reinstall: its port does not answer,
+/// so rocm-cli sees it as still loading.
+#[when("a ComfyUI started by rocm-cli is still loading from that install")]
+async fn comfyui_loading_from_install(world: &mut E2eWorld) {
+    plant_running_stand_in(world);
+}
+
+fn plant_running_stand_in(world: &mut E2eWorld) {
+    let output = std::process::Command::new("sh")
+        .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
+        .output()
+        .expect("failed to start the stand-in ComfyUI process");
+    let pid: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("the shell printed the stand-in's pid");
+    // A port nothing listens on, so the CLI's view rests on the process alone.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("failed to pick a free port")
+        .port();
+    let source = comfyui_source_dir(world);
+    let state = serde_json::json!({
+        "app_id": "comfyui",
+        "url": format!("http://127.0.0.1:{port}"),
+        "host": "127.0.0.1",
+        "port": port,
+        "pid": pid,
+        "source_path": source,
+        "python_executable": "python3",
+        "log_path": source.parent().expect("source has a parent").join("logs").join("start.log"),
+        "started_at_unix_ms": 1u64,
+    });
+    write_fixture(
+        &data_dir(world)
+            .join("apps")
+            .join("comfyui")
+            .join("state")
+            .join("running.json"),
+        &serde_json::to_string_pretty(&state).expect("state serialises"),
+    );
+}
+
+#[then("the reinstall is refused and names rocm comfyui stop")]
+async fn reinstall_refused_while_running(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "expected the reinstall to be refused\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ComfyUI is running from") && stderr.contains("`rocm comfyui stop`"),
+        "the refusal must say ComfyUI is running and name `rocm comfyui stop`, got:\n{stderr}"
+    );
+}
+
+#[when("the user stops ComfyUI")]
+async fn stop_comfyui(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "stop"]);
+    assert_eq!(
+        rc, 0,
+        "`rocm comfyui stop` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Leaves the installed folder as a reinstall killed part-way through
+/// replacing the code would: the swap's marker present (naming what the user
+/// had) and `main.py`, the first thing removed, gone. The swap's own unit test
+/// (`interrupted_swap_converges_when_run_again`) interrupts it for real at
+/// every step; this plants the end state so the CLI's handling of it can be
+/// driven through the binary.
+#[given("the reinstall was cut short while replacing ComfyUI's code")]
+async fn reinstall_cut_short(world: &mut E2eWorld) {
+    let source = comfyui_source_dir(world);
+    // What the marker holds: the user's entries that were there before, then
+    // the names of the release being installed.
+    let marker = KEPT_LIST
+        .split(", ")
+        .map(str::to_owned)
+        .chain(
+            INSTALLED_RELEASE_RECORD
+                .lines()
+                .map(|name| format!("release\t{name}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_fixture(&source.join(".rocm-cli-reinstall-in-progress"), &marker);
+    std::fs::remove_file(source.join("main.py")).expect("main.py was installed");
+}
+
+#[when("the user starts ComfyUI")]
+async fn start_comfyui(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(
+        world,
+        &["comfyui", "start", "--no-open-browser", "--port", "1"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+const FINISH_ADVICE: &str = "a reinstall was interrupted; run `rocm comfyui install --runtime-id e2e-comfyui-runtime` to finish it";
+
+#[then("start refuses and names the command that finishes the reinstall")]
+async fn start_refuses_mid_swap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(world.cli_rc, Some(0), "start must refuse:\n{stderr}");
+    assert!(
+        stderr.contains(FINISH_ADVICE),
+        "start must name the command that finishes the reinstall, got:\n{stderr}"
+    );
+}
+
+/// Runs the command `start` named, taken from its own output rather than
+/// restated, so the advice is what gets proven.
+#[when("the user runs the command start named")]
+async fn run_command_start_named(world: &mut E2eWorld) {
+    run_named_command(world);
+}
+
+#[when("the user runs the command the reinstall named")]
+async fn run_command_reinstall_named(world: &mut E2eWorld) {
+    run_named_command(world);
+}
+
+/// Runs the first backticked `rocm` command in the last command's stderr.
+fn run_named_command(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let command = stderr
+        .split('`')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no backticked command in:\n{stderr}"))
+        .to_owned();
+    let args: Vec<&str> = command
+        .strip_prefix("rocm ")
+        .unwrap_or_else(|| panic!("not a rocm command: {command}"))
+        .split_whitespace()
+        .collect();
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &args);
+    assert_eq!(
+        rc, 0,
+        "`{command}` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the user's own files are untouched")]
+async fn user_files_untouched(world: &mut E2eWorld) {
+    assert_user_files_intact(world);
+}
+
+#[then("ComfyUI status reports the interrupted reinstall")]
+async fn status_reports_interruption(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(
+        stdout.contains(&format!("  note: {FINISH_ADVICE}\n")),
+        "status must report the interrupted reinstall, got:\n{stdout}"
+    );
+}
+
+#[then("ComfyUI status no longer reports an interrupted reinstall")]
+async fn status_clear_of_interruption(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(
+        !stdout.contains("interrupted"),
+        "status still reports the interruption:\n{stdout}"
+    );
+    assert!(
+        !comfyui_source_dir(world)
+            .join(".rocm-cli-reinstall-in-progress")
+            .exists()
+    );
+}
+
+/// Asked as one argument, as a user types `rocm "<question>"`; answered
+/// without a model, and without changing anything.
+const PLAIN_WORDS_STATUS_QUESTION: &str = "what is the comfyui status";
+
+fn plain_words_status_answer(world: &mut E2eWorld) -> String {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &[PLAIN_WORDS_STATUS_QUESTION]);
+    assert_eq!(
+        rc, 0,
+        "the status question failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.starts_with("ComfyUI status\n") && stdout.contains("\nNothing was changed.\n"),
+        "expected the ComfyUI status answer, got:\n{stdout}"
+    );
+    stdout
+}
+
+#[when("the user asks in plain words for ComfyUI's status")]
+async fn ask_status_in_plain_words(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    world.cli_output = Some(answer);
+}
+
+#[then("the answer says ComfyUI is installed and starting and does not advise starting it")]
+async fn answer_says_starting(world: &mut E2eWorld) {
+    let answer = world.cli_output.clone().unwrap_or_default();
+    assert!(answer.contains("ComfyUI: installed\n"), "{answer}");
+    assert!(answer.contains("Running: starting\n"), "{answer}");
+    assert!(
+        !answer.contains("comfyui start"),
+        "a second ComfyUI must not be advised while one starts:\n{answer}"
+    );
+    // What "starting" claims: rocm-cli's own view is the same.
+    let (status, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{status}");
+    assert!(status.contains("  status: starting\n"), "{status}");
+}
+
+#[then("the preview says the reinstall is refused until ComfyUI is stopped")]
+async fn preview_says_refused_while_running(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(0), "dry run failed:\n{stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.starts_with("  note: ComfyUI is running from ")
+                && line.ends_with(
+                    "Stop it with `rocm comfyui stop`; a reinstall is refused until then",
+                )
+        }),
+        "the preview must say the reinstall waits for `rocm comfyui stop`, got:\n{stdout}"
+    );
+    // The scenario's next steps run that reinstall and prove the refusal.
+}
+
+#[then("the plain-words status answer names that command instead of start")]
+async fn answer_names_finishing_command(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    assert!(
+        answer.contains(&format!("Note: {FINISH_ADVICE}.\n")),
+        "the answer must name the command that finishes the reinstall, got:\n{answer}"
+    );
+    assert!(
+        !answer.contains("comfyui start"),
+        "`start` refuses here, so it must not be advised:\n{answer}"
+    );
+}
+
+#[then("the plain-words status answer no longer reports an interrupted reinstall")]
+async fn answer_clear_of_interruption(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    assert!(!answer.contains("interrupted"), "{answer}");
+    // Nothing rocm-cli started is running here, but the host may run a
+    // ComfyUI of its own on ComfyUI's port; `start` is advised only if not.
+    if answer.contains("Running: yes\n") {
+        assert!(!answer.contains("comfyui start"), "{answer}");
+    } else {
+        assert!(answer.contains("Running: no\n"), "{answer}");
+        assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
+    }
+}
+
+#[given("rocm-cli's saved record of the ComfyUI it started cannot be read")]
+async fn unreadable_saved_state(world: &mut E2eWorld) {
+    write_fixture(
+        &data_dir(world)
+            .join("apps")
+            .join("comfyui")
+            .join("state")
+            .join("running.json"),
+        "{\"app_id\": \"comfy",
+    );
+}
+
+#[then("the reinstall says it could not tell whether ComfyUI was running")]
+async fn reinstall_notes_unreadable_state(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let state = data_dir(world)
+        .join("apps")
+        .join("comfyui")
+        .join("state")
+        .join("running.json");
+    let prefix = format!("Note: failed to parse {}", state.display());
+    let suffix = format!(
+        "; whether a ComfyUI started by rocm-cli is running from {} is unknown, so the \
+         reinstall is not refused for it",
+        comfyui_source_dir(world).display()
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&prefix) && line.ends_with(&suffix)),
+        "the reinstall must say why it was not refused, got:\n{stdout}"
+    );
+    // What the note claims: the reinstall was not refused. The scenario's
+    // other steps check what it did.
+    assert_eq!(world.cli_rc, Some(0), "{stdout}");
+}
+
+#[given("the runtime's AMD GPU check fails")]
+async fn gpu_check_fails(world: &mut E2eWorld) {
+    write_shim(
+        &runtime_python(world),
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-c\" ]; then\n\
+         \tprintf '{}'\n\
+         \texit 0\n\
+         fi\n\
+         cat > \"$2\" <<'JSON'\n\
+         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}\n\
+         JSON\n",
+    );
+}
+
+#[when("the runtime's AMD GPU check passes again")]
+async fn gpu_check_passes_again(world: &mut E2eWorld) {
+    write_gpu_probe_shim(&runtime_python(world));
+}
+
+fn runtime_python(world: &E2eWorld) -> PathBuf {
+    data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(RUNTIME_KEY)
+        .join("bin")
+        .join("python3")
+}
+
+#[then("the reinstall fails and names what it replaced and the command that finishes the install")]
+async fn reinstall_fails_after_swap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(world.cli_rc, Some(0), "the reinstall must fail:\n{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "the new ComfyUI code is in place (replaced: comfy, main.py, requirements.txt), but \
+             the install did not finish; once the cause below is fixed, run `rocm comfyui install \
+             --runtime-id {RUNTIME_KEY}` to finish it"
+        )),
+        "the failure must name what was replaced and how to finish, got:\n{stderr}"
+    );
+    assert!(stderr.contains("AMD GPU check failed"), "{stderr}");
+    // What "replaced" claims: those are the new release's now.
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("requirements.txt"))
+            .ok()
+            .as_deref(),
+        Some("torch==2.4.0\n")
+    );
+}
+
+#[then("ComfyUI is installed and its AMD GPU check is ready")]
+async fn comfyui_installed_and_ready(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(stdout.contains("  installed: yes\n"), "{stdout}");
+    assert!(stdout.contains("  AMD GPU check: ready\n"), "{stdout}");
 }
