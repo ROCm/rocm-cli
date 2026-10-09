@@ -294,4 +294,25 @@ Feature: Model serving
     And the selected GPU is reported nearly out of VRAM
     When the user previews a vLLM serve plan pinned to that GPU
     Then the serve plan warns the GPU is low on VRAM
+
+  # `--require-api-key` reuse refusal (#604). A running server's key is read once
+  # at launch; reuse cannot retroactively satisfy a demand for auth the server
+  # never got, so the idempotency guard refuses instead of upgrading the record
+  # in place (see `spawn_managed_engine_child` in `main.rs`). This is the
+  # local-side proof that the printed stop hint is not just present but correct
+  # and directly runnable: the scenario stops the service with it and checks the
+  # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
+  # running-service` gives the summary's own hint. The idempotency match is keyed
+  # on (engine, canonical model id) only — not a real listening port or process —
+  # so a planted record is enough; no actual Lemonade load is needed. Runs on the
+  # Lemonade GPU lane because `--managed` serve still refuses before reaching
+  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # on this lane.
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade
+  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again with --require-api-key
+    Then the CLI refuses and names the exact command to stop the existing service
+    And running that command actually stops the service
     And the serve plan explains how to lower vLLM's memory reservation
