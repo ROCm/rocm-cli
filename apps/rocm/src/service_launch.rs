@@ -46,13 +46,15 @@ use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse}
 use crate::endpoint_keys;
 use crate::engines_cmd::env_root_for_service;
 use crate::{
-    SandboxToolArg, apply_app_path_env, builtin_engine_serve_http_args, device_policy_name,
-    existing_live_managed_service, managed_service_launcher_path, read_optional_tail_lines,
-    record_cli_audit_event, render_service_action_result, run_internal_sandbox_tool,
-    status_for_readiness, wait_for_service_http_ready_with_progress,
+    SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
+    existing_live_managed_service, managed_service_launcher_path, record_cli_audit_event,
+    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
+    wait_for_service_http_ready_with_progress,
 };
 #[cfg(windows)]
 use crate::{app_path_env_var_refs, app_path_env_var_values};
+#[cfg(not(windows))]
+use crate::{apply_app_path_env, read_optional_tail_lines};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
