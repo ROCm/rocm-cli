@@ -35189,7 +35189,12 @@ ID_LIKE="suse opensuse"
     ///
     /// Pre-creating a file at every name that scheme could pick while this
     /// test runs stands in for the other writer deterministically: the write
-    /// has to succeed without touching any of them.
+    /// has to succeed without touching any of them. This guards against a
+    /// return to that millis-only scheme specifically. The shared writer's own
+    /// names (`{name}.tmp-{pid}-{millis}-{attempt}`) cannot match these by
+    /// construction, so collision safety under the current scheme is covered
+    /// by `concurrent_active_runtime_marker_writes_keep_a_complete_marker_published`
+    /// and by `rocm_core::atomic_write`'s own concurrency tests.
     #[test]
     fn active_runtime_marker_write_never_reuses_another_writers_temp_file() -> Result<()> {
         const WINDOW_MS: u128 = 2_000;
