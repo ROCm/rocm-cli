@@ -989,8 +989,8 @@ pub fn generate_consolidated_from_reports(
 /// [`generate_consolidated`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
 /// directly instead, to share the `PlatformReport` build instead of
-/// building it twice. The scenario reference section still parses `inputs`
-/// itself either way.
+/// building it twice. The expectation grid and scenario reference sections
+/// still parse `inputs` themselves either way.
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
 }
@@ -1769,7 +1769,11 @@ mod tests {
 
         let md = consolidated_summary_markdown_from_reports(&empty_reports, &inputs);
         assert!(md.contains("No per-platform report.json files"));
-        assert!(!md.contains("e2e-report"));
+        // Not `!md.contains("e2e-report")`: that label is the `inputs` tuple's
+        // key, which never appears in rendered output (the platform renders as
+        // "Mock") — so it can't tell a buggy re-derive-from-inputs apart from
+        // the correct empty-reports path either way.
+        assert!(!md.contains("| Mock"));
 
         let out = tempfile::NamedTempFile::new().expect("temp");
         generate_consolidated_from_reports(
@@ -1810,52 +1814,67 @@ mod tests {
         // `keys == sorted(keys)` (the test above) derives its expectation from
         // `report_sort_key` itself, so it can't catch a change to the key — e.g.
         // dropping or swapping one of its fields — because the expectation would
-        // drift along with it. This test instead hard-codes the expected order,
-        // from fixtures that each isolate one dimension of the tuple:
+        // drift along with it. This test instead hard-codes the expected order.
         //
-        //   A (MI300X, Linux, known_bugs=false, channel=None)
-        //   B (MI300X, Linux, known_bugs=true,  channel=None)      — vs A: known_bugs
-        //   C (MI300X, Linux, known_bugs=true,  channel=nightly)   — vs B: channel
-        //   D (Strix Halo, Ubuntu,  known_bugs=false, channel=None)
-        //   E (Strix Halo, Windows, known_bugs=false, channel=None) — vs D: os
+        // Built directly as `PlatformReport`s rather than through artifact-name
+        // fixtures: every real platform/OS pair in `parse_descriptor` keeps OS
+        // rank non-decreasing as platform rank increases (every non-Strix-Halo
+        // platform is Linux-only, and Strix Halo's non-Linux OSes only appear at
+        // the highest platform rank), so no artifact name can produce a
+        // platform-sorts-first/OS-sorts-last pair — needed below to tell a
+        // platform/OS field swap apart from the correct key.
         //
-        // so swapping or dropping any single field breaks at least one adjacent
-        // pair's order.
-        let mi300x_base = write_report(&feature_json(&[(&[], &["passed"])]));
-        let mi300x_known_bugs =
-            write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
-        let (_nightly_dir, mi300x_known_bugs_nightly) = write_platform(
-            &feature_json(&[(&["expected-failure"], &["failed"])]),
-            r#"{"versions": {"channel": "nightly"}}"#,
-        );
-        let strix_ubuntu = write_report(&feature_json(&[(&[], &["passed"])]));
-        let strix_windows = write_report(&feature_json(&[(&[], &["passed"])]));
+        //   A1 (Alpha, Able, known_bugs=false, channel=None)
+        //   A2 (Alpha, Able, known_bugs=false, channel=nightly)  — vs A1: channel
+        //   A3 (Alpha, Able, known_bugs=true,  channel=None)     — vs A2: known_bugs
+        //                                                           (and channel resets)
+        //   A4 (Alpha, Able, known_bugs=true,  channel=nightly)  — vs A3: channel
+        //   D  (Alpha, Zulu, known_bugs=false, channel=None)     — vs A4: os
+        //   E  (Beta,  Able, known_bugs=false, channel=None)     — vs D: platform
+        //                                                           (D's OS "Zulu" > E's
+        //                                                           "Able" — platform
+        //                                                           still has to win)
+        //
+        // Fed as [A4, A3, A2, A1, E, D]: with the real key every tuple is
+        // distinct, so the sort is deterministic regardless of feed order — but
+        // dropping `known_bugs` ties {A1, A3} and {A2, A4}, and dropping
+        // `channel` ties {A1, A2} and {A3, A4}, and this feed order puts the
+        // later element of each tied pair first, so a dropped field changes the
+        // output instead of the stable sort coincidentally restoring it.
+        fn mk(
+            platform: &str,
+            os: &str,
+            known_bugs: bool,
+            channel: Option<&'static str>,
+        ) -> PlatformReport {
+            PlatformReport {
+                desc: Descriptor {
+                    platform: platform.to_string(),
+                    os: os.to_string(),
+                    known_bugs,
+                    channel_from_name: channel,
+                },
+                label: String::new(),
+                features: Vec::new(),
+                stats: Stats::new(),
+                xfail: XfailReport::default(),
+                is_known_bugs: false,
+                commands: Vec::new(),
+                tally: None,
+                versions: PlatformVersions::default(),
+            }
+        }
 
-        // Fed in an order that is neither the expected order nor its reverse.
-        let inputs = vec![
-            (
-                "e2e-gpu-strix-windows-report".to_string(),
-                strix_windows.path().to_path_buf(),
-            ),
-            (
-                "e2e-gpu-known-bugs-report".to_string(),
-                mi300x_known_bugs_nightly,
-            ),
-            (
-                "e2e-gpu-report".to_string(),
-                mi300x_base.path().to_path_buf(),
-            ),
-            (
-                "e2e-gpu-strix-ubuntu-report".to_string(),
-                strix_ubuntu.path().to_path_buf(),
-            ),
-            (
-                "e2e-gpu-known-bugs-report".to_string(),
-                mi300x_known_bugs.path().to_path_buf(),
-            ),
-        ];
+        let a1 = mk("Alpha", "Able", false, None);
+        let a2 = mk("Alpha", "Able", false, Some("nightly"));
+        let a3 = mk("Alpha", "Able", true, None);
+        let a4 = mk("Alpha", "Able", true, Some("nightly"));
+        let d = mk("Alpha", "Zulu", false, None);
+        let e = mk("Beta", "Able", false, None);
 
-        let reports = load_platform_reports(&inputs);
+        let mut reports = [a4, a3, a2, a1, e, d];
+        reports.sort_by(|x, y| report_sort_key(x).cmp(&report_sort_key(y)));
+
         let actual: Vec<_> = reports
             .iter()
             .map(|r| {
@@ -1870,11 +1889,12 @@ mod tests {
         assert_eq!(
             actual,
             vec![
-                ("MI300X", "Linux", false, None),
-                ("MI300X", "Linux", true, None),
-                ("MI300X", "Linux", true, Some("nightly")),
-                ("Strix Halo", "Ubuntu", false, None),
-                ("Strix Halo", "Windows", false, None),
+                ("Alpha", "Able", false, None),
+                ("Alpha", "Able", false, Some("nightly")),
+                ("Alpha", "Able", true, None),
+                ("Alpha", "Able", true, Some("nightly")),
+                ("Alpha", "Zulu", false, None),
+                ("Beta", "Able", false, None),
             ]
         );
     }
