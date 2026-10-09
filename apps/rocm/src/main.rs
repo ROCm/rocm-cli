@@ -9464,7 +9464,7 @@ pub(crate) fn render_launch_summary(paths: &AppPaths, config: &RocmCliConfig) ->
 /// it never writes to and never closes therefore waits, exactly as `cat` would;
 /// the TTY guard is what keeps that off an interactive user, and a
 /// non-interactive caller with no prompt to send should pass `/dev/null` (as
-/// `scripts/smoke_local.py` does) rather than an idle pipe. A read error — a
+/// `cargo xtask smoke` does) rather than an idle pipe. A read error — a
 /// closed or non-UTF-8 fd 0 — is reported instead of being folded into "no
 /// prompt", so text that was piped but could not be decoded fails loudly rather
 /// than silently becoming a status screen and a zero exit.
