@@ -3090,8 +3090,8 @@ mod archive_properties {
     use proptest::prelude::*;
 
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, Modes, benign_entries, check_round_trip, entries,
-        note_mode_scope, run_case, run_property, tar_gz_bytes,
+        Entry, Expect, Kind, Layout, Modes, entries, note_mode_scope, run_case, run_property,
+        run_round_trip, tar_gz_bytes,
     };
 
     /// The unpack plus the first write `install` makes into the result: the
@@ -3109,30 +3109,34 @@ mod archive_properties {
     }
 
     /// [`entries`] with every relative name moved one level down, under
-    /// `a/`, and any symlink that would still land directly in the extraction
-    /// root dropped: that is the one shape that hits the known #522 defect
-    /// (`first_child_dir` follows it). Moving names down rather than only
-    /// dropping top-level links keeps "link, then write through it" in play,
-    /// one level down where the source tree is.
+    /// `a/`, and every symlink dropped that could still land directly in the
+    /// extraction root: the shape that hits the known #522 defect
+    /// (`first_child_dir` follows it). A symlink is dropped when its name,
+    /// read as text, has at most one component, or when it walks through an
+    /// earlier symlink's name, which could point anywhere. Absolute names are
+    /// left alone: re-rooted, they land deep inside the extraction root.
+    /// Moving names down rather than only dropping top-level links keeps
+    /// "link, then write through it" in play, one level down where the
+    /// source tree is.
     fn entries_without_top_level_symlink() -> impl Strategy<Value = Vec<Entry>> {
-        fn lands_top_level(name: &[u8]) -> bool {
-            let mut depth = 0usize;
+        /// Lexical components, or `None` when the name climbs above the root.
+        fn components(name: &[u8]) -> Option<Vec<&[u8]>> {
+            let mut out = Vec::new();
             for part in name.split(|byte| *byte == b'/') {
                 match part {
                     b"" | b"." => {}
                     b".." => {
-                        let Some(up) = depth.checked_sub(1) else {
-                            return true;
-                        };
-                        depth = up;
+                        out.pop()?;
                     }
-                    _ => depth += 1,
+                    _ => out.push(part),
                 }
             }
-            depth <= 1
+            Some(out)
         }
         entries().prop_map(|entries| {
-            entries
+            let mut links: Vec<Vec<&[u8]>> = Vec::new();
+            let mut kept = Vec::new();
+            let moved: Vec<Entry> = entries
                 .into_iter()
                 .map(|mut entry| {
                     if !entry.name.starts_with(b"/") && !entry.name.starts_with(b"@") {
@@ -3140,10 +3144,23 @@ mod archive_properties {
                     }
                     entry
                 })
-                .filter(|entry| {
-                    !(matches!(entry.kind, Kind::Symlink(_)) && lands_top_level(&entry.name))
-                })
-                .collect()
+                .collect();
+            for entry in &moved {
+                if matches!(entry.kind, Kind::Symlink(_))
+                    && !entry.name.starts_with(b"/")
+                    && !entry.name.starts_with(b"@")
+                {
+                    let Some(parts) = components(&entry.name) else {
+                        continue;
+                    };
+                    if parts.len() <= 1 || links.iter().any(|link| parts.starts_with(link)) {
+                        continue;
+                    }
+                    links.push(parts);
+                }
+                kept.push(entry.clone());
+            }
+            kept
         })
     }
 
@@ -3201,19 +3218,12 @@ mod archive_properties {
     /// full, its single top-level directory becoming `source/`.
     #[test]
     fn source_unpack_installs_a_benign_archive_as_the_source_dir() {
-        run_property(
-            "comfyui-benign",
-            64,
-            benign_entries(),
-            None,
-            |layout, entries| {
-                let archive = layout.base.join("source.tar.gz");
-                fs::write(&archive, tar_gz_bytes(entries)).unwrap();
-                unpack_then_first_install_write(layout, &archive)
-                    .map_err(|error| format!("{error:#}"))?;
-                check_round_trip(&source_path_from_app_root(&layout.dest), entries)
-            },
-        )
+        run_round_trip("comfyui-benign", |layout, entries| {
+            let archive = layout.base.join("source.tar.gz");
+            fs::write(&archive, tar_gz_bytes(entries))?;
+            unpack_then_first_install_write(layout, &archive)?;
+            Ok(source_path_from_app_root(&layout.dest))
+        })
         .unwrap();
     }
 
