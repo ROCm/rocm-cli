@@ -30,3 +30,14 @@ serving is Linux or WSL2 only (see
 
 See [Contributing](../about/contributing.md) for the full development setup, test
 commands, and commit-signing requirements.
+
+## Uninstall ROCm CLI
+
+To remove ROCm CLI and what it manages:
+
+```bash
+rocm uninstall
+```
+
+Pass `--dry-run` first to preview what it removes. For the full flag list, see
+[Logs and cleanup](../commands.md#logs-and-cleanup).

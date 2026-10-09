@@ -21,7 +21,7 @@ SPDX-License-Identifier: MIT
 ```
 
 ROCm CLI is a command-line tool for setting up and running local AI on AMD GPUs, with a
-full-screen TUI dashboard for GPU telemetry, model serving, and chat.
+full-screen terminal user interface (TUI) dashboard for GPU telemetry, model serving, and chat.
 
 It ships as a single prebuilt binary for Linux and Windows (x86_64), needs no
 Python, Rust, or existing ROCm install, and includes inference engine adapters
@@ -48,7 +48,7 @@ back to. Ubuntu 22.04 ships glibc 2.35 and cannot run it; Ubuntu 24.04 provides
 glibc 2.39 and `GLIBCXX_3.4.33`.
 
 > [!IMPORTANT]
-> **Tech Preview** -- This software is provided as-is, without warranty or
+> **Tech Preview:** This software is provided as-is, without warranty or
 > guarantee of stability. APIs, commands, and behavior might change without
 > notice. Intended for experimentation and early feedback only.
 
@@ -80,7 +80,7 @@ The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
 directory to your shell `PATH`. Rerun it any time to upgrade.
 
-### Linux and WSL (x86_64)
+### Linux and WSL2 (x86_64)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.sh | sh
@@ -107,10 +107,27 @@ $env:ROCM_CLI_CHANNEL = "nightly"
 irm https://raw.githubusercontent.com/ROCm/rocm-cli/main/install.ps1 | iex
 ```
 
+### Verify the installation
+
+Open a new terminal so the updated `PATH` takes effect, then run:
+
+```bash
+rocm version
+```
+
+The output shows the ROCm CLI version with its release tag or branch and commit
+hash, the ROCm SDK that ROCm CLI would use on this computer, and the GPU driver
+version. A successful install prints the CLI version line. The SDK and driver
+lines read `not detected` when none is found, which is expected on a computer
+where you haven't installed ROCm or a driver yet.
+
+If the shell reports `rocm: command not found`, confirm that `~/.local/bin` is on
+your `PATH`.
+
 ## Build from source
 
 Building requires [Rust](https://rustup.rs/); the pinned toolchain in
-`rust-toolchain.toml` (currently 1.96.0) installs automatically via `rustup`.
+`rust-toolchain.toml` (currently 1.96.0) installs automatically through `rustup`.
 
 ```bash
 git clone https://github.com/ROCm/rocm-cli
@@ -120,8 +137,8 @@ cargo build --release
 
 This produces the two binaries under `target/release/`:
 
-- `rocm` — the CLI and interactive interfaces
-- `rocmd` — the background telemetry daemon used by the dashboard
+- `rocm`: the CLI and interactive interfaces
+- `rocmd`: the background telemetry daemon used by the dashboard
 
 Run without installing:
 
@@ -146,22 +163,25 @@ Launch ROCm CLI with no arguments:
 rocm
 ```
 
-With no arguments on an interactive terminal, `rocm` opens the **launcher** — a
+With no arguments on an interactive terminal, `rocm` opens the **launcher**, a
 small front-door menu that gets you to the common tasks:
 
-- **Set up this system** — install or update ROCm
-- **Serve a model** — run a model on your GPU
-- **Diagnose & fix** — check GPU, driver, and ROCm
-- **Chat** — talk to a local or API-backed model
-- **Open full dashboard →** — escalate into the live dashboard (`rocm dash`)
+- **Set up this system**: install or update ROCm
+- **Serve a model**: run a model on your GPU
+- **Diagnose & fix**: check GPU, driver, and ROCm
+- **Chat**: talk to a local or API-backed model
+- **Open full dashboard →**: escalate into the live dashboard (`rocm dash`)
 
-Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which quits
-from the launcher and the dashboard alike and restores your terminal — to quit.
+Pick a row with the arrow keys and `Enter`. Press `q` or `Ctrl-C` to quit.
+`Ctrl-C` quits from the launcher and the dashboard alike and restores your
+terminal.
+
 The one exception is the dashboard's console for a **running** job, where
-`Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
-that job finishes, `Ctrl-C` quits there too. On a non-interactive terminal (or
-piped output), `rocm` prints a one-shot status summary instead of opening the
-launcher.
+`Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit. Once
+that job finishes, `Ctrl-C` quits there too.
+
+On a non-interactive terminal (or piped output), `rocm` prints a one-shot status
+summary instead of opening the launcher.
 
 ## Interactive interfaces
 
@@ -176,7 +196,7 @@ the legacy full-screen setup assistant has been retired.
 
 ### The dashboard (`rocm dash`)
 
-The full-screen telemetry dashboard — every instrument and action on one screen.
+The full-screen telemetry dashboard shows every instrument and action on one screen.
 It auto-starts an embedded `rocmd` daemon when none is running, then presents
 five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 
@@ -189,25 +209,41 @@ five tabs (switch with `Tab`/`Shift+Tab` or number keys `1`–`5`):
 | **Chat** | Assistant chat backed by a local server or configured provider |
 
 Live mode reads telemetry over a Unix domain socket, so it requires Linux or
-WSL. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
+WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
 GPU or daemon.
 
 ## Configure ROCm and serve a model
 
-Before serving a model, ensure a managed ROCm runtime is configured:
+Before serving a model, check whether a managed ROCm runtime is already
+configured:
+
+```
+rocm examine
+```
+
+When `active_runtime_status` reports `ready`, you can serve a model now. A
+machine can also have an existing ROCm install that `rocm examine` reports as
+`legacy_rocm_status: detected_unmanaged`, alongside the managed runtime. To
+install a runtime, or to get a different version or configuration, run:
 
 ```
 rocm install sdk
 ```
 
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
-environment. On machines with an existing ROCm install, `rocm examine` will
-show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it. Running the command when a
-managed runtime is already the active default asks first, because the new
-install takes over as the active default; see
+environment. Running `rocm install sdk` creates a managed runtime alongside any
+legacy install.
+
+ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
+`rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
+add `--version` and `--family`, and give `--family` the exact GPU arch (the raw
+`gfx` code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+
+Running `rocm install sdk` when a managed runtime is already the active default
+asks first, because the new install takes over as the active default; see
 [ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
-for that gate and the flags that approve it without a prompt.
+for that gate, the flags that approve it without a prompt, and the ROCm 10 and
+newer requirements.
 
 Then serve a model:
 
@@ -217,7 +253,7 @@ rocm serve qwen
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
 box. You can also serve any compatible Hugging Face model directly. See
-[Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
+[Model serving](#model-serving) for the GGUF versus safetensors rule, because which
 form works depends on the engine your GPU selects.
 
 ## Quick reference
@@ -226,7 +262,7 @@ form works depends on the engine your GPU selects.
 |---|---|
 | `rocm` | Open the launcher menu (setup, serve, diagnose, chat, dashboard) |
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
-| `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
+| `rocm diagnose` | Match this machine against known ROCm, PyTorch, and llama.cpp failure modes |
 | `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
 | `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
@@ -237,7 +273,7 @@ form works depends on the engine your GPU selects.
 | `rocm dash` | Open the full-screen telemetry dashboard |
 | `rocm bench load --endpoint <url>` | Load-test a local OpenAI-compatible endpoint |
 | `rocm setup status` | Show first-time setup state |
-| `rocm version` | Print the rocm-cli version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
+| `rocm version` | Print the ROCm CLI version, release tag or branch, and commit hash, plus the ROCm SDK and GPU driver in use |
 | `rocm completions <shell>` | Print a shell completion script (bash, zsh, fish, elvish, powershell) |
 
 ## Commands
@@ -249,83 +285,101 @@ rocm examine [--json] [--framework auto|pytorch|llama-cpp|skip]
 ```
 
 Checks this computer's GPU, ROCm install, engines, and managed setup
-folders — the command to run first to see whether a system is ready, and
-what `rocm install sdk` and `rocm serve` will see. `--json` emits a
+folders. Run this command first to see whether a system is ready and what
+`rocm install sdk` and `rocm serve` will see. `--json` emits a
 machine-readable report for diagnosis tooling instead of the human-readable
 summary. `--framework` controls which ML framework the `--json` report probes
-for its ROCm build and compiled GPU architectures: `auto` (the default) tries
-PyTorch, then falls back to llama.cpp; `pytorch` or `llama-cpp` probe only
-that framework; `skip` runs no framework probe at all, which is fastest and
-still enough to answer GPU and driver questions. `--framework` only affects
-the JSON report, not the human-readable one.
+for its ROCm build and compiled GPU architectures:
+
+- `auto` (the default) tries PyTorch, then falls back to llama.cpp.
+- `pytorch` or `llama-cpp` probe only that framework.
+- `skip` runs no framework probe at all, which is fastest and still enough to
+  answer GPU and driver questions.
+
+`--framework` only affects the JSON report, not the human-readable one.
 
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
 
 `diagnose` matches this machine against a fixed catalog of known
-ROCm/PyTorch/llama.cpp misconfigurations and ranks what it finds. It can only
-recognise failure modes that are in the catalog: no match means "not
-recognised", not "nothing is wrong" — in that case it points you at where to
-report the symptom. Each result prints an `id:` and an `apply with:` command;
-the leading `#1`, `#2` are ranking positions for reading order only — `rocm
-fix` takes the id, not the position.
+ROCm, PyTorch, and llama.cpp misconfigurations and ranks what it finds. It can
+only recognize failure modes that are in the catalog: no match means "not
+recognized", not "nothing is wrong". In that case it points you at where to
+report the symptom.
+
+Each result prints an `id:` and an `apply with:` command. The leading `#1`, `#2`
+are ranking positions for reading order only. `rocm fix` takes the id, not the
+position.
+
+`rocm diagnose` takes these flags:
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
 - `--top` caps how many matches are shown in the human-readable output
-  (default 5) — `--json` always emits the full, untruncated report.
+  (default 5). `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of
-  this machine (nothing needs to be installed inside the distribution — name
+  this machine (nothing needs to be installed inside the distribution; name
   it only when more than one is installed). Inspecting remotely this way
   skips checks that need to read the distribution's own environment
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework and ROCm pairing). Run
   `rocm diagnose` inside the distribution for those.
 - `--report` shows exactly what this machine would contribute to a problem
-  report, and sends nothing — there is no transport yet, and there will be no
-  automatic one: a report leaves a machine only by its owner's own action. The
-  content is deliberately narrow (a schema version, the matched entry, whether
-  a fix was offered for it, the GPU architecture and which compatibility
-  matrix snapshot it was checked against, the OS family, distribution and
-  major version, the ROCm release, the inference engine and its release, the
-  CLI version), and it carries no host name, user name, file path, or error
-  text. The ROCm release and the inference engine's release are each cut
-  back to a release, so a build number that would narrow toward one machine
-  never appears there; the CLI's own version is the exception, since it names
-  the tool that wrote the report rather than something read off the machine.
-  The distribution is checked against a list of known names rather than
-  repeated from the machine. Hardware that is not on AMD's published
-  compatibility matrix produces no report at all, and the CLI says why. So
-  does a WSL machine, for a different reason: this CLI does not inspect the
-  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
-  matrix and says that rather than claiming the architecture could not be
-  read.
+  report, and sends nothing. There is no transport yet, and there will be no
+  automatic one: a report leaves a machine only by its owner's own action.
 - `--send`, which requires `--report`, additionally offers a prefilled mail
   carrying that report. It still sends nothing: the mail opens already filled
   in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
   and it leaves the machine only when you send it yourself. Requiring
   `--report` is what guarantees the content is shown before the mail is
-  offered. A mail client opens only when you asked and the machine looks like
-  a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
-  set, the address and the link are printed instead, which is also what
-  happens on a machine with no mail client. It is not combinable with
-  `--json`, which exists for scripts, and a script is not a person who can
-  read a mail before sending it. Note that a mail carries your address, which
-  the report itself does not.
+  offered.
 
-`fix` applies a known fix by the `id:` that `diagnose` reported — not the
+The `--report` content is deliberately narrow (a schema version, the matched entry, whether
+a fix was offered for it, the GPU architecture and which compatibility
+matrix snapshot it was checked against, the OS family, distribution and
+major version, the ROCm release, the inference engine and its release, the
+CLI version), and it carries no host name, user name, file path, or error
+text.
+
+The ROCm release and the inference engine's release are each cut
+back to a release, so a build number that would narrow toward one machine
+never appears there; the CLI's own version is the exception, since it names
+the tool that wrote the report instead of something read off the machine.
+The distribution is checked against a list of known names instead of
+being repeated from the machine.
+
+Hardware that is not on AMD's published
+compatibility matrix produces no report at all, and the CLI says why. So
+does a WSL machine, for a different reason: this CLI does not inspect the
+GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+matrix and says that instead of claiming the architecture could not be
+read.
+
+With `--send`, a mail client opens only when you asked and the machine looks like
+a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
+set, the address and the link are printed instead, which is also what
+happens on a machine with no mail client. It is not combinable with
+`--json`, which exists for scripts, and a script is not a person who can
+read a mail before sending it. Note that a mail carries your address, which
+the report itself does not.
+
+`fix` applies a known fix by the `id:` that `diagnose` reported, not the
 ranking position noted above, which isn't a stable name. Run it with no id
-to list the whole catalog. Each fix carries a marker saying what happens on
+to list the whole catalog.
+
+Each fix carries a marker saying what happens on
 this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
 once given the argument it names), PRINT-ONLY (it prints the steps for you to
-run yourself — usually because the right command depends on a choice only you
+run yourself, usually because the right command depends on a choice only you
 can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
-(no reliable fix exists, so nothing will be changed -- no catalog entry
-carries this marker today; it is reserved for a future detect-but-cannot-repair
+(no reliable fix exists, so nothing will be changed; no catalog entry
+carries this marker today, and it is reserved for a future detect-but-cannot-repair
 failure).
+
+`rocm fix` takes these flags:
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
@@ -348,7 +402,12 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by rocm-cli.
+by ROCm CLI. ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
+it currently installs ROCm 7.14. To install 10.0 or 10.1, follow the steps under
+ROCm 10 and newer, below.
+
+To remove ROCm CLI and what it manages, see
+[Logs and cleanup](#logs-and-cleanup).
 
 #### Compiler toolchain (--devel)
 
@@ -378,7 +437,7 @@ To reclaim the space, uninstall the one you don't want with
 If no managed runtime is the active default, `install sdk` doesn't prompt.
 Otherwise it asks first, because the new install becomes the active default.
 The prompt applies to any install, including a `--family` or `--channel` you
-haven't installed before, just as it does for a same-family upgrade.
+haven't installed before, as it does for a same-family upgrade.
 
 To approve without a prompt, for example in scripts or CI, where the prompt
 would otherwise refuse:
@@ -403,6 +462,31 @@ already there no longer runs its own Python, it is removed outright and rebuilt.
 The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
+#### ROCm 10 and newer
+
+ROCm 10 and newer ship from a different source layout. You opt in by passing two
+things together: pin the version with `--version`, and name the exact GPU arch,
+using the raw `gfx` code instead of a family label:
+
+```
+rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
+```
+
+A family label such as `--family gfx120X-all` is rejected for those versions
+instead of being resolved to a guess, because the ROCm 10 packages publish one
+payload per exact arch and there is no bucket payload to fall back to. Run
+`rocm examine` to see the arch this machine reports.
+
+For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
+torchaudio from their published dependency metadata, then validates that every
+selected framework package carries the same ROCm build identifier before it
+creates or changes a managed runtime.
+
+Nothing about this happens on its own. Without a `--version` of 10 or newer,
+`install sdk` resolves the same release and nightly sources as before. It doesn't
+quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
+you what it couldn't find instead.
+
 #### Driver installation
 
 `install driver` installs the AMD kernel driver on Linux, using DKMS or a native
@@ -420,31 +504,6 @@ package.
 | `--json` | Prints the check result as a single line of JSON instead of text. Conflicts with `--apply` and `--dry-run`. |
 | `--timeout-secs` | Bounds the network calls of the check. Requires `--json`. Conflicts with `--apply`. |
 | `--yes` | Accepted for consistency with other mutating commands, but grants nothing on `update`. The approval line the update path prints never credits it. |
-
-#### ROCm 10 and newer
-
-ROCm 10 and newer ship from a different source layout. You opt in by passing two
-things together: pin the version with `--version`, and name the exact GPU arch,
-using the raw `gfx` code rather than a family label:
-
-```
-rocm install sdk --version 10.0.0 --family gfx1200 --dry-run
-```
-
-A family label such as `--family gfx120X-all` is rejected for those versions
-rather than resolved to a guess, because the ROCm 10 packages publish one
-payload per exact arch and there is no bucket payload to fall back to. Run
-`rocm examine` to see the arch this machine reports.
-
-For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
-torchaudio from their published dependency metadata, then validates that every
-selected framework package carries the same ROCm build identifier before it
-creates or changes a managed runtime.
-
-Nothing about this happens on its own. Without a `--version` of 10 or newer,
-`install sdk` resolves the same release and nightly sources as before. It doesn't
-quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
-you what it couldn't find instead.
 
 ### Runtime management
 
@@ -482,32 +541,38 @@ updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
 ```
-rocm storage [report] [--json]
+rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
 
 `remove-old-installs` keeps the two most recent installs for each channel,
 format, GPU family, and toolchain choice, and never touches the install in use,
-the rollback target, or a folder rocm-cli did not create. "Most recent" means
-most recently installed rather than highest version, so after a deliberate
-downgrade the older version counts as the newer install. Because the count
-applies per channel, format, GPU family, and toolchain choice, a machine that
-has tried several channels keeps `--keep` installs for each of them — and a
-runtime-only install never evicts a `--devel` one, since the two are separate
-runtimes serving different purposes rather than newer and older versions of the
-same thing. Anything it declines to remove is
-listed with the reason, and `--dry-run` shows the whole plan without changing
-anything. `remove-downloads` clears cached archives that rocm-cli can download
-again; a cache folder that is a link to somewhere else is left alone rather
-than followed. The two archive rows the report prints are tagged
+the rollback target, or a folder ROCm CLI did not create. "Most recent" means
+most recently installed instead of highest version, so after a deliberate
+downgrade the older version counts as the newer install.
+
+Because the count applies per channel, format, GPU family, and toolchain
+choice, a machine that has tried several channels keeps `--keep` installs for
+each of them. A runtime-only install never evicts a `--devel` one, because the
+two are separate runtimes serving different purposes instead of newer and
+older versions of the same thing. Anything it declines to remove is listed with
+the reason, and `--dry-run` shows the whole plan without changing anything.
+
+`remove-downloads` clears cached archives that ROCm CLI can download again; a
+cache folder that is a link to somewhere else is left alone instead of
+being followed. The two archive rows the report prints are tagged
 `note: can be downloaded again; safe to remove`, so it is visible which rows
-`remove-downloads` acts on. The report also lists `local server records` — one
-JSON record plus the engine's log for each `rocm serve --managed` launch, kept
-after the server stops; `rocm services list --all` lists them, and no `rocm
-storage` command removes them — and the `uv` package cache, the Hugging Face
-model cache, and downloaded models; those last three are shared with other
-tools and are never removed by rocm-cli.
+`remove-downloads` acts on.
+
+The report also lists `local server records`: one JSON record plus the engine's
+log for each `rocm serve --managed` launch, kept after the server stops.
+`rocm services list --all` lists them, and no `rocm storage` command removes
+them. It also lists the `uv` package cache, the Hugging Face model cache, and
+downloaded models. Those last three are shared with other tools, and no
+`rocm storage` command removes them. `rocm uninstall` removes downloaded models
+along with the data directory unless you pass `--keep-data`; see
+[Logs and cleanup](#logs-and-cleanup).
 
 ### Inference engines
 
@@ -527,18 +592,35 @@ Ask before downloading anything:
 rocm diagnose --model <model> [--json]
 ```
 
-Answers in seconds, from the curated recipe and this machine's GPU — it
+Answers in seconds, from the curated recipe and this machine's GPU. It
 fetches no weights and makes no network call. The verdict is `ready`,
 `degraded`, `blocked`, or `undetermined`. A `ready` answer also names the
 engine `rocm serve` would use; a `blocked` one names curated models that would
 run here instead.
 
-`undetermined` is a real answer and not a failure: it is what you get when the
-recipe catalog could not be read, when this machine's GPU memory could not be
-measured, or when the model is not one of the curated recipes (`rocm model`
-lists those). None of those say anything about whether the model fits, so none
-of them are reported as though they did — `rocm serve` still accepts a model
-outside the catalog, this just cannot tell you in advance how it will go.
+`undetermined` is a real answer, not a failure. You get it when any of these is
+true:
+
+- The recipe catalog could not be read.
+- This machine's GPU memory could not be measured. This includes an integrated
+  GPU (APU), where the CLI can't yet read the memory pool the engine uses.
+- The model is not one of the curated recipes. [`rocm model --verbose`](#curated-models)
+  lists all of them, including recipes hidden from the default list.
+
+None of these says anything about whether the model fits, so none of them is
+reported as though it did. `rocm serve` still accepts a model outside the
+catalog, but `diagnose` cannot tell you in advance how it will go.
+
+### Curated models
+
+```
+rocm model [--verbose]
+```
+
+`rocm model` (alias `rocm models`) lists the recommended local models, grouped by
+the hardware they target. Pass `--verbose` to list every recipe, including ones
+hidden from the default list, with details such as aliases, data type, minimum
+GPU memory, and preferred engines.
 
 ### Model serving
 
@@ -562,7 +644,7 @@ server-wide sampling defaults for the launched engine. They apply only to
 into a single `--override-generation-config` JSON object (`--max-tokens` maps
 to vLLM's `max_new_tokens`); for Lemonade they pass straight through as
 llama.cpp's `--temperature`, `--top-p`, and `--n-predict` flags. Each control
-is optional and independent — omit any of them to keep the engine's own
+is optional and independent, so omit any of them to keep the engine's own
 default.
 
 `rocm serve` only reuses an already-running service for the same engine and
@@ -570,46 +652,53 @@ model if its sampling controls (and other recipe settings) match the ones
 requested this time; otherwise it errors out instead of silently serving with
 different settings. If you previously started a service with `--temperature`
 (or another sampling flag) and now run `rocm serve` for the same model without
-flags — or with different ones — stop the existing service first (`rocm
+flags, or with different ones, stop the existing service first (`rocm
 services stop`) or match the original flags.
 
-By default the server runs in the background under rocm-cli's supervision and
-prints a deployment summary — a progress indicator while it starts, then a table
+By default the server runs in the background under ROCm CLI's supervision and
+prints a deployment summary: a progress indicator while it starts, then a table
 with the status, the full inference endpoint, the API-qualified model name, and a
-quick smoke test (time to first token and approximate tokens/sec). Control
+quick smoke test (time to first token and approximate tokens per second). Control
 returns to your shell with the server still running; manage it later with `rocm
 services` (below).
 
 `--verbose` (or `--foreground`) instead attaches to the server in the current
-terminal and streams every engine log line — use it to debug a startup problem.
-The server still runs as a managed background process, so while streaming you can
-press **Ctrl-D to detach** — the log stream stops, your shell comes back, and the
-server keeps running (manage it afterward with `rocm services`). Press **Ctrl-C**
-to stop the server instead. `--managed` is the explicit form of the default
-background behavior. `--no-smoke-test` skips the post-startup inference probe.
+terminal and streams every engine log line. Use it to debug a startup problem.
+The server still runs as a managed background process, so while streaming you
+can:
+
+- Press **Ctrl-D** to detach. The log stream stops, your shell comes back, and
+  the server keeps running. Manage it afterward with `rocm services`.
+- Press **Ctrl-C** to stop the server instead.
+
+`--managed` is the explicit form of the default background behavior.
+`--no-smoke-test` skips the post-startup inference probe.
 
 Which model form to pass depends on the engine your GPU selects. The Lemonade
-engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models — pass a GGUF repo
+engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models. Pass a GGUF repo
 with an explicit quantization variant, for example,
-`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. The vLLM engine (Instinct) serves
-**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`. A
-safetensors-only id has no GGUF build, so serving it through Lemonade fails
-rather than silently substituting a different model.
+`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`.
 
-Some models (such as Llama) are gated and require HuggingFace authentication.
+The vLLM engine (Instinct) serves
+**safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`.
+A safetensors-only id has no GGUF build, so serving it through Lemonade fails
+instead of silently substituting a different model.
+
+Some models (such as Llama) are gated and require Hugging Face authentication.
 Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
-per-GPU VRAM (via `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is
-not installed) and picks the lowest-numbered GPU that is idle and
-not already used by another rocm-cli server (managed or foreground), falling
-back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
-pin a specific device. The
-selected GPU is exposed to the engine via `HIP_VISIBLE_DEVICES`. Serving one
-model across multiple GPUs is not supported. Because selection uses the
-`amd-smi` ordinal but is applied via `HIP_VISIBLE_DEVICES`, rocm-cli warns when
-`ROCR_VISIBLE_DEVICES` is set, since the two orderings can diverge.
+per-GPU VRAM (through `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi`
+is not installed) and picks the lowest-numbered GPU that is idle and not already
+used by another ROCm CLI server (managed or foreground), falling back to the GPU
+with the most free memory. Pass a single index (`--gpu 1`) to pin a specific
+device.
+
+The selected GPU is exposed to the engine through `HIP_VISIBLE_DEVICES`. Serving
+one model across multiple GPUs is not supported. Because selection uses the
+`amd-smi` ordinal but is applied through `HIP_VISIBLE_DEVICES`, ROCm CLI warns
+when `ROCR_VISIBLE_DEVICES` is set, because the two orderings can diverge.
 
 Manage background servers started with `--managed`:
 
@@ -626,14 +715,17 @@ rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
 alone, and additionally clears leftover files whose record is already gone.
+
 Removal destroys both the log and the `restart` option for the records it
 takes, so `prune` only considers records untouched for 24 hours. Age is
 measured from when the record file was last written, so a stop, a restart, or a
 status correction all count as touching it. Pass `--older-than-hours <n>` for a
 different threshold, or `--any-age` to take every record that is not running
-however recent — that is the flag `prune` names in its own summary when it
+however recent. That is the flag `prune` names in its own summary when it
 reports how many records it kept for being too recent. The two cannot be
-combined. A file whose record has not been written *yet* belongs to a server
+combined.
+
+A file whose record has not been written *yet* belongs to a server
 that is still starting, not to something left behind, so `prune` waits for any
 managed launch already under way to finish publishing its record before it looks
 at the directory. That wait lasts as long as the launch does and has no timeout,
@@ -653,7 +745,7 @@ Run a model on a different GPU machine and reach it from your own. Both machines
 join a [Tailscale](https://tailscale.com) network; the GPU machine serves the
 model on its own loopback address and publishes that port onto the network, so
 the endpoint keeps working after the command exits and answers from any of your
-machines rather than only the one that started it.
+machines instead of only the one that started it.
 
 ```console
 rocm remote targets [--tag <tag>]
@@ -665,20 +757,20 @@ rocm remote attach <session>
 rocm remote stop <session> [--force]
 ```
 
-`targets` lists machines on your network — it does not check whether they can
+`targets` lists machines on your network. It does not check whether they can
 actually serve, which is what `doctor` is for. `serve` prepares the machine
 (installing the CLI if it is missing), starts the model, publishes the endpoint
 and prints the address together with an API key.
 
 **The endpoint is reachable by every machine on your network that your network's
 access rules allow**, not just yours. That API key is what stops anyone else
-using it, so `rocm remote` always sets one — unlike local serving, which is
+from using it, so `rocm remote` always sets one. This differs from local serving, which is
 credential-free because only your own machine can reach it.
 
 `status` reports the model and the endpoint separately, because either can fail
 alone: a healthy model with no endpoint needs `attach`, not a restart. `stop`
 withdraws the endpoint and stops the model, and keeps the session listed if it
-cannot confirm both — use `--force` to forget one whose machine is gone.
+cannot confirm both. Use `--force` to forget one whose machine is gone.
 
 Communication with the machine uses your existing `ssh` setup. Set
 `ROCM_REMOTE_SSH_CONFIG` to point at a configuration file other than the
@@ -690,15 +782,18 @@ default.
 rocm dash [--demo] [--replay <file>]
 ```
 
-Full-screen TUI with Home, ROCm, Serving, Observe, and Chat tabs — GPU
+Full-screen TUI with Home, ROCm, Serving, Observe,
+and Chat tabs. It shows GPU
 utilization graphs, active serving instances, benchmark results, guided actions,
 and a chat tab backed by any configured provider. See
 [Interactive interfaces](#interactive-interfaces) for the tab breakdown.
 
-- `--demo` runs a deterministic synthetic session with no GPU or daemon needed,
-  works on all platforms.
+For `rocm dash`:
+
+- `--demo` runs a deterministic synthetic session with no GPU or daemon needed.
+  It works on all platforms.
 - `--replay <file>` replays a recorded NDJSON session.
-- Live mode requires Unix domain sockets (Linux and WSL only).
+- Live mode requires Unix domain sockets (Linux and WSL2 only).
 
 ### Bench
 
@@ -708,21 +803,23 @@ rocm bench load --endpoint URL [--model NAME] [--concurrency N,N,...]
 ```
 
 Saturates a local OpenAI-compatible endpoint and reports rough client-side
-throughput — a local smoke test, **not** an official ROCm/AMD benchmark.
+throughput. It is a local smoke test, **not** an official ROCm or AMD benchmark.
 `load` measures raw serving throughput with synthetic single-shot requests
 (the vLLM `benchmark_serving` shape); it does not reproduce agent-shaped,
 multi-turn, long-context tool traffic and isn't comparable to `*-agent-bench`
 quality harnesses.
 
+Flags and output for `rocm bench load`:
+
 - `--endpoint` is the OpenAI-compatible URL shown by `rocm services list` (a
-  plain host address without `/v1` also works); only `http://` is accepted —
-  `https://` endpoints are rejected outright, since the load generator has no
+  plain host address without `/v1` also works). Only `http://` is accepted;
+  `https://` endpoints are rejected outright, because the load generator has no
   TLS backend compiled in.
 - `--concurrency` sweeps a comma-separated list of levels (default
   `1,8,32,64`, each 1-128); `--auto-ramp` ignores `--concurrency` and instead
   ramps `1,2,4,8,16,32,64,128` automatically, stopping early once generation
   throughput plateaus or the request queue backs up.
-- `--isl`/`--osl` (input/output sequence length, default 1024 each) accept
+- `--isl` and `--osl` (input and output sequence length, default 1024 each) accept
   1-32768, and `--requests` (default 128) accepts 1-10000.
 - Results are written to `--out` (default `<data-dir>/bench/results.csv`,
   where `<data-dir>` is `~/.rocm` unless overridden), intended to match the
@@ -735,14 +832,25 @@ quality harnesses.
 ### Chat
 
 ```
-rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--tools]
+rocm chat [--provider local|openai|anthropic] [--model NAME] [--prompt TEXT] [--tools]
           [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
-Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
-omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
-controls forwarded to the request; each is independent, so omit any of them to
-use the provider's default.
+Chat with an AI provider from the terminal. In an interactive terminal,
+`rocm chat` without `--prompt` opens the dashboard chat, where you switch
+providers with `/provider <name>`. With `--prompt`, or with input piped to
+standard input, it sends one prompt and prints the reply.
+
+- `--provider` selects `local` (a model that `rocm serve` runs on this machine,
+  the default), `openai`, or `anthropic`. A cloud provider needs setup
+  first: run `rocm config enable-provider <provider>` and
+  `rocm config set-provider-key <provider>`. See [Configuration](#configuration).
+- `--tools` lets an OpenAI-compatible provider request ROCm tool calls.
+- `--provider`, `--model`, and `--tools` apply to the one-prompt form. The
+  dashboard chat ignores them.
+- `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
+  forwarded to the request. Each is independent, so omit any of them to use the
+  provider's default.
 
 ### ComfyUI
 
@@ -769,11 +877,20 @@ rocm automations enable <watcher-id>  [--mode observe|propose|contained]
 rocm automations disable <watcher-id>
 ```
 
-Optional background checks that can propose or apply changes automatically.
+Automations are optional background checks, called watchers, that can propose or
+apply changes automatically. `list` shows the available watchers and their IDs.
+`enable` turns one on, and `--mode` sets how far it can act:
+
+- `observe` reports what it finds and changes nothing.
+- `propose` queues a suggested change for you to approve, for watchers that can
+  make one.
+- `contained` lets a watcher act on its own only where that is safe. Today only
+  `server-recover` does: it restarts a managed service that failed. The other
+  watchers stay review-gated or record only in this mode.
 
 ### Configuration
 
-Show or change rocm-cli's saved settings — the default engine and runtime,
+Show or change ROCm CLI's saved settings: the default engine and runtime,
 which runtime each engine prefers, local GPU telemetry opt-in, and the
 provider used for chat, automations, and ambiguous natural-language plans
 (including enabling providers and storing their API keys).
@@ -802,19 +919,55 @@ rocm setup reset
 ```
 
 Manage first-time setup state. `status` shows whether first-time setup has
-completed; `reset` clears the recorded completed/dismissed state (nothing
-auto-triggers onboarding from this alone — open it manually from the
-dashboard, `rocm dash`: switch to the **Observe** tab, then press `n`). ROCm
-installs, API keys, and provider settings are left untouched.
+completed. `reset` clears the recorded completed or dismissed state. Nothing
+auto-triggers onboarding from this alone; to open it manually, run `rocm dash`,
+switch to the **Observe** tab, and press `n`. ROCm installs, API keys, and
+provider settings are left untouched.
 
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...]
+rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+               [--force-dev-binaries]
 ```
+
+`rocm uninstall` removes four categories of files that ROCm CLI manages on this
+computer: its binaries, configuration, data, and caches. Use `--dry-run` to
+preview what it removes, and `--yes` to skip the confirmation. Each `--keep-*`
+flag skips the removal of one category:
+
+- `--keep-binaries` keeps the installed ROCm CLI binaries.
+- `--keep-config` keeps your saved settings.
+- `--keep-data` keeps app data such as logs, services, engines, downloaded
+  models, the managed ROCm SDK installs, and the managed `uv` package cache.
+- `--keep-cache` keeps the caches under the cache directory. It doesn't cover
+  the managed `uv` package cache, which `--keep-data` controls.
+
+By default, the configuration and data directories are both `~/.rocm`, and the
+cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+unless you keep that category, so on a default installation a flag doesn't
+protect its files by itself. To keep your settings and data, pass `--keep-config`
+and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
+
+When you run `rocm` from a cargo `target` build, `uninstall` skips binary
+removal. Pass `--force-dev-binaries` to remove the debug and release binaries
+beside it.
+
+Before removing anything, `uninstall` prints warnings about two situations:
+
+- Managed service records exist. `uninstall` doesn't stop their background
+  processes.
+- Remote sessions exist. For each one, run `rocm remote stop <session>` first.
+  Otherwise the model keeps running on the remote machine with its endpoint
+  published, and the record that tracked it is gone.
+
+It also lists the shared caches it leaves in place, when they live outside the
+ROCm CLI directories: a `uv` package cache that `UV_CACHE_DIR` or the default
+`~/.cache/uv` points to, and the Hugging Face model cache. Delete them yourself
+if you no longer need them.
 
 ### Shell completions
 
@@ -858,8 +1011,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## More docs
 
-- Architecture and module map: `docs/architecture.md`
-- Testing and verification: `docs/testing.md`
-- Developer manual QA: `docs/manual-testing.md`
-- Engine plugin policy: `docs/engine-plugins.md`
-- vLLM adapter: `docs/vllm.md`
+- [Architecture and module map](https://github.com/ROCm/rocm-cli/blob/main/docs/architecture.md)
+- [Testing and verification](https://github.com/ROCm/rocm-cli/blob/main/docs/testing.md)
+- [Developer manual QA](https://github.com/ROCm/rocm-cli/blob/main/docs/manual-testing.md)
+- [Engine plugin policy](https://github.com/ROCm/rocm-cli/blob/main/docs/engine-plugins.md)
+- [vLLM adapter](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md)

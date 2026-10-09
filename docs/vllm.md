@@ -36,11 +36,11 @@ as a `torch_alignment:` line.
 
 A torch that already executes a GPU kernel against the installed SDK is kept
 exactly as it is, whichever installer put it there. Otherwise the runtime is
-moved to the SDK's *build* of the torch *release* the engine pins: the release
-comes from the engine, which was built against it, and the build comes from the
-SDK, whose libraries it has to load. A `device_check:` line reports what the
-result can actually do, and a realignment also reports what the runtime could do
-before it.
+moved to the SDK's *build* of the torch *release* that the engine pins: the
+release comes from the engine, which was built against it, and the build comes
+from the SDK, whose libraries it has to load. A `device_check:` line reports
+what the result can actually do, and a realignment also reports what the runtime
+could do before it.
 
 Set `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` to keep whatever torch is installed and
 skip the replacement:
@@ -52,62 +52,68 @@ ROCM_CLI_DISABLE_TORCH_ALIGNMENT=1 rocm engines install vllm --yes
 Any value works, including an empty one: the variable being set is the signal.
 The install then reports `torch_alignment: disabled`, naming both the build it
 would have installed and the one it kept. The device check still runs, so an
-opt-out that leaves the runtime unable to serve says so rather than failing later
+opt-out that leaves the runtime unable to serve says so instead of failing later
 during serving.
 
-Use it when you are deliberately running a torch the alignment would replace (a
-locally built wheel, a version under test, or a stack pinned for a reproduction). It
-is an escape hatch, not a supported configuration: the resulting combination is
-not validated against the supported matrix, and a runtime that cannot execute a
-kernel will fail at serving time.
+Use it when you are deliberately running a torch that the alignment would
+replace, such as a locally built wheel, a version under test, or a stack pinned
+for a reproduction. It is an escape hatch, not a supported configuration: the
+resulting combination is not validated against the supported matrix, and a
+runtime that cannot execute a kernel will fail at serving time.
 
 ## ROCm 10.x wheel discovery
 
-For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
-and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,
-flash-attn, and amd-aiter there under a rotating dev-tag filename (for example
+For ROCm SDK 7.x versions, including 7.14, `rocm engines install vllm` pins a
+fixed vLLM wheel and index URL. Any ROCm SDK 10.x version is different: AMD
+publishes vLLM, flash-attn, and amd-aiter there under a rotating dev-tag
+filename (for example
 `vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
-so there is no fixed filename to pin in the adapter. The wheel's own tag shows
-the other thing that changes on this route: ROCm 10.x's vLLM, flash-attn, and
-amd-aiter are published for **`cp314` only**, unlike every earlier ROCm SDK
-version's `cp312` wheels. ROCm CLI provisions a matching interpreter for a
-10.x install automatically; a Python already on `PATH` or already installed
-as ROCm CLI's managed Python is rejected if it is not `cp314`, with a message
-naming the required tag.
+so there is no fixed filename to pin in the adapter.
+
+The wheel's own tag shows the other thing that changes on this route: ROCm
+10.x's vLLM, flash-attn, and amd-aiter are published for **`cp314` only**, unlike
+every earlier ROCm SDK version's `cp312` wheels. ROCm CLI provisions a matching
+interpreter for a 10.x install automatically. A Python already on `PATH`, or
+already installed as ROCm CLI's managed Python, is rejected if it is not
+`cp314`, with a message naming the required tag.
 
 This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
 through *different* rows: they pin different vLLM minors and read vLLM from
 different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
 host from 10.0's production index. Both rows take their torch stack from the
-same `whl-next` index, which is where `rocm install sdk` resolves either SDK's
-own `+rocmX.Y` torch from, but vLLM's discovery is independent of that: it
-resolves its own torch/torchvision/torchaudio pins fresh from the row's own
-static version prefixes, rather than reusing whatever the SDK install
-resolved, which may be a different torch version than this row pins. Patch
-and any dev/pre-release suffix are still ignored within a row, since AMD
-rotates those constantly.
+same `whl-next` index, which is also where `rocm install sdk` resolves either
+SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
+resolves its own torch, torchvision, and torchaudio pins fresh from the row's
+own static version prefixes, instead of reusing what the SDK install resolved.
+The SDK install might have resolved a different torch version than the row pins.
+Patch and any dev or pre-release suffix are still ignored within a row, because
+AMD rotates those constantly.
 
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
 reports it would install, then reinstalls pinned to that exact version.
-tensorizer is not discovered or pinned this way: it has no ROCm-specific
-build, and vllm's own wheel metadata already declares an exact tensorizer
-dependency, so it is left to vllm's own dependency resolution rather than
-risk a conflicting pin of its own. Every resolved pin that carries a
+`tensorizer` is not discovered or pinned this way: it has no ROCm-specific
+build, and vLLM's own wheel metadata already declares an exact tensorizer
+dependency, so it is left to vLLM's own dependency resolution instead of
+risking a conflicting pin of its own. Every resolved pin that carries a
 `+rocmX.Y` local version is checked against the SDK's own major.minor before
 installing, so an index that happens to serve more than one ROCm line at once
 cannot silently install the wrong line's wheel onto this SDK. If AMD's index
 has no compatible build for a package, the resolver fails and the install
-fails rather than falling back to an unpinned or CPU install. The final install
-of vllm/flash-attn/amd-aiter also resolves vllm's own plain-PyPI transitive
-dependencies (e.g. `lm-format-enforcer`), which AMD's index doesn't host; a
-generated `uv.toml` sets `ignore-error-codes = [403]` for that index so `uv`
-falls through to PyPI for those instead of treating the index's 403 as fatal.
+fails instead of falling back to an unpinned or CPU install.
+
+The final install of vllm, flash-attn, and amd-aiter also resolves vLLM's own
+plain-PyPI transitive dependencies (for example, `lm-format-enforcer`), which
+AMD's index doesn't host. A generated `uv.toml` sets `ignore-error-codes = [403]`
+for that index so `uv` falls through to PyPI for those instead of treating the
+index's 403 as fatal.
+
 That same full-dependency resolve can also pull in an unconstrained `torch`
 from PyPI, undoing the exact ROCm pin just installed, and transitively an
-unconstrained `torchvision`/`torchaudio` with it; the install re-pins all
-three back to the exact builds discovered above immediately afterwards. That
-same realign also covers AMD's per-GPU-architecture device-kernel plugins
+unconstrained `torchvision` and `torchaudio` with it. The install re-pins all
+three back to the exact builds discovered above immediately afterwards.
+
+That same realign also covers AMD's per-GPU-architecture device-kernel plugins
 (`amd-torch-device-gfx*`, `amd-torchvision-device-gfx*`): each is versioned in
 lockstep with its own base package but resolved independently of it, so the
 full-dependency install can leave one ahead of the base package it ships
@@ -115,14 +121,14 @@ kernels for. The install reads `uv pip freeze`, and re-pins every such plugin
 it finds to its own base package's resolved release. The mismatch is invisible
 at install time and only surfaces at serve time, as a HIP "Cannot find Symbol"
 crash.
-Every other
-ROCm SDK version, including 7.2.3, keeps using the static pin table; an SDK
-version with no matching row there falls back to the table's default pin,
-*unless* its major release matches a discovery-table entry, in which case
-guessing the default pin would very likely install an ABI-incompatible build,
-so the install fails closed instead with a message naming the detected
-version and pointing at `ROCM_CLI_VLLM_ROCM_INDEX_URL` as the way to install
-anyway.
+
+Every other ROCm SDK version, including 7.2.3, keeps using the static pin
+table. An SDK version with no matching row there falls back to the table's
+default pin, *unless* its major release matches a discovery-table entry. In that
+case, guessing the default pin would very likely install an ABI-incompatible
+build, so the install fails closed instead. The error message names the
+detected version and points at `ROCM_CLI_VLLM_ROCM_INDEX_URL` as the way to
+install anyway.
 
 ## Discovery paths and checks
 
@@ -153,13 +159,19 @@ python3 scripts/vllm_therock_gpu_test.py \
   --model facebook/opt-125m
 ```
 
-The acceptance script is Linux or WSL only. It requires vLLM to be discoverable
-through a ROCm CLI-managed TheRock runtime manifest, launches with
-`gpu_required`, checks `/health` and `/v1/completions`, and verifies loaded
-ROCm libraries come from the managed TheRock SDK wheel directories. It rejects
-external vLLM command overrides and does not allow CPU fallback. It defaults
-to the active exact runtime key; if `--runtime-id` is passed, use an exact
-runtime key or an unambiguous runtime id.
+The acceptance script is Linux or WSL only. It does the following:
+
+- Requires vLLM to be discoverable through a ROCm CLI-managed TheRock runtime
+  manifest.
+- Launches with `gpu_required`.
+- Checks `/health` and `/v1/completions`.
+- Verifies that loaded ROCm libraries come from the managed TheRock SDK wheel
+  directories.
+- Rejects external vLLM command overrides.
+- Does not allow CPU fallback.
+
+The script defaults to the active exact runtime key. If you pass `--runtime-id`,
+use an exact runtime key or an unambiguous runtime id.
 
 ### Source build notes
 
@@ -179,7 +191,7 @@ GPTQ compatibility guard in
 Without that patch, `q_gemm.hip` fails to compile because TheRock 7.13 headers
 do not expose the `half`/`half2` `atomicAdd` overloads used by vLLM's GPTQ
 kernel. With the patch, the live acceptance harness passed on
-`facebook/opt-125m` and verified HIP/BLAS libraries loaded from the managed
+`facebook/opt-125m` and verified HIP and BLAS libraries loaded from the managed
 TheRock SDK wheel directories.
 
 ## Serve a model
@@ -202,14 +214,14 @@ rocm serve Qwen/Qwen3.5-4B --engine vllm --managed
 rocm serve Qwen/Qwen3.5-4B --engine vllm --gpu 1 --managed
 ```
 
-ROCm CLI pins the device via `HIP_VISIBLE_DEVICES`. Serving one model across
+ROCm CLI pins the device through `HIP_VISIBLE_DEVICES`. Serving one model across
 multiple GPUs is not supported.
 
 ## GPU memory
 
-vLLM claims a fixed fraction of each GPU's **total** VRAM (not of the free
-VRAM, and not scaled to the model) for weights plus KV cache. On a large card
-a small model therefore still reserves a large slice.
+vLLM claims a fixed fraction of each GPU's **total** VRAM for weights plus KV
+cache. The fraction is not based on the free VRAM, and it is not scaled to the
+model. On a large card, a small model therefore still reserves a large slice.
 
 ROCm CLI sets no `--gpu-memory-utilization` of its own, so vLLM's own default
 applies unless a value comes from somewhere else: either a model's catalog
@@ -220,63 +232,65 @@ rocm serve <model> --engine vllm --gpu-memory-utilization 0.3 --managed
 ```
 
 The value is a fraction in `(0, 1]` of total device VRAM. Lower it to leave room
-for a display, another workload, or a second server; raise it to give a large
-model more KV cache. Applies to vLLM only; it is ignored, with a note in the
+for a display, another workload, or a second server. Raise it to give a large
+model more KV cache. It applies to vLLM only and is ignored, with a note in the
 serve output, for other engines. An out-of-range or unparsable value fails the
-command rather than falling back silently.
+command instead of falling back silently.
 
-Earlier releases pinned this to `0.80` to leave display/WSL headroom. That pin is
-gone, so an unchanged command now reserves vLLM's own (higher) default. Pass
-`--gpu-memory-utilization 0.8` to restore the previous reservation.
+Earlier releases pinned this to `0.80` to leave display or WSL headroom. That
+pin is gone, so an unchanged command now reserves vLLM's own (higher) default.
+Pass `--gpu-memory-utilization 0.8` to restore the previous reservation.
 
 ### Shared or busy GPUs
 
 Because the reservation is a fraction of **total** VRAM, it ignores memory
 already held by other workloads. On a shared multi-GPU node the default can
 collide with in-use memory and the engine fails with `HIP out of memory` even for
-a tiny model. rocm-cli helps in three ways:
+a tiny model. ROCm CLI helps in three ways:
 
 - **Auto-selection avoids busy cards.** `--gpu auto` ranks GPUs by free VRAM and
-  skips heavily-used ones. When `amd-smi` is not installed it falls back to the
+  skips heavily used ones. When `amd-smi` is not installed, it falls back to the
   amdgpu DRM sysfs counters
   (`/sys/class/drm/card*/device/mem_info_vram_{total,used}`), so selection still
   works on stripped-down container images with a single GPU. That fallback
-  withholds telemetry on a multi-GPU host, since its `card<N>` numbering is not
-  guaranteed to match HIP's device ordinal there.
+  withholds telemetry on a multi-GPU host, because its `card<N>` numbering is
+  not guaranteed to match HIP's device ordinal there.
 - **The serve summary warns on low free VRAM.** When the selected GPU is already
-  heavily used, `rocm serve` prints a note — before launch on the plain path, or
-  in the post-readiness summary in the default interactive mode — and, for vLLM,
-  points at `--gpu-memory-utilization` as the fix.
+  heavily used, `rocm serve` prints a note. The note appears before launch on
+  the plain path, or in the post-readiness summary in the default interactive
+  mode. For vLLM, the note also points at `--gpu-memory-utilization` as the fix.
 - **OOM failures hint the workaround.** When a startup failure log shows an
   out-of-memory error, the failure message suggests retrying with a smaller
-  reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
-  with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
-  for the full conditional remediation (busy GPU vs. a model that does not fit).
-  The printed command quotes your actual failing line when it can be rendered as
-  one intact single-quoted argument; a line carrying an apostrophe or terminal
-  control bytes falls back to the canonical symptom below rather than handing you
-  a command whose quoting the log text broke.
+  reservation, such as `--gpu-memory-utilization 0.5`, or targeting a less busy
+  GPU with `--gpu <index>`. It also points at
+  `rocm diagnose --symptom '<the error>'` for the full conditional remediation
+  (busy GPU versus a model that does not fit). The printed command quotes your
+  actual failing line when it can be rendered as one intact single-quoted
+  argument. A line carrying an apostrophe or terminal control bytes falls back to
+  the canonical symptom below instead of handing you a command whose quoting the
+  log text broke.
 
 Explicitly, the workaround for an OOM on a shared card is:
 
 ```bash
 rocm serve <model> --engine vllm --gpu-memory-utilization 0.5
-# optionally target a specific, less-busy GPU by index
+# optionally target a specific, less busy GPU by index
 rocm serve <model> --engine vllm --gpu 1 --gpu-memory-utilization 0.5
-# for the full busy-GPU-vs-model-too-large breakdown, pass the error to diagnose
+# for the full breakdown of a busy GPU versus a model that is too large, pass the error to diagnose
 rocm diagnose --symptom 'vllm: torch.OutOfMemoryError: HIP out of memory'
 ```
 
 ## Tool calling
 
-The TUI chat tab attaches tool definitions to every chat request. vLLM rejects
+The chat tab in the terminal user interface (TUI) attaches tool definitions to
+every chat request. vLLM rejects
 those with HTTP 400 unless it is launched with `--enable-auto-tool-choice` **and**
-a matching `--tool-call-parser`. vLLM does not auto-detect the parser and it is
-model-specific, so ROCm CLI never guesses one:
+a matching `--tool-call-parser`. vLLM does not auto-detect the parser, and the
+parser is model-specific, so ROCm CLI never guesses one:
 
 - **Built-in catalog models** carry the correct parser in their recipe metadata,
-  so tool calling works out of the box (for example, Qwen family → `hermes`,
-  Llama 3 → `llama3_json`).
+  so tool calling works out of the box. For example, the Qwen family uses
+  `hermes` and Llama 3 uses `llama3_json`.
 - **Other models** (arbitrary Hugging Face repos, or a catalog model forced onto
   vLLM without authored metadata) need an explicit parser:
 
