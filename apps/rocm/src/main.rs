@@ -871,7 +871,7 @@ enum ComfyuiCommand {
         /// renamed to `<name>.rocm-cli-kept-<time>`. An install made before rocm-cli recorded
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
-        /// running.
+        /// running, unless rocm-cli's saved record of it cannot be read, which it then says.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.

@@ -108,7 +108,9 @@ pub(super) struct SwapReport {
 }
 
 /// A release entry that could not be removed, which leaves the swap
-/// unfinished. Typed so the caller can name the command that finishes it.
+/// unfinished. Its message says to close the program holding it; the caller
+/// adds the command that finishes the swap, as for any failure once the
+/// [`SWAP_MARKER`] is written.
 #[derive(Debug)]
 pub(super) struct RemovalFailed {
     pub(super) path: PathBuf,
@@ -1637,7 +1639,7 @@ mod tests {
         );
     }
 
-    fn crosses_devices_once(first: &Path) -> impl Fn(&Path, &Path) -> io::Result<()> + use<'_> {
+    fn crosses_devices_for(first: &Path) -> impl Fn(&Path, &Path) -> io::Result<()> + use<'_> {
         move |from: &Path, to: &Path| {
             if from == first {
                 Err(io::Error::from(io::ErrorKind::CrossesDevices))
@@ -1661,7 +1663,7 @@ mod tests {
         write(&into, &[(".rocm-cli-copy-comfy/a.py", "trunc")]);
         let to = into.join("comfy");
 
-        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_once(&from))?;
+        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_for(&from))?;
 
         assert_eq!(read(&to.join("a.py")).as_deref(), Some("new code"));
         assert_eq!(read(&to.join("sub/b.py")).as_deref(), Some("more code"));
@@ -1675,15 +1677,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_copy_across_filesystems_leaves_no_temporary_copy() -> Result<()> {
-        let dir = TestDir::new("cross-device-fail");
-        let from = dir.0.join("extract").join("comfy");
+        // Short names: a socket path must fit in `sun_path` (108 bytes).
+        let dir = TestDir::new("xd");
+        let from = dir.0.join("x").join("comfy");
         write(&from, &[("a.py", "new code")]);
-        let _socket = std::os::unix::net::UnixListener::bind(from.join("z.sock"))?;
+        let _socket = std::os::unix::net::UnixListener::bind(from.join("s"))?;
         let into = dir.0.join("source");
         fs::create_dir_all(&into)?;
         let to = into.join("comfy");
 
-        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_once(&from))
+        move_release_entry_with(&from, &to, &mut |_| Ok(()), &crosses_devices_for(&from))
             .expect_err("a socket cannot be copied");
 
         assert!(!to.exists());

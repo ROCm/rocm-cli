@@ -500,6 +500,7 @@ pub(crate) fn install(
     writeln!(log, "python={}", runtime.python.display())?;
 
     let mut swap = source_swap::SwapReport::default();
+    let mut swapped = false;
     let source_url = if source_path.exists() && !replaces_existing {
         println!("Using existing ComfyUI source folder...");
         let _ = io::stdout().flush();
@@ -532,10 +533,13 @@ pub(crate) fn install(
             println!("Note: {warning}");
         }
         swap = report;
+        swapped = true;
         source_url
     };
-    // A failure from here on happens after the swap. The entries it replaced
-    // or set aside are named in the error, as the success report would have.
+    // A failure from here on, after new code was put in place, leaves an
+    // install that is not finished. The error says how to finish it, and
+    // names the entries the swap replaced or set aside, which the success
+    // report would have listed.
     let finish = || -> Result<ComfyUiProbe> {
         fs::create_dir_all(&models_folder)
             .with_context(|| format!("failed to create {}", models_folder.display()))?;
@@ -597,11 +601,18 @@ pub(crate) fn install(
         save_manifest(paths, &manifest)?;
         Ok(probe)
     };
-    let probe = finish().map_err(|error| match swap_changes_summary(&swap) {
-        Some(summary) => error.context(format!(
-            "the new ComfyUI code is in place ({summary}), but the install did not finish"
-        )),
-        None => error,
+    let probe = finish().map_err(|error| {
+        if !swapped {
+            return error;
+        }
+        let changes = swap_changes_summary(&swap)
+            .map(|summary| format!(" ({summary})"))
+            .unwrap_or_default();
+        error.context(format!(
+            "the new ComfyUI code is in place{changes}, but the install did not finish; once \
+             the cause below is fixed, run `rocm comfyui install --runtime-id {}` to finish it",
+            runtime.manifest.runtime_key
+        ))
     })?;
 
     writeln!(output, "  installed: yes")?;
@@ -745,9 +756,10 @@ fn interrupted_reinstall_advice(runtime_key: &str) -> String {
 /// from `source_path`: it keeps the old code loaded and keeps writing into the
 /// folder a reinstall changes, so the reinstall waits for it. `rocm comfyui
 /// stop` stops it and removes the saved state this reads, which is what clears
-/// it. A saved state that cannot be read is reported in `warnings` and counts
-/// as not running, since `stop` cannot read it either and so could not clear a
-/// refusal.
+/// it. A saved state that cannot be read counts as not running, and
+/// `warnings` says so: `stop` cannot read it either, so a refusal would have
+/// nothing to clear it. What a running ComfyUI risks is the code it runs; the
+/// preserved folders are left alone whatever is running.
 fn running_from(
     paths: &AppPaths,
     source_path: &Path,
@@ -757,8 +769,8 @@ fn running_from(
         Ok(state) => state?,
         Err(error) => {
             warnings.push(format!(
-                "{error:#}; if a ComfyUI started by rocm-cli is still running from {}, stop it \
-                 before it is reinstalled",
+                "{error:#}; whether a ComfyUI started by rocm-cli is running from {} is unknown, \
+                 so the reinstall is not refused for it",
                 source_path.display()
             ));
             return None;
@@ -3526,6 +3538,12 @@ mod tests {
             format!("{error:#}").contains("failed to extract"),
             "unexpected error: {error:#}"
         );
+        // No swap marker was written, so no interrupted reinstall is
+        // reported and no command is named to finish one.
+        assert!(
+            !format!("{error:#}").contains("rocm comfyui install"),
+            "nothing was changed, so there is nothing to finish: {error:#}"
+        );
         assert_user_files_intact(&source);
         assert_eq!(
             fs::read_to_string(source.join("main.py"))?,
@@ -4154,9 +4172,10 @@ mod tests {
         Ok(())
     }
 
-    /// When the install fails after the swap (here the GPU check), the
-    /// entries the swap replaced are named in the error, since the report
-    /// that would have listed them is never printed.
+    /// When the install fails after the swap (here the GPU check), the error
+    /// names the entries the swap replaced, since the report that would have
+    /// listed them is never printed, and the command that finishes the
+    /// install, which does once the cause is gone.
     #[cfg(unix)]
     #[test]
     fn a_failure_after_the_swap_names_what_it_replaced() -> Result<()> {
@@ -4181,7 +4200,8 @@ mod tests {
         assert!(
             message.starts_with(
                 "the new ComfyUI code is in place (replaced: comfy, main.py, requirements.txt), \
-                 but the install did not finish: "
+                 but the install did not finish; once the cause below is fixed, run `rocm \
+                 comfyui install --runtime-id reinstall-runtime` to finish it: "
             ),
             "{message}"
         );
@@ -4189,8 +4209,108 @@ mod tests {
         assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
         assert!(!source.join("comfy/removed_upstream.py").exists());
         assert_user_files_intact(&source);
+
+        // With the GPU check passing again, the named command, as printed.
+        plant_installable_release(&paths, &app_root)?;
+        let rendered = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+        assert!(rendered.contains("  installed: yes\n"), "{rendered}");
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        assert!(manifest.torch_cuda_available);
+        ensure_source_is_startable(&manifest)?;
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        assert_user_files_intact(&source);
         remove_test_root(&paths);
         Ok(())
+    }
+
+    /// An install that fails without having put new code in place (here a
+    /// plain install reusing the existing folder) names nothing to finish.
+    /// A first install that fails after its download put the code in place
+    /// says so, with nothing replaced to list, and names the command.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (paths, config, app_root) = reinstall_fixture("comfyui-install-fails-no-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}' > \"$2\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        let plain = ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: false,
+            dry_run: false,
+        };
+
+        let reused = install(&paths, &config, plain.clone()).expect_err("the GPU check fails");
+        let message = format!("{reused:#}");
+        assert!(message.contains("AMD GPU check failed"), "{message}");
+        assert!(!message.contains("in place"), "{message}");
+        assert!(!message.contains("rocm comfyui install"), "{message}");
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+
+        fs::remove_dir_all(&source)?;
+        let fresh = install(&paths, &config, plain).expect_err("the GPU check fails");
+        let message = format!("{fresh:#}");
+        assert!(
+            message.starts_with(
+                "the new ComfyUI code is in place, but the install did not finish; once the \
+                 cause below is fixed, run `rocm comfyui install --runtime-id reinstall-runtime` \
+                 to finish it: "
+            ),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// What a failure after the swap says it changed: both kinds of change,
+    /// either alone, or nothing to name.
+    #[test]
+    fn swap_changes_summary_names_what_was_replaced_and_set_aside() {
+        let report = |replaced: &[&str], set_aside: &[(&str, &str)]| source_swap::SwapReport {
+            replaced: replaced.iter().map(|name| (*name).to_owned()).collect(),
+            set_aside: set_aside
+                .iter()
+                .map(|(name, new_name)| ((*name).to_owned(), (*new_name).to_owned()))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(swap_changes_summary(&report(&[], &[])), None);
+        assert_eq!(
+            swap_changes_summary(&report(&["comfy", "main.py"], &[])).as_deref(),
+            Some("replaced: comfy, main.py")
+        );
+        assert_eq!(
+            swap_changes_summary(&report(
+                &["main.py"],
+                &[
+                    ("app", "app.rocm-cli-kept-1"),
+                    ("api", "api.rocm-cli-kept-1")
+                ]
+            ))
+            .as_deref(),
+            Some(
+                "replaced: main.py; set aside: app (now app.rocm-cli-kept-1), api (now \
+                 api.rocm-cli-kept-1)"
+            )
+        );
     }
 
     /// The running guard only applies to a run that replaces the code: a
@@ -4204,19 +4324,26 @@ mod tests {
         plant_installable_release(&paths, &app_root)?;
         let mut child = spawn_stand_in_process()?;
         save_running_state(&paths, &app_root, &source, child.id())?;
+        let plain = ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: false,
+            dry_run: true,
+        };
 
+        let preview = install(&paths, &config, plain.clone());
         let result = install(
             &paths,
             &config,
             ComfyUiInstallOptions {
-                runtime_id: None,
-                reinstall: false,
                 dry_run: false,
+                ..plain
             },
         );
         let _ = child.kill();
         let _ = child.wait();
 
+        let preview = preview?;
+        assert!(!preview.contains("is running"), "{preview}");
         let rendered = result?;
         assert!(rendered.contains("  installed: yes\n"), "{rendered}");
         assert_eq!(

@@ -345,9 +345,18 @@ Expected result:
   folder's `downloads/`), the reinstall fails and the existing install and
   your files are untouched.
 - With ComfyUI started (`rocm comfyui start`), the dry run prints a `note:`
-  that the reinstall is refused until `rocm comfyui stop`, the reinstall is
-  refused and names `rocm comfyui stop`; after running that, the reinstall
-  goes ahead.
+  that the reinstall is refused until `rocm comfyui stop`. The reinstall is
+  then refused and names `rocm comfyui stop`; after running that, the
+  reinstall goes ahead.
+- With ComfyUI stopped (which removes rocm-cli's saved record of it), create
+  `apps/comfyui/state/running.json` under rocm-cli's data folder containing
+  only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
+  is running, and goes ahead.
+- If the reinstall fails after the new code is in place (on a host where the
+  AMD GPU check fails, say), the error names what was replaced or set aside
+  and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
+  command finishes the install and `rocm comfyui status` shows
+  `installed: yes`.
 
 Interrupting the code swap itself is hard to time by hand; the unit test
 `interrupted_swap_converges_when_run_again` stops it at every step instead.

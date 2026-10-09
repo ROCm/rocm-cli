@@ -95,18 +95,25 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # without redirecting any of them. A reinstall now replaces only the code
   # around those. These scenarios plant a used install, then reinstall from a
   # loopback archive server: the success path, the path where the download
-  # fails, the dry run, and a reinstall attempted while ComfyUI runs. Each
-  # asserts what the CLI prints together with what is actually on disk
-  # afterwards. Linux-only because the planted runtime uses `.so` names and a
-  # POSIX-shell Python stand-in.
+  # fails, the dry run, a reinstall attempted while ComfyUI runs, an
+  # interrupted reinstall, a user's entry set aside, and a failure after the
+  # new code is in place. Each asserts what the CLI prints together with what
+  # is actually on disk afterwards. Linux-only because the planted runtime
+  # uses `.so` names and a POSIX-shell Python stand-in.
+  #
+  # rocm-cli's saved record of a ComfyUI it started is unreadable here. `stop`
+  # cannot read it either, so it must not block the reinstall; the reinstall
+  # says it could not tell.
   @id:comfyui-reinstall-keeps-user-data @requires-os:linux
   Scenario: comfyui-05 - Reinstalling ComfyUI replaces its code and keeps the user's own files
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
+    And rocm-cli's saved record of the ComfyUI it started cannot be read
     When the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
     And the reinstall lists the code it replaced
+    And the reinstall says it could not tell whether ComfyUI was running
 
   @id:comfyui-reinstall-failed-download-changes-nothing @requires-os:linux
   Scenario: comfyui-06 - A ComfyUI reinstall whose download fails leaves the existing install untouched
@@ -186,3 +193,22 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And the reinstall reports the user's app folder as set aside and it still holds the user's files
     And ComfyUI's code is the newer release
+
+  # A reinstall can fail after the new code is in place: here the runtime's
+  # GPU check fails. The success report that would have listed what was
+  # replaced is never printed, so the error names it, together with the
+  # command that finishes the install. The scenario runs that command, read
+  # from the error, once the GPU check passes again.
+  @id:comfyui-reinstall-failing-after-swap-names-the-finish @requires-os:linux
+  Scenario: comfyui-11 - A ComfyUI reinstall that fails after replacing the code says what it replaced and how to finish
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available to download
+    And the runtime's AMD GPU check fails
+    When the user reinstalls ComfyUI
+    Then the reinstall fails and names what it replaced and the command that finishes the install
+    And ComfyUI's code is the newer release
+    And the user's own files are untouched
+    When the runtime's AMD GPU check passes again
+    And the user runs the command the reinstall named
+    Then ComfyUI is installed and its AMD GPU check is ready
+    And the user's own files are untouched

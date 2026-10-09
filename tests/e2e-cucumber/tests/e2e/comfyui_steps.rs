@@ -46,13 +46,15 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
-//! `comfyui-05` to `comfyui-10` cover `--reinstall` over a used install: one
+//! `comfyui-05` to `comfyui-11` cover `--reinstall` over a used install: one
 //! file of the user's in every entry of `source/` a reinstall keeps, plus
 //! release code. The new release comes from the same loopback server
 //! (unpaced), at a path that 404s for the failed-download case. Each `Then`
 //! that checks a printed claim about what was kept also checks the files.
 //! `comfyui-08` plants a running stand-in in the saved state and runs the
 //! `rocm comfyui stop` the refusal names before reinstalling again.
+//! `comfyui-11` makes the runtime's GPU check fail after the swap, then pass,
+//! and runs the command the failed reinstall names.
 //! `comfyui-08` and `comfyui-09` also ask `rocm` for ComfyUI's status in plain
 //! words, which is answered without a model.
 //!
@@ -877,6 +879,8 @@ async fn comfyui_reinstall_fails(world: &mut E2eWorld) {
         stderr.contains("404"),
         "expected the failed download in stderr, got:\n{stderr}"
     );
+    // Nothing was changed, so no command is named to finish anything.
+    assert!(!stderr.contains("rocm comfyui install"), "{stderr}");
 }
 
 #[then("the existing ComfyUI code and the user's files are untouched")]
@@ -1061,7 +1065,17 @@ async fn start_refuses_mid_swap(world: &mut E2eWorld) {
 /// Runs the command `start` named, taken from its own output rather than
 /// restated, so the advice is what gets proven.
 #[when("the user runs the command start named")]
-async fn run_named_command(world: &mut E2eWorld) {
+async fn run_command_start_named(world: &mut E2eWorld) {
+    run_named_command(world);
+}
+
+#[when("the user runs the command the reinstall named")]
+async fn run_command_reinstall_named(world: &mut E2eWorld) {
+    run_named_command(world);
+}
+
+/// Runs the first backticked `rocm` command in the last command's stderr.
+fn run_named_command(world: &mut E2eWorld) {
     let stderr = world.cli_stderr.clone().unwrap_or_default();
     let command = stderr
         .split('`')
@@ -1184,11 +1198,109 @@ async fn answer_names_finishing_command(world: &mut E2eWorld) {
 async fn answer_clear_of_interruption(world: &mut E2eWorld) {
     let answer = plain_words_status_answer(world);
     assert!(!answer.contains("interrupted"), "{answer}");
-    // `start` is advised exactly when nothing answers on ComfyUI's port; the
-    // host may run a ComfyUI of its own there.
-    assert_eq!(
-        answer.contains("Running: no\n"),
-        answer.contains("run `rocm comfyui start`"),
-        "{answer}"
+    // Nothing rocm-cli started is running here, but the host may run a
+    // ComfyUI of its own on ComfyUI's port; `start` is advised only if not.
+    if answer.contains("Running: yes\n") {
+        assert!(!answer.contains("comfyui start"), "{answer}");
+    } else {
+        assert!(answer.contains("Running: no\n"), "{answer}");
+        assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
+    }
+}
+
+#[given("rocm-cli's saved record of the ComfyUI it started cannot be read")]
+async fn unreadable_saved_state(world: &mut E2eWorld) {
+    write_fixture(
+        &data_dir(world)
+            .join("apps")
+            .join("comfyui")
+            .join("state")
+            .join("running.json"),
+        "{\"app_id\": \"comfy",
     );
+}
+
+#[then("the reinstall says it could not tell whether ComfyUI was running")]
+async fn reinstall_notes_unreadable_state(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let state = data_dir(world)
+        .join("apps")
+        .join("comfyui")
+        .join("state")
+        .join("running.json");
+    let prefix = format!("Note: failed to parse {}", state.display());
+    let suffix = format!(
+        "; whether a ComfyUI started by rocm-cli is running from {} is unknown, so the \
+         reinstall is not refused for it",
+        comfyui_source_dir(world).display()
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&prefix) && line.ends_with(&suffix)),
+        "the reinstall must say why it was not refused, got:\n{stdout}"
+    );
+    // What the note claims: the reinstall was not refused. The scenario's
+    // other steps check what it did.
+    assert_eq!(world.cli_rc, Some(0), "{stdout}");
+}
+
+#[given("the runtime's AMD GPU check fails")]
+async fn gpu_check_fails(world: &mut E2eWorld) {
+    write_shim(
+        &runtime_python(world),
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-c\" ]; then\n\
+         \tprintf '{}'\n\
+         \texit 0\n\
+         fi\n\
+         cat > \"$2\" <<'JSON'\n\
+         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}\n\
+         JSON\n",
+    );
+}
+
+#[when("the runtime's AMD GPU check passes again")]
+async fn gpu_check_passes_again(world: &mut E2eWorld) {
+    write_gpu_probe_shim(&runtime_python(world));
+}
+
+fn runtime_python(world: &E2eWorld) -> PathBuf {
+    data_dir(world)
+        .join("runtimes")
+        .join("roots")
+        .join(RUNTIME_KEY)
+        .join("bin")
+        .join("python3")
+}
+
+#[then("the reinstall fails and names what it replaced and the command that finishes the install")]
+async fn reinstall_fails_after_swap(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(world.cli_rc, Some(0), "the reinstall must fail:\n{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "the new ComfyUI code is in place (replaced: comfy, main.py, requirements.txt), but \
+             the install did not finish; once the cause below is fixed, run `rocm comfyui install \
+             --runtime-id {RUNTIME_KEY}` to finish it"
+        )),
+        "the failure must name what was replaced and how to finish, got:\n{stderr}"
+    );
+    assert!(stderr.contains("AMD GPU check failed"), "{stderr}");
+    // What "replaced" claims: those are the new release's now.
+    let source = comfyui_source_dir(world);
+    assert_eq!(
+        std::fs::read_to_string(source.join("requirements.txt"))
+            .ok()
+            .as_deref(),
+        Some("torch==2.4.0\n")
+    );
+}
+
+#[then("ComfyUI is installed and its AMD GPU check is ready")]
+async fn comfyui_installed_and_ready(world: &mut E2eWorld) {
+    let (stdout, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{stdout}");
+    assert!(stdout.contains("  installed: yes\n"), "{stdout}");
+    assert!(stdout.contains("  AMD GPU check: ready\n"), "{stdout}");
 }

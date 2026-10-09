@@ -473,20 +473,25 @@ cargo test -p rocm --bin rocm comfyui::tests
 The second filter covers the install-level tests: `reinstall_*`,
 `install_after_an_interrupted_reinstall_finishes_it`,
 `start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
-`a_reinstall_that_*`, `a_failure_after_the_swap_names_what_it_replaced`,
+`a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
+`a_failure_after_the_swap_names_what_it_replaced`,
+`only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it`,
+`swap_changes_summary_names_what_was_replaced_and_set_aside`,
 `a_plain_install_is_not_refused_while_comfyui_runs` and `chat_status_answer_*`.
 
-The e2e scenarios `comfyui-05` to `comfyui-10` (`comfyui.feature`, Linux, no
+The e2e scenarios `comfyui-05` to `comfyui-11` (`comfyui.feature`, Linux, no
 GPU) cover the same through the built binary: what is kept, replaced and left
-in place, a failed download, the dry run, a reinstall refused while ComfyUI
-runs (which the dry run says first), `start` refusing a half-replaced folder
-until the command it names is run, the answer to a plain-words status question
+in place (also when the saved run state is unreadable), a failed download, the
+dry run, a reinstall refused while ComfyUI runs (which the dry run says
+first), `start` refusing a half-replaced folder until the command it names is
+run, the answer to a plain-words status question
 (`rocm "what is the comfyui status"`) while ComfyUI starts and while a
-reinstall is unfinished, and a folder of the user's set aside when the new
-release ships one of the same name:
+reinstall is unfinished, a folder of the user's set aside when the new release
+ships one of the same name, and a reinstall that fails after the swap naming
+what it replaced and the command that finishes it:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-(0[5-9]|10)"
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[01])"
 ```
 
 ## Runtime Selection And Activation
