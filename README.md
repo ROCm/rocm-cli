@@ -214,24 +214,33 @@ GPU or daemon.
 
 ## Configure ROCm and serve a model
 
-Before serving a model, ensure a managed ROCm runtime is configured:
+Before serving a model, check whether a managed ROCm runtime is already
+configured:
+
+```
+rocm examine
+```
+
+When `active_runtime_status` reports `ready`, you can serve a model now. A
+machine can also have an existing ROCm install that `rocm examine` reports as
+`legacy_rocm_status: detected_unmanaged`, alongside the managed runtime. To
+install a runtime, or to get a different version or configuration, run:
 
 ```
 rocm install sdk
 ```
 
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
-environment. On machines with an existing ROCm install, `rocm examine` will
-show it as `legacy_rocm_status: detected_unmanaged`. Running `rocm install sdk`
-creates a separate managed runtime alongside it.
+environment. Running `rocm install sdk` creates a managed runtime alongside any
+legacy install.
 
 ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
 `rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
 add `--version` and `--family`, and give `--family` the exact GPU arch (the raw
 `gfx` code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
-Running the command when a managed runtime is already the active default asks
-first, because the new install takes over as the active default; see
+Running `rocm install sdk` when a managed runtime is already the active default
+asks first, because the new install takes over as the active default; see
 [ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
 for that gate, the flags that approve it without a prompt, and the ROCm 10 and
 newer requirements.
