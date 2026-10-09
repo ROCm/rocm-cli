@@ -291,7 +291,7 @@ for its ROCm build and compiled GPU architectures:
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report [--send]]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
@@ -585,12 +585,26 @@ fetches no weights and makes no network call. The verdict is `ready`,
 engine `rocm serve` would use; a `blocked` one names curated models that would
 run here instead.
 
-`undetermined` is a real answer and not a failure: it is what you get when the
-recipe catalog could not be read, when this machine's GPU memory could not be
-measured, or when the model is not one of the curated recipes (`rocm model`
-lists those). None of those say anything about whether the model fits, so none
-of them are reported as though they did. `rocm serve` still accepts a model
-outside the catalog; it cannot tell you in advance how it will go.
+`undetermined` is a real answer, not a failure. You get it when any of these is
+true:
+
+- The recipe catalog could not be read.
+- This machine's GPU memory could not be measured.
+- The model is not one of the curated recipes. [`rocm model`](#curated-models)
+  lists those.
+
+None of these says anything about whether the model fits, so none of them is
+reported as though it did. `rocm serve` still accepts a model outside the
+catalog, but `diagnose` cannot tell you in advance how it will go.
+
+### Curated models
+
+```
+rocm model [--verbose]
+```
+
+`rocm model` (alias `rocm models`) lists the recommended local models, grouped by
+the hardware they target. Pass `--verbose` to show detailed recipe diagnostics.
 
 ### Model serving
 
@@ -802,14 +816,21 @@ Flags and output for `rocm bench load`:
 ### Chat
 
 ```
-rocm chat [--provider anthropic|openai|...] [--model NAME] [--prompt TEXT] [--tools]
+rocm chat [--provider local|openai|anthropic] [--model NAME] [--prompt TEXT] [--tools]
           [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
-Chat with an AI provider from the terminal. Reads from stdin when `--prompt` is
-omitted. `--temperature`, `--top-p`, and `--max-tokens` are optional sampling
-controls forwarded to the request; each is independent, so omit any of them to
-use the provider's default.
+Chat with an AI provider from the terminal. The command reads from stdin when
+you omit `--prompt`.
+
+- `--provider` selects `local` (a model that `rocm serve` runs on this machine),
+  `openai`, or `anthropic`. A cloud provider needs setup first: run
+  `rocm config enable-provider <provider>` and
+  `rocm config set-provider-key <provider>`. See [Configuration](#configuration).
+- `--tools` lets an OpenAI-compatible provider request ROCm tool calls.
+- `--temperature`, `--top-p`, and `--max-tokens` are optional sampling controls
+  forwarded to the request. Each is independent, so omit any of them to use the
+  provider's default.
 
 ### ComfyUI
 
@@ -836,7 +857,13 @@ rocm automations enable <watcher-id>  [--mode observe|propose|contained]
 rocm automations disable <watcher-id>
 ```
 
-Optional background checks that can propose or apply changes automatically.
+Automations are optional background checks, called watchers, that can propose or
+apply changes automatically. `list` shows the available watchers and their IDs.
+`enable` turns one on, and `--mode` sets how far it can act:
+
+- `observe` reports what it finds and changes nothing.
+- `propose` suggests a change for you to approve.
+- `contained` applies a change on its own, within a contained, reversible scope.
 
 ### Configuration
 
@@ -877,7 +904,7 @@ provider settings are left untouched.
 ### Logs and cleanup
 
 ```
-rocm logs [--service <service-id>] [--search TERM ...]
+rocm logs [--service <service-id>] [--search TERM ...] [QUERY ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
