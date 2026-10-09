@@ -575,11 +575,10 @@ async fn assert_comfyui_spinner_line_cleared(world: &mut E2eWorld) {
 /// `install_root: <path>` line for each installed runtime; the interpreter is
 /// resolved from it by [`find_venv_python`].
 ///
-/// Reads `runtimes list` rather than `examine`: examine only prints a `Folder:`
-/// line for the *active* runtime and takes a different branch when none is marked
-/// active, so it is not a reliable source for the install root (this cost a GPU
-/// dispatch — the scenario panicked on a missing `Folder:` there). `runtimes list`
-/// prints `install_root:` for every installed runtime unconditionally.
+/// Reads `runtimes list` rather than `examine`: without an active runtime,
+/// examine's `Folder:` line can be the saved setup root instead of an
+/// `install_root`, and which it prints depends on the branch examine takes.
+/// `runtimes list` prints `install_root:` for every installed runtime.
 fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
     let listing = crate::run_rocm_ok(world, &["runtimes", "list"]);
     let roots: Vec<&str> = listing
