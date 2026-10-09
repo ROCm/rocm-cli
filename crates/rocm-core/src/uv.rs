@@ -1314,3 +1314,174 @@ All installed packages are compatible
         Ok(())
     }
 }
+
+/// Property tests for the `uv` bootstrap archive, judged on the filesystem by
+/// `crate::archive_props`. Extraction here is the system `tar` resolved from
+/// `PATH`, so these exercise the host's `tar` (GNU tar on the Linux CI
+/// runners) through `extract_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use std::path::Path;
+
+    use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
+    use crate::archive_props::{
+        Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
+        naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case, run_property,
+        run_round_trip, tar_gz_bytes,
+    };
+
+    fn property(
+        label: &str,
+        expect: Expect,
+        extract: fn(&Path, &Path) -> anyhow::Result<()>,
+    ) -> Result<(), String> {
+        note_mode_scope(label, expect.modes);
+        run_property(label, 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "archive.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| extract(archive, &layout.dest),
+            )
+            .judge(expect)
+        })
+    }
+
+    const ESCAPES_ONLY: Expect = Expect {
+        modes: Modes::Unchecked,
+        no_outward_links: false,
+    };
+
+    #[test]
+    fn uv_archive_extraction_never_writes_outside_the_staging_dir() {
+        property("uv", ESCAPES_ONLY, extract_archive).unwrap();
+    }
+
+    /// The other direction: a well-formed archive is extracted in full, into
+    /// the staging directory it was given. An extraction that wrote somewhere
+    /// else entirely (no `-C`) escapes the oracle above; this catches it.
+    #[test]
+    fn uv_archive_extraction_extracts_a_benign_archive_into_the_staging_dir() {
+        run_round_trip("uv-benign", |layout, entries| {
+            let archive = layout.base.join("archive.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
+    }
+
+    /// The system `tar` drops setuid/setgid and applies the umask only for an
+    /// unprivileged user, so this is judged only there (see `Modes`).
+    #[test]
+    fn uv_archive_extraction_leaves_no_setuid_or_world_writable_entry() {
+        property(
+            "uv-modes",
+            Expect {
+                modes: Modes::SafeUnlessRoot,
+                no_outward_links: false,
+            },
+            extract_archive,
+        )
+        .unwrap();
+    }
+
+    /// Unpack a one-off archive into the layout's staging dir and run the
+    /// lookup-and-chmod half of `ensure_uv_binary` on it.
+    fn stage_and_locate(layout: &Layout, entries: &[Entry]) -> Option<std::path::PathBuf> {
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&concretize(entries, layout))).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let binary = find_binary_in(&layout.dest, uv_binary_name())?;
+        let _ = make_executable(&binary);
+        Some(binary)
+    }
+
+    /// Known defect: `find_binary_in` tests `is_file`/`is_dir`, which follow
+    /// symlinks, and `make_executable` then chmods whatever was found. An
+    /// archive whose `uv` entry is a symlink to a file outside the staging
+    /// directory gets that outside file chmodded to 0755 — the system `tar`
+    /// recreates the symlink as archived, so nothing upstream of the lookup
+    /// stops it.
+    #[test]
+    #[ignore = "known defect: uv binary lookup follows symlinks out of the staging dir (#522)"]
+    fn uv_binary_lookup_never_chmods_a_file_outside_staging() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let layout = Layout::new();
+        let sentinel = layout.outside.join("sentinel");
+        std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let entries = [Entry {
+            name: b"uv".to_vec(),
+            kind: Kind::Symlink(format!("{OUTSIDE_TOKEN}/sentinel").into_bytes()),
+            mode: 0o777,
+        }];
+        let found = stage_and_locate(&layout, &entries);
+        let mode = std::fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file outside staging was chmodded via {found:?} (now {mode:o})"
+        );
+    }
+
+    /// Known defect: the same link-following walk recurses through directory
+    /// symlinks with no depth bound and no cycle check, so two `-> .` links
+    /// make it branch at every level until the kernel's 40-hop symlink limit:
+    /// on the order of 2^40 directory reads. (A link to `/` instead walks the
+    /// whole host filesystem.) This runs the lookup on a worker thread and
+    /// fails if it has not returned in 20 s; the thread is leaked on failure.
+    #[test]
+    #[ignore = "known defect: uv binary lookup does not terminate on a symlink loop (#522)"]
+    fn uv_binary_lookup_terminates_on_a_symlink_loop() {
+        let layout = Layout::new();
+        let entries = [
+            Entry {
+                name: b"a".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+            Entry {
+                name: b"b".to_vec(),
+                kind: Kind::Symlink(b".".to_vec()),
+                mode: 0o777,
+            },
+        ];
+        let archive = layout.base.join("uv.tar.gz");
+        std::fs::write(&archive, tar_gz_bytes(&entries)).unwrap();
+        extract_archive(&archive, &layout.dest).unwrap();
+        let staging = layout.dest;
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(find_binary_in(&staging, uv_binary_name()));
+        });
+        let result = wait.recv_timeout(std::time::Duration::from_secs(20));
+        assert!(
+            result.is_ok(),
+            "find_binary_in did not finish within 20 s on a two-link symlink loop"
+        );
+    }
+
+    /// Calibration: the same property over the same generator must catch an
+    /// extractor that joins raw names. If this starts passing, the generator
+    /// has stopped producing traversal names and every "no escape" result
+    /// above is meaningless.
+    #[test]
+    fn generator_catches_a_traversing_extractor() {
+        let error = property("naive", ESCAPES_ONLY, naive_unpack)
+            .expect_err("an extractor that honours `..` must be caught");
+        // Caught for a write outside the root (an escape, not a harness
+        // failure or a link the escape check does not judge).
+        assert!(error.contains("outside the root: "), "{error}");
+    }
+
+    /// Calibration for the two-step link shape: an extractor that sanitises
+    /// every name but follows a symlink an earlier entry planted is only
+    /// caught if the generator really emits "link, then write through it".
+    #[test]
+    fn generator_catches_a_link_following_extractor() {
+        let error = property("naive-links", ESCAPES_ONLY, naive_sanitizing_unpack)
+            .expect_err("an extractor that writes through planted links must be caught");
+        assert!(error.contains("outside the root: "), "{error}");
+    }
+}

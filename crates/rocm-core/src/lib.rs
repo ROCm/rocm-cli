@@ -27,6 +27,8 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+#[cfg(all(test, unix))]
+mod archive_props;
 pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
