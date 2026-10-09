@@ -755,9 +755,7 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use super::super::test_support::press;
 
     fn hk(c: KeyCode, tab: ActiveTab) -> KeyAction {
         handle_key(press(c), tab, &Modal::None, ChatKeyCtx::default())
