@@ -364,6 +364,51 @@ async fn cli_succeeds_and_shows_progress(world: &mut E2eWorld) {
     );
 }
 
+/// The `folder:` line `install` and `status` both print names this
+/// directory, not the runtime root or the bare app root; the fixture
+/// plants only `requirements.txt` here (production also has `main.py`).
+fn expected_comfyui_folder_line(world: &E2eWorld) -> String {
+    let source_dir = install_root(world)
+        .join("apps")
+        .join("comfyui")
+        .join("source");
+    format!("  folder: {}\n", source_dir.display())
+}
+
+#[then("the install output's folder: line names the ComfyUI source checkout")]
+async fn install_folder_line_names_source_checkout(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let expected = expected_comfyui_folder_line(world);
+    assert!(
+        stdout.contains(&expected),
+        "expected install output to contain {expected:?}, got:\n{stdout}"
+    );
+}
+
+#[when("the user checks ComfyUI status")]
+async fn user_checks_comfyui_status(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "status"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("status names the same ComfyUI source folder as the install")]
+async fn status_names_same_comfyui_source_folder(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let rc = world.cli_rc.unwrap_or(-1);
+    let expected = expected_comfyui_folder_line(world);
+    assert!(
+        rc == 0,
+        "expected `rocm comfyui status` to succeed, got rc={rc}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "expected status output to contain {expected:?}, got:\n{stdout}"
+    );
+}
+
 #[given("two ready ROCm runtimes and no active default")]
 async fn plant_two_ready_runtimes(world: &mut E2eWorld) {
     // No `active.json` and no `activate` step: with two ready runtimes and no
