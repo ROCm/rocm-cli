@@ -35,11 +35,16 @@ rocm diagnose --distro          # the only distro installed
 rocm diagnose --distro Ubuntu   # a named one
 ```
 
-The host-side form collects the facts over `wsl.exe` and runs the same catalog.
-It needs neither ROCm CLI nor Python inside the target distro, which matters
-because the distro you are checking is usually not set up yet.
+With `--distro`, ROCm CLI runs on Windows and calls `wsl.exe` to run a short
+read-only script inside the distro and collect diagnostic data. It then checks
+that data against the same WSL checks as a run from inside the distro, except
+those that need information it cannot collect (see the following list).
+Nothing is installed in the distro, and neither ROCm CLI nor Python needs to be
+there. That matters because the distro you are checking is usually not set up
+yet.
 
-It sees less than a run from inside, so prefer the in-distro form where you can:
+The `--distro` form sees less than a run from inside the distro, so prefer the
+in-distro form where you can:
 
 - It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
   cannot honor a `$ROCM_PATH` pointing elsewhere. The probe runs under
@@ -176,7 +181,8 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 ## Diagnosing A WSL Host
 
-`rocm diagnose` carries a WSL catalog, separate from the bare-metal Linux one.
+`rocm diagnose` has a separate set of WSL checks, called the WSL catalog,
+distinct from the bare-metal Linux ones.
 The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
 never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
 naming one would send you after a fault that cannot exist on this platform.
