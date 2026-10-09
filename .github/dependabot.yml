@@ -1,113 +1,24 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Dependabot version updates. See
+# https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference
+
 version: 2
 updates:
-  # Keep GitHub Actions pinned to SHAs but current: Dependabot reads the version
-  # from the trailing `# vX.Y.Z` comment on each `uses:` and opens PRs that bump
-  # the SHA when a new release lands, so pinning for supply-chain safety does not
-  # mean going stale.
-  - package-ecosystem: github-actions
-    directory: /
+  - package-ecosystem: "github-actions"
+    # "/" covers .github/workflows; composite actions keep their own `uses:`
+    # pins, so .github/actions has to be listed separately to get bumped.
+    directory: "/"
     schedule:
-      interval: weekly
-    # Wait out the window in which a compromised release is typically found and
-    # yanked before adopting it. Bumping a pinned SHA is the one moment the pin
-    # stops protecting us: the bump PR itself runs the new action's code on CI —
-    # including the self-hosted GPU lanes, which every Dependabot PR reaches
-    # because each path filter in ci.yml folds in `.github/workflows/**` — before
-    # a human has read the diff. Those runners keep state across jobs, so the
-    # blast radius outlives the run. GitHub already applies 3 days by default;
-    # published Actions compromises have gone unnoticed for longer than that, so
-    # widen it. Cooldown delays only version updates, never security updates.
+      interval: "daily"
+      # Wait a week before adopting newly released action versions.
     cooldown:
       default-days: 7
-    # `main` no longer requires a branch to be up to date before merging: the
-    # merge queue already builds `main` + PR and runs the full required set
-    # against that merged tree, so an out-of-date branch is not a merge blocker.
-    # Left on `auto`, Dependabot re-pushes every open PR each time `main` moves,
-    # and because every path filter in ci.yml folds in `.github/workflows/**`,
-    # each of those re-pushes drags the whole suite — self-hosted GPU lanes
-    # included — through a full rerun that changes no outcome. Disable it and let
-    # the queue be the thing that reconciles with `main`. Cost: Dependabot also
-    # stops auto-resolving genuine conflicts, so a PR that truly conflicts (most
-    # often on `Cargo.lock`) needs `@dependabot recreate` by hand.
-    rebase-strategy: disabled
+      exclude:
+        - "ROCm/rocm-security-gh*"
     groups:
+      rocm-security-gh:
+        patterns: ["ROCm/rocm-security-gh*"]
       github-actions:
-        patterns:
-          - "*"
-
-  # Cargo dependencies were previously untracked, so the workspace could drift
-  # onto crate versions carrying published advisories with nothing to surface
-  # them. `directory: /` is the workspace root: Dependabot resolves the whole
-  # member graph from the root manifest and `Cargo.lock`, so one entry covers
-  # every crate. Minor and patch bumps are grouped into a single weekly PR --
-  # they are almost always drop-in for a workspace this wide, and one PR per
-  # crate would bury real review signal. Major bumps stay ungrouped so each
-  # breaking change is reviewed, and eventually merged, on its own.
-  - package-ecosystem: cargo
-    directory: /
-    schedule:
-      interval: weekly
-    # Let a bad release be found and yanked before we adopt it. A crate bump is
-    # not inert data waiting for review: `cargo build` runs the new version's
-    # `build.rs` and expands its proc macros on the CI runner, so the bump PR
-    # executes third-party code the moment it opens — before a human reads the
-    # lockfile diff. A week is long enough for the common case of a malicious or
-    # backdoored release being yanked from crates.io to play out off our
-    # runners. Cooldown delays only version updates, never security updates.
-    cooldown:
-      default-days: 7
-    # Above the default of 5 so a backlog of separate major bumps cannot starve
-    # the grouped minor/patch PR, but still bounded so the queue stays readable.
-    open-pull-requests-limit: 10
-    # Same reasoning as the github-actions entry above: the merge queue, not a
-    # rebase, is what reconciles a PR with `main`. This matters more here — a
-    # cargo bump touches `Cargo.lock`, which the `heavy` and `tpn` filters both
-    # match, so every rebase of every open cargo PR re-runs the heavy lanes.
-    rebase-strategy: disabled
-    ignore:
-      # sha2 0.11 is built on `digest` 0.11, and `rsa` 0.9 -- the newest stable
-      # release; 0.10 is still a release candidate -- is built on `digest` 0.10.
-      # The two generic trait sets are not interchangeable, so under sha2 0.11
-      # `SigningKey::<Sha256>` and `VerifyingKey::<Sha256>` in rocm-core stop
-      # satisfying rsa's bounds and the release-signing path fails to compile.
-      # Nothing on our side fixes that, and putting signing on a release
-      # candidate is not a trade worth making, so the major is held rather than
-      # reopened every week. Revisit when rsa 0.10 ships stable: bump both
-      # together and drop this entry.
-      #
-      # Scoped to the major on purpose. An unscoped `ignore` would also suppress
-      # security updates for the dependency; restricting it to a
-      # `version-update:` type does not, because those types never match a
-      # security-driven update. Minor and patch bumps keep flowing too.
-      - dependency-name: sha2
-        update-types:
-          - version-update:semver-major
-    groups:
-      cargo-minor-patch:
-        applies-to: version-updates
-        patterns:
-          - "*"
-        update-types:
-          - minor
-          - patch
-
-  # The hook pins in `.pre-commit-config.yaml` were bumped by hand, so they
-  # drifted. Dependabot resolves each `rev` against the hook repository's tags
-  # and leaves the `builtin` and `local` blocks alone -- prek's native hooks and
-  # the `cargo xtask` hooks have no upstream release to track. Grouped into one
-  # PR: this is a short list of linters whose individual bumps carry no review
-  # signal worth a PR each.
-  - package-ecosystem: pre-commit
-    directory: /
-    schedule:
-      interval: weekly
-    # Same reasoning as the two blocks above, and it lands harder here: a hook is
-    # executable code that runs on every contributor's machine at commit time and
-    # in the `prek` CI job, so a compromised release executes before anyone has
-    # read the bump. Cooldown delays only version updates, never security updates.
-    cooldown:
-      default-days: 7
-    groups:
-      pre-commit:
-        patterns:
-          - "*"
+        patterns: ["*"]
