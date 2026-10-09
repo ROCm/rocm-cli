@@ -179,6 +179,25 @@ Keep docs and behavior claims in sync while editing:
   drifts independently, so grep for the claim's wording across all of them,
   not just the surface you're editing, and check each against the actual
   code path
+- cite a specific repo file in markdown as a link relative to the citing
+  file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — not as a
+  bare backtick path: the `docs-links` CI job and the `lychee` prek hook
+  fail when a link's target is moved or deleted, but cannot see a bare
+  path go stale. Point at a line by naming the symbol, never as
+  `file.rs:42` (lychee reads `:42` as part of the filename and fails); a
+  `#L42` anchor on a source file passes but is never checked. Commit a
+  newly linked file together with the link: the hook checks the working
+  tree, CI only committed files. Keep a mention bare when no tracked file
+  is meant — a generic "don't grow `main.rs`", a deleted file named
+  historically, a glob, gitignored or generated output such as cucumber's
+  `report.json` — and where the rule does not apply: `.github/` (its
+  templates become issue and PR bodies, where a relative link breaks),
+  `docs/rocm-docs/` (Sphinx source built into a separate site, excluded
+  from `docs-links`), README.md and CONTRIBUTING.md (`{include}`d into
+  that site, where `docs-build`'s `sphinx-build -W` fails on a link to a
+  file outside it), and a link leaving a skill folder in `skills/`
+  (published or embedded elsewhere, §7). This covers citations you add or
+  edit, not converting existing bare paths in an unrelated change
 
 ## 6) rocm-cli Architecture Guardrails
 

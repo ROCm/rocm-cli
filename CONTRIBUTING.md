@@ -46,7 +46,7 @@ prek install                # fast checks on every commit
 prek install -t pre-push    # heavier checks on push (clippy + tests)
 ```
 
-`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
+`prek` runs the same checks locally that CI enforces: `cargo fmt`, `clippy`, `cargo test`, `ruff` (Python), `shellcheck` (shell), PowerShell syntax, license headers (`hawkeye`), markdown links (`lychee`), and the generated manifests (`MANIFEST.md`, `THIRD_PARTY_NOTICES.txt`).
 
 The manifest hooks only run when you change the dependency graph, and they *rewrite* the generated file rather than just reporting it stale — when that happens the commit stops so you can re-stage the refreshed file. `THIRD_PARTY_NOTICES.txt` additionally needs the pinned generator; without it that hook skips and CI remains the gate:
 
@@ -62,6 +62,12 @@ cargo install hawkeye@7.0.0 --locked   # pinned to match the CI license-headers 
 
 To commit or push without it (for example, while iterating without the binary installed, or on a version it rejects), skip it explicitly: `SKIP=license-headers git commit ...` or `SKIP=license-headers git push`. CI's `license-headers` job still enforces the check either way.
 
+The markdown-links hook (`lychee`) runs on every commit, over the whole repo rather than just the changed files, since moving or deleting a file can break a link in a markdown file you didn't touch. It checks your working tree, so a link to a new file you haven't `git add`ed passes locally and still fails in CI. The hook runs `cargo xtask lychee --if-available`. prek doesn't provision the binary; without it the hook prints a warning and passes, leaving the `docs-links` CI job as the gate, and a version other than the pinned one runs with a warning:
+
+```bash
+cargo install lychee@0.24.2 --locked   # pinned to match the CI docs-links job (lycheeVersion)
+```
+
 ### Workspace layout
 
 | Path | Description |
@@ -75,11 +81,13 @@ To commit or push without it (for example, while iterating without the binary in
 
 ### Module organization
 
-New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full — its path citations are relative markdown links, checked for resolution (not prose accuracy) by the `docs-links` job below.
+New subcommands and subsystems default to their own file from day one — don't let them grow inside `main.rs`/`lib.rs` waiting for a future extraction pass. See `docs/architecture.md` for the two extraction patterns in use, the current module map, and the module-organization convention in full — its file links, including every concrete file citation in the per-crate inventories, are checked for resolution (not prose accuracy) by the `docs-links` job below; its section headings and directory names stay bare and unchecked.
 
 Crate-layering invariants (e.g. `rocmd` must never depend on `rocm`) are enforced by `cargo xtask check-crate-edges` (`xtask/src/crate_edges.rs`).
 
-Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead — is checked by the `docs-links` CI job (`lychee.toml`); it runs offline only, so it doesn't catch broken external `https://` links (see `lychee.toml` for the current exclusions).
+Every local (relative-path) markdown link and `#anchor` fragment in the repo — outside `docs/rocm-docs/`, which `docs-build` covers instead, and hidden directories such as `.github/`, which neither check walks — is checked by the `docs-links` CI job and by the `lychee` prek hook above, both configured by `lychee.toml` (which lists the current exclusions). Both run offline only, so they don't catch broken external `https://` links.
+
+Since only links are checked, cite a specific repo file as a link relative to the citing file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — rather than a bare backtick path, which nothing checks. The full rule, including the link forms that fail the check and the places it doesn't apply (`.github/`, `docs/rocm-docs/` and the files it includes — this one and README.md — and links leaving a `skills/` folder), is in AGENTS.md §5 ("Investigate rocm-cli Before Editing"); it applies to citations you add or edit.
 
 ### Test commands
 
