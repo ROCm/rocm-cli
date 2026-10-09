@@ -8922,8 +8922,9 @@ fn apply_service_prune_plan(
 /// **No nested acquire.** `FileLock::acquire` blocks with no `try_` variant, so
 /// a second acquire on a path already held by this process would hang forever.
 /// Nothing under either phase acquires this path: the only other
-/// `FileLock::acquire` in the tree is `ensure_background_helper_running_quiet`,
-/// on a different lock file, and it is not reachable from here. In the other
+/// `FileLock::acquire` calls in the tree are `ensure_background_helper_running_quiet`
+/// and the managed-uv bootstrap in `rocm_core::uv`, each on a different lock file,
+/// and neither is reachable from here. In the other
 /// direction `serve` holds this lock but never runs prune, in-process or as a
 /// subprocess.
 fn prune_managed_service_records(
