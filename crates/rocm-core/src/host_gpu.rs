@@ -4509,6 +4509,25 @@ Class Name:                Display
         );
     }
 
+    /// The distro name is read through the shared `os_release` parser, so it
+    /// names the distro `sh` would: the last assignment wins, a trailing
+    /// comment is not part of the value, and an unreadable file names nothing
+    /// (the caller then falls back to "Linux") rather than a guess.
+    #[test]
+    fn pretty_name_reads_as_sh_reads_it() {
+        assert_eq!(
+            parse_os_release_pretty_name(
+                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
+            ),
+            Some("Ubuntu 24.04 LTS".to_owned())
+        );
+        assert_eq!(
+            parse_os_release_pretty_name("PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"),
+            None
+        );
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME=\"  \"\n"), None);
+    }
+
     #[test]
     fn dev_dxg_is_believed_on_its_own() {
         // Nothing but WSLg's GPU passthrough creates this device node, so it is

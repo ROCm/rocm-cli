@@ -1289,6 +1289,23 @@ rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
 
+## /etc/os-release
+
+Every reader of `/etc/os-release` (the driver plan, `rocm examine`, the
+OpenMPI/libatomic/libnuma hints and the host distro name) goes through
+`rocm_core::os_release`, which returns the value `sh` would assign or nothing.
+A line that is not a plain assignment makes the whole file unreadable: the
+driver plan then has policy `unreadable_os_release`, plans no commands, and its
+reason names the line; `rocm examine` leaves the distro empty and records the
+same line in `probe_failures`.
+
+```bash
+cargo test -p rocm-core --lib os_release
+cargo test -p rocm --bin rocm os_release
+```
+
+The parser tests that compare against `/bin/sh` itself are Unix-only.
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a curated model will run on this
