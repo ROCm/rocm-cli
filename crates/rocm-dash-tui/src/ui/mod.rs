@@ -280,10 +280,19 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
             // unconditionally would be remediation advice the user cannot
             // follow for that instance (AGENTS.md §3).
             if state.managed_service_ids.contains(&i.container_id) {
-                body.push(format!(
-                    "• {} — stop it first: rocm services stop {} --yes",
-                    i.model_name, i.container_id
-                ));
+                // The command sits on its own line rather than trailing the
+                // model name on one long line: at the popup's narrowest width
+                // (the launcher's copy, @id:dash-launcher-quit-confirm-when-serving
+                // on an 80-column terminal) a combined line word-wraps the
+                // command itself across two rows, which the e2e assertion
+                // matches against the full flattened screen — a wrap there
+                // lands the command's second half next to unrelated menu text
+                // from outside the popup instead of the first half. Splitting
+                // keeps the command short enough to never need to wrap, which
+                // also means a real user never has to reassemble a
+                // remediation command broken across two lines.
+                body.push(format!("• {} — stop it first:", i.model_name));
+                body.push(format!("  rocm services stop {} --yes", i.container_id));
             } else {
                 body.push(format!("• {}", i.model_name));
             }
