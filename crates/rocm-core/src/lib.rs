@@ -2049,8 +2049,8 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
 }
 
 /// Picks the best available detail string from a failed subprocess's
-/// captured output: stderr if non-empty, else stdout, else a literal "no
-/// output".
+/// captured output: stderr if non-blank after trimming, else stdout, else a
+/// literal "no output"; the result is trimmed.
 pub fn command_failure_detail(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
@@ -7592,16 +7592,8 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    #[cfg(windows)]
     fn test_exit_status() -> std::process::ExitStatus {
-        use std::os::windows::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
-    }
-
-    #[cfg(not(windows))]
-    fn test_exit_status() -> std::process::ExitStatus {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::ExitStatus::from_raw(0)
+        std::process::ExitStatus::default()
     }
 
     fn test_process_output(stdout: &str, stderr: &str) -> std::process::Output {
@@ -7614,13 +7606,13 @@ last_installed_runtime_id = "therock-release"
 
     #[test]
     fn command_failure_detail_prefers_nonempty_stderr() {
-        let output = test_process_output("stdout text", "stderr text");
+        let output = test_process_output("  stdout text\n", "  stderr text\n");
         assert_eq!(command_failure_detail(&output), "stderr text");
     }
 
     #[test]
     fn command_failure_detail_falls_back_to_stdout_when_stderr_is_whitespace_only() {
-        let output = test_process_output("stdout text", "   \n\t  ");
+        let output = test_process_output("  stdout text\n", "   \n\t  ");
         assert_eq!(command_failure_detail(&output), "stdout text");
     }
 
