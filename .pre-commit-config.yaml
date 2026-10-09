@@ -108,11 +108,23 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy --workspace --all-targets --exclude e2e-cucumber -- -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
         stages: [pre-push] # compiles the workspace; too slow for every commit
+        groups: [local-tools] # runs in the dedicated `clippy` CI job
+      - id: cargo-clippy-e2e
+        name: cargo clippy (e2e harness + steps)
+        # e2e-cucumber's `e2e` test sets `harness = false, test = false` (see its
+        # Cargo.toml), which also excludes it from `clippy --all-targets` above --
+        # leaving the ~1.6k lines of harness + step code unlinted. Clippy honours
+        # an explicit `--test`, so lint it directly, mirroring the CI job.
+        entry: cargo clippy -p e2e-cucumber --test e2e -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
         groups: [local-tools] # runs in the dedicated `clippy` CI job
       - id: cargo-test
         name: cargo test
