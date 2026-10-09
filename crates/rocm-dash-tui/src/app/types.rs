@@ -98,6 +98,33 @@ pub struct ResolvedArgs {
     /// a host whose servers had all failed showed an empty overlay and no sign
     /// that any record existed. 0 when there are none.
     pub services_past_attempts: usize,
+    /// Whether any managed-service record on disk was already `ready`/`running`
+    /// at launch — the same statuses `Instance::status.is_serving()` treats as
+    /// "actively serving" — read the same way `services_past_attempts` is:
+    /// synchronously, from the same registry, before the TUI starts.
+    /// `AppState::instances` starts empty and is only populated once the
+    /// daemon's first instance snapshot lands, so
+    /// without this a `q` pressed in that startup window (or at any point the
+    /// daemon connection never succeeds) saw no live instance and exited with
+    /// no confirm prompt even though a model actually was being served (issue
+    /// #145). `AppState::has_live_instance` ORs this in only until that first
+    /// snapshot arrives, so it never outlives its own staleness.
+    pub startup_has_live_service: bool,
+    /// Ids of managed-service records this host's own registry can reach with
+    /// `rocm services stop <id> --yes` — read the same way and at the same
+    /// time as `startup_has_live_service`. The quit-confirm prompt
+    /// (`ui::quit_confirm_body`) prints that remediation line only for an
+    /// instance whose id is in this set: `AppState::instances` can also hold
+    /// Docker- or Lemonade-discovered entries from an external daemon, which
+    /// `rocm services stop` cannot touch, so printing the line unconditionally
+    /// would be a command the user cannot actually run against that service.
+    /// Same staleness as `startup_has_live_service`: a one-shot snapshot taken
+    /// before the TUI starts, never refreshed for the life of the session —
+    /// a service served mid-session through this same registry after launch
+    /// is not reflected here. Accepted for the same reason: the CLI's own
+    /// managed-service identity for a record, `service_id`, only changes when
+    /// the user runs `rocm serve` again, which this process does not observe.
+    pub managed_service_ids: std::collections::HashSet<String>,
 }
 
 impl ResolvedArgs {

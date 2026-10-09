@@ -56,11 +56,28 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
     (cur.cast_signed() + delta).rem_euclid(n) as usize
 }
 
+/// Resolve a quit request (issue #145): a model still being served gets a
+/// confirm prompt first — opening it, not quitting, is this fn's whole job;
+/// the event loop's dedicated `quit_confirm_pending` arm owns the actual exit
+/// once the prompt resolves. Returns `true` to request immediate exit the
+/// same way `apply_action` does, so every quit entry point — the `q` key, the
+/// Esc main menu's "Quit" row, `/quit`/`/exit` (`app::slash`), and the
+/// pre-dashboard launcher's own `q`/Esc (`ui::launcher`) — shares this one
+/// gate rather than each re-deciding (and risking re-deciding wrong) whether
+/// to ask first.
+pub(crate) fn request_quit(state: &mut AppState) -> bool {
+    if state.has_live_instance() {
+        state.open_quit_confirm();
+        return false;
+    }
+    true
+}
+
 /// Apply a `KeyAction` to mutable state. Returns `true` when the action
 /// requests application exit (Quit).
 pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
     match action {
-        KeyAction::Quit => return true,
+        KeyAction::Quit => return request_quit(state),
         KeyAction::SwitchTab(t) => {
             state.active_tab = t;
             state.modal = Modal::None;
@@ -252,7 +269,14 @@ pub(crate) fn apply_action(state: &mut AppState, action: KeyAction) -> bool {
                 1 => {
                     state.modal = Modal::GlobalHelp;
                 }
-                _ => return true, // Quit
+                // Issue #145: this must share `KeyAction::Quit`'s own gate —
+                // choosing "Quit" from the Esc menu is a second, independent
+                // entry point to the same decision, not a separate one that
+                // gets to skip the confirm prompt. `request_quit` →
+                // `open_quit_confirm` closes the Esc menu itself when a
+                // prompt opens, so a decline doesn't strand the user back in
+                // it (same as every other row here already does on success).
+                _ => return request_quit(state),
             },
             Modal::Palette => {
                 if let Some((_, tab)) = crate::ui::modal::PALETTE_DESTS.get(state.palette_sel) {
@@ -785,6 +809,146 @@ mod tests {
         assert_eq!(with_modal(&Modal::Menu), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Palette), KeyAction::Quit);
         assert_eq!(with_modal(&Modal::Options), KeyAction::Quit);
+    }
+
+    #[test]
+    fn quit_exits_immediately_when_nothing_is_serving() {
+        // Regression guard (issue #145): the overwhelmingly common case —
+        // nothing running — must stay a one-keystroke quit, no prompt.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn quit_opens_a_confirm_prompt_when_a_model_is_serving() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(!apply_action(&mut s, KeyAction::Quit));
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn quit_key_while_a_modal_is_open_closes_it_instead_of_stranding_the_user() {
+        // Regression: `q` reaches the shared `KeyAction::Quit` arm from
+        // inside every per-modal match (ThemePicker, Detail, Help,
+        // GlobalHelp, Menu, Palette, Options — see those arms above), not
+        // just the Esc-menu's "Quit" row. `open_quit_confirm` used to close
+        // overlays but never `modal`, so declining left the user stuck back
+        // inside whatever modal was open when they pressed `q`.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for modal in [
+            Modal::ThemePicker,
+            Modal::Detail,
+            Modal::Help,
+            Modal::GlobalHelp,
+            Modal::Palette,
+            Modal::Options,
+        ] {
+            let mut s = AppState::new("t".into(), "default-dark".into());
+            s.instances.insert(
+                "vllm-1".into(),
+                Instance {
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+            s.modal = modal.clone();
+            assert!(!apply_action(&mut s, KeyAction::Quit), "modal: {modal:?}");
+            assert!(s.quit_confirm.is_some(), "modal: {modal:?}");
+            assert_eq!(
+                s.modal,
+                Modal::None,
+                "quit-confirm must close {modal:?} so a decline doesn't strand the user in it"
+            );
+        }
+    }
+
+    #[test]
+    fn quitting_from_the_esc_menu_opens_the_same_confirm_prompt() {
+        // Regression: choosing "Quit" from the Esc main menu (Modal::Menu's
+        // last row) used to `return true` directly, a second quit entry
+        // point that completely bypassed the confirm-before-quit gate.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2; // the "Quit" row
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert!(s.quit_confirm.is_some());
+        assert_eq!(
+            s.modal,
+            Modal::None,
+            "choosing Quit must close the Esc menu like every other row, \
+             not strand it open behind the confirm prompt"
+        );
+    }
+
+    #[test]
+    fn declining_quit_from_the_esc_menu_returns_to_the_dashboard_not_the_menu() {
+        // Regression: `request_quit` opened the confirm prompt without
+        // clearing `Modal::Menu`, so declining from the Esc-menu "Quit" row
+        // used to strand the user back in the Esc menu, unlike declining via
+        // the plain `q` key (where `modal` was already `None`).
+        //
+        // Goes through `resolve_quit_confirm_key` (not the lower-level
+        // `on_quit_confirm_key`, which only routes the key and never clears
+        // `quit_confirm` itself) so this actually exercises the Deny verdict's
+        // side effect rather than a verdict this test then applies by hand.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.modal = Modal::Menu;
+        s.menu_sel = 2;
+        assert!(!apply_action(&mut s, KeyAction::MenuActivate));
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(
+            s.quit_confirm.is_none(),
+            "Deny must clear the prompt, not merely report it"
+        );
+        assert_eq!(s.modal, Modal::None);
+    }
+
+    #[test]
+    fn quit_confirm_key_approves_denies_and_cancels() {
+        // Through `resolve_quit_confirm_key`, so this covers the verdict's
+        // side effect (clearing `quit_confirm` on Deny/Cancel, leaving it set
+        // on Approve for the caller that's about to exit) and not merely
+        // `on_quit_confirm_key`'s lower-level routing.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('y')), Some(true));
+        assert!(
+            s.quit_confirm.is_some(),
+            "Approve leaves the prompt for the caller, which is about to exit"
+        );
+
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(s.quit_confirm.is_none(), "Deny must clear the prompt");
+
+        s.open_quit_confirm();
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Esc), Some(false));
+        assert!(s.quit_confirm.is_none(), "Cancel must clear the prompt");
     }
 
     #[test]

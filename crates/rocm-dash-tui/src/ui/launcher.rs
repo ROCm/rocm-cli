@@ -10,6 +10,7 @@
 //! pre-screen, not a parallel event loop). Per the latest mocks there is no
 //! image-generation row; "Optimize a model" is display-only with a `soon` badge.
 
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -98,9 +99,13 @@ pub const fn move_selection(sel: usize, row_count: usize, forward: bool) -> usiz
     }
 }
 
-/// True when a model is actively serving (drives the running vs idle variant).
+/// True when a model is actively serving (drives the running vs idle
+/// variant). Delegates to [`AppState::has_live_instance`] — the same
+/// predicate the confirm-before-quit gate uses — rather than re-testing
+/// `status.is_serving()` here too, so "what counts as serving" can't drift
+/// between the status strip and the quit gate.
 fn is_running(state: &AppState) -> bool {
-    state.instances.values().any(|i| i.status.is_serving())
+    state.has_live_instance()
 }
 
 pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Theme) {
@@ -140,6 +145,26 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
     );
 
     draw_menu(f, rows[4], state, sel, theme);
+
+    // Quit-confirm prompt (issue #145): the launcher's own `q`/Esc is a
+    // second, independent quit entry point and shares the dashboard's gate
+    // (`handle_launcher_key`) — so it must also share the dashboard's prompt
+    // rendering (`crate::ui::quit_confirm_request`, the same builder
+    // `ui::draw`'s own quit_confirm arm calls) rather than silently dropping
+    // the decision on the floor once opened, or hand-copying the title text.
+    if let Some(choice) = state.quit_confirm {
+        crate::ui::modal::grey_overlay(f);
+        // `false`: the launcher has no live Services overlay to jump to
+        // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
+        // it must not advertise the `s` hint the dashboard's copy does.
+        crate::ui::approval::draw_approval(
+            f,
+            area,
+            &crate::ui::quit_confirm_request(state, false),
+            choice,
+            theme,
+        );
+    }
 }
 
 fn draw_status_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -257,11 +282,24 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// Build the launcher's render state, seeding `instances` from the serving
 /// models the caller discovered in the managed-service registry.
 ///
+/// Also seeds `managed_service_ids` with every one of those ids: unlike the
+/// full dashboard's live daemon connection, which can also surface Docker- or
+/// Lemonade-discovered instances from an external daemon, every entry here
+/// came from `apps/rocm::dash::launcher_serving_instances`'s own
+/// `discover_managed_services` call, so all of them are genuinely reachable
+/// with `rocm services stop <id> --yes` — without this, the launcher's own
+/// copy of the quit-confirm prompt (`ui::quit_confirm_body`) would gate that
+/// remediation line on an always-empty set and warn with nothing actionable.
+///
 /// Kept separate from the terminal loop so the seeding is unit-testable without
 /// a real terminal: an empty `serving` yields the idle front door, a non-empty
 /// one makes `is_running` report the running model.
 fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
     let mut state = AppState::new(String::new(), theme_name.to_string());
+    state.managed_service_ids = serving
+        .iter()
+        .map(|inst| inst.container_id.clone())
+        .collect();
     state.instances = serving
         .into_iter()
         .map(|inst| (inst.container_id.clone(), inst))
@@ -286,12 +324,12 @@ pub fn run_launcher(
     theme_name: &str,
     serving: Vec<Instance>,
 ) -> std::io::Result<Option<LauncherChoice>> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::event::{self, Event, KeyEventKind};
     use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
-    let state = launcher_state(theme_name, serving);
+    let mut state = launcher_state(theme_name, serving);
     let theme = state.theme;
 
     enable_raw_mode()?;
@@ -323,17 +361,9 @@ pub fn run_launcher(
         if crate::app::is_ctrl_c(k) {
             crate::app::exit_on_ctrl_c();
         }
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => break None,
-            KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
-            KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
-                sel = move_selection(sel, row_count(), true);
-            }
-            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
-                sel = move_selection(sel, row_count(), false);
-            }
-            _ => {}
+        if let LauncherKeyOutcome::Exit(outcome) = handle_launcher_key(&mut state, &mut sel, k.code)
+        {
+            break outcome;
         }
     };
 
@@ -345,6 +375,57 @@ pub fn run_launcher(
     // clean launcher exit into an `Err`, which the `?`s here previously did.
     crate::app::restore_terminal();
     Ok(result)
+}
+
+/// What a single launcher key input does: either `run_launcher`'s loop keeps
+/// going (`Continue`) or it should break with this result (`Exit`).
+enum LauncherKeyOutcome {
+    Continue,
+    Exit(Option<LauncherChoice>),
+}
+
+/// What a single launcher key input does. Pure w.r.t. I/O — like
+/// `move_selection` below and the dashboard's own
+/// `app::actions::apply_action` — so the decision is unit-testable without a
+/// real terminal.
+///
+/// While the quit-confirm prompt is open it owns every key, resolved via the
+/// shared [`crate::app::AppState::resolve_quit_confirm_key`] — the same one
+/// the dashboard's event loop calls from its own `quit_confirm_pending` arm —
+/// so nothing else in this match can pre-empt the decision, and the two
+/// loops can't drift on what a verdict does.
+///
+/// `q`/Esc route through the shared [`crate::app::request_quit`] gate
+/// (issue #145) instead of quitting outright — the launcher is a second,
+/// independent quit entry point and must not get to skip the confirm prompt
+/// a model still serving requires.
+fn handle_launcher_key(state: &mut AppState, sel: &mut usize, code: KeyCode) -> LauncherKeyOutcome {
+    if state.quit_confirm_pending() {
+        return match state.resolve_quit_confirm_key(code) {
+            Some(true) => LauncherKeyOutcome::Exit(None),
+            Some(false) | None => LauncherKeyOutcome::Continue,
+        };
+    }
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if crate::app::request_quit(state) {
+                LauncherKeyOutcome::Exit(None)
+            } else {
+                LauncherKeyOutcome::Continue
+            }
+        }
+        KeyCode::Char('d') => LauncherKeyOutcome::Exit(Some(LauncherChoice::OpenDashboard)),
+        KeyCode::Enter => LauncherKeyOutcome::Exit(Some(choice_for(*sel))),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+            *sel = move_selection(*sel, row_count(), true);
+            LauncherKeyOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            *sel = move_selection(*sel, row_count(), false);
+            LauncherKeyOutcome::Continue
+        }
+        _ => LauncherKeyOutcome::Continue,
+    }
 }
 
 /// Draw one launcher frame, unless a shutdown has already been claimed on
@@ -658,6 +739,34 @@ mod tests {
     }
 
     #[test]
+    fn launcher_state_marks_every_seeded_instance_as_managed() {
+        // Regression: `launcher_state` seeded `instances` but never
+        // `managed_service_ids`, so the launcher's own copy of the
+        // quit-confirm prompt (`ui::quit_confirm_body`) gated its
+        // `rocm services stop <id> --yes` line on an always-empty set and
+        // warned with nothing actionable — even though every instance here
+        // comes from `launcher_serving_instances`'s own
+        // `discover_managed_services` call and is genuinely stoppable.
+        let serving = vec![
+            Instance {
+                container_id: "vllm-ready".into(),
+                status: InstanceStatus::Ready,
+                ..Default::default()
+            },
+            Instance {
+                container_id: "vllm-second".into(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        ];
+        let state = launcher_state("default-dark", serving);
+        assert_eq!(
+            state.managed_service_ids,
+            std::collections::HashSet::from(["vllm-ready".to_string(), "vllm-second".to_string()])
+        );
+    }
+
+    #[test]
     fn choice_mapping_and_counts() {
         assert_eq!(row_count(), 5);
         // Row order: 0=Set up, 1=Serve, 2=Diagnose, 3=Chat, 4=Open dashboard.
@@ -700,5 +809,117 @@ mod tests {
         for h in [1u16, 2, 3, 5, 8] {
             let _ = render(&s, 0, 60, h);
         }
+    }
+
+    #[test]
+    fn launcher_renders_the_quit_confirm_prompt_when_open() {
+        // Regression: `handle_launcher_key`'s own tests only assert on
+        // `quit_confirm.is_some()`/`is_none()`; nothing exercised `draw`'s
+        // quit_confirm render arm itself (the `grey_overlay` +
+        // `ApprovalRequest`/`draw_approval` branch added alongside it).
+        //
+        // Seeds a serving instance: the title is derived from the same
+        // "is anything still serving" decision as the body
+        // (`nothing_is_currently_being_served`), so an unseeded `base()`
+        // would render the other title ("Nothing to confirm — quit?") here.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = base();
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.open_quit_confirm();
+        let out = render(&s, 0, 100, 24);
+        assert!(
+            out.contains("Still serving"),
+            "quit-confirm prompt must render: {out:?}"
+        );
+        // Must not panic at awkward sizes either, same as the idle menu above.
+        for h in [1u16, 2, 3, 5, 8] {
+            let _ = render(&s, 0, 60, h);
+        }
+    }
+
+    #[test]
+    fn launcher_quit_key_exits_immediately_when_idle() {
+        // Regression guard (issue #145): the overwhelmingly common case —
+        // nothing running — must stay a one-keystroke quit, no prompt, same
+        // as the dashboard's own `quit_exits_immediately_when_nothing_is_serving`.
+        let mut s = base();
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Exit(None)
+        ));
+        assert!(s.quit_confirm.is_none());
+    }
+
+    #[test]
+    fn launcher_quit_key_opens_confirm_prompt_when_a_model_is_serving() {
+        // Regression (issue #145): the launcher's own `q`/Esc used to bypass
+        // the confirm-before-quit gate entirely — a second, unguarded quit
+        // entry point distinct from the dashboard's. Exiting on this key
+        // must not happen while a model is serving.
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_some());
+
+        // Esc reaches the same gate.
+        let mut s2 = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        assert!(matches!(
+            handle_launcher_key(&mut s2, &mut sel, KeyCode::Esc),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s2.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn launcher_quit_confirm_approve_exits_deny_and_cancel_stay() {
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('q')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_some());
+
+        // Deny: prompt closes, loop keeps going, back at the idle front door.
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('n')),
+            LauncherKeyOutcome::Continue
+        ));
+        assert!(s.quit_confirm.is_none());
+
+        // Re-open and approve ('y'): resolves the loop with None (quit).
+        s.open_quit_confirm();
+        assert!(matches!(
+            handle_launcher_key(&mut s, &mut sel, KeyCode::Char('y')),
+            LauncherKeyOutcome::Exit(None)
+        ));
     }
 }

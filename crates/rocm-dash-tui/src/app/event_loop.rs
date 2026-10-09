@@ -226,6 +226,27 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
     fx
 }
 
+/// Seeds the quit-confirm gate's two pre-TUI registry reads onto `state`:
+/// whether anything was already serving at launch (`startup_has_live_service`,
+/// issue #145's startup-race fix — see `AppState::has_live_instance`) and
+/// which ids a `rocm services stop` can reach (`managed_service_ids`, see
+/// `ui::quit_confirm_body`). Takes the two values rather than all of `args`
+/// so a test can call it directly without building an unrelated
+/// `ResolvedArgs`, the same reason `apply_startup_focus` below takes a bare
+/// `Option<Focus>` instead. A separate, directly testable function rather
+/// than two bare field assignments inlined into `event_loop`, which only an
+/// end-to-end async run exercises — a hand-off that can silently regress to
+/// a no-op with no test noticing (see
+/// `seed_startup_live_service_wires_both_fields_onto_state`).
+fn seed_startup_live_service(
+    state: &mut AppState,
+    startup_has_live_service: bool,
+    managed_service_ids: std::collections::HashSet<String>,
+) {
+    state.startup_has_live_service = startup_has_live_service;
+    state.managed_service_ids = managed_service_ids;
+}
+
 /// The dashboard's entire startup gate: an overlay opens only when an
 /// explicit `Focus` was resolved from the command line. `event_loop` calls
 /// this directly (rather than inlining the `match`) so a regression test can
@@ -802,6 +823,11 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.bench_results_dir = args.bench_results_dir.clone();
     // Managed-service records that are no longer running, counted by the bin.
     state.services_past_attempts = args.services_past_attempts;
+    seed_startup_live_service(
+        &mut state,
+        args.startup_has_live_service,
+        args.managed_service_ids.clone(),
+    );
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -1129,6 +1155,28 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                                 state.on_approval_declined();
                             }
                             None => { /* cursor moved or key ignored — modal stays open */ }
+                        }
+                    }
+                    // The quit-confirm prompt (issue #145), when open, owns
+                    // every remaining key the same way the approval modal
+                    // above does — nothing behind it can pre-empt the
+                    // decision. Only the Ctrl-C arm above outranks it, for
+                    // the same reason it outranks the approval modal.
+                    Some(Ok(CtEvent::Key(k))) if state.quit_confirm_pending() => {
+                        // `s`: jump to the Services overlay and stop it there,
+                        // rather than only resolving an Approve/Deny/Cancel
+                        // verdict. Checked first so it can't be shadowed by
+                        // `resolve_quit_confirm_key`'s own key handling; it
+                        // already mutated `state` (prompt closed, overlay
+                        // opened) when it returns `true`, so there is nothing
+                        // further to resolve for this key.
+                        //
+                        // `Some(false)`: Deny/Cancel already closed the prompt.
+                        // `None`: cursor moved or key ignored — prompt stays open.
+                        if !state.quit_confirm_open_services_key(k.code)
+                            && state.resolve_quit_confirm_key(k.code) == Some(true)
+                        {
+                            break;
                         }
                     }
                     // De-modal back-out: on any tab, when an inline manager is
@@ -2133,6 +2181,28 @@ mod tests {
             s.onboarding.is_some(),
             "an explicit Focus::Setup must open onboarding"
         );
+    }
+
+    #[test]
+    fn seed_startup_live_service_wires_both_fields_onto_state() {
+        // Regression guard: this hand-off (`args.*` → `state.*`) is otherwise
+        // only reachable through a full async `event_loop` run, so a silent
+        // no-op here (the call site deleted, or the field names swapped)
+        // would not fail any other test. Each half (the bin producing the
+        // values, `AppState::has_live_instance`/`ui::quit_confirm_body`
+        // consuming them) is tested elsewhere; this is the wiring between
+        // them.
+        let mut s = st();
+        assert!(!s.startup_has_live_service);
+        assert!(s.managed_service_ids.is_empty());
+
+        let ids: std::collections::HashSet<String> = ["svc-a".to_string(), "svc-b".to_string()]
+            .into_iter()
+            .collect();
+        seed_startup_live_service(&mut s, true, ids.clone());
+
+        assert!(s.startup_has_live_service);
+        assert_eq!(s.managed_service_ids, ids);
     }
 
     #[test]
