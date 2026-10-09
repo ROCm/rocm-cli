@@ -968,6 +968,13 @@ jobs:
           # once and reused - see the native Ubuntu lane.
           $combined = $true
           $gttAbsent = $false
+          # Unlike the bash lanes, this loop checks the deadline before its
+          # first poll, and that is deliberate. Get-Date has sub-second
+          # precision, so the first poll is skipped only if the step stalls for
+          # the whole ceiling between computing the deadline and entering the
+          # loop, which the production ceiling makes unreachable. The bash lanes
+          # poll first because $SECONDS counts whole wall-clock seconds, so a
+          # short ceiling there could lapse after a stall of microseconds (#607).
           while ((Get-Date) -lt $deadline) {
             $out = ""
             if ($combined) {
