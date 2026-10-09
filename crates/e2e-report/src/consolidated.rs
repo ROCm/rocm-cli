@@ -1819,7 +1819,7 @@ mod tests {
         // Built directly as `PlatformReport`s rather than through artifact-name
         // fixtures. A platform-sorts-first/OS-sorts-last pair — needed below to
         // tell a platform/OS field swap apart from the correct key — is
-        // reachable from real names ("strix-windows" → (Strix Halo, Windows),
+        // reachable from real names ("gpu-strix-windows" → (Strix Halo, Windows),
         // "unknown" → (Unknown, Unknown): Strix Halo < Unknown but
         // Windows > Unknown), but only via the degenerate `unknown` fallback,
         // which isn't a real platform and would read as testing the error path
