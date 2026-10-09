@@ -17881,11 +17881,16 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         // the entry that is actually removed, and `dir/` and `dir` dedup to one
         // line. Existence is the entry's own, not its target's: a dangling link
         // is listed and then really removed, instead of reported as absent.
-        if let Ok(Some((entry, _))) = existing_entry(&path) {
-            plan.actions.push(UninstallPlanEntry { kind, path: entry });
-        } else {
-            plan.skipped
-                .push(format!("{kind} path not present: {}", path.display()));
+        // A failed check is not an absence either: it fails the plan, so the
+        // uninstall stops before removing anything instead of leaving a folder
+        // that may still be on disk out of the review.
+        match existing_entry(&path)
+            .with_context(|| format!("failed to check the {kind} folder {}", path.display()))?
+        {
+            Some((entry, _)) => plan.actions.push(UninstallPlanEntry { kind, path: entry }),
+            None => plan
+                .skipped
+                .push(format!("{kind} path not present: {}", path.display())),
         }
     }
 
@@ -18160,9 +18165,19 @@ fn existing_entry(path: &Path) -> io::Result<Option<(PathBuf, fs::Metadata)>> {
     let entry = entry_path(path);
     // Not `path.exists()`: that follows links, so a dangling link would read as
     // already gone, be skipped, and still be reported as removed by the caller.
+    // "Not a directory" means a folder on the way is really a file (as in
+    // `notes.txt/../x`), so the path names nothing, the same as "not found".
+    // Any other failure is a real error, not an absence.
     let metadata = match fs::symlink_metadata(&entry) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     if spelled_as_directory(path) && !metadata.is_dir() && !metadata.file_type().is_symlink() {

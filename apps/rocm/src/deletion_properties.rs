@@ -899,6 +899,71 @@ fn uninstall_lists_and_removes_a_dangling_link_root() {
     assert!(!link_left, "dangling link {} survived", link.display());
 }
 
+/// A root that cannot be checked is not an absent root. Here a parent link
+/// loops, so the kernel answers "too many levels of symbolic links" for the
+/// cache folder. The plan fails and names that folder, rather than reporting it
+/// "not present" and leaving it out of the review while it may still be on disk.
+#[test]
+fn uninstall_plan_fails_when_a_root_cannot_be_checked() {
+    let sandbox = fresh_sandbox("uninstall-unreadable-root");
+    let looping = sandbox.join("loop");
+    symlink(&looping, &looping).expect("self link");
+    let cache = looping.join("cache");
+    let paths = AppPaths {
+        config_dir: sandbox.join("no-config"),
+        data_dir: sandbox.join("no-data"),
+        cache_dir: cache.clone(),
+    };
+    let options = UninstallOptions {
+        yes: true,
+        keep_binaries: true,
+        ..UninstallOptions::default()
+    };
+    let plan = build_uninstall_plan(&paths, &options);
+    cleanup(&sandbox);
+    let error = plan.expect_err("a root that cannot be checked must fail the plan");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!("cache folder {}", cache.display())),
+        "the error must name the cache folder it could not check: {message}"
+    );
+}
+
+/// The control for the test above: a path that runs through a regular file as
+/// if it were a folder (`notes.txt/cache`) names nothing. The kernel answers
+/// "not a directory", which is an absence, not a failed check: the root is
+/// reported not present and the plan still succeeds.
+#[test]
+fn a_root_below_a_regular_file_is_not_present() {
+    let sandbox = fresh_sandbox("uninstall-root-below-file");
+    let file = sandbox.join("notes.txt");
+    std::fs::write(&file, b"keep").expect("file");
+    let cache = file.join("cache");
+    let paths = AppPaths {
+        config_dir: sandbox.join("no-config"),
+        data_dir: sandbox.join("no-data"),
+        cache_dir: cache.clone(),
+    };
+    let options = UninstallOptions {
+        keep_binaries: true,
+        ..UninstallOptions::default()
+    };
+    let plan = build_uninstall_plan(&paths, &options);
+    let removal = remove_path(&cache);
+    let file_kept = file.is_file();
+    cleanup(&sandbox);
+    let plan = plan.expect("a path through a regular file names nothing; the plan must succeed");
+    assert!(plan.actions.is_empty(), "{plan:?}");
+    assert!(
+        plan.skipped
+            .iter()
+            .any(|line| line == &format!("cache path not present: {}", cache.display())),
+        "{plan:?}"
+    );
+    assert!(removal.is_ok(), "remove_path failed: {removal:?}");
+    assert!(file_kept, "remove_path deleted {}", file.display());
+}
+
 // ---------------------------------------------------------------------------
 // remove_path: trailing-separator spellings of a symlinked directory
 // ---------------------------------------------------------------------------
