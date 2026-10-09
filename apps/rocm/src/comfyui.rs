@@ -2077,6 +2077,12 @@ mod tests {
         let paths = test_paths("comfyui-status-runtime-label");
         let runtime = ready_runtime_manifest(&paths, "release-wheel-gfx94x-dcgpu-7-13-0")?;
         write_runtime_manifest(&paths, &runtime)?;
+        // Built from `runtime_app_root`, the same helper `install()` uses, rather
+        // than the test-only `source_path(&paths)` (which hangs off a different,
+        // data-dir-rooted `app_root`): this way the planted manifest's
+        // `source_path` is the layout a real install actually produces, so this
+        // test can show status's `folder:` line agrees with install's.
+        let managed_source_path = source_path_from_app_root(&runtime_app_root(&runtime));
         save_manifest(
             &paths,
             &ComfyUiManifest {
@@ -2087,8 +2093,8 @@ mod tests {
                 runtime_root: runtime.install_root.clone(),
                 python_executable: paths.data_dir.join("runtimes").join("python.exe"),
                 source_url: comfyui_source_archive_url(),
-                source_path: source_path(&paths),
-                requirements_path: source_path(&paths).join("requirements.txt"),
+                source_path: managed_source_path.clone(),
+                requirements_path: managed_source_path.join("requirements.txt"),
                 pip_cache_dir: None,
                 log_path: app_root(&paths).join("logs").join("install-100.log"),
                 torch_version: Some("2.10.0".to_owned()),
@@ -2116,7 +2122,7 @@ mod tests {
             "status must not reintroduce the `ROCm install` label, got: {rendered}"
         );
         assert!(
-            rendered.contains(&format!("  folder: {}\n", source_path(&paths).display())),
+            rendered.contains(&format!("  folder: {}\n", managed_source_path.display())),
             "status `folder:` should report the ComfyUI source checkout, not the runtime root, got: {rendered}"
         );
         assert!(

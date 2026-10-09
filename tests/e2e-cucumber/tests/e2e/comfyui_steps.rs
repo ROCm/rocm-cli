@@ -364,6 +364,42 @@ async fn cli_succeeds_and_shows_progress(world: &mut E2eWorld) {
     );
 }
 
+/// The ComfyUI source checkout `install` and `status` must both name as
+/// `folder:` -- in production, the directory containing `main.py`; this
+/// fixture only plants `requirements.txt` there, not the runtime root or
+/// the bare app root.
+fn expected_comfyui_folder_line(world: &E2eWorld) -> String {
+    let source_dir = install_root(world)
+        .join("apps")
+        .join("comfyui")
+        .join("source");
+    format!("  folder: {}\n", source_dir.display())
+}
+
+#[then("the install output's folder: line names the ComfyUI source checkout")]
+async fn install_folder_line_names_source_checkout(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let expected = expected_comfyui_folder_line(world);
+    assert!(
+        stdout.contains(&expected),
+        "expected install output to contain {expected:?}, got:\n{stdout}"
+    );
+}
+
+#[then("rocm comfyui status reports the same folder: line")]
+async fn status_reports_same_folder_line(world: &mut E2eWorld) {
+    let expected = expected_comfyui_folder_line(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "status"]);
+    assert!(
+        rc == 0,
+        "expected `rocm comfyui status` to succeed, got rc={rc}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "expected status output to contain {expected:?}, got:\n{stdout}"
+    );
+}
+
 #[given("two ready ROCm runtimes and no active default")]
 async fn plant_two_ready_runtimes(world: &mut E2eWorld) {
     // No `active.json` and no `activate` step: with two ready runtimes and no
