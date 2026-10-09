@@ -2,53 +2,27 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Shared fixtures for building a throwaway [`AppPaths`] under a per-test,
-//! per-process directory.
-//!
-//! Used from every module split out of this crate's former `lib.rs` god file
-//! (`host_gpu`, `rocm_install`, `managed_runtime`, and `lib.rs` itself) so the
-//! naming/uniqueness scheme for test artifact directories stays in one place
-//! rather than drifting across copies.
+//! Shared test-only fixtures for `rocm`'s module test suites.
 
-use crate::{AppPaths, unix_time_millis};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
-    let root = workspace_test_artifact_dir().join(format!("rocm-core-{name}-{}", unique_suffix()));
-    let paths = AppPaths {
-        config_dir: root.join("config"),
-        data_dir: root.join("data"),
-        cache_dir: root.join("cache"),
-    };
-    (root, paths)
-}
-
 /// A name suffix no other call in this test process returns.
 ///
-/// The pid separates processes and the timestamp keeps names readable across
-/// runs, but neither separates two tests in one process: `cargo test` runs
-/// them on parallel threads, and two that start in the same millisecond with
-/// the same label got the same root, so one test's cleanup deleted the other's
-/// files. The counter is per-process and monotonic, so no two calls here can
-/// agree.
+/// Test scratch roots are named `<label>-<suffix>`. The pid separates
+/// processes and the timestamp keeps names readable across runs, but neither
+/// separates two tests in one process: `cargo test` runs them on parallel
+/// threads, and two that start in the same millisecond with the same label got
+/// the same root, so one test's cleanup deleted the other's files. The counter
+/// is per-process and monotonic, so no two calls here can agree.
 pub(crate) fn unique_suffix() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
         "{}-{}-{}",
         std::process::id(),
-        unix_time_millis(),
+        rocm_core::unix_time_millis(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-pub(crate) fn workspace_test_artifact_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join(".rocm-work")
-        .join("tests")
-        .join("core")
 }
 
 /// Call `make_root` from many threads at once, remove what it made, and
@@ -86,12 +60,13 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
     );
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn temp_app_paths_gives_each_call_its_own_root_even_for_one_label() {
-        assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
+    fn unique_suffix_never_repeats_within_a_process() {
+        let suffixes: std::collections::HashSet<String> =
+            (0..64).map(|_| unique_suffix()).collect();
+        assert_eq!(suffixes.len(), 64, "two calls must never share a suffix");
     }
 }

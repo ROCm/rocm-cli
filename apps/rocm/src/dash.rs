@@ -1079,9 +1079,14 @@ mod tests {
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("{name}-{}", std::process::id()));
+            .join(format!("{name}-{}", crate::test_support::unique_suffix()));
         std::fs::remove_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn scratch_dir_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| scratch_dir("same-label"));
     }
 
     /// `AppPaths` rooted at a real directory, so the clock file's presence can

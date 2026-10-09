@@ -216,8 +216,10 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, or CI config). On `main` and in the merge
-queue the full workspace always runs. For local verification, keep using
+file, the workspace root manifest, CI config, or a doc an xtask test reads —
+`MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
+`tests/e2e-cucumber/README.md`). On `main`
+and in the merge queue the full workspace always runs. For local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It

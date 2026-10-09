@@ -1356,6 +1356,31 @@ case "$*" in
 esac
 "#;
 
+    /// Stands in for `scripts/reclaim-gpu.sh`, which a native lane runs with
+    /// `--report-holders` when it gives up, and says so in the log. Without it
+    /// the call resolves against whatever directory the test runs from, fails,
+    /// and the holder-reporting path is never exercised at all.
+    #[cfg(unix)]
+    const RECLAIM_STUB: &str = "#!/bin/sh\necho \"reclaim-gpu.sh stub called: $*\"\n";
+
+    /// What a lane logs when it reached the step that names what holds the GPU.
+    #[cfg(unix)]
+    const REPORTED_HOLDERS: &str = "reclaim-gpu.sh stub called: --report-holders";
+
+    /// A preflight's exit code, or a panic naming the signal that killed it:
+    /// `code()` is `None` exactly when there is no code to report.
+    #[cfg(unix)]
+    fn exit_code(status: std::process::ExitStatus, what: &str) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+
+        status.code().unwrap_or_else(|| {
+            panic!(
+                "{what} exited with no status code: killed by signal {:?}",
+                status.signal()
+            )
+        })
+    }
+
     /// Run a preflight script against fixture `rocm-smi` output, returning its
     /// exit code and everything it logged. `rocm-smi` is stubbed on `PATH`;
     /// nothing touches a real GPU.
@@ -1380,6 +1405,11 @@ esac
         std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("make the stub executable");
+        // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
+        // run from a directory that has one.
+        std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
+        std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), RECLAIM_STUB)
+            .expect("write reclaim-gpu.sh stub");
 
         let path = format!(
             "{}:{}",
@@ -1392,6 +1422,7 @@ esac
         }
         let out = cmd
             .arg(&script_path)
+            .current_dir(dir.path())
             .env("PATH", path)
             .env("FIXTURE", &fixture_path)
             .env("COUNTER", dir.path().join("calls"))
@@ -1403,12 +1434,7 @@ esac
             .expect("running the preflight script");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "preflight"), log)
     }
 
     /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
@@ -1493,12 +1519,7 @@ esac
             .expect("running the preflight script under pwsh");
         let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
         log.push_str(&String::from_utf8_lossy(&out.stderr));
-        (
-            out.status
-                .code()
-                .expect("preflight exited with a status code"),
-            log,
-        )
+        (exit_code(out.status, "pwsh preflight"), log)
     }
 
     /// One host reading, and what each lane must make of it.
@@ -1681,6 +1702,16 @@ esac
             for handle in handles {
                 let (case, native, advisory, windows) =
                     handle.join().expect("preflight case thread");
+                // A native lane that gives up must also say what holds the card.
+                if case.native.0 == 1 {
+                    assert!(
+                        native.1.contains(REPORTED_HOLDERS),
+                        "native preflight, {}: failed without reporting the GPU's \
+                         holders, logged:\n{}",
+                        case.label,
+                        native.1
+                    );
+                }
                 assert_gate("native", case.label, native, case.native);
                 assert_gate("advisory", case.label, advisory, case.advisory);
                 // The Windows block guards the same hardware class with the
@@ -1715,7 +1746,12 @@ esac
         // Two polls: one at t=0, one after the script's own 5s backoff. The
         // first spends two calls (combined, then GTT alone); everything after
         // that fails, so the second poll reads nothing.
-        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "6")];
+        //
+        // The ceiling is counted in bash's whole-second `$SECONDS`, so a
+        // ceiling of N buys between N-1 and N real seconds. 7 keeps the second
+        // check, at just over 5s, inside the budget; 6 left it a coin toss, and
+        // a skipped second poll passes this test without exercising it.
+        let env = [("GOOD_CALLS", "2"), ("GPU_PREFLIGHT_CEILING_SECS", "7")];
         let fixture = smi_fixture(512 * MIB, 200 * MIB, None);
         let (native, advisory) = apu_lanes();
 
@@ -1733,6 +1769,91 @@ esac
             run_preflight(&native, PreflightShell::DefaultRunStep, &fixture, &env),
             (1, &["reported no GTT pool"]),
         );
+    }
+
+    /// A `BASH_ENV` file that stalls the script once, for just over a second,
+    /// as soon as its `deadline` is set — before anything else runs.
+    ///
+    /// That is the descheduling a loaded host can impose at the same spot.
+    /// `$SECONDS` ticks on whole wall-clock seconds, so with a 1s ceiling the
+    /// deadline is already past when the script resumes.
+    #[cfg(unix)]
+    const STALL_AFTER_DEADLINE: &str = "trap '[ -z \"${__stalled:-}\" ] && [ -n \"${deadline:-}\" ] \
+         && { __stalled=1; sleep 1.05; } || true' DEBUG\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn every_shell_preflight_polls_at_least_once_whatever_the_ceiling() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // A lane whose deadline expires before its first poll reports a verdict
+        // no reading produced: the native lanes "rocm-smi never returned within
+        // its timeout", the advisory ones "no VRAM figures under WSL". This
+        // flaked the gate test above whenever the second boundary passed
+        // between computing the deadline and the loop's first check. Every
+        // shell copy in both workflows is driven, not just the APU twins the
+        // drift test pins, because each was written with the same loop.
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let trap_dir = tempfile::tempdir().expect("temp dir");
+        let bash_env = trap_dir.path().join("stall.sh");
+        std::fs::write(&bash_env, STALL_AFTER_DEADLINE).expect("write BASH_ENV");
+        let bash_env = bash_env.to_str().expect("utf-8 temp path");
+
+        let mut lanes = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
+                let Some(script) = preflight_shell_script(step) else {
+                    continue;
+                };
+                let shell = if step.contains("-Script @'") {
+                    PreflightShell::WslBareBash
+                } else {
+                    PreflightShell::DefaultRunStep
+                };
+                lanes.push((format!("{workflow} shell lane #{i}"), script, shell));
+            }
+        }
+        assert_eq!(
+            lanes.len(),
+            8,
+            "expected 8 shell GPU preflight blocks across both workflows — if a \
+             lane was added or removed, update this count"
+        );
+
+        // A card held by a leftover serve: every lane, native or advisory,
+        // discrete or APU, must take a reading and fail on it.
+        let fixture = smi_fixture(192 * GIB, 191 * GIB, None);
+        let env = [("BASH_ENV", bash_env), ("GPU_PREFLIGHT_CEILING_SECS", "1")];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = lanes
+                .iter()
+                .map(|(label, script, shell)| {
+                    let (fixture, env) = (&fixture, &env);
+                    scope.spawn(move || (label, shell, run_preflight(script, *shell, fixture, env)))
+                })
+                .collect();
+            for handle in handles {
+                let (label, shell, got) = handle.join().expect("preflight lane thread");
+                // The advisory lanes `cd` to the runner's absolute checkout
+                // path first, so only the native ones reach the stub here.
+                if matches!(shell, PreflightShell::DefaultRunStep) {
+                    assert!(
+                        got.1.contains(REPORTED_HOLDERS),
+                        "{label}: failed without reporting the GPU's holders, logged:\n{}",
+                        got.1
+                    );
+                }
+                assert_gate(
+                    label,
+                    "deadline already past at the first check",
+                    got,
+                    (1, &["VRAM never dropped below the floor"]),
+                );
+            }
+        });
     }
 
     #[test]
@@ -2113,6 +2234,50 @@ esac
         }
     }
 
+    /// Extract the literal glob entries from ci.yml's pull-request `rust:`
+    /// paths-filter bucket, stopping at the next sibling filter key. Scoped to
+    /// an exact `rust:` line (not a prefix match) so this doesn't also pick up
+    /// the unrelated `rust: ${{ … }}` job output a few lines above it.
+    fn rust_paths_filter_entries(ci: &str) -> Vec<String> {
+        let lines: Vec<&str> = ci.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == "rust:")
+            .unwrap_or_else(|| panic!("ci.yml declares a `rust:` paths-filter bucket"));
+        let key_indent = indent_of(lines[start]);
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| !line.trim().is_empty() && indent_of(line) <= key_indent)
+            .map_or(lines.len(), |offset| start + 1 + offset);
+        lines[start + 1..end]
+            .iter()
+            .filter_map(|line| strip_comment(line).trim().strip_prefix("- "))
+            .map(|item| strip_quotes(item.trim()))
+            .collect()
+    }
+
+    /// `forces_full_workspace` (xtask/src/affected.rs) names the doc paths
+    /// that fall back to a full-workspace run because an xtask test reads
+    /// them directly ([`crate::affected::XTASK_READ_DOCS`]). If one of them
+    /// isn't ALSO in ci.yml's `rust` paths-filter bucket,
+    /// `needs.changes.outputs.rust` stays false for a PR that touches only
+    /// that doc, and the `test` job's every step — including `cargo nextest
+    /// run`, which is what would have caught the drift — never runs at all.
+    #[test]
+    fn forces_full_workspace_docs_are_in_the_rust_filter() {
+        let ci = read_workflow("ci.yml");
+        let rust_filter = rust_paths_filter_entries(&ci);
+        for doc in crate::affected::XTASK_READ_DOCS {
+            assert!(
+                rust_filter.iter().any(|entry| entry == doc),
+                "`{doc}` is in `forces_full_workspace` (xtask/src/affected.rs) but \
+                 missing from ci.yml's `rust` paths-filter bucket, so an edit to it \
+                 alone skips the rust-gated jobs entirely instead of running the \
+                 test that reads it"
+            );
+        }
+    }
+
     #[test]
     fn workflows_use_distinct_concurrency_groups() {
         // Isolation comes from the group KEY differing per workflow. Extract the
@@ -2344,8 +2509,501 @@ esac
         );
     }
 
-    // Extractor guards: prove the helpers actually parse multiline forms, so the
-    // contract tests above can't silently false-pass on a shape they don't handle.
+    /// Extract the version token right after `marker` in `line`, up to the
+    /// next whitespace (trailing sentence punctuation is trimmed too, so a
+    /// doc sentence ending right after the version with no space, e.g.
+    /// `cargo-about@0.9.1.`, doesn't glue the period onto the token). With
+    /// marker `"hawkeye@"`, `cargo install hawkeye@7.0.0 --locked` yields
+    /// `7.0.0`.
+    ///
+    /// `strip_comments` must be true only for YAML lines: there, a pin
+    /// mentioned only inside a trailing `# ...` comment must not satisfy a
+    /// check meant for the real line beside it. It must be false for
+    /// Markdown prose, where `strip_comment`'s `" #"` delimiter also matches
+    /// an issue reference (`see #474, install hawkeye@7.0.1`) that is not a
+    /// comment at all — stripping there would silently drop that line's pin
+    /// from the check, which is the exact stale-duplicate case this helper
+    /// exists to catch. Compared for exact equality (not `contains`) so
+    /// neither a stale duplicate pin nor a version sharing a prefix
+    /// (`0.9.10` satisfying a check for `0.9.1`) can false-pass.
+    fn pin_token<'a>(line: &'a str, marker: &str, strip_comments: bool) -> Option<&'a str> {
+        let line = if strip_comments {
+            strip_comment(line)
+        } else {
+            line
+        };
+        let (_, rest) = line.split_once(marker)?;
+        let token = rest.split_whitespace().next().unwrap_or(rest);
+        Some(token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']))
+    }
+
+    /// Every `marker` occurrence on its own line — not just the first line
+    /// that has one — must pin exactly `expected`: a stale duplicate left
+    /// behind by a previous bump must not go unnoticed. (`pin_token` itself
+    /// only reads the first occurrence within a single line; today's pins
+    /// are each one per line, so this doesn't miss anything in practice.)
+    ///
+    /// Comment-stripping (see `pin_token`'s doc) is scoped by `path`'s
+    /// extension: on for `.yml`/`.yaml`, off for everything else (our
+    /// Markdown callers).
+    fn assert_pins_match(marker: &str, expected: &str, path: &Path, text: &str) {
+        let strip_comments = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"));
+        let mut found = false;
+        for line in text.lines() {
+            let Some(token) = pin_token(line, marker, strip_comments) else {
+                continue;
+            };
+            found = true;
+            assert_eq!(
+                token,
+                expected,
+                "{} pins `{marker}{token}`, which does not match the pinned version \
+                 `{expected}`:\n{line}",
+                path.display()
+            );
+        }
+        assert!(
+            found,
+            "{} has no `{marker}` pin; expected `{marker}{expected}`",
+            path.display()
+        );
+    }
+
+    /// The hawkeye and cargo-about versions pinned across CI, CONTRIBUTING.md
+    /// and (for cargo-about) MANIFEST.md must never drift from each other: a
+    /// mismatch lets a contributor's local tool accept or reject something CI
+    /// disagrees with, silently leaving CI as the only real gate.
+    ///
+    /// hawkeye's canonical version lives in `ci.yml`'s `license-headers`
+    /// job's `env:` mapping, read with the extractors this file already has
+    /// fixture tests for (`job_block`, `job_mapping`) rather than duplicated
+    /// into a constant — scoped to that one job so a nested step `env` or an
+    /// unrelated job can't leak in. A bump needs three edits: this test
+    /// guards two of them (ci.yml's `HAWKEYE_VERSION` and CONTRIBUTING.md);
+    /// the third, `HAWKEYE_SHA256` right beside it in ci.yml, is not guarded
+    /// here — see the comment at its definition. cargo-about's canonical
+    /// version is the `ABOUT_VERSION` constant in `tpn.rs`, which is what
+    /// `cargo xtask tpn` itself builds against. A cargo-about bump needs
+    /// seven edits across five files: `ABOUT_VERSION` itself, plus six
+    /// mirror pins — the four `cargo-about@` install lines (CONTRIBUTING.md,
+    /// MANIFEST.md, ci.yml, dependabot-manifests.yml) and the two
+    /// `${{ runner.os }}-cargo-about-<version>` cache keys in ci.yml and
+    /// dependabot-manifests.yml — and this test guards all six mirrors
+    /// against the `ABOUT_VERSION` canonical: the cache keys use a `-`
+    /// instead of `@`, so they need their own marker row rather than the
+    /// `cargo-about@` one. A forgotten cache-key bump would otherwise
+    /// cache-hit the OLD binary while `tpn --check` enforces the NEW
+    /// version, failing loudly but in a confusing place.
+    ///
+    /// One table, one check: a new pinned tool, or a new file that mentions
+    /// an existing one, costs a row here rather than another ~30-line test.
+    #[test]
+    fn pinned_tool_versions_match_across_docs_and_workflows() {
+        let ci = read_workflow("ci.yml");
+        let hawkeye_env = job_mapping(job_block(&ci, "license-headers"), "env");
+        let hawkeye_installed = hawkeye_env
+            .get("HAWKEYE_VERSION")
+            .unwrap_or_else(|| panic!("license-headers job has no HAWKEYE_VERSION entry"));
+        // ci.yml's env var is `v`-prefixed (`v7.0.0`); CONTRIBUTING.md's prose
+        // is not (`hawkeye@7.0.0`).
+        let hawkeye_version = hawkeye_installed
+            .strip_prefix('v')
+            .unwrap_or_else(|| panic!("HAWKEYE_VERSION `{hawkeye_installed}` must be `v`-prefixed"))
+            .to_owned();
+        let about_version = crate::tpn::ABOUT_VERSION.to_owned();
+
+        let root = repo_root();
+        let read = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+        };
+        // Each file below is read once here rather than once per table row
+        // that names it: CONTRIBUTING.md and dependabot-manifests.yml each
+        // appear in two rows, and ci.yml appears in a row on top of the read
+        // already done above for HAWKEYE_VERSION.
+        let contributing = read("CONTRIBUTING.md");
+        let manifest = read("MANIFEST.md");
+        let dependabot = read(".github/workflows/dependabot-manifests.yml");
+        let file_text = |rel: &str| -> &str {
+            match rel {
+                "CONTRIBUTING.md" => &contributing,
+                "MANIFEST.md" => &manifest,
+                ".github/workflows/ci.yml" => &ci,
+                ".github/workflows/dependabot-manifests.yml" => &dependabot,
+                other => panic!(
+                    "pinned_tool_versions_match_across_docs_and_workflows: unexpected file `{other}`"
+                ),
+            }
+        };
+
+        let table: [(&str, String, &[&str]); 3] = [
+            ("hawkeye@", hawkeye_version, &["CONTRIBUTING.md"]),
+            (
+                "cargo-about@",
+                about_version.clone(),
+                &[
+                    "CONTRIBUTING.md",
+                    "MANIFEST.md",
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
+            (
+                "cargo-about-",
+                about_version,
+                &[
+                    ".github/workflows/ci.yml",
+                    ".github/workflows/dependabot-manifests.yml",
+                ],
+            ),
+        ];
+
+        for (marker, expected, files) in table {
+            for file in files {
+                assert_pins_match(marker, &expected, &root.join(file), file_text(file));
+            }
+        }
+    }
+
+    /// Extract one prek hook's complete YAML block by its `- id:` value, up
+    /// to the next line at or above this hook's own `- id:` indent — the
+    /// same indent-based termination `job_block` and `nested_block` already
+    /// use, rather than two needles hardcoded to the exact text that
+    /// happens to follow today (`- id:`/`- repo:`). Hooks inside one
+    /// `repo:` block sit back to back with no blank line between them (see
+    /// `.pre-commit-config.yaml`'s `cargo-fmt`/`cargo-clippy`/... run), so a
+    /// blank-line-anchored end would silently fold a following sibling
+    /// hook's lines into this one's block whenever this hook is not the
+    /// last in its `repo:` block — and a needle that fails to match (e.g. a
+    /// reformat, or this hook ending up last with only a trailing comment
+    /// after it) would silently run the block to the end of the file
+    /// instead of failing loudly. A comment line at or below the hook's own
+    /// indent doesn't end the block by itself: it only does when it turns
+    /// out to head the next sibling, i.e. nothing deeper follows it before
+    /// the next such line — a comment with real indent-8 content still
+    /// after it (`hook_block_does_not_end_at_a_comment_only_line`) is just
+    /// an annotation inside this hook's own mapping, not a boundary, while
+    /// one immediately followed by the next `- id:`/`- repo:` (as
+    /// `.pre-commit-config.yaml` has between `license-headers` and the
+    /// `cargo-fmt` repo block today) is the next block's header comment and
+    /// must not be folded into this one's.
+    fn hook_block<'a>(text: &'a str, id: &str) -> &'a str {
+        let marker = format!("- id: {id}\n");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!(".pre-commit-config.yaml defines hook `{id}`"));
+        let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+        let marker_indent = indent_of(&text[line_start..start]);
+        let rest = &text[start + marker.len()..];
+
+        let mut offset = 0usize;
+        let mut pending_comment: Option<usize> = None;
+        for line in rest.split_inclusive('\n') {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let trimmed = content.trim_start();
+            if trimmed.is_empty() {
+                offset += line.len();
+                continue;
+            }
+            if indent_of(content) > marker_indent {
+                // Real content deeper than the hook's own indent proves any
+                // dedented comment seen so far was just an annotation inside
+                // this hook's mapping, not a sibling's header.
+                pending_comment = None;
+                offset += line.len();
+                continue;
+            }
+            if trimmed.starts_with('#') {
+                pending_comment.get_or_insert(offset);
+                offset += line.len();
+                continue;
+            }
+            return &rest[..pending_comment.unwrap_or(offset)];
+        }
+        rest
+    }
+
+    /// True if `block` has a line that, after stripping any trailing `#`
+    /// comment, is exactly `flag` once trimmed — so `flag` mentioned only
+    /// inside a comment, or commented out with the real line changed to
+    /// something else, can't satisfy the check.
+    fn hook_block_sets(block: &str, flag: &str) -> bool {
+        block.lines().any(|line| strip_comment(line).trim() == flag)
+    }
+
+    /// Regression guard: the `license-headers` hook once had a `types_or`
+    /// filter (`types_or: [rust, python, shell]`) that let a
+    /// `licenserc.toml`- or Markdown-only commit skip it entirely, while
+    /// CI's hawkeye check still enforced it. `always_run: true` is what
+    /// actually closes that gap: it fires the hook on every commit/push
+    /// regardless of any file-type filter, and hawkeye then scans the
+    /// whole repo per `licenserc.toml` (`pass_filenames: false`) however
+    /// it was triggered. The filter-key checks below guard the next step:
+    /// `always_run: true` already makes any of them inert, so none of
+    /// these alone can reopen the gap, but leaving one in place is
+    /// misleading maintenance debt that could let a later edit drop
+    /// `always_run` while assuming the filter still gates correctly.
+    #[test]
+    fn license_headers_hook_has_no_file_type_filter() {
+        // CRLF-normalize: `.pre-commit-config.yaml` isn't forced to `eol=lf` in
+        // .gitattributes, so a Windows checkout can give `\r\n` line endings,
+        // which `hook_block`'s `\n`-anchored marker would otherwise miss.
+        let config = std::fs::read_to_string(repo_root().join(".pre-commit-config.yaml"))
+            .expect("reading .pre-commit-config.yaml")
+            .replace("\r\n", "\n");
+        let block = hook_block(&config, "license-headers");
+        assert!(
+            hook_block_sets(block, "always_run: true"),
+            "license-headers hook must set `always_run: true`:\n{block}"
+        );
+        assert!(
+            hook_block_sets(block, "pass_filenames: false"),
+            "license-headers hook must set `pass_filenames: false` — hawkeye scans \
+             the whole repo per `licenserc.toml` regardless of trigger only because \
+             of this flag; without it, pre-commit would narrow the scan to changed \
+             files instead:\n{block}"
+        );
+        for filter_key in ["types:", "types_or:", "files:", "exclude:"] {
+            assert!(
+                !block.contains(filter_key),
+                "license-headers hook must not have a file-type filter (`{filter_key}`) — \
+                 `always_run: true` above already makes it inert, but leaving one in place \
+                 is misleading maintenance debt that could let a later edit drop \
+                 `always_run` while assuming the filter still gates correctly:\n{block}"
+            );
+        }
+    }
+
+    // Extractor guards: prove the helpers above actually parse the shapes they
+    // claim to — multiline hook blocks, comment-stripping, and single-line pin
+    // tokens alike — so the contract tests above can't silently false-pass on a
+    // shape they don't handle.
+    #[test]
+    fn hook_block_stops_at_next_hook_in_the_same_repo_block() {
+        // license-headers is NOT last in its `hooks:` list here, unlike in the
+        // real file today — this is exactly the shape that let a sibling
+        // hook's `always_run: true` leak into license-headers' block.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+      - id: cargo-fmt
+        name: cargo fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_the_next_repo_entry() {
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("always_run"),
+            "hook_block leaked into the next repo block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_does_not_end_at_a_comment_only_line() {
+        // The comment sits at the hook's own `- id:` indent — exactly the
+        // indent that used to end the block — with a real filter key after
+        // it. A reformat could leave a repo looking like this; the filter
+        // key must still be visible to the contract test above.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+      # a comment at the hook's own indent must not end the block
+        types_or: [rust]
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            block.contains("types_or:"),
+            "hook_block ended at a comment-only line, hiding a types_or filter that \
+             comes after it:\n{block}"
+        );
+        assert!(
+            !block.contains("cargo-fmt") && !block.contains("always_run"),
+            "hook_block still must not leak into the next hook's lines:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_a_dedented_comment_heading_the_next_repo_block() {
+        // Unlike the comment in the test above, this one sits right before the
+        // next `repo:` entry with nothing deeper in between — it heads that
+        // entry rather than annotating `license-headers`' own mapping, exactly
+        // the shape `.pre-commit-config.yaml` has between `license-headers`
+        // and the `cargo-fmt` repo block today.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # Rust + PowerShell: mirror the CI checks using the local toolchain.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("Rust + PowerShell") && !block.contains("always_run"),
+            "hook_block folded the next repo block's header comment into this hook's \
+             block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_stops_at_the_first_of_several_header_comment_lines() {
+        // A multi-line header comment, still heading the next repo block (nothing
+        // deeper follows before it). The boundary must be the FIRST of these
+        // lines, not the last: `pending_comment` has to keep the earliest offset
+        // it saw, because every line in the run belongs to the next sibling's
+        // header, not to `license-headers`' own block. Keeping the last offset
+        // instead would fold every comment line but the last into this block —
+        // undetectable with only one header-comment line, which is why this test
+        // needs at least two.
+        let yaml = "\
+  - repo: local
+    hooks:
+      - id: license-headers
+        name: license header check (hawkeye)
+        pass_filenames: false
+
+  # First header line: types_or: [rust]
+  # Second header line, right before the next repo entry.
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        always_run: true
+";
+        let block = hook_block(yaml, "license-headers");
+        assert!(
+            !block.contains("First header line") && !block.contains("Second header line"),
+            "hook_block folded a multi-line header comment into this hook's block:\n{block}"
+        );
+    }
+
+    #[test]
+    fn hook_block_sets_rejects_comment_only_and_falsified_mentions() {
+        assert!(hook_block_sets(
+            "        always_run: true",
+            "always_run: true"
+        ));
+        // Trailing comment after the real value is still read.
+        assert!(hook_block_sets(
+            "        always_run: true  # hawkeye ignores pass_filenames",
+            "always_run: true"
+        ));
+        // The flag mentioned only inside a comment, with the real line
+        // changed to something else, must not satisfy the check.
+        assert!(!hook_block_sets(
+            "        # always_run: true\n        always_run: false",
+            "always_run: true"
+        ));
+    }
+
+    #[test]
+    fn pin_token_rejects_prefixes_and_comment_only_mentions() {
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about@0.9.1 --locked",
+                "cargo-about@",
+                true
+            ),
+            Some("0.9.1")
+        );
+        // A version sharing a prefix must not compare equal to the one it shares
+        // a prefix with — `contains` would wrongly let this satisfy `"0.9.1"`.
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about@0.9.10 --locked",
+                "cargo-about@",
+                true
+            ),
+            Some("0.9.10")
+        );
+        // A pin mentioned only after a trailing ` #` comment (the real line
+        // changed to something else) must not be seen, when comment-stripping
+        // is on (the YAML case).
+        assert_eq!(
+            pin_token(
+                "cargo install cargo-about --version 0.9.0  # was cargo-about@0.9.1",
+                "cargo-about@",
+                true,
+            ),
+            None
+        );
+        // Prose that ends the sentence right after the version, with no
+        // separating whitespace, must not glue the punctuation onto the token.
+        assert_eq!(
+            pin_token("pinned to cargo-about@0.9.1.", "cargo-about@", true),
+            Some("0.9.1")
+        );
+        // With comment-stripping off (the Markdown case), an issue reference
+        // like `#474` must not be mistaken for a `# ...` comment that hides the
+        // real pin after it — the exact shape CONTRIBUTING.md/MANIFEST.md prose
+        // can take.
+        assert_eq!(
+            pin_token("see #474, install hawkeye@7.0.1", "hawkeye@", false),
+            Some("7.0.1")
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.8.0`")]
+    fn assert_pins_match_flags_a_stale_duplicate_pin() {
+        let text = "cargo install cargo-about@0.9.1 --locked\n\
+                     cargo install cargo-about@0.8.0 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "pins `cargo-about@0.9.10`, which does not match")]
+    fn assert_pins_match_flags_a_version_sharing_a_prefix() {
+        // The property `pin_token` guarantees — `0.9.10` must not satisfy a
+        // check for `0.9.1` — proven end to end through the real comparison
+        // path, not just through extraction.
+        let text = "cargo install cargo-about@0.9.10 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no `cargo-about@` pin")]
+    fn assert_pins_match_flags_a_marker_with_no_pin_at_all() {
+        // A file whose pin was reworded out of the marker's shape (e.g. split
+        // onto `--version` instead of `cargo-about@<version>`) must not
+        // silently drop out of the drift guard — deleting the `found` check
+        // this fixture pins would otherwise leave every other test green.
+        let text = "cargo install cargo-about --version 0.9.1 --locked\n";
+        assert_pins_match("cargo-about@", "0.9.1", Path::new("fixture"), text);
+    }
+
     #[test]
     fn runs_on_extractor_flattens_multiline_forms() {
         let yaml = "\

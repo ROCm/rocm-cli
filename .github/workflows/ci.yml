@@ -110,7 +110,9 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain*'
-              # clippy runs `cargo xtask manifest --check` against this file.
+              # clippy runs `cargo xtask manifest --check` against this file;
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask)
+              # also reads its cargo-about pin.
               - 'MANIFEST.md'
               # The committed per-crate coverage floors. Listed so that lowering
               # a floor re-runs the gate that floor controls, instead of being
@@ -119,6 +121,31 @@ jobs:
               # rocm-deps compiles the pins into constants, so a pin change is a
               # source change even though no *.rs file moved.
               - 'runtime-deps.toml'
+              # pinned_tool_versions_match_across_docs_and_workflows (xtask) reads
+              # this file's hawkeye/cargo-about pins. This entry only gates
+              # whether the rust-flagged jobs run at all; `cargo xtask affected`
+              # treats Markdown as ignorable by default and would otherwise skip
+              # the `Test (nextest)` step for a pin-only edit here (the coverage
+              # job isn't affected-narrowed, so it alone would still catch a
+              # drift, but invisibly). CONTRIBUTING.md is listed in
+              # `forces_full_workspace` (xtask/src/affected.rs) for the same
+              # reason MANIFEST.md already is, so nextest runs too.
+              - 'CONTRIBUTING.md'
+              # hardware_testing_docs_cover_all_self_hosted_platforms (xtask)
+              # reads this file and the one below it; same
+              # `Selection::Empty`/invisible-coverage gap as CONTRIBUTING.md
+              # above, so both are in `forces_full_workspace` too and need the
+              # same rust-filter entry. tests/e2e-cucumber/README.md also
+              # matches `heavy` below, so the Windows lane's full workspace
+              # run backstops this entry on its own; it's listed here anyway
+              # so the Linux `test` job (which is `rust`-gated, not
+              # `heavy`-gated) doesn't silently skip the test that reads it.
+              - 'docs/ci-hardware-testing.md'
+              - 'tests/e2e-cucumber/README.md'
+              # license_headers_hook_has_no_file_type_filter (xtask) reads this
+              # file's license-headers hook config; an edit here that reopens the
+              # file-type-filter gap must still run that test on the PR.
+              - '.pre-commit-config.yaml'
               - '.github/workflows/**'
             # build-and-test runs cargo AND the python/shell smoke steps plus the
             # install-lifecycle E2E (`cargo xtask package` + the real installer),
@@ -864,8 +891,9 @@ jobs:
     # single source of truth in .pre-commit-config.yaml — hygiene + Python (ruff)
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
-    # hawkeye, or PowerShell — those have their own jobs (clippy, build-and-test,
-    # license-headers, powershell-lint).
+    # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
+    # their own jobs (clippy, build-and-test, license-headers, docs-links,
+    # powershell-lint, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1331,6 +1359,9 @@ jobs:
         with:
           args: --config lychee.toml './**/*.md'
           fail: true
+          # Explicit, so an action bump can't silently drift from the version
+          # CONTRIBUTING.md pins for the local `lychee` prek hook — bump both.
+          lycheeVersion: v0.24.2
 
   docs-build:
     name: Sphinx docs build (-W)
