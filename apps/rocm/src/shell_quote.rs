@@ -49,6 +49,14 @@
 /// ordinary command line stays readable: `rocm serve qwen2.5-7b --managed`,
 /// not `rocm 'serve' 'qwen2.5-7b' '--managed'`.
 pub(crate) fn shell_quote(value: &str) -> String {
+    // `=` is left bare because POSIX gives it meaning only in a word ahead of
+    // the command name, where `A=b` is an assignment rather than an argument.
+    // Every caller renders values after a fixed program word (`rocm …`,
+    // `uv …`, `rocm serve …` on the remote), never as argv[0], so it is inert
+    // where it lands. Nothing enforces that: a caller that puts a quoted value
+    // in command position must quote `=` as well. zsh is the other exception —
+    // with its default `EQUALS` option a word *starting* with `=` expands to a
+    // command path — and is outside the POSIX contract this quoter states.
     let inert = |character: char| {
         character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '/' | ':' | '=')
     };
