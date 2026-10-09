@@ -31,7 +31,7 @@ pub(crate) fn uninstall(options: UninstallOptions) -> Result<()> {
 /// Split from [`uninstall`] only so a test can drive the real command — plan,
 /// confirm gate, stop pass, removal — against an isolated root, instead of
 /// exercising the pieces separately and taking the wiring between them on faith.
-fn uninstall_with_paths(paths: &AppPaths, options: &UninstallOptions) -> Result<()> {
+pub(crate) fn uninstall_with_paths(paths: &AppPaths, options: &UninstallOptions) -> Result<()> {
     let plan = build_uninstall_plan(paths, options)?;
     print!("{}", render_uninstall_plan(&plan, options));
 

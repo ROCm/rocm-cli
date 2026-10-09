@@ -52,6 +52,11 @@ pub(crate) enum StopFailureRemedy {
     /// The background helper is still alive, so it can restart what was just
     /// stopped. It has to go before anything is removed.
     StopTheDaemon,
+    /// A live pid is recorded as the helper but cannot be proven to be `rocmd`
+    /// (a pre-upgrade state file, or a reboot since). Killing it would risk an
+    /// unrelated process, so the operator has to decide, and the state file is the
+    /// thing to delete if it is not the helper.
+    ConfirmTheDaemonPid,
     /// The helper's runtime-state file does not parse, so no pid was ever
     /// recovered from it — "kill that pid" is advice nobody can act on. The file
     /// itself has to be repaired or deleted, so the remedy names it.
@@ -84,6 +89,13 @@ impl StopFailureRemedy {
                                     anything: kill that pid (`kill <pid>` on Linux, `Stop-Process -Id <pid> -Force` \
                                     on Windows), then re-run uninstall."
                 .to_owned(),
+            Self::ConfirmTheDaemonPid => format!(
+                "That pid could not be proven to be the background helper, so it was left alone. \
+                 Check what pid {} is: if it is `rocmd`, stop it; if it is something else (the \
+                 state file may predate a reboot), delete the stale runtime state file, then \
+                 re-run uninstall.",
+                ids.join(", ")
+            ),
             Self::RepairTheDaemonState => format!(
                 "The background helper's runtime state does not parse, so no pid could be read \
                  from it and `rocm` cannot tell whether the helper is running. Check for a live \
@@ -115,6 +127,7 @@ impl StopFailureRemedy {
             Self::StopTheService => 0,
             Self::StopWhatHoldsThePort => 1,
             Self::StopTheDaemon => 2,
+            Self::ConfirmTheDaemonPid => 2,
             Self::RepairTheDaemonState => 3,
             Self::RepairTheRecord => 4,
         }
@@ -164,7 +177,7 @@ pub(crate) fn daemon_identity_unverified(daemon_pid: u32) -> FailedManagedServic
         reason: "the background helper's identity could not be verified, so it was left running \
                  rather than risk signalling an unrelated process that inherited its pid"
             .to_owned(),
-        remedy: StopFailureRemedy::StopTheDaemon,
+        remedy: StopFailureRemedy::ConfirmTheDaemonPid,
     }
 }
 
@@ -443,13 +456,21 @@ pub(crate) fn stop_managed_services_with(
     // the same model again after a stop leaves exactly that pair, and the live
     // record's own server answers there. That answer says nothing about the
     // stopped record until the live one has been stopped, so it is probed after.
-    let live_endpoints: Vec<(String, u16)> = records
+    let live_endpoints: Vec<(Vec<String>, u16)> = records
         .iter()
         .filter(|record| managed_service_is_live(record))
-        .map(|record| (probe_hosts(&record.host).join("|"), record.port))
+        .map(|record| (probe_hosts(&record.host), record.port))
         .collect();
+    // Overlap, not equality: `0.0.0.0`, `localhost` and `127.0.0.1` can all name
+    // the one listener, so any shared probe address on the same port counts.
     let shares_a_live_endpoint = |record: &ManagedServiceRecord| {
-        live_endpoints.contains(&(probe_hosts(&record.host).join("|"), record.port))
+        let mine = probe_hosts(&record.host);
+        live_endpoints.iter().any(|(hosts, port)| {
+            *port == record.port
+                && mine
+                    .iter()
+                    .any(|a| hosts.iter().any(|b| hosts_name_one_listener(a, b)))
+        })
     };
     let already_stopped: Vec<&ManagedServiceRecord> = records
         .iter()
@@ -707,6 +728,15 @@ fn probe_records_for_survivors(
 /// direction for a check whose whole job is to catch a surviving engine
 /// grandchild. Records do carry bracketed spellings (`loopback_host_key`
 /// normalizes them too) because `--host` is free-form.
+/// Whether two probe addresses can reach the same listener on one port.
+fn hosts_name_one_listener(a: &str, b: &str) -> bool {
+    let canonical = |h: &str| match h {
+        "localhost" => "127.0.0.1".to_owned(),
+        other => other.to_owned(),
+    };
+    canonical(a) == canonical(b)
+}
+
 pub(crate) fn probe_hosts(host: &str) -> Vec<String> {
     // Trimmed and case-folded so the spellings a record can carry — `0.0.0.0`,
     // `::`, `[::]`, `0:0:0:0:0:0:0:0`, `*`, or empty — all resolve to loopback
@@ -903,7 +933,8 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
             format!(
                 " These services were stopped before the failure and stay stopped: {}. Stopping \
                  them dropped their endpoint keys, so a publicly bound one has to be served \
-                 again with `rocm serve --host <host> --allow-public-bind` (add `--api-key <key>`) \
+                 again with `rocm serve <model> --host <host> --port <port> --allow-public-bind` (add \
+                 `--api-key <key>`) \
                  to return.",
                 report.stopped.join(", ")
             )

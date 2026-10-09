@@ -3813,7 +3813,7 @@ fn ensure_public_service_has_endpoint_key(
             "managed service is bound to the public host `{host}` but has no endpoint API key, \
              so restarting it would reopen it without authentication. The key is dropped when a \
              service stops and cannot be recovered. Launch it again with \
-             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
+             `rocm serve <model> --host {host} --port <port> --allow-public-bind` (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
     }
@@ -33729,15 +33729,13 @@ install therock";
             "an unverifiable pid must never be signalled: uninstall killed an unrelated process"
         );
         assert!(
-            report.stopped.is_empty(),
+            report.stopped.is_empty() && !report.helper_stopped,
             "nothing was confirmed stopped: {report:?}"
         );
         assert!(
-            report
-                .failed
-                .iter()
-                .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon
-                    && failure.service_id.contains(&pid.to_string())),
+            report.failed.iter().any(|failure| failure.remedy
+                == StopFailureRemedy::ConfirmTheDaemonPid
+                && failure.service_id.contains(&pid.to_string())),
             "an unverifiable helper must abort the uninstall and name its pid: {report:?}"
         );
         let mut stranger = stranger;
@@ -34877,8 +34875,80 @@ install therock";
             "{}",
             find(&kept)
         );
+        // And the behaviour the warning promises: the real command, against the
+        // same unreadable directory, errors out and removes nothing.
+        let marker = paths.config_dir.join("keep-me");
+        fs::create_dir_all(&paths.config_dir).expect("config dir");
+        fs::write(&marker, b"x").expect("seed a planned file");
+        let outcome = crate::uninstall::uninstall_with_paths(
+            &paths,
+            &UninstallOptions {
+                yes: true,
+                force_dev_binaries: true,
+                ..UninstallOptions::default()
+            },
+        );
+        assert!(
+            outcome.is_err(),
+            "an unreadable services dir must abort uninstall"
+        );
+        assert!(marker.exists(), "an aborted uninstall must remove nothing");
         fs::set_permissions(paths.services_dir(), fs::Permissions::from_mode(0o755)).ok();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopped_record_spelled_with_a_wildcard_host_still_waits_for_its_live_partner() {
+        // Same shape as the port-reuse case, but the stopped record says
+        // `0.0.0.0` and the live one `127.0.0.1`: both name the one listener.
+        let endpoint = std::sync::Mutex::new(Some(ServingEndpoint::serving("amd/reused-model")));
+        let port = endpoint.lock().unwrap().as_ref().unwrap().port;
+        let (root, paths) = test_paths("uninstall-reused-port-wildcard");
+        let make = |id: &str, host: &str, status: &str| {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                id,
+                "vllm",
+                "amd/reused-model",
+                "amd/reused-model",
+                host,
+                port,
+                "managed",
+                0,
+                None,
+                None,
+                None,
+            );
+            record.status = status.to_owned();
+            record.write().expect("write record");
+        };
+        make("svc-a", "0.0.0.0", "stopped");
+        make("svc-b", "127.0.0.1", "ready");
+        let report = stop_managed_services_with(&paths, |_, _| {
+            drop(endpoint.lock().unwrap().take());
+            Ok(serde_json::json!({ "status": "stopped" }))
+        })
+        .expect("the pass succeeds");
+        assert!(
+            report.failed.is_empty(),
+            "a differently spelled host for the same listener must not doom the run: {report:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_helper_only_stop_prints_a_success_line() {
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: Vec::new(),
+            warnings: Vec::new(),
+            helper_stopped: true,
+        };
+        assert_eq!(
+            uninstall_removal_gate(&report).unwrap().as_deref(),
+            Some("stopped the background helper (rocmd)")
+        );
     }
 
     #[test]
@@ -34895,7 +34965,7 @@ install therock";
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert!(
-            message.contains("rocm serve --host <host> --allow-public-bind"),
+            message.contains("rocm serve <model> --host <host> --port <port> --allow-public-bind"),
             "without --host a serve binds loopback and the public service does not return: {message}"
         );
     }
@@ -36039,6 +36109,7 @@ install therock";
             (StopFailureRemedy::StopTheService, true),
             (StopFailureRemedy::StopWhatHoldsThePort, true),
             (StopFailureRemedy::StopTheDaemon, false),
+            (StopFailureRemedy::ConfirmTheDaemonPid, false),
             (StopFailureRemedy::RepairTheDaemonState, false),
             (StopFailureRemedy::RepairTheRecord, false),
         ] {
