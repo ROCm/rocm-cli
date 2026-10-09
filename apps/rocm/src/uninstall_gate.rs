@@ -242,14 +242,7 @@ pub(crate) const fn daemon_identity_outcome(
 /// spawns on, and off Linux it is the only one that applies.
 ///
 /// Linux (`/proc`) and Windows (`GetProcessTimes` creation time) can record and
-/// compare a start-time, so a recycled pid is told apart there. On a platform
-/// with neither (macOS) no start-time exists, so this degrades to the same
-/// best-effort match the managed-service kills already use there rather than
-/// making uninstall unusable whenever the daemon is up: `running` and a live-pid
-/// check are the whole of the protection. Whether this platform can
-/// read a start-time at all is asked of a process known to be alive — this one —
-/// so a failed reading of the daemon's pid is never mistaken for a platform that
-/// cannot read them.
+/// compare a start-time, so a recycled pid is told apart there.
 ///
 /// Two residual gaps, and the list above is otherwise the complete set of
 /// inputs. First, a *missing* `runtime-state.json` is taken at face value as "no
@@ -257,9 +250,7 @@ pub(crate) const fn daemon_identity_outcome(
 /// daemon stop silently. This is deliberate — a missing file is the ordinary
 /// never-started case, and there is no pid to verify or signal without it — but
 /// it does mean the gate is only as good as the state file. An unreadable one is
-/// the case that aborts; an absent one is the case that proceeds. Second, on
-/// macOS a pid recycled while `running` was still true (a crash, not a clean
-/// exit) cannot be told from the daemon itself.
+/// the case that aborts; an absent one is the case that proceeds.
 pub(crate) fn stop_background_helper_before_uninstall(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -313,8 +304,6 @@ pub(crate) fn stop_background_helper_with(
     // started without `--automations-enabled` returns before its first state
     // write — so a false flag means the recorded pid belongs to a daemon that
     // already exited, and anything alive under it now inherited the number.
-    // Where no start-time can be read (macOS) this flag is the only guard against
-    // a force-kill landing on a stranger.
     if !state.running || state.daemon_pid == 0 || state.daemon_pid == std::process::id() {
         return;
     }
@@ -334,11 +323,6 @@ pub(crate) fn stop_background_helper_with(
     // (`/proc`) yet none was recorded, the record simply predates the field:
     // treat it as unverifiable, leave the process alone, and abort. Being told
     // to kill a PID is recoverable; killing an unrelated process tree is not.
-    //
-    // Only where no start-time can ever be read (macOS) does
-    // this fall back to the best-effort match the managed-service kills already
-    // use there — otherwise uninstall could never stop a live daemon on those
-    // platforms. That residual gap is documented on `daemon_start_ticks`.
     //
     // Which platform this is gets answered by a process that is definitely
     // alive — this one — rather than by whether the daemon's own reading
@@ -829,19 +813,11 @@ pub(crate) const fn stopped_record_verdict(
     }
 }
 
-/// Whether a record carrying no start-time predates the field, as opposed to
-/// coming from a platform that cannot report one.
-///
-/// Deliberately takes no PID, and that is the whole point of it being a function
-/// rather than two lines at the call site. The question is about the *platform*,
-/// and asking it of the process under inspection cannot tell "this OS has no
-/// `/proc`" from "that one read just failed" — a conflation that sends a legacy
-/// record down the best-effort `Matches` arm and force-kills a tree it never
-/// verified. Answering from our own PID has no such window: the process asking
-/// is, by construction, running. Keeping the target PID out of the signature
-/// makes that conflation unrepresentable here rather than merely avoided.
-pub(crate) fn record_predates_start_ticks(recorded_start_ticks: Option<u64>) -> bool {
-    recorded_start_ticks.is_none() && rocm_core::process_start_ticks(std::process::id()).is_some()
+/// Whether a record carrying no start-time predates the field. Both supported
+/// platforms (Linux, Windows) can record one, so an absent value means the record
+/// was written by a pre-upgrade `rocmd`.
+pub(crate) const fn record_predates_start_ticks(recorded_start_ticks: Option<u64>) -> bool {
+    recorded_start_ticks.is_none()
 }
 
 /// Whether `endpoint_url` answered the identity probe with an auth refusal.

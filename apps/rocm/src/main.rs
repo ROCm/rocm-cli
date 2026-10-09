@@ -34880,11 +34880,14 @@ install therock";
         let marker = paths.config_dir.join("keep-me");
         fs::create_dir_all(&paths.config_dir).expect("config dir");
         fs::write(&marker, b"x").expect("seed a planned file");
+        // `keep_binaries` keeps this off the real executable-discovery path: with
+        // the dev-binary override a regression here would delete the shared build
+        // output. The services dir lives under the data dir, so it still refuses.
         let outcome = crate::uninstall::uninstall_with_paths(
             &paths,
             &UninstallOptions {
                 yes: true,
-                force_dev_binaries: true,
+                keep_binaries: true,
                 ..UninstallOptions::default()
             },
         );
@@ -35183,37 +35186,6 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
-    /// The platform conjunct in `record_predates_start_ticks`, pinned on the one
-    /// lane where it is falsifiable.
-    ///
-    /// On Linux `process_start_ticks` always answers for a live process, so the
-    /// conjunct is unconditionally true there and *no* Linux assertion can
-    /// distinguish the predicate from a bare `is_none()`. Deleting it leaves
-    /// every Linux test green — which is exactly what happened to this test's
-    /// previous version. Off Linux the same call is a compile-time stub that
-    /// always answers `None`, so the conjunct decides the result, and this
-    /// assertion fails the moment it is dropped. It compiles only where no
-    /// start-time is readable (macOS), which has no CI lane, so in practice the
-    /// platform conjunct is not exercised by any lane.
-    ///
-    /// The behaviour it protects: with no start-time readable on this platform,
-    /// a record carrying none is NOT evidence of a pre-upgrade record — it is
-    /// just what every record looks like here. Treating it as pre-upgrade would
-    /// abort every uninstall that finds a live daemon on macOS.
-    #[cfg(not(any(target_os = "linux", windows)))]
-    #[test]
-    fn without_readable_start_times_a_bare_record_is_not_a_legacy_record() {
-        assert!(
-            !record_predates_start_ticks(None),
-            "where no start-time can be read, an absent one says nothing about the record's age"
-        );
-        assert!(
-            !record_predates_start_ticks(Some(1)),
-            "a record that carries a start-time is never a pre-upgrade record"
-        );
-    }
-
-    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_record_without_a_start_time_is_a_legacy_record_where_start_times_are_readable() {
         // The readable-start-time half of the predicate's contract (Linux, Windows), and no more than that.
@@ -35225,13 +35197,6 @@ install therock";
         // takes no PID, so passing one is a compile error. It is prevented by
         // construction, not caught by an assertion, and no assertion here should
         // claim otherwise.
-        //
-        // The platform conjunct itself is unfalsifiable on this lane: on Linux
-        // `process_start_ticks` always answers for a live process, so the
-        // conjunct is constantly true and this test cannot tell the predicate
-        // from a bare `is_none()`. `without_readable_start_times_a_bare_record_\
-        // is_not_a_legacy_record` targets it, but compiles only on macOS, which
-        // has no CI lane.
         //
         // The guard's end-to-end behaviour is pinned separately, by
         // `uninstall_never_kills_a_daemon_pid_from_a_state_file_that_predates_\
