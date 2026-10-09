@@ -201,6 +201,13 @@ pub struct AppState {
     /// read. Consulted by `has_live_instance` only until `has_received_snapshot`
     /// flips (issue #145).
     pub startup_has_live_service: bool,
+    /// Set from `ResolvedArgs::managed_service_ids`: ids this host's own
+    /// registry manages, so `ui::quit_confirm_body` only ever prints a
+    /// `rocm services stop <id> --yes` line for an instance that command can
+    /// actually reach. Same pre-TUI snapshot and staleness as
+    /// `startup_has_live_service` — not refreshed for the life of the
+    /// session.
+    pub managed_service_ids: std::collections::HashSet<String>,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -267,9 +274,11 @@ pub struct AppState {
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
-    /// A quit attempted (`q`, or `/quit`/`/exit` in chat) while a managed
-    /// instance was still serving. `Some` ⇒ the confirm-before-quit prompt is
-    /// open and owns keyboard focus, the same way `approval` does.
+    /// A quit attempted while a managed instance was still serving, from any
+    /// of `request_quit`'s entry points: `q`, the Esc main menu's `Quit` row,
+    /// `/quit`/`/exit` in chat, or the pre-dashboard launcher's own `q`/Esc.
+    /// `Some` ⇒ the confirm-before-quit prompt is open and owns keyboard
+    /// focus, the same way `approval` does.
     pub(crate) quit_confirm: Option<crate::ui::approval::ApprovalChoice>,
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
@@ -358,6 +367,7 @@ impl AppState {
             simulated: false,
             services_past_attempts: 0,
             startup_has_live_service: false,
+            managed_service_ids: std::collections::HashSet::new(),
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -617,19 +627,40 @@ impl AppState {
     /// True when a managed instance is actively serving from the user's point
     /// of view — the gate for the confirm-before-quit prompt.
     ///
-    /// ORs in `startup_has_live_service` until the daemon's first instance
-    /// snapshot lands (`has_received_snapshot`): `instances` starts empty and
-    /// is only populated once that snapshot arrives (see `push_snapshot`), so
-    /// a `q` pressed in that startup window — or at any point the daemon
-    /// connection never succeeds at all — would otherwise see this return
-    /// `false` even though a model actually was being served, simply because
-    /// the live state hadn't arrived yet (issue #145). Once a snapshot lands,
-    /// `instances` is authoritative and the pre-launch disk read is never
-    /// consulted again, so a model that legitimately stops later in the
+    /// Always `false` under `simulated` (`--demo`/`--replay`): a demo session
+    /// synthesizes `Instance { status: Running, .. }` entries so the Serving
+    /// tab has something to show, but nothing is actually running, so warning
+    /// before quitting would print a false claim (AGENTS.md §3, issue #145's
+    /// own prompt text: "it keeps running in the background after you quit").
+    ///
+    /// Otherwise ORs in `startup_has_live_service` until the daemon's first
+    /// instance snapshot lands (`has_received_snapshot`): `instances` starts
+    /// empty and is only populated once that snapshot arrives (see
+    /// `push_snapshot`), so a `q` pressed in that startup window — or at any
+    /// point the daemon connection never succeeds at all — would otherwise
+    /// see this return `false` even though a model actually was being served,
+    /// simply because the live state hadn't arrived yet. Once a snapshot
+    /// lands, `instances` is authoritative and the pre-launch disk read is
+    /// never consulted again, so a model that legitimately stops later in the
     /// session is still reflected correctly.
     pub(crate) fn has_live_instance(&self) -> bool {
+        if self.simulated {
+            return false;
+        }
         self.instances.values().any(|i| i.status.is_serving())
             || (!self.has_received_snapshot && self.startup_has_live_service)
+    }
+
+    /// Whether at least one currently-serving instance is one this host's own
+    /// registry manages (`managed_service_ids`) — i.e. one `rocm services
+    /// stop` can actually reach. Shared by `ui::quit_confirm_body` (whether to
+    /// show the "press s" hint) and `quit_confirm_open_services_key` (whether
+    /// `s` does anything), so the two can't drift on when stopping is
+    /// actually offered.
+    pub(crate) fn has_stoppable_managed_instance(&self) -> bool {
+        self.instances
+            .values()
+            .any(|i| i.status.is_serving() && self.managed_service_ids.contains(&i.container_id))
     }
 
     /// Whether the confirm-before-quit prompt is open. Mirrors
@@ -693,6 +724,47 @@ impl AppState {
                 Some(false)
             }
         }
+    }
+
+    /// The quit-confirm prompt's `s` ("stop…") key (issue #145): rather than
+    /// only warning that a model keeps running, jump straight to the Services
+    /// overlay — pre-focused on a managed instance that's actually serving —
+    /// so the user can stop it there through its own proven approval+job+
+    /// console flow (`ui::services_manager`), instead of only being told the
+    /// shell command to run themselves.
+    ///
+    /// Dashboard-only: the pre-dashboard launcher shares this prompt's text
+    /// but has no live Services overlay to jump to (it isn't connected to a
+    /// daemon and has no `services` field rendering path of its own), so its
+    /// own key routing never calls this. Returns `true` when handled — the
+    /// caller must not also resolve `code` through
+    /// [`resolve_quit_confirm_key`](Self::resolve_quit_confirm_key) in that
+    /// case. Returns `false` (prompt not open, key isn't `s`, or nothing
+    /// stoppable is currently serving) when the caller should fall through to
+    /// that normal resolution instead.
+    pub(crate) fn quit_confirm_open_services_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> bool {
+        if !self.quit_confirm_pending() || code != crossterm::event::KeyCode::Char('s') {
+            return false;
+        }
+        let rows = crate::ui::services_manager::service_rows(&self.instances);
+        let Some(selected) = rows.iter().position(|r| {
+            self.managed_service_ids.contains(&r.id)
+                && self
+                    .instances
+                    .get(&r.id)
+                    .is_some_and(|i| i.status.is_serving())
+        }) else {
+            return false;
+        };
+        self.close_overlays();
+        self.services = Some(crate::ui::services_manager::ServicesManagerState {
+            selected,
+            ..Default::default()
+        });
+        true
     }
 
     /// Whether a modal that owns the body absolutely — no console, nothing to
@@ -2242,6 +2314,7 @@ mod tests {
             bench_results_dir: None,
             services_past_attempts: 0,
             startup_has_live_service: false,
+            managed_service_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -3178,6 +3251,31 @@ mod tests {
         assert!(
             !s.has_live_instance(),
             "a real (even empty) snapshot must retire the startup fallback"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_is_always_false_under_simulated() {
+        // `--demo`/`--replay` synthesize `Instance { status: Running, .. }`
+        // entries (the Serving tab needs something to show), but nothing is
+        // actually running, so the quit-confirm gate must never trust them —
+        // otherwise it prints "it keeps running in the background" when
+        // nothing does (AGENTS.md §3, issue #145).
+        let mut s = st();
+        s.simulated = true;
+        s.instances.insert(
+            "id0".to_string(),
+            rocm_dash_core::metrics::Instance {
+                container_id: "id0".to_string(),
+                status: rocm_dash_core::metrics::InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.startup_has_live_service = true;
+        assert!(
+            !s.has_live_instance(),
+            "a simulated session must never report a live instance, \
+             whether from a snapshot or the startup fallback"
         );
     }
 

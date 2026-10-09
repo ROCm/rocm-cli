@@ -903,7 +903,11 @@ mod tests {
         // clearing `Modal::Menu`, so declining from the Esc-menu "Quit" row
         // used to strand the user back in the Esc menu, unlike declining via
         // the plain `q` key (where `modal` was already `None`).
-        use crate::ui::approval::ApprovalVerdict;
+        //
+        // Goes through `resolve_quit_confirm_key` (not the lower-level
+        // `on_quit_confirm_key`, which only routes the key and never clears
+        // `quit_confirm` itself) so this actually exercises the Deny verdict's
+        // side effect rather than a verdict this test then applies by hand.
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.instances.insert(
@@ -916,33 +920,35 @@ mod tests {
         s.modal = Modal::Menu;
         s.menu_sel = 2;
         assert!(!apply_action(&mut s, KeyAction::MenuActivate));
-        assert_eq!(
-            s.on_quit_confirm_key(KeyCode::Char('n')),
-            Some(ApprovalVerdict::Deny)
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(
+            s.quit_confirm.is_none(),
+            "Deny must clear the prompt, not merely report it"
         );
-        s.quit_confirm = None;
         assert_eq!(s.modal, Modal::None);
     }
 
     #[test]
     fn quit_confirm_key_approves_denies_and_cancels() {
-        use crate::ui::approval::ApprovalVerdict;
+        // Through `resolve_quit_confirm_key`, so this covers the verdict's
+        // side effect (clearing `quit_confirm` on Deny/Cancel, leaving it set
+        // on Approve for the caller that's about to exit) and not merely
+        // `on_quit_confirm_key`'s lower-level routing.
         let mut s = AppState::new("t".into(), "default-dark".into());
         s.open_quit_confirm();
-        assert_eq!(
-            s.on_quit_confirm_key(KeyCode::Char('y')),
-            Some(ApprovalVerdict::Approve)
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('y')), Some(true));
+        assert!(
+            s.quit_confirm.is_some(),
+            "Approve leaves the prompt for the caller, which is about to exit"
         );
+
         s.open_quit_confirm();
-        assert_eq!(
-            s.on_quit_confirm_key(KeyCode::Char('n')),
-            Some(ApprovalVerdict::Deny)
-        );
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Char('n')), Some(false));
+        assert!(s.quit_confirm.is_none(), "Deny must clear the prompt");
+
         s.open_quit_confirm();
-        assert_eq!(
-            s.on_quit_confirm_key(KeyCode::Esc),
-            Some(ApprovalVerdict::Cancel)
-        );
+        assert_eq!(s.resolve_quit_confirm_key(KeyCode::Esc), Some(false));
+        assert!(s.quit_confirm.is_none(), "Cancel must clear the prompt");
     }
 
     #[test]

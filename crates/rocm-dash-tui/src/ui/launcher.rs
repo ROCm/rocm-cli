@@ -154,10 +154,13 @@ pub fn draw(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &The
     // the decision on the floor once opened, or hand-copying the title text.
     if let Some(choice) = state.quit_confirm {
         crate::ui::modal::grey_overlay(f);
+        // `false`: the launcher has no live Services overlay to jump to
+        // (`AppState::quit_confirm_open_services_key` is dashboard-only), so
+        // it must not advertise the `s` hint the dashboard's copy does.
         crate::ui::approval::draw_approval(
             f,
             area,
-            &crate::ui::quit_confirm_request(state),
+            &crate::ui::quit_confirm_request(state, false),
             choice,
             theme,
         );
@@ -773,7 +776,20 @@ mod tests {
         // `quit_confirm.is_some()`/`is_none()`; nothing exercised `draw`'s
         // quit_confirm render arm itself (the `grey_overlay` +
         // `ApprovalRequest`/`draw_approval` branch added alongside it).
+        //
+        // Seeds a serving instance: the title is derived from the same
+        // "is anything still serving" decision as the body
+        // (`nothing_is_currently_being_served`), so an unseeded `base()`
+        // would render the other title ("Nothing to confirm — quit?") here.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
         let mut s = base();
+        s.instances.insert(
+            "vllm-1".into(),
+            Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
         s.open_quit_confirm();
         let out = render(&s, 0, 100, 24);
         assert!(

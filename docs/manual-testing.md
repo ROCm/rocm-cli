@@ -311,10 +311,17 @@ rocm
 Expected result:
 
 - A prompt appears naming the serving model and warning that it keeps
-  running in the background after you quit, with the `rocm services stop
-  <id> --yes` command to stop it first.
-- Declining (`n`/Esc) returns to exactly where you were, with the model
-  still shown as serving.
+  running in the background after you quit, with the real
+  `rocm services stop <service-id> --yes` command (the actual id, not a
+  placeholder) to stop it first.
+- From the dashboard (not the launcher), the prompt also offers `s`: pressing
+  it closes the prompt and opens the Services overlay, pre-focused on the
+  serving model, so you can stop it there through the overlay's own
+  approval+job flow. The launcher's copy of the prompt does not show this
+  hint or respond to `s` — it has no live Services overlay to jump to.
+- Declining (`n`/Esc) returns to the dashboard — any modal or overlay that was
+  open when you pressed `q` (the Esc menu, a manager overlay, …) is closed
+  along with the prompt, not restored.
 - Confirming (`y`/Enter) exits immediately, and `rocm services list --all`
   afterward still shows the model as `ready`/`running` — quitting never
   stops it.

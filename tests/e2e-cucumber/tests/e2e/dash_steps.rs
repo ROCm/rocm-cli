@@ -550,6 +550,38 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
 }
 
+/// Proves the prompt's remediation line itself (not just that some prompt
+/// appeared) names a command that is real: the fixture's own managed-service
+/// record always carries `"service_id": "e2e-mock"` (`mock_server.rs`'s
+/// `write_service_record_with`), so this checks for the literal, fillable
+/// `rocm services stop e2e-mock --yes` — not a `<id>` placeholder or a bare
+/// mention of the model name — directly answering AGENTS.md §3's rule that a
+/// remediation command must be asserted, not just its wording.
+///
+/// Whitespace (including a mid-command line wrap inside the narrow 80-column
+/// PTY) is collapsed to single spaces before matching, since `screen_text`
+/// renders exactly the wrapped rows a user would see and `ratatui`'s
+/// word-wrap only ever breaks on a space boundary — it never fabricates text
+/// — so collapsing whitespace reassembles the original command losslessly.
+#[then("the quit prompt shows the real stop command for the managed model")]
+async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
+    let expected = "rocm services stop e2e-mock --yes";
+    session(world)
+        .wait_for_screen_where(
+            &format!("the quit prompt shows {expected:?}"),
+            |screen| {
+                screen
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(expected)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
 /// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
 /// is a second, independent quit entry point (issue #145) and must not wait
 /// for (or resolve) the prompt it may open, since the point of this step is
@@ -579,11 +611,12 @@ async fn decline_quit_prompt(world: &mut E2eWorld) {
         .send("n")
         .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
     // The prompt's own body names the serving model (`quit_confirm_body` in
-    // `ui/mod.rs`), so the very next assertion in both scenarios — "the
-    // managed model is displayed" — could pass on the prompt's own text even
-    // if `n` did nothing and the prompt never actually closed. Wait for it to
-    // actually leave the screen so that assertion proves the decline worked,
-    // not just that the model's name is on screen somewhere.
+    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // displayed" (dash-25) or "the launcher shows the model serving"
+    // (dash-26; a different step, same risk) — could pass on the prompt's
+    // own text even if `n` did nothing and the prompt never actually closed.
+    // Wait for it to actually leave the screen so that assertion proves the
+    // decline worked, not just that the model's name is on screen somewhere.
     session(world)
         .wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
         .await

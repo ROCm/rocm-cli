@@ -167,65 +167,123 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 
     // Quit-confirm prompt (issue #145): a quit attempted while a model is
     // still serving. Same reuse of the approval seam, same "drawn last, owns
-    // the screen" rule — `apply_action`/the event loop never let it be open
-    // at the same time as the chat approval above (see `quit_confirm`'s doc
-    // comment on `AppState`), so render order between the two never matters.
+    // the screen" rule — the two are never open at the same time, so render
+    // order between them never matters: `open_approval` refuses outright
+    // while `quit_confirm` is open, and `open_quit_confirm` closes any open
+    // approval the same way it closes every other overlay (see their doc
+    // comments on `AppState`, not a doc comment on `quit_confirm` itself).
     if let Some(choice) = state.quit_confirm {
         modal::grey_overlay(f);
-        approval::draw_approval(f, body, &quit_confirm_request(state), choice, &theme);
+        // `true`: the dashboard's own `s` key (`quit_confirm_open_services_key`
+        // in `event_loop`) can act on the hint this renders.
+        approval::draw_approval(f, body, &quit_confirm_request(state, true), choice, &theme);
     }
 }
 
 /// Build the quit-confirm prompt's request (title + body) once, so the
 /// dashboard's own render arm above and the pre-dashboard launcher's
 /// (`ui::launcher::draw`) call the same construction instead of each
-/// hand-copying the title string — the exact launcher/dashboard drift this
-/// round's other refactors (`quit_confirm_body`, `resolve_quit_confirm_key`,
-/// `is_running`) all set out to close.
-pub(crate) fn quit_confirm_request(state: &AppState) -> approval::ApprovalRequest {
-    approval::ApprovalRequest::new("Still serving — quit anyway?", quit_confirm_body(state))
+/// hand-copying the title string — the same launcher/dashboard drift
+/// `quit_confirm_body`, `resolve_quit_confirm_key`, and `is_running` are each
+/// also shared to avoid.
+///
+/// The title is derived from the same decision as the body
+/// (`nothing_is_currently_being_served`) rather than hardcoded, so the two
+/// can't contradict each other the way they used to when a model stopped
+/// (or was never confirmed live) while the prompt sat open: "Still serving"
+/// above a body that says "Nothing is being served anymore." underneath it.
+///
+/// `offer_stop_action` gates the trailing "press s" hint (issue #145): `true`
+/// from the dashboard's own render arm, which can actually act on `s`
+/// (`AppState::quit_confirm_open_services_key`); `false` from the
+/// pre-dashboard launcher, which shares this prompt's text but has no live
+/// Services overlay to jump to, so advertising a key it can't honor would be
+/// exactly the kind of printed claim AGENTS.md §3 rules out.
+pub(crate) fn quit_confirm_request(
+    state: &AppState,
+    offer_stop_action: bool,
+) -> approval::ApprovalRequest {
+    let title = if nothing_is_currently_being_served(state) {
+        "Nothing to confirm — quit?"
+    } else {
+        "Still serving — quit anyway?"
+    };
+    let mut body = quit_confirm_body(state);
+    if offer_stop_action && state.has_stoppable_managed_instance() {
+        body.push(String::new());
+        body.push("Press s to open Services and stop it.".to_string());
+    }
+    approval::ApprovalRequest::new(title, body)
+}
+
+/// Whether the authoritative view — a real snapshot if one has landed,
+/// otherwise the pre-launch startup-fallback read — says nothing is
+/// currently serving. Shared by `quit_confirm_request` (title) and
+/// `quit_confirm_body` (its own early-return branch) so the two can't
+/// independently decide this and drift apart.
+fn nothing_is_currently_being_served(state: &AppState) -> bool {
+    let total = state
+        .instances
+        .values()
+        .filter(|i| i.status.is_serving())
+        .count();
+    let startup_fallback = !state.has_received_snapshot && state.startup_has_live_service;
+    total == 0 && !startup_fallback
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
 /// (mirroring the Serving tab's "Running now" listing in
 /// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
-/// styled spans) and how to stop them first.
+/// styled spans), and how to stop each one that this host's own registry
+/// manages (`AppState::managed_service_ids`) — not a blanket command, since a
+/// Docker- or Lemonade-discovered instance from an external daemon cannot be
+/// stopped that way.
 ///
-/// Two passes over `state.instances.values()` (count, then take(5)) rather
-/// than collecting into a `Vec` first: nothing here needs random access, and
-/// a `HashMap`'s `values()` is cheap to re-create, so this avoids a
-/// per-render-frame allocation while the prompt is open.
+/// Iterates `state.instances.values()` more than once (via the `running`
+/// closure below, and again inside `nothing_is_currently_being_served`)
+/// rather than collecting into a `Vec` first: nothing here needs random
+/// access, and a `HashMap`'s `values()` is cheap to re-create, so this avoids
+/// a per-render-frame allocation while the prompt is open.
 fn quit_confirm_body(state: &AppState) -> Vec<String> {
     let running = || state.instances.values().filter(|i| i.status.is_serving());
     let total = running().count();
-    // The startup-race fallback (issue #145): a model was recorded live on
-    // disk at launch, but `instances` is still empty because the daemon's
-    // first snapshot hasn't landed yet (or never will, if the connection
-    // never succeeds). Distinct from a genuine "nothing is serving" below —
-    // this is "don't know yet", not "confirmed gone".
-    let startup_fallback = !state.has_received_snapshot && state.startup_has_live_service;
-    if total == 0 && !startup_fallback {
+    if nothing_is_currently_being_served(state) {
         // A real snapshot is authoritative here (or there was never a
         // startup fallback to begin with) and it says nothing is serving.
         // Can change between opening the prompt and this render (e.g. the
         // model exits on its own while the prompt is up) — not dead code.
-        // The trailer below ("it keeps running" / "stop it first") would be
-        // a direct, printed lie in this state — a prior round's fix handled
-        // the startup-fallback trigger for that same contradiction but
-        // missed this one, where a real snapshot confirms the model already
-        // stopped while the prompt sat open awaiting a keypress — so return
-        // before appending it rather than widening the gate below.
+        // The "it keeps running" trailer below would be a direct, printed
+        // lie in this state (reachable whether or not the startup fallback
+        // was ever active), so return before appending it rather than
+        // widening the gate below.
         return vec!["Nothing is being served anymore.".to_string()];
     }
     let mut body = Vec::new();
     if total == 0 {
-        // startup_fallback: see above — a model *was* recorded live at
-        // launch, so this stays honest about not knowing whether it still
-        // is, instead of claiming to know either way.
+        // `total == 0` here only because `nothing_is_currently_being_served`
+        // returned `false` above: the startup-race fallback (issue #145) is
+        // active — a model was recorded live on disk at launch, but
+        // `instances` is still empty because the daemon's first snapshot
+        // hasn't landed yet (or never will, if the connection never
+        // succeeds). So this stays honest about not knowing whether it still
+        // is serving, instead of claiming to know either way.
         body.push("A model was serving when this started.".to_string());
     } else {
         for i in running().take(5) {
-            body.push(format!("• {}", i.model_name));
+            // The stop command is only ever printed next to a service this
+            // host's own registry can actually reach: `instances` can also
+            // hold a Docker- or Lemonade-discovered entry from an external
+            // daemon, which `rocm services stop` cannot touch — printing it
+            // unconditionally would be remediation advice the user cannot
+            // follow for that instance (AGENTS.md §3).
+            if state.managed_service_ids.contains(&i.container_id) {
+                body.push(format!(
+                    "• {} — stop it first: rocm services stop {} --yes",
+                    i.model_name, i.container_id
+                ));
+            } else {
+                body.push(format!("• {}", i.model_name));
+            }
         }
         if let Some(line) = format::overflow_line(total, 5) {
             body.push(line);
@@ -233,7 +291,6 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     }
     body.push(String::new());
     body.push("It keeps running in the background after you quit.".to_string());
-    body.push("Stop it first: rocm services stop <id> --yes".to_string());
     body
 }
 
@@ -921,11 +978,11 @@ mod tests {
 
     #[test]
     fn quit_confirm_body_does_not_contradict_itself_during_the_startup_fallback() {
-        // Closing-review regression: with `instances` still empty (no daemon
-        // snapshot has landed yet) but the prompt open via
-        // `startup_has_live_service`, the body used to say "Nothing is being
-        // served anymore." two lines above "It keeps running in the
-        // background after you quit." — a printed self-contradiction.
+        // Regression guard: with `instances` still empty (no daemon snapshot
+        // has landed yet) but the prompt open via `startup_has_live_service`,
+        // the body must not say "Nothing is being served anymore." two lines
+        // above "It keeps running in the background after you quit." — a
+        // printed self-contradiction.
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.startup_has_live_service = true;
         assert!(state.instances.is_empty());
@@ -948,15 +1005,13 @@ mod tests {
     fn quit_confirm_body_says_nothing_is_being_served_once_a_snapshot_confirms_it() {
         // Once a real (even empty) snapshot has landed, the startup fallback
         // is retired (`AppState::has_live_instance`'s own doc comment) and
-        // the plain "nothing anymore" line is accurate again. Second closing-
-        // review regression: this same trigger (a model that was serving
-        // stops on its own while the prompt sits open awaiting a keypress —
-        // the event loop drains daemon snapshots on its own `select!` arm
-        // independent of the pending prompt) used to still print the
-        // unconditional "It keeps running in the background" trailer right
-        // after "Nothing is being served anymore." — the same class of
-        // self-contradiction the prior round fixed for the startup-fallback
-        // trigger, reached via its sibling instead.
+        // the plain "nothing anymore" line is accurate again. Same class of
+        // self-contradiction as the sibling test above, reached via a
+        // different trigger: a model that was serving stops on its own while
+        // the prompt sits open awaiting a keypress (the event loop drains
+        // daemon snapshots on its own `select!` arm independent of the
+        // pending prompt) — the body must not print "It keeps running in the
+        // background" right after "Nothing is being served anymore."
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.startup_has_live_service = true;
         state.has_received_snapshot = true;
@@ -973,6 +1028,254 @@ mod tests {
         assert!(
             !body.iter().any(|line| line.contains("Stop it first")),
             "must not point at a stop command for a service that isn't running: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_request_title_matches_the_body_when_nothing_is_being_served() {
+        // The title used to be hardcoded to "Still serving" even in the exact
+        // states `quit_confirm_body` itself renders as "Nothing is being
+        // served anymore." — a visible contradiction between the two halves
+        // of the same prompt. Covers both triggers for that state (plain
+        // "nothing ever was", and the snapshot-confirms-it-stopped case) so a
+        // fix for only one can't quietly leave the other still titled wrong.
+        let plain = AppState::new("t".into(), "default-dark".into());
+        let req = quit_confirm_request(&plain, true);
+        assert!(
+            !req.title.contains("Still serving"),
+            "title must not claim serving when nothing is: {:?}",
+            req.title
+        );
+        assert!(
+            req.body
+                .iter()
+                .any(|l| l.contains("Nothing is being served"))
+        );
+
+        let mut snapshot_confirmed = AppState::new("t".into(), "default-dark".into());
+        snapshot_confirmed.startup_has_live_service = true;
+        snapshot_confirmed.has_received_snapshot = true;
+        let req = quit_confirm_request(&snapshot_confirmed, true);
+        assert!(
+            !req.title.contains("Still serving"),
+            "title must not claim serving once a snapshot confirms it stopped: {:?}",
+            req.title
+        );
+    }
+
+    #[test]
+    fn quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        state.managed_service_ids.insert("svc-managed".to_string());
+
+        let dashboard = quit_confirm_request(&state, true);
+        assert!(
+            dashboard
+                .body
+                .iter()
+                .any(|l| l.contains("Press s to open Services")),
+            "the dashboard copy must offer the hint it can act on: {:?}",
+            dashboard.body
+        );
+
+        let launcher = quit_confirm_request(&state, false);
+        assert!(
+            !launcher.body.iter().any(|l| l.contains("Press s")),
+            "the launcher copy must not advertise a key it cannot honor: {:?}",
+            launcher.body
+        );
+
+        // No managed instance serving (only an unmanaged/external one): the
+        // dashboard copy must not offer the hint either, since `s` would have
+        // nothing to focus.
+        let mut unmanaged_only = AppState::new("t".into(), "default-dark".into());
+        unmanaged_only.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        let dashboard_unmanaged = quit_confirm_request(&unmanaged_only, true);
+        assert!(
+            !dashboard_unmanaged
+                .body
+                .iter()
+                .any(|l| l.contains("Press s")),
+            "must not offer to stop something `s` can't reach: {:?}",
+            dashboard_unmanaged.body
+        );
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_focuses_the_stoppable_managed_row() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        // Sorts before "svc-managed" by id (`service_rows` sorts by id), so a
+        // naive "just pick row 0" would wrongly focus this unmanaged one.
+        s.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.managed_service_ids.insert("svc-managed".to_string());
+        s.open_quit_confirm();
+
+        assert!(s.quit_confirm_open_services_key(KeyCode::Char('s')));
+        assert!(
+            s.quit_confirm.is_none(),
+            "the quit-confirm prompt must close once `s` is handled"
+        );
+        let services = s
+            .services
+            .as_ref()
+            .expect("`s` must open the Services overlay");
+        let rows = crate::ui::services_manager::service_rows(&s.instances);
+        assert_eq!(
+            rows[services.selected].id, "svc-managed",
+            "must focus the stoppable managed row, not whichever sorts first: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_is_a_no_op_without_a_stoppable_managed_instance() {
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.instances.insert(
+            "docker-abc".to_string(),
+            Instance {
+                container_id: "docker-abc".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        s.open_quit_confirm();
+
+        assert!(!s.quit_confirm_open_services_key(KeyCode::Char('s')));
+        assert!(
+            s.quit_confirm.is_some(),
+            "nothing to stop: the prompt must stay open for its normal y/n/Esc handling"
+        );
+        assert!(s.services.is_none());
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_ignores_other_keys_and_a_closed_prompt() {
+        use crossterm::event::KeyCode;
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        assert!(
+            !s.quit_confirm_open_services_key(KeyCode::Char('s')),
+            "must not fire while the prompt isn't open"
+        );
+
+        s.open_quit_confirm();
+        assert!(
+            !s.quit_confirm_open_services_key(KeyCode::Char('y')),
+            "must not fire for any key other than `s`"
+        );
+        assert!(s.quit_confirm.is_some());
+    }
+
+    #[test]
+    fn quit_confirm_body_prints_a_working_stop_command_for_a_managed_instance() {
+        // The prompt's remediation must name the id `rocm services stop`
+        // actually needs, not a literal `<id>` placeholder, and must only
+        // offer it for a service this host's own registry manages.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                model_name: "Qwen2.5-7B".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        state.managed_service_ids.insert("svc-managed".to_string());
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line.contains("rocm services stop svc-managed --yes")),
+            "expected a fillable stop command naming the real id: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_omits_the_stop_command_for_an_unmanaged_instance() {
+        // `instances` can hold a Docker- or Lemonade-discovered entry from an
+        // external daemon when connected to one; `rocm services stop` cannot
+        // reach those, so the prompt must not suggest it can.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "docker-abc123".to_string(),
+            Instance {
+                container_id: "docker-abc123".to_string(),
+                model_name: "external-model".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        assert!(state.managed_service_ids.is_empty());
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter().any(|line| line.contains("external-model")),
+            "the model must still be named: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains("rocm services stop")),
+            "must not offer a stop command this host cannot honor: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        for n in 0..6 {
+            state.instances.insert(
+                format!("svc-{n}"),
+                Instance {
+                    container_id: format!("svc-{n}"),
+                    model_name: format!("model-{n}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let body = quit_confirm_body(&state);
+        let bullets = body.iter().filter(|line| line.starts_with('•')).count();
+        assert_eq!(bullets, 5, "the listing must cap at 5 bullets: {body:?}");
+        assert!(
+            body.iter().any(|line| line.contains("…and 1 more")),
+            "the sixth instance must be summarized by the overflow line: {body:?}"
         );
     }
 

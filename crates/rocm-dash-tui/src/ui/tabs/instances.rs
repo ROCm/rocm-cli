@@ -1093,6 +1093,7 @@ mod tests {
         AppState {
             services_past_attempts: 0,
             startup_has_live_service: false,
+            managed_service_ids: std::collections::HashSet::new(),
             connect: "test".into(),
             conn: ConnState::Initial,
             latest: None,

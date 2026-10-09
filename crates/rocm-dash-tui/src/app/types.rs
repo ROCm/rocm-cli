@@ -110,6 +110,21 @@ pub struct ResolvedArgs {
     /// #145). `AppState::has_live_instance` ORs this in only until that first
     /// snapshot arrives, so it never outlives its own staleness.
     pub startup_has_live_service: bool,
+    /// Ids of managed-service records this host's own registry can reach with
+    /// `rocm services stop <id> --yes` — read the same way and at the same
+    /// time as `startup_has_live_service`. The quit-confirm prompt
+    /// (`ui::quit_confirm_body`) prints that remediation line only for an
+    /// instance whose id is in this set: `AppState::instances` can also hold
+    /// Docker- or Lemonade-discovered entries from an external daemon, which
+    /// `rocm services stop` cannot touch, so printing the line unconditionally
+    /// would be a command the user cannot actually run against that service.
+    /// Same staleness as `startup_has_live_service`: a one-shot snapshot taken
+    /// before the TUI starts, never refreshed for the life of the session —
+    /// a service served mid-session through this same registry after launch
+    /// is not reflected here. Accepted for the same reason: the CLI's own
+    /// managed-service identity for a record, `service_id`, only changes when
+    /// the user runs `rocm serve` again, which this process does not observe.
+    pub managed_service_ids: std::collections::HashSet<String>,
 }
 
 impl ResolvedArgs {

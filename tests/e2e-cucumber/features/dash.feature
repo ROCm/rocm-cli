@@ -340,6 +340,7 @@ Feature: Interactive dashboard
     Then the managed model is displayed
     When the user tries to quit the dashboard
     Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
     When the user declines the quit prompt
     Then the managed model is displayed
     When the user quits the dashboard

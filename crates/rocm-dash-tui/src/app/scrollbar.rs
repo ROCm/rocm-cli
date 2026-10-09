@@ -60,9 +60,10 @@ pub(crate) fn resolve_mouse(me: MouseEvent, state: &AppState) -> KeyAction {
     // when the pointer slides off the narrow track.
     if me.kind == MouseEventKind::Drag(MouseButton::Left) {
         // A drag can start before an approval or quit-confirm prompt becomes
-        // pending (it's only gated at the click that starts it, via
-        // `scrollbar_hit`'s own `blocks_body_absolutely()` check below) and
-        // then have one land asynchronously mid-drag. Swallow it here too, or
+        // pending (it's only gated at the click that starts it, via this same
+        // fn's own `blocks_body_absolutely()` check in the `Down` branch
+        // below — not inside `scrollbar_hit`, which has no gate of its own)
+        // and then have one land asynchronously mid-drag. Swallow it here too, or
         // the drag would keep mutating a scroll position hidden behind the
         // modal — "a pending approval owns the body with no exception" (see
         // the wheel-scroll swallow further down) applies to an in-flight drag

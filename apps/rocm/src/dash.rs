@@ -297,6 +297,11 @@ pub fn resolved_args(
         // Whether anything is already serving (issue #145's startup-race fix
         // — see the doc comment on `ResolvedArgs::startup_has_live_service`).
         startup_has_live_service: startup_has_live_service(&service_records),
+        // Ids this host's own registry manages, so the quit-confirm prompt
+        // only ever prints a `rocm services stop <id> --yes` line for a
+        // service that command can actually reach (see
+        // `ResolvedArgs::managed_service_ids`).
+        managed_service_ids: managed_service_ids(&service_records),
     }
 }
 
@@ -309,42 +314,34 @@ pub fn resolved_args(
 /// daemon connection never succeeds at all — saw no live instance and exited
 /// with no confirm prompt even though a model actually was being served.
 ///
-/// Mirrors `instance_status_for_record`'s own `running`+`startup_phase`
-/// overlap (`rocm_dash_daemon::registry`, not `pub`, so re-derived here rather
-/// than called): the supervisor flips a record to `running` immediately after
-/// spawning the engine child, before it starts polling `startup_phase` from
-/// the serve log, so a `running` record with a *recognized* phase token
-/// (`downloading`/`loading`/`warmup`) is still coming up, not actually
-/// serving yet, in the authoritative live view. Treating it as live here too
-/// would be the wrong direction to diverge in — over-prompting in a tiny
-/// startup window is harmless, but the doc claim above ("the same statuses
-/// `is_serving()` treats as live") would be a lie if it didn't hold.
-///
-/// `starting`/`recovering` records are excluded for the same reason — neither
-/// is *actively serving* yet — matching `is_serving()` rather than the
-/// broader `is_scrapeable_status`/`managed_service_is_live` set those two
-/// statuses are part of elsewhere.
-///
-/// Also mirrors `discovered_from_record`'s `port == 0` exclusion: a record
-/// with no bound port never becomes a live `Instance` in the authoritative
-/// view either (`registry.rs`), so counting it here would diverge from the
-/// real snapshot this stands in for rather than merely preceding it.
+/// Delegates to `discover_managed_services` (the same read
+/// `services_past_attempts`/`managed_service_ids` share) rather than
+/// re-deriving `ready`/`running`+`startup_phase`/port-0 classification by
+/// hand: that function is `pub` and already applies exactly those rules
+/// (`registry.rs`'s `discovered_from_record`/`instance_status_for_record`),
+/// so a second hand-rolled copy here could only drift from it, not improve
+/// on it.
 fn startup_has_live_service(records: &[rocm_dash_daemon::registry::ServiceRecord]) -> bool {
-    use rocm_dash_core::metrics::StartupPhase;
-    records.iter().any(|record| {
-        if record.port == 0 {
-            return false;
-        }
-        match record.status.trim().to_ascii_lowercase().as_str() {
-            "ready" => true,
-            "running" => record
-                .startup_phase
-                .as_deref()
-                .and_then(StartupPhase::from_token)
-                .is_none(),
-            _ => false,
-        }
-    })
+    use rocm_dash_daemon::registry::discover_managed_services;
+    discover_managed_services(records)
+        .svcs
+        .iter()
+        .any(|svc| svc.status.is_serving())
+}
+
+/// Ids of every managed-service record `discover_managed_services` currently
+/// treats as a live scrape target (`ManagedDiscovery::seen`) — i.e. the ids
+/// `rocm services stop <id> --yes` can actually reach, as opposed to a
+/// Docker- or Lemonade-discovered instance from an external daemon, which
+/// that command cannot stop. Read once at launch alongside
+/// `startup_has_live_service` and `services_past_attempts`; see
+/// `ResolvedArgs::managed_service_ids`'s doc comment for the staleness this
+/// accepts, same as `startup_has_live_service`.
+fn managed_service_ids(
+    records: &[rocm_dash_daemon::registry::ServiceRecord],
+) -> std::collections::HashSet<String> {
+    use rocm_dash_daemon::registry::discover_managed_services;
+    discover_managed_services(records).seen
 }
 
 /// Managed-service records that are no longer running, read from the same
@@ -1155,14 +1152,72 @@ mod tests {
 
         let args = resolved_args(&cfg(), &p, ActiveTab::Home);
         assert!(args.startup_has_live_service);
+        assert_eq!(
+            args.managed_service_ids,
+            std::collections::HashSet::from(["svc-live".to_string()]),
+            "the live record's id must be reachable via `rocm services stop`"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Isolated `ready`-only fixture: the sibling test above pairs `running`
-    /// with other records, so nothing there actually exercises the `"ready"
-    /// => true` arm on its own — a mutation collapsing it to `false` would
-    /// still pass that test via the `running` record.
+    /// Paired with `resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running`:
+    /// `managed_service_ids` and `startup_has_live_service` are two different
+    /// questions over the same read (liveness vs. reachability), so a record
+    /// that is not live can still be a managed id — `discover_managed_services`
+    /// only drops a record for a bad status or an unbound port, not for being
+    /// `starting`/`recovering`.
+    #[test]
+    fn resolved_args_managed_service_ids_includes_a_starting_record() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "managed-ids-starting-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+        std::fs::write(
+            p.services_dir().join("starting.json"),
+            br#"{"service_id":"svc-starting","engine":"vllm","port":8003,"status":"starting","created_at_unix_ms":4}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            p.services_dir().join("dead.json"),
+            br#"{"service_id":"svc-dead","engine":"vllm","port":8000,"status":"failed","created_at_unix_ms":1}"#,
+        )
+        .unwrap();
+
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!args.startup_has_live_service);
+        assert_eq!(
+            args.managed_service_ids,
+            std::collections::HashSet::from(["svc-starting".to_string()]),
+            "a starting (not yet live) record is still this host's to stop; a \
+             failed one is not a scrape target and must not appear"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Isolated `ready`-only fixture: the sibling test above
+    /// (`resolved_args_reports_a_live_managed_service_at_startup`) writes only
+    /// a `running` record, so nothing there actually exercises the `"ready"`
+    /// status on its own (mapped to `InstanceStatus::Ready`, hence
+    /// `is_serving()`, by `registry.rs`'s `instance_status_for_record` —
+    /// `startup_has_live_service` now delegates to that via
+    /// `discover_managed_services` rather than matching the string itself) —
+    /// a mutation breaking that one status would still pass that sibling test
+    /// via the `running` record.
     #[test]
     fn resolved_args_reports_a_ready_managed_service_at_startup() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
