@@ -36,11 +36,11 @@ as a `torch_alignment:` line.
 
 A torch that already executes a GPU kernel against the installed SDK is kept
 exactly as it is, whichever installer put it there. Otherwise the runtime is
-moved to the SDK's *build* of the torch *release* the engine pins: the release
-comes from the engine, which was built against it, and the build comes from the
-SDK, whose libraries it has to load. A `device_check:` line reports what the
-result can actually do, and a realignment also reports what the runtime could do
-before it.
+moved to the SDK's *build* of the torch *release* that the engine pins: the
+release comes from the engine, which was built against it, and the build comes
+from the SDK, whose libraries it has to load. A `device_check:` line reports
+what the result can actually do, and a realignment also reports what the runtime
+could do before it.
 
 Set `ROCM_CLI_DISABLE_TORCH_ALIGNMENT` to keep whatever torch is installed and
 skip the replacement:
@@ -63,9 +63,10 @@ runtime that cannot execute a kernel will fail at serving time.
 
 ## ROCm 10.x wheel discovery
 
-For most ROCm SDK versions, `rocm engines install vllm` pins a fixed vLLM wheel
-and index URL. Any ROCm SDK 10.x version is different: AMD publishes vLLM,
-flash-attn, and amd-aiter there under a rotating dev-tag filename (for example
+For ROCm SDK 7.x versions, including 7.14, `rocm engines install vllm` pins a
+fixed vLLM wheel and index URL. Any ROCm SDK 10.x version is different: AMD
+publishes vLLM, flash-attn, and amd-aiter there under a rotating dev-tag
+filename (for example
 `vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
 so there is no fixed filename to pin in the adapter.
 
@@ -80,13 +81,13 @@ This route is selected by `major.minor`, so `10.0.0` and `10.1.0` discover
 through *different* rows: they pin different vLLM minors and read vLLM from
 different index URLs, because AMD stages ROCm 10.1's vLLM builds on a separate
 host from 10.0's production index. Both rows take their torch stack from the
-same `whl-next` index, which is where `rocm install sdk` resolves either SDK's
-own `+rocmX.Y` torch from, but vLLM's discovery is independent of that: it
+same `whl-next` index, which is also where `rocm install sdk` resolves either
+SDK's own `+rocmX.Y` torch from. vLLM's discovery is independent of that: it
 resolves its own torch, torchvision, and torchaudio pins fresh from the row's
-own static version prefixes, instead of reusing whatever the SDK install
-resolved, which might be a different torch version than this row pins. Patch
-and any dev or pre-release suffix are still ignored within a row, because AMD
-rotates those constantly.
+own static version prefixes, instead of reusing what the SDK install resolved.
+The SDK install might have resolved a different torch version than the row pins.
+Patch and any dev or pre-release suffix are still ignored within a row, because
+AMD rotates those constantly.
 
 The install resolves each package's current wheel, including torch, from the
 row's index with `uv pip install --dry-run --reinstall`, parses the version it
