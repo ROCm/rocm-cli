@@ -61,10 +61,20 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // `{error:#}` rather than `to_string()`: the outermost context
+                // alone says "failed to launch amd-smi ...", which names the
+                // wrong thing when what actually happened was a timeout. (Only
+                // the timeout: the non-zero-exit and parse failures below are
+                // their own outermost context and already read correctly.) The
+                // note is the only account of this that reaches the bridge
+                // snapshot and the automation watcher, so it carries the causes
+                // too -- bounded, because it is persisted; see
+                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`. Pinned by
+                // `examine-21`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -75,10 +85,11 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
+                // Same reasoning as the `static` probe above.
                 amd_smi_available: true,
                 static_snapshot,
                 monitor_snapshot: None,
-                note: Some(error.to_string()),
+                note: Some(format!("{error:#}")),
             };
         }
     };
@@ -115,7 +126,7 @@ fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, AMD_SMI_PROBE_TIMEOUT)
+    let output = rocm_core::process::run_with_timeout(command, AMD_SMI_PROBE_TIMEOUT, "process")
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -190,45 +201,6 @@ pub(crate) struct CommandCapture {
     pub(crate) stderr: String,
 }
 
-pub(crate) fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
     run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
@@ -249,7 +221,7 @@ pub(crate) fn run_rocm_capture_for_paths(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())

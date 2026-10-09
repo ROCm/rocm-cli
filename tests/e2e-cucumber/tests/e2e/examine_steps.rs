@@ -2,9 +2,32 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
+
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
+
+/// How many GPU entries the stub `amd-smi` describes.
+///
+/// Chosen for the size of the resulting JSON, not for realism: it clears
+/// ~150KiB, comfortably past the ~64KiB pipe buffer whose overflow is the whole
+/// premise of `examine-20`. A stub that printed a few hundred bytes would pass
+/// against the defect.
+const STUB_GPU_COUNT: usize = 1200;
+
+/// Where the `amd-smi` stub and its payload live inside the isolated root.
+///
+/// Derived rather than carried on the World so the Given and the When agree on
+/// it without a field whose only purpose is this one scenario.
+fn stub_bin_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("amd-smi-stub")
+}
 
 /// The value of a `  <field>: <value>` line in a `rocm` command's plain output.
 ///
@@ -1271,5 +1294,230 @@ async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
         }),
         "the CLI installed this runtime and its ROCm wheels, so the search has to \
          find the copy it put there. Reported copies:\n{copies:#?}"
+    );
+}
+
+/// Write the stub's ~150KiB `payload.json` and return its path.
+///
+/// Shared by the two stub scenarios below, which differ only in what the script
+/// does after printing it.
+fn write_stub_payload(world: &E2eWorld) -> PathBuf {
+    let bin_dir = stub_bin_dir(world);
+    std::fs::create_dir_all(&bin_dir).expect("failed to create the amd-smi stub directory");
+
+    // The payload is built here rather than in the script so its size is set in
+    // Rust, where the constant explaining it lives.
+    let gpus: Vec<serde_json::Value> = (0..STUB_GPU_COUNT)
+        .map(|index| {
+            serde_json::json!({
+                "gpu": index,
+                "asic": {
+                    "market_name": "stub-accelerator",
+                    "vendor_id": "0x1002",
+                    "device_id": format!("0x{index:04x}"),
+                    // amd-smi's real `static -a` output per GPU is far wider
+                    // than the handful of fields worth asserting on; this
+                    // stands in for that bulk.
+                    "padding": "0".repeat(64),
+                }
+            })
+        })
+        .collect();
+    let payload = bin_dir.join("payload.json");
+    std::fs::write(
+        &payload,
+        serde_json::to_string(&gpus).expect("failed to render the stub amd-smi payload"),
+    )
+    .expect("failed to write the stub amd-smi payload");
+    payload
+}
+
+/// Install an executable stub `amd-smi` whose script body is `body`.
+///
+/// The stub answers every probe the snapshot makes (`static` and `monitor`)
+/// with the same script: which probe it is does not matter to a test about
+/// output size, and branching on argv would only add a way to get it wrong.
+fn write_amd_smi_stub(world: &E2eWorld, body: &str) {
+    let stub = stub_bin_dir(world).join("amd-smi");
+    std::fs::write(&stub, format!("#!/bin/sh\n{body}\n"))
+        .expect("failed to write the amd-smi stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to make the amd-smi stub executable");
+    }
+}
+
+#[given("amd-smi reports more output than a pipe buffer holds")]
+async fn stub_amd_smi_with_large_output(world: &mut E2eWorld) {
+    let payload = write_stub_payload(world);
+    write_amd_smi_stub(world, &format!("exec cat {}", payload.display()));
+}
+
+#[given("amd-smi prints more than a pipe buffer holds and then stalls")]
+async fn stub_amd_smi_that_stalls_after_printing(world: &mut E2eWorld) {
+    let payload = write_stub_payload(world);
+    // Print first, then stall: the order is what makes the timeout error quote
+    // the payload, which is the thing the bound has to cut down. A stub that
+    // only slept would time out with nothing to quote and the note would be
+    // short however this is implemented.
+    //
+    // The sleep only has to outlast the 2s probe budget. It is kept short
+    // anyway because killing the stub shell does not reliably kill a `sleep`
+    // the shell forked, and an orphan that outlives the scenario by half a
+    // minute is a nuisance on a shared runner.
+    write_amd_smi_stub(world, &format!("cat {}\nsleep 10", payload.display()));
+}
+
+#[when("the daemon gathers a bridge snapshot")]
+async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
+    let rocmd = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
+        panic!(
+            "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \
+             ROCM_CLI_BINARY, provide the matching prebuilt rocmd path explicitly"
+        )
+    });
+
+    let mut command = std::process::Command::new(rocmd);
+    command.arg("bridge-snapshot");
+    world.isolate_cmd(&mut command);
+
+    // `resolve_amd_smi_binary` looks in two places before `PATH`, and NEITHER is
+    // covered by `isolate_env`: `default_data_dir()/runtimes/registry` and the
+    // home fallbacks both resolve through `runtime_home_dir()`, which reads the
+    // real `$HOME` (`BaseDirs::new()`) rather than `ROCM_CLI_DATA_DIR`. On a host
+    // carrying a managed SDK under `~/.rocm`, the real `amd-smi` would therefore
+    // win and the stub would never run -- the scenario would fail on the size
+    // assertion and blame the pipe-drain defect for an environment problem.
+    //
+    // So point `HOME` at the isolated root for this invocation only. Scoped here
+    // rather than added to `isolate_env`, because other scenarios deliberately
+    // inherit the real HOME/XDG environment -- `pty_env` is where the isolated
+    // HOME lives, and it documents why it applies to interactive sessions only
+    // -- and they would change behaviour if it moved.
+    let isolated_home = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    command.env("HOME", &isolated_home);
+
+    // With both managed-SDK lookups now rooted in an empty isolated tree,
+    // `resolve_amd_smi_binary` falls through to the bare `PATH` name below.
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(stub_bin_dir(world)).chain(std::env::split_paths(&inherited)),
+    )
+    .expect("failed to build the stub PATH");
+    command.env("PATH", path);
+
+    let output = command
+        .output()
+        .expect("failed to run rocmd bridge-snapshot");
+    world.cli_output = Some(String::from_utf8_lossy(&output.stdout).into_owned());
+    // Kept rather than dropped: when the snapshot comes back degraded the
+    // reason is usually here, and a failure that quotes only the JSON leaves
+    // the next reader guessing.
+    world.cli_stderr = Some(String::from_utf8_lossy(&output.stderr).into_owned());
+    world.cli_rc = Some(output.status.code().unwrap_or(-1));
+}
+
+#[then("the snapshot reports amd-smi as available and carries every GPU it described")]
+async fn assert_telemetry_survived_large_output(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(true),
+        "amd-smi answered with a valid document, so the only thing that can have made it \
+         unavailable is this side failing to read it: note={:?}\n{stderr}",
+        gpu["note"]
+    );
+    // Both probes, because `gather_gpu_snapshot` gives up on the first failure
+    // and reports what it already has: a `monitor` probe killed by the very
+    // defect this scenario is named for still leaves `amd_smi_available: true`
+    // with a full `static_snapshot`, and only the note and the missing
+    // `monitor_snapshot` say otherwise. Asserting the first probe alone would
+    // let half the symptom through.
+    for probe in ["static_snapshot", "monitor_snapshot"] {
+        assert_eq!(
+            gpu[probe].as_array().map(Vec::len),
+            Some(STUB_GPU_COUNT),
+            "{probe} must carry every GPU amd-smi described; a short read is the same defect \
+             arriving quietly rather than as a timeout. note={:?}\n{stderr}",
+            gpu["note"]
+        );
+    }
+    assert_eq!(
+        gpu["note"],
+        serde_json::Value::Null,
+        "a snapshot that read both probes in full has nothing to explain\n{stderr}"
+    );
+}
+
+/// The ceiling the stalled-probe note must stay under.
+///
+/// Set against `run_with_timeout`'s 2000-character quote bound plus the error
+/// chain around it, and ~40x below the ~150KiB payload the stub prints, so this
+/// asks "is it bounded at all" rather than pinning a constant that is a tuning
+/// decision.
+const MAX_NOTE_CHARS: usize = 4000;
+
+#[then("the snapshot reports amd-smi as unavailable with a bounded note naming the timeout")]
+async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    // The snapshot is still a successful snapshot: a probe that timed out
+    // degrades the GPU section, it does not fail the command.
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(false),
+        "a probe that never returned cannot have reported a GPU: {gpu}"
+    );
+    let note = gpu["note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a degraded snapshot must explain itself: {gpu}"));
+
+    // What the note claims, asserted where it is claimed. The outer context
+    // alone ("failed to launch") named the wrong thing; `{error:#}` is what
+    // puts the timeout in front of a reader, and nothing else checks that.
+    assert!(
+        note.contains("failed to launch amd-smi static"),
+        "the note must still say which probe gave up: {note:?}"
+    );
+    assert!(
+        note.contains("exceeded 2s timeout"),
+        "the note must name the timeout rather than blaming the launch: {note:?}"
+    );
+
+    // And the bound, checked on the same note, because the two pull against
+    // each other: dropping the child's output entirely would satisfy the size
+    // check while losing the diagnostic, and keeping all of it costs the
+    // automation and audit logs the payload's size every 60s.
+    assert!(
+        note.contains("...[truncated]"),
+        "a shortened note must say so, or a reader takes the head for the whole: {note:?}"
+    );
+    let length = note.chars().count();
+    assert!(
+        length <= MAX_NOTE_CHARS,
+        "the note must be bounded before it reaches the bridge snapshot and the automation \
+         logs, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
     );
 }

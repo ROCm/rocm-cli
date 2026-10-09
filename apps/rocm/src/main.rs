@@ -12785,7 +12785,7 @@ fn run_rocm_capture_for_paths(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_app_path_env(&mut command, paths);
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
@@ -13043,45 +13043,6 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
         },
     )?
     .output)
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn internal_mcp_install_sdk_args(

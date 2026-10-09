@@ -275,3 +275,60 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system in machine-readable form
     Then the inspection attributes a code object manager library to that runtime
+
+  # ROCMAI-448. `rocmd` captured child output by waiting for the child to exit
+  # and only then draining its pipes, so a child that wrote more than one OS
+  # pipe buffer (~64KiB) blocked in `write`, never exited, and was killed at the
+  # timeout. The probe runs under a 2s budget, so on a multi-GPU host -- where
+  # `amd-smi static -a -g all --json` comfortably clears that buffer -- GPU
+  # telemetry reported `amd_smi_available: false`, permanently, with a note
+  # reading `failed to launch amd-smi static -a -g all --json`. The note blamed
+  # the launch rather than the timeout that actually happened, because
+  # `gather_gpu_snapshot` rendered only the outermost context; it now uses
+  # `{error:#}` and carries the cause. That answer feeds `rocmd
+  # bridge-snapshot`, the `gpu_snapshot` and `bridge_snapshot` MCP tools, and
+  # the automation watcher. (Not `examine_snapshot`: that sandbox tool returns
+  # an `ExamineSummary` only and never reads this snapshot.)
+  #
+  # The size of the output is the whole premise, so the stub emits ~150KiB --
+  # over two buffers. A stub that printed a few hundred bytes would pass against
+  # the defect and test nothing.
+  #
+  # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
+  # occur naturally, which would strand this on a lane that does not run per-PR.
+  # A stub `amd-smi` on `PATH` reaches the same code, but only because the step
+  # also points `HOME` at the isolated root. `resolve_amd_smi_binary` tries
+  # `default_data_dir()/runtimes/registry` and then the home fallbacks, and both
+  # resolve through `runtime_home_dir()` -- the real `$HOME`, not
+  # `ROCM_CLI_DATA_DIR`, which `isolate_env` does not override. Without that
+  # `HOME`, a host with a managed SDK under `~/.rocm` would run the real
+  # `amd-smi` and this scenario would fail for an unrelated reason.
+  # Linux-only because the stub is a shell script.
+  @id:examine-telemetry-survives-large-amd-smi-output @requires-os:linux
+  Scenario: examine-20 - GPU telemetry survives an amd-smi that outruns the pipe buffer
+    Given amd-smi reports more output than a pipe buffer holds
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as available and carries every GPU it described
+
+  # The other side of examine-20's note, and the reason the note needs a size
+  # limit. When the probe really does time out, `{error:#}` renders the whole
+  # chain -- including `run_with_timeout`'s quote of what the child printed.
+  # With an amd-smi that prints a snapshot's worth of JSON and only then
+  # stalls, that quote is the entire payload, and the note is not a terminal
+  # message: `record_gpu_metrics` copies it into the automation-event and audit
+  # JSONL files every 60s, and both append helpers rewrite the whole file each
+  # time. Unbounded, the logs grew by the payload's size every minute and each
+  # write cost more than the last. So the note must name the timeout, keep
+  # enough of the child's output to be worth reading, say that it was shortened
+  # -- and stay small.
+  #
+  # Asserted here rather than only as a unit test because the note's journey is
+  # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
+  # claim being made is about what `rocmd` finally reports.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-20 above.
+  @id:examine-telemetry-note-is-bounded-when-amd-smi-stalls @requires-os:linux
+  Scenario: examine-21 - A stalled amd-smi leaves a bounded note that names the timeout
+    Given amd-smi prints more than a pipe buffer holds and then stalls
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as unavailable with a bounded note naming the timeout

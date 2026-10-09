@@ -37,6 +37,7 @@ pub mod managed_runtime;
 pub mod model_readiness;
 pub mod openmpi;
 pub mod proc_lifecycle;
+pub mod process;
 pub mod report;
 pub mod report_delivery;
 pub mod rocm_install;
