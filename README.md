@@ -225,7 +225,8 @@ environment. On machines with an existing ROCm install, `rocm examine` will
 show it as `legacy_rocm_status: detected_unmanaged`. Running `rocm install sdk`
 creates a separate managed runtime alongside it.
 
-By default, `rocm install sdk` installs ROCm 7.14. For ROCm 10.0 or newer, add
+ROCm CLI supports ROCm 7.14, 10.0, and 10.1. By default, `rocm install sdk`
+installs the latest stable release, currently 7.14. For ROCm 10.0 or newer, add
 `--version` and `--family`, and give `--family` the exact GPU arch (the raw `gfx`
 code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
@@ -291,7 +292,7 @@ for its ROCm build and compiled GPU architectures:
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report [--send]]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
@@ -392,7 +393,8 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 ```
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
-by ROCm CLI. It can install ROCm 7.14, 10.0, or 10.1. To install 10.0 or newer,
+by ROCm CLI. ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
+it installs the latest stable release, currently 7.14. To install 10.0 or newer,
 follow the steps under ROCm 10 and newer, below.
 
 To remove ROCm CLI and what it manages, see
@@ -530,7 +532,7 @@ updating a few times adds up. `rocm storage` shows where the space went and
 frees the parts that are safe to remove:
 
 ```
-rocm storage [report] [--json]
+rocm storage [report [--json]]
 rocm storage remove-old-installs [--keep N] [--dry-run] [--yes]
 rocm storage remove-downloads [--dry-run] [--yes]
 ```
@@ -558,8 +560,10 @@ The report also lists `local server records`: one JSON record plus the engine's
 log for each `rocm serve --managed` launch, kept after the server stops.
 `rocm services list --all` lists them, and no `rocm storage` command removes
 them. It also lists the `uv` package cache, the Hugging Face model cache, and
-downloaded models. Those last three are shared with other tools and are never
-removed by ROCm CLI.
+downloaded models. Those last three are shared with other tools, and no
+`rocm storage` command removes them. `rocm uninstall` removes downloaded models
+along with the data directory unless you pass `--keep-data`; see
+[Logs and cleanup](#logs-and-cleanup).
 
 ### Inference engines
 
@@ -591,8 +595,8 @@ true:
 - The recipe catalog could not be read.
 - This machine's GPU memory could not be measured. This includes an integrated
   GPU (APU), where the CLI can't yet read the memory pool the engine uses.
-- The model is not one of the curated recipes. [`rocm model`](#curated-models)
-  lists those.
+- The model is not one of the curated recipes. [`rocm model --verbose`](#curated-models)
+  lists all of them, including recipes hidden from the default list.
 
 None of these says anything about whether the model fits, so none of them is
 reported as though it did. `rocm serve` still accepts a model outside the
@@ -924,7 +928,7 @@ rocm uninstall [--yes] [--dry-run]
 `rocm uninstall` removes four categories of files that ROCm CLI manages on this
 computer: its binaries, configuration, data, and caches. Use `--dry-run` to
 preview what it removes, and `--yes` to skip the confirmation. Each `--keep-*`
-flag leaves one category in place:
+flag skips the removal of one category:
 
 - `--keep-binaries` keeps the installed ROCm CLI binaries.
 - `--keep-config` keeps your saved settings.
@@ -932,6 +936,12 @@ flag leaves one category in place:
   models, the managed ROCm SDK installs, and the managed `uv` package cache.
 - `--keep-cache` keeps the caches under the cache directory. It doesn't cover
   the managed `uv` package cache, which `--keep-data` controls.
+
+By default, the configuration and data directories are both `~/.rocm`, and the
+cache directory is `~/.rocm/cache`. `uninstall` removes a category's directory
+unless you keep that category, so on a default installation a flag doesn't
+protect its files by itself. To keep your settings and data, pass `--keep-config`
+and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
 
 When you run `rocm` from a cargo `target` build, `uninstall` skips binary
 removal. Pass `--force-dev-binaries` to remove the debug and release binaries

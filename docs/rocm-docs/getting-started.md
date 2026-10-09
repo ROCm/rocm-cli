@@ -33,8 +33,8 @@ that approve it without a prompt, and the ROCm 10 and newer requirements.
 ```
 
 You can also serve any compatible Hugging Face model directly. See
-[Model serving](commands.md#model-serving) for the GGUF-vs-safetensors rule,
-since which form works depends on the engine your GPU selects.
+[Model serving](commands.md#model-serving) for the GGUF versus safetensors rule,
+because which form works depends on the engine your GPU selects.
 
 ```{include} ../../README.md
 :start-after: "form works depends on the engine your GPU selects."
