@@ -426,6 +426,23 @@ rocm model --verbose"
     /// logs in this terminal instead. When streaming, press Ctrl-D to detach and leave the
     /// server running, or Ctrl-C to stop it. Inspect or stop servers later with
     /// `rocm services`.
+    ///
+    /// When a vLLM server THIS command launched fails to become ready and its engine log
+    /// shows an out-of-memory failure, the deployment summary adds a note naming
+    /// --gpu-memory-utilization and --gpu, warning that lowering the reservation will not
+    /// help if the model does not fit, and printing a `rocm diagnose --symptom` command
+    /// for your own failing line. That note belongs to the interactive summary only: a
+    /// piped or redirected run prints the plain machine-readable form with no notes, and
+    /// --verbose streams the traceback itself. It is never shown for a healthy or
+    /// still-loading server, for a non-memory failure, or for a run that reused an
+    /// already-running server rather than launching one — read that server's own log with
+    /// `rocm services logs <service-id>`.
+    ///
+    /// Under --device gpu_required (the default) this command refuses on a host with no
+    /// usable AMD GPU, before preparing any engine. Reusing an already-running managed
+    /// server for the same engine and model is the one exception: it launches nothing and
+    /// pins no GPU, so it is allowed through. A live server for a different model or
+    /// engine does not soften the refusal.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
