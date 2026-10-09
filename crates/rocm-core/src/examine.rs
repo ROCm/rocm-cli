@@ -4381,9 +4381,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-{label}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-{label}-{}",
+            crate::test_support::unique_suffix()
         ));
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
@@ -4411,6 +4410,14 @@ mod tests {
             library_paths: vec![libs],
         };
         (root, interpreter)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plant_fake_runtime_interpreter_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_fake_runtime_interpreter("same-label").0
+        });
     }
 
     #[test]
@@ -4484,9 +4491,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-{label}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-{label}-{}",
+            crate::test_support::unique_suffix()
         ));
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
@@ -4512,6 +4518,14 @@ mod tests {
             library_paths: vec![libs],
         };
         (root, recorded, interpreter)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plant_loader_path_recording_interpreter_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_loader_path_recording_interpreter("same-label").0
+        });
     }
 
     #[test]
@@ -4839,9 +4853,8 @@ mod tests {
     /// the caller removes `root` once the read is done.
     fn plant_kfd_topology(tag: &str, gpu_nodes: &[(u32, u32)]) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-kfd-{tag}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-kfd-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let nodes = root.join("nodes");
         std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
@@ -4863,6 +4876,13 @@ mod tests {
             .expect("plant the GPU node properties");
         }
         (root, nodes)
+    }
+
+    #[test]
+    fn plant_kfd_topology_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_kfd_topology("same-label", &[]).0
+        });
     }
 
     #[test]

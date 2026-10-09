@@ -335,11 +335,27 @@ mod tests {
         (port, handle)
     }
     fn probe_state_path(tag: &str) -> PathBuf {
+        // pid + time alone repeat when two threads of one test process ask for
+        // the same label in the same tick; the counter makes every call unique.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "rocm-vllm-probe-{tag}-{}-{}.json",
+            "rocm-vllm-probe-{tag}-{}-{}-{}.json",
             std::process::id(),
-            current_unix_millis()
+            current_unix_millis(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+    #[test]
+    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
+        // Many calls rather than two: without a counter the names differ only
+        // when the clock ticks between calls, so a pair can pass by luck.
+        let paths: Vec<PathBuf> = (0..64).map(|_| probe_state_path("same-tag")).collect();
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            paths.len(),
+            "two calls with one tag shared a path"
+        );
     }
     #[test]
     fn inference_verification_latches_into_the_state_file() -> Result<()> {
