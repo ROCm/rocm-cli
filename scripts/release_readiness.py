@@ -914,6 +914,42 @@ def _assert_env_trigger_reaches_the_gate(dist: Path, name: str) -> None:
         )
 
 
+def _assert_the_inline_pem_alone_triggers_nothing(dist: Path) -> None:
+    """A set `ROCM_CLI_SIGNING_PUBLIC_KEY_PEM` must not, by itself, turn verification on.
+
+    Before this change, a configured PEM *was* a trigger. Removing it is a
+    promise that something will no longer happen, and `docs/release-trust.md`
+    states it: "a readiness run that asks for neither now checks neither". Only
+    a test that runs with the PEM set can tell the two behaviours apart -- every
+    other "off" case leaves it unset, so putting the old
+    ``or env_text(SIGNING_PUBLIC_KEY_ENV) is not None`` term back survives them
+    all.
+
+    Both levels are pinned, because each is silent on its own: the decision
+    helper must resolve nothing, and `main` -- which assembles the arguments fed
+    to it -- must run no verification.
+    """
+    decision = resolve_verification(False, False, None)
+    if decision != (False, None, None):
+        raise ReadinessError(
+            "a bare run with only the inline PEM configured must not verify; "
+            f"resolve_verification(False, False, None) returned {decision!r}. A "
+            "configured key is no longer a trigger -- asking for neither flag "
+            "must check neither."
+        )
+    code, _stdout, stderr, argvs = _run_main_verifying(dist)
+    if code is not None:
+        raise ReadinessError(
+            f"main rejected a bare run it should have accepted (exit {code}): "
+            f"{stderr.strip()!r}"
+        )
+    if argvs:
+        raise ReadinessError(
+            f"a bare run verified {len(argvs)} signature(s) with only the inline "
+            f"PEM set: {argvs!r}; the PEM is no longer a verification trigger"
+        )
+
+
 def _assert_main_honours_trigger(dist: Path, *flags: str) -> None:
     """Each trigger must force verification *through `main`*, not just in the helper.
 
@@ -935,6 +971,16 @@ def run_self_test(root: Path) -> None:
         shutil.rmtree(root)
     root.mkdir(parents=True)
     try:
+        # The block below, down to "production trust inputs accepted", drives
+        # `validate_release` directly with `require_signatures=True, verify=False`.
+        # `main` can no longer produce that combination -- requiring signatures now
+        # implies verifying them -- so these are unit checks of the *presence* half
+        # of the signature rule: that a `.sig` must exist next to every archive, and
+        # that the surrounding asset/sha/name rules behave. They deliberately use
+        # placeholder `.sig` bytes, which the real gate would reject; nothing here
+        # claims a signature is valid. End-to-end verification, with the key handoff
+        # and the real argv, is covered further down by the `_run_main_verifying`
+        # cases.
         dist = root / "dist"
         dist.mkdir()
         linux_archive = dist / "rocm-cli-test-linux-amd64.tar.gz"
@@ -954,7 +1000,7 @@ def run_self_test(root: Path) -> None:
             require_rocm_asset_names=False,
             require_exact_assets=False,
         )
-        print("release readiness self-test: valid signed dist accepted")
+        print("release readiness self-test: dist with a .sig present accepted")
 
         exact_dist = root / "exact-dist"
         exact_dist.mkdir()
@@ -975,7 +1021,7 @@ def run_self_test(root: Path) -> None:
             require_rocm_asset_names=True,
             require_exact_assets=True,
         )
-        print("release readiness self-test: exact signed dist accepted")
+        print("release readiness self-test: exact dist with a .sig present accepted")
 
         stale_archive = exact_dist / "rocm-cli-v9.9.9-linux-amd64.tar.gz"
         create_test_tar(stale_archive, "rocm-cli-v9.9.9-linux-amd64")
@@ -1339,11 +1385,20 @@ def run_self_test(root: Path) -> None:
         print("release readiness self-test: key line survives a failed verify ok")
 
         # The source release and nightly actually use.
+        inline_pem_env = {**no_key_env, SIGNING_PUBLIC_KEY_ENV: inline_pem}
         run_with_env(
-            {**no_key_env, SIGNING_PUBLIC_KEY_ENV: inline_pem},
+            inline_pem_env,
             lambda: _assert_inline_pem_run_omits_the_key_flag(gate_dist),
         )
         print("release readiness self-test: inline-PEM run reports its source ok")
+
+        # ...and the same environment with nothing asking for signatures, which
+        # is the only shape that can see the removed PEM trigger come back.
+        run_with_env(
+            inline_pem_env,
+            lambda: _assert_the_inline_pem_alone_triggers_nothing(gate_dist),
+        )
+        print("release readiness self-test: a configured PEM alone triggers nothing ok")
 
         # The other two triggers, driven through `main` rather than the helper.
         run_with_env(
