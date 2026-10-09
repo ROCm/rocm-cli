@@ -267,8 +267,7 @@ mod tests {
     }
 
     /// Every lane that pre-builds `rocm` and hands it to the suite via
-    /// `ROCM_CLI_BINARY` must enable the same test-hook feature `cargo xtask e2e`
-    /// enables when it builds for itself.
+    /// `ROCM_CLI_BINARY` must enable `rocm/e2e-test-hooks`.
     ///
     /// The suite's deterministic failure seams (e.g. the scripted Lemonade
     /// backend-install failure) are `#[cfg(feature = "e2e-test-hooks")]`. A lane
@@ -277,6 +276,14 @@ mod tests {
     /// regressions — but only on whichever lane happens to select them, which is
     /// what made this divergence so hard to read the first time. Pin it here so a
     /// new lane copying an existing block cannot silently reintroduce it.
+    ///
+    /// `cargo xtask e2e` builds a *superset* for itself
+    /// (`rocm/e2e-test-hooks rocm/e2e-oom-fault-injection`), so this asserts the
+    /// shared floor rather than an exact match. The extra
+    /// `e2e-oom-fault-injection` hook is deliberately absent from the prebuilt
+    /// lanes: the scenarios needing it carry `@requires-oom-fault-injection` and
+    /// the harness skips them when `xtask` did not build the binary itself, so a
+    /// missing hook is a reported skip rather than a silent green.
     fn assert_prebuilt_e2e_lanes_enable_test_hooks(workflow: &str, text: &str) {
         let blocks: Vec<_> = multiline_run_blocks(text)
             .into_iter()
@@ -292,9 +299,9 @@ mod tests {
                     "cargo build --release -p rocm -p rocmd --features rocm/e2e-test-hooks"
                 ),
                 "{workflow} prebuilt E2E lane must build with \
-                 `--features rocm/e2e-test-hooks`, matching what `cargo xtask e2e` \
-                 builds for itself; without it the suite's scripted failure seams \
-                 are compiled out:\n{block}"
+                 `--features rocm/e2e-test-hooks`, the hook floor `cargo xtask e2e` \
+                 also builds for itself; without it the suite's scripted failure \
+                 seams are compiled out:\n{block}"
             );
         }
     }
@@ -2507,6 +2514,133 @@ esac
             "the lifecycle-only lane packages and installs what a release ships, \
              so it must NOT carry the test hooks:\n{lifecycle}"
         );
+    }
+
+    /// Nothing shipped may be built with a test-only feature.
+    ///
+    /// Shape-based rather than a deny-list of feature names: a deny-list only
+    /// catches the features that existed when it was written. The pre-existing
+    /// guard spells `e2e-test-hooks` literally, which does not match the
+    /// substring `e2e-oom-fault-injection`, so a release build carrying only
+    /// the new one would have passed.
+    ///
+    /// Matches `--features`, `--all-features` and `-F` in both its spellings,
+    /// because `--features` alone misses the rest: `--all-features` does not
+    /// contain the substring `--features` and would compile in every test-only
+    /// feature at once, and cargo accepts the short flag detached (`-F name`)
+    /// or compact (`-Fname`). It joins `\` continuations first, because a
+    /// release build is wrapped across lines and matching physical lines would
+    /// see the `cargo build` and the `--features` on its continuation as two
+    /// unrelated lines — counting the build while finding no offender. Asserts
+    /// a build was actually found, so a renamed or deleted build step fails
+    /// loudly instead of passing vacuously.
+    #[test]
+    fn the_release_workflow_builds_no_feature_gated_binaries() {
+        let release = read_workflow("release.yml");
+        let mut builds = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for block in multiline_run_blocks(&release)
+            .into_iter()
+            .chain(std::iter::once(release.clone()))
+        {
+            for command in logical_commands(&block) {
+                if !command.contains("cargo build") {
+                    continue;
+                }
+                builds += 1;
+                if command_enables_a_feature(&command) {
+                    offenders.push(command);
+                }
+            }
+        }
+        assert!(
+            builds > 0,
+            "release.yml has no `cargo build` step for this guard to check; if the build moved, \
+             point this test at it rather than letting it pass vacuously"
+        );
+        assert!(
+            offenders.is_empty(),
+            "release.yml must build the shipped binaries with no feature flags, so a test-only \
+             feature cannot reach a release artefact; found:\n{offenders:#?}"
+        );
+    }
+
+    /// Join `\` continuations so each entry is one shell command.
+    ///
+    /// A build wrapped across lines is one command to the shell but several to
+    /// `str::lines`, and a guard reading physical lines sees the `cargo build`
+    /// without the flags that follow it.
+    fn logical_commands(block: &str) -> Vec<String> {
+        let mut commands = Vec::new();
+        let mut current = String::new();
+        for line in block.lines().map(str::trim) {
+            if let Some(head) = line.strip_suffix('\\') {
+                current.push_str(head.trim_end());
+                current.push(' ');
+                continue;
+            }
+            current.push_str(line);
+            commands.push(std::mem::take(&mut current));
+        }
+        if !current.trim().is_empty() {
+            commands.push(current);
+        }
+        commands
+    }
+
+    /// Whether a cargo invocation turns any feature on.
+    ///
+    /// `-F` has two spellings: detached (`-F name`) and compact (`-Fname`).
+    /// Comparing whole tokens to `-F` only catches the first, so the compact
+    /// form -- which is what someone squeezing a flag onto a wrapped line is
+    /// most likely to write -- would pass.
+    fn command_enables_a_feature(command: &str) -> bool {
+        command.contains("--features")
+            || command.contains("--all-features")
+            || command
+                .split_whitespace()
+                .any(|word| word == "-F" || (word.starts_with("-F") && word.len() > 2))
+    }
+
+    /// The guard must catch every spelling that enables a feature, and must not
+    /// fire on a clean release build. Each case is a shape that previously
+    /// slipped through: a flag on a `\` continuation, and a compact `-Fname`.
+    #[test]
+    fn the_release_feature_guard_catches_every_spelling() {
+        let caught = |command: &str| {
+            logical_commands(command)
+                .iter()
+                .any(|c| c.contains("cargo build") && command_enables_a_feature(c))
+        };
+
+        assert!(caught(
+            "cargo build --release -p rocm --features rocm/e2e-test-hooks"
+        ));
+        assert!(caught("cargo build --release -p rocm --all-features"));
+        assert!(caught(
+            "cargo build --release -p rocm -F rocm/e2e-test-hooks"
+        ));
+        // Compact short flag: one token, so a whole-token `== "-F"` test misses it.
+        assert!(
+            caught("cargo build --release -p rocm -Frocm/e2e-oom-fault-injection"),
+            "a compact -Fname must count as enabling a feature"
+        );
+        // Wrapped across a `\` continuation, which is how the real release
+        // build is written: the flag is not on the `cargo build` line at all.
+        assert!(
+            caught(
+                "cargo build --release -p rocm -p rocmd \\\n  --features rocm/e2e-oom-fault-injection"
+            ),
+            "a feature flag on a continuation line must still be attributed to its build"
+        );
+        // ...and the shape the release workflow actually uses stays clean, so
+        // the guard is not simply matching everything.
+        assert!(!caught("cargo build --release -p rocm -p rocmd"));
+        assert!(!caught(
+            "cargo build --release -p rocm -p rocmd \\\n  --locked"
+        ));
+        // `-F` must not be confused with other short flags.
+        assert!(!caught("cargo build --release -p rocm --frozen"));
     }
 
     /// Extract the version token right after `marker` in `line`, up to the

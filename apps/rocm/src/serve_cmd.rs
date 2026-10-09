@@ -44,13 +44,15 @@ use crate::endpoint_keys;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::serve_summary;
 use crate::{
-    cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name,
-    drop_orphaned_endpoint_key_on_already_running, engine_request,
-    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported, gpu_vram_usage,
-    parse_device_policy, parse_gpu_selection, print_managed_launch_plain, resolve_endpoint_auth,
-    resolve_engine_selection, run_attached_service, select_gpu_indices_under_launch_lock,
-    serve_gpu_low_memory_warning, start_managed_service, validate_bind_host,
-    validate_engine_selection_runtime, validate_pinned_gpu_index,
+    EngineSelection, any_live_managed_service_for_model, append_oom_serve_note, cli_progress,
+    collect_serve_notes, detect_gpu_count, device_policy_name,
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch, engine_request,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    existing_live_managed_service, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
+    print_managed_launch_plain, resolve_endpoint_auth, resolve_engine_selection,
+    run_attached_service, select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
+    start_managed_service, validate_bind_host, validate_engine_selection_runtime,
+    validate_pinned_gpu_index,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -663,17 +665,111 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         rocm_core::usable_amd_gpu_indices()
     };
+    // Reusing an already-running managed service launches nothing and pins no
+    // GPU, so it must bypass the GPU-required pre-flight below — the reused
+    // service was already vetted at its own launch, and this invocation does no
+    // GPU work. Detect that here, but only when a live managed service that
+    // plausibly serves *this* model already exists, and when the model ref can be
+    // canonicalized (a runtime/env is available, or the engine manages its own).
+    // Without a runtime we cannot resolve, so we fall through and the pre-flight
+    // refuses the no-GPU / no-runtime case with its usual message.
+    //
+    // The outermost condition is `any_live_managed_service_for_model`, and it is
+    // first for a reason: it reads the managed-service records and nothing else,
+    // so it is the only thing this block costs on the ordinary launch. Everything
+    // it guards has side effects that must not precede the bail —
+    //
+    //   - the pre-gate matches on the model, not just the engine, because the
+    //     probe body is real engine work (a `ResolveModel` round-trip, and for a
+    //     self-managing engine an `ensure_self_managed_engine_ready` that can
+    //     print "Preparing <engine> for GPU serving..." and install). Gating on
+    //     the engine alone let a live service for an *unrelated* model — one this
+    //     invocation can never reuse — drag that work ahead of the no-usable-GPU
+    //     bail on a GPU-less host.
+    //
+    //   - resolving the engine/runtime selection is not free either.
+    //     `validate_engine_selection_runtime` takes `single_ready_runtime_key`
+    //     whenever neither `--runtime-id` nor `--env-id` is given (the default
+    //     path), and that calls `recover_setup_runtime_registration`, which can
+    //     `fs::create_dir_all` + `fs::write` a runtime registry manifest and can
+    //     fail with an unrelated runtime-manifest error. So it stays *inside*
+    //     this block, behind the record-only check, and is computed below the
+    //     bail on every other path.
+    let mut resolved_selection: Option<EngineSelection> = None;
+    let mut resolved_model: Option<ResolveModelResponse> = None;
+    let mut reuse_existing = false;
+    if !cpu_only && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
+    {
+        let selection = validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(
+                &config,
+                &selected_engine,
+                runtime_id.as_deref(),
+                env_id.as_deref(),
+            ),
+        )?;
+        let can_resolve_model = selection.runtime_id.is_some()
+            || selection.env_id.is_some()
+            || engine_manages_own_runtime(&selected_engine);
+        if can_resolve_model {
+            if engine_manages_own_runtime(&selected_engine) {
+                ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
+            }
+            let probe = engine_request::<_, ResolveModelResponse>(
+                Some(&paths),
+                &selected_engine,
+                EngineMethod::ResolveModel,
+                &ResolveModelRequest {
+                    model_ref: engine_model_ref.clone(),
+                    runtime_id: selection.runtime_id.clone(),
+                    device_policy: Some(device_policy.clone()),
+                    recipe_override: None,
+                    engine_recipe: engine_recipe.clone(),
+                },
+            )?;
+            reuse_existing =
+                existing_live_managed_service(&paths, &selected_engine, &probe.canonical_model_id)
+                    .is_some();
+            resolved_model = Some(probe);
+        }
+        resolved_selection = Some(selection);
+    }
     // Fail fast under a GPU-required policy when the host has no usable AMD GPU,
-    // BEFORE preparing or launching any engine (no wasted engine download, and an
-    // actionable message instead of a late engine crash). The engine enforces the
-    // same rule as a backstop. Skipped for cpu_only; permissive when availability
-    // cannot be probed on this platform (probe returns `None`). The E2E-only
+    // before preparing or launching any engine for *this* model (no wasted engine
+    // download, and an actionable message instead of a late engine crash). The
+    // engine enforces the same rule as a backstop.
+    //
+    // The precise contract, since the reuse detection above is the one thing that
+    // can precede this bail: everything with a side effect — the runtime-selection
+    // resolution (which can write a runtime registry manifest), the `ResolveModel`
+    // round-trip, and any self-managed engine install — runs first only when a
+    // live managed service already matches this engine and model, i.e. only when
+    // this invocation is about to reuse it and legitimately skip the bail. When no
+    // such service exists (the ordinary launch, and every no-GPU refusal path)
+    // that block's body is skipped and this is the first thing that runs.
+    //
+    // Its *condition* is not free, though: `any_live_managed_service_for_model`
+    // goes through `load_managed_services`, which refreshes every service record —
+    // including records for unrelated models, since the model filter is applied
+    // afterwards — so a stale `ready`/`running` record costs an endpoint listing
+    // probe and possibly an inference probe, plus a `record.write()`, before this
+    // bail is reached. That is bounded and paid only when such records exist, but
+    // it is not "nothing runs before the pre-flight".
+    //
+    // Skipped for cpu_only and when reusing an already-running service (nothing is
+    // launched); permissive when availability cannot be probed on this platform
+    // (probe returns `None`). The E2E-only
     // backend-failure scenario bypasses this host precondition so the black-box
-    // test reaches Lemonade's backend boundary without real GPU hardware.
+    // test reaches Lemonade's backend boundary without real GPU hardware, and the
+    // E2E-only OOM-launch fault injection likewise stands in for the GPU it does
+    // not have.
     let scripted_backend_failure = cfg!(feature = "e2e-test-hooks")
         && std::env::var_os("ROCM_E2E_LEMONADE_BACKEND_INSTALL_FAILURE").is_some();
     if !cpu_only
         && !scripted_backend_failure
+        && !reuse_existing
+        && !e2e_simulate_oom_launch()
         && let Some(usable) = visible_gpu_indices.as_deref()
         && usable.is_empty()
     {
@@ -715,13 +811,28 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         None
     };
-    let resolved_selection = resolve_engine_selection(
-        &config,
-        &selected_engine,
-        runtime_id.as_deref(),
-        env_id.as_deref(),
-    );
-    let resolved_selection = validate_engine_selection_runtime(&paths, resolved_selection)?;
+    // Resolve which runtime/env this serve will use, now that the host GPU
+    // pre-condition and `--gpu` have both been checked. This must not move back
+    // above the bail: `validate_engine_selection_runtime` reaches
+    // `recover_setup_runtime_registration` on the default (no `--runtime-id` /
+    // `--env-id`) path, which writes a runtime registry manifest and can fail
+    // with a runtime-manifest error that has nothing to do with the GPU — so a
+    // GPU-less `rocm serve <model>` would mutate disk, or report the wrong
+    // problem, instead of failing fast. The reuse pre-gate above needs the answer
+    // early and already paid for it when a reusable service exists; take that
+    // answer rather than repeating the registry recovery.
+    let resolved_selection = match resolved_selection {
+        Some(selection) => selection,
+        None => validate_engine_selection_runtime(
+            &paths,
+            resolve_engine_selection(
+                &config,
+                &selected_engine,
+                runtime_id.as_deref(),
+                env_id.as_deref(),
+            ),
+        )?,
+    };
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && resolved_selection.runtime_id.is_none()
         && resolved_selection.env_id.is_none()
@@ -734,21 +845,27 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
     if !matches!(device_policy, DevicePolicy::CpuOnly)
         && engine_manages_own_runtime(&selected_engine)
+        && resolved_model.is_none()
     {
         ensure_self_managed_engine_ready(&paths, &mut config, &selected_engine)?;
     }
-    let resolve = engine_request::<_, ResolveModelResponse>(
-        Some(&paths),
-        &selected_engine,
-        EngineMethod::ResolveModel,
-        &ResolveModelRequest {
-            model_ref: engine_model_ref,
-            runtime_id: resolved_selection.runtime_id.clone(),
-            device_policy: Some(device_policy),
-            recipe_override: None,
-            engine_recipe,
-        },
-    )?;
+    // Reuse the `ResolveModel` answer the reuse pre-gate already paid for, so a
+    // reusing invocation does not make the same round-trip twice.
+    let resolve = match resolved_model {
+        Some(resolve) => resolve,
+        None => engine_request::<_, ResolveModelResponse>(
+            Some(&paths),
+            &selected_engine,
+            EngineMethod::ResolveModel,
+            &ResolveModelRequest {
+                model_ref: engine_model_ref,
+                runtime_id: resolved_selection.runtime_id.clone(),
+                device_policy: Some(device_policy),
+                recipe_override: None,
+                engine_recipe,
+            },
+        )?,
+    };
     // Serialize GPU auto-selection with the managed-service claim: the busy-GPU
     // read and the claiming record write inside `spawn_managed_engine_child` must
     // be atomic, or two concurrent `rocm serve --gpu auto` can both read the same
@@ -921,6 +1038,25 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 gpu_memory_utilization_note.as_deref(),
                 host_gpu_summary.as_ref(),
                 engine_serves_vllm,
+            );
+            // A managed serve that failed on VRAM lands here not-ready with the OOM
+            // traceback only in its own log. Read that log tail so the summary can
+            // name the memory knobs, since the pre-launch low-VRAM warning cannot
+            // fire without amd-smi/rocm-smi telemetry.
+            //
+            // Note the asymmetry this sits inside: `summary_mode` is
+            // `background && stdout().is_terminal()`, so the guidance reaches an
+            // interactive user only. A scripted / CI / assistant-driven run takes
+            // `print_managed_launch_plain`, which prints `readiness: {status}` and
+            // no notes at all — that path is machine-readable by design and is not
+            // the place to grow prose, but it does mean the same failed launch is
+            // explained in one invocation and not the other.
+            let notes = append_oom_serve_note(
+                notes,
+                engine_serves_vllm,
+                report.already_running,
+                &report.status,
+                report.log_path.as_deref(),
             );
             let summary = serve_summary::DeploymentSummary {
                 engine: selected_engine.clone(),

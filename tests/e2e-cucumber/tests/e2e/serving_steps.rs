@@ -9,11 +9,39 @@ use std::time::{Duration, Instant};
 use cucumber::{given, then, when};
 
 use crate::E2eWorld;
-use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions};
+use crate::e2e::tui_driver::{TuiSession, default_timeout};
+use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
 use e2e_cucumber::serve_log::{
     ServeAttempt, archive_service_log, serve_attempt_report, service_log_tail,
 };
 
+const OOM_GUIDANCE_MODEL: &str = "e2e/oom-model";
+
+/// How long to wait for an interactive (PTY) serve summary to render and exit.
+///
+/// Routed through the suite-wide [`default_timeout`] rather than a fixed literal
+/// so an operator can raise it with `E2E_TUI_TIMEOUT_SECS` on a contended
+/// self-hosted lane without a code change — the same reason every other PTY wait
+/// uses it.
+fn interactive_summary_timeout() -> Duration {
+    default_timeout()
+}
+/// Model id for the positive OOM-launch scenario. A distinct id from
+/// [`OOM_GUIDANCE_MODEL`] keeps the two OOM scenarios' service records from ever
+/// colliding, and marks this one as the launch (not reuse) case.
+const OOM_LAUNCH_MODEL: &str = "e2e/oom-launch-model";
+/// Model id of the live managed service planted by
+/// `@id:serve-unrelated-live-service-still-fails-fast`.
+///
+/// Must not be relatable to [`LEMONADE_SERVE_TARGET`] by the CLI's lenient
+/// service-name matcher (case-insensitive equality, or either name containing
+/// the other once extensions are stripped) — otherwise the pre-gate would open
+/// on a legitimate match and the scenario would stop testing the model keying.
+const UNRELATED_LIVE_MODEL: &str = "e2e/unrelated-live-model";
+/// The GGUF model the Lemonade-pinned serve steps request. Same checkpoint
+/// `serve-lemonade-preparation-recovery` uses, so no new download is implied on
+/// any lane that ever does reach a real install.
+const LEMONADE_SERVE_TARGET: &str = "Qwen3-0.6B-GGUF";
 /// How long to wait for a freshly served model's endpoint to become ready.
 ///
 /// On real GPU hardware the first serve of a model downloads its weights and
@@ -1122,6 +1150,106 @@ async fn assert_selector_conflict_message(world: &mut E2eWorld) {
     );
 }
 
+#[given("a live managed vLLM serve has an OOM startup log")]
+async fn plant_oom_managed_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        OOM_GUIDANCE_MODEL,
+        65_534,
+        ServiceRecordOptions {
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+            ..ServiceRecordOptions::default()
+        },
+    );
+    // A real allocator OOM signature (not vLLM's generic EngineCore wrapper,
+    // which is deliberately excluded from detection — see EAI-8059 review). This
+    // log belongs to whatever process is already live, not to the invocation
+    // under test in this scenario.
+    std::fs::write(
+        services.join("e2e-mock.log"),
+        "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+    )
+    .expect("failed to plant the OOM startup log");
+}
+
+/// Plant a live managed **Lemonade** service for a model the serve under test
+/// will not ask for.
+///
+/// Lemonade because it is the engine that manages its own runtime: the reuse
+/// pre-gate's body calls `ensure_self_managed_engine_ready`, which prints
+/// "Preparing lemonade for GPU serving..." and installs. That print is the
+/// user-visible evidence that engine work ran, and it is what
+/// `assert_no_engine_preparation` looks for.
+///
+/// The record names the same engine the serve will pass, so the ENGINE is not
+/// what holds the pre-gate shut — only [`UNRELATED_LIVE_MODEL`] differing from
+/// the served model is. `starting` plus this test process's pid keeps the record
+/// live through the CLI's liveness overlay, exactly as the reuse scenario's
+/// record does.
+#[given("a live managed Lemonade serve for an unrelated model")]
+async fn plant_unrelated_live_lemonade_serve(world: &mut E2eWorld) {
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services = root.path().join("data").join("services");
+    write_service_record_with(
+        &services,
+        UNRELATED_LIVE_MODEL,
+        65_533,
+        ServiceRecordOptions {
+            engine: "lemonade",
+            status: "starting",
+            startup_phase: Some("initializing"),
+            supervisor_pid: std::process::id(),
+            engine_pid: Some(std::process::id()),
+        },
+    );
+}
+
+/// Serve a Lemonade model under the GPU-required default while the unrelated
+/// live service planted above exists. No fault-injection env var: the scripted
+/// Lemonade backend failure would waive the very GPU pre-flight this scenario
+/// asserts.
+#[when("the user serves a different model with Lemonade under the GPU-required default")]
+async fn user_serves_other_model_with_unrelated_service_live(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["serve", LEMONADE_SERVE_TARGET, "--engine", "lemonade"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[when("the user opens its interactive serve summary")]
+async fn open_oom_serve_summary(world: &mut E2eWorld) {
+    // The synthetic env selection satisfies resolution without installing a
+    // runtime. The planted live service is reused rather than launched, so
+    // `rocm serve` bypasses the GPU-required pre-flight (a reuse pins no GPU) and
+    // reaches the reuse short-circuit on the no-GPU mock host, allocating no GPU
+    // memory.
+    let mut session = TuiSession::spawn(
+        world,
+        &[
+            "serve",
+            OOM_GUIDANCE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom",
+        ],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -1223,6 +1351,24 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     );
 }
 
+#[then("no engine was prepared for GPU serving")]
+async fn assert_no_engine_preparation(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    // `ensure_self_managed_engine_ready` announces itself with exactly this line
+    // (`apps/rocm/src/main.rs`) immediately before it downloads and installs, so
+    // its absence is the observable "no engine work ran". Matched on the
+    // "Preparing " prefix rather than the whole sentence: that is the token the
+    // CLI owns, and it stays true if the rest of the sentence is reworded.
+    //
+    // Nothing here wraps — this is captured pipe output, not a PTY grid — so a
+    // plain `contains` is the right check.
+    assert!(
+        !output.contains("Preparing "),
+        "a live managed service for an unrelated model must not drag engine \
+         preparation ahead of the no-usable-GPU refusal:\n{output}"
+    );
+}
+
 #[then("the CLI explains that temperature cannot be negative")]
 async fn assert_negative_temperature_message(world: &mut E2eWorld) {
     let output = serve_output(world);
@@ -1265,6 +1411,135 @@ async fn assert_absent_index_message(world: &mut E2eWorld) {
         "expected the absent GPU index to be reported unavailable, got:\n{}",
         serve_output(world)
     );
+}
+
+#[then("the summary reflects the reused already-running service")]
+async fn assert_reused_running_service(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // Whitespace-insensitive for the same reason as the two assertions below: the
+    // heading is rendered onto an 80-column PTY grid, so a soft wrap falling
+    // between "already" and "running" would break a literal `contains`.
+    assert!(
+        screen_without_whitespace(&screen).contains("alreadyrunning"),
+        "expected the summary to reflect the reused live service:\n{screen}"
+    );
+}
+
+#[then("the deployment summary does not blame this invocation for GPU memory")]
+async fn assert_no_oom_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // Match whitespace-insensitively, exactly as the positive assertions do: the
+    // note is a long line the 80-column PTY wraps across grid rows, so a literal
+    // `contains("ran out of GPU memory")` would never match the rendered note and
+    // this negative check would pass even if the note WERE wrongly shown. Collapse
+    // whitespace so a mis-rendered note is actually caught.
+    assert!(
+        !screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
+        "reusing an already-running service must not blame this invocation for \
+         another process's OOM:\n{screen}"
+    );
+}
+
+#[given("a managed vLLM launch will run out of GPU memory")]
+async fn plant_oom_launch(_world: &mut E2eWorld) {
+    // Nothing to plant on disk: unlike the reuse case, this scenario drives a
+    // real `rocm serve` launch. The launch's failed-with-OOM state (an owned log
+    // carrying a real allocator signature, status "starting", nothing reused) is
+    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook,
+    // armed per-invocation by the env var set in the next step. This step exists
+    // to state the scenario's premise.
+}
+
+#[when("the user opens the interactive serve summary for that launch")]
+async fn open_oom_launch_summary(world: &mut E2eWorld) {
+    // Arm the CLI's test-only OOM-launch fault injection for this child only (the
+    // mock-lane binary is built with `e2e-oom-fault-injection`). The GPU-required
+    // pre-flight is bypassed for the simulated launch, so no GPU is touched; the
+    // launch resolves the model, "spawns", writes an OOM log it owns, and reports
+    // `starting` — exactly the state the memory-guidance note keys on.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/main.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared through
+    // `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails
+    // loudly rather than silently skipping: the fault injection would not arm,
+    // the real GPU pre-flight would bail, and the step below would fail.
+    let mut session = TuiSession::spawn_with_env(
+        world,
+        &[
+            "serve",
+            OOM_LAUNCH_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom-launch",
+        ],
+        &[("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1")],
+    )
+    .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
+    session
+        .wait_for_exit(interactive_summary_timeout())
+        .await
+        .unwrap_or_else(|error| panic!("interactive serve summary failed: {error}"));
+    world.tui = Some(session);
+}
+
+#[then("the deployment summary blames this launch for GPU memory")]
+async fn assert_oom_launch_memory_guidance(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The note is a long line the 80-column PTY wraps across grid rows, so match
+    // whitespace-insensitively — otherwise a soft wrap between "GPU" and "memory"
+    // would break a literal `contains` and mask a rendered note.
+    assert!(
+        screen_without_whitespace(&screen).contains("ranoutofGPUmemory"),
+        "a managed launch that OOM'd must be blamed for GPU memory in its own \
+         deployment summary:\n{screen}"
+    );
+}
+
+#[then("the deployment summary names the GPU memory knobs")]
+async fn assert_oom_launch_names_knobs(world: &mut E2eWorld) {
+    let screen = world
+        .tui
+        .as_ref()
+        .expect("no interactive serve summary")
+        .screen_text();
+    // The actionable fix: lower the reservation or move to a less-busy device.
+    // Assert on the flag names (whitespace-insensitive, since an 80-column wrap
+    // can split a token across rows) so a reworded preamble does not mask a
+    // dropped remediation. Both knobs the step promises are checked — the step
+    // passed while only `--gpu-memory-utilization` was asserted, so dropping
+    // `--gpu <index>` from the guidance would not have failed anything.
+    let flattened = screen_without_whitespace(&screen);
+    assert!(
+        flattened.contains("--gpu-memory-utilization"),
+        "the OOM summary must name the memory knob `--gpu-memory-utilization`:\n{screen}"
+    );
+    assert!(
+        flattened.contains("--gpu<index>"),
+        "the OOM summary must also name the other knob it advertises, `--gpu <index>`:\n{screen}"
+    );
+}
+
+/// Collapse a rendered PTY screen to its non-whitespace characters, so an
+/// assertion survives the terminal soft-wrapping a long line across grid rows
+/// (which inserts row breaks mid-phrase / mid-token). Only meaningful for
+/// needles that themselves contain no whitespace once collapsed.
+fn screen_without_whitespace(screen: &str) -> String {
+    screen.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 #[then("the user is told the pinned GPU is unavailable")]

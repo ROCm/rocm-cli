@@ -1225,6 +1225,110 @@ toolchain, so install the runtime with `rocm install sdk --devel` (see
 On native Windows this script prints a JSON skip result; run it from WSL/Linux
 for live ROCm GPU acceptance.
 
+## Serve OOM Guidance And The Reuse Exemption
+
+Two `rocm serve` behaviours are checked here: the interactive deployment
+summary's out-of-memory note, and the reuse path's exemption from the
+GPU-required pre-flight. See [the README](../README.md#when-a-serve-runs-out-of-gpu-memory)
+for the user-facing contract and [vllm.md](vllm.md#shared-or-busy-gpus) for the
+flag and the quoting rule.
+
+Focused unit coverage — what counts as a vLLM OOM, and which log line is routed
+into the printed `rocm diagnose --symptom` command:
+
+```bash
+cargo test -p rocm-core vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures
+cargo test -p rocm-core vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom
+cargo test -p rocm-core quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms
+cargo test -p rocm-core the_stripper_follows_the_escape_grammar_not_just_the_colour_case
+```
+
+The note itself — its conditions, the de-duplication of the hint the pre-launch
+low-VRAM warning already printed, and the quoting guard on the command it hands
+the user to paste:
+
+```bash
+cargo test -p rocm --bin rocm oom_note_
+cargo test -p rocm --bin rocm oom_signatures_are_detected_case_insensitively
+cargo test -p rocm --bin rocm unrelated_failures_are_not_flagged_as_oom
+cargo test -p rocm --bin rocm the_shared_hint_is_de_duplicated_without_losing_the_rest_of_the_oom_note
+cargo test -p rocm --bin rocm an_apostrophe_in_the_failing_line_cannot_break_out_of_the_printed_command
+cargo test -p rocm --bin rocm control_bytes_from_the_log_never_reach_the_printed_command
+```
+
+The gate that decides whether the note is appended at all, and the pre-gate that
+decides which invocations may skip the no-usable-GPU refusal:
+
+```bash
+cargo test -p rocm --bin rocm append_oom_serve_note_
+cargo test -p rocm --bin rocm reuse_pregate_
+```
+
+`append_oom_serve_note_ignores_an_already_running_services_log` is the only
+check that discriminates the `already_running` clause of that gate: it passes a
+log path that *does* contain an OOM signature. The reuse E2E scenario below
+cannot, because the real reuse path reports no log path at all and the note is
+withheld on that ground alone.
+
+The fault-injection feature must never reach a shipped binary:
+
+```bash
+cargo test -p xtask the_release_workflow_builds_no_feature_gated_binaries
+cargo test -p xtask prebuilt_e2e_lanes_enable_test_hooks
+```
+
+E2E scenarios, in `tests/e2e-cucumber/features/model_serving.feature`:
+
+```bash
+cargo xtask e2e -- -n serve-oom-memory-guidance
+cargo xtask e2e -- -n serve-oom-launch-memory-guidance
+cargo xtask e2e -- -n serve-unrelated-live-service-still-fails-fast
+```
+
+- serve-24, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
+  already-running vLLM service whose log *does* carry an OOM traceback prints
+  the reuse summary with no memory guidance in it.
+- serve-25, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+  GPU memory blames this launch and names the knobs. The positive counterpart of
+  serve-24.
+- serve-26, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+  Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
+  serving a different model is refused before any engine starts, and nothing is
+  prepared or downloaded. Lemonade specifically, because it manages its own
+  runtime and so is the engine whose preparation is user-visible.
+
+All three carry `@requires-no-gpu` (their premise is a host with no usable AMD
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-24
+and serve-25 also carry `@requires-os:linux`.
+
+### The OOM fault-injection capability
+
+serve-25 needs a managed launch that really failed on VRAM, which a GPU-less CI
+host cannot produce. It is therefore driven by a test-only fault-injection hook:
+the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
+`ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
+of a managed vLLM launch that spawned, wrote an allocator OOM traceback to the
+log it owns, and never became ready. No process is spawned, and the seam
+compiles out entirely without the feature, so a build that does not enable it
+behaves exactly as the shipped binary does.
+
+Only `cargo xtask e2e` enables it, by building the binary under test with
+`--features "rocm/e2e-test-hooks rocm/e2e-oom-fault-injection"`, and it is the
+only producer of the `ROCM_E2E_OOM_FAULT_INJECTION=1` signal the harness reads.
+This is the one capability the harness **cannot probe for** — no product command
+exposes a compile-time feature — so `@requires-oom-fault-injection` resolves
+from that variable alone, and xtask clears it rather than inheriting it when it
+was handed a prebuilt binary.
+
+Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
+self-hosted lanes in `e2e-selfhosted.yml`, the `nightly.yml` lanes, and the
+Windows lifecycle lane in `ci.yml` — has the hook compiled out and resolves
+serve-25 to a reported **skip**, not a silent pass. It gates PRs on the
+GitHub-hosted mock lane, which lets `cargo xtask e2e` build the binary itself.
+The prebuilt lanes' `--features` floor is asserted as a superset check rather
+than an exact match for this reason; see the test notes on
+`assert_prebuilt_e2e_lanes_enable_test_hooks` in `xtask/src/workflow_contract.rs`.
+
 ## Windows Tool Notes
 
 The TheRock SDK wheel install path should not require users to install global
