@@ -1564,7 +1564,7 @@ fn parse_anthropic_sse_line(line: &str) -> Result<Option<ProviderStreamEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::{AppPaths, ManagedServiceRecord, RocmCliConfig, unix_time_millis};
+    use rocm_core::{AppPaths, ManagedServiceRecord, RocmCliConfig};
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
@@ -3048,9 +3048,8 @@ mod tests {
             .join("tests")
             .join("providers")
             .join(format!(
-                "rocm-provider-{name}-{}-{}",
-                std::process::id(),
-                unix_time_millis()
+                "rocm-provider-{name}-{}",
+                crate::test_support::unique_suffix()
             ));
         let _ = fs::remove_dir_all(&root);
         (
@@ -3061,5 +3060,10 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_app_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_app_paths("same-label").0);
     }
 }
