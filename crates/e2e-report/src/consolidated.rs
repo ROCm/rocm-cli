@@ -1817,14 +1817,17 @@ mod tests {
         // drift along with it. This test instead hard-codes the expected order.
         //
         // Built directly as `PlatformReport`s rather than through artifact-name
-        // fixtures. A platform-sorts-first/OS-sorts-last pair — needed below to
-        // tell a platform/OS field swap apart from the correct key — is
-        // reachable from real names ("gpu-strix-windows" → (Strix Halo, Windows),
-        // "unknown" → (Unknown, Unknown): Strix Halo < Unknown but
-        // Windows > Unknown), but only via the degenerate `unknown` fallback,
-        // which isn't a real platform and would read as testing the error path
-        // rather than the sort order. Constructing reports directly keeps the
-        // fixture about `report_sort_key` alone.
+        // fixtures. None of `parse_descriptor`'s named hardware platforms form a
+        // platform-sorts-first/OS-sorts-last pair — needed below to tell a
+        // platform/OS field swap apart from the correct key — since OS rank
+        // never decreases as platform rank increases among them. Stepping
+        // outside that set does produce one (e.g. "gpu-strix-windows" →
+        // (Strix Halo, Windows) paired with the `"unknown"` case →
+        // (Unknown, Unknown): Strix Halo < Unknown but Windows > Unknown), but
+        // `"unknown"` (and any other unrecognized name) is an error/fallback
+        // state, not a real platform — so constructing reports directly keeps
+        // the fixture about `report_sort_key` alone, rather than testing the
+        // error path to get the shape we need.
         //
         //   A1 (Alpha, Able, known_bugs=false, channel=None)
         //   A2 (Alpha, Able, known_bugs=false, channel=nightly)  — vs A1: channel
