@@ -34,7 +34,7 @@ Each crate's modules are listed one per line, sorted alphabetically by filename,
 - [`chat_host_facts.rs`](../apps/rocm/src/chat_host_facts.rs) — full domain extraction.
 - [`cli_progress.rs`](../apps/rocm/src/cli_progress.rs) — shared CLI-output component (`Spinner`, `AnimatedSpinner`).
 - [`cli_report.rs`](../apps/rocm/src/cli_report.rs) — shared CLI-output component (`ActionReport`).
-- [`comfyui.rs`](../apps/rocm/src/comfyui.rs) — full domain extraction (`ComfyuiCommand`).
+- [`comfyui.rs`](../apps/rocm/src/comfyui.rs) — full domain extraction; serves the `comfyui` subcommand, whose command enum (`ComfyuiCommand`) and dispatch fn stay in [`main.rs`](../apps/rocm/src/main.rs) (unlike `bootstrap.rs` above, which owns its own).
 - [`dash.rs`](../apps/rocm/src/dash.rs) — full domain extraction.
 - [`dash_seam.rs`](../apps/rocm/src/dash_seam.rs) — full domain extraction.
 - [`driver_install.rs`](../apps/rocm/src/driver_install.rs) — mechanical relocation, owns private types (part of `main.rs`'s Phase 6a split, ROCMAI-82): `install_driver()`/`reconcile_driver_install()`, plus the driver-plan/state types.
@@ -46,7 +46,7 @@ Each crate's modules are listed one per line, sorted alphabetically by filename,
 - [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs) — mechanical relocation, owns private types (Phase 6a): `serve()`, plus engine-recipe overrides.
 - [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) — full domain extraction.
 - [`storage.rs`](../apps/rocm/src/storage.rs) — full domain extraction.
-- [`therock.rs`](../apps/rocm/src/therock.rs) — full domain extraction (`RuntimesCommand`).
+- [`therock.rs`](../apps/rocm/src/therock.rs) — full domain extraction; serves the `runtimes` subcommand, whose command enum (`RuntimesCommand`) and dispatch fn stay in [`main.rs`](../apps/rocm/src/main.rs) (unlike `bootstrap.rs` above, which owns its own).
 - [`uninstall.rs`](../apps/rocm/src/uninstall.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 
 ### `apps/rocmd` — background daemon
