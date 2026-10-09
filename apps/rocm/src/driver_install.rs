@@ -1662,6 +1662,7 @@ fn driver_reboot_observed(executed_boot_id: Option<&str>) -> bool {
 mod tests {
     use super::*;
     use crate::tests::{ScopedTestEnv, test_paths};
+    #[cfg(unix)]
     use std::path::Path;
 
     fn test_examine(os: &str, wsl: bool) -> ExamineSummary {
