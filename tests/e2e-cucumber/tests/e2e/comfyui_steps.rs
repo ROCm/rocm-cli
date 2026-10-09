@@ -46,16 +46,24 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
-//! `comfyui-05` to `comfyui-08` cover `--reinstall` over a used install: one
+//! `comfyui-05` to `comfyui-10` cover `--reinstall` over a used install: one
 //! file of the user's in every entry of `source/` a reinstall keeps, plus
 //! release code. The new release comes from the same loopback server
 //! (unpaced), at a path that 404s for the failed-download case. Each `Then`
 //! that checks a printed claim about what was kept also checks the files.
 //! `comfyui-08` plants a running stand-in in the saved state and runs the
 //! `rocm comfyui stop` the refusal names before reinstalling again.
+//! `comfyui-08` and `comfyui-09` also ask `rocm` for ComfyUI's status in plain
+//! words, which is answered without a model.
 //!
-//! Black-box throughout: the planted registry manifests are plain JSON matching
-//! the CLI's on-disk schema, not typed imports from the product crates.
+//! The planted registry manifests are plain JSON matching the CLI's on-disk
+//! schema, not typed imports from the product crates. Two scenarios also write
+//! files the CLI keeps inside `source/`, by name and format: `comfyui-09` the
+//! marker an interrupted reinstall leaves (`.rocm-cli-reinstall-in-progress`),
+//! because a kill cannot be timed from outside, and `comfyui-10` the record of
+//! what the installed release shipped (`.rocm-cli-release-entries`), which an
+//! install made by this CLI would have. `source_swap`'s unit tests interrupt
+//! the swap for real at every step.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -1000,10 +1008,19 @@ async fn stop_comfyui(world: &mut E2eWorld) {
 #[given("the reinstall was cut short while replacing ComfyUI's code")]
 async fn reinstall_cut_short(world: &mut E2eWorld) {
     let source = comfyui_source_dir(world);
-    write_fixture(
-        &source.join(".rocm-cli-reinstall-in-progress"),
-        &KEPT_LIST.replace(", ", "\n"),
-    );
+    // What the marker holds: the user's entries that were there before, then
+    // the names of the release being installed.
+    let marker = KEPT_LIST
+        .split(", ")
+        .map(str::to_owned)
+        .chain(
+            INSTALLED_RELEASE_RECORD
+                .lines()
+                .map(|name| format!("release\t{name}")),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_fixture(&source.join(".rocm-cli-reinstall-in-progress"), &marker);
     std::fs::remove_file(source.join("main.py")).expect("main.py was installed");
 }
 
@@ -1082,5 +1099,84 @@ async fn status_clear_of_interruption(world: &mut E2eWorld) {
         !comfyui_source_dir(world)
             .join(".rocm-cli-reinstall-in-progress")
             .exists()
+    );
+}
+
+/// Asked as one argument, as a user types `rocm "<question>"`; answered
+/// without a model, and without changing anything.
+const PLAIN_WORDS_STATUS_QUESTION: &str = "what is the comfyui status";
+
+fn plain_words_status_answer(world: &mut E2eWorld) -> String {
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &[PLAIN_WORDS_STATUS_QUESTION]);
+    assert_eq!(
+        rc, 0,
+        "the status question failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.starts_with("ComfyUI status\n") && stdout.contains("\nNothing was changed.\n"),
+        "expected the ComfyUI status answer, got:\n{stdout}"
+    );
+    stdout
+}
+
+#[when("the user asks in plain words for ComfyUI's status")]
+async fn ask_status_in_plain_words(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    world.cli_output = Some(answer);
+}
+
+#[then("the answer says ComfyUI is starting and does not advise starting it")]
+async fn answer_says_starting(world: &mut E2eWorld) {
+    let answer = world.cli_output.clone().unwrap_or_default();
+    assert!(answer.contains("Running: starting\n"), "{answer}");
+    assert!(
+        !answer.contains("comfyui start"),
+        "a second ComfyUI must not be advised while one starts:\n{answer}"
+    );
+    // What "starting" claims: rocm-cli's own view is the same.
+    let (status, _, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(rc, 0, "{status}");
+    assert!(status.contains("  status: starting\n"), "{status}");
+}
+
+#[then("the preview says the reinstall is refused until ComfyUI is stopped")]
+async fn preview_says_refused_while_running(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    assert_eq!(world.cli_rc, Some(0), "dry run failed:\n{stdout}");
+    assert!(
+        stdout.lines().any(|line| {
+            line.starts_with("  note: ComfyUI is running from ")
+                && line.ends_with(
+                    "Stop it with `rocm comfyui stop`; a reinstall is refused until then",
+                )
+        }),
+        "the preview must say the reinstall waits for `rocm comfyui stop`, got:\n{stdout}"
+    );
+    // The scenario's next steps run that reinstall and prove the refusal.
+}
+
+#[then("the plain-words status answer names that command instead of start")]
+async fn answer_names_finishing_command(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    assert!(
+        answer.contains(&format!("Note: {FINISH_ADVICE}.\n")),
+        "the answer must name the command that finishes the reinstall, got:\n{answer}"
+    );
+    assert!(
+        !answer.contains("comfyui start"),
+        "`start` refuses here, so it must not be advised:\n{answer}"
+    );
+}
+
+#[then("the plain-words status answer no longer reports an interrupted reinstall")]
+async fn answer_clear_of_interruption(world: &mut E2eWorld) {
+    let answer = plain_words_status_answer(world);
+    assert!(!answer.contains("interrupted"), "{answer}");
+    // `start` is advised exactly when nothing answers on ComfyUI's port; the
+    // host may run a ComfyUI of its own there.
+    assert_eq!(
+        answer.contains("Running: no\n"),
+        answer.contains("run `rocm comfyui start`"),
+        "{answer}"
     );
 }

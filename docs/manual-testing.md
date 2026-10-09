@@ -344,8 +344,10 @@ Expected result:
 - With the network disconnected (and no archive cached under the ComfyUI
   folder's `downloads/`), the reinstall fails and the existing install and
   your files are untouched.
-- With ComfyUI started (`rocm comfyui start`), the reinstall is refused and
-  names `rocm comfyui stop`; after running that, the reinstall goes ahead.
+- With ComfyUI started (`rocm comfyui start`), the dry run prints a `note:`
+  that the reinstall is refused until `rocm comfyui stop`, the reinstall is
+  refused and names `rocm comfyui stop`; after running that, the reinstall
+  goes ahead.
 
 Interrupting the code swap itself is hard to time by hand; the unit test
 `interrupted_swap_converges_when_run_again` stops it at every step instead.

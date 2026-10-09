@@ -756,11 +756,14 @@ whose code would be replaced, which of the kept folders it holds, and whether
 an entry of yours named like the new release's code would be set aside or
 replaced; which entries those are is only known once the new release is
 downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
-launched is running; stop it with `rocm comfyui stop` first. If a reinstall is
-interrupted part-way, or stops because a file it must delete is in use, `start`
-refuses to launch the half-replaced folder, and `start`, `status` and the
-failed reinstall name the `rocm comfyui install --runtime-id <key>` command
-that finishes it.
+launched is running, and its dry run says so; stop it with `rocm comfyui stop`
+first. If a reinstall is interrupted part-way, or stops part-way (because a
+file it must delete or move is in use, say), `start` refuses to launch the
+half-replaced folder, and `start`, `status`, the answer to
+`rocm "what is the comfyui status"` and the failed reinstall name the
+`rocm comfyui install --runtime-id <key>` command that finishes it. If the
+install fails after the code was replaced (in the GPU check, say), the error
+names what was replaced or set aside.
 
 ### Automations
 

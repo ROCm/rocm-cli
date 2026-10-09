@@ -126,13 +126,21 @@ Feature: ComfyUI install reports progress and makes failures actionable
 
   # The running ComfyUI keeps the old code loaded and keeps writing into the
   # folder a reinstall changes, so the reinstall is refused until it is
-  # stopped. The refusal names `rocm comfyui stop`; the scenario runs exactly
-  # that and proves the same reinstall then goes through.
+  # stopped. The dry run says so first. The refusal names `rocm comfyui stop`;
+  # the scenario runs exactly that and proves the same reinstall then goes
+  # through. The stand-in process answers on no port, so a natural-language
+  # status question gets "starting", and must not be told to start a second
+  # ComfyUI.
   @id:comfyui-reinstall-refused-while-running @requires-os:linux
   Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
     And the ComfyUI that rocm-cli started is running from that install
+    When the user asks in plain words for ComfyUI's status
+    Then the answer says ComfyUI is starting and does not advise starting it
+    When the user previews reinstalling ComfyUI
+    Then the preview says the reinstall is refused until ComfyUI is stopped
+    And the existing ComfyUI code and the user's files are untouched
     When the user reinstalls ComfyUI
     Then the reinstall is refused and names rocm comfyui stop
     And the existing ComfyUI code and the user's files are untouched
@@ -144,7 +152,9 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # A reinstall killed while it replaces the code leaves a half-replaced
   # folder. `start` must not launch it; it names the install command that
   # finishes the reinstall, and the scenario runs that exact command (read from
-  # the CLI's own message) and proves the condition is cleared.
+  # the CLI's own message) and proves the condition is cleared. `status` and
+  # the answer to a natural-language status question both name that command
+  # rather than `start` until then.
   @id:comfyui-interrupted-reinstall-blocks-start @requires-os:linux
   Scenario: comfyui-09 - ComfyUI will not start a half-replaced install until the reinstall is finished
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
@@ -155,8 +165,10 @@ Feature: ComfyUI install reports progress and makes failures actionable
     When the user starts ComfyUI
     Then start refuses and names the command that finishes the reinstall
     And ComfyUI status reports the interrupted reinstall
+    And the plain-words status answer names that command instead of start
     When the user runs the command start named
     Then ComfyUI status no longer reports an interrupted reinstall
+    And the plain-words status answer no longer reports an interrupted reinstall
     And ComfyUI's code is the newer release
     And the user's own files are untouched
 
