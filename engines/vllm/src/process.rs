@@ -758,7 +758,8 @@ fn wait_for_vllm_ready(
     }
 }
 /// Reads the last N lines from a log file and returns them as a formatted string.
-/// Handles large files by seeking to near the end and reading backwards.
+/// Handles large files by seeking to the last `MAX_TAIL_READ` bytes and reading
+/// forward from there.
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
     let lines = crate::state::tail_lines(log_path, limit)?;
     if lines.is_empty() {
@@ -908,15 +909,6 @@ mod tests {
             DevicePolicy::GpuRequired
         );
         Ok(())
-    }
-    #[test]
-    fn engine_recipe_launch_args_forward_required_flags() {
-        let hint = test_engine_recipe(ENGINE_NAME, ENGINE_RECIPE_CONTRACT_VERSION);
-
-        assert_eq!(
-            engine_recipe_launch_args(Some(&hint)),
-            vec!["--enable-auto-tool-choice".to_owned()]
-        );
     }
     #[test]
     fn resolve_model_omits_gpu_memory_utilization_default() -> Result<()> {

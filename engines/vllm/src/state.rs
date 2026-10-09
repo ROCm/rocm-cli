@@ -124,10 +124,11 @@ pub(crate) fn service_files(service_id: &str) -> Result<ServiceFiles> {
 /// writes it. Kept here, paired with the readers that reconstruct the PID,
 /// process identity, and endpoint from it ([`pid_from_state`],
 /// [`identity_from_state`], [`endpoint_url_from_state`]) and with
-/// [`write_terminal_state`] — see `engines/lemonade/src/state.rs` for the
-/// sibling engine's matching layout. The `VllmRuntime`-derived fields come
-/// from `crate::runtime`, never from `process.rs`, so this module still never
-/// reaches back into it.
+/// [`write_terminal_state`] — `engines/lemonade/src/state.rs`'s
+/// `write_running_state` pairs with the same readers, though lemonade has no
+/// equivalent of `pid_from_state` or `write_terminal_state`. The
+/// `VllmRuntime`-derived fields come from `crate::runtime`, never from
+/// `process.rs`, so this module still never reaches back into it.
 pub(crate) fn write_running_state(
     request: &ServeHttpRequest,
     runtime: &VllmRuntime,
@@ -567,6 +568,12 @@ mod tests {
         // `is_some()`, which `Some(Value::Null)` also satisfies).
         let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
+        // `sdk_root` must be a real, scratch directory on Linux: this payload can
+        // materialize a `libmpi_cxx.so.40` compat stub under it (see
+        // `ensure_mpi_cxx_compat`), and a fixed `/home/user/...` path would leave
+        // that file behind after the test runs wherever it happens to be writable
+        // (for example, in root containers).
+        let scratch = tempfile::tempdir().expect("tempdir");
         let request = ServeHttpRequest {
             service_id: "svc-vllm".to_owned(),
             model_ref: "facebook/opt-125m".to_owned(),
@@ -591,11 +598,11 @@ mod tests {
             python_executable: None,
             version: Some("test".to_owned()),
             source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(PathBuf::from(if cfg!(windows) {
-                r"C:\rocm-sdk"
+            sdk_root: Some(if cfg!(windows) {
+                PathBuf::from(r"C:\rocm-sdk")
             } else {
-                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
-            })),
+                scratch.path().join("rocm_sdk")
+            }),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
