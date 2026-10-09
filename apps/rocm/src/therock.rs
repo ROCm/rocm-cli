@@ -11182,8 +11182,8 @@ exit 1
 mod archive_properties {
     use super::extract_tarball_and_discard_archive;
     use crate::archive_props::{
-        Expect, Modes, benign_entries, check_round_trip, entries, note_mode_scope, run_case,
-        run_property, tar_gz_bytes,
+        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
+        tar_gz_bytes,
     };
 
     /// No escape, and no setuid/setgid or world-writable entry. The modes are
@@ -11217,19 +11217,12 @@ mod archive_properties {
     /// entirely escapes the oracle above; this catches it.
     #[test]
     fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
-        run_property(
-            "therock-benign",
-            64,
-            benign_entries(),
-            None,
-            |layout, entries| {
-                let archive = layout.base.join("sdk.tar.gz");
-                std::fs::write(&archive, tar_gz_bytes(entries)).unwrap();
-                extract_tarball_and_discard_archive(&archive, &layout.dest)
-                    .map_err(|error| format!("{error:#}"))?;
-                check_round_trip(&layout.dest.join("top"), entries)
-            },
-        )
+        run_round_trip("therock-benign", |layout, entries| {
+            let archive = layout.base.join("sdk.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
         .unwrap();
     }
 }

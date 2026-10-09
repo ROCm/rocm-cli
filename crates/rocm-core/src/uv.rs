@@ -982,9 +982,9 @@ mod archive_properties {
 
     use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, benign_entries, check_round_trip,
-        concretize, entries, naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case,
-        run_property, tar_gz_bytes,
+        Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
+        naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case, run_property,
+        run_round_trip, tar_gz_bytes,
     };
 
     fn property(
@@ -1021,18 +1021,12 @@ mod archive_properties {
     /// else entirely (no `-C`) escapes the oracle above; this catches it.
     #[test]
     fn uv_archive_extraction_extracts_a_benign_archive_into_the_staging_dir() {
-        run_property(
-            "uv-benign",
-            64,
-            benign_entries(),
-            None,
-            |layout, entries| {
-                let archive = layout.base.join("archive.tar.gz");
-                std::fs::write(&archive, tar_gz_bytes(entries)).unwrap();
-                extract_archive(&archive, &layout.dest).map_err(|error| format!("{error:#}"))?;
-                check_round_trip(&layout.dest.join("top"), entries)
-            },
-        )
+        run_round_trip("uv-benign", |layout, entries| {
+            let archive = layout.base.join("archive.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
         .unwrap();
     }
 
@@ -1133,7 +1127,8 @@ mod archive_properties {
     fn generator_catches_a_traversing_extractor() {
         let error = property("naive", ESCAPES_ONLY, naive_unpack)
             .expect_err("an extractor that honours `..` must be caught");
-        eprintln!("{error}");
+        // Caught for writing outside the root, not for some harness failure.
+        assert!(error.contains("outside the root"), "{error}");
     }
 
     /// Calibration for the two-step link shape: an extractor that sanitises
@@ -1143,6 +1138,6 @@ mod archive_properties {
     fn generator_catches_a_link_following_extractor() {
         let error = property("naive-links", ESCAPES_ONLY, naive_sanitizing_unpack)
             .expect_err("an extractor that writes through planted links must be caught");
-        eprintln!("{error}");
+        assert!(error.contains("outside the root"), "{error}");
     }
 }

@@ -17,15 +17,15 @@
 //!   is mostly `..`, `.`, empty components, mixed separators and links, so the
 //!   dangerous shapes actually occur instead of being drowned in random text;
 //! - the **oracle** never re-derives the extractor's path logic: it snapshots
-//!   the whole per-case temporary directory before and after, and
+//!   the whole temporary directory the case runs in before and after, and
 //!   walks/canonicalizes what is actually on disk.
 //!
-//! Every case runs in a fresh temporary directory laid out so that nothing
-//! the generator can name reaches past it (see [`Layout`]): absolute names and
-//! link targets are re-rooted inside it, and the extraction root sits deeper
-//! than any `..` chain the generator can build. An extractor that escapes its
-//! root therefore writes somewhere the oracle watches, never onto the host.
-//! The one escape that leaves the temporary directory regardless is an
+//! Every case runs in a fresh directory at the bottom of a [`Fence`], laid out
+//! so that nothing the generator can name reaches past the fence: absolute
+//! names and link targets are re-rooted inside it, and the extraction root
+//! sits deeper than any `..` chain the generator can build. An extractor that
+//! escapes its root therefore writes somewhere the oracle watches, never onto
+//! the host. The one escape that leaves the fence regardless is an
 //! extractor ignoring its destination altogether (`tar` without `-C` writes
 //! into the working directory); [`check_round_trip`] over [`benign_entries`]
 //! is what catches that.
@@ -280,6 +280,19 @@ pub fn check_round_trip(top: &Path, entries: &[Entry]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// [`check_round_trip`] over 64 archives from [`benign_entries`]. `extract`
+/// writes the archive in its extractor's format, runs the extractor, and
+/// returns where the archive's `top/` directory should now be.
+pub fn run_round_trip(
+    label: &str,
+    extract: impl Fn(&Layout, &[Entry]) -> anyhow::Result<PathBuf>,
+) -> Result<(), String> {
+    run_property(label, 64, benign_entries(), None, |layout, entries| {
+        let top = extract(layout, entries).map_err(|error| format!("{error:#}"))?;
+        check_round_trip(&top, entries)
+    })
 }
 
 fn substitute(bytes: &[u8], layout: &Layout) -> Vec<u8> {
@@ -610,11 +623,14 @@ pub struct Violations {
     pub outward_links: Vec<String>,
     /// setuid/setgid entries in the installed tree, including the root.
     pub setid_modes: Vec<String>,
-    /// World-writable entries in the installed tree, including the root.
-    pub world_writable: Vec<String>,
+    /// World-writable files in the installed tree.
+    pub world_writable_files: Vec<String>,
+    /// World-writable directories in the installed tree, including the root.
+    pub world_writable_dirs: Vec<String>,
 }
 
-fn check_mode(path: &Path, mode: u32, violations: &mut Violations) {
+fn check_mode(path: &Path, meta: &fs::Metadata, violations: &mut Violations) {
+    let mode = meta.mode();
     if mode & 0o6000 != 0 {
         violations.setid_modes.push(format!(
             "{} has setuid/setgid bits ({mode:o})",
@@ -622,10 +638,29 @@ fn check_mode(path: &Path, mode: u32, violations: &mut Violations) {
         ));
     }
     if mode & 0o002 != 0 {
-        violations
-            .world_writable
-            .push(format!("{} is world-writable ({mode:o})", path.display()));
+        let found = format!("{} is world-writable ({mode:o})", path.display());
+        if meta.is_dir() {
+            violations.world_writable_dirs.push(found);
+        } else {
+            violations.world_writable_files.push(found);
+        }
     }
+}
+
+/// `path` with `.` and `..` resolved by text alone, the way a dangling link's
+/// target would resolve once something exists there.
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Walk `root` on the real filesystem (never following links) and report any
@@ -643,7 +678,7 @@ pub fn inspect_tree(root: &Path, outside_inodes: &[u64]) -> Violations {
         ));
         return violations;
     }
-    check_mode(root, root_meta.mode(), &mut violations);
+    check_mode(root, &root_meta, &mut violations);
     ensure_listable(root);
     let Ok(canonical_root) = fs::canonicalize(root) else {
         return violations;
@@ -657,8 +692,10 @@ pub fn inspect_tree(root: &Path, outside_inodes: &[u64]) -> Violations {
             let file_type = meta.file_type();
             if file_type.is_symlink() {
                 // `canonicalize` resolves the whole chain on disk; a dangling
-                // link is reported by its lexical target instead.
+                // link is judged by its target read as text, relative to the
+                // directory the link is in.
                 let target = fs::read_link(&path).unwrap_or_default();
+                let lexical = lexically_normal(&dir.join(&target));
                 match fs::canonicalize(&path) {
                     Ok(resolved) if !resolved.starts_with(&canonical_root) => {
                         violations.outward_links.push(format!(
@@ -668,7 +705,7 @@ pub fn inspect_tree(root: &Path, outside_inodes: &[u64]) -> Violations {
                             resolved.display()
                         ));
                     }
-                    Err(_) if target.is_absolute() && !target.starts_with(&canonical_root) => {
+                    Err(_) if !lexical.starts_with(&canonical_root) => {
                         violations.outward_links.push(format!(
                             "dangling symlink {} -> {} points outside the root",
                             path.display(),
@@ -679,7 +716,7 @@ pub fn inspect_tree(root: &Path, outside_inodes: &[u64]) -> Violations {
                 }
                 continue;
             }
-            check_mode(&path, meta.mode(), &mut violations);
+            check_mode(&path, &meta, &mut violations);
             if file_type.is_file() && outside_inodes.contains(&meta.ino()) {
                 violations.shared_inodes.push(format!(
                     "{} is a hard link to a file outside the root",
@@ -892,6 +929,12 @@ pub fn run_case(
     {
         layout.fence_dirty.set(true);
     }
+    if fs::symlink_metadata(inspect_root).is_err() {
+        escapes.push(format!(
+            "removed the extraction root itself: {}",
+            inspect_root.display()
+        ));
+    }
     let mut tree = inspect_tree(inspect_root, &inodes);
     escapes.append(&mut tree.shared_inodes);
     CaseOutcome {
@@ -903,21 +946,23 @@ pub fn run_case(
 
 /// What an extractor promises about the modes it leaves behind.
 ///
-/// Both promises are relative to the process: an extractor that creates
-/// directories (or runs `tar`) gets modes through the umask, so under a umask
-/// that leaves world-write open (`umask 0`) a world-writable entry is what the
-/// user asked for, and only setuid/setgid is judged.
+/// No promise covers a world-writable entry the umask let through: under a
+/// umask that leaves world-write open (`umask 0`) that is what the user asked
+/// for. What differs is which entries get their mode through the umask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modes {
     /// Not judged.
     Unchecked,
-    /// No setuid/setgid entry, and no world-writable one while the umask
-    /// clears world-write. Holds whoever runs it.
+    /// For an extractor that sets every file's mode itself: no setuid/setgid
+    /// entry and no world-writable file, whatever the umask or uid;
+    /// directories, which it creates through the umask, are judged only
+    /// while the umask clears world-write.
     Safe,
-    /// [`Modes::Safe`] for the system `tar`, which promises it only to an
-    /// unprivileged user: run as root, GNU tar restores archived modes,
-    /// setuid included. So under effective uid 0 the modes are not judged,
-    /// and [`note_mode_scope`] says so.
+    /// For the system `tar`, which gives every entry its mode through the
+    /// umask and drops setuid/setgid only for an unprivileged user: no
+    /// setuid/setgid entry, and no world-writable entry while the umask
+    /// clears world-write. Run as root, GNU tar restores archived modes,
+    /// setuid included, so under effective uid 0 the modes are not judged.
     SafeUnlessRoot,
 }
 
@@ -948,11 +993,14 @@ impl Modes {
                 "running as root, where the system tar restores archived modes: modes not judged"
                     .to_owned(),
             ),
-            Self::Safe | Self::SafeUnlessRoot => {
-                umask.filter(|umask| umask & 0o002 == 0).map(|umask| {
-                    format!("umask {umask:03o} leaves world-write open: only setuid/setgid judged")
-                })
-            }
+            Self::Safe => umask.filter(|umask| umask & 0o002 == 0).map(|umask| {
+                format!(
+                    "umask {umask:03o} leaves world-write open: world-writable directories not judged"
+                )
+            }),
+            Self::SafeUnlessRoot => umask.filter(|umask| umask & 0o002 == 0).map(|umask| {
+                format!("umask {umask:03o} leaves world-write open: only setuid/setgid judged")
+            }),
         }
     }
 
@@ -963,8 +1011,11 @@ impl Modes {
             Self::SafeUnlessRoot if euid == Some(0) => false,
             Self::Safe | Self::SafeUnlessRoot => {
                 let umask_clears_world_write = umask.is_none_or(|umask| umask & 0o002 != 0);
+                let files_follow_umask = self == Self::SafeUnlessRoot;
                 !tree.setid_modes.is_empty()
-                    || (umask_clears_world_write && !tree.world_writable.is_empty())
+                    || (!tree.world_writable_files.is_empty()
+                        && (umask_clears_world_write || !files_follow_umask))
+                    || (umask_clears_world_write && !tree.world_writable_dirs.is_empty())
             }
         }
     }
@@ -972,7 +1023,10 @@ impl Modes {
 
 /// Print, once per property, which part of the mode promise this run cannot
 /// judge (running as root, or under a umask that leaves world-write open), so
-/// a pass there is not read as the whole promise holding.
+/// a pass there is not read as the whole promise holding. It goes to stderr:
+/// `cargo test` shows it with `--nocapture`, and nextest only for a failing
+/// test unless run with `--success-output`. The default CI runners run
+/// unprivileged under umask 022, where nothing is relaxed and nothing prints.
 pub fn note_mode_scope(label: &str, modes: Modes) {
     if let Some(reason) = modes.relaxed_because() {
         eprintln!("[{label}] {reason}");
@@ -1007,8 +1061,8 @@ impl CaseOutcome {
 
 /// Run `check` over `cases` archives from `strategy`, each in a fresh
 /// [`Layout`] with the archive already [`concretize`]d into it. Reach is
-/// counted on the archive as generated, before absolute names are re-rooted. Returns the
-/// shrunk counterexample as text on failure. On success, when `reach_floor`
+/// counted on the archive as generated, before absolute names are re-rooted.
+/// Returns the shrunk counterexample as text on failure. On success, when `reach_floor`
 /// is set, also fails if any dangerous shape occurred in fewer than that
 /// percentage of cases — a pass over a generator that never produced the
 /// shape would prove nothing.
@@ -1022,10 +1076,12 @@ pub fn run_property(
     let reach = Reach::new();
     // `PROPTEST_CASES` (proptest's own knob, which an explicit case count
     // would otherwise override) scales every property up for a longer hunt.
+    // Never down: the reach floors below are percentages, which a handful of
+    // cases cannot meet.
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(cases);
+        .map_or(cases, |requested: u32| requested.max(cases));
     let mut config = proptest::test_runner::Config {
         cases,
         failure_persistence: None,
@@ -1107,15 +1163,29 @@ pub fn naive_unpack(archive: &Path, destination: &Path) -> anyhow::Result<()> {
 }
 
 /// [`run_property`] reuses one [`Fence`] across cases only while it is clean:
-/// a case whose extraction changed something above its own directory gets the
-/// next case a fresh fence, and one that changed only its own directory does
-/// not.
+/// a case whose extraction created, changed or removed something above its
+/// own directory gets the next case a fresh fence, and one that changed only
+/// its own directory does not.
 #[test]
 fn a_fence_is_replaced_after_a_case_changes_it_and_only_then() {
-    let tops_seen = |write_above_the_case: bool| {
+    use std::os::unix::fs::PermissionsExt as _;
+    #[derive(Clone, Copy, Debug)]
+    enum Change {
+        OwnDirectory,
+        CreateAbove,
+        ModifyAbove,
+        RemoveAbove,
+    }
+    let fences_over_cases = |change: Change| {
         let tops = std::cell::RefCell::new(Vec::new());
         run_property("fence", 3, Just(Vec::new()), None, |layout, _| {
             tops.borrow_mut().push(layout.top.clone());
+            let above = layout.base.parent().unwrap().to_path_buf();
+            // Something to remove that the extraction did not create.
+            let doomed = above.join(format!("doomed-{}", tops.borrow().len()));
+            if matches!(change, Change::RemoveAbove) {
+                fs::write(&doomed, b"x").unwrap();
+            }
             let outcome = run_case(
                 layout,
                 "a",
@@ -1123,16 +1193,18 @@ fn a_fence_is_replaced_after_a_case_changes_it_and_only_then() {
                 &[&layout.dest],
                 &layout.dest,
                 |layout, _| {
-                    let target = if write_above_the_case {
-                        layout.base.parent().unwrap().join("x")
-                    } else {
-                        layout.outside.join("sentinel")
-                    };
-                    fs::write(target, b"changed")?;
+                    match change {
+                        Change::OwnDirectory => fs::write(layout.outside.join("sentinel"), b"x")?,
+                        Change::CreateAbove => fs::write(above.join("created"), b"x")?,
+                        Change::ModifyAbove => {
+                            fs::set_permissions(&above, fs::Permissions::from_mode(0o700))?;
+                        }
+                        Change::RemoveAbove => fs::remove_file(&doomed)?,
+                    }
                     Ok(())
                 },
             );
-            assert!(!outcome.escapes.is_empty(), "{outcome:#?}");
+            assert!(!outcome.escapes.is_empty(), "{change:?}: {outcome:#?}");
             Ok(())
         })
         .unwrap();
@@ -1140,14 +1212,58 @@ fn a_fence_is_replaced_after_a_case_changes_it_and_only_then() {
         let distinct: std::collections::BTreeSet<_> = tops.iter().collect();
         (tops.len(), distinct.len())
     };
-    let (cases, fences) = tops_seen(false);
+    let (cases, fences) = fences_over_cases(Change::OwnDirectory);
     assert_eq!(
         fences, 1,
         "{cases} cases that stayed in their own directory"
     );
-    let (cases, fences) = tops_seen(true);
-    assert_eq!(
-        fences, cases,
-        "every case after a fence change needs a fresh fence"
+    for change in [
+        Change::CreateAbove,
+        Change::ModifyAbove,
+        Change::RemoveAbove,
+    ] {
+        let (cases, fences) = fences_over_cases(change);
+        assert_eq!(
+            fences, cases,
+            "{change:?}: every case after a fence change needs a fresh fence"
+        );
+    }
+}
+
+/// A dangling symlink is judged by where its target would be, relative to
+/// the link: `../../x` from the root leaves it even though nothing is there
+/// yet, while a dangling link to a name inside the root does not.
+#[test]
+fn a_dangling_link_is_judged_by_where_it_would_resolve() {
+    let layout = Layout::new();
+    std::os::unix::fs::symlink("../../not-there", layout.dest.join("out")).unwrap();
+    std::os::unix::fs::symlink("not-there-either", layout.dest.join("in")).unwrap();
+    let tree = inspect_tree(&layout.dest, &[]);
+    assert_eq!(tree.outward_links.len(), 1, "{tree:#?}");
+    assert!(tree.outward_links[0].contains("/out "), "{tree:#?}");
+}
+
+/// An extraction that deletes its own root has not stayed inside it, even
+/// though nothing outside the root changed.
+#[test]
+fn removing_the_extraction_root_is_an_escape() {
+    let layout = Layout::new();
+    let outcome = run_case(
+        &layout,
+        "a",
+        b"",
+        &[&layout.dest],
+        &layout.dest,
+        |layout, _| {
+            fs::remove_dir(&layout.dest)?;
+            Ok(())
+        },
+    );
+    assert!(
+        outcome
+            .escapes
+            .iter()
+            .any(|escape| escape.contains("removed the extraction root")),
+        "{outcome:#?}"
     );
 }
