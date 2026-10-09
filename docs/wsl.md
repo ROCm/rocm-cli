@@ -15,13 +15,13 @@ The AMD WSL path is:
 
 1. Windows 11 with the AMD Adrenalin WSL-capable driver.
 2. WSL2 with Ubuntu 24.04 or newer. Ubuntu 22.04 is not supported: it ships
-   glibc 2.35, below the glibc 2.38 / `GLIBCXX_3.4.32` floor that every
-   published Lemonade embeddable requires, so the Lemonade engine cannot start
-   there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
+   glibc 2.35, below the minimum that every published Lemonade embeddable
+   requires (glibc 2.38 and `GLIBCXX_3.4.32`), so the Lemonade engine cannot
+   start there. Ubuntu 24.04 provides glibc 2.39 and `GLIBCXX_3.4.33`.
 3. ROCDXG (`librocdxg`) installed inside WSL.
-4. A TheRock runtime installed by `rocm-cli` into a managed Python venv.
+4. A TheRock runtime installed by ROCm CLI into a managed Python venv.
 
-Useful read-only preflight, from inside the distro:
+To run a read-only preflight check from inside the distro:
 
 ```bash
 rocm diagnose
@@ -35,19 +35,25 @@ rocm diagnose --distro          # the only distro installed
 rocm diagnose --distro Ubuntu   # a named one
 ```
 
-The host-side form collects the facts over `wsl.exe` and runs the same catalog.
-It needs no `rocm-cli`, and no Python, inside the target distro — which is the
-point, since the distro being checked is usually the one that is not set up yet.
+With `--distro`, ROCm CLI runs on Windows and calls `wsl.exe` to run a short
+read-only script inside the distro and collect diagnostic data. It then checks
+that data against the same WSL checks as a run from inside the distro, except
+those that need information it cannot collect (see the following list).
+Nothing is installed in the distro, and neither ROCm CLI nor Python needs to be
+there. That matters because the distro you are checking is usually not set up
+yet.
 
-It sees less than a run from inside, so prefer the in-distro form where you can:
+The `--distro` form sees less than a run from inside the distro, so prefer the
+in-distro form where you can:
 
-- It probes the conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) but
-  cannot honour a `$ROCM_PATH` pointing elsewhere. `wsl.exe --exec` runs a
-  non-login, non-interactive shell, so nothing exported from a shell profile is
-  set.
-- For the same reason it collects no environment, so the checks that read one —
-  `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework/ROCm version pairing —
-  do not run. It reports on the WSL GPU stack, not on the whole installation.
+- The `--distro` form probes the conventional ROCm roots (`/opt/rocm*`,
+  `/usr/local/rocm*`) but cannot honor a `$ROCM_PATH` pointing elsewhere. The
+  probe runs under `/bin/sh -c` through `wsl.exe --exec`, a non-login,
+  non-interactive shell, so nothing exported from a shell profile is set.
+- For the same reason, the `--distro` form collects no environment, so the
+  checks that read one (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework
+  and ROCm version pairing) do not run. It reports on the WSL GPU stack, not on
+  the whole installation.
 
 ## Install ROCDXG In WSL
 
@@ -58,7 +64,7 @@ rocm install driver            # print the plan
 rocm install driver --yes      # run it
 ```
 
-On WSL2 this installs ROCDXG rather than Linux DKMS — there is no in-tree
+On WSL2 this installs ROCDXG rather than Linux DKMS. There is no in-tree
 amdgpu driver to build, because the GPU comes from the Windows host driver
 through `/dev/dxg`. The plan is printed for review first and only runs with
 `--yes`, the same as on bare metal. It checks `/dev/dxg` and dxcore before
@@ -75,7 +81,7 @@ it; on a mismatch the plan stops before `apt install` runs the package's
 maintainer scripts as root. Nothing needs to be set for this.
 
 To install a release other than the pinned one, set `ROCM_CLI_ROCDXG_VERSION`.
-Because rocm-cli has no digest for a release it predates, supply one:
+Because ROCm CLI has no digest for a release it predates, supply one:
 
 ```bash
 ROCM_CLI_ROCDXG_VERSION=<version> \
@@ -83,8 +89,8 @@ ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
 
 `ROCM_CLI_ROCDXG_SHA256` also overrides the pinned digest for a known version.
-If you genuinely want to install without verifying, that has to be said out
-loud — the plan then prints a warning naming the version it is not checking:
+To install without verifying, you must opt in explicitly. The plan then prints
+a warning that names the version it does not check:
 
 ```bash
 ROCM_CLI_ROCDXG_VERSION=<version> \
@@ -97,24 +103,26 @@ unverified.
 ### Doing it by hand
 
 The equivalent manual steps, for reference or for a host where the CLI is not
-installed yet. The `sha256sum -c` line is the same trust anchor `rocm install
-driver` uses — `apt install` runs the package's maintainer scripts as root, so
-do not skip it. The digest below is the one rocm-cli pins for 1.2.2; for a
-different release, take the digest published with it:
+installed yet. The `sha256sum -c` line is the same trust anchor that
+`rocm install driver` uses. Do not skip it, because `apt install` runs the
+package's maintainer scripts as root. Set `ROCDXG_VERSION` to the release you
+want and `ROCDXG_SHA256` to the digest published with that release:
 
 ```bash
+ROCDXG_VERSION=<version>
+ROCDXG_SHA256=<64-hex-sha256>
 sudo apt-get update
 sudo apt-get install -y ca-certificates curl
-curl -L -o /tmp/rocdxg-roct_1.2.2_amd64.deb \
-  https://github.com/ROCm/librocdxg/releases/download/v1.2.2/rocdxg-roct_1.2.2_amd64.deb
-printf '%s  %s\n' \
-  28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541 \
-  /tmp/rocdxg-roct_1.2.2_amd64.deb | sha256sum -c -
-sudo apt install -y /tmp/rocdxg-roct_1.2.2_amd64.deb
+curl -L -o "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" \
+  "https://github.com/ROCm/librocdxg/releases/download/v${ROCDXG_VERSION}/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
+printf '%s  %s\n' "${ROCDXG_SHA256}" \
+  "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb" | sha256sum -c -
+sudo apt install -y "/tmp/rocdxg-roct_${ROCDXG_VERSION}_amd64.deb"
 sudo ldconfig
 ```
 
-Source-build alternative:
+Source-build alternative. Set `win_sdk` to the Windows SDK version installed on
+your host; the version in this example may differ from yours:
 
 ```bash
 git clone https://github.com/ROCm/librocdxg.git
@@ -173,20 +181,16 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 ## Diagnosing A WSL Host
 
-`rocm diagnose` carries a WSL catalog, separate from the bare-metal Linux one.
+`rocm diagnose` has a separate set of WSL checks, called the WSL catalog,
+distinct from the bare-metal Linux ones.
 The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
 never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
 naming one would send you after a fault that cannot exist on this platform.
 
-```bash
-rocm diagnose
-rocm diagnose --json
-```
+Run `rocm diagnose`, or `rocm diagnose --json` for machine-readable output.
 
-This catalog replaces the standalone preflight script this repo used to ship;
-it does not carry over that script's `--require-build-tools` flag or its
-Python venv-tooling check, so a distro missing only build tools or `venv`
-support reports clean here.
+The WSL catalog does not check for build tools or Python `venv` support, so a
+distro missing only those reports clean here.
 
 The WSL entries, in the order a broken stack usually reveals them:
 
@@ -218,7 +222,8 @@ belong to the Windows host, and none of that meets the bar an auto-applied fix
 has to clear. On WSL the CLI carries out exactly one catalog entry itself,
 `fix-6-path`, which is not one of the WSL entries.
 
-Two deliberate silences, so a report can be trusted:
+Two checks deliberately stay silent when they cannot be sure, so you can trust
+the report:
 
 - `fix-wsl-6` **abstains** when WSL interop cannot reach the Windows host, rather
   than reading "could not ask" as "driver is too old". Inside a container, or
@@ -230,10 +235,11 @@ Two deliberate silences, so a report can be trusted:
 
 ## What `rocm examine` Reports On WSL
 
-`rocm examine` detects WSL cheaply and reports:
+`rocm examine` detects WSL cheaply and reports the following. The text report
+shows a subset; the rest appear in `rocm examine --json`.
 
 - `wsl: true`
-- WSL distro/version, and whether the release clears the supported floor
+- WSL distro and version, and whether the release clears the supported floor
 - WSL major version (1 or 2)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
@@ -242,10 +248,11 @@ Two deliberate silences, so a report can be trusted:
 - `librocdxg` linker-cache visibility from `ldconfig -p`
 - the Windows host AMD driver version, when WSL interop can reach the host
 - whether `HSA_ENABLE_DXG_DETECTION` is set
-- managed TheRock runtime count and active/default runtime
+- managed TheRock runtime count and active default runtime
 
-The driver, device-node and group probes stay skipped, so `has_amd_gpu` and
-`gpus` describe the bare-metal view and are not populated here.
+The driver, device-node, and group probes stay skipped. In the `--json` output,
+`has_amd_gpu` is therefore always false and `gpus` is empty on WSL, even on a
+healthy host, because both describe the bare-metal view.
 
 ## Install UX Recommendations
 
