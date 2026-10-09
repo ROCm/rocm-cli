@@ -717,8 +717,9 @@ fn nvidia_only(distributions: Vec<String>) -> Vec<String> {
 async fn setup_isolated_runtime(world: &mut E2eWorld) {
     // DELIBERATELY do NOT call `world.use_shared_runtimes()`: this scenario may
     // corrupt the runtime (that is the bug it pins), so it must own a private,
-    // throwaway runtime prefix. Each World already has isolated ROCM_CLI_* dirs,
-    // so a plain `install sdk` here lands in this scenario's own tree.
+    // throwaway runtime prefix. The runtime lands under the World's per-scenario
+    // data dir (only the download caches are shared), so a plain `install sdk` here
+    // lands in this scenario's own tree.
     crate::run_rocm_ok(world, &["install", "sdk", "--yes"]);
 }
 

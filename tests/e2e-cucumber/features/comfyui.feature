@@ -96,9 +96,7 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   #
   # The contract: after installing an optional app, the machine's ROCm runtime must
   # still be a ROCm runtime — its torch, torchvision and torchaudio versions are unchanged and
-  # no `nvidia-*` CUDA distributions appear in it (that last check only has teeth on
-  # Linux: PyPI's Windows torch wheels are CPU builds with no `nvidia-*` dependencies,
-  # so on Windows the exit code and the torch-stack comparison are the guards). Since #298 the install exits 0,
+  # no `nvidia-*` CUDA distributions appear in it. Since #298 the install exits 0,
   # so the scenario also requires that. It is also the step that catches a revert
   # of #298 (the post-install GPU probe then bails and the install exits non-zero),
   # so do not relax it as a mere premise: a bail-out (no runtime, download failure)
@@ -119,8 +117,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # combining it with @nightly would make this scenario unreachable on every lane;
   # it touches the OS only as much as runtime-01's `install sdk --yes` does (installing
   # missing torch system libraries), and otherwise only its own isolated runtime
-  # prefix. Linux-only until a Windows/WSL2 run of `comfyui install` has been seen.
-  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux
+  # prefix. Native Linux only (@requires-os:linux @requires-bare-metal; WSL2 reports
+  # linux, so the first tag alone would not exclude it) until a Windows/WSL2 run of
+  # `comfyui install` has been seen. If that gate is lifted, note the `nvidia-*` check has
+  # no teeth on Windows (PyPI's Windows torch wheels are CPU builds).
+  @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
   Scenario: comfyui-05 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given a machine with a managed ROCm runtime
     And the runtime has torch and no CUDA packages
