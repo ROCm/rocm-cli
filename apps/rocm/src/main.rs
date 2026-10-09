@@ -81,7 +81,6 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(not(windows))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -3860,12 +3859,233 @@ fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>
     Ok(())
 }
 
+/// How long a freshly spawned managed engine is watched before it is treated as
+/// started. Long enough to catch an engine that dies on the way up (bad runtime,
+/// missing model, port already taken), short enough to be invisible next to the
+/// readiness wait that follows. Both platforms use the same budget so a launch
+/// that fails at startup fails the same way on each.
+const MANAGED_ENGINE_STARTUP_SETTLE: Duration = Duration::from_millis(200);
+
+/// E2E-only switch that makes the managed engine die during startup, so the
+/// black-box suite can assert what a user sees when it does.
+///
+/// Read in the *parent*, which is what spawns the engine, so nothing test-only
+/// leaks into the child's own code path. The child is the real `rocm` binary,
+/// really spawned and really dead — only its arguments are swapped for ones the
+/// CLI rejects outright, so the launch takes exactly the path a broken engine
+/// takes.
+#[cfg(feature = "e2e-test-hooks")]
+const MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTUP_FAILURE";
+
+/// Whether the E2E startup-failure switch is armed.
+#[cfg(feature = "e2e-test-hooks")]
+fn scripted_managed_engine_startup_failure() -> bool {
+    std::env::var_os(MANAGED_ENGINE_STARTUP_FAILURE_TEST_ENV).is_some()
+}
+
+/// Release builds do not enable `e2e-test-hooks`, so the switch does not exist
+/// there and no environment variable can arm it.
+#[cfg(not(feature = "e2e-test-hooks"))]
+const fn scripted_managed_engine_startup_failure() -> bool {
+    false
+}
+
+/// Arguments that make the spawned `rocm` exit immediately with a non-zero
+/// status. Used only under [`scripted_managed_engine_startup_failure`].
+///
+/// An unrecognised *flag*, deliberately: clap rejects it with exit code 2 before
+/// any work. An unrecognised subcommand would not do — the CLI falls back to
+/// natural-language request parsing for those and exits 0, which is a different
+/// (and much slower) thing than an engine dying.
+#[cfg(feature = "e2e-test-hooks")]
+fn managed_engine_startup_failure_args() -> Vec<String> {
+    vec!["--e2e-managed-engine-startup-failure".to_owned()]
+}
+
+/// Retire the service record of a launch that did not get an engine running.
+///
+/// Callers must reach this on *every* path that abandons a record, because a
+/// record left in a non-terminal state keeps claiming its engine + model:
+/// `managed_service_is_live` counts `"starting"` as alive, so the idempotency
+/// guard would report the corpse as `AlreadyRunning` and refuse every later
+/// `rocm serve` for the same pair. `"failed"` is outside the live set, so the
+/// next launch proceeds.
+///
+/// On the launch path the record is persisted *before* the spawn, to claim the
+/// GPU for concurrent auto-selection, so it still carries the constructor's
+/// `"starting"` status and a `supervisor_pid` of 0 — and pid 0 is skipped by
+/// `recorded_service_pids`, so the liveness refresh cannot demote it either and
+/// the wedge is permanent. On the restart path the record is pre-existing and
+/// its pid is merely stale, which the liveness refresh would eventually clean
+/// up; retiring it here is what makes the outcome immediate and identical on
+/// both paths.
+///
+/// `"failed"` is also a status `rocmd` acts on, and that is intended: a failed
+/// launch *is* a failure. Its `server-recover` watcher is off until a user
+/// enables it, and enabled in its default `contained` mode it restarts any
+/// managed record whose status is `"failed"` — a launch retired here becomes
+/// eligible on its next tick (subject to the watcher's backoff), where the
+/// pid-0 `"starting"` record it replaces was eligible only after the 5-minute
+/// stale-`"starting"` window. Two consequences follow. A failed *restart* is
+/// restarted again rather than left down. And that recovery can race a user's
+/// own retry: `rocm serve` for the same engine + model mints a new service id,
+/// so both may try to bind the same port, and one of them loses.
+fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
+    record.status = "failed".to_owned();
+    record.write()
+}
+
+/// Retire `record` on a failed launch without letting a failed write displace the
+/// launch's own error, which is what diagnoses it. The write failure is still
+/// reported, on stderr, because a record left unretired keeps claiming its
+/// engine + model.
+fn retire_managed_launch_or_warn(record: &mut ManagedServiceRecord) {
+    if let Some(warning) = managed_launch_retirement_warning(record) {
+        eprintln!("{warning}");
+    }
+}
+
+/// Retire `record`, returning the warning to print if the retirement could not be
+/// written. Split from [`retire_managed_launch_or_warn`] so a test can read the
+/// warning alongside the record it describes.
+fn managed_launch_retirement_warning(record: &mut ManagedServiceRecord) -> Option<String> {
+    mark_managed_launch_failed(record).err().map(|error| {
+        format!(
+            "warning: could not mark managed service `{}` as failed: {error:#}",
+            record.service_id
+        )
+    })
+}
+
+/// Retire `record` when `outcome` failed, so a bail-out before the child exists
+/// stops it claiming its engine + model.
+///
+/// Every fallible step between `record.write()` and the spawn has to go through
+/// here. Each one that does not is another way to strand the pid-0 `"starting"`
+/// corpse — the failures differ, the wedge is identical.
+///
+/// **The span ends at the spawn, deliberately.** Once a child exists, retiring the
+/// record is no longer the safe default: it frees this engine + model for the next
+/// `rocm serve`, which would start a rival engine on the same port while the child
+/// this launch spawned may still be alive. Past that point the caller has to decide
+/// per failure whether the child is known dead — which is what
+/// [`fail_managed_launch_if_engine_died`] does, and why a failed *liveness query*
+/// is not routed here.
+///
+/// Takes an already-evaluated `Result` rather than a closure so it can wrap that
+/// prefix without holding a second borrow of `record` across the call.
+///
+/// The returned error is always the one that aborted the launch; a failed
+/// retirement is only warned about (see [`retire_managed_launch_or_warn`]).
+fn retire_record_on_error<T>(record: &mut ManagedServiceRecord, outcome: Result<T>) -> Result<T> {
+    outcome.inspect_err(|_| retire_managed_launch_or_warn(record))
+}
+
+/// Fail the launch if the freshly spawned engine had already exited, retiring the
+/// record on the way out so the dead launch stops claiming its engine + model.
+///
+/// Both platforms funnel their startup check through here — Unix from
+/// `Child::try_wait`, Windows from the watched detached spawn — so a child that
+/// is *observed* to have died produces the same error, carrying the same tail of
+/// the child's own log, whichever platform the user is on.
+///
+/// A liveness query that *fails* is a different case, and the platforms do not
+/// agree on it. Windows degrades to "assume it is alive": `observe_early_exit`
+/// reports `None` when the wait times out or the exit code cannot be read, so the
+/// launch proceeds. Unix propagates the `try_wait` error and fails the launch.
+/// Neither retires the record, because at that point the child may be running and
+/// releasing the engine + model would invite a rival engine onto the same port.
+/// On Unix the record already names the child by then
+/// (`persist_spawned_engine_child`), so the failed launch stays stoppable.
+fn fail_managed_launch_if_engine_died(
+    record: &mut ManagedServiceRecord,
+    startup_exit: Option<ExitStatus>,
+) -> Result<()> {
+    let Some(status) = startup_exit else {
+        return Ok(());
+    };
+    // Warned about, not propagated, for the same reason as
+    // `retire_record_on_error`: the engine's own exit status and log tail are what
+    // diagnose this launch, and a failed record write must not displace them.
+    retire_managed_launch_or_warn(record);
+    bail!(
+        "{}",
+        managed_engine_startup_failure_detail(status, &record.log_path)
+    );
+}
+
+/// Read a watched detached spawn's early exit as an `ExitStatus`.
+///
+/// `GetExitCodeProcess` yields a bare `u32`, which is exactly what
+/// `ExitStatusExt::from_raw` takes on Windows; the conversion is isolated here so
+/// the shared startup check above stays platform-neutral.
+#[cfg(windows)]
+fn managed_startup_exit(spawn: &rocm_core::DetachedSpawn) -> Option<ExitStatus> {
+    use std::os::windows::process::ExitStatusExt as _;
+
+    spawn.early_exit_code.map(ExitStatus::from_raw)
+}
+
+/// Point `record` at a freshly spawned engine child: its pid, plus the start-time
+/// token that lets a later stop verify it is this process and not a recycled pid.
+fn adopt_spawned_engine_child(record: &mut ManagedServiceRecord, child_pid: u32) {
+    record.supervisor_pid = child_pid;
+    record.engine_pid = Some(child_pid);
+    // Captured while the child is (most likely) alive. A child that has already
+    // died yields `None`, which a stop treats as "unverifiable", not as a match.
+    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+}
+
+/// Persist the just-spawned child as a `"starting"` service *before* the Unix
+/// startup check, so every way that check can end leaves an accurate record.
+///
+/// The check is a sleep plus `try_wait`, and a `try_wait` that errors fails the
+/// launch without retiring the record (the child's state is unknown, so freeing
+/// the engine + model could put a rival engine on its port). Without this write,
+/// what that error left on disk described no process at all: a launch record
+/// still at pid 0, which `rocm services stop` cannot reach and no liveness
+/// refresh can demote; or a restart record still naming the previous run's dead
+/// pids, which a pending-stop marker would then read as "stopped" and delete the
+/// endpoint key of a service that may be running. With it, the record names the
+/// child, so a stop can reach it and the liveness refresh reconciles it either
+/// way.
+///
+/// Windows needs no counterpart: its startup check runs inside the spawn call
+/// and cannot fail — a failed query degrades to "assume it is alive" — so the
+/// launch never leaves between learning the pid and recording it.
 #[cfg(not(windows))]
+fn persist_spawned_engine_child(record: &mut ManagedServiceRecord, child_pid: u32) -> Result<()> {
+    adopt_spawned_engine_child(record, child_pid);
+    record.status = "starting".to_owned();
+    record.write()
+}
+
+/// Render a managed engine's immediate exit for the user: the exit status plus a
+/// tail of the child's own service log, which is the only record of why it died —
+/// the child is detached, so nothing else reaches the terminal.
 fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
+    managed_engine_startup_failure_detail_polling(
+        status,
+        log_path,
+        MANAGED_ENGINE_STARTUP_LOG_POLL_INTERVAL,
+    )
+}
+
+/// How long to wait between re-reads of an empty service log before giving up on
+/// a tail. A child that died at startup may still be flushing its last lines.
+const MANAGED_ENGINE_STARTUP_LOG_POLL_INTERVAL: Duration = Duration::from_millis(120);
+
+/// [`managed_engine_startup_failure_detail`] with the re-read interval injected,
+/// so a test of the no-log branch need not sit through the real waits.
+fn managed_engine_startup_failure_detail_polling(
+    status: ExitStatus,
+    log_path: &Path,
+    poll_interval: Duration,
+) -> String {
     let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
     if recent_lines.is_empty() {
         for _ in 0..5 {
-            thread::sleep(Duration::from_millis(120));
+            thread::sleep(poll_interval);
             recent_lines = read_optional_tail_lines(log_path, 80, "service log");
             if !recent_lines.is_empty() {
                 break;
@@ -4049,15 +4269,25 @@ fn spawn_managed_engine_child(
     record.requires_api_key = require_api_key;
     record.write()?;
 
-    if let Some(parent) = record.engine_state_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    // From here up to and including the spawn, every fallible step goes through
+    // `retire_record_on_error`: the record is on disk claiming this engine + model,
+    // so any bail-out that skips the retirement wedges the service just as an
+    // unretired startup death would. The span stops at the spawn — see that
+    // helper's doc for why retiring is no longer the safe default once a child
+    // exists.
+    let engine_state_parent = record.engine_state_path.parent().map(Path::to_path_buf);
+    if let Some(parent) = engine_state_parent {
+        let created = fs::create_dir_all(&parent)
+            .with_context(|| format!("failed to create {}", parent.display()));
+        retire_record_on_error(&mut record, created)?;
     }
-    fs::File::create(&record.log_path)
-        .with_context(|| format!("failed to create {}", record.log_path.display()))?;
-    let current_exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let serve_args = builtin_engine_serve_http_args(
+    let log_created = fs::File::create(&record.log_path)
+        .with_context(|| format!("failed to create {}", record.log_path.display()));
+    retire_record_on_error(&mut record, log_created)?;
+    let launcher =
+        managed_service_launcher_path().context("failed to resolve current rocm executable path");
+    let current_exe = retire_record_on_error(&mut record, launcher)?;
+    let built_args = builtin_engine_serve_http_args(
         engine,
         service_id,
         &resolve.canonical_model_id,
@@ -4070,8 +4300,18 @@ fn spawn_managed_engine_child(
         engine_recipe,
         &record.engine_state_path,
         Some(&record.log_path),
-    )?;
-    let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
+    );
+    let serve_args = retire_record_on_error(&mut record, built_args)?;
+    // E2E-only: swap in arguments the child rejects immediately, so the launch
+    // below observes a real engine that really died during startup.
+    #[cfg(feature = "e2e-test-hooks")]
+    let serve_args = if scripted_managed_engine_startup_failure() {
+        managed_engine_startup_failure_args()
+    } else {
+        serve_args
+    };
+    let envs_root = env_root_for_service(paths, engine, runtime_id, env_id);
+    let engine_envs_root = retire_record_on_error(&mut record, envs_root)?;
     // Hand the child the *path* to the endpoint key file (public bind only) via the
     // environment. A path — not the secret value — is what the detached-spawn
     // primitives accept as an env override, and it keeps the key off both the argv
@@ -4095,11 +4335,15 @@ fn spawn_managed_engine_child(
     //
     // The field is threaded, never derived from the key file. Deriving it marked
     // every public bind as having demanded auth — see the assignment above.
-    ensure_public_service_has_endpoint_key(
+    //
+    // Evaluated before the guard, not inside the call, so reading the record here
+    // does not overlap the `&mut` borrow the retirement needs.
+    let public_key_guard = ensure_public_service_has_endpoint_key(
         host,
         endpoint_key_file.is_some(),
         record.requires_api_key,
-    )?;
+    );
+    retire_record_on_error(&mut record, public_key_guard)?;
     #[cfg(windows)]
     let child_pid = {
         let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
@@ -4107,14 +4351,30 @@ fn spawn_managed_engine_child(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
+        // The detached spawn hands back a bare PID, not a `Child`, so there is no
+        // `try_wait()` to lean on. Watch the process while its handle is still
+        // open instead — the Windows helper does that internally, which is what
+        // makes the check free of the PID-reuse race a later `OpenProcess` would
+        // have.
+        let spawned = rocm_core::spawn_detached_no_inherit_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to launch managed engine process");
+        let spawn = retire_record_on_error(&mut record, spawned)?;
+        fail_managed_launch_if_engine_died(&mut record, managed_startup_exit(&spawn))?;
+        spawn.pid
     };
     #[cfg(not(windows))]
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
+        // Evaluated first so the borrow of `record.log_path` ends before the
+        // `&mut record` the retirement needs.
+        let attached = attach_background_stdio(&mut command, Some(&record.log_path));
+        retire_record_on_error(&mut record, attached)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
@@ -4123,27 +4383,26 @@ fn spawn_managed_engine_child(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
-        let mut child = command
+        let spawned = command
             .spawn()
-            .context("failed to launch managed engine process")?;
+            .context("failed to launch managed engine process");
+        let mut child = retire_record_on_error(&mut record, spawned)?;
         let child_pid = child.id();
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = child
+        persist_spawned_engine_child(&mut record, child_pid)?;
+        thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
+        // NOT routed through `retire_record_on_error`: the child is already
+        // spawned, and a failed query means its state is unknown, not that it
+        // died. Retiring here would release the engine + model to the next serve
+        // while this child may still be listening on the port. The record already
+        // names the child (see `persist_spawned_engine_child`), so a stop can
+        // still reach it.
+        let startup_exit = child
             .try_wait()
-            .context("failed to check managed engine startup state")?
-        {
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
-            );
-        }
+            .context("failed to check managed engine startup state")?;
+        fail_managed_launch_if_engine_died(&mut record, startup_exit)?;
         child_pid
     };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    adopt_spawned_engine_child(&mut record, child_pid);
     record.status = "running".to_owned();
     record.write()?;
 
@@ -4194,10 +4453,13 @@ fn start_managed_service(
     // visible to any concurrent auto-selection. Release the launch lock before
     // the readiness wait below, which can block for many seconds — holding it
     // that long would needlessly serialize unrelated serves.
+    //
+    // What the lock *does* still cover is the startup check above: both platforms
+    // spend `MANAGED_ENGINE_STARTUP_SETTLE` inside `spawn_managed_engine_child`,
+    // so a concurrent serve waits that much longer for the lock. That is
+    // deliberate — the check has to see the child before the record is promoted to
+    // `"running"` — and bounded, unlike the readiness wait.
     drop(launch_lock);
-
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
 
     let readiness = wait_for_service_http_ready_with_progress(
         engine,
@@ -15609,9 +15871,33 @@ fn restart_internal_managed_service(
     }
     // The stop above may have recorded an unconfirmed-stop marker; a successful
     // restart supersedes it. Leaving it set would let the next liveness refresh
-    // delete the key of the service we are bringing back up. Reaches disk with
-    // the record writes below; if the restart bails before one of those, the
-    // marker stays set on disk — correct, since then the stop is what stands.
+    // delete the key of the service we are bringing back up.
+    //
+    // Whether a *failed* restart persists the cleared marker depends on where it
+    // fails, because the marker reaches disk only with the first record write:
+    //
+    // - The plain `?`s between here and the spawn (device policy, log file,
+    //   state directory, launcher, recipe, serve arguments, engine environment)
+    //   leave the record unwritten: the marker stays set and the next refresh
+    //   reclaims the key once the old pids are gone. Nothing was restarted, so
+    //   the stop stands.
+    // - The retired steps — attaching the log to the child's stdio (Unix only,
+    //   and still before the spawn) and the spawn itself — write the record as
+    //   `"failed"` with the marker cleared, naming the previous run's dead pids.
+    //   The key is kept, as for a crashed service; `"failed"` is not live, so
+    //   nothing reuses the service meanwhile.
+    // - Once a child exists, an engine observed dead at startup is retired as
+    //   `"failed"` on both platforms. On Unix the record is first written naming
+    //   the child (`persist_spawned_engine_child`), so a `try_wait` error leaves
+    //   it `"starting"` with the new pid and no marker: the next refresh keeps
+    //   the key while that child lives, and marks the record `"stopped"` (key
+    //   still kept) once it does not. Windows has no failing query — its check
+    //   degrades to "alive".
+    // - A child that passes the check is written as `"starting"` before the
+    //   readiness wait, so the marker is off disk for the whole wait.
+    //
+    // The one exception is a failed record write itself after the spawn: the
+    // restart then bails with the record as the stop left it, marker set.
     record.stop_requested_unix_ms = None;
     let policy = parse_device_policy(record.device_policy.as_deref())?;
     fs::OpenOptions::new()
@@ -15658,14 +15944,31 @@ fn restart_internal_managed_service(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to restart managed engine process")?
+        // Same reasoning as the launch path: without a `Child` to `try_wait()` on,
+        // the only race-free liveness check is the one the Windows helper performs
+        // while the process handle is still open.
+        let spawned = rocm_core::spawn_detached_no_inherit_watching_startup(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            MANAGED_ENGINE_STARTUP_SETTLE,
+        )
+        .context("failed to restart managed engine process");
+        let spawn = retire_record_on_error(&mut record, spawned)?;
+        // A child was spawned, so the restart happened whether or not it
+        // survives startup; count it before the check can retire the record.
+        record.reset_for_restart();
+        fail_managed_launch_if_engine_died(&mut record, managed_startup_exit(&spawn))?;
+        spawn.pid
     };
     #[cfg(not(windows))]
     let child_pid = {
         let mut command = managed_service_process_command(&current_exe, &serve_args);
         command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
+        // Evaluated first so the borrow of `record.log_path` ends before the
+        // `&mut record` the retirement needs.
+        let attached = attach_background_stdio(&mut command, Some(&record.log_path));
+        retire_record_on_error(&mut record, attached)?;
         detach_background_command(&mut command);
         apply_app_path_env(&mut command, paths);
         if let Some(engine_envs_root) = engine_envs_root.as_deref() {
@@ -15674,34 +15977,40 @@ fn restart_internal_managed_service(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
         }
-        let mut child = command
+        let spawned = command
             .spawn()
-            .context("failed to restart managed engine process")?;
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = child
+            .context("failed to restart managed engine process");
+        let mut child = retire_record_on_error(&mut record, spawned)?;
+        // Counted here, before the startup check, for the reason given on the
+        // Windows branch — and before the write below, so a record persisted
+        // mid-check carries a fresh restart time rather than one `rocmd` would
+        // read as a long-stale `"starting"`.
+        record.reset_for_restart();
+        persist_spawned_engine_child(&mut record, child.id())?;
+        thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
+        // Not retired on a failed query, for the reason given at the launch site:
+        // an unknown child state is not a dead child.
+        let startup_exit = child
             .try_wait()
-            .context("failed to check restarted engine startup state")?
-        {
-            record.status = "failed".to_owned();
-            record.write()?;
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
-            );
-        }
+            .context("failed to check restarted engine startup state")?;
+        fail_managed_launch_if_engine_died(&mut record, startup_exit)?;
         child.id()
     };
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
-    record.status = "running".to_owned();
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Refresh the identity token in lockstep with the restarted child's PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
-    // Counts the restart and drops the previous run's inference verification —
-    // the new child has an unloaded model, so the old verdict says nothing about
-    // it.
-    record.reset_for_restart();
+    // `reset_for_restart` ran on each platform's branch above: it counts the
+    // restart and drops the previous run's inference verification, since the new
+    // child has an unloaded model and the old verdict says nothing about it.
+    adopt_spawned_engine_child(&mut record, child_pid);
+    // Persisted before the readiness wait, so the record on disk names the new
+    // child for the whole wait. Left until after it, the record would still
+    // carry the stop's marker and the previous run's dead pids for up to the
+    // full timeout — long enough for any refresh to read "stopped" and delete
+    // the endpoint key of the service coming up.
+    //
+    // As `"starting"`, not `"running"`: the readiness verdict below is what
+    // promotes it, and a `"running"` record whose port is not open yet is one
+    // `rocmd`'s server-recover watcher would treat as unreachable and restart.
+    record.status = "starting".to_owned();
+    record.write()?;
     let readiness = wait_for_service_http_ready(
         &record.engine,
         &record.host,
@@ -27381,6 +27690,384 @@ install therock";
         assert!(found.is_none());
     }
 
+    /// An engine that dies during startup must reach the user with the child's
+    /// own log tail, not just an exit status — the log is the only place the
+    /// reason is recorded, since the child is detached and writes nowhere else.
+    /// Both platforms feed this from the same startup check, so both produce this
+    /// message.
+    #[test]
+    fn managed_engine_startup_failure_detail_carries_the_child_log_tail() {
+        let (root, _paths) = test_paths("managed-startup-failure-detail");
+        fs::create_dir_all(&root).expect("test dir");
+        let log_path = root.join("service.log");
+        fs::write(&log_path, "loading runtime\nfatal: no usable device\n").expect("write log");
+
+        let detail = managed_engine_startup_failure_detail(exit_status_from_code(3), &log_path);
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            detail.contains("managed engine exited immediately"),
+            "unexpected detail: {detail}"
+        );
+        assert!(
+            detail.contains("fatal: no usable device"),
+            "log tail missing from detail: {detail}"
+        );
+        assert!(
+            detail.contains(&log_path.display().to_string()),
+            "log path missing from detail: {detail}"
+        );
+    }
+
+    /// The same failure with no log written yet still has to name the log path so
+    /// the user knows where to look once the child flushes.
+    #[test]
+    fn managed_engine_startup_failure_detail_without_a_log_still_points_at_it() {
+        let (root, _paths) = test_paths("managed-startup-failure-no-log");
+        fs::create_dir_all(&root).expect("test dir");
+        let log_path = root.join("absent.log");
+
+        // Zero interval only keeps this fast: the log never appears, so this pins
+        // the no-tail message and nothing about the re-reads themselves. Those
+        // are pinned by
+        // `managed_engine_startup_failure_detail_picks_up_a_log_written_while_polling`.
+        let detail = managed_engine_startup_failure_detail_polling(
+            exit_status_from_code(1),
+            &log_path,
+            Duration::ZERO,
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            detail.contains(&log_path.display().to_string()),
+            "log path missing from detail: {detail}"
+        );
+        assert!(
+            !detail.contains("recent startup log output"),
+            "empty log should not advertise a tail: {detail}"
+        );
+    }
+
+    /// A child that died at startup may still be flushing its log when the
+    /// failure is rendered. The re-reads exist for exactly that, so the tail
+    /// must appear when the log lands only after the first read found nothing.
+    #[test]
+    fn managed_engine_startup_failure_detail_picks_up_a_log_written_while_polling() {
+        let (root, _paths) = test_paths("managed-startup-failure-late-log");
+        fs::create_dir_all(&root).expect("test dir");
+        let log_path = root.join("late.log");
+
+        // The writer starts the clock only once released, and then waits well
+        // past the first (immediate) read but well inside the re-read window
+        // (5 x 250 ms). Landing the file by rename means a read never sees it
+        // half-written.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let log_path = log_path.clone();
+            let staged = root.join("late.log.partial");
+            thread::spawn(move || {
+                released.recv().expect("release writer");
+                thread::sleep(Duration::from_millis(60));
+                fs::write(&staged, "fatal: flushed after exit\n").expect("stage log");
+                fs::rename(&staged, &log_path).expect("land log");
+            })
+        };
+        release.send(()).expect("release writer");
+        let detail = managed_engine_startup_failure_detail_polling(
+            exit_status_from_code(1),
+            &log_path,
+            Duration::from_millis(250),
+        );
+        writer.join().expect("writer thread");
+
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            detail.contains("fatal: flushed after exit"),
+            "a log written after the first read must still reach the user: {detail}"
+        );
+    }
+
+    /// Build an `ExitStatus` from a plain exit code the way the Windows startup
+    /// check does, i.e. straight from `GetExitCodeProcess`.
+    #[cfg(windows)]
+    fn exit_status_from_code(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        ExitStatus::from_raw(code.cast_unsigned())
+    }
+
+    /// Build an `ExitStatus` from a plain exit code the way the Unix startup
+    /// check does, i.e. from the raw wait status `try_wait` reports.
+    #[cfg(not(windows))]
+    fn exit_status_from_code(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        // Unix wait status: exit code in the high byte, no signal.
+        ExitStatus::from_raw(code << 8)
+    }
+
+    /// A launch that dies at startup must retire its own service record.
+    ///
+    /// The record is written before the spawn, so it still says `"starting"` with
+    /// a `supervisor_pid` of 0. Pid 0 is filtered out of the liveness refresh, so
+    /// nothing ever demotes such a record, while `"starting"` counts as live —
+    /// leaving it would make the idempotency guard report the corpse as already
+    /// running and refuse every later `rocm serve` for the same engine + model.
+    #[test]
+    fn a_failed_launch_record_stops_blocking_the_next_serve() -> Result<()> {
+        let (root, paths) = test_paths("managed-failed-launch-unblocks");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "lemonade-qwen-3000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11512,
+            "managed",
+            // The pre-spawn state: no child pid recorded yet.
+            0,
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        // Precondition: abandoned as written, the record blocks the next launch.
+        assert!(
+            existing_live_managed_service(&paths, "lemonade", "qwen-canonical").is_some(),
+            "a pid-0 `starting` record should look live — that is the trap being closed"
+        );
+
+        mark_managed_launch_failed(&mut record)?;
+
+        let still_blocking = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let _ = fs::remove_dir_all(root);
+        assert!(
+            still_blocking.is_none(),
+            "a failed launch must not keep claiming the engine+model"
+        );
+        Ok(())
+    }
+
+    /// Build the pre-spawn record every managed launch persists to claim its
+    /// engine + model: `"starting"`, with no child pid recorded yet.
+    fn pre_spawn_record(paths: &AppPaths, port: u16) -> ManagedServiceRecord {
+        ManagedServiceRecord::new(
+            paths,
+            "lemonade-qwen-3000",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// The whole user-visible fix in one assertion: an engine that exited during
+    /// startup must fail the launch, name its log, *and* let go of the engine +
+    /// model so the next `rocm serve` can try again.
+    ///
+    /// Both platforms route their startup check through this function — Unix from
+    /// `Child::try_wait`, Windows from the watched detached spawn — so this runs
+    /// everywhere and covers the wiring between detecting the death and acting on
+    /// it, which the two halves tested in isolation do not.
+    #[test]
+    fn a_dead_engine_fails_the_launch_and_frees_the_engine_for_the_next_serve() -> Result<()> {
+        let (root, paths) = test_paths("managed-dead-engine-fails-launch");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11513);
+        record.write()?;
+        fs::write(&record.log_path, "fatal: no usable device\n")?;
+
+        let outcome =
+            fail_managed_launch_if_engine_died(&mut record, Some(exit_status_from_code(3)));
+
+        let still_blocking = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let _ = fs::remove_dir_all(root);
+        let error = outcome
+            .expect_err("an engine that already exited must fail the launch")
+            .to_string();
+        assert!(
+            error.contains("fatal: no usable device"),
+            "the child's log tail is the only account of why it died: {error}"
+        );
+        assert!(
+            still_blocking.is_none(),
+            "a launch that failed at startup must not keep claiming the engine+model"
+        );
+        Ok(())
+    }
+
+    /// What a Unix startup check that cannot query its child leaves behind: the
+    /// record persisted just before the check, which must name the child so a
+    /// stop can reach it and the liveness refresh can reconcile it.
+    ///
+    /// Restart-shaped on purpose — previous run's dead pid, endpoint key on disk,
+    /// stop marker already cleared — because that is the case where an
+    /// inaccurate record cost the most: a refresh read the dead pids as a
+    /// finished stop and deleted the key of a service that may be running.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_spawned_child_is_on_record_before_its_startup_check() -> Result<()> {
+        let (root, paths) = test_paths("managed-child-persisted-before-check");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11517);
+        record.supervisor_pid = 999_999_999;
+        record.status = "stopped".to_owned();
+        record.write()?;
+        endpoint_keys::store_endpoint_api_key(&paths, &record.service_id, "k-restart")?;
+        let mut child = ProcessCommand::new("sleep").arg("30").spawn()?;
+        let child_pid = child.id();
+
+        persist_spawned_engine_child(&mut record, child_pid)?;
+        let while_alive = load_managed_services(&paths)?;
+        let _ = child.kill();
+        let _ = child.wait();
+        let after_exit = load_managed_services(&paths)?;
+        let key_after_exit = endpoint_keys::endpoint_api_key(&paths, &record.service_id);
+        let _ = fs::remove_dir_all(root);
+
+        let alive = while_alive.first().expect("record on disk");
+        assert_eq!(
+            alive.supervisor_pid, child_pid,
+            "the record must name the child"
+        );
+        assert_eq!(alive.engine_pid, Some(child_pid));
+        assert!(
+            alive.supervisor_start_ticks.is_some(),
+            "a stop needs the start-time token to verify it is this child"
+        );
+        assert_eq!(alive.status, "starting", "a live child keeps the claim");
+        let gone = after_exit.first().expect("record on disk");
+        assert_eq!(
+            gone.status, "stopped",
+            "once the child is gone the refresh must reconcile the record"
+        );
+        assert_eq!(
+            key_after_exit.as_deref(),
+            Some("k-restart"),
+            "no stop was requested, so the key must survive the child, as for a crash"
+        );
+        Ok(())
+    }
+
+    /// The converse, and the reason the check can be trusted: a child that is
+    /// still running must leave the launch untouched. If this ever failed, every
+    /// healthy serve would be rejected and its record retired.
+    #[test]
+    fn a_live_engine_leaves_the_launch_running() -> Result<()> {
+        let (root, paths) = test_paths("managed-live-engine-proceeds");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11514);
+        record.write()?;
+
+        let outcome = fail_managed_launch_if_engine_died(&mut record, None);
+
+        let _ = fs::remove_dir_all(root);
+        assert!(outcome.is_ok(), "a running engine must not fail the launch");
+        assert_eq!(
+            record.status, "starting",
+            "a running engine must not have its record retired"
+        );
+        Ok(())
+    }
+
+    /// The helper itself, fed a synthetic failure: it must retire the record and
+    /// hand back the *original* error, since that is what reaches the user.
+    ///
+    /// This proves the helper, not that any launch or restart calls it — the
+    /// call-site wiring is pinned by the real launch failures driven through
+    /// `spawn_managed_engine_child` (the key-guard refusal and the missing
+    /// runtime), which leave the record retired only if their site retires it.
+    #[test]
+    fn retire_record_on_error_retires_the_record_and_keeps_the_original_error() -> Result<()> {
+        let (root, paths) = test_paths("managed-spawn-failure-unblocks");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11515);
+        record.write()?;
+
+        let outcome: Result<u32> = retire_record_on_error(
+            &mut record,
+            Err(anyhow::anyhow!("failed to launch managed engine process")),
+        );
+
+        let still_blocking = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
+        let _ = fs::remove_dir_all(root);
+        let error = outcome
+            .expect_err("a failed spawn must fail the launch")
+            .to_string();
+        assert!(
+            error.contains("failed to launch managed engine process"),
+            "the spawn failure must survive the retirement: {error}"
+        );
+        assert!(
+            still_blocking.is_none(),
+            "a spawn that never started must not keep claiming the engine+model"
+        );
+        Ok(())
+    }
+
+    /// A retirement that cannot be written must say so — the record it failed to
+    /// write still claims the engine + model — while the launch's own error stays
+    /// the one returned.
+    #[test]
+    fn a_retirement_that_cannot_be_written_is_reported_not_swallowed() -> Result<()> {
+        let (root, paths) = test_paths("managed-retirement-write-fails");
+        paths.ensure()?;
+        let mut record = pre_spawn_record(&paths, 11518);
+        // A directory where the manifest file should be makes the write fail.
+        fs::create_dir_all(&record.manifest_path)?;
+
+        let warning = managed_launch_retirement_warning(&mut record);
+        let manifest_is_still_unwritten = record.manifest_path.is_dir();
+        let outcome: Result<u32> =
+            retire_record_on_error(&mut record, Err(anyhow::anyhow!("spawn refused")));
+        let _ = fs::remove_dir_all(root);
+
+        let warning = warning.expect("a failed retirement must produce a warning");
+        assert!(
+            manifest_is_still_unwritten,
+            "precondition: the retirement really did not reach disk"
+        );
+        assert!(
+            warning.contains("lemonade-qwen-3000") && warning.contains("failed to write"),
+            "the warning must name the service and the write that failed: {warning}"
+        );
+        let error = outcome.expect_err("the launch must still fail").to_string();
+        assert_eq!(
+            error, "spawn refused",
+            "the launch's own error is what reaches the user"
+        );
+        Ok(())
+    }
+
+    /// The Windows adapter between the watched spawn and the shared startup
+    /// check: an observed exit code has to arrive as that exit code, and a child
+    /// still running has to arrive as "no exit".
+    #[cfg(windows)]
+    #[test]
+    fn managed_startup_exit_reads_the_watched_exit_code() {
+        let exited = rocm_core::DetachedSpawn {
+            pid: 4242,
+            early_exit_code: Some(7),
+        };
+        assert_eq!(
+            managed_startup_exit(&exited).and_then(|status| status.code()),
+            Some(7)
+        );
+
+        let running = rocm_core::DetachedSpawn {
+            pid: 4242,
+            early_exit_code: None,
+        };
+        assert!(managed_startup_exit(&running).is_none());
+    }
+
     #[test]
     fn spawn_managed_engine_child_blocks_reuse_with_mismatched_recipe() -> Result<()> {
         // A live service recorded with one recipe (e.g. a tool-call parser flag)
@@ -27608,6 +28295,10 @@ install therock";
             None,
             true,
         );
+        // The refusal fires after the claiming record is written, so this is a
+        // real launch path abandoning its pid-0 `"starting"` record — the one
+        // `retire_record_on_error` exists for. Read before the cleanup below.
+        let still_claimed = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
 
         let Err(error) = result else {
@@ -27621,6 +28312,68 @@ install therock";
         assert!(
             message.contains("without authentication"),
             "the refusal must say what the risk is: {message}"
+        );
+        assert!(
+            still_claimed.is_none(),
+            "a refused launch must retire its record, or every later `rocm serve` for \
+             this engine + model is refused as already running"
+        );
+        Ok(())
+    }
+
+    /// A second real launch-path failure after the record write, at a different
+    /// call site from the key-guard refusal above: the runtime the launch names
+    /// has no installed manifest, so resolving its engine environment fails
+    /// before any child is spawned. No GPU, engine, or network is involved.
+    #[test]
+    fn a_managed_spawn_naming_a_missing_runtime_frees_the_engine_for_the_next_serve() -> Result<()>
+    {
+        let (root, paths) = test_paths("managed-spawn-missing-runtime");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+        let resolve = ResolveModelResponse {
+            canonical_model_id: "qwen-canonical".to_owned(),
+            task: "chat".to_owned(),
+            source: "hf".to_owned(),
+            revision: "main".to_owned(),
+            loader: "vllm".to_owned(),
+            trust_remote_code: false,
+            chat_template_mode: "auto".to_owned(),
+            dtype: "auto".to_owned(),
+            device_policy: DevicePolicy::GpuPreferred,
+            estimated_memory: "unknown".to_owned(),
+            launch_defaults: serde_json::json!({}),
+            engine_recipe: None,
+            warnings: Vec::new(),
+        };
+
+        let result = spawn_managed_engine_child(
+            &paths,
+            // vLLM, not Lemonade: Lemonade manages its own runtime and never
+            // looks the runtime manifest up, so it would not reach this failure.
+            "vllm",
+            "vllm-qwen-3000",
+            "qwen",
+            &resolve,
+            "127.0.0.1",
+            11516,
+            &resolve.device_policy,
+            &[],
+            Some("no-such-runtime"),
+            None,
+            None,
+            false,
+        );
+        let still_claimed = existing_live_managed_service(&paths, "vllm", "qwen-canonical");
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            result.is_err(),
+            "a launch naming an uninstalled runtime must fail before spawning"
+        );
+        assert!(
+            still_claimed.is_none(),
+            "a launch that failed before its spawn must not keep claiming the engine+model"
         );
         Ok(())
     }

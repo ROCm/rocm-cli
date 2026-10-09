@@ -295,3 +295,28 @@ Feature: Model serving
     When the user previews a vLLM serve plan pinned to that GPU
     Then the serve plan warns the GPU is low on VRAM
     And the serve plan explains how to lower vLLM's memory reservation
+
+  # A managed engine is spawned detached, so if it dies on the way up there is no
+  # terminal for it to report to: the child's own service log is the only account
+  # of why. The startup check that catches such a death used to exist only on
+  # Unix; on Windows the launch was reported as a success and left the user
+  # waiting on a server that would never come up. This pins the Windows check
+  # alongside the Unix one, plus the retirement of the failed launch's record
+  # that both now share. The engine is
+  # scripted to die at startup in test builds (`rocm/e2e-test-hooks`), which also
+  # waives the no-GPU pre-flight and engine preparation so this reaches a real
+  # spawn without GPU hardware or a runtime download — the death itself is real,
+  # only its trigger is scripted.
+  #
+  # Carries no host tag on purpose, so it runs on every lane. `@requires-no-gpu`
+  # would have been wrong twice over: the premise is a dead engine, not an absent
+  # GPU, and that tag is skipped on any host that HAS a GPU — which would have
+  # excluded the Windows lane, the one place the Windows half of the startup check
+  # can actually execute. The waivers above are what make the premise hold
+  # regardless of the host's hardware.
+  @id:serve-managed-engine-dies-at-startup
+  Scenario: serve-24 - An engine that dies at startup fails the serve and names its log
+    Given the managed engine dies during startup
+    When the user serves a model with Lemonade
+    Then serving fails and names the engine's own log
+    And the failed launch does not block the next serve
