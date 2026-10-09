@@ -578,7 +578,9 @@ The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
 local run. They are Unix-only because they plant symlinks.
 
 The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
-behaviour through the built binary, confined to the scenario's own folder:
+behaviour through the built binary, confined to the scenario's own folder,
+including a folder that cannot be checked stopping the uninstall before
+anything is removed:
 
 ```bash
 cargo xtask e2e -- -n "uninstall-"

@@ -31,3 +31,12 @@ Feature: Uninstall
     Then the uninstall succeeds
     And the uninstall reports the cache link as removed
     And the cache link is gone
+
+  @id:uninstall-unreadable-root-stops-before-removing @requires-os:linux
+  Scenario: uninstall-03 - A cache folder that cannot be checked stops the uninstall before anything is removed
+    Given the config folder holds the user's files
+    And the cache folder is reached through a link that points at itself
+    When the user uninstalls the config and the cache
+    Then the uninstall fails
+    And the error names the cache folder it could not check
+    And the config folder still holds the user's files
