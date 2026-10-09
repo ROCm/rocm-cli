@@ -496,6 +496,7 @@ repository.
 | toml_writer | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
 | tower | 0.5.3 | MIT |
 | tower-http | 0.6.11 | MIT |
+| tower-http | 0.7.0 | MIT |
 | tower-layer | 0.3.3 | MIT |
 | tower-service | 0.3.3 | MIT |
 | tracing | 0.1.44 | MIT |
