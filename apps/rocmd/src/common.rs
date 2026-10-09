@@ -63,10 +63,14 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
             return CodexBridgeGpuSnapshot {
                 // `{error:#}` rather than `to_string()`: the outermost context
                 // alone says "failed to launch amd-smi ...", which names the
-                // wrong thing when what actually happened was a timeout or a
-                // JSON parse failure. The note is the only account of this that
-                // reaches the bridge snapshot and the automation watcher, so it
-                // carries the causes too.
+                // wrong thing when what actually happened was a timeout. (Only
+                // the timeout: the non-zero-exit and parse failures below are
+                // their own outermost context and already read correctly.) The
+                // note is the only account of this that reaches the bridge
+                // snapshot and the automation watcher, so it carries the causes
+                // too -- bounded, because it is persisted; see
+                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`. Pinned by
+                // `examine-21`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,

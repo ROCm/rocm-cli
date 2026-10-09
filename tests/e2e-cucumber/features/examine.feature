@@ -285,8 +285,10 @@ Feature: GPU detection and system inspection
   # reading `failed to launch amd-smi static -a -g all --json`. The note blamed
   # the launch rather than the timeout that actually happened, because
   # `gather_gpu_snapshot` rendered only the outermost context; it now uses
-  # `{error:#}` and carries the cause. That answer feeds `bridge-snapshot`, the
-  # `examine_snapshot` and `bridge_snapshot` tools, and the automation watcher.
+  # `{error:#}` and carries the cause. That answer feeds `rocmd
+  # bridge-snapshot`, the `gpu_snapshot` and `bridge_snapshot` MCP tools, and
+  # the automation watcher. (Not `examine_snapshot`: that sandbox tool returns
+  # an `ExamineSummary` only and never reads this snapshot.)
   #
   # The size of the output is the whole premise, so the stub emits ~150KiB --
   # over two buffers. A stub that printed a few hundred bytes would pass against
@@ -307,3 +309,26 @@ Feature: GPU detection and system inspection
     Given amd-smi reports more output than a pipe buffer holds
     When the daemon gathers a bridge snapshot
     Then the snapshot reports amd-smi as available and carries every GPU it described
+
+  # The other side of examine-20's note, and the reason the note needs a size
+  # limit. When the probe really does time out, `{error:#}` renders the whole
+  # chain -- including `run_with_timeout`'s quote of what the child printed.
+  # With an amd-smi that prints a snapshot's worth of JSON and only then
+  # stalls, that quote is the entire payload, and the note is not a terminal
+  # message: `record_gpu_metrics` copies it into the automation-event and audit
+  # JSONL files every 60s, and both append helpers rewrite the whole file each
+  # time. Unbounded, the logs grew by the payload's size every minute and each
+  # write cost more than the last. So the note must name the timeout, keep
+  # enough of the child's output to be worth reading, say that it was shortened
+  # -- and stay small.
+  #
+  # Asserted here rather than only as a unit test because the note's journey is
+  # the point: the bound lives in `rocm-core`'s `run_with_timeout` and the
+  # claim being made is about what `rocmd` finally reports.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-20 above.
+  @id:examine-telemetry-note-is-bounded-when-amd-smi-stalls @requires-os:linux
+  Scenario: examine-21 - A stalled amd-smi leaves a bounded note that names the timeout
+    Given amd-smi prints more than a pipe buffer holds and then stalls
+    When the daemon gathers a bridge snapshot
+    Then the snapshot reports amd-smi as unavailable with a bounded note naming the timeout

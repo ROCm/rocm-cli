@@ -28,6 +28,40 @@ const READ_CHUNK: usize = 16 * 1024;
 /// genuinely finished has at most a buffer or two left to collect here.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
+/// How much of a timed-out child's own output the timeout error quotes.
+///
+/// Bounded here rather than at any one caller because the quote is assembled
+/// here, and this is the only place that knows those characters are raw child
+/// output rather than something this crate wrote. All four callers inherit it.
+///
+/// The bound matters because the message does not stop at a terminal. `rocmd`
+/// renders the whole error chain into the bridge snapshot's `note`, and the
+/// GPU-metrics watcher copies that note into the automation-event and audit
+/// JSONL files once a minute — files whose append helpers rewrite the whole
+/// file each time. Unbounded, a child that prints a megabyte and then stalls
+/// past its timeout grows both logs by that much per minute, and every
+/// subsequent append costs more than the last.
+///
+/// Sized to still hold a real stderr backtrace: the point is to stop a
+/// payload-sized quote, not to shorten diagnostics.
+const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
+
+/// Truncate `value` to at most `max_chars` characters, appending a marker when
+/// truncated. Slices on char boundaries; a byte slice would panic when the cut
+/// lands inside a multibyte character.
+///
+/// Matches `examine.rs`'s `truncate_to_chars` and `host_gpu.rs`'s
+/// `truncate_diagnostic_line` — same shape, same visible marker — so a reader
+/// who has met one recognises the others.
+fn truncate_to_chars(value: String, max_chars: usize) -> String {
+    if value.chars().count() > max_chars {
+        let truncated: String = value.chars().take(max_chars).collect();
+        format!("{truncated}...[truncated]")
+    } else {
+        value
+    }
+}
+
 /// One captured stream: the bytes so far, whether its reader saw EOF, and the
 /// read error that stopped it, if one did.
 #[derive(Clone)]
@@ -173,16 +207,23 @@ pub fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) ->
     if timed_out {
         let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
+        // Truncated, not dropped: what the child managed to say before it
+        // stalled is usually the whole explanation, and the timeout is named
+        // first either way, so a reader who only sees the head still learns
+        // which command gave up and why.
         bail!(
             "{label} exceeded {}s timeout: {}",
             timeout.as_secs(),
-            if !stderr.is_empty() {
-                stderr
-            } else if !stdout.is_empty() {
-                stdout
-            } else {
-                "no output".to_owned()
-            }
+            truncate_to_chars(
+                if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    stdout
+                } else {
+                    "no output".to_owned()
+                },
+                MAX_QUOTED_OUTPUT_CHARS,
+            )
         );
     }
 
@@ -232,7 +273,10 @@ mod tests {
     fn a_command_that_succeeds_reports_its_output() {
         let mut command = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
         if cfg!(windows) {
-            command.args(["/C", "echo hello"]);
+            // No space around `&`: cmd would carry a trailing one into the
+            // echoed text, which `trim` hides on stdout but is easier not to
+            // write than to explain.
+            command.args(["/C", "echo hello&echo oops 1>&2"]);
         } else {
             command.args(["-c", "echo hello; echo oops >&2"]);
         }
@@ -241,9 +285,10 @@ mod tests {
 
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
-        if !cfg!(windows) {
-            assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "oops");
-        }
+        // Asserted on Windows too: `1>&2` is a cmd redirection like any other,
+        // and skipping it there left the second pipe — the one whose separate
+        // reader this function exists to provide — unchecked on that platform.
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "oops");
     }
 
     #[cfg(unix)]
@@ -463,6 +508,181 @@ mod tests {
             output.stderr.len() > 64 * 1024,
             "stderr must exceed one pipe buffer: {} bytes",
             output.stderr.len()
+        );
+    }
+
+    /// How large a quoted-output assertion lets the whole error message get.
+    ///
+    /// Comfortably above `MAX_QUOTED_OUTPUT_CHARS` plus the label and marker,
+    /// and two orders of magnitude below the ~200KB the fixtures below feed in,
+    /// so the assertion answers "is it bounded at all" rather than pinning the
+    /// exact constant — which is a tuning decision, not a contract.
+    const QUOTE_ASSERTION_CEILING: usize = 4000;
+
+    /// The flooding fixtures below write this many bytes, past one pipe buffer
+    /// and ~100x the quote bound.
+    const FLOOD_BYTES: usize = 200_000;
+
+    const FLOOD_CANARY: &str = "flood-canary";
+
+    /// The assertions shared by both platforms' timeout-quote cases.
+    ///
+    /// Checked together because they trade off against each other: a bound that
+    /// kept nothing would satisfy the size check while making the message
+    /// useless, and quoting everything keeps it useful while costing the logs
+    /// the thing this bound exists to protect.
+    fn assert_timeout_quote_is_bounded_and_useful(message: &str, timeout_secs: u64) {
+        assert!(
+            message.contains(&format!("exceeded {timeout_secs}s timeout")),
+            "the timeout must still be named: {message:?}"
+        );
+        assert!(
+            message.contains(FLOOD_CANARY),
+            "the child's own output must still be quoted, not dropped: {message:?}"
+        );
+        assert!(
+            message.contains("[truncated]"),
+            "a shortened quote must say so, or a reader takes the head for the whole: {message:?}"
+        );
+        let length = message.chars().count();
+        assert!(
+            length <= QUOTE_ASSERTION_CEILING,
+            "the quote must be bounded: the message is {length} characters, from a child that \
+             printed {FLOOD_BYTES} bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_child_has_its_output_quoted_within_a_bound() {
+        for shell in grandchild_shells() {
+            // Both halves are load-bearing. The flood is what makes the quote
+            // large; the backgrounded `sleep` is what makes this a timeout,
+            // which is the only path that quotes the child's output at all.
+            //
+            // Unbounded, this message travels: `rocmd` renders the error chain
+            // into the bridge snapshot's `note`, and the GPU-metrics watcher
+            // writes that note into two JSONL logs every 60s, rewriting each
+            // file whole. A real amd-smi on a multi-GPU host prints well past
+            // this fixture's size.
+            let mut command = Command::new(shell);
+            command.args([
+                "-c",
+                &format!("yes {FLOOD_CANARY} | head -c {FLOOD_BYTES} >&2; sleep 30 & wait"),
+            ]);
+
+            let error = run_with_timeout(command, Duration::from_secs(1), "process")
+                .expect_err("a command that outlives its timeout must fail");
+
+            assert_timeout_quote_is_bounded_and_useful(&format!("{error:#}"), 1);
+        }
+    }
+
+    /// A scratch directory holding a Windows fixture's script and payload.
+    ///
+    /// Per-process unique so concurrent test binaries cannot collide on it, and
+    /// removed on drop so a failing assertion does not leave the payload behind.
+    #[cfg(windows)]
+    struct WindowsFixture {
+        dir: std::path::PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl WindowsFixture {
+        /// Write `script` as a batch file next to a `FLOOD_BYTES` payload.
+        ///
+        /// A batch file rather than `cmd /C "<command line>"`: cmd's rules for
+        /// stripping the quotes Rust adds around an argument containing spaces
+        /// and redirections are subtle enough that the fixture would become the
+        /// thing under test. A bare path has none of that, and `%~dp0` inside
+        /// the script resolves the payload without the test passing a path in.
+        fn new(name: &str, script: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("rocm-cli-process-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("failed to create the fixture directory");
+
+            let line = format!("{FLOOD_CANARY}\r\n");
+            let mut payload = String::with_capacity(FLOOD_BYTES + line.len());
+            while payload.len() < FLOOD_BYTES {
+                payload.push_str(&line);
+            }
+            std::fs::write(dir.join("payload.txt"), payload).expect("failed to write the payload");
+            std::fs::write(dir.join("fixture.bat"), script).expect("failed to write the script");
+
+            Self { dir }
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new("cmd");
+            command.args(["/C"]).arg(self.dir.join("fixture.bat"));
+            command
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for WindowsFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_child_that_floods_both_pipes_does_not_deadlock() {
+        // The Windows half of the unix case above, and the same property: both
+        // pipes are bounded by the OS here too — more tightly than on Linux —
+        // so an implementation that drains only after the child exits, or
+        // drains stdout to completion before starting on stderr, never lets
+        // this child finish. `type` twice is the shell-free equivalent of the
+        // unix `yes | head`; cmd has no `yes`.
+        let fixture = WindowsFixture::new(
+            "flood",
+            "@echo off\r\ntype \"%~dp0payload.txt\"\r\ntype \"%~dp0payload.txt\" 1>&2\r\n",
+        );
+
+        let output = run_with_timeout(fixture.command(), Duration::from_secs(30), "process")
+            .expect("a child that outruns the pipe buffer must not be killed as a timeout");
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            output.stdout.len() > 64 * 1024,
+            "stdout must exceed one pipe buffer: {} bytes",
+            output.stdout.len()
+        );
+        assert!(
+            output.stderr.len() > 64 * 1024,
+            "stderr must exceed one pipe buffer: {} bytes",
+            output.stderr.len()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_timed_out_child_has_its_output_quoted_within_a_bound() {
+        // Covers on Windows what three separate unix cases cover there, because
+        // one fixture happens to exhibit all of it: `ping -n 30` runs for ~29
+        // seconds, so the call times out; `ping` is a grandchild of the `cmd`
+        // this function kills at the deadline, and killing a process on Windows
+        // does not kill its children, so it keeps the inherited write ends open
+        // and no EOF arrives — an implementation that joins its readers waits
+        // the full 29 seconds; and the preceding flood makes the resulting
+        // quote large enough for the bound to matter.
+        let fixture = WindowsFixture::new(
+            "timeout",
+            "@echo off\r\ntype \"%~dp0payload.txt\" 1>&2\r\nping -n 30 127.0.0.1\r\n",
+        );
+
+        let started = Instant::now();
+        let error = run_with_timeout(fixture.command(), Duration::from_secs(2), "process")
+            .expect_err("a command that outlives its timeout must fail");
+        let elapsed = started.elapsed();
+
+        assert_timeout_quote_is_bounded_and_useful(&format!("{error:#}"), 2);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the call must return at its deadline rather than waiting for an abandoned \
+             grandchild to exit, but it took {elapsed:?}"
         );
     }
 }

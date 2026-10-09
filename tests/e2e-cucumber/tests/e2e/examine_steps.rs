@@ -1297,8 +1297,11 @@ async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
     );
 }
 
-#[given("amd-smi reports more output than a pipe buffer holds")]
-async fn stub_amd_smi_with_large_output(world: &mut E2eWorld) {
+/// Write the stub's ~150KiB `payload.json` and return its path.
+///
+/// Shared by the two stub scenarios below, which differ only in what the script
+/// does after printing it.
+fn write_stub_payload(world: &E2eWorld) -> PathBuf {
     let bin_dir = stub_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the amd-smi stub directory");
 
@@ -1326,22 +1329,45 @@ async fn stub_amd_smi_with_large_output(world: &mut E2eWorld) {
         serde_json::to_string(&gpus).expect("failed to render the stub amd-smi payload"),
     )
     .expect("failed to write the stub amd-smi payload");
+    payload
+}
 
-    // Answers every probe the snapshot makes (`static` and `monitor`) with the
-    // same document: which one it is does not matter to a test about output
-    // size, and branching on argv would only add a way to get it wrong.
-    let stub = bin_dir.join("amd-smi");
-    std::fs::write(
-        &stub,
-        format!("#!/bin/sh\nexec cat {}\n", payload.display()),
-    )
-    .expect("failed to write the amd-smi stub");
+/// Install an executable stub `amd-smi` whose script body is `body`.
+///
+/// The stub answers every probe the snapshot makes (`static` and `monitor`)
+/// with the same script: which probe it is does not matter to a test about
+/// output size, and branching on argv would only add a way to get it wrong.
+fn write_amd_smi_stub(world: &E2eWorld, body: &str) {
+    let stub = stub_bin_dir(world).join("amd-smi");
+    std::fs::write(&stub, format!("#!/bin/sh\n{body}\n"))
+        .expect("failed to write the amd-smi stub");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .expect("failed to make the amd-smi stub executable");
     }
+}
+
+#[given("amd-smi reports more output than a pipe buffer holds")]
+async fn stub_amd_smi_with_large_output(world: &mut E2eWorld) {
+    let payload = write_stub_payload(world);
+    write_amd_smi_stub(world, &format!("exec cat {}", payload.display()));
+}
+
+#[given("amd-smi prints more than a pipe buffer holds and then stalls")]
+async fn stub_amd_smi_that_stalls_after_printing(world: &mut E2eWorld) {
+    let payload = write_stub_payload(world);
+    // Print first, then stall: the order is what makes the timeout error quote
+    // the payload, which is the thing the bound has to cut down. A stub that
+    // only slept would time out with nothing to quote and the note would be
+    // short however this is implemented.
+    //
+    // The sleep only has to outlast the 2s probe budget. It is kept short
+    // anyway because killing the stub shell does not reliably kill a `sleep`
+    // the shell forked, and an orphan that outlives the scenario by half a
+    // minute is a nuisance on a shared runner.
+    write_amd_smi_stub(world, &format!("cat {}\nsleep 10", payload.display()));
 }
 
 #[when("the daemon gathers a bridge snapshot")]
@@ -1367,8 +1393,9 @@ async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
     //
     // So point `HOME` at the isolated root for this invocation only. Scoped here
     // rather than added to `isolate_env`, because other scenarios deliberately
-    // inherit the real HOME/XDG environment (see `isolate_env`'s note on PTY
-    // defaults) and would change behaviour if it moved.
+    // inherit the real HOME/XDG environment -- `pty_env` is where the isolated
+    // HOME lives, and it documents why it applies to interactive sessions only
+    // -- and they would change behaviour if it moved.
     let isolated_home = world
         .isolated_root
         .as_ref()
@@ -1434,5 +1461,63 @@ async fn assert_telemetry_survived_large_output(world: &mut E2eWorld) {
         gpu["note"],
         serde_json::Value::Null,
         "a snapshot that read both probes in full has nothing to explain\n{stderr}"
+    );
+}
+
+/// The ceiling the stalled-probe note must stay under.
+///
+/// Set against `run_with_timeout`'s 2000-character quote bound plus the error
+/// chain around it, and ~40x below the ~150KiB payload the stub prints, so this
+/// asks "is it bounded at all" rather than pinning a constant that is a tuning
+/// decision.
+const MAX_NOTE_CHARS: usize = 4000;
+
+#[then("the snapshot reports amd-smi as unavailable with a bounded note naming the timeout")]
+async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    // The snapshot is still a successful snapshot: a probe that timed out
+    // degrades the GPU section, it does not fail the command.
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(false),
+        "a probe that never returned cannot have reported a GPU: {gpu}"
+    );
+    let note = gpu["note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a degraded snapshot must explain itself: {gpu}"));
+
+    // What the note claims, asserted where it is claimed. The outer context
+    // alone ("failed to launch") named the wrong thing; `{error:#}` is what
+    // puts the timeout in front of a reader, and nothing else checks that.
+    assert!(
+        note.contains("failed to launch amd-smi static"),
+        "the note must still say which probe gave up: {note:?}"
+    );
+    assert!(
+        note.contains("exceeded 2s timeout"),
+        "the note must name the timeout rather than blaming the launch: {note:?}"
+    );
+
+    // And the bound, checked on the same note, because the two pull against
+    // each other: dropping the child's output entirely would satisfy the size
+    // check while losing the diagnostic, and keeping all of it costs the
+    // automation and audit logs the payload's size every 60s.
+    assert!(
+        note.contains("...[truncated]"),
+        "a shortened note must say so, or a reader takes the head for the whole: {note:?}"
+    );
+    let length = note.chars().count();
+    assert!(
+        length <= MAX_NOTE_CHARS,
+        "the note must be bounded before it reaches the bridge snapshot and the automation \
+         logs, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
     );
 }
