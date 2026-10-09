@@ -11181,10 +11181,21 @@ exit 1
 #[cfg(all(test, unix))]
 mod archive_properties {
     use super::extract_tarball_and_discard_archive;
-    use crate::archive_props::{Expect, entries, run_case, run_property, tar_gz_bytes};
+    use crate::archive_props::{
+        Expect, Modes, benign_entries, check_round_trip, entries, note_mode_scope, run_case,
+        run_property, tar_gz_bytes,
+    };
 
+    /// No escape, and no setuid/setgid or world-writable entry. The modes are
+    /// what the system `tar` gives an unprivileged user, so they are not
+    /// judged when this runs as root (see `Modes`).
     #[test]
     fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let expect = Expect {
+            modes: Modes::SafeUnlessRoot,
+            no_outward_links: false,
+        };
+        note_mode_scope("therock", expect.modes);
         run_property("therock", 256, entries(), Some(5), |layout, entries| {
             run_case(
                 layout,
@@ -11196,11 +11207,29 @@ mod archive_properties {
                     extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
                 },
             )
-            .judge(Expect {
-                safe_modes: true,
-                no_outward_links: false,
-            })
+            .judge(expect)
         })
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed tarball is extracted in full, into
+    /// the install root it was given. An unpack that wrote somewhere else
+    /// entirely escapes the oracle above; this catches it.
+    #[test]
+    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        run_property(
+            "therock-benign",
+            64,
+            benign_entries(),
+            None,
+            |layout, entries| {
+                let archive = layout.base.join("sdk.tar.gz");
+                std::fs::write(&archive, tar_gz_bytes(entries)).unwrap();
+                extract_tarball_and_discard_archive(&archive, &layout.dest)
+                    .map_err(|error| format!("{error:#}"))?;
+                check_round_trip(&layout.dest.join("top"), entries)
+            },
+        )
         .unwrap();
     }
 }

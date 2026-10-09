@@ -17,10 +17,22 @@
 //!   is mostly `..`, `.`, empty components, mixed separators and links, so the
 //!   dangerous shapes actually occur instead of being drowned in random text;
 //! - the **oracle** never re-derives the extractor's path logic: it snapshots
-//!   the real filesystem around the extraction root before and after, and
+//!   the whole per-case temporary directory before and after, and
 //!   walks/canonicalizes what is actually on disk.
 //!
-//! Unix-only: the oracle reads mode bits, inode numbers and symlinks.
+//! Every case runs in a fresh temporary directory laid out so that nothing
+//! the generator can name reaches past it (see [`Layout`]): absolute names and
+//! link targets are re-rooted inside it, and the extraction root sits deeper
+//! than any `..` chain the generator can build. An extractor that escapes its
+//! root therefore writes somewhere the oracle watches, never onto the host.
+//! The one escape that leaves the temporary directory regardless is an
+//! extractor ignoring its destination altogether (`tar` without `-C` writes
+//! into the working directory); [`check_round_trip`] over [`benign_entries`]
+//! is what catches that.
+//!
+//! Unix-only: the oracle reads mode bits, inode numbers and symlinks. Mode
+//! checks read the process umask and effective uid from `/proc/self/status`,
+//! because what an extractor may leave behind depends on both (see [`Modes`]).
 
 #![cfg(all(test, unix))]
 #![allow(
@@ -45,6 +57,28 @@ use proptest::prelude::*;
 /// Placeholder for "an absolute path into the sibling `outside/` directory";
 /// substituted per case once the temporary layout exists.
 pub const OUTSIDE_TOKEN: &str = "@OUT";
+
+/// Most members in one generated archive.
+const MAX_ENTRIES: usize = 6;
+
+/// Most components in one generated name.
+const MAX_COMPONENTS: usize = 4;
+
+/// Most `..` steps one generated name or link target can take: one per
+/// component, even for an extractor that reads `\` as a separator (no
+/// component holds more than one `..`, which is what keeps [`NESTING`], and
+/// so the cost of every case, small).
+const MAX_UP_PER_STRING: usize = MAX_COMPONENTS;
+
+/// How many directories a [`Fence`] nests each case's fake root under the
+/// temporary directory. A path the generator builds starts at the extraction root, at
+/// the fake root (absolute names and targets are re-rooted there), or where an
+/// earlier member's link lands, and its own name or target then climbs at most
+/// [`MAX_UP_PER_STRING`]. Each member contributes a name and at most one
+/// target, so no chain over one archive climbs more than
+/// `MAX_ENTRIES * 2 * MAX_UP_PER_STRING` above the fake root; one more level
+/// keeps even that inside the temporary directory.
+const NESTING: usize = MAX_ENTRIES * 2 * MAX_UP_PER_STRING + 1;
 
 /// What one archive member is.
 #[derive(Clone, Debug)]
@@ -74,7 +108,7 @@ fn component() -> impl Strategy<Value = Vec<u8>> {
         4 => Just(b"l".to_vec()),
         3 => Just(b"a".to_vec()),
         1 => Just(b"b".to_vec()),
-        1 => Just(b"..\\..\\x".to_vec()),
+        1 => Just(b"..\\x".to_vec()),
         1 => Just(b"a\\b".to_vec()),
         1 => Just(b"C:".to_vec()),
         1 => Just(b"C:\\x".to_vec()),
@@ -82,6 +116,7 @@ fn component() -> impl Strategy<Value = Vec<u8>> {
         1 => Just(vec![0xff, 0xfe]),
         1 => Just(b"x\0y".to_vec()),
         1 => Just(vec![b'n'; 120]),
+        1 => Just(b"victim".to_vec()),
     ]
 }
 
@@ -108,7 +143,7 @@ fn prefix() -> impl Strategy<Value = Vec<u8>> {
 pub fn name() -> impl Strategy<Value = Vec<u8>> {
     (
         prefix(),
-        prop::collection::vec((component(), separator()), 1..=4),
+        prop::collection::vec((component(), separator()), 1..=MAX_COMPONENTS),
     )
         .prop_map(|(prefix, parts)| {
             let mut out = prefix;
@@ -128,6 +163,7 @@ fn link_target() -> impl Strategy<Value = Vec<u8>> {
         2 => Just(format!("{OUTSIDE_TOKEN}/sentinel").into_bytes()),
         2 => Just(b"../outside".to_vec()),
         2 => Just(b"../../outside".to_vec()),
+        1 => Just(b"../victim".to_vec()),
         1 => Just(b"/".to_vec()),
         1 => Just(b".".to_vec()),
         3 => name(),
@@ -180,12 +216,13 @@ fn entry() -> impl Strategy<Value = Entry> {
 
 /// A whole archive: 1-6 members.
 pub fn entries() -> impl Strategy<Value = Vec<Entry>> {
-    prop::collection::vec(entry(), 1..=6)
+    prop::collection::vec(entry(), 1..=MAX_ENTRIES)
 }
 
 /// Archives that every extractor must accept: plain relative names built only
-/// from safe components, regular files and directories, ordinary modes. Used
-/// for the "does not over-reject / extracts what it was given" direction.
+/// from safe components, regular files and directories, ordinary modes. Each
+/// extractor's tests run these through [`check_round_trip`], the "does not
+/// over-reject / extracts what it was given, where it was told to" direction.
 pub fn benign_entries() -> impl Strategy<Value = Vec<Entry>> {
     let part = prop_oneof![Just("a"), Just("b"), Just("c"), Just("d.txt")];
     prop::collection::vec(
@@ -216,10 +253,45 @@ pub fn benign_entries() -> impl Strategy<Value = Vec<Entry>> {
     })
 }
 
-fn substitute(bytes: &[u8], outside: &Path) -> Vec<u8> {
+/// The benign direction, for an archive from [`benign_entries`]: `top` is
+/// where the extractor left the archive's single `top/` directory (the
+/// extraction root's `top/` for a plain unpack). Every file must be there,
+/// byte for byte. A rejecting extractor fails this, and so does one that
+/// ignored its destination and wrote somewhere the escape oracle cannot see.
+pub fn check_round_trip(top: &Path, entries: &[Entry]) -> Result<(), String> {
+    for entry in entries {
+        let Kind::File(data) = &entry.kind else {
+            continue;
+        };
+        let relative = entry
+            .name
+            .strip_prefix(b"top/")
+            .ok_or_else(|| format!("not a benign entry: {entry:?}"))?;
+        let path = top.join(std::ffi::OsStr::from_bytes(relative));
+        match fs::read(&path) {
+            Ok(found) if &found == data => {}
+            Ok(found) => {
+                return Err(format!(
+                    "{} holds {found:?}, the archive had {data:?}",
+                    path.display()
+                ));
+            }
+            Err(error) => return Err(format!("{} was not extracted: {error}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn substitute(bytes: &[u8], layout: &Layout) -> Vec<u8> {
     let token = OUTSIDE_TOKEN.as_bytes();
-    let replacement = outside.as_os_str().as_bytes();
+    let replacement = layout.outside.as_os_str().as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
+    // An absolute name or target is re-rooted at the case's fake root, the way
+    // a chroot would see it: an extractor that honours it then writes inside
+    // the watched temporary directory instead of onto the host.
+    if bytes.first() == Some(&b'/') {
+        out.extend_from_slice(layout.base.as_os_str().as_bytes());
+    }
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index..].starts_with(token) {
@@ -234,15 +306,16 @@ fn substitute(bytes: &[u8], outside: &Path) -> Vec<u8> {
 }
 
 /// Replace the `@OUT` placeholder in names and link targets with the real
-/// absolute path of the case's `outside/` directory.
-pub fn concretize(entries: &[Entry], outside: &Path) -> Vec<Entry> {
+/// absolute path of the case's `outside/` directory, and re-root every other
+/// absolute name or target at the case's fake root ([`Layout::base`]).
+pub fn concretize(entries: &[Entry], layout: &Layout) -> Vec<Entry> {
     entries
         .iter()
         .map(|entry| Entry {
-            name: substitute(&entry.name, outside),
+            name: substitute(&entry.name, layout),
             kind: match &entry.kind {
-                Kind::Symlink(target) => Kind::Symlink(substitute(target, outside)),
-                Kind::Hardlink(target) => Kind::Hardlink(substitute(target, outside)),
+                Kind::Symlink(target) => Kind::Symlink(substitute(target, layout)),
+                Kind::Hardlink(target) => Kind::Hardlink(substitute(target, layout)),
                 other => other.clone(),
             },
             mode: entry.mode,
@@ -339,30 +412,104 @@ pub fn tar_gz_bytes(entries: &[Entry]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
-/// Per-case filesystem layout: `base/dest` is the extraction root;
-/// `base/outside/sentinel` and `base/victim` are what an escape would touch.
+/// The guard rail every case runs inside: a temporary directory with a
+/// chain of [`NESTING`] directories in it, each case's own directory at the
+/// bottom. Nothing the generator can name climbs out of the chain, and the
+/// oracle watches all of it.
+///
+/// Creating the chain costs a directory per level, so [`run_property`] keeps
+/// one fence for all of a property's cases and builds a fresh one only after
+/// a case changed something in it: a clean fence is the same fence a new one
+/// would be.
+pub struct Fence {
+    _temp: tempfile::TempDir,
+    top: PathBuf,
+    bottom: PathBuf,
+    dirty: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Fence {
+    pub fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let temp = tempfile::Builder::new()
+            .prefix("archive-props-")
+            .tempdir()
+            .unwrap();
+        let top = fs::canonicalize(temp.path()).unwrap();
+        let mut bottom = top.clone();
+        for _ in 0..NESTING {
+            bottom.push("d");
+        }
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&bottom)
+            .unwrap();
+        Self {
+            _temp: temp,
+            top,
+            bottom,
+            dirty: std::rc::Rc::default(),
+        }
+    }
+}
+
+/// Per-case filesystem layout, at the bottom of a [`Fence`]. `top` is the
+/// fence's temporary directory and the oracle watches all of it. `base`, the
+/// case's own directory, stands in for `/`; `base/dest` is the extraction
+/// root, and `base/outside/sentinel` and `base/victim` are what an escape
+/// would touch.
+///
+/// Every directory and file the case is judged on gets an explicit mode, so
+/// the oracle judges what the extractor did, not what the runner's umask made
+/// of the fixture.
 pub struct Layout {
-    pub _temp: tempfile::TempDir,
+    // Declared first so the case directory goes before a fence it owns.
+    _case: tempfile::TempDir,
+    _own_fence: Option<Fence>,
+    fence_dirty: std::rc::Rc<std::cell::Cell<bool>>,
+    pub top: PathBuf,
     pub base: PathBuf,
     pub dest: PathBuf,
     pub outside: PathBuf,
 }
 
 impl Layout {
+    /// A one-off case in a fence of its own.
     pub fn new() -> Self {
-        let temp = tempfile::Builder::new()
-            .prefix("archive-props-")
-            .tempdir()
+        let fence = Fence::new();
+        let mut layout = Self::in_fence(&fence);
+        layout._own_fence = Some(fence);
+        layout
+    }
+
+    /// A fresh case directory at the bottom of `fence`.
+    pub fn in_fence(fence: &Fence) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        let case = tempfile::Builder::new()
+            .prefix("case-")
+            .tempdir_in(&fence.bottom)
             .unwrap();
-        let base = fs::canonicalize(temp.path()).unwrap();
+        let base = fs::canonicalize(case.path()).unwrap();
+        let mkdir = |dir: &Path| {
+            fs::create_dir(dir).unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let write = |file: &Path| {
+            fs::write(file, b"original").unwrap();
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        };
         let dest = base.join("dest");
         let outside = base.join("outside");
-        fs::create_dir_all(&dest).unwrap();
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("sentinel"), b"original").unwrap();
-        fs::write(base.join("victim"), b"original").unwrap();
+        mkdir(&dest);
+        mkdir(&outside);
+        write(&outside.join("sentinel"));
+        write(&base.join("victim"));
         Self {
-            _temp: temp,
+            _case: case,
+            _own_fence: None,
+            fence_dirty: fence.dirty.clone(),
+            top: fence.top.clone(),
             base,
             dest,
             outside,
@@ -431,6 +578,7 @@ fn read_dir_paths(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Snapshot of every path under `base` except those under the given roots.
+/// [`run_case`] passes the whole temporary directory ([`Layout::top`]).
 pub fn snapshot_outside(base: &Path, inside: &[&Path]) -> BTreeMap<PathBuf, String> {
     let mut out = BTreeMap::new();
     let mut stack = vec![base.to_path_buf()];
@@ -460,21 +608,22 @@ pub struct Violations {
     /// outside, but every later step that follows links (a directory walk, a
     /// copy, a chmod, writing into the installed tree) inherits it.
     pub outward_links: Vec<String>,
-    /// setuid/setgid or world-writable entries in the installed tree,
-    /// including the root itself.
-    pub bad_modes: Vec<String>,
+    /// setuid/setgid entries in the installed tree, including the root.
+    pub setid_modes: Vec<String>,
+    /// World-writable entries in the installed tree, including the root.
+    pub world_writable: Vec<String>,
 }
 
 fn check_mode(path: &Path, mode: u32, violations: &mut Violations) {
     if mode & 0o6000 != 0 {
-        violations.bad_modes.push(format!(
+        violations.setid_modes.push(format!(
             "{} has setuid/setgid bits ({mode:o})",
             path.display()
         ));
     }
     if mode & 0o002 != 0 {
         violations
-            .bad_modes
+            .world_writable
             .push(format!("{} is world-writable ({mode:o})", path.display()));
     }
 }
@@ -601,15 +750,15 @@ impl Reach {
                 .iter()
                 .any(|e| e.name.split(|b| *b == b'/').any(|c| c == b"..")),
         );
-        bump(
-            &self.absolute,
-            entries.iter().any(|e| e.name.first() == Some(&b'/')),
-        );
+        let absolute = |bytes: &[u8]| {
+            bytes.first() == Some(&b'/') || bytes.starts_with(OUTSIDE_TOKEN.as_bytes())
+        };
+        bump(&self.absolute, entries.iter().any(|e| absolute(&e.name)));
         bump(&self.backslash, entries.iter().any(|e| has(b"\\", &e.name)));
         bump(
             &self.symlink_out,
             entries.iter().any(|e| match &e.kind {
-                Kind::Symlink(t) => t.first() == Some(&b'/') || has(b"..", t),
+                Kind::Symlink(t) => absolute(t) || has(b"..", t),
                 _ => false,
             }),
         );
@@ -690,8 +839,9 @@ pub struct CaseOutcome {
 }
 
 /// Write `archive_bytes` to `base/<archive_name>`, run `extract`, and judge
-/// the result: nothing outside `inside_roots` (which must include the
-/// extraction root) may have changed, and the tree under `inspect_root` is
+/// the result: nothing in the case's temporary directory outside
+/// `inside_roots` (which must include the extraction root) may have changed,
+/// and the tree under `inspect_root` is
 /// walked by [`inspect_tree`]. `extract` receives the layout and the archive
 /// path.
 pub fn run_case(
@@ -707,9 +857,9 @@ pub fn run_case(
     let mut excluded: Vec<&Path> = inside_roots.to_vec();
     excluded.push(&archive);
     let inodes = outside_inodes(layout);
-    let before = snapshot_outside(&layout.base, &excluded);
+    let before = snapshot_outside(&layout.top, &excluded);
     let result = extract(layout, &archive);
-    let after = snapshot_outside(&layout.base, &excluded);
+    let after = snapshot_outside(&layout.top, &excluded);
     let mut escapes = Vec::new();
     for (path, stamp) in &after {
         match before.get(path) {
@@ -731,6 +881,17 @@ pub fn run_case(
             escapes.push(format!("removed outside the root: {}", path.display()));
         }
     }
+    // A change above the case's own directory is a change to the fence, which
+    // the next case must not inherit.
+    if after
+        .iter()
+        .filter(|(path, stamp)| before.get(*path) != Some(*stamp))
+        .map(|(path, _)| path)
+        .chain(before.keys().filter(|path| !after.contains_key(*path)))
+        .any(|path| !path.starts_with(&layout.base))
+    {
+        layout.fence_dirty.set(true);
+    }
     let mut tree = inspect_tree(inspect_root, &inodes);
     escapes.append(&mut tree.shared_inodes);
     CaseOutcome {
@@ -740,14 +901,92 @@ pub fn run_case(
     }
 }
 
+/// What an extractor promises about the modes it leaves behind.
+///
+/// Both promises are relative to the process: an extractor that creates
+/// directories (or runs `tar`) gets modes through the umask, so under a umask
+/// that leaves world-write open (`umask 0`) a world-writable entry is what the
+/// user asked for, and only setuid/setgid is judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Modes {
+    /// Not judged.
+    Unchecked,
+    /// No setuid/setgid entry, and no world-writable one while the umask
+    /// clears world-write. Holds whoever runs it.
+    Safe,
+    /// [`Modes::Safe`] for the system `tar`, which promises it only to an
+    /// unprivileged user: run as root, GNU tar restores archived modes,
+    /// setuid included. So under effective uid 0 the modes are not judged,
+    /// and [`note_mode_scope`] says so.
+    SafeUnlessRoot,
+}
+
+/// The process umask and effective uid, from `/proc/self/status` (Linux).
+/// `None` for either when it cannot be read.
+fn process_umask_and_euid() -> (Option<u32>, Option<u32>) {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .map(str::trim)
+    };
+    let umask = field("Umask:").and_then(|value| u32::from_str_radix(value, 8).ok());
+    let euid = field("Uid:")
+        .and_then(|value| value.split_whitespace().nth(1))
+        .and_then(|value| value.parse().ok());
+    (umask, euid)
+}
+
+impl Modes {
+    /// Why this run judges less than the whole promise, if it does.
+    fn relaxed_because(self) -> Option<String> {
+        let (umask, euid) = process_umask_and_euid();
+        match self {
+            Self::Unchecked => None,
+            Self::SafeUnlessRoot if euid == Some(0) => Some(
+                "running as root, where the system tar restores archived modes: modes not judged"
+                    .to_owned(),
+            ),
+            Self::Safe | Self::SafeUnlessRoot => {
+                umask.filter(|umask| umask & 0o002 == 0).map(|umask| {
+                    format!("umask {umask:03o} leaves world-write open: only setuid/setgid judged")
+                })
+            }
+        }
+    }
+
+    fn broken_by(self, tree: &Violations) -> bool {
+        let (umask, euid) = process_umask_and_euid();
+        match self {
+            Self::Unchecked => false,
+            Self::SafeUnlessRoot if euid == Some(0) => false,
+            Self::Safe | Self::SafeUnlessRoot => {
+                let umask_clears_world_write = umask.is_none_or(|umask| umask & 0o002 != 0);
+                !tree.setid_modes.is_empty()
+                    || (umask_clears_world_write && !tree.world_writable.is_empty())
+            }
+        }
+    }
+}
+
+/// Print, once per property, which part of the mode promise this run cannot
+/// judge (running as root, or under a umask that leaves world-write open), so
+/// a pass there is not read as the whole promise holding.
+pub fn note_mode_scope(label: &str, modes: Modes) {
+    if let Some(reason) = modes.relaxed_because() {
+        eprintln!("[{label}] {reason}");
+    }
+}
+
 /// Which parts of the contract a given extractor promises. Escapes (writes
 /// outside the root) are always checked; the tree-hygiene parts are opt-in,
 /// because the system-`tar` extractors deliberately recreate symlinks as
 /// archived.
 #[derive(Clone, Copy, Debug)]
 pub struct Expect {
-    /// No setuid/setgid or world-writable entry in the extracted tree.
-    pub safe_modes: bool,
+    /// What the modes in the extracted tree may be.
+    pub modes: Modes,
     /// No symlink in the extracted tree resolves outside it.
     pub no_outward_links: bool,
 }
@@ -756,7 +995,7 @@ impl CaseOutcome {
     /// `Ok` when the outcome meets `expect`, else the outcome as text.
     pub fn judge(&self, expect: Expect) -> Result<(), String> {
         let broken = !self.escapes.is_empty()
-            || (expect.safe_modes && !self.tree.bad_modes.is_empty())
+            || expect.modes.broken_by(&self.tree)
             || (expect.no_outward_links && !self.tree.outward_links.is_empty());
         if broken {
             Err(format!("{self:#?}"))
@@ -767,7 +1006,8 @@ impl CaseOutcome {
 }
 
 /// Run `check` over `cases` archives from `strategy`, each in a fresh
-/// [`Layout`] with the `@OUT` placeholder already substituted. Returns the
+/// [`Layout`] with the archive already [`concretize`]d into it. Reach is
+/// counted on the archive as generated, before absolute names are re-rooted. Returns the
 /// shrunk counterexample as text on failure. On success, when `reach_floor`
 /// is set, also fails if any dangerous shape occurred in fewer than that
 /// percentage of cases — a pass over a generator that never produced the
@@ -797,10 +1037,14 @@ pub fn run_property(
     if config.rng_seed == proptest::test_runner::RngSeed::Random {
         config.rng_seed = proptest::test_runner::RngSeed::Fixed(0x00a2_c41e);
     }
+    let fence = std::cell::RefCell::new(Fence::new());
     let result = proptest::test_runner::TestRunner::new(config).run(&strategy, |entries| {
-        let layout = Layout::new();
-        let entries = concretize(&entries, &layout.outside);
+        if fence.borrow().dirty.get() {
+            *fence.borrow_mut() = Fence::new();
+        }
+        let layout = Layout::in_fence(&fence.borrow());
         reach.record(&entries);
+        let entries = concretize(&entries, &layout);
         check(&layout, &entries).map_err(proptest::test_runner::TestCaseError::fail)
     });
     if let Err(error) = result {
@@ -844,6 +1088,9 @@ pub fn naive_sanitizing_unpack(archive: &Path, destination: &Path) -> anyhow::Re
 /// joins each raw entry name onto the root and unpacks there, following any
 /// link an earlier entry planted. If the property does not fail against this,
 /// the generator is not reaching the shapes it claims to.
+///
+/// Absolute names reach it already re-rooted by [`concretize`], so even this
+/// extractor writes only inside the case's temporary directory.
 pub fn naive_unpack(archive: &Path, destination: &Path) -> anyhow::Result<()> {
     let file = fs::File::open(archive)?;
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));

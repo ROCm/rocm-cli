@@ -982,8 +982,9 @@ mod archive_properties {
 
     use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, OUTSIDE_TOKEN, concretize, entries, naive_sanitizing_unpack,
-        naive_unpack, run_case, run_property, tar_gz_bytes,
+        Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, benign_entries, check_round_trip,
+        concretize, entries, naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case,
+        run_property, tar_gz_bytes,
     };
 
     fn property(
@@ -991,6 +992,7 @@ mod archive_properties {
         expect: Expect,
         extract: fn(&Path, &Path) -> anyhow::Result<()>,
     ) -> Result<(), String> {
+        note_mode_scope(label, expect.modes);
         run_property(label, 256, entries(), Some(5), |layout, entries| {
             run_case(
                 layout,
@@ -1005,7 +1007,7 @@ mod archive_properties {
     }
 
     const ESCAPES_ONLY: Expect = Expect {
-        safe_modes: false,
+        modes: Modes::Unchecked,
         no_outward_links: false,
     };
 
@@ -1014,12 +1016,34 @@ mod archive_properties {
         property("uv", ESCAPES_ONLY, extract_archive).unwrap();
     }
 
+    /// The other direction: a well-formed archive is extracted in full, into
+    /// the staging directory it was given. An extraction that wrote somewhere
+    /// else entirely (no `-C`) escapes the oracle above; this catches it.
+    #[test]
+    fn uv_archive_extraction_extracts_a_benign_archive_into_the_staging_dir() {
+        run_property(
+            "uv-benign",
+            64,
+            benign_entries(),
+            None,
+            |layout, entries| {
+                let archive = layout.base.join("archive.tar.gz");
+                std::fs::write(&archive, tar_gz_bytes(entries)).unwrap();
+                extract_archive(&archive, &layout.dest).map_err(|error| format!("{error:#}"))?;
+                check_round_trip(&layout.dest.join("top"), entries)
+            },
+        )
+        .unwrap();
+    }
+
+    /// The system `tar` drops setuid/setgid and applies the umask only for an
+    /// unprivileged user, so this is judged only there (see `Modes`).
     #[test]
     fn uv_archive_extraction_leaves_no_setuid_or_world_writable_entry() {
         property(
             "uv-modes",
             Expect {
-                safe_modes: true,
+                modes: Modes::SafeUnlessRoot,
                 no_outward_links: false,
             },
             extract_archive,
@@ -1031,11 +1055,7 @@ mod archive_properties {
     /// lookup-and-chmod half of `ensure_uv_binary` on it.
     fn stage_and_locate(layout: &Layout, entries: &[Entry]) -> Option<std::path::PathBuf> {
         let archive = layout.base.join("uv.tar.gz");
-        std::fs::write(
-            &archive,
-            tar_gz_bytes(&concretize(entries, &layout.outside)),
-        )
-        .unwrap();
+        std::fs::write(&archive, tar_gz_bytes(&concretize(entries, layout))).unwrap();
         extract_archive(&archive, &layout.dest).unwrap();
         let binary = find_binary_in(&layout.dest, uv_binary_name())?;
         let _ = make_executable(&binary);
