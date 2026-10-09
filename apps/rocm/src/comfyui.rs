@@ -3087,7 +3087,12 @@ mod archive_properties {
         COMFYUI_SOURCE_ARCHIVE_NAME, download_and_extract_source, models_folder_for_source,
         source_path_from_app_root,
     };
-    use crate::archive_props::{Expect, Layout, entries, run_case, run_property, tar_gz_bytes};
+    use proptest::prelude::*;
+
+    use crate::archive_props::{
+        Entry, Expect, Kind, Layout, Modes, benign_entries, check_round_trip, entries,
+        note_mode_scope, run_case, run_property, tar_gz_bytes,
+    };
 
     /// The unpack plus the first write `install` makes into the result: the
     /// models folder under the source tree.
@@ -3103,8 +3108,53 @@ mod archive_properties {
         Ok(())
     }
 
-    fn property(label: &str, expect: Expect, source_must_be_real_dir: bool) -> Result<(), String> {
-        run_property(label, 512, entries(), Some(5), |layout, entries| {
+    /// [`entries`] with every relative name moved one level down, under
+    /// `a/`, and any symlink that would still land directly in the extraction
+    /// root dropped: that is the one shape that hits the known #522 defect
+    /// (`first_child_dir` follows it). Moving names down rather than only
+    /// dropping top-level links keeps "link, then write through it" in play,
+    /// one level down where the source tree is.
+    fn entries_without_top_level_symlink() -> impl Strategy<Value = Vec<Entry>> {
+        fn lands_top_level(name: &[u8]) -> bool {
+            let mut depth = 0usize;
+            for part in name.split(|byte| *byte == b'/') {
+                match part {
+                    b"" | b"." => {}
+                    b".." => {
+                        let Some(up) = depth.checked_sub(1) else {
+                            return true;
+                        };
+                        depth = up;
+                    }
+                    _ => depth += 1,
+                }
+            }
+            depth <= 1
+        }
+        entries().prop_map(|entries| {
+            entries
+                .into_iter()
+                .map(|mut entry| {
+                    if !entry.name.starts_with(b"/") && !entry.name.starts_with(b"@") {
+                        entry.name.splice(0..0, *b"a/");
+                    }
+                    entry
+                })
+                .filter(|entry| {
+                    !(matches!(entry.kind, Kind::Symlink(_)) && lands_top_level(&entry.name))
+                })
+                .collect()
+        })
+    }
+
+    fn property(
+        label: &str,
+        strategy: impl Strategy<Value = Vec<Entry>>,
+        expect: Expect,
+        source_must_be_real_dir: bool,
+    ) -> Result<(), String> {
+        note_mode_scope(label, expect.modes);
+        run_property(label, 512, strategy, Some(5), |layout, entries| {
             let log = layout.base.join("install.log");
             let outcome = run_case(
                 layout,
@@ -3129,6 +3179,44 @@ mod archive_properties {
         })
     }
 
+    const ESCAPES_ONLY: Expect = Expect {
+        modes: Modes::Unchecked,
+        no_outward_links: false,
+    };
+
+    /// What holds today: with the #522 shape (a top-level symlink) left out,
+    /// the unpack and the first install write stay inside the app root.
+    #[test]
+    fn source_unpack_without_a_top_level_symlink_never_writes_outside_the_app_root() {
+        property(
+            "comfyui-no-top-link",
+            entries_without_top_level_symlink(),
+            ESCAPES_ONLY,
+            true,
+        )
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed source archive is installed in
+    /// full, its single top-level directory becoming `source/`.
+    #[test]
+    fn source_unpack_installs_a_benign_archive_as_the_source_dir() {
+        run_property(
+            "comfyui-benign",
+            64,
+            benign_entries(),
+            None,
+            |layout, entries| {
+                let archive = layout.base.join("source.tar.gz");
+                fs::write(&archive, tar_gz_bytes(entries)).unwrap();
+                unpack_then_first_install_write(layout, &archive)
+                    .map_err(|error| format!("{error:#}"))?;
+                check_round_trip(&source_path_from_app_root(&layout.dest), entries)
+            },
+        )
+        .unwrap();
+    }
+
     /// Known defect: `first_child_dir` tests `is_dir`, which follows symlinks,
     /// and the result is renamed to `source/` as-is. An archive whose first
     /// top-level entry is a symlink therefore installs `source` as a link out
@@ -3137,41 +3225,28 @@ mod archive_properties {
     #[test]
     #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn source_unpack_never_writes_outside_the_app_root() {
-        property(
-            "comfyui",
-            Expect {
-                safe_modes: false,
-                no_outward_links: false,
-            },
-            false,
-        )
-        .unwrap();
+        property("comfyui", entries(), ESCAPES_ONLY, false).unwrap();
     }
 
     #[test]
     #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn installed_source_path_is_a_real_directory() {
-        property(
-            "comfyui-source-dir",
-            Expect {
-                safe_modes: false,
-                no_outward_links: false,
-            },
-            true,
-        )
-        .unwrap();
+        property("comfyui-source-dir", entries(), ESCAPES_ONLY, true).unwrap();
     }
 
     /// Known gap: `tar::Archive::unpack` applies `mode & 0o777` (setuid and
     /// setgid are dropped) without the process umask, so a `0777`/`0666`
     /// entry stays world-writable. Shrunk counterexample: one file, mode 0777.
+    /// The top-level symlink shape is left out, so this fails for the modes
+    /// alone and can be un-ignored on its own when they are fixed.
     #[test]
     #[ignore = "known gap: the ComfyUI unpack keeps world-writable modes from the archive (#522)"]
     fn source_unpack_leaves_no_setuid_or_world_writable_entry() {
         property(
             "comfyui-modes",
+            entries_without_top_level_symlink(),
             Expect {
-                safe_modes: true,
+                modes: Modes::Safe,
                 no_outward_links: false,
             },
             false,
@@ -3186,7 +3261,7 @@ mod archive_properties {
     #[test]
     #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn top_level_symlink_in_source_archive_does_not_redirect_the_install() {
-        use crate::archive_props::{Entry, Kind, OUTSIDE_TOKEN, concretize};
+        use crate::archive_props::{OUTSIDE_TOKEN, concretize};
         let layout = Layout::new();
         let entries = concretize(
             &[Entry {
@@ -3194,7 +3269,7 @@ mod archive_properties {
                 kind: Kind::Symlink(OUTSIDE_TOKEN.as_bytes().to_vec()),
                 mode: 0o777,
             }],
-            &layout.outside,
+            &layout,
         );
         let archive = layout.base.join("source.tar.gz");
         fs::write(&archive, tar_gz_bytes(&entries)).unwrap();

@@ -1971,7 +1971,8 @@ mod archive_properties {
     use sha2::{Digest as _, Sha256};
 
     use super::archive_props::{
-        Entry, Expect, Kind, benign_entries, entries, run_case, run_property, tar_gz_bytes,
+        Entry, Expect, Kind, Modes, benign_entries, check_round_trip, entries, note_mode_scope,
+        run_case, run_property, tar_gz_bytes,
     };
     use super::{
         AppPaths, extract_tar_gz, extract_zip, installed_runtime_version, lemonade_path_in,
@@ -1979,14 +1980,15 @@ mod archive_properties {
     };
 
     /// The in-process extractor rejects every link kind and masks modes, so it
-    /// promises the whole contract, not just "no escape".
+    /// promises the whole contract, not just "no escape", whoever runs it.
     const FULL: Expect = Expect {
-        safe_modes: true,
+        modes: Modes::Safe,
         no_outward_links: true,
     };
 
     #[test]
     fn tar_extraction_keeps_every_entry_inside_the_root() {
+        note_mode_scope("lemonade-tar", FULL.modes);
         run_property(
             "lemonade-tar",
             512,
@@ -2037,9 +2039,42 @@ mod archive_properties {
         writer.finish().unwrap().into_inner()
     }
 
+    /// The other direction for both formats: a well-formed archive is
+    /// extracted in full, into the root it was given.
+    #[test]
+    fn tar_and_zip_extraction_extract_a_benign_archive_into_the_root() {
+        run_property(
+            "lemonade-benign-tar",
+            64,
+            benign_entries(),
+            None,
+            |layout, entries| {
+                let archive = layout.base.join("embeddable.tar.gz");
+                std::fs::write(&archive, tar_gz_bytes(entries)).unwrap();
+                extract_tar_gz(&archive, &layout.dest).map_err(|error| format!("{error:#}"))?;
+                check_round_trip(&layout.dest.join("top"), entries)
+            },
+        )
+        .unwrap();
+        run_property(
+            "lemonade-benign-zip",
+            64,
+            benign_entries(),
+            None,
+            |layout, entries| {
+                let archive = layout.base.join("embeddable.zip");
+                std::fs::write(&archive, zip_bytes(entries)).unwrap();
+                extract_zip(&archive, &layout.dest).map_err(|error| format!("{error:#}"))?;
+                check_round_trip(&layout.dest.join("top"), entries)
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn zip_extraction_keeps_every_entry_inside_the_root() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        note_mode_scope("lemonade-zip", FULL.modes);
         // Reach is measured on what the zip writer actually stored, since it
         // may drop or normalise some generated names.
         let (cases, traversal, symlink) = (
@@ -2136,6 +2171,7 @@ mod archive_properties {
         // Reach of the install half: a property over installs that all fail
         // at extraction would say nothing about the copy step.
         let (cases, installed) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        note_mode_scope("lemonade-install", FULL.modes);
         run_property(
             "lemonade-install",
             256,
