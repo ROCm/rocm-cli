@@ -370,3 +370,45 @@ Feature: Runtime configuration
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # `install sdk --prefix` uses the folder it is given as-is, and rebuilds the
+  # Python environment in it when the one already there no longer runs. That
+  # rebuild used to delete the whole folder, whoever made it — reported for a
+  # home folder whose `~/bin/python` fails `--version`. The install now refuses
+  # a folder ROCm CLI cannot show it created, and the second half takes the
+  # refusal's own advice to prove it is a way forward, not a dead end. The
+  # `--dry-run` preview comes first: it has to predict that refusal and print
+  # `command: none`, since the install will run no command.
+  #
+  # No GPU or network: the index is a loopback fixture, and the install pins
+  # ROCm 10 with an exact arch, the one path whose device payload comes from the
+  # arch given rather than a probe of the host GPU. A fake uv and Python stand
+  # in for the real ones, so the install stops at the package step, after the
+  # decision under test. Linux-only because those fakes and the broken Python
+  # are shell scripts.
+  @id:runtime-install-sdk-refuses-unowned-prefix @requires-os:linux
+  Scenario: runtime-19 - Installing into a home folder with a broken Python refuses rather than deleting it
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And the user's home folder holds their files and a Python that no longer runs
+    When the user previews installing the SDK into their home folder
+    Then the preview predicts the refusal of the home folder and changes nothing
+    When the user installs the SDK into their home folder
+    Then the install refuses to rebuild the home folder and changes nothing in it
+    When the user installs the SDK into an empty folder instead
+    Then the install gets past the refusal and creates a Python environment in the empty folder
+
+  # Even a folder ROCm CLI did create holds more than the environment: ComfyUI
+  # keeps the user's models, workflows and outputs under `apps/comfyui`. A
+  # rebuild replaces the environment's own files and nothing else, and the line
+  # it prints names what it kept — asserted together with the disk. The preview
+  # shows the `uv venv --allow-existing` a rebuild runs. Same hermetic setup and
+  # Linux-only reason as runtime-19; the fake uv refuses a non-empty folder
+  # without `--allow-existing` and wipes it on `--clear`, as uv 0.10 does.
+  @id:runtime-install-sdk-rebuild-keeps-comfyui-data @requires-os:linux
+  Scenario: runtime-20 - Rebuilding a broken environment ROCm CLI created keeps the ComfyUI data in its folder
+    Given a canonical release pip index fixture and a ROCm 10 pip index fixture
+    And a folder ROCm CLI installed into holds ComfyUI models and a Python that no longer runs
+    When the user previews installing the SDK into the folder ROCm CLI installed into
+    Then the preview shows a rebuild in place that keeps the folder
+    When the user installs the SDK into the folder ROCm CLI installed into
+    Then the install rebuilds only the environment's own files and reports keeping the ComfyUI data
