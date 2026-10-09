@@ -455,9 +455,14 @@ pub enum PaneFocus {
 ///
 /// Lives here, not in `scrollbar.rs`: `actions.rs`'s `KeyAction::ScrollGrab`
 /// variant carries one, so the type has to be visible to `actions.rs` without
-/// `actions.rs` depending on `scrollbar.rs`. The reverse edge stays —
-/// `scrollbar.rs` still imports `KeyAction`/`handle_mouse`/`tab_bar_hit` from
-/// `actions.rs` — that's the one edge this module boundary keeps.
+/// `actions.rs` importing it from `scrollbar.rs`. The reverse `use` edge
+/// stays — `scrollbar.rs` still imports `KeyAction`/`handle_mouse`/
+/// `tab_bar_hit` from `actions.rs` — that's the one direct `use`-level edge
+/// this module boundary keeps. `actions.rs` still reaches `ScrollDrag`,
+/// `ScrollbarHandle` and `FooterChip` indirectly, through the fields they
+/// type on `AppState` (defined in `mod.rs`, e.g. `state.scroll_drag = None`)
+/// — reading or writing a field never requires importing its type, so this
+/// move doesn't touch that coupling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollTarget {
     /// Job console vertical (`console_scroll`).

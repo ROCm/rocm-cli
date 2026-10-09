@@ -1246,23 +1246,52 @@ mod tests {
     #[test]
     fn actions_does_not_import_from_scrollbar() {
         // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit).
-        // A `use` in actions.rs naming the scrollbar module -- directly, through
-        // `crate::app::scrollbar`, or by one of the names app/mod.rs re-exports
-        // from it (ScrollbarHandle, ScrollDrag, FooterChip) -- would reintroduce
-        // the module cycle that moving PaneFocus/ScrollTarget into types.rs
-        // removes. The compiler accepts such a cycle, so nothing else catches
-        // it; this scans non-comment `use` lines instead, the way
-        // `no_checker_hand_sets_auto_applicable` (rocm-core/src/diagnose.rs)
-        // does for a similar unenforced invariant.
+        // A `use`/`pub use`/`pub(crate) use` in actions.rs naming the scrollbar
+        // module -- directly, through `crate::app::scrollbar`, or by one of the
+        // names app/mod.rs re-exports from it (ScrollbarHandle, ScrollDrag,
+        // FooterChip) -- would reintroduce the module cycle that moving
+        // PaneFocus/ScrollTarget into types.rs removes. The compiler accepts
+        // such a cycle, so nothing else catches it.
+        //
+        // This joins the source into whole statements (splitting on `;`) so a
+        // rustfmt-wrapped multi-line `use super::{ ... }` group is one match
+        // candidate, not several innocuous lines, and matches whole identifier
+        // tokens rather than a bare substring, so `vertical_scrollbar` doesn't
+        // false-positive on `scrollbar`. It does NOT catch a fully-qualified
+        // path referenced directly in an expression or type position with no
+        // `use` statement at all (e.g. a bare `super::scrollbar::resolve_mouse(
+        // ..)` call) -- that would need real parsing, not a source scan, and is
+        // the test's accepted scope limit.
         const SCROLLBAR_NAMES: [&str; 4] =
             ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
-        let offenders: Vec<&str> = include_str!("actions.rs")
+
+        fn tokens(s: &str) -> impl Iterator<Item = &str> {
+            s.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+        }
+
+        fn is_use_statement(stmt: &str) -> bool {
+            let s = stmt.trim_start();
+            let s = s
+                .strip_prefix("pub(crate)")
+                .or_else(|| s.strip_prefix("pub"))
+                .map_or(s, str::trim_start);
+            s.starts_with("use ")
+        }
+
+        let without_comments: String = include_str!("actions.rs")
             .lines()
-            .filter(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("use ")
-                    && SCROLLBAR_NAMES.iter().any(|name| trimmed.contains(name))
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let offenders: Vec<String> = without_comments
+            .split(';')
+            .map(str::trim)
+            .filter(|stmt| {
+                is_use_statement(stmt) && tokens(stmt).any(|t| SCROLLBAR_NAMES.contains(&t))
             })
+            .map(|stmt| stmt.split_whitespace().collect::<Vec<_>>().join(" "))
             .collect();
         assert!(
             offenders.is_empty(),
