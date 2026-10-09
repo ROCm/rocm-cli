@@ -125,6 +125,28 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+### Known-gap reproducers
+
+Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
+server, an API key. One other use is allowed: a test that pins a defect which
+is filed but not yet fixed. Such a test fails on purpose today, so it is
+committed ignored, with the reason naming the issue:
+
+```rust
+#[ignore = "known gap: in-band SSE error payloads are dropped and the stream reports a clean finish (#516)"]
+```
+
+The issue must name the test, and its fix un-ignores it. Neither CI job passes
+`--include-ignored`, so nothing reports when the gap closes or the test drifts;
+the issue is the only link back. List the open ones with:
+
+```bash
+git grep -n 'ignore = "known gap'
+```
+
+A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
+with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
+
 ## Coverage floors
 
 Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
