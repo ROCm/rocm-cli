@@ -2670,7 +2670,7 @@ pub fn unix_time_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::temp_app_paths;
+    use crate::test_support::{probe_test_record, temp_app_paths};
 
     use std::fs;
     use std::path::Path;
@@ -2800,29 +2800,6 @@ mod tests {
         // A bare empty user name (as opposed to unset) also falls back to "user".
         let path = dashboard_socket_path(None, None, Some(String::new()), PathBuf::from("/tmp"));
         assert_eq!(path, PathBuf::from("/tmp/rocm-user/rocmdashd.sock"));
-    }
-
-    fn probe_test_record(port: u16) -> ManagedServiceRecord {
-        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        ManagedServiceRecord::new(
-            &paths,
-            "svc-probe",
-            "vllm",
-            "Qwen/Qwen3-0.6B",
-            "Qwen/Qwen3-0.6B",
-            "127.0.0.1",
-            port,
-            "serve",
-            4242,
-            None,
-            None,
-            None,
-        )
     }
 
     #[test]

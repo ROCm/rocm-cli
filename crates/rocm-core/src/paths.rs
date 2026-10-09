@@ -175,7 +175,7 @@ impl AppPaths {
     /// Lock file serializing the managed-serve GPU select-then-claim sequence, so
     /// two concurrent `rocm serve` invocations cannot read the same free GPU and
     /// both launch on it. Held from auto-selection through the claiming service
-    /// record write (see [`FileLock`]).
+    /// record write (see [`FileLock`](crate::FileLock)).
     pub fn managed_launch_lock_path(&self) -> PathBuf {
         self.services_dir().join("launch.lock")
     }
@@ -209,7 +209,7 @@ impl AppPaths {
 
     /// Lock file serializing the daemon autostart check-then-spawn, so two
     /// concurrent callers cannot both observe "not running" and each spawn a
-    /// background automation daemon (see [`FileLock`]).
+    /// background automation daemon (see [`FileLock`](crate::FileLock)).
     pub fn automation_autostart_lock_path(&self) -> PathBuf {
         self.automations_dir().join("autostart.lock")
     }

@@ -237,7 +237,7 @@ pub fn terminate_process_tree(pid: u32) -> Result<()> {
 /// Delivery to a process that has already exited (`ESRCH`) counts as success:
 /// the goal — that process no longer running — is already met. Returns `false`
 /// only when a signal could not be delivered for another reason (for example
-/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`].
+/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`](crate::proc_lifecycle).
 #[cfg(not(windows))]
 #[allow(unsafe_code)] // libc FFI
 pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) -> bool {
@@ -258,7 +258,7 @@ pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) ->
 
 /// Snapshot `root` plus its transitive descendants as a flat PID list.
 ///
-/// Used by [`proc_lifecycle`] to bind a tree termination to the exact processes
+/// Used by [`proc_lifecycle`](crate::proc_lifecycle) to bind a tree termination to the exact processes
 /// present when the stop began. On platforms without `/proc` only `root` is
 /// returned.
 #[cfg(not(windows))]
