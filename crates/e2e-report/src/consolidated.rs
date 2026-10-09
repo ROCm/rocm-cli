@@ -2021,10 +2021,14 @@ mod tests {
         // command_coverage_distinguishes_channels_on_same_platform pin channel
         // only as a tie-breaker between two rows that already share a
         // platform — not where it sits in this tuple, which is what the
-        // MI300X/R9700 rows pin here. No platform.json sidecar, so
-        // display_counts falls back to raw junit stats and each row's
-        // distinct scenario count (1/2/3/4/5/6) tells the rows apart in the
-        // rendered table.
+        // MI300X/R9700 rows pin here. A seventh row, same platform/os as the
+        // MI300X row but known_bugs=true and channel=nightly, pins that
+        // known_bugs outranks channel too: "nightly" sorts before "release",
+        // so if channel outranked known_bugs, this row would sort before the
+        // MI300X/release row despite known_bugs=false < true. No
+        // platform.json sidecar, so display_counts falls back to raw junit
+        // stats and each row's distinct scenario count (1/2/3/4/5/6/7) tells
+        // the rows apart in the rendered table.
         let ubuntu_plain_report = write_report(&feature_json(&[(&[], &["passed"])]));
         let ubuntu_known_bugs_report =
             write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
@@ -2047,6 +2051,15 @@ mod tests {
             (&[], &["passed"]),
         ]));
         let r9700_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+            (&[], &["passed"]),
+        ]));
+        let mi300x_known_bugs_nightly_report = write_report(&feature_json(&[
+            (&[], &["passed"]),
             (&[], &["passed"]),
             (&[], &["passed"]),
             (&[], &["passed"]),
@@ -2079,6 +2092,10 @@ mod tests {
                 "e2e-gpu-rad3-nightly-report".to_string(),
                 r9700_nightly_report.path().to_path_buf(),
             ),
+            (
+                "e2e-gpu-known-bugs-nightly-report".to_string(),
+                mi300x_known_bugs_nightly_report.path().to_path_buf(),
+            ),
         ];
 
         let md = consolidated_summary_markdown(&inputs);
@@ -2100,6 +2117,9 @@ mod tests {
         let r9700_pos = md
             .find("| R9700 (nightly) | Linux | 6 |")
             .expect("R9700 nightly row");
+        let mi300x_known_bugs_nightly_pos = md
+            .find("| MI300X (nightly) | Linux | 7 |")
+            .expect("MI300X known-bugs nightly row");
         assert!(
             ubuntu_plain_pos < ubuntu_known_bugs_pos,
             "same platform/os: known_bugs=false must sort before known_bugs=true:\n{md}"
@@ -2116,6 +2136,12 @@ mod tests {
             mi300x_pos < r9700_pos,
             "\"MI300X\" must sort before \"R9700\" by platform, even though its channel \
              (\"release\") sorts after R9700's (\"nightly\"):\n{md}"
+        );
+        assert!(
+            mi300x_pos < mi300x_known_bugs_nightly_pos,
+            "same platform/os: known_bugs=false must sort before known_bugs=true, even though \
+             the known_bugs=true row's channel (\"nightly\") sorts before the known_bugs=false \
+             row's (\"release\"):\n{md}"
         );
     }
 
