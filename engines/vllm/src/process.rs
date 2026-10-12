@@ -753,8 +753,10 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     // cause". Selecting the line is the shared helper's job, so this surface and
     // the `rocm` CLI serve summary route to `rocm diagnose` identically instead
     // of hand-rolling the selection twice; it classifies each line with the
-    // *same* rule the diagnose checker uses, so whatever it returns is
-    // diagnosable by construction.
+    // *same* rule the diagnose checker uses. Its guarantee is specifically that
+    // a line passing `quotable_in_single_quotes` is diagnosable -- not that
+    // every returned line is -- which is exactly what the branch below needs,
+    // since the non-quotable branch substitutes the canonical symptom anyway.
     //
     // No line means the tail carries no OOM, so the helper's `None` is the OOM
     // gate too; there is no separate classifier predicate to ask first.
@@ -1139,9 +1141,11 @@ mod tests {
     fn every_emitted_oom_symptom_is_diagnosable_and_names_the_branch_that_produced_it() {
         // Closes the loop between the two layers: the engine prints
         // `rocm diagnose --symptom '<symptom>'`, so whatever it emits must
-        // actually score for the diagnose checker. The detector now classifies
-        // each line with the *same* rule the checker uses, so an accepted line
-        // is diagnosable by construction -- this guards that invariant.
+        // actually score for the diagnose checker. What makes that true is the
+        // pair of branches, not the selector alone: a *quotable* selected line
+        // is diagnosable because the selector scores with the checker's own
+        // rule, and a non-quotable one is replaced by the canonical symptom,
+        // which is diagnosable by definition. This guards both branches.
         //
         // Each case pins the *exact* symptom, not just that one is diagnosable.
         // Diagnosability alone cannot fail for the defect this test is named

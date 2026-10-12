@@ -4546,13 +4546,34 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 /// The `rocm diagnose --symptom` string to route a vLLM OOM log tail to, or
 /// `None` when the tail carries no OOM line to route.
 ///
-/// Returns the user's actual failing line (so `diagnose` echoes their real
-/// error), selected with [`segment_shows_oom`], which is the checker's own rule,
-/// so whatever comes back is diagnosable by construction. Shared by the vLLM
-/// engine's post-failure hint and the `rocm` CLI serve summary so both surfaces
-/// route to `diagnose` identically instead of hand-rolling the line selection
-/// twice. It is also the OOM *gate* for both: `None` is the "this tail is not an
-/// OOM" answer, so no caller needs a separate predicate first.
+/// Returns the user's actual failing *raw* line (so `diagnose` echoes their real
+/// error), selected with [`segment_shows_oom`], which is the checker's own rule.
+/// Shared by the vLLM engine's post-failure hint and the `rocm` CLI serve summary
+/// so both surfaces route to `diagnose` identically instead of hand-rolling the
+/// line selection twice. It is also the OOM *gate* for both: `None` is the "this
+/// tail is not an OOM" answer, so no caller needs a separate predicate first.
+///
+/// The exact guarantee is narrower than "whatever comes back is diagnosable",
+/// and the difference is load-bearing. What holds is:
+///
+/// > if [`quotable_in_single_quotes`] accepts the returned value, then
+/// > [`vllm_oom_symptom_is_diagnosable`] accepts it too.
+///
+/// That is what the callers need, because quotability is what they gate the
+/// printed command on, and it is exactly enough: a returned line that is *not*
+/// quotable is replaced by [`VLLM_OOM_CANONICAL_SYMPTOM`], which is diagnosable,
+/// so the printed command always reports a cause either way.
+///
+/// The stronger claim is false, and necessarily so. A segment carrying an
+/// escape — `\x1b[2Ktorch.OutOfMemoryError: ...` from a progress-bar repaint —
+/// is scored by [`segment_shows_oom`] on its rendered rows and is a genuine OOM,
+/// but handed to the checker *whole* it splits into `["vllm: ", "torch..."]`,
+/// leaving the anchor on the empty row and scoring 0. Returning the rendered row
+/// instead would make the claim true and reintroduce the hole it exists to
+/// close: the stripped row is quotable, so a colourised line would be printed as
+/// a runnable lookalike of the user's error rather than refused. The raw bytes
+/// are kept, the quoting guard does its job, and the fallback covers the rest.
+/// Pinned by `every_rendered_line_break_keeps_the_gate_in_step_with_the_scorer`.
 ///
 /// Lines rocm-cli wrote into the log itself are skipped — see
 /// [`is_rocm_authored_log_line`] for why the newest-first scan would otherwise
@@ -7832,15 +7853,46 @@ last_installed_runtime_id = "therock-release"
             );
             let symptom = vllm_oom_diagnose_symptom(&tail)
                 .unwrap_or_else(|| panic!("{label}: an OOM tail must select a line"));
-            assert!(
-                diagnose::vllm_oom_symptom_is_diagnosable(&symptom),
-                "{label}: the selected line must stay diagnosable"
+
+            // The contract the callers actually rely on: *if* the line is
+            // quotable it must be diagnosable, because quotability is what they
+            // gate the printed command on. When it is not quotable the canonical
+            // symptom stands in, and that is diagnosable by definition — so the
+            // printed command reports a cause on every branch.
+            //
+            // The stronger "the returned line is always diagnosable" does NOT
+            // hold here and must not be asserted: a segment carrying an escape
+            // scores on its rendered rows but splits into an empty anchored row
+            // when the checker is handed it whole. Making that claim true would
+            // mean returning the stripped row, which is quotable, and a
+            // colourised line would then be printed as a runnable lookalike of
+            // the user's error instead of being refused.
+            if terminal::quotable_in_single_quotes(&symptom) {
+                assert!(
+                    diagnose::vllm_oom_symptom_is_diagnosable(&symptom),
+                    "{label}: a quotable selected line must be diagnosable"
+                );
+            } else {
+                assert!(
+                    diagnose::vllm_oom_symptom_is_diagnosable(VLLM_OOM_CANONICAL_SYMPTOM),
+                    "{label}: the fallback the callers substitute must report a cause"
+                );
+            }
+
+            // Either way the user still sees their real error: the raw bytes
+            // survive selection, so stripping for display recovers the
+            // exception rather than the progress-bar text that preceded it.
+            let displayed = terminal::strip_terminal_control_sequences(
+                symptom.strip_prefix("vllm: ").unwrap_or(&symptom),
             );
-            // The raw bytes survive selection, so a segment carrying an escape
-            // is still refused by the quoting guard and falls back to the
-            // canonical symptom rather than being stripped into a runnable
-            // lookalike of the user's error.
-            if break_seq.contains('\u{1b}') && !break_seq.starts_with('\r') {
+            assert!(
+                displayed.contains("torch.OutOfMemoryError"),
+                "{label}: the displayed line must be the exception, got {displayed:?}"
+            );
+
+            // An escape-bearing segment must never pass the quoting guard, or it
+            // would reach the printed command stripped into a lookalike.
+            if break_seq.contains('\u{1b}') {
                 assert!(
                     !terminal::quotable_in_single_quotes(&symptom),
                     "{label}: an escape-bearing symptom must not pass the quoting guard"
