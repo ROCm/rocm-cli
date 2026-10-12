@@ -30126,9 +30126,7 @@ install therock";
             "7.13.0",
             20,
         )?;
-        let activation_paths = paths
-            .clone()
-            .with_managed_root(newest.install_root.clone(), false);
+        let activation_paths = paths.clone().with_managed_root(newest.install_root, false);
         activation_paths.ensure()?;
         plant_service_record_on_runtime(
             &activation_paths,
