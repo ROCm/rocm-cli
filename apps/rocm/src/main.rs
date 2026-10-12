@@ -18887,10 +18887,11 @@ pub(crate) mod tests {
             (
                 after.status.as_str(),
                 after.supervisor_pid,
+                after.engine_pid,
                 after.restart_count,
                 after.stop_requested_unix_ms,
             ),
-            ("failed", std::process::id(), 1, None),
+            ("failed", std::process::id(), None, 1, None),
             "retired without naming the dead child"
         );
         Ok(())
