@@ -46,11 +46,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
 ureq = { version = "2.12", features = ["native-certs"] }
 
-[dev-dependencies]
-# Archive-extraction property tests; see `crates/rocm-core/src/archive_props.rs`.
-proptest = { version = "1", default-features = false, features = ["std"] }
-tempfile = "3"
-
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
@@ -73,3 +68,4 @@ zbus-secret-service-keyring-store = { version = "1.0", features = ["rt-tokio-cry
 # Test-only, so it adds nothing to any shipped binary.
 # Also used for the recursive-deletion paths in deletion_properties.
 proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = "3"
