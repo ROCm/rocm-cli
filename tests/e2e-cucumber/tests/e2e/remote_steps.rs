@@ -764,9 +764,12 @@ async fn then_stop_hint_clears_the_service(world: &mut E2eWorld) {
         "running the printed hint `{hint}` must report success:\n{stop_output}"
     );
     let listing = machine(world).exec(&["rocm", "services", "list", "--json"]);
-    let service_id = args
-        .get(3)
-        .expect("hint must be `rocm services stop <id> --yes`");
+    assert_eq!(
+        args.len(),
+        5,
+        "hint must be `rocm services stop <id> --yes`, got `{hint}`"
+    );
+    let service_id = args[3];
     assert!(
         !listing.contains(service_id),
         "the service must be gone from the remote's own listing after running the hint:\n{listing}"
