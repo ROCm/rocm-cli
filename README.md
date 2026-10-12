@@ -308,8 +308,8 @@ fix` takes the id, not the position.
   `fix-19-shm-too-small`) — run `rocm diagnose` inside the distribution for
   those.
 - `--report` shows exactly what this machine would contribute to a problem
-  report, and sends nothing — there is no transport yet, and there will be no
-  automatic one: a report leaves a machine only by its owner's own action. The
+  report, and sends nothing. There is no automatic transport: a report leaves a
+  machine only by its owner's own action (see `--send`). The
   content is deliberately narrow (a schema version, the matched entry, whether
   a fix was offered for it, the GPU architecture and which compatibility
   matrix snapshot it was checked against, the OS family, distribution and
@@ -337,7 +337,8 @@ fix` takes the id, not the position.
   happens on a machine with no mail client. It is not combinable with
   `--json`, which exists for scripts, and a script is not a person who can
   read a mail before sending it. Note that a mail carries your address, which
-  the report itself does not.
+  the report itself does not. The dashboard offers the same path on its Diagnose
+  screen: `p` shows the report, and `s` asks before it runs `--report --send`.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
