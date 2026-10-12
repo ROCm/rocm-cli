@@ -121,8 +121,10 @@ version. A successful install prints the CLI version line. The SDK and driver
 lines read `not detected` when none is found, which is expected on a computer
 where you haven't installed ROCm or a driver yet.
 
-If the shell reports `rocm: command not found`, confirm that `~/.local/bin` is on
-your `PATH`.
+If the shell reports `rocm: command not found`, confirm that the install
+directory is on your `PATH`. That is `~/.local/bin` on Linux,
+`%USERPROFILE%\.local\bin` on Windows, or the folder you set with
+`ROCM_CLI_INSTALL_DIR`.
 
 ## Build from source
 
@@ -236,8 +238,9 @@ legacy install.
 
 ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
 `rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
-add `--version` and `--family`, and give `--family` the exact GPU arch (the raw
-`gfx` code) from `rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
+or you want a different one, also add `--family` with the raw `gfx` code from
+`rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
 
 Running `rocm install sdk` when a managed runtime is already the active default
 asks first, because the new install takes over as the active default; see
@@ -303,7 +306,7 @@ for its ROCm build and compiled GPU architectures:
 ```
 rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME] | --report [--send]]
 rocm diagnose --model <model> [--json]
-rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
+rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
 
 `diagnose` matches this machine against a fixed catalog of known
@@ -386,6 +389,8 @@ failure).
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
+- `--json` prints the catalog as JSON for tooling. It's valid only without a fix
+  id.
 
 ### ROCm installation
 
@@ -464,9 +469,11 @@ active default runtime, not about what a named prefix loses.
 
 #### ROCm 10 and newer
 
-ROCm 10 and newer ship from a different source layout. You opt in by passing two
-things together: pin the version with `--version`, and name the exact GPU arch,
-using the raw `gfx` code instead of a family label:
+ROCm 10 and newer ship from a different source layout. You opt in by pinning the
+version with `--version`. These versions select their device payload by exact
+GPU arch, so when ROCm CLI can't resolve one for this computer (it detects only
+a family of GPUs, or none), or you want to target a different GPU, also pass
+`--family` with the raw `gfx` code instead of a family label:
 
 ```
 rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
@@ -475,7 +482,8 @@ rocm install sdk --version 10.1.0 --family gfx1200 --dry-run
 A family label such as `--family gfx120X-all` is rejected for those versions
 instead of being resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
-`rocm examine` to see the arch this machine reports.
+`rocm examine` to see the arch this machine reports. If `--family` is needed and
+missing, the error names the command to re-run.
 
 For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
 torchaudio from their published dependency metadata, then validates that every
@@ -579,10 +587,14 @@ both `--keep-data` and `--keep-config`; see [Logs and cleanup](#logs-and-cleanup
 ```
 rocm engines list
 rocm engines install <engine> [--runtime-id KEY] [--python-version X.Y] [--reinstall]
+                             [--yes]
 rocm engines shell <engine>   [--runtime-id KEY | --env-id ID] [--shell PATH]
 ```
 
 Supported engines: `lemonade`, `vllm`.
+
+`--yes` approves required system-package installs, such as OpenMPI for vLLM,
+without asking.
 
 ### Will a model run here?
 
@@ -634,9 +646,21 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--host HOST] [--port PORT]
                    [--verbose] [--foreground | --managed]
                    [--no-smoke-test]
-                   [--allow-public-bind]
+                   [--allow-public-bind] [--require-api-key] [--api-key KEY]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
+                   [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
 ```
+
+`--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
+total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
+`mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
+the memory fraction when a small model shouldn't reserve most of a large card.
+
+`--require-api-key` makes a loopback endpoint require an API key too, which
+matters when something else republishes the port. A public bind generates a key
+automatically unless you supply one. Set `ROCM_SERVE_API_KEY` rather than
+passing `--api-key`, so the secret stays out of your shell history and the
+process table.
 
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to

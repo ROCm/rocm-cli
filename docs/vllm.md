@@ -63,8 +63,8 @@ runtime that cannot execute a kernel will fail at serving time.
 
 ## ROCm 10.x wheel discovery
 
-For ROCm SDK 7.x versions, including 7.14, `rocm engines install vllm` pins a
-fixed vLLM wheel and index URL. Any ROCm SDK 10.x version is different: AMD
+For ROCm SDK 7.x versions, `rocm engines install vllm` pins a fixed vLLM wheel
+and index URL. Any ROCm SDK 10.x version is different: AMD
 publishes vLLM, flash-attn, and amd-aiter there under a rotating dev-tag
 filename (for example
 `vllm-0.27.1.dev5+rocm10.0.0.gf46a9dfe2.d20260826-cp314-cp314-linux_x86_64.whl`),
