@@ -72,6 +72,15 @@ These guidelines are project constraints for user-facing ROCm CLI flows.
 - Color should carry meaning: cyan for the active focus, green for ready/safe,
   yellow/orange for work in progress or caution, and AMD red only for real
   errors or destructive danger.
+- "Work in progress" splits by whether the user is watching it right now. A
+  foreground in-progress action the user's attention is on, such as a running
+  job in the job console or Home activity feed, counts as the active focus and
+  uses cyan/accent. A background in-progress state the user is not necessarily
+  watching, such as an instance still starting up, uses yellow/orange/warn.
+  Exception: the LOGS dock renders a running job's entire streamed output in
+  its status color, not just a small badge, so it keeps `Running` neutral
+  rather than accent there — full-width saturated cyan would hurt readability
+  of the log body itself (see `dock::logs_dock`).
 - Do not show a persistent Activity pane by default.
 - Do not show a prompt/composer on screens where no assistant or server session
   exists. Use a main menu with clickable/arrow-key rows until the user starts or

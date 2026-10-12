@@ -36,7 +36,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::folder_browser::{FolderBrowser, FolderOutcome, draw_folder_browser};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::model_picker::{ModelPicker, ModelRecipeSummary, PickerOutcome, draw_model_picker};
@@ -398,6 +398,13 @@ impl ServeWizardState {
     /// form is exactly `serve MODEL`.
     fn build_args(&self) -> Result<Vec<String>, (Field, String)> {
         let port = self.validate()?;
+        // Trimmed, and deliberately so: `self.model` is typed as often as it is
+        // browser-filled, and three other places already derive from the
+        // trimmed form — the approval card's title, the job id, and the
+        // "already running" guard. Staging an untrimmed value here would let
+        // two launches differing only by trailing whitespace collide on one job
+        // id while actually running different commands. `host` and `port` below
+        // follow the same rule.
         let model = self.model.trim();
         let mut args = vec!["serve".to_string(), model.to_string()];
         // Automatic engine → the CLI resolves it.
@@ -655,7 +662,7 @@ fn request_launch(w: &mut ServeWizardState) {
     match w.build_args() {
         Ok(args) => {
             let cmd = resolve_exe();
-            let cmdline = format!("{} {}", exe_label(&cmd), args.join(" "));
+            let cmdline = format!("{} {}", exe_label(&cmd), display_args(&args));
             let mut body = vec![
                 cmdline,
                 String::new(),
@@ -1094,6 +1101,21 @@ mod tests {
         assert_eq!(
             w.build_args().unwrap(),
             vec!["serve", "m", "--port", "11500"]
+        );
+    }
+
+    #[test]
+    fn model_is_trimmed_so_argv_matches_the_job_id_and_approval_title() {
+        let w = ServeWizardState {
+            model: " /mnt/models/glm ".into(),
+            ..Default::default()
+        };
+        let args = w.build_args().unwrap();
+        assert_eq!(
+            args[1], "/mnt/models/glm",
+            "the approval title, the job id and the duplicate-launch guard all \
+             key off model.trim(); staging an untrimmed value here would let \
+             two launches share one job id while running different commands"
         );
     }
 

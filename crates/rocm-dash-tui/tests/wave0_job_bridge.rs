@@ -18,6 +18,7 @@ use ratatui::backend::TestBackend;
 use rocm_dash_core::state::{JobStatus, State, StateEvent};
 use rocm_dash_tui::jobs;
 use rocm_dash_tui::ui::approval::{ApprovalChoice, ApprovalRequest, draw_approval};
+use rocm_dash_tui::ui::exec::display_args;
 use rocm_dash_tui::ui::job_console::draw_job_console;
 use rocm_dash_tui::ui::theme::Theme;
 use tokio::sync::mpsc;
@@ -191,4 +192,53 @@ fn approval_snapshot_renders_request_and_buttons() {
     assert!(out.contains("Approve"), "approve button");
     assert!(out.contains("Deny"), "deny button");
     assert!(out.contains("Esc/q cancel"), "cancel hint");
+}
+
+/// #443: a space-containing argument (e.g. a `--prefix` path) must render
+/// quoted in the rendered approval preview, not as two bare, ambiguous words.
+/// Builds the body line the same way every affected call site does — via
+/// `display_args` — to prove the real widget renders the quotes, not just
+/// that the string helper returns them.
+#[test]
+fn approval_snapshot_quotes_args_containing_spaces() {
+    let theme = Theme::from_name("default-dark");
+    let args = vec![
+        "--prefix".to_string(),
+        "/mnt/my folder".to_string(),
+        "--approve-replacing-active-default".to_string(),
+    ];
+    let req = ApprovalRequest::new(
+        "install SDK",
+        vec![format!("rocm install sdk {}", display_args(&args))],
+    );
+    let out = render(140, 26, |f| {
+        draw_approval(f, f.area(), &req, ApprovalChoice::Approve, &theme);
+    });
+
+    assert!(
+        out.contains("--prefix \"/mnt/my folder\""),
+        "space-containing arg is rendered quoted:\n{out}"
+    );
+}
+
+/// #443: the running-job console title must quote a space-containing
+/// argument too, for the same reason as the approval preview above.
+#[test]
+fn job_console_snapshot_quotes_args_containing_spaces() {
+    let theme = Theme::from_name("default-dark");
+    let mut state = State::default();
+    state.apply(StateEvent::StartJob {
+        id: "install".into(),
+        cmd: "rocm".into(),
+        args: vec!["install".into(), "sdk".into(), "/mnt/my folder".into()],
+    });
+    let job = state.job("install").unwrap();
+    let out = render(140, 32, |f| {
+        draw_job_console(f, f.area(), job, (0, 0), 0, &theme);
+    });
+
+    assert!(
+        out.contains("\"/mnt/my folder\""),
+        "space-containing arg is rendered quoted:\n{out}"
+    );
 }

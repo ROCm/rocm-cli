@@ -14,41 +14,80 @@
 //! - SI units (k / M / B) for token throughput and request counts.
 //! - Percentages always with 1 decimal unless < 0.1, then 2 decimals.
 //! - Optional values render `-`.
+//! - [`display_or_placeholder`] is the one exception to "numeric": a small
+//!   shared UI helper for rendering an optional field's value, so every overlay
+//!   that has one stays visually consistent.
 
 use chrono::{DateTime, Utc};
 use rocm_dash_core::metrics::{ObservationFreshness, ObservationMetadata};
 
-/// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
-/// Promotes to GiB at 1024, TiB at 1024², with one decimal.
-pub fn mib(value: u64) -> String {
-    if value >= 1024 * 1024 {
-        format!("{:.1} TiB", value as f64 / (1024.0 * 1024.0))
-    } else if value >= 1024 {
-        format!("{:.1} GiB", value as f64 / 1024.0)
+/// An optional field's value, or `placeholder` when unset.
+///
+/// For any overlay row that stays blank until the user fills it — by typing, or
+/// via the [`FolderBrowser`](crate::ui::folder_browser::FolderBrowser), or by
+/// picking from a list. The callers are deliberately not enumerated here: that
+/// list has gone stale twice, and a grep for the function name is exact.
+///
+/// "Unset" means whitespace-only, matching every caller's own emptiness test,
+/// so a row never looks populated while the value would actually be treated as
+/// unset — rejected outright for the two required fields (install-manager
+/// channel, serve-wizard model), silently omitted for the rest. Whether to
+/// trim the *value* before passing it on is a separate,
+/// caller-specific decision: onboarding's install prefix is written only by the
+/// folder browser and so is kept byte-exact, while the typed fields elsewhere
+/// are trimmed. See `onboarding::build_install_args` for that contrast.
+pub fn display_or_placeholder(v: &str, placeholder: &'static str) -> String {
+    if v.trim().is_empty() {
+        placeholder.to_string()
     } else {
-        format!("{value} MiB")
+        v.to_string()
+    }
+}
+
+/// The unit a mebibyte count is shown in once it reaches 1024 MiB, as the
+/// divisor that converts MiB into it and its label. `None` below 1024 MiB,
+/// which is printed as a whole number of MiB.
+///
+/// Promotes while the value AS PRINTED would reach 1024, not merely while the
+/// raw value does: 1_048_575 MiB is 1023.999… GiB, which `{:.1}` renders as
+/// "1024.0 GiB". Comparing the rounded tenths, as `rocm_core::format_bytes`
+/// does, keeps every size in the unit it belongs to.
+fn promoted_mib_unit(value: u64) -> Option<(f64, &'static str)> {
+    const UNITS: [&str; 2] = ["GiB", "TiB"];
+    if value < 1024 {
+        return None;
+    }
+    let mut divisor = 1024.0;
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && (value as f64 / divisor * 10.0).round() >= 10_240.0 {
+        divisor *= 1024.0;
+        unit += 1;
+    }
+    Some((divisor, UNITS[unit]))
+}
+
+/// Format a byte count that's already in mebibytes (e.g. amd-smi `vram_used_mb`).
+///
+/// Promotes to GiB at 1024, TiB at 1024², with one decimal — and as soon as the
+/// printed value would read 1024.0, so it never shows "1024.0 GiB".
+pub fn mib(value: u64) -> String {
+    match promoted_mib_unit(value) {
+        Some((divisor, unit)) => format!("{:.1} {unit}", value as f64 / divisor),
+        None => format!("{value} MiB"),
     }
 }
 
 /// Pair of (used_mib, total_mib) → "used / total" with promotion. Both promoted
-/// to the same unit (driven by total) so they compare visually.
+/// to the same unit (driven by total, exactly as [`mib`] would pick it) so they
+/// compare visually.
 pub fn mib_pair(used: u64, total: u64) -> String {
-    if total >= 1024 * 1024 {
-        let scale = 1024.0 * 1024.0;
-        format!(
-            "{:.1} / {:.1} TiB",
-            used as f64 / scale,
-            total as f64 / scale
-        )
-    } else if total >= 1024 {
-        let scale = 1024.0;
-        format!(
-            "{:.1} / {:.1} GiB",
-            used as f64 / scale,
-            total as f64 / scale
-        )
-    } else {
-        format!("{used} / {total} MiB")
+    match promoted_mib_unit(total) {
+        Some((divisor, unit)) => format!(
+            "{:.1} / {:.1} {unit}",
+            used as f64 / divisor,
+            total as f64 / divisor
+        ),
+        None => format!("{used} / {total} MiB"),
     }
 }
 
@@ -115,6 +154,29 @@ pub fn tps_opt(value: Option<f64>) -> String {
 pub fn tokens_per_watt(value: Option<f64>) -> String {
     match value {
         Some(v) if v.is_finite() => format!("{v:.2} tok/W"),
+        _ => "-".to_string(),
+    }
+}
+
+/// Energy efficiency, held-observation-aware.
+///
+/// Same formatting as [`tokens_per_watt`], with [`HELD_MARKER`] appended when
+/// `obs` is Held — tok/W derives from the same per-tick `gen_tps` sample, so
+/// it goes stale exactly when gen_tps does.
+///
+/// - `None` or non-finite → `"-"` (unchanged from [`tokens_per_watt`])
+/// - `Some(v)`, Held → `"{v:.2} tok/W*"`
+/// - `Some(v)`, Fresh or unknown metadata → `"{v:.2} tok/W"`
+pub fn tokens_per_watt_cell(value: Option<f64>, obs: Option<&ObservationMetadata>) -> String {
+    match value {
+        Some(v) if v.is_finite() => {
+            let base = format!("{v:.2} tok/W");
+            if obs.is_some_and(|m| m.freshness == ObservationFreshness::Held) {
+                format!("{base}{HELD_MARKER}")
+            } else {
+                base
+            }
+        }
         _ => "-".to_string(),
     }
 }
@@ -280,6 +342,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_or_placeholder_treats_whitespace_only_as_unset() {
+        assert_eq!(display_or_placeholder("", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("   ", "(default)"), "(default)");
+        assert_eq!(display_or_placeholder("release", "(default)"), "release");
+    }
+
+    #[test]
     fn mib_promotes_to_gib_then_tib() {
         assert_eq!(mib(0), "0 MiB");
         assert_eq!(mib(512), "512 MiB");
@@ -294,6 +363,133 @@ mod tests {
         assert_eq!(mib_pair(256, 512), "256 / 512 MiB");
         assert_eq!(mib_pair(2048, 4096), "2.0 / 4.0 GiB");
         assert_eq!(mib_pair(1024, 1024 * 1024), "0.0 / 1.0 TiB");
+    }
+
+    /// Just below 1 TiB the value rounds up to a full 1024 GiB, which has to be
+    /// reported as 1.0 TiB — the same defect `rocm_core::format_bytes` had.
+    /// 1_048_524 MiB is the last input that still belongs to GiB; 1_048_525 is
+    /// the first that `{:.1}` rounds up to 1024.0 of it and used to print
+    /// "1024.0 GiB".
+    #[test]
+    fn mib_promotes_a_value_that_rounds_up_to_a_full_unit() {
+        assert_eq!(mib(1023), "1023 MiB");
+        assert_eq!(mib(1_048_524), "1023.9 GiB");
+        assert_eq!(mib(1_048_525), "1.0 TiB");
+        assert_eq!(mib(1_048_575), "1.0 TiB");
+    }
+
+    /// `mib_pair` picks the unit from the total, so the total is the value that
+    /// must not print as "1024.0 GiB".
+    #[test]
+    fn mib_pair_promotes_a_total_that_rounds_up_to_a_full_unit() {
+        assert_eq!(mib_pair(512, 1_048_524), "0.5 / 1023.9 GiB");
+        assert_eq!(mib_pair(0, 1_048_525), "0.0 / 1.0 TiB");
+        assert_eq!(mib_pair(1_048_575, 1_048_575), "1.0 / 1.0 TiB");
+    }
+
+    // ── Properties ─────────────────────────────────────────────────
+
+    /// The units `mib` and `mib_pair` print, smallest first.
+    const MIB_UNITS: [&str; 3] = ["MiB", "GiB", "TiB"];
+
+    /// Check that `value`, printed as `printed` in `unit`, is in the unit it
+    /// belongs to. Two edges, both on the mantissa as printed, in tenths:
+    ///
+    /// Upper: below the top unit, the mantissa is under 1024.0 — otherwise the
+    /// size is shown in a unit it has outgrown.
+    ///
+    /// Lower: above `MiB`, the mantissa is at least 1.0, and the next smaller
+    /// unit would have printed 1024.0 or more — otherwise the size was
+    /// promoted before it reached a whole unit.
+    fn own_unit_violation(value_mib: u64, printed: f64, unit: &str) -> Option<String> {
+        let tenths = (printed * 10.0).round();
+        let exponent = MIB_UNITS
+            .iter()
+            .position(|name| *name == unit)
+            .expect("rendered unit is one of the known units");
+        if exponent + 1 < MIB_UNITS.len() && tenths >= 10_240.0 {
+            return Some(format!(
+                "{value_mib} MiB printed as {printed:.1} {unit}, which should have \
+                 been promoted to the next unit"
+            ));
+        }
+        if exponent > 0 {
+            if tenths < 10.0 {
+                return Some(format!(
+                    "{value_mib} MiB printed as {printed:.1} {unit}, which was \
+                     promoted before it reached a whole unit"
+                ));
+            }
+            // Dividing by a power of two is exact, so this is the value the
+            // smaller unit would have printed, not an approximation of it.
+            let smaller = (1..exponent).fold(value_mib as f64, |value, _| value / 1024.0);
+            if (smaller * 10.0).round() < 10_240.0 {
+                return Some(format!(
+                    "{value_mib} MiB printed as {printed:.1} {unit}, but still fits \
+                     the smaller unit as {smaller:.1} {}",
+                    MIB_UNITS[exponent - 1]
+                ));
+            }
+        }
+        None
+    }
+
+    /// MiB counts that actually visit the unit boundaries. A uniform `u64`
+    /// almost always lands far above the top unit, so on its own it never
+    /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
+    /// draw uniformly within one unit's range, and from a window just below the
+    /// GiB→TiB boundary that scales with it, as the band does — see
+    /// `rocm_core::disk_space`'s generator for the full reasoning. The
+    /// MiB→GiB boundary has no band: MiB prints a whole number.
+    fn mib_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        const TIB_BOUNDARY: u64 = 1024 * 1024;
+        prop_oneof![
+            any::<u64>(),
+            (0u32..=2).prop_flat_map(|exponent| {
+                let low = if exponent == 0 {
+                    0
+                } else {
+                    1024u64.pow(exponent)
+                };
+                low..1024u64.pow(exponent + 1)
+            }),
+            (TIB_BOUNDARY - TIB_BOUNDARY / 16384)..=(TIB_BOUNDARY + 1),
+        ]
+    }
+
+    /// Split `"<number> <unit>"` into its parts.
+    fn split_rendered(rendered: &str) -> (f64, &str) {
+        let (value, unit) = rendered
+            .split_once(' ')
+            .expect("rendered size is `<number> <unit>`");
+        (value.parse().expect("numeric part parses"), unit)
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn mib_renders_a_size_in_its_own_unit(value in mib_count_strategy()) {
+            let rendered = mib(value);
+            let (printed, unit) = split_rendered(&rendered);
+            let violation = own_unit_violation(value, printed, unit);
+            proptest::prop_assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+        }
+
+        /// The pair takes its unit from the total, so the total obeys the same
+        /// contract as `mib` does on its own; the used half just shares it.
+        #[test]
+        fn mib_pair_renders_the_total_in_its_own_unit(
+            total in mib_count_strategy(),
+            used in mib_count_strategy(),
+        ) {
+            let rendered = mib_pair(used, total);
+            let (_used, total_part) = rendered
+                .split_once(" / ")
+                .expect("rendered pair is `<used> / <total> <unit>`");
+            let (printed, unit) = split_rendered(total_part);
+            let violation = own_unit_violation(total, printed, unit);
+            proptest::prop_assert!(violation.is_none(), "{}", violation.unwrap_or_default());
+        }
     }
 
     #[test]
@@ -345,6 +541,27 @@ mod tests {
         assert_eq!(tokens_per_watt(None), "-");
         assert_eq!(tokens_per_watt(Some(0.42)), "0.42 tok/W");
         assert_eq!(tokens_per_watt(Some(f64::INFINITY)), "-");
+    }
+
+    #[test]
+    fn tokens_per_watt_cell_appends_held_marker() {
+        let held = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Held,
+        };
+        let fresh = ObservationMetadata {
+            observed_at: "2023-11-15T12:00:00Z".parse().unwrap(),
+            freshness: ObservationFreshness::Fresh,
+        };
+        assert_eq!(tokens_per_watt_cell(None, None), "-");
+        assert_eq!(tokens_per_watt_cell(Some(f64::NAN), Some(&held)), "-");
+        assert_eq!(
+            tokens_per_watt_cell(Some(0.42), None),
+            "0.42 tok/W",
+            "unknown metadata must not fabricate a held marker"
+        );
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&fresh)), "0.42 tok/W");
+        assert_eq!(tokens_per_watt_cell(Some(0.42), Some(&held)), "0.42 tok/W*");
     }
 
     #[test]

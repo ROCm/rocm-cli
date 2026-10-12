@@ -625,6 +625,38 @@ impl MockServer {
         }
     }
 
+    /// Poll for a chat request that satisfies `matches`, so a scenario asserting
+    /// on the user's turn cannot be answered by an earlier unrelated one.
+    ///
+    /// [`Self::wait_for_chat_request`] returns whichever body was recorded
+    /// first, and the local-endpoint detection probe (`Say ok.`, `max_tokens: 2`)
+    /// is itself a chat request that lands before the user has typed anything.
+    /// A scenario with no intervening screen wait therefore sees the probe and
+    /// reports the real turn as missing. Only `last_chat_request` is retained,
+    /// so this narrows to the newest body rather than searching a history.
+    pub async fn wait_for_chat_request_where(
+        &self,
+        timeout: Duration,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Result<Value, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(body) = self.last_chat_request()
+                && matches(&body)
+            {
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {timeout:?} waiting for a matching chat request; \
+                     the most recent one was: {:?}",
+                    self.last_chat_request()
+                ));
+            }
+            tokio::time::sleep(CHAT_REQUEST_POLL_INTERVAL).await;
+        }
+    }
+
     /// Shut the server down explicitly. Equivalent to dropping it — the
     /// handle stops the server on drop — but says so at the call site.
     pub fn stop(self) {

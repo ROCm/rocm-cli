@@ -35,6 +35,7 @@ tests/e2e-cucumber/
 │   ├── chat.feature
 │   ├── examine.feature
 │   ├── model_serving.feature
+│   ├── rocm_doctor_skill.feature # skill↔CLI contract (see below)
 │   └── runtime_setup.feature
 │
 ├── tests/                        # test binary + step modules
@@ -43,7 +44,8 @@ tests/e2e-cucumber/
 │       ├── chat_steps.rs
 │       ├── examine_steps.rs
 │       ├── runtime_steps.rs
-│       └── serving_steps.rs
+│       ├── serving_steps.rs
+│       └── skill_steps.rs
 │
 └── src/                          # shared test infrastructure
     ├── lib.rs
@@ -106,14 +108,39 @@ There is no tag-filter tiering. Each CI job runs the **whole** suite
 **pass / xfail / skip** at runtime from its capability tags plus the known-bug
 matrix, then reconciles the actual result against that expectation.
 
+### Naming
+
+Each feature file has a short **key** that prefixes both its scenario names and
+its ids. The key is usually the file's stem in kebab-case, but not always —
+`install_lifecycle` uses `lifecycle`, `model_serving` uses `serve`, and
+`dependency_guard` uses `deps-guard` — so `FEATURE_KEYS` in
+`tests/feature_naming.rs` is the list, not this page.
+
+Keys must also be **distinct between files**: `runtime_setup` owns `runtime`, so
+`runtime_lifecycle` takes `runtime-lifecycle`. Two files sharing a key would emit
+the same `<key>-01` index twice, which is exactly what the key exists to prevent.
+
+- **Scenario name** — `Scenario: <key>-<NN> - <description>`, numbered
+  sequentially in declaration order. The report sorts the grid's rows by this
+  index, so it must match the order in the file. Without the key the index names
+  nothing: every file used to number from 1, so "1" meant eight different
+  scenarios.
+- **`@id:`** — `<key>-<slug>`, so an id alone says which feature it belongs to.
+
+`tests/feature_naming.rs` enforces all of this (sequential, unique suite-wide,
+feature-qualified ids) in the ordinary `cargo test` run. Adding a feature file
+means adding its key to `FEATURE_KEYS` there.
+
 Scenarios carry stable-id and capability tags:
 
 | Tag | Meaning |
 |---|---|
-| `@id:<slug>` | Stable scenario id. Keys the expectation matrix and the report grid; every scenario has one. |
+| `@id:<key>-<slug>` | Stable scenario id, prefixed with its feature's key. Keys the expectation matrix and the report grid; every scenario has one. |
 | `@requires-gpu` | Needs a usable AMD GPU. Resolves to **skip** (n/a) on a host with none — the mock job, or a WSL host whose ROCm passthrough is incomplete (`driver_status` other than `wsl_rocdxg_ready`), where the gfx target is reported but unreachable. |
+| `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
+| `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -159,12 +186,17 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow runs four non-blocking jobs — MI300X plus Strix Halo on
-Ubuntu, Windows, and WSL2 — with `E2E_INCLUDE_NIGHTLY=1`, then consolidates them
-into the same cross-platform grid. The
-shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and
-the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint
-through Lemonade on Strix Halo.
+The nightly workflow covers a strict superset of the hardware in the table
+above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+`e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
+`e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
+`E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
+grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
+counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
+so nightly is where their regression coverage now lives. The shared
+large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and the
+hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint through
+Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on
@@ -213,3 +245,63 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
+- **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id>`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
+
+## The rocm-doctor skill contract
+
+`rocm_doctor_skill.feature` is the one feature that treats a file in this repo as
+an expected value. `skills/rocm-doctor/` is a published skill: this repo is its
+source of truth, and the [`amd/skills`](https://github.com/amd/skills) catalog
+vendors it from here. The skill owns no probe, no catalog and no fixes — all of
+that ships inside the binary — so what it does own is a **contract**: which
+fix-ids exist, which ones the CLI applies
+itself, which machines each is for, which fields a diagnosis carries, which
+confidence thresholds an agent reasons about, which verdicts `examine` can
+return, and where a report goes when nothing matched.
+
+`diagnose.feature` covers the same commands, so the division matters:
+
+|  | expected value lives in | catches |
+|---|---|---|
+| `diagnose.feature` | the test suite (e.g. `CATALOG_FIX_IDS`) | the **CLI** drifting |
+| `rocm_doctor_skill.feature` | `skills/rocm-doctor/reference.md` | the **document** drifting |
+
+Only the second can notice that a published document has gone stale, and that is
+the whole reason the feature exists. So anything already proven by
+`diagnose.feature` — that a fix for another OS is declined without writing
+anything, that the listing is complete, that a report says plainly whether a
+cause was established — stays there and is **not** restated here. If a scenario
+in this feature does not read `reference.md`, it is in the wrong file.
+
+Reading that document as test data is a deliberate, narrow exception to
+**Black-box only** above: nothing is imported from the rocm-cli codebase — a
+*documentation artifact* is read as test data, and that artifact is the thing
+under test. `skill_steps.rs` parses the specific claims each scenario names —
+the catalog table's cells, the auto-applicable prose line, the framework-routing
+bullets, the diagnose fields and thresholds — rather than restating them as
+constants, so editing one of those in `reference.md` starts being checked with
+no code change, and every one of those parsers asserts it found something — a
+heading it depends on being reworded upstream must fail loudly rather than
+quietly reduce an assertion to a no-op. Free-standing prose outside those
+spots — the failure-mode count in the catalog heading, the Linux-only/
+Windows-only recap line under the table, SKILL.md's "the other N are
+print-only" — is not parsed, so it can drift without failing anything here.
+
+Two rules follow:
+
+- The catalog is authoritative in `crates/rocm-core/src/fix.rs`. When one of
+  these scenarios fails, the CLI is right and the docs are what change.
+- A skill-only edit must still run this job, so `skills/**` is in the `heavy`
+  paths filter that gates the `e2e` job.
+
+No scenario asserts whether a symptom matched, in either direction — that is not
+a property this suite can hold still. The catalog scores several checkers from
+**host state alone**, with no symptom keyword involved, so a runner with `amdgpu`
+blacklisted is explained by `fix-5-amdgpu-load` whatever it is asked about; and
+on a host the catalog rules out of scope (WSL2) nothing is scored at all. An
+assertion either way would encode one runner's state.
+
+Claims about *whether* a cause was established therefore live in
+`crates/rocm-core/src/diagnose.rs`, where the `Examination` is constructed rather
+than probed. What this feature asserts holds on any host, so it is clean on WSL2,
+the no-GPU lane, and the GPU lanes alike.

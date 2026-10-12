@@ -306,11 +306,15 @@ ensure_installer_process_path() {
   esac
 }
 
-os="$(uname -s)"
-arch="$(uname -m)"
+# Which machine the artifact is *for*. Normally this machine, but the target can
+# be named explicitly so an artifact can be fetched here on behalf of a different
+# one -- see ROCM_CLI_DOWNLOAD_ONLY below. Detection is the only thing that
+# changes; naming a target does not relax any verification.
+os="${ROCM_CLI_TARGET_OS:-$(uname -s)}"
+arch="${ROCM_CLI_TARGET_ARCH:-$(uname -m)}"
 
 case "${os}" in
-  Linux) platform_os="linux" ;;
+  Linux|linux) platform_os="linux" ;;
   *)
     fail "unsupported OS: ${os} (installer currently supports Linux x86_64 only)"
     ;;
@@ -322,6 +326,29 @@ case "${arch}" in
     fail "unsupported architecture: ${arch} (installer currently supports Linux x86_64 only)"
     ;;
 esac
+
+# Fetch and verify an artifact, then stop without installing it. Used to obtain a
+# build for a machine that cannot reach the release host itself: this machine
+# downloads it, verifies it, and hands the verified files over for delivery.
+#
+# The artifact is emitted with its checksum and signature sidecars so that
+# whatever installs it later can repeat every check performed here. Nothing is
+# skipped on either side -- this splits the trust chain across two machines, it
+# does not shorten it.
+DOWNLOAD_ONLY=0
+if truthy "${ROCM_CLI_DOWNLOAD_ONLY:-0}"; then
+  DOWNLOAD_ONLY=1
+fi
+DOWNLOAD_DIR="${ROCM_CLI_DOWNLOAD_DIR:-.}"
+
+# Install from an artifact already on disk instead of downloading one. The
+# receiving half of the split above. Its .sha256 sidecar is required, not
+# optional: an artifact that arrived over the network is exactly the one whose
+# integrity still has to be proven.
+LOCAL_ARCHIVE="${ROCM_CLI_ARCHIVE:-}"
+if [ -n "${LOCAL_ARCHIVE}" ] && [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
+  fail "ROCM_CLI_ARCHIVE and ROCM_CLI_DOWNLOAD_ONLY are mutually exclusive"
+fi
 
 case "${CHANNEL}" in
   nightly)
@@ -358,11 +385,29 @@ sig_path="${archive_path}.sig"
 echo "rocm-cli installer"
 echo "  repo: ${REPO}"
 echo "  channel: ${CHANNEL}"
-echo "  install_dir: ${INSTALL_DIR}"
-echo "  download: ${archive_url}"
+echo "  platform: ${platform_os}-${platform_arch}"
+if [ -n "${LOCAL_ARCHIVE}" ]; then
+  echo "  archive: ${LOCAL_ARCHIVE}"
+elif [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
+  echo "  download_only: ${DOWNLOAD_DIR}"
+  echo "  download: ${archive_url}"
+else
+  echo "  install_dir: ${INSTALL_DIR}"
+  echo "  download: ${archive_url}"
+fi
 
-fetch "${archive_url}" "${archive_path}"
-fetch "${sha_url}" "${sha_path}"
+if [ -n "${LOCAL_ARCHIVE}" ]; then
+  [ -f "${LOCAL_ARCHIVE}" ] || fail "archive not found: ${LOCAL_ARCHIVE}"
+  [ -f "${LOCAL_ARCHIVE}.sha256" ] || fail "archive checksum not found: ${LOCAL_ARCHIVE}.sha256"
+  cp "${LOCAL_ARCHIVE}" "${archive_path}"
+  cp "${LOCAL_ARCHIVE}.sha256" "${sha_path}"
+  if [ -f "${LOCAL_ARCHIVE}.sig" ]; then
+    cp "${LOCAL_ARCHIVE}.sig" "${sig_path}"
+  fi
+else
+  fetch "${archive_url}" "${archive_path}"
+  fetch "${sha_url}" "${sha_path}"
+fi
 
 expected="$(awk '{print $1}' "${sha_path}" | head -n1)"
 [ -n "${expected}" ] || fail "checksum file did not contain a sha256 digest"
@@ -385,9 +430,29 @@ fi
 
 if [ "${require_sig}" -eq 1 ] || [ -n "${public_keys}" ]; then
   [ -n "${public_keys}" ] || fail "signature verification requires ROCM_CLI_SIGNING_PUBLIC_KEY_PATH or ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"
-  fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"
+  if [ -n "${LOCAL_ARCHIVE}" ]; then
+    # A locally-supplied archive has no URL to fall back on: the signature had to
+    # travel with it. Refusing here is the point -- an artifact delivered out of
+    # band is precisely the one whose provenance cannot be assumed.
+    [ -f "${sig_path}" ] || fail "required signature sidecar is missing: ${LOCAL_ARCHIVE}.sig"
+  else
+    fetch "${sig_url}" "${sig_path}" "required signature sidecar is missing or unavailable: ${sig_url}"
+  fi
   verify_signature "${archive_path}" "${sig_path}" "${public_keys}"
   echo "signature verified"
+fi
+
+# Everything above ran unchanged. Only now, with the artifact proven, is it
+# handed over rather than installed.
+if [ "${DOWNLOAD_ONLY}" -eq 1 ]; then
+  mkdir -p "${DOWNLOAD_DIR}"
+  install -m 0644 "${archive_path}" "${DOWNLOAD_DIR}/${asset_base}"
+  install -m 0644 "${sha_path}" "${DOWNLOAD_DIR}/${asset_base}.sha256"
+  if [ -f "${sig_path}" ]; then
+    install -m 0644 "${sig_path}" "${DOWNLOAD_DIR}/${asset_base}.sig"
+  fi
+  echo "downloaded: ${DOWNLOAD_DIR}/${asset_base}"
+  exit 0
 fi
 
 extract_dir="${tmp_dir}/extract"

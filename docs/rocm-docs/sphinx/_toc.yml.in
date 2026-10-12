@@ -1,0 +1,20 @@
+root: index
+subtrees:
+  - caption: Install
+    entries:
+      - file: install/installation
+  - caption: Getting started
+    entries:
+      - file: getting-started
+      - file: demos
+        title: See ROCm CLI in action
+  - caption: Use ROCm CLI
+    entries:
+      - file: commands
+        title: Command reference
+      - file: engines/vllm
+        title: vLLM adapter
+  - caption: About
+    entries:
+      - file: about/contributing
+      - file: about/license

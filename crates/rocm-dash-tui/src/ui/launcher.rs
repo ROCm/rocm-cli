@@ -16,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use rocm_dash_core::metrics::Instance;
 #[cfg(test)]
 use rocm_dash_core::metrics::InstanceStatus;
 
@@ -81,6 +82,20 @@ pub const fn row_count() -> usize {
 pub fn choice_for(sel: usize) -> LauncherChoice {
     ROWS.get(sel)
         .map_or(LauncherChoice::OpenDashboard, |(_, _, _, c)| *c)
+}
+
+/// Move the selection cursor one step, wrapping around `row_count`.
+///
+/// `forward` selects the next row (Down/j/Right); otherwise the previous row
+/// (Up/k/Left). Pulled out of `run_launcher`'s event loop so the wrapping
+/// arithmetic is unit-testable without a real terminal.
+#[must_use]
+pub const fn move_selection(sel: usize, row_count: usize, forward: bool) -> usize {
+    if forward {
+        (sel + 1) % row_count
+    } else {
+        (sel + row_count - 1) % row_count
+    }
 }
 
 /// True when a model is actively serving (drives the running vs idle variant).
@@ -233,10 +248,25 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
     ]));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ move   Enter select   d dashboard   q quit",
+        "↑↓←→ move   Enter select   d dashboard   q / Ctrl-C quit",
         Style::default().fg(theme.muted),
     )));
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Build the launcher's render state, seeding `instances` from the serving
+/// models the caller discovered in the managed-service registry.
+///
+/// Kept separate from the terminal loop so the seeding is unit-testable without
+/// a real terminal: an empty `serving` yields the idle front door, a non-empty
+/// one makes `is_running` report the running model.
+fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
+    let mut state = AppState::new(String::new(), theme_name.to_string());
+    state.instances = serving
+        .into_iter()
+        .map(|inst| (inst.container_id.clone(), inst))
+        .collect();
+    state
 }
 
 /// Run the launcher as a synchronous pre-dash screen.
@@ -245,20 +275,23 @@ fn draw_menu(f: &mut Frame, area: Rect, state: &AppState, sel: usize, theme: &Th
 /// caller escalates into the existing dash entry points (ponytail: no parallel
 /// async loop here).
 ///
-/// Renders the idle variant from a fresh `AppState` (no live daemon is started
-/// just for the front door); live telemetry appears once the dash is opened.
+/// `serving` seeds the status strip / menu so the front door reflects the models
+/// the managed-service registry reports as running (the same authority
+/// `rocm services` reads) — without starting a live telemetry daemon just for the
+/// front door. Live GPU telemetry still appears once the dash is opened.
 ///
 /// # Errors
 /// Propagates terminal setup / event-read I/O errors.
-pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>> {
+pub fn run_launcher(
+    theme_name: &str,
+    serving: Vec<Instance>,
+) -> std::io::Result<Option<LauncherChoice>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
 
-    let state = AppState::new(String::new(), theme_name.to_string());
+    let state = launcher_state(theme_name, serving);
     let theme = state.theme;
 
     enable_raw_mode()?;
@@ -269,29 +302,81 @@ pub fn run_launcher(theme_name: &str) -> std::io::Result<Option<LauncherChoice>>
 
     let mut sel = 0usize;
     let result = loop {
-        terminal.draw(|f| draw(f, f.area(), &state, sel, &theme))?;
+        draw_menu_unless_shutting_down(
+            &mut terminal,
+            &state,
+            sel,
+            &theme,
+            &crate::app::SHUTTING_DOWN,
+        )?;
         let Event::Key(k) = event::read()? else {
             continue;
         };
         if k.kind != KeyEventKind::Press {
             continue;
         }
+        // Raw mode delivers a typed Ctrl-C as a key event, not a signal, so the
+        // hub's termination watcher never sees it. This menu is the second of
+        // the process's two key loops; route it through the same
+        // restore-and-exit path a real SIGINT takes, so the gesture cannot mean
+        // one thing inside a session and nothing at all at the front door.
+        if crate::app::is_ctrl_c(k) {
+            crate::app::exit_on_ctrl_c();
+        }
         match k.code {
             KeyCode::Char('q') | KeyCode::Esc => break None,
             KeyCode::Char('d') => break Some(LauncherChoice::OpenDashboard),
             KeyCode::Enter => break Some(choice_for(sel)),
-            KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1) % row_count(),
-            KeyCode::Up | KeyCode::Char('k') => {
-                sel = (sel + row_count() - 1) % row_count();
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
+                sel = move_selection(sel, row_count(), true);
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+                sel = move_selection(sel, row_count(), false);
             }
             _ => {}
         }
     };
 
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // One shared teardown for the whole crate. This used to be an open-coded
+    // `disable_raw_mode` + `LeaveAlternateScreen` + `show_cursor` — a second
+    // restore implementation that could (and would) drift from the one the
+    // signal watcher and the typed-Ctrl-C path run. `restore_terminal` is
+    // best-effort by design: a vanished controlling terminal must not turn a
+    // clean launcher exit into an `Err`, which the `?`s here previously did.
+    crate::app::restore_terminal();
     Ok(result)
+}
+
+/// Draw one launcher frame, unless a shutdown has already been claimed on
+/// `latch`.
+///
+/// The hub's signal watcher runs on its own runtime while this menu loop owns
+/// the main thread, so a termination can be in flight concurrently: the terminal
+/// is being restored, and this frame must not land after the restore and undo
+/// it. See the ordering note on `crate::app::restore_terminal`.
+///
+/// As in the dashboard's gate, the latch read is done *under*
+/// `crate::app::lock_terminal_writer`, which is then held for the whole frame:
+/// the lock stops a restore splicing into (or being overtaken by) this frame, and
+/// the latch read under it stops a frame that a restore already beat to the lock.
+/// Neither half is sufficient alone.
+///
+/// Parameterised over the backend and the latch so the gate is testable against
+/// a `TestBackend` — inlined in the loop it was reachable only from a real
+/// terminal, and deleting it turned no test red.
+fn draw_menu_unless_shutting_down<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    state: &AppState,
+    sel: usize,
+    theme: &Theme,
+    latch: &std::sync::atomic::AtomicBool,
+) -> Result<(), <B as ratatui::backend::Backend>::Error> {
+    let _writer = crate::app::lock_terminal_writer();
+    if crate::app::shutdown_claimed_on(latch) {
+        return Ok(());
+    }
+    terminal.draw(|f| draw(f, f.area(), state, sel, theme))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -313,6 +398,150 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect()
+    }
+
+    #[test]
+    fn a_claimed_shutdown_stops_the_launcher_painting_another_frame() {
+        // Same gate as the dashboard's, on the crate's *other* key loop. The hub
+        // menu runs on the main thread while the hub's signal watcher runs on its
+        // own runtime, so a frame started after `restore_terminal()` would hide
+        // the cursor again and repaint the menu over the restored screen.
+        // Local latch, `TestBackend`: asserts painted cells, not the predicate.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+
+        // Control: an unclaimed latch must let the frame through, or the
+        // assertion below would hold for a helper that simply never draws.
+        let open = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &open)
+            .expect("drawing to a TestBackend cannot fail");
+        assert!(
+            !painted(&term).is_empty(),
+            "with no shutdown claimed the launcher must paint its menu"
+        );
+
+        let claimed = AtomicBool::new(true);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &claimed)
+            .expect("the gate must not turn a suppressed frame into an error");
+        assert_eq!(
+            painted(&term),
+            "",
+            "once the shutdown is claimed the launcher must stop painting — a \
+             late frame lands after `restore_terminal()` and undoes it"
+        );
+    }
+
+    #[test]
+    fn a_menu_frame_cannot_paint_while_a_teardown_owns_the_terminal() {
+        // The launcher's half of the fix for the partial restore the WSL2 E2E
+        // lane caught (`alternate_screen=false, cursor_hidden=true`): reading the
+        // latch cannot stop a frame that already passed the gate, and that
+        // frame's trailing `Hide` undoes the restore's `Show`. The menu loop must
+        // therefore take `lock_terminal_writer()` first and read the latch under
+        // it. See the twin test in `app::tests`, which carries the full analysis.
+        use std::sync::atomic::AtomicBool;
+
+        let painted = |term: &Terminal<TestBackend>| -> String {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .trim()
+                .to_string()
+        };
+
+        let state = base();
+        let theme = state.theme;
+        let latch = AtomicBool::new(false);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (drawing_tx, drawing_rx) = std::sync::mpsc::channel::<()>();
+
+        std::thread::scope(|scope| {
+            // `mpsc::Receiver` is `Send` but not `Sync`, so the halves the
+            // teardown thread uses are moved into it; the latch is shared as a
+            // plain reference (the whole point is that both threads see it).
+            let latch = &latch;
+            scope.spawn(move || {
+                // Stands in for `crate::app::restore_terminal()`, which takes this
+                // same lock around its escape bytes.
+                let guard = crate::app::lock_terminal_writer();
+                held_tx.send(()).expect("the drawing thread is alive");
+                drawing_rx.recv().expect("the drawing thread is alive");
+                // Only to make the unfixed code reliably red; the fixed path is
+                // correct for any duration, including zero.
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                latch.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(guard);
+            });
+
+            held_rx.recv().expect("the teardown thread is alive");
+            drawing_tx.send(()).expect("the teardown thread is alive");
+            draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, latch)
+                .expect("the gate must not turn a suppressed frame into an error");
+        });
+
+        assert_eq!(
+            painted(&term),
+            "",
+            "a menu frame asked for while a teardown owned the terminal must not \
+             paint — its trailing `Hide` would land after the restore's `Show` and \
+             leave the user on the normal screen with an invisible cursor"
+        );
+    }
+
+    #[test]
+    fn the_front_door_comes_back_after_a_session_ends_cleanly() {
+        // The launcher-hub regression, at the seam the e2e scenario
+        // `dash-launcher-sigterm-restores-terminal-across-a-session` exercises
+        // end to end: open a session, quit back to the menu, and the front door
+        // must be there. `app::run`'s clean-quit teardown used to CLAIM the
+        // process-exit latch, which nothing ever releases — so the gate above
+        // suppressed every frame for the rest of the process and the user got a
+        // blank terminal instead of the menu.
+        //
+        // This is the cheap version of a 30-second PTY scenario: run the real
+        // teardown, then ask the real gate for a frame.
+        use std::sync::atomic::AtomicBool;
+
+        let latch = AtomicBool::new(false);
+        let restored = std::cell::Cell::new(false);
+        crate::app::restore_after_session(&latch, || restored.set(true));
+        assert!(restored.get(), "the session must restore the terminal");
+
+        let state = base();
+        let theme = state.theme;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        draw_menu_unless_shutting_down(&mut term, &state, 0, &theme, &latch)
+            .expect("drawing to a TestBackend cannot fail");
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("Set up this system"),
+            "the launcher front door must repaint once a session returns:\n{painted}"
+        );
     }
 
     fn base() -> AppState {
@@ -398,6 +627,37 @@ mod tests {
     }
 
     #[test]
+    fn launcher_state_seeds_serving_from_registry_instances() {
+        // Regression: the front door built an empty AppState and always showed
+        // "Idle — nothing serving" even when a model was running. Seeding from
+        // the caller's registry-derived instances must make the launcher report
+        // the running model.
+        let serving = vec![Instance {
+            container_id: "vllm-ready".into(),
+            model_name: "Qwen2.5-0.5B".into(),
+            status: InstanceStatus::Ready,
+            port: Some(11435),
+            ..Default::default()
+        }];
+        let running = launcher_state("default-dark", serving);
+        assert!(
+            is_running(&running),
+            "seeded serving instance must make the launcher report running"
+        );
+        let out = render(&running, 0, 100, 24);
+        assert!(out.contains("Serving"), "serve line missing: {out:?}");
+        assert!(
+            out.contains("Qwen2.5-0.5B"),
+            "served model missing: {out:?}"
+        );
+        assert!(out.contains("11435"), "served port missing: {out:?}");
+
+        // With no serving instances the front door stays honestly idle.
+        let idle = launcher_state("default-dark", Vec::new());
+        assert!(!is_running(&idle), "empty seed must render idle");
+    }
+
+    #[test]
     fn choice_mapping_and_counts() {
         assert_eq!(row_count(), 5);
         // Row order: 0=Set up, 1=Serve, 2=Diagnose, 3=Chat, 4=Open dashboard.
@@ -410,6 +670,28 @@ mod tests {
         assert_eq!(ROWS[0].3, LauncherChoice::SetUp);
         assert_eq!(ROWS[1].1, "Serve a model");
         assert_eq!(ROWS[1].3, LauncherChoice::Serve);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        // Right must move the selection identically to Down, and Left
+        // identically to Up — `move_selection`'s `forward` flag is the only
+        // thing standing in for the aliased key, so compare it against the
+        // exact wrapping formulas the run_launcher match arms used to inline.
+        let rc = row_count();
+        let mut sel = 0usize;
+        for _ in 0..10 {
+            let via_right = move_selection(sel, rc, true);
+            let via_down = (sel + 1) % rc;
+            assert_eq!(via_right, via_down, "Right must match Down");
+            sel = via_right;
+        }
+        for _ in 0..10 {
+            let via_left = move_selection(sel, rc, false);
+            let via_up = (sel + rc - 1) % rc;
+            assert_eq!(via_left, via_up, "Left must match Up");
+            sel = via_left;
+        }
     }
 
     #[test]

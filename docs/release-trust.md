@@ -118,16 +118,32 @@ happen before activation. Run the current host's set with
 
 ## WSL ROCDXG Package Verification
 
-`scripts/wsl_setup_rocdxg.sh` does not bake in a production checksum for the
-ROCDXG `.deb`. Operators can require verification by providing the expected
-digest:
+The ROCDXG `.deb` is fetched over plain HTTPS from a release page and handed to
+`apt-get install`, which runs its maintainer scripts as root. rocm-cli therefore
+carries a SHA-256 digest for each published ROCDXG release and checks the
+download against it before the install step; on a mismatch the plan stops before
+anything runs as root. Verification is on by default and needs nothing set.
+
+`ROCM_CLI_ROCDXG_SHA256` supplies a digest for a release rocm-cli has none for,
+and overrides the pinned digest for one it does:
 
 ```bash
-ROCDXG_SHA256=<64-hex-sha256> bash scripts/wsl_setup_rocdxg.sh
+ROCM_CLI_ROCDXG_VERSION=<version> \
+ROCM_CLI_ROCDXG_SHA256=<64-hex-sha256> rocm install driver --yes
 ```
 
-When `ROCDXG_SHA256` is set, the script verifies the downloaded `.deb` before
-`apt install` and fails on malformed or mismatched digests.
+A version with no pinned digest and no supplied one is refused: the plan is
+built unsupported with no commands, so the failure mode of an unset variable is
+a plan that will not run rather than an unauthenticated root install.
+
+`ROCM_CLI_ROCDXG_ALLOW_UNVERIFIED=1` is the only route to an unverified install.
+It is deliberately explicit, and the plan then carries a command that prints a
+warning naming the version it is not checking, so the choice is visible in the
+plan under review and in `state.json` rather than being inferred from a missing
+variable. The value is matched against a fixed allowlist of affirmative
+spellings — `1`, `true`, `TRUE`, `yes`, `YES`, `on`, `ON` — after trimming
+surrounding whitespace; anything else, including `0` and `false`, leaves
+verification on.
 
 ## Runtime Metadata Verification
 
@@ -184,6 +200,134 @@ artifact prefetch. A declared policy can require HTTPS, required source hosts,
 sha256 and size metadata, Hugging Face host scoping, Hugging Face token
 approval, or manual-only blocking. Existing signed indexes without
 `source_policy` keep the older explicit-review behavior.
+
+## TheRock Source Base Overrides
+
+rocm-cli hardcodes the pip index and tarball catalog bases it resolves TheRock
+SDK artifacts from. Six of those bases can be overridden, for fixture-server
+testing only:
+
+```text
+ROCM_CLI_THEROCK_RELEASE_PIP_BASE
+ROCM_CLI_THEROCK_NIGHTLY_PIP_BASE
+ROCM_CLI_THEROCK_RELEASE_TARBALL_BASE
+ROCM_CLI_THEROCK_NIGHTLY_TARBALL_BASE
+ROCM_CLI_THEROCK_NEXT_PIP_BASE
+ROCM_CLI_THEROCK_NEXT_TARBALL_BASE
+```
+
+The last two address the ROCm 10 ("next") source layout, which is a layout
+rather than a channel: it has no nightly counterpart and is never resolved
+unless an install explicitly pins a ROCm version of 10 or newer.
+
+None of these take effect unless `ROCM_CLI_THEROCK_ALLOW_BASE_OVERRIDE` is also
+set to a non-empty value. Without that gate, a stray override left in a
+developer's shell environment cannot silently redirect a release install to an
+untrusted host; rocm-cli always resolves the hardcoded default base instead.
+Set the gate and the specific base variable together, and only in tests or
+deliberate manual QA against a fixture server. The `therock-next` E2E scenarios
+use exactly this pairing to exercise next-layout dispatch hermetically.
+
+## ComfyUI Source Archive Override
+
+rocm-cli hardcodes the URL it downloads the ComfyUI source archive from. It
+can be overridden, for fixture-server testing only, and only in builds
+compiled with the `e2e-test-hooks` Cargo feature:
+
+```text
+ROCM_CLI_COMFYUI_SOURCE_ARCHIVE_URL_OVERRIDE
+```
+
+Unlike the TheRock base overrides above, this needs no separate "allow" gate:
+the override *logic* does not exist at all in a build without
+`e2e-test-hooks` — the accessor compiled in that configuration ignores the
+environment entirely and unconditionally returns the hardcoded default URL, so
+a stray environment variable can never redirect a production install.
+
+## Dashboard Test Clock File
+
+`rocm dash` checks for one test-only input that, unlike the override above, is
+**not** compiled out of release builds:
+
+```text
+<data dir>/telemetry/test-clock-offset
+```
+
+When the file exists, the embedded telemetry daemon takes its observation clock
+from the directive in it instead of wall time. That is deliberate: it lets the
+E2E suite drive the dashboard across metric-validity boundaries
+deterministically while testing the same binary that ships, rather than one
+built with a test-only feature.
+
+Nothing in rocm-cli creates this file; only the E2E harness plants it, inside
+its own isolated data root. If one is found, `rocm dash` logs a WARN naming the
+path. Its effect is not limited to displayed timestamps: the clock drives
+generation throughput, latency averages and metric freshness, and the
+timestamps written into persisted session records. To return to wall time,
+remove the file **and restart `rocm dash`** — the path is resolved once per
+launch, and deleting the file mid-run leaves the clock pinned at its last
+directive.
+
+The directive is an integer offset in seconds, `hold`, or `hold <int>`; it can
+skew telemetry but cannot select code or redirect a download. The data directory it lives in
+already holds the runtime registry and service records, so write access to it
+is already trusted.
+
+## Simulated Host Root
+
+rocm-cli decides what hardware it is running on by reading fixed host paths:
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
+under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
+`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
+`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
+behind the distro name `rocm examine` reports, the modprobe configuration
+directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and `/run/modprobe.d`, the
+WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+`lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
+`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
+discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+simulated host instead, but only in builds compiled with the `e2e-test-hooks`
+Cargo feature:
+
+```text
+ROCM_CLI_TEST_HOST_ROOT
+```
+
+Same model as the ComfyUI override above: in a build without
+`e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
+reads the environment, so a release build always probes the real machine. The
+re-rooting changes only where the probes read; the CLI still names the logical
+path (`/dev/kfd`) when it reports a device. The dashboard test clock above is
+read from a state file by the same binary that ships, while this seam is
+compiled out; the difference is the one drawn there: the clock can skew
+telemetry but cannot select code or redirect a download, whereas a re-rooted
+hardware probe decides which plan runs against the real machine, so it must not
+exist in a shipped build.
+
+Some reads stay on the real machine even in a hook build:
+
+- ROCm install discovery itself. Which installs exist, and the paths and
+  versions `rocm examine` reports for them, always come from the real host: the
+  CLI prints those paths and can write them into a shell rc file. The one
+  re-rooted read under them is the ROCDXG file check above, which looks for its
+  two files under each discovered install's path inside the simulated root.
+- The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
+  the probes execute, such as `ldconfig`.
+- Every package-manager plan, which reads the real `/etc/os-release`: the
+  OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
+  `rocm` runs before serving. Their commands run against the real machine, so a
+  simulated host must not pick the distro they are built for.
+- Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
+  this process's own environment, not the hardware.
+
+One check is routed but keeps the real device as a veto: the `rocm dash`
+pre-flight that decides whether to start `amd-smi`. Because it gates a real
+process, `amd-smi` runs only when both the real `/dev/kfd` and the simulated
+host's `/dev/kfd` are readable. A simulated host can hide the GPU from the
+dashboard, but cannot start `amd-smi` on a machine without one. On WSL the
+pre-flight still accepts the CLI's GPU-reachability verdict instead of a device
+node, as it always has, so the veto does not apply there.
 
 ## Remaining Owner Step
 

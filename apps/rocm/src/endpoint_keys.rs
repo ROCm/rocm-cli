@@ -64,13 +64,11 @@ pub(crate) fn clear_endpoint_api_key(paths: &AppPaths, service_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_core::unix_time_millis;
 
     fn temp_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-endpoint-key-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-endpoint-key-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("data").join("services")).unwrap();
@@ -82,6 +80,11 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_paths("same-label").0);
     }
 
     #[test]

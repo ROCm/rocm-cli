@@ -21,7 +21,7 @@ use rocm_dash_core::state::{SideEffect, State, StateEvent};
 use crate::ui::approval::{
     ApprovalChoice, ApprovalRequest, ApprovalVerdict, approval_key, draw_approval,
 };
-use crate::ui::exec::{exe_label, resolve_exe};
+use crate::ui::exec::{display_args, exe_label, resolve_exe};
 use crate::ui::job_console::{ConsoleOutcome, on_console_key};
 use crate::ui::panel::{self, BoxRole};
 use crate::ui::theme::Theme;
@@ -147,8 +147,10 @@ pub fn on_key(
     // 3) Menu navigation + action.
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => *update = None,
-        KeyCode::Up | KeyCode::Char('k') => u.selected = u.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left => {
+            u.selected = u.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right => {
             u.selected = (u.selected + 1).min(ACTIONS.len() - 1);
         }
         KeyCode::Enter => return activate_selected(u, jobs),
@@ -166,7 +168,7 @@ fn activate_selected(u: &mut UpdateManagerState, jobs: &mut State) -> Vec<SideEf
         let request = ApprovalRequest::new(
             action.label().to_string(),
             vec![
-                format!("{} {}", exe_label(&cmd), action.args().join(" ")),
+                format!("{} {}", exe_label(&cmd), display_args(&action.args())),
                 String::new(),
                 "This installs a ROCm package update on this machine.".to_string(),
             ],
@@ -276,7 +278,7 @@ pub fn draw_update_manager(
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ select · Enter run · Esc close",
+            "↑↓←→ select · Enter run · Esc close",
             Style::default().fg(theme.muted),
         ))),
         rows[2],
@@ -390,6 +392,20 @@ mod tests {
         assert_eq!(u.as_ref().unwrap().selected, ACTIONS.len() - 1);
         for _ in 0..10 {
             on_key(&mut u, &mut jobs, key(KeyCode::Up));
+        }
+        assert_eq!(u.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn left_right_alias_up_down() {
+        let mut u = Some(UpdateManagerState::default());
+        let mut jobs = State::default();
+        for _ in 0..10 {
+            on_key(&mut u, &mut jobs, key(KeyCode::Right));
+        }
+        assert_eq!(u.as_ref().unwrap().selected, ACTIONS.len() - 1);
+        for _ in 0..10 {
+            on_key(&mut u, &mut jobs, key(KeyCode::Left));
         }
         assert_eq!(u.as_ref().unwrap().selected, 0);
     }

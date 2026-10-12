@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::container::{InspectContainerOptions, ListContainersOptions};
-use bollard::secret::ContainerInspectResponse;
+use bollard::models::ContainerInspectResponse;
+use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
 use rocm_dash_core::metrics::InstanceStatus;
 use rocm_dash_core::traits::{CollectorError, DiscoveredService, Result, ServiceDiscovery};
 use tokio::time::timeout;
@@ -102,7 +102,7 @@ impl DockerDiscovery {
             .as_ref()
             .ok_or_else(|| CollectorError::Unsupported("docker not connected".into()))?;
 
-        let opts: ListContainersOptions<String> = ListContainersOptions {
+        let opts = ListContainersOptions {
             all: false,
             ..Default::default()
         };

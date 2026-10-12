@@ -8,26 +8,42 @@
 // than splitting the step API into sync/async and mut/non-mut variants.
 #![allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cucumber::{World as _, WriterExt as _};
 use e2e_cucumber::cli_failure_report;
 use e2e_cucumber::loopback_http::LoopbackServer;
 use e2e_cucumber::mock_server::{MockServer, ServiceRecordOptions, write_service_record_with};
+use e2e_cucumber::paced_download::PacedDownloadServer;
 use tempfile::TempDir;
 
 mod e2e {
     pub mod artifact_steps;
+    pub mod automations_steps;
     pub mod bench_steps;
+    pub mod bootstrap_steps;
     pub mod chat_steps;
+    pub mod comfyui_steps;
+    pub mod config_steps;
     pub mod dash_steps;
+    pub mod dependency_guard_steps;
     pub mod diagnose_steps;
+    pub mod driver_steps;
     pub mod engines_steps;
     pub mod examine_steps;
     pub mod lifecycle_steps;
+    pub mod logs_steps;
+    pub mod remote_steps;
+    pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
+    pub mod service_cleanup_steps;
     pub mod serving_steps;
+    pub mod skill_steps;
+    pub mod storage_steps;
+    pub mod therock_steps;
     pub mod tui_driver;
+    pub mod uninstall_steps;
+    pub mod update_steps;
 }
 
 // ── World ──────────────────────────────────────────────────────────
@@ -41,6 +57,10 @@ pub struct E2eWorld {
     /// Listener that deliberately occupies the default serve port while a real
     /// `rocm serve` invocation proves automatic allocation advances past it.
     pub automatic_port_guard: Option<std::net::TcpListener>,
+    /// Paced download server used by the download-progress-spinner PTY
+    /// scenario. Kept on the World so it remains alive while the real `rocm`
+    /// subprocess downloads.
+    pub paced_download_server: Option<PacedDownloadServer>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -50,6 +70,39 @@ pub struct E2eWorld {
     pub cli_outputs: Option<Vec<String>>,
     pub cli_stderr: Option<String>,
     pub cli_rc: Option<i32>,
+    /// Wall-clock time the last measured `rocm` invocation took, for scenarios
+    /// where the *duration* bounds the behaviour under test —
+    /// `service-cleanup-07`, where a prune that returned while the managed-launch
+    /// lock was still held cannot have waited for it. It is a one-sided bound:
+    /// the measurement brackets the whole child process, so a long elapsed time
+    /// does not establish that the prune blocked. Set by the When step that
+    /// measures it; `None` everywhere else.
+    pub cli_elapsed: Option<std::time::Duration>,
+    /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
+    /// tailscale stand-in, and the status document it should serve. Set by a
+    /// Given step so the When steps stay about what the user does.
+    pub remote_env: Vec<(String, String)>,
+    /// Tells `service-cleanup-07`'s staged launch to let go of the managed-launch
+    /// lock. Set by the Given that takes the lock, taken by the When that spawns
+    /// the prune, so the hold begins at the spawn and cannot be eaten by however
+    /// long the harness took between the two steps.
+    ///
+    /// On the World rather than in a `static`: the suite runs up to 64 scenarios
+    /// concurrently (see `max_concurrent` below) and two of them share that When
+    /// step's text, so a process-global slot could be filled by one scenario and
+    /// emptied by another. A World is constructed per scenario, so "only the
+    /// launch-lock scenario sees a sender" holds by construction.
+    pub launch_release: Option<std::sync::mpsc::Sender<()>>,
+    /// The thread holding that lock. Kept so `Drop` can join it before the
+    /// `TempDir` goes, instead of leaving it detached to write a record into a
+    /// directory that may already have been removed. Dropping `launch_release`
+    /// first disconnects its channel, so a scenario that never reached the When
+    /// step does not wait out the thread's receive timeout.
+    pub launch_stage: Option<std::thread::JoinHandle<()>>,
+    /// Container standing in for a second machine, for the `@requires-docker`
+    /// scenarios. Held on the World so it lives for the scenario and is torn
+    /// down when the World drops, even if a step panics.
+    pub remote_machine: Option<e2e::remote_steps::RemoteMachine>,
     /// Name of the scenario currently executing, set by the `before` hook. Used
     /// to tie each recorded `rocm` invocation to its scenario so the coverage
     /// report can join commands to pass/fail results.
@@ -74,6 +127,10 @@ pub struct E2eWorld {
     /// a run whose failure is already the expected outcome — see the relaunch
     /// budget in `setup_gpu_model`.
     pub expect_xfail: bool,
+    /// Extra environment for this scenario's next `rocm` invocation. A Given step
+    /// records a behavioral precondition here; the When step remains a plain user
+    /// action and consumes the fixture without exposing its mechanism in Gherkin.
+    pub command_env: Vec<(&'static str, std::ffi::OsString)>,
     /// The interactive dash/chat TUI spawned under a pseudo-terminal for this
     /// scenario, if any (see `e2e::tui_driver`). Torn down in `Drop` before the
     /// mock server and isolated directory so the child process never outlives
@@ -87,6 +144,27 @@ pub struct E2eWorld {
     /// dir, captured logs). `Some` only for `@lifecycle` scenarios; all its paths
     /// are rooted in `isolated_root` so teardown removes them with the temp dir.
     pub lifecycle: Option<e2e::lifecycle_steps::LifecycleState>,
+    /// Raw text of `skills/rocm-doctor/reference.md`, loaded by the rocm-doctor
+    /// skill scenarios. That document is the EXPECTED-value fixture for the
+    /// skill↔CLI contract checks — see `e2e::skill_steps`.
+    pub skill_reference: Option<String>,
+    /// The symptom text a rocm-doctor scenario hands to `rocm diagnose`. Its own
+    /// field rather than borrowing `model_name`, which means a served model and
+    /// has nothing to do with a user's error report.
+    pub skill_symptom: Option<String>,
+}
+
+/// One scenario's resolved expectation plus the identity needed to report it.
+///
+/// Recorded by `filter_run`, which sees every scenario — including the ones it
+/// filters OUT. A filtered (skipped) scenario never reaches `report.json`, so
+/// this is the only place its feature and name survive to `platform.json`.
+struct Resolution {
+    expectation: e2e_cucumber::expectation::Expectation,
+    /// Effective serve engine for this scenario on this host.
+    engine: String,
+    feature: String,
+    scenario: String,
 }
 
 /// Resolve a CI-provided shared-directory env var to a validated, existing path.
@@ -110,13 +188,16 @@ fn validated_shared_dir(env_var: &str) -> Option<PathBuf> {
 }
 
 /// A persistent directory shared across scenarios for heavy, immutable artifacts
-/// (TheRock runtime wheels, HF model weights, engine venvs). Set by CI to a path
-/// on the runner's persistent disk; unset for local runs, where every scenario
-/// stays fully isolated (nothing shared).
+/// (HF model weights, the pip cache, and the CLI's own therock/tool archive
+/// download cache). Set by CI to a path on the runner's persistent disk; unset
+/// for local runs, where every scenario stays fully isolated (nothing shared).
 ///
-/// Sharing these read-only artifacts avoids re-downloading multi-GB runtimes and
-/// model weights per scenario. Only immutable artifacts are shared — service
-/// records, config, and per-service engine state stay isolated per scenario.
+/// Sharing these read-only artifacts avoids re-downloading the therock
+/// SDK/tool archives and model weights per scenario. Only immutable artifacts
+/// are shared — service records, config, and the runtimes registry stay
+/// isolated per scenario (see [`shared_runtimes_dir`] for the runtimes' own,
+/// opt-in, shared tree, which is what actually covers engine backends like
+/// `llamacpp:rocm`).
 fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
 }
@@ -128,29 +209,37 @@ fn shared_cache_dir() -> Option<PathBuf> {
 /// cold ~160s install into a ~34s warm one (measured on MI300X) without sharing
 /// any mutable state — the runtimes *registry* the suite asserts on still lives
 /// in each scenario's isolated `<data>/runtimes` (see `default()`). Kept as its
-/// own env var (not derived from `E2E_SHARED_CACHE_DIR`) so CI can place it on a
-/// larger overlay disk than the model-weights cache. Unset locally → no sharing.
+/// own env var (not derived from `E2E_SHARED_CACHE_DIR`) because it has a
+/// placement constraint the weights cache does not: uv can only hardlink out of
+/// it into a managed environment when the two are reachable without crossing a
+/// mount point, so CI must put it under the same mount as the runtimes it
+/// populates — the same volume is not enough. Unset locally → no sharing.
 fn shared_uv_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_UV_CACHE_DIR")
 }
 
-/// A persistent directory holding ONE installed managed-runtime tree
-/// (`runtimes/registry/*` + the TheRock venv) shared across scenarios that only
+/// A persistent directory holding the installed managed-runtime trees
+/// (`runtimes/registry/*` + the TheRock venvs) shared across scenarios that only
 /// need *a* runtime active. Set by CI (`E2E_SHARED_RUNTIMES_DIR`) on the runner's
 /// persistent disk; unset for local runs, where every scenario installs its own.
 ///
 /// Why opt-in and not global: a cold `rocm install sdk` installs a multi-GiB
-/// TheRock runtime (and its post-install probe unpacks an ~8.8 GiB devel tarball),
-/// and each scenario's isolated data dir made it re-run per scenario — the GPU job
-/// then exceeds its time cap. Scenarios that just need a runtime present
+/// TheRock runtime (`--devel`, when passed, unpacks an additional ~8.8 GiB
+/// compiler/headers tarball), and each scenario's isolated data dir made it
+/// re-run per scenario — the GPU job then exceeds its time cap. Scenarios that
+/// just need a runtime present
 /// ("a managed runtime is active") point their `data/runtimes` at this shared tree
 /// (see [`E2eWorld::use_shared_runtimes`]) so the install happens once per runner.
 /// Scenarios that ASSERT a clean slate ("a machine with no CLI-managed runtimes",
 /// "Installing the SDK") deliberately do NOT opt in — they keep their empty
-/// isolated runtimes dir. A serve resolves the shared runtime via
-/// `single_ready_runtime` (no active-key wiring needed) and `runtimes list`
-/// reports it `status=ready`, so both the precondition and serve are satisfied
-/// (verified by hand on MI300X: serve + chat completion through a symlinked tree).
+/// isolated runtimes dir.
+///
+/// The tree may hold MORE THAN ONE runtime: `xtask e2e-prewarm` installs a newer
+/// one side by side when the channel index publishes it, so the count tracks
+/// upstream releases rather than anything the suite controls. A serve therefore
+/// cannot lean on the CLI's `single_ready_runtime` fallback, which deliberately
+/// refuses to guess once two are installed — the scenario names its runtime
+/// explicitly instead (see [`E2eWorld::activate_shared_runtime`]).
 fn shared_runtimes_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_RUNTIMES_DIR")
 }
@@ -178,6 +267,7 @@ impl Default for E2eWorld {
             mock: None,
             artifact_server: None,
             automatic_port_guard: None,
+            paced_download_server: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
@@ -186,14 +276,22 @@ impl Default for E2eWorld {
             cli_outputs: None,
             cli_stderr: None,
             cli_rc: None,
+            cli_elapsed: None,
+            remote_env: Vec::new(),
+            launch_release: None,
+            launch_stage: None,
+            remote_machine: None,
             current_scenario: None,
             isolated_root: Some(root),
             legacy_rocm_path: None,
             serve_timeout_override: None,
             expect_xfail: false,
+            command_env: Vec::new(),
             tui: None,
             chat_use_mock: false,
             lifecycle: None,
+            skill_reference: None,
+            skill_symptom: None,
         }
     }
 }
@@ -208,7 +306,29 @@ impl E2eWorld {
             let root = root.path();
             env.push(("ROCM_CLI_CONFIG_DIR", root.join("config").into_os_string()));
             env.push(("ROCM_CLI_DATA_DIR", root.join("data").into_os_string()));
-            env.push(("ROCM_CLI_CACHE_DIR", root.join("cache").into_os_string()));
+            // The CLI's own therock/tool archive download cache — every archive
+            // in it is content-addressed and re-fetchable (see
+            // storage::download_cache_dir / tool_download_cache_dir). Route it
+            // through the same shared, persistent dir as HF_HOME/PIP_CACHE_DIR
+            // below instead of this scenario's TempDir, so therock SDK/tool
+            // archives are downloaded once per runner rather than once per
+            // scenario. Local runs (no shared dir) keep the old fully-isolated
+            // cache. This does NOT cover the ~3.3GB llamacpp:rocm Lemonade backend
+            // (EAI-8572) — that lives under the shared runtimes tree (see
+            // `use_shared_runtimes`) and was actually fixed by making
+            // `prepare_embeddable` stop wiping that shared tree on every scenario
+            // (rocm-engine-lemonade's `RUNTIME_VERSION_MARKER`).
+            //
+            // Two paths under this cache are mutable rather than content-
+            // addressed: `cache/therock/startup-update-check.json` and
+            // `cache/therock/metadata/*.json` (the etag revalidation cache).
+            // Both are now written atomically (`save_startup_update_check` /
+            // `write_cached_http_entry`), so concurrent scenarios sharing this
+            // dir can't tear either into a state `load_startup_update_check`
+            // would hard-error on.
+            let cache_dir = shared_cache_dir()
+                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
@@ -222,8 +342,9 @@ impl E2eWorld {
         }
         // Share uv's content-addressed download/build cache (the wheels `rocm
         // install sdk` fetches) so only the first scenario pays the cold download.
-        // Independent of the weights cache above so CI can host it on a larger
-        // disk; the runtimes registry the suite asserts on stays isolated.
+        // Independent of the weights cache above because it has to sit under the
+        // same mount as the runtimes it populates or uv copies instead of
+        // hardlinking; the runtimes registry the suite asserts on stays isolated.
         if let Some(uv_cache) = shared_uv_cache_dir() {
             env.push(("UV_CACHE_DIR", uv_cache.into_os_string()));
         }
@@ -238,7 +359,7 @@ impl E2eWorld {
         // CLI's OWN vLLM readiness cap to match. `rocm serve --managed` otherwise
         // SIGTERM-kills a vLLM that isn't ready within its default (5 min,
         // EAI-7393), which a large model's cold load legitimately exceeds — so
-        // extending only the harness's poll (wait_for_model) isn't enough; the CLI
+        // extending only the harness's poll (`model_is_ready`) isn't enough; the CLI
         // would kill the server first. Keeping the two in lockstep makes the
         // big-model serve actually reach ready (verified on MI300X with Qwen3.6-27B).
         if let Some(secs) = self.serve_timeout_override {
@@ -271,6 +392,42 @@ impl E2eWorld {
         }
     }
 
+    /// Create `link` as a directory link to `target`.
+    ///
+    /// Self-hosted Windows runners commonly lack `SeCreateSymbolicLinkPrivilege`,
+    /// so a failed symlink falls back to a directory junction, which needs neither
+    /// developer mode nor an elevated token and looks the same to the CLI.
+    #[allow(unused_variables)]
+    fn link_directory(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).or_else(|_| {
+                let status = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .status()?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "mklink /J exited with {status}"
+                    )))
+                }
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::other(
+                "directory links are unsupported here",
+            ))
+        }
+    }
+
     /// Opt this scenario into the shared managed-runtime tree (see
     /// [`shared_runtimes_dir`]): replace its empty isolated `data/runtimes` with a
     /// directory link to the shared dir, so an `install sdk` here populates the
@@ -292,28 +449,81 @@ impl E2eWorld {
         }
         let link = data.join("runtimes");
         let _ = std::fs::remove_dir_all(&link);
-        #[cfg(unix)]
-        let res = std::os::unix::fs::symlink(&shared, &link);
-        #[cfg(windows)]
-        let res = std::os::windows::fs::symlink_dir(&shared, &link).or_else(|_| {
-            // Self-hosted Windows runners commonly lack SeCreateSymbolicLinkPrivilege.
-            // Directory junctions need no developer mode or elevated token and expose
-            // the same shared runtime tree to the scenario's isolated data directory.
-            let status = std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(&link)
-                .arg(&shared)
-                .status()?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other(format!(
-                    "mklink /J exited with {status}"
-                )))
-            }
-        });
-        if res.is_err() {
+        if Self::link_directory(&shared, &link).is_err() {
             let _ = std::fs::create_dir_all(&link);
+        }
+    }
+
+    /// Point this scenario's `data/runtimes` at a sibling folder inside its own
+    /// isolated tree, and return that folder.
+    ///
+    /// The same shape as [`use_shared_runtimes`] without the shared tree: for
+    /// scenarios that need to observe what the CLI does when its runtimes folder is
+    /// reached through a link, but must not write anywhere a later run can see.
+    pub fn link_runtimes_within_scenario(&self) -> std::io::Result<PathBuf> {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("scenario has no isolated root")
+            .path();
+        let data = root.join("data");
+        std::fs::create_dir_all(&data)?;
+        let real = data.join("real-runtimes");
+        std::fs::create_dir_all(&real)?;
+        let link = data.join("runtimes");
+        let _ = std::fs::remove_dir_all(&link);
+        Self::link_directory(&real, &link)?;
+        Ok(real)
+    }
+
+    /// Point this scenario's config at a specific runtime in the shared tree.
+    ///
+    /// The shared tree is reached through a symlinked `data/runtimes`, but the
+    /// config dir stays per-scenario — so the activation `xtask e2e-prewarm`
+    /// performed is invisible here and every scenario starts with no active
+    /// runtime. That was harmless only while the CLI could auto-select, which it
+    /// stops doing as soon as the tree holds a second runtime (serve then fails
+    /// with "no active ROCm runtime is configured"). Re-activating from the
+    /// tree's own `active.json` makes the choice explicit and independent of how
+    /// many runtimes the pre-warm has accumulated.
+    ///
+    /// Also writes the shared tree's `active.json`, because for a symlinked
+    /// scenario that marker IS the shared one — the activation is not confined
+    /// to this scenario's config.
+    ///
+    /// Best-effort: a no-op for local runs (no shared tree), and it does not
+    /// fail the scenario when the tree names no runtime or the activation is
+    /// refused. Both of those leave the serve that follows failing with "no
+    /// active ROCm runtime is configured", and NEITHER precondition assertion
+    /// can see it — `installed: none` reports an empty registry, not an
+    /// unset active key, and `engines list` scans every manifest regardless of
+    /// which is active. So say what happened on stderr instead of failing here:
+    /// the serve's own failure is the one worth reading, and this is the line
+    /// that explains it.
+    pub fn activate_shared_runtime(&self) {
+        let Some(shared) = shared_runtimes_dir() else {
+            return;
+        };
+        let Some(key) = e2e_cucumber::shared_runtime::runtime_key_to_activate(&shared) else {
+            eprintln!(
+                "shared runtime: no runtime to activate in {}; a serve will fail unless exactly \
+                 one is installed. Installed: {:?}",
+                shared.display(),
+                e2e_cucumber::shared_runtime::registry_runtime_keys(&shared)
+            );
+            return;
+        };
+        let (stdout, stderr, rc) = run_rocm(self, &["runtimes", "activate", &key]);
+        if rc != 0 {
+            eprintln!(
+                "shared runtime: {}",
+                e2e_cucumber::cli_failure_report(
+                    &["runtimes", "activate", &key],
+                    rc,
+                    &stdout,
+                    &stderr
+                )
+            );
         }
     }
 
@@ -381,10 +591,21 @@ impl Drop for E2eWorld {
         if let Some(tui) = self.tui.take() {
             drop(tui);
         }
+        // Let `service-cleanup-07`'s staged launch finish and join it, so its last
+        // write lands while the isolated root still exists rather than panicking
+        // in a detached thread after the TempDir below is gone. Dropping the
+        // sender first disconnects the channel the thread is blocked on, so a
+        // scenario that failed before the When step returns immediately instead of
+        // waiting out that thread's receive timeout.
+        self.launch_release.take();
+        if let Some(stage) = self.launch_stage.take() {
+            let _ = stage.join();
+        }
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
         self.artifact_server.take();
+        self.paced_download_server.take();
         // A scenario that ran `rocm serve --managed` left a DETACHED supervisor +
         // engine process (vLLM / llama-server) that outlives this harness — the
         // TempDir drop below removes the on-disk record but never kills those
@@ -480,6 +701,20 @@ fn last_line(text: &str) -> String {
 
 // ── Shared helpers ─────────────────────────────────────────────────
 
+/// The suite's artifact directory.
+///
+/// This is the ONLY path CI uploads (see the `upload-artifact` steps in
+/// `.github/workflows/e2e-selfhosted.yml`), so anything a failure needs to
+/// survive the run has to be written under here; a scenario's own isolated
+/// `TempDir` is gone by the time the artifact is collected.
+///
+/// Unlike [`results_dir`] this only computes the path and never creates it, so
+/// it is safe to call from a failure path where a second panic would replace the
+/// report being written.
+pub fn results_path() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"))
+}
+
 pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
 }
@@ -521,6 +756,56 @@ pub fn run_rocm_ok(world: &E2eWorld, args: &[&str]) -> String {
     stdout
 }
 
+/// Like [`run_rocm`], but writes `stdin` to the child's standard input and sets
+/// extra environment variables on the child.
+///
+/// Used by scenarios that drive a command reading from stdin — e.g. `config
+/// set-provider-key`, which reads the secret from stdin non-interactively. The
+/// scenario can then assert on both the exit code and that the piped secret is
+/// never echoed back. `envs` lets a scenario also control the child's environment
+/// (e.g. point the secret store at an unreachable D-Bus so the save deterministically
+/// fails), applied on top of the scenario's isolated config/data/cache env.
+pub fn run_rocm_with_stdin(
+    world: &E2eWorld,
+    args: &[&str],
+    stdin: &str,
+    envs: &[(&str, &str)],
+) -> (String, String, i32) {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    child
+        .stdin
+        .take()
+        .expect("child stdin was not piped")
+        .write_all(stdin.as_bytes())
+        .expect("failed to write to child stdin");
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait on {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
 /// Like [`run_rocm`], but with extra environment variables set on the child.
 ///
 /// Used by scenarios that must control the device environment the CLI and engine
@@ -537,6 +822,29 @@ pub fn run_rocm_with_env(
     cmd.args(args);
     world.isolate_cmd(&mut cmd);
     for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let rc = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (
+        stdout,
+        String::from_utf8_lossy(&output.stderr).to_string(),
+        rc,
+    )
+}
+
+/// Run `rocm` with the behavioral fixture established by a Given step, then
+/// consume it so it cannot leak into a later action in the same scenario.
+pub fn run_rocm_with_scenario_env(world: &mut E2eWorld, args: &[&str]) -> (String, String, i32) {
+    let binary = rocm_binary();
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in std::mem::take(&mut world.command_env) {
         cmd.env(key, value);
     }
     let output = cmd
@@ -582,7 +890,7 @@ fn record_command(scenario: Option<&str>, args: &[&str], rc: i32, stdout: &str) 
         "engine": engine,
         "engine_is_default": engine_is_default,
     });
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
+    let dir = results_path();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -845,7 +1153,7 @@ pub async fn send_chat(world: &mut E2eWorld) {
 // ── Runner ─────────────────────────────────────────────────────────
 
 fn results_dir() -> PathBuf {
-    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/results"));
+    let dir = results_path();
     std::fs::create_dir_all(&dir).expect("failed to create results directory");
     dir
 }
@@ -867,8 +1175,13 @@ async fn main() {
     use cucumber::writer::{self, Stats as _};
     use e2e_cucumber::capability::host_capability;
     use e2e_cucumber::expectation::{Expectation, ScenarioDecl, resolve};
+    use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
+
+    // Baseline for the diagnostics log the lane uploads; see the `run()` boundary
+    // below and `harness_diagnostics` for what it is answering.
+    e2e_cucumber::harness_diagnostics::record_startup(&dir);
     let json_file =
         std::fs::File::create(dir.join("report.json")).expect("failed to create report.json");
     let junit_file =
@@ -890,14 +1203,19 @@ async fn main() {
     // install/uninstall) are skipped unless the caller opts in via
     // `E2E_INCLUDE_LIFECYCLE`, so the default `cargo xtask e2e` stays fast.
     let include_lifecycle = std::env::var_os("E2E_INCLUDE_LIFECYCLE").is_some_and(|v| v == "1");
+    // The container-backed remote scenarios need a runner that can *build* the
+    // fixture image, which a working daemon alone does not guarantee — a
+    // restricted network gives you one without the other. Opt in explicitly on
+    // the lanes where it holds.
+    let include_docker = std::env::var_os("E2E_INCLUDE_DOCKER").is_some_and(|v| v == "1");
     // CI runs just the lifecycle set after opting in. Keep this selection inside
     // our custom filter instead of cucumber's `--tags`/`-n`: cucumber 0.23 uses
     // either its CLI filter OR this closure, so CLI selection would bypass OS,
     // nightly/lifecycle, ID, and expectation resolution entirely.
     let only_lifecycle = std::env::var_os("E2E_ONLY_LIFECYCLE").is_some_and(|v| v == "1");
     // Heavy `@merge-queue` serves run only in the merge queue (a cheaper
-    // per-engine canary covers them on the PR fast path); set by ci.yml on the
-    // `merge_group` event.
+    // per-engine canary covers them on the PR fast path); set by
+    // e2e-selfhosted.yml on the `merge_group` event.
     let include_merge_queue = std::env::var_os("E2E_MERGE_QUEUE").is_some_and(|v| v == "1");
     eprintln!(
         "Host capability: platform={} os={} gpu={} effective_engine={}",
@@ -908,8 +1226,11 @@ async fn main() {
     // Populated by `filter_run` (which sees every scenario, run or skipped) so
     // the post-run evaluation and platform.json can reconcile by id — including
     // skipped scenarios, which never appear in cucumber's report.json.
-    // id → (resolved expectation, effective engine for that scenario).
-    let resolutions: &'static Mutex<BTreeMap<String, (Expectation, String)>> =
+    // id → (resolved expectation, effective engine, feature name, scenario name).
+    // The feature/scenario names travel with the resolution so platform.json can
+    // place even a SKIPPED scenario under its feature in the report's grouped
+    // grid — a skip never reaches report.json, which is the only other source.
+    let resolutions: &'static Mutex<BTreeMap<String, Resolution>> =
         Box::leak(Box::new(Mutex::new(BTreeMap::new())));
 
     // `.run()` records failures into the writers but never sets a non-zero exit
@@ -926,8 +1247,30 @@ async fn main() {
     // one scenario at a time whenever a GPU is present. The no-GPU mock job keeps
     // the default parallelism (its scenarios use isolated in-process mock servers
     // on OS-assigned ports, so they're safe to run concurrently).
-    let max_concurrent = if cap.has_amd_gpu { 1 } else { 64 };
-    let summary = E2eWorld::cucumber()
+    //
+    // This `max_concurrent == 1` is ALSO what makes it safe for a GPU lane to
+    // point `shared_cache_dir()`/`shared_runtimes_dir()`/`shared_uv_cache_dir()`
+    // at one persistent dir (see `isolate_env`): readers extracting an archive
+    // and a concurrent `remove_file`/`remove_dir_all` of that same archive or
+    // runtime tree after another scenario's extract (`uv.rs`, `therock.rs`,
+    // rocm-engine-lemonade's `prepare_embeddable`) would otherwise race.
+    // `cap.has_amd_gpu` is a capability *probe* that can disagree with what a
+    // lane actually exports (e.g. a missing GPU driver reads `false` while a
+    // shared dir env var is still set) — so derive the cap from the hazards
+    // themselves rather than only from the probe. `shared_uv_cache_dir()` is
+    // deliberately excluded: uv's cache is content-addressed and uv does its
+    // own locking. A lane that races becomes serialized-and-slower instead.
+    let max_concurrent =
+        if cap.has_amd_gpu || shared_cache_dir().is_some() || shared_runtimes_dir().is_some() {
+            1
+        } else {
+            64
+        };
+    // Wrapped, not hooked — see `harness_diagnostics::run_or_record`, which this is
+    // handed to below. cucumber replaces the panic hook with an empty one for the
+    // whole run, so a panic raised by the *writer* unwinds out of here with that
+    // silencing hook still installed and prints nothing at all.
+    let cucumber_run = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
         // `rocm` invocation can be tied back to its scenario for the coverage
@@ -953,36 +1296,54 @@ async fn main() {
             }
             Box::pin(async {})
         })
-        .with_writer(
+        // The clock correction wraps the whole stack, so it sees events in
+        // arrival order — it must stay OUTSIDE `.normalized()`. `Normalize`
+        // re-emits events grouped by scenario rather than chronologically, and
+        // up to 64 scenarios run at once, so after normalisation a timestamp
+        // lower than its predecessor is ordinary. Correcting there would fire
+        // constantly on healthy runs and flatten the durations this is meant
+        // to protect. Before it, a backward move means the wall clock moved:
+        // the Strix Halo WSL2 guest steps its clock back (34 s observed) when
+        // Hyper-V resynchronises it, and both writers below turn the resulting
+        // negative duration into a panic that cucumber silences (EAI-9018).
+        .with_writer(MonotonicClockWriter::new(
             writer::Basic::raw(std::io::stdout(), writer::Coloring::Auto, 1)
                 .summarized()
                 .tee(writer::Json::new(json_file).discard_stats_writes())
                 .tee(writer::JUnit::new(junit_file, 0).discard_stats_writes())
                 .normalized(),
-        )
+        ))
         // Resolve every scenario's expectation from its tags + host capability +
         // the xfail matrix. Scenarios resolving to `Skip` (not-applicable on this
         // host — e.g. a required engine can't start) are filtered out and never
         // run; their resolution is still recorded so platform.json can show N/A.
         .filter_run(concat!(env!("CARGO_MANIFEST_DIR"), "/features/"), {
-            move |_feature, _rule, scenario| {
+            move |feature, _rule, scenario| {
                 let decl = ScenarioDecl::from_tags(&scenario.tags);
                 let expectation = resolve(
                     &decl,
                     cap,
                     matrix,
-                    include_nightly,
-                    include_lifecycle,
-                    include_merge_queue,
+                    e2e_cucumber::expectation::Included {
+                        nightly: include_nightly,
+                        lifecycle: include_lifecycle,
+                        docker: include_docker,
+                        merge_queue: include_merge_queue,
+                    },
                 );
                 let run = (!only_lifecycle || decl.lifecycle)
                     && !matches!(expectation, Expectation::Skip { .. });
                 if let Some(id) = &decl.id {
                     let engine = decl.effective_engine(cap).to_owned();
-                    let prev = resolutions
-                        .lock()
-                        .expect("resolutions poisoned")
-                        .insert(id.clone(), (expectation, engine));
+                    let prev = resolutions.lock().expect("resolutions poisoned").insert(
+                        id.clone(),
+                        Resolution {
+                            expectation,
+                            engine,
+                            feature: feature.name.clone(),
+                            scenario: scenario.name.clone(),
+                        },
+                    );
                     // Two scenarios sharing an `@id` would silently overwrite each
                     // other's resolution (e.g. a copy-paste with a forgotten id
                     // change) — the report grid keys on @id, so the collision would
@@ -994,8 +1355,8 @@ async fn main() {
                 }
                 run
             }
-        })
-        .await;
+        });
+    let summary = e2e_cucumber::harness_diagnostics::run_or_record(&dir, cucumber_run).await;
 
     // Generate the HTML report before exiting so the artifact still uploads on
     // failure.
@@ -1037,8 +1398,14 @@ async fn main() {
         versions,
         expectations: resolutions
             .iter()
-            .map(|(id, (exp, engine))| {
-                e2e_cucumber::expectation::ResolvedScenario::new(id, engine, exp)
+            .map(|(id, r)| {
+                e2e_cucumber::expectation::ResolvedScenario::new(
+                    id,
+                    &r.feature,
+                    &r.scenario,
+                    &r.engine,
+                    &r.expectation,
+                )
             })
             .collect(),
     };
@@ -1054,7 +1421,7 @@ async fn main() {
     let mut unexpected_fail = Vec::new();
     let mut xfail_count = 0u32;
     for (id, passed) in &actual {
-        match resolutions.get(id).map(|(exp, _)| exp) {
+        match resolutions.get(id).map(|r| &r.expectation) {
             Some(Expectation::ExpectXfail { bug, flaky, .. }) => {
                 if *passed {
                     let label = format!("{id} ({bug})");
