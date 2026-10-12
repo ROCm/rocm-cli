@@ -320,8 +320,8 @@ fn managed_engine_startup_failure_args() -> Vec<String> {
 /// dies at startup is restarted again rather than left down; one that fails
 /// before spawning usually is not, because it leaves the record its stop wrote,
 /// which is `"stopped"` — unless that stop could not confirm, when the prior
-/// status stands, and a record recovery restarted for being `"failed"` stays
-/// `"failed"` and eligible. And that recovery can race a user's own retry: `rocm
+/// status stands, so a record that was already `"failed"` stays `"failed"`,
+/// and so stays eligible for recovery. And that recovery can race a user's own retry: `rocm
 /// serve` for the same engine + model mints a new service id, so both may try
 /// to bind the same port, and one of them loses.
 pub(crate) fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
