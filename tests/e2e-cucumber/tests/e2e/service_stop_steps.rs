@@ -109,8 +109,12 @@ async fn plant_running_service(world: &mut E2eWorld) {
 
 // ── When ───────────────────────────────────────────────────────────
 
-/// Runs the exact line `serve_summary.rs`'s `stop` row prints: `rocm services
-/// stop <id> --yes`.
+/// Runs the pinned, directly-runnable form `serve_summary.rs`'s `stop` row
+/// prints: `rocm services stop <id> --yes`. Built from the known
+/// [`SERVICE_ID`] rather than parsed out of any printed hint — nothing here
+/// ties this literally back to `serve_summary.rs`'s own output; that
+/// equivalence is what the hint-specific scenarios (`serve-24`, remote-15)
+/// prove, by asserting the hint text first and then running it.
 #[when("the user stops it with --yes")]
 async fn stop_with_yes(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["services", "stop", SERVICE_ID, "--yes"]);

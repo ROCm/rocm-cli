@@ -309,9 +309,10 @@ Feature: Model serving
   # Lemonade GPU lane because `--managed` serve still refuses before reaching
   # this guard without a live GPU, same as every other `@requires-gpu` scenario
   # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
-  # bind, and `ensure_public_bind_engine_supported` in `serve_cmd.rs` refuses that
-  # combination for Lemonade on Windows (its server can't receive the key through
-  # the Windows detached-spawn primitive), so this scenario cannot reach the
+  # bind, and the serve path's `ensure_public_bind_engine_supported` guard
+  # (defined in `main.rs`, called from `serve_cmd.rs`) refuses that combination
+  # for Lemonade on Windows (its server can't receive the key through the
+  # Windows detached-spawn primitive), so this scenario cannot reach the
   # refusal it exercises there.
   @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
   Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request

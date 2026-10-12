@@ -3,10 +3,15 @@ Feature: Stopping a managed service
   # `serve_summary.rs`'s `stop` row and the approval gate in `main.rs` both print
   # `rocm services stop <id> --yes` as the one canonical, copy-pasteable command
   # to stop a managed service. Unit tests on both sides prove the two agree on
-  # that exact string; neither proves that running it actually stops anything.
-  # `service_record_cleanup.feature`'s scenarios run this same command too, but
-  # only as best-effort teardown or as a refusal premise — never asserting that
-  # a *running* record is left stopped. This file closes that gap.
+  # that exact string; neither proves that running it changes the service's
+  # recorded state. `service_record_cleanup.feature`'s scenarios run this same
+  # command too, but only as best-effort teardown or as a refusal premise —
+  # never asserting that a *running* record is left stopped. This file closes
+  # that gap: the planted record's `supervisor_pid: 0` means there is no live
+  # process for the stop to reap, so what this proves is that the on-disk
+  # record is actually persisted `stopped`, not that a real server process
+  # was signalled — that part is exercised only on a GPU lane, by a real
+  # `rocm serve`.
   #
   # A new feature file rather than a `service-cleanup-NN` addition: that file's
   # scenarios are about `remove`/`prune` deleting the files a record owns; this

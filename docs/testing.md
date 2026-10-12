@@ -704,7 +704,8 @@ running record on the mock lane and the record being persisted as stopped;
 there is still no e2e coverage of the key being dropped or `services restart`,
 which remain unit-tested only. Reusing a running service for a
 `--require-api-key` request it never had is refused rather than silently
-upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane)
+upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
+Linux-only since the Windows managed Lemonade spawn can't enforce the key)
 covers the local refusal and that its printed stop hint actually clears it;
 `remote-15` (`features/remote.feature`, `@requires-docker`) covers the same
 refusal on `rocm remote serve`, reusing the fake remote's own deterministic
