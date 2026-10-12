@@ -388,17 +388,38 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
         }
         KeyAction::OpenEngineManager => {
             let mut lines = vec![head("Engines".into())];
-            let lemon = info().and_then(|i| i.lemond_version.clone());
+            // External endpoint evidence is live; managed installation evidence
+            // is a separate launch-time Detect snapshot. GPU metadata carries
+            // neither verdict and must never imply an absent engine.
+            let external_running = state.instances.values().any(|i| {
+                i.container_name == "lemonade"
+                    && i.container_id.starts_with("lemonade-")
+                    && i.status.is_serving()
+            });
+            let lemon = if external_running {
+                "Lemonade — externally running"
+            } else {
+                match state.lemonade_managed_installed {
+                    Some(true) => "Lemonade — managed runtime installed",
+                    Some(false) => "Lemonade — managed runtime not installed",
+                    None => "Lemonade — open to check",
+                }
+            };
             lines.push(Line::from(vec![
-                mark(lemon.is_some()),
-                Span::styled(
-                    lemon.map_or_else(
-                        || "Lemonade — not installed".into(),
-                        |v| format!("Lemonade {v}"),
-                    ),
-                    Style::default().fg(theme.fg),
-                ),
+                mark(external_running || state.lemonade_managed_installed == Some(true)),
+                Span::styled(lemon, Style::default().fg(theme.fg)),
             ]));
+            if external_running {
+                let managed = match state.lemonade_managed_installed {
+                    Some(true) => "Managed runtime — installed",
+                    Some(false) => "Managed runtime — not installed",
+                    None => "Managed runtime — open to check",
+                };
+                lines.push(Line::from(Span::styled(
+                    managed,
+                    Style::default().fg(theme.muted),
+                )));
+            }
             // The daemon doesn't surface vLLM detection yet — open the manager to
             // check rather than claiming a status we don't have.
             lines.push(Line::from(vec![
@@ -475,5 +496,75 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
             (lines, any_held)
         }
         _ => (Vec::new(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_text(state: &AppState) -> String {
+        live_lines(KeyAction::OpenEngineManager, state, &Theme::default())
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn installed_stopped_managed_lemonade_is_installed_without_gpu_metadata() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.lemonade_managed_installed = Some(true);
+        assert!(state.instances.is_empty());
+        assert!(engine_text(&state).contains("Lemonade — managed runtime installed"));
+        assert!(!engine_text(&state).contains("running"));
+    }
+
+    #[test]
+    fn absent_managed_lemonade_is_reported_only_from_inventory() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.lemonade_managed_installed = Some(false);
+        assert!(engine_text(&state).contains("Lemonade — managed runtime not installed"));
+    }
+
+    #[test]
+    fn external_running_and_stopped_instances_do_not_invent_managed_installation() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        let id = "lemonade-localhost-13305-model-61".to_owned();
+        state.instances.insert(
+            id.clone(),
+            Instance {
+                container_id: id.clone(),
+                container_name: "lemonade".into(),
+                status: InstanceStatus::Ready,
+                ..Instance::default()
+            },
+        );
+        let text = engine_text(&state);
+        assert!(text.contains("Lemonade — externally running"));
+        assert!(text.contains("Managed runtime — open to check"));
+        state.lemonade_managed_installed = Some(true);
+        assert!(engine_text(&state).contains("Managed runtime — installed"));
+        state.instances.get_mut(&id).unwrap().status = InstanceStatus::Stopped;
+        assert!(engine_text(&state).contains("Lemonade — managed runtime installed"));
+        assert!(!engine_text(&state).contains("externally running"));
+    }
+
+    #[test]
+    fn unknown_lemonade_installation_is_not_claimed_absent() {
+        let state = AppState::new("unix:/unused".into(), "dark".into());
+        let (lines, _) = live_lines(KeyAction::OpenEngineManager, &state, &Theme::default());
+        let text = lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Lemonade — open to check"), "{text}");
+        assert!(
+            !text.contains("not installed"),
+            "missing GPU metadata is not installation evidence"
+        );
     }
 }

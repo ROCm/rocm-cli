@@ -189,6 +189,8 @@ pub struct ManagedDiscovery {
     pub svcs: Vec<DiscoveredService>,
     pub seen: HashSet<String>,
     pub non_vllm: HashSet<String>,
+    /// Read-only Lemonade telemetry targets at registry-owned endpoints.
+    pub lemonade: Vec<ManagedLemonadeTarget>,
     /// How many records were skipped because they are no longer running
     /// (`failed`/`stopped`/unrecognized status). These are dropped from the
     /// scrape set on purpose - polling a dead port is pointless - but they are
@@ -200,15 +202,43 @@ pub struct ManagedDiscovery {
     pub past_attempts: usize,
 }
 
+/// A managed Lemonade endpoint, including both display and canonical names so
+/// a CLI alias does not prevent safe last-request attribution.
+#[derive(Debug, Clone)]
+pub struct ManagedLemonadeTarget {
+    pub service_id: String,
+    pub host: String,
+    pub port: u16,
+    pub model_ref: String,
+    pub canonical_model_id: String,
+}
+
+/// Whether two co-located HTTP bindings address the same service. Wildcard
+/// binds are reachable through loopback; unrelated remote hosts are not aliases.
+pub fn endpoints_match(left_host: &str, left_port: u16, right_host: &str, right_port: u16) -> bool {
+    fn normalized(host: &str) -> String {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        match host.as_str() {
+            "" | "localhost" | "127.0.0.1" | "0.0.0.0" => "ipv4-loopback".into(),
+            "::" | "::1" => "ipv6-loopback".into(),
+            _ => host,
+        }
+    }
+    left_port == right_port && normalized(left_host) == normalized(right_host)
+}
+
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
 ///
 /// Non-scrapeable records (bad status / port 0) are dropped; vLLM-engine services flow to the
 /// Prometheus scrape, others are flagged in `non_vllm`.
 ///
-/// NOTE: gen_tps for managed **non-vLLM** engines (e.g. Lemonade) is not yet
-/// wired — they appear in the dashboard but are excluded from the vLLM scrape
-/// and not routed to a per-engine collector here. vLLM (the Phase-2 acceptance
-/// target) is fully wired. Non-vLLM managed scraping is a D7 follow-up.
+/// Managed Lemonade endpoints are routed to the existing Lemonade collector.
+/// Servers without that protocol (including direct llama-server) keep their
+/// registry row, with throughput unavailable rather than fabricated.
 pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery {
     let mut out = ManagedDiscovery::default();
     for record in records {
@@ -220,6 +250,20 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
             }
             continue;
         };
+        if engine_kind_for(record) == Some(EngineKind::Lemonade) {
+            let host = match record.host.trim() {
+                "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+                "::" | "[::]" | "[::1]" => "::1".to_string(),
+                host => host.to_string(),
+            };
+            out.lemonade.push(ManagedLemonadeTarget {
+                service_id: svc.container_id.clone(),
+                host,
+                port: record.port,
+                model_ref: record.model_ref.clone(),
+                canonical_model_id: record.canonical_model_id.clone(),
+            });
+        }
         out.seen.insert(svc.container_id.clone());
         if engine_kind_for(record) != Some(EngineKind::Vllm) {
             out.non_vllm.insert(svc.container_id.clone());
@@ -236,6 +280,21 @@ mod tests {
     use rocm_dash_core::observation::GenerationObservationTracker;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn endpoint_matching_does_not_conflate_distinct_ports_hosts_or_ip_families() {
+        assert!(endpoints_match("localhost", 13305, "127.0.0.1", 13305));
+        assert!(endpoints_match("0.0.0.0", 13305, "127.0.0.1", 13305));
+        assert!(endpoints_match("[::]", 13305, "::1", 13305));
+        assert!(!endpoints_match("::1", 13305, "127.0.0.1", 13305));
+        assert!(!endpoints_match("127.0.0.1", 13306, "127.0.0.1", 13305));
+        assert!(!endpoints_match(
+            "remote.example",
+            13305,
+            "127.0.0.1",
+            13305
+        ));
+    }
 
     fn at(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()

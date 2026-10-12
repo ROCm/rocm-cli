@@ -152,7 +152,7 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 `engines/lemonade` follows the same pattern:
 
 - [`backend_alignment.rs`](../engines/lemonade/src/backend_alignment.rs) — ROCm-SDK-to-llama.cpp-backend Tier 1/Tier 2/revert alignment and backend discovery/install/selection.
-- [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution and the direct-llama-server serve path.
+- [`direct_llama.rs`](../engines/lemonade/src/direct_llama.rs) — Hugging Face checkpoint/GGUF resolution, registered GGUF checkpoint lookup from the installed Lemonade catalog, selected-backend binary lookup, and the direct-llama-server serve path.
 - [`install.rs`](../engines/lemonade/src/install.rs) — embeddable-runtime archive download/verify/extract, cache locking, and manifest persistence.
 - [`process.rs`](../engines/lemonade/src/process.rs) — `lemond`/llama-server spawn, env/path setup, and readiness/health polling.
 - [`runtime_dir.rs`](../engines/lemonade/src/runtime_dir.rs) — `XDG_RUNTIME_DIR` tier1/2/3 hardening for the spawned child.

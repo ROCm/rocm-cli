@@ -178,9 +178,11 @@ fn observe_empty_state_shows_placeholders() {
     };
     s.latest = Some(synthetic_snapshot());
     let out = render(&mut s, 160, 44);
+    // @id:dash-lemonade-external-protocol-transitions proves model absence
+    // together with this message and navigation to the named Serving view.
     assert!(
-        out.contains("no instances"),
-        "empty instances placeholder: {out:?}"
+        out.contains("no serving models discovered"),
+        "empty serving-model placeholder: {out:?}"
     );
 }
 
