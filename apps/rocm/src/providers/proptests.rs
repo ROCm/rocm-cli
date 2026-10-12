@@ -10,6 +10,7 @@
 //! interrupts its reads. None of them generates SSE text from scratch.
 
 use super::*;
+use crate::test_support::proptest_cases;
 use proptest::prelude::*;
 use std::io::{BufReader, Cursor, ErrorKind, Read};
 
@@ -199,7 +200,7 @@ fn close_delimited_events<R: Read>(reader: &mut R) -> Result<Vec<ProviderStreamE
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(256)))]
 
     /// Chunked transfer coding is transparent: any chunk layout yields the same
     /// events as the plain body.

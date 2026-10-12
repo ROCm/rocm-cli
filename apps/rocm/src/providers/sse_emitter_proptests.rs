@@ -16,7 +16,8 @@
 //! after the end of the stream, and bodies whose last line is cut off before
 //! its terminator, so that `finish()` has a partial line to flush. None of them
 //! generates SSE text from scratch. The transport readers that feed these
-//! emitters (chunked and close-delimited bodies) are not covered here.
+//! emitters (chunked, `Content-Length` and close-delimited bodies) are covered
+//! by the sibling `proptests` module.
 //!
 //! The CRLF fixtures check that both line parsers trim the `\r`. The emitters'
 //! own `trim_end_matches('\r')` is redundant with that trim, so no test here can

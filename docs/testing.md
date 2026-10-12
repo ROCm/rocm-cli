@@ -127,22 +127,24 @@ python scripts/smoke_local.py --skip-build
 
 ### Property tests
 
-`proptest` properties run with the rest of `cargo test`. Each runs proptest's
-default of 256 cases unless its module sets its own count, and
-`PROPTEST_CASES` overrides both for a deeper local run:
+`proptest` properties run with the rest of `cargo test`. One on proptest's
+default config runs 256 cases, and `PROPTEST_CASES` changes that for a deeper
+local run:
 
 ```bash
-PROPTEST_CASES=20000 cargo test -p rocm --bin rocm proptests
+PROPTEST_CASES=10000 cargo test -p rocm --bin rocm proptests
 ```
 
-A module that sets its own count reads it through `proptest_cases` in
-[test_support.rs](../apps/rocm/src/test_support.rs) (in `rocm-core`, the
-`cases` helper in
-[examine_driver_proptests.rs](../crates/rocm-core/src/examine_driver_proptests.rs)),
-because an explicit `with_cases` otherwise overrides `PROPTEST_CASES`. The
-uninstall properties set their count from their own knob instead,
+An explicit case count overrides `PROPTEST_CASES`, so a module that sets one
+reads the variable back itself: in `rocm` through `proptest_cases` in
+[test_support.rs](../apps/rocm/src/test_support.rs); in `rocm-core` through
+the `cases` helper in
+[examine_driver_proptests.rs](../crates/rocm-core/src/examine_driver_proptests.rs)
+and through `run_property` in
+[archive_props.rs](../crates/rocm-core/src/archive_props.rs), which only
+ever raises its count. The uninstall properties read their own knob instead,
 `ROCM_DELETION_PROP_CASES`, described under Uninstall And Download Removal
-below, and ignore `PROPTEST_CASES`.
+below.
 
 ### Known-gap reproducers
 
