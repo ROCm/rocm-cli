@@ -164,12 +164,10 @@ impl RunMeta {
 /// platform × tier combination, e.g. "GPU Strix Ubuntu (known bugs)").
 ///
 /// `pub` (with no `pub` fields) so a caller producing both the HTML report and
-/// the markdown summary in one process — see [`load_platform_reports`] — can
-/// build the per-platform `PlatformReport` set once and pass it to both
-/// [`generate_consolidated_from_reports`]/[`consolidated_summary_markdown_from_reports`],
-/// instead of each output function building its own set independently
+/// the markdown summary in one process can build this set once via
+/// [`load_platform_reports`] and pass it to both outputs; see there for why
 /// (ROCMAI-484). The type stays opaque from outside this crate: nothing
-/// outside `consolidated.rs` needs to construct one or read its fields.
+/// outside this crate needs to construct one or read its fields.
 pub struct PlatformReport {
     desc: Descriptor,
     /// Precomputed column label (platform, OS and effective channel) kept
@@ -868,13 +866,13 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
 /// `report.json`/`platform.json`/`commands.jsonl`, sorted by platform/OS,
 /// then known-bugs flag, then channel.
 ///
-/// [`generate_consolidated`] and [`consolidated_summary_markdown`] each used
-/// to build their own `Vec<PlatformReport>` independently, so a caller
-/// producing both outputs from the same `inputs` in one process (e.g.
-/// `xtask`'s `e2e_report::run`) built it — and read each platform's on-disk
-/// files — twice. A caller that wants both outputs should call this once and
-/// pass the result to [`generate_consolidated_from_reports`] and
-/// [`consolidated_summary_markdown_from_reports`] instead (ROCMAI-484).
+/// Shared by [`generate_consolidated_from_reports`] and
+/// [`consolidated_summary_markdown_from_reports`], so a caller producing both
+/// outputs from the same `inputs` in one process (e.g. `xtask`'s
+/// `e2e_report::run`) builds this set, and reads each platform's on-disk
+/// files, only once instead of once per output (ROCMAI-484). The
+/// expectation grid and scenario reference sections still parse `inputs`
+/// independently of this set.
 pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
     let mut reports: Vec<PlatformReport> = inputs
         .iter()
@@ -897,9 +895,7 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// that only needs the HTML output. A caller that also wants
 /// [`consolidated_summary_markdown`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead, to share the `PlatformReport` build instead of
-/// building it twice. The expectation grid still parses `inputs` itself
-/// either way.
+/// directly instead; see there for why.
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
     html_out: &Path,
@@ -988,9 +984,7 @@ pub fn generate_consolidated_from_reports(
 /// caller that only needs the markdown output. A caller that also wants
 /// [`generate_consolidated`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead, to share the `PlatformReport` build instead of
-/// building it twice. The expectation grid and scenario reference sections
-/// still parse `inputs` themselves either way.
+/// directly instead; see there for why.
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
 }
