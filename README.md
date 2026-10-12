@@ -194,17 +194,7 @@ GPU or daemon.
 
 ## Configure ROCm and serve a model
 
-Before serving a model, check whether a managed ROCm runtime is already
-configured:
-
-```
-rocm examine
-```
-
-When `active_runtime_status` reports `ready`, you can serve a model now. A
-machine can also have an existing ROCm install that `rocm examine` reports as
-`legacy_rocm_status: detected_unmanaged`, alongside the managed runtime. To
-install a runtime, or to get a different version or configuration, run:
+Before serving a model, ensure a managed ROCm runtime is configured:
 
 ```
 rocm install sdk
