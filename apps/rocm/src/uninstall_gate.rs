@@ -57,6 +57,9 @@ pub(crate) enum StopFailureRemedy {
     /// The background helper is still alive, so it can restart what was just
     /// stopped. It has to go before anything is removed.
     StopTheDaemon,
+    /// A live record carries no start time for a pid that is still alive, so the
+    /// pid cannot be proven to be the server and is left alone.
+    ConfirmTheServicePid,
     /// A live pid is recorded as the helper but cannot be proven to be `rocmd`
     /// (a pre-upgrade state file, or a reboot since). Killing it would risk an
     /// unrelated process, so the operator has to decide, and the state file is the
@@ -87,6 +90,15 @@ impl StopFailureRemedy {
                  engine outlived its supervisor, so `rocm services stop` has nothing left to \
                  kill. Find what holds that port (`ss -ltnp` on Linux, `Get-NetTCPConnection \
                  -LocalPort <port>` on Windows), stop it, then re-run uninstall.",
+                ids.join(", ")
+            ),
+            Self::ConfirmTheServicePid => format!(
+                "The record was written before start times were recorded, so its pid cannot be \
+                 proven to still be the server (the pid may have been reused after a reboot) and \
+                 it was left alone. Check what each pid is ({}): if it is your server, stop it \
+                 yourself, or with `rocm services stop <id> --yes` once you have confirmed it, \
+                 then re-run uninstall; if it is something else, delete the stale record with \
+                 `rocm services remove <id> --yes`.",
                 ids.join(", ")
             ),
             Self::StopTheDaemon => "The background helper restarts managed services on its own, \
@@ -138,11 +150,12 @@ impl StopFailureRemedy {
         match self {
             Self::StopTheService => 0,
             Self::StopWhatHoldsThePort => 1,
-            Self::RemoveTheStoppedRecord => 1,
-            Self::StopTheDaemon => 2,
-            Self::ConfirmTheDaemonPid => 2,
-            Self::RepairTheDaemonState => 3,
-            Self::RepairTheRecord => 4,
+            Self::RemoveTheStoppedRecord => 2,
+            Self::ConfirmTheServicePid => 3,
+            Self::StopTheDaemon => 4,
+            Self::ConfirmTheDaemonPid => 5,
+            Self::RepairTheDaemonState => 6,
+            Self::RepairTheRecord => 7,
         }
     }
 }
@@ -377,6 +390,11 @@ pub(crate) fn stop_background_helper_with(
     let outcome = terminate(&identity);
     if outcome.stopped() {
         report.helper_stopped = true;
+    } else if matches!(outcome, rocm_core::TerminationOutcome::Unverified) {
+        report.failed.push(daemon_identity_unverified(
+            state.daemon_pid,
+            &paths.automation_state_path(),
+        ));
     } else {
         report.failed.push(FailedManagedServiceStop {
             service_id: format!("rocmd (pid {})", state.daemon_pid),
@@ -447,6 +465,50 @@ pub(crate) fn stop_managed_services_with(
                     .to_owned(),
             remedy: StopFailureRemedy::RepairTheRecord,
         });
+    }
+    if !report.failed.is_empty() {
+        return Ok(report);
+    }
+    // A live record with no recorded start time cannot prove its pid is still the
+    // server (the pid may have been reused after a reboot), and the stop below
+    // force-kills a process tree. Refuse before anything is stopped, as the
+    // daemon path does for a tick-less state file.
+    for record in load_managed_services(paths)?
+        .iter()
+        .filter(|record| managed_service_is_live(record))
+    {
+        let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+        for (pid, ticks) in [
+            (Some(record.supervisor_pid), record.supervisor_start_ticks),
+            (record.engine_pid, record.engine_start_ticks),
+        ] {
+            let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
+                continue;
+            };
+            if let Some(seen) = entries.iter_mut().find(|(p, _)| *p == pid) {
+                seen.1 = seen.1.or(ticks);
+            } else {
+                entries.push((pid, ticks));
+            }
+        }
+        let unprovable: Vec<u32> = entries
+            .into_iter()
+            .filter(|(pid, ticks)| {
+                record_predates_start_ticks(*ticks)
+                    && rocm_core::process_start_ticks(*pid).is_some()
+            })
+            .map(|(pid, _)| pid)
+            .collect();
+        if !unprovable.is_empty() {
+            report.failed.push(FailedManagedServiceStop {
+                service_id: record.service_id.clone(),
+                reason: format!(
+                    "no start time was recorded for live pid(s) {unprovable:?}, so they cannot be \
+                     told apart from a reused pid"
+                ),
+                remedy: StopFailureRemedy::ConfirmTheServicePid,
+            });
+        }
     }
     if !report.failed.is_empty() {
         return Ok(report);
@@ -551,8 +613,7 @@ pub(crate) fn stop_managed_services_with(
     // instructions.
     //
     // What differs is the evidence required, because a stopped record keeps its
-    // manifest and its old port forever (nothing prunes them, and there is no
-    // `services remove`), so an unrelated process that later binds that port
+    // manifest and its old port until `rocm services remove` or `prune` deletes it, so an unrelated process that later binds that port
     // must not brick uninstall with no way out:
     //
     //   * stopped by this pass — any listener fails the gate. We killed the
@@ -661,7 +722,7 @@ fn probe_records_for_survivors(
             // with `an_endpoint_listing_nothing_does_not_block_uninstall` and
             // `a_listener_naming_another_model_does_not_block_uninstall` driving
             // the two proceed-on-a-live-socket arms through this call site. The
-            // tests live at the bottom of this file, far from here; change an
+            // tests live in `main.rs`'s `mod tests`, far from here; change an
             // arm and expect them, not this match, to be what goes red.
             let verdict = stopped_record_verdict(probe.ok(), auth_refused);
             if !verdict.blocks() {

@@ -34125,7 +34125,7 @@ install therock";
 
     #[test]
     fn a_stale_record_whose_old_port_was_reused_does_not_block_uninstall() {
-        // A stopped service keeps its manifest and its old port forever: nothing
+        // prunes records, and `services remove` is a manual step. If the gate judged
         // prunes records and there is no `services remove`. If the gate judged
         // those records by their recorded port, any unrelated process that later
         // bound it would fail uninstall deterministically, with no override and
@@ -35311,7 +35311,7 @@ install therock";
         // live under that number today inherited it.
         //
         // Windows is where this is the only defence: `process_start_ticks` is
-        // always `None` there, so the identity check falls back to its legacy
+        // unset there for a record written before the upgrade, so the identity check falls back to its legacy
         // `Matches` verdict and the force tree-kill lands on a stranger. That
         // shape cannot be staged on Linux — identity genuinely works here — so
         // this stages the same *decision*: a live pid that the identity check
@@ -36155,6 +36155,62 @@ install therock";
     }
 
     #[test]
+    fn interleaved_failure_classes_print_each_advice_once() {
+        let failure = |id: &str, remedy| FailedManagedServiceStop {
+            service_id: id.to_owned(),
+            reason: "r".to_owned(),
+            remedy,
+        };
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![
+                failure("svc-a", StopFailureRemedy::StopWhatHoldsThePort),
+                failure("svc-b", StopFailureRemedy::RemoveTheStoppedRecord),
+                failure("svc-c", StopFailureRemedy::StopWhatHoldsThePort),
+            ],
+            warnings: Vec::new(),
+            helper_stopped: false,
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert_eq!(
+            message.matches("Find what holds that port").count(),
+            1,
+            "{message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_record_without_start_ticks_is_refused_not_killed() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn child");
+        let (root, paths) = test_paths("tickless-live-record");
+        let record = managed_record_for_pid(&paths, child.id(), None);
+        fs::create_dir_all(paths.services_dir()).unwrap();
+        fs::write(
+            paths.services_dir().join("svc-managed-stop.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("a tick-less live record must not be stopped")
+        })
+        .unwrap();
+        let alive = child.try_wait().unwrap().is_none();
+        child.kill().ok();
+        child.wait().ok();
+        fs::remove_dir_all(root).ok();
+        assert!(alive);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            report.failed[0].remedy,
+            StopFailureRemedy::ConfirmTheServicePid
+        );
+    }
+
+    #[test]
     fn the_endpoint_sentence_follows_the_failure_class() {
         let sentence = "may still be serving";
         for (remedy, expected) in [
@@ -36162,6 +36218,7 @@ install therock";
             (StopFailureRemedy::StopWhatHoldsThePort, true),
             (StopFailureRemedy::RemoveTheStoppedRecord, false),
             (StopFailureRemedy::StopTheDaemon, false),
+            (StopFailureRemedy::ConfirmTheServicePid, false),
             (StopFailureRemedy::ConfirmTheDaemonPid, false),
             (StopFailureRemedy::RepairTheDaemonState, false),
             (StopFailureRemedy::RepairTheRecord, false),

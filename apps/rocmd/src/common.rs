@@ -352,7 +352,7 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
         bail!(
             "refusing to respawn a service bound to the public host `{host}` without an endpoint \
              API key: it would come back up without authentication. Relaunch it with \
-             `rocm serve --host {host} --allow-public-bind` to issue a new key."
+             `rocm serve <model> --host {host} --port <port> --allow-public-bind` to issue a new key."
         );
     }
     Ok(())

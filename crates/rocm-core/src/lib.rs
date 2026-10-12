@@ -4759,7 +4759,7 @@ fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> 
 /// writers cannot pick the same scratch file — and published with
 /// [`publish_temp_file`]. A failed publish takes the scratch file with it.
 ///
-/// Two limits worth knowing before reaching for this:
+/// Three limits worth knowing before reaching for this:
 ///
 /// * **Atomic, not durable.** The staged bytes are `sync_all`ed before the
 ///   publish, so a crash cannot leave a half-written or zero-length file. The
