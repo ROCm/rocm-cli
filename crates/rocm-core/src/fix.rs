@@ -2392,6 +2392,14 @@ mod tests {
         // `current_os()` reports the same answer `is_wsl_host()` does on
         // whatever machine actually runs it, whether that is a bare-metal CI
         // runner, Windows, or a real WSL host.
+        //
+        // In an `e2e-test-hooks` build both calls read through the simulated
+        // host root, which another test may be setting and clearing, so hold
+        // its lock to compare two answers about the same host. Without the
+        // feature the lock is uncontended and costs nothing.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             current_os() == "wsl",
             crate::is_wsl_host(),
