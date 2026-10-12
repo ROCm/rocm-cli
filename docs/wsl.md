@@ -29,7 +29,7 @@ rocm diagnose --json
 ```
 
 To check a distro from Windows without installing anything in it, see
-"Diagnosing a WSL host" later on this page.
+[Diagnosing a WSL host](#diagnosing-a-wsl-host) later on this page.
 
 ## Install ROCDXG In WSL
 
@@ -48,7 +48,8 @@ touching anything, installs the release package, runs `ldconfig`, and then
 verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
 No reboot is needed: ROCDXG is userspace.
 
-Confirm afterwards with `rocm examine`, which should report
+Confirm afterwards with
+[`rocm examine`](rocm-docs/commands.md#examine), which should report
 `driver_status: wsl_rocdxg_ready`.
 
 The download is verified before it is installed. `rocm install driver` carries a
@@ -157,8 +158,8 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 ## Diagnosing A WSL Host
 
-`rocm diagnose` has a separate set of WSL checks, called the WSL catalog,
-distinct from the bare-metal Linux ones.
+[`rocm diagnose`](rocm-docs/commands.md#diagnose-and-fix) has a separate set of
+WSL checks, called the WSL catalog, distinct from the bare-metal Linux ones.
 The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
 never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
 naming one would send you after a fault that cannot exist on this platform.
@@ -177,12 +178,13 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-2-dxcore-missing` | `libdxcore.so` is absent or off the loader path |
 | `fix-wsl-3-rocdxg-missing` | ROCDXG is not installed in the distro |
 | `fix-wsl-4-rocdxg-not-linked` | ROCDXG is installed but absent from the linker cache |
-| `fix-wsl-5-distro-too-old` | The distro release is below the floor in the prerequisites above |
+| `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
 Two entries outside this list also apply when you run `rocm diagnose` inside the
 distro: `fix-19-shm-too-small` and `fix-18-comgr-conflict`. A `--distro` run
-skips both (see "Diagnose a distro from Windows" later in this section).
+skips both (see [Diagnose a distro from Windows](#diagnose-a-distro-from-windows)
+later in this section).
 
 `fix-19-shm-too-small` is not a WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
 serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
@@ -195,8 +197,9 @@ the code object manager library collide there exactly as they do on bare
 metal, through the same `LD_LIBRARY_PATH`/loader-cache search, so the finding
 is not specific to either platform.
 
-Every WSL remedy is print-only. `rocm fix <id>` shows the commands and does not
-run them: they either install packages with `sudo`, edit loader configuration, or
+Every WSL remedy is print-only.
+[`rocm fix <id>`](rocm-docs/commands.md#diagnose-and-fix) shows the commands and
+does not run them: they either install packages with `sudo`, edit loader configuration, or
 belong to the Windows host, and none of that meets the bar an auto-applied fix
 has to clear. On WSL the CLI carries out exactly one catalog entry itself,
 `fix-6-path`, which is not one of the WSL entries.
@@ -217,8 +220,9 @@ the report:
 ### Diagnose a distro from Windows
 
 To inspect a distro without installing anything in it, install ROCm CLI on
-Windows (see the Windows steps in the installation guide) and run this from
-PowerShell:
+Windows (see the Windows steps in the
+[installation guide](rocm-docs/install/installation.md#windows-x86_64-powershell))
+and run this from PowerShell:
 
 ```powershell
 rocm diagnose --distro          # the only distro installed
@@ -265,8 +269,8 @@ Resolve that error first, then run `rocm diagnose --distro` again.
 
 ## What `rocm examine` Reports On WSL
 
-`rocm examine` detects WSL cheaply and reports the following. The text report
-shows a subset; the rest appear in `rocm examine --json`.
+[`rocm examine`](rocm-docs/commands.md#examine) detects WSL cheaply and reports
+the following. The text report shows a subset; the rest appear in `rocm examine --json`.
 
 - `wsl: true`
 - WSL distro and version, and whether the release clears the supported floor

@@ -27,6 +27,7 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 
 ```{include} ../../wsl.md
 :start-after: "## Install ROCDXG In WSL"
+:relative-docs: rocm-docs/
 :end-before: "## TheRock Runtime Env In WSL"
 ```
 
@@ -34,6 +35,7 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 
 ```{include} ../../wsl.md
 :start-after: "## Diagnosing A WSL Host"
+:relative-docs: rocm-docs/
 :end-before: "## What `rocm examine` Reports On WSL"
 ```
 
@@ -41,6 +43,7 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 
 ```{include} ../../wsl.md
 :start-after: "## What `rocm examine` Reports On WSL"
+:relative-docs: rocm-docs/
 :end-before: "## Install UX Recommendations"
 ```
 
