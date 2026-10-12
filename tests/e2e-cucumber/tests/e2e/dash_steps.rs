@@ -135,9 +135,11 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
 }
 
 /// The name of a child directory `dash-25` plants under the scenario's cwd,
-/// and later asserts the folder browser lists — a space in the name is the
-/// motivating case for #501 (the harness previously could not land the
-/// spawned process in a path a scenario controls). The browser's entry list
+/// and later asserts the folder browser lists. The space in the name
+/// exercises how the browser renders an entry with whitespace in it; it
+/// does not exercise a whitespace path through `spawn_in` itself (the cwd
+/// passed to `spawn_in` is the scenario root, which has no space) — that
+/// remains explicit follow-up work for #500. The browser's entry list
 /// labels children by `file_name()` alone (`build_entries` in
 /// `folder_browser.rs`), not their full path, so asserting on this fixed,
 /// short label stays robust however long the host's own temp directory is —
