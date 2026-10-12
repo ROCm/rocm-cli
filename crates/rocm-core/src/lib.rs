@@ -2048,6 +2048,21 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Picks the best available detail string from a failed subprocess's
+/// captured output: stderr if non-blank after trimming, else stdout, else a
+/// literal "no output"; the result is trimmed.
+pub fn command_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    "no output".to_owned()
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WatcherMode {
@@ -7575,5 +7590,35 @@ last_installed_runtime_id = "therock-release"
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    fn test_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::default()
+    }
+
+    fn test_process_output(stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: test_exit_status(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn command_failure_detail_prefers_nonempty_stderr() {
+        let output = test_process_output("  stdout text\n", "  stderr text\n");
+        assert_eq!(command_failure_detail(&output), "stderr text");
+    }
+
+    #[test]
+    fn command_failure_detail_falls_back_to_stdout_when_stderr_is_whitespace_only() {
+        let output = test_process_output("  stdout text\n", "   \n\t  ");
+        assert_eq!(command_failure_detail(&output), "stdout text");
+    }
+
+    #[test]
+    fn command_failure_detail_reports_no_output_when_both_are_empty_or_whitespace() {
+        let output = test_process_output("  \n", "   ");
+        assert_eq!(command_failure_detail(&output), "no output");
     }
 }
