@@ -1277,13 +1277,23 @@ cargo test -p xtask the_release_workflow_builds_no_feature_gated_binaries
 cargo test -p xtask prebuilt_e2e_lanes_enable_test_hooks
 ```
 
-E2E scenarios, in `tests/e2e-cucumber/features/model_serving.feature`:
+E2E scenarios, in `tests/e2e-cucumber/features/model_serving.feature`. Run the
+suite unfiltered and let the harness select:
 
 ```bash
-cargo xtask e2e -- -n serve-oom-memory-guidance
-cargo xtask e2e -- -n serve-oom-launch-memory-guidance
-cargo xtask e2e -- -n serve-unrelated-live-service-still-fails-fast
+cargo xtask e2e
 ```
+
+There is deliberately no focused command for these three. Cucumber 0.23 honours
+*either* its own CLI filter *or* the harness closure, never both, so `-n` or
+`--tags` bypasses the OS, capability and expectation resolution that decides
+whether a scenario may run at all (see the comment at
+`tests/e2e-cucumber/tests/e2e.rs`, above `only_lifecycle`). That matters most
+for serve-25, which is gated on the `@requires-oom-fault-injection` capability:
+selected from the CLI it would run on a binary built without the hook and fail
+for the wrong reason. Note also that `-n` matches the scenario *name*
+(`serve-24 - Reusing an already-running serve ...`), not the `@id:` tag, so
+passing an id to it silently selects nothing.
 
 - serve-24, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
   already-running vLLM service whose log *does* carry an OOM traceback prints
