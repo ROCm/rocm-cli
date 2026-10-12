@@ -604,6 +604,10 @@ print(json.dumps({"present": spec is not None, "version": version}))
 
 /// Describes a resolved runtime's TheRock SDK layout for the running-state
 /// payload, or `None` when the runtime is not backed by a TheRock SDK root.
+/// Not pure: via `therock_library_path_entries`, this can write a
+/// `libmpi_cxx` compat stub and delete a stale numa shim in a runtime-owned
+/// `rocm-cli-lib-compat` directory under the managed Python env root (or the
+/// SDK root as a fallback).
 pub(crate) fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
     let root = runtime.sdk_root.as_ref()?;
     Some(json!({
