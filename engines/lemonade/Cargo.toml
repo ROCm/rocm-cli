@@ -11,7 +11,7 @@ publish.workspace = true
 workspace = true
 
 [features]
-e2e-test-hooks = []
+e2e-test-hooks = ["rocm-core/e2e-test-hooks"]
 
 [[bin]]
 name = "rocm-engine-lemonade"

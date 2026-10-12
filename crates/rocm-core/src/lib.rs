@@ -32,6 +32,7 @@ pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod hardware_root;
 pub mod host_gpu;
 pub mod managed_runtime;
 pub mod model_readiness;
@@ -65,6 +66,7 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
+pub use hardware_root::host_path;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,

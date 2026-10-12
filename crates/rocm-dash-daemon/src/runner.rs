@@ -16,6 +16,9 @@ use crate::snapshot_ring::SnapshotRing;
 
 use chrono::{DateTime, Utc};
 use rocm_dash_collectors::amd_smi::AmdSmiCollector;
+/// The real `/dev/kfd`, re-exported so callers without a direct
+/// `rocm-dash-collectors` dependency can resolve their host-root view of it.
+pub use rocm_dash_collectors::amd_smi::KFD_DEVICE;
 use rocm_dash_collectors::bench_tail::CsvBenchTailer;
 use rocm_dash_collectors::docker::DockerDiscovery;
 use rocm_dash_collectors::host::HostCollector;
@@ -90,6 +93,15 @@ pub struct RunnerOptions {
     /// the caller (`apps/rocm`) does and passes the answer through. `false`
     /// (the default) preserves the bare-metal-only `/dev/kfd` check.
     pub amd_smi_gpu_reachable: bool,
+    /// Where the caller's hardware probes put `/dev/kfd`.
+    ///
+    /// This is `rocm_core::host_path`'s answer, threaded in like
+    /// `amd_smi_gpu_reachable`. The amd-smi pre-flight needs both this and
+    /// the real `/dev/kfd` to be readable, so a simulated host root can hide
+    /// the runner's GPU but never start `amd-smi` on a host without one.
+    /// Defaults to the real [`KFD_DEVICE`], and equals it in every build
+    /// without a simulated root, which leaves the pre-flight unchanged.
+    pub amd_smi_host_kfd_device: PathBuf,
     /// **Test-only.** When set, cycle timestamps come from the logical clock
     /// this file controls instead of `Utc::now()` — see [`TestClockDirective`]
     /// for the file's grammar. Production callers leave this unset; E2E
@@ -117,6 +129,7 @@ impl Default for RunnerOptions {
             amd_smi_binary: None,
             amd_smi_skip_device_preflight: false,
             amd_smi_gpu_reachable: false,
+            amd_smi_host_kfd_device: PathBuf::from(KFD_DEVICE),
             test_clock_offset_path: None,
         }
     }
@@ -245,21 +258,24 @@ fn parse_test_clock_directive(value: &str) -> Option<TestClockDirective> {
 /// test can assert on without spawning the task or touching a real binary.
 enum AmdSmiDetectPlan {
     SkipDevicePreflight(OsString),
-    Detect(OsString, bool),
+    /// Binary, `gpu_reachable` verdict, host-root view of `/dev/kfd`.
+    Detect(OsString, bool, PathBuf),
 }
 
 /// `amd_smi_binary: None` means "no override", not "no detection" — it still
 /// runs the real pre-flight against the literal `amd-smi` command name, with
-/// the same threaded `gpu_reachable` verdict as an explicit binary.
+/// the same threaded `gpu_reachable` verdict and `host_kfd_device` as an
+/// explicit binary.
 fn amd_smi_detect_plan(
     binary: Option<OsString>,
     skip_device_preflight: bool,
     gpu_reachable: bool,
+    host_kfd_device: PathBuf,
 ) -> AmdSmiDetectPlan {
     match binary {
         Some(binary) if skip_device_preflight => AmdSmiDetectPlan::SkipDevicePreflight(binary),
-        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable),
-        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable),
+        Some(binary) => AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device),
+        None => AmdSmiDetectPlan::Detect("amd-smi".into(), gpu_reachable, host_kfd_device),
     }
 }
 
@@ -365,6 +381,7 @@ pub async fn run_loop(
         opts.amd_smi_binary.clone(),
         opts.amd_smi_skip_device_preflight,
         opts.amd_smi_gpu_reachable,
+        opts.amd_smi_host_kfd_device.clone(),
     );
     let (gpu_init_tx, mut gpu_init_rx) =
         tokio::sync::oneshot::channel::<(Option<AmdSmiCollector>, Option<GpuSystemInfo>)>();
@@ -373,8 +390,8 @@ pub async fn run_loop(
             AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
                 AmdSmiCollector::detect_with_binary_skipping_device_preflight(binary).await
             }
-            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
-                AmdSmiCollector::detect_with_binary(binary, gpu_reachable).await
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device) => {
+                AmdSmiCollector::detect_with_binary(binary, gpu_reachable, &host_kfd_device).await
             }
         };
         let info = match &gpu {
@@ -1172,23 +1189,29 @@ mod tests {
     /// binary named literally `amd-smi`.
     #[test]
     fn detect_plan_threads_gpu_reachable_through_the_none_binary_arm() {
-        match amd_smi_detect_plan(None, false, true) {
-            AmdSmiDetectPlan::Detect(binary, gpu_reachable) => {
+        match amd_smi_detect_plan(None, false, true, PathBuf::from("/fake-root/dev/kfd")) {
+            AmdSmiDetectPlan::Detect(binary, gpu_reachable, host_kfd_device) => {
                 assert_eq!(binary, OsString::from("amd-smi"));
                 assert!(gpu_reachable);
+                assert_eq!(host_kfd_device, PathBuf::from("/fake-root/dev/kfd"));
             }
             AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
         }
 
-        match amd_smi_detect_plan(None, false, false) {
-            AmdSmiDetectPlan::Detect(_, gpu_reachable) => assert!(!gpu_reachable),
+        match amd_smi_detect_plan(None, false, false, PathBuf::from(KFD_DEVICE)) {
+            AmdSmiDetectPlan::Detect(_, gpu_reachable, _) => assert!(!gpu_reachable),
             AmdSmiDetectPlan::SkipDevicePreflight(_) => panic!("expected Detect"),
         }
     }
 
     #[test]
     fn detect_plan_skip_preflight_takes_priority_over_an_explicit_binary() {
-        match amd_smi_detect_plan(Some("fake-amd-smi".into()), true, false) {
+        match amd_smi_detect_plan(
+            Some("fake-amd-smi".into()),
+            true,
+            false,
+            PathBuf::from(KFD_DEVICE),
+        ) {
             AmdSmiDetectPlan::SkipDevicePreflight(binary) => {
                 assert_eq!(binary, OsString::from("fake-amd-smi"));
             }
