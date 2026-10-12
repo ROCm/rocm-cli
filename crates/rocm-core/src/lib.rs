@@ -2109,11 +2109,10 @@ pub fn tail_lines(path: &Path, limit: usize, max_tail_read: u64) -> Result<Vec<S
     // capacity upfront. Real callers ask for small limits (tens to a few
     // hundred lines), so capping still gives them a single allocation.
     let mut lines: VecDeque<String> = VecDeque::with_capacity(limit.min(4096));
-    let mut skip_next = first_line_is_partial;
     for line in reader.lines() {
         let line = line.with_context(|| format!("failed to read lines from {}", path.display()))?;
-        if skip_next {
-            skip_next = false;
+        if first_line_is_partial {
+            first_line_is_partial = false;
             continue;
         }
         if lines.len() == limit {
@@ -4630,7 +4629,7 @@ pub fn unix_time_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{temp_app_paths, workspace_test_artifact_dir};
+    use crate::test_support::{temp_app_paths, unique_suffix, workspace_test_artifact_dir};
 
     use std::fs;
     use std::path::Path;
@@ -7687,11 +7686,7 @@ last_installed_runtime_id = "therock-release"
 
     #[test]
     fn tail_lines_returns_suffix() -> Result<()> {
-        let path = std::env::temp_dir().join(format!(
-            "rocm-core-tail-{}-{}.log",
-            std::process::id(),
-            unix_time_millis()
-        ));
+        let path = std::env::temp_dir().join(format!("rocm-core-tail-{}.log", unique_suffix()));
         fs::write(&path, "a\nb\nc\n")?;
         let lines = tail_lines(&path, 2, TEST_MAX_TAIL_READ)?;
         fs::remove_file(&path).ok();
@@ -7715,11 +7710,8 @@ last_installed_runtime_id = "therock-release"
         }
         assert_eq!(tail.len(), TEST_MAX_TAIL_READ as usize);
 
-        let path = std::env::temp_dir().join(format!(
-            "rocm-core-tail-boundary-{}-{}.log",
-            std::process::id(),
-            unix_time_millis()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-boundary-{}.log", unique_suffix()));
         fs::write(&path, format!("{prefix}{tail}"))?;
         let lines = tail_lines(&path, usize::MAX, TEST_MAX_TAIL_READ)?;
         fs::remove_file(&path).ok();
@@ -7751,11 +7743,8 @@ last_installed_runtime_id = "therock-release"
         // mid-line.
         tail.truncate(TEST_MAX_TAIL_READ as usize);
 
-        let path = std::env::temp_dir().join(format!(
-            "rocm-core-tail-midline-{}-{}.log",
-            std::process::id(),
-            unix_time_millis()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-midline-{}.log", unique_suffix()));
         fs::write(&path, format!("{prefix}{tail}"))?;
         let lines = tail_lines(&path, usize::MAX, TEST_MAX_TAIL_READ)?;
         fs::remove_file(&path).ok();
