@@ -21,8 +21,8 @@ use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
 use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
 use crate::state::{
-    mark_json_status, merge_json_state, parse_http_endpoint, resolve_lemonade_model_ref,
-    tail_lines, terminate_pid, write_running_state,
+    MAX_TAIL_READ, mark_json_status, merge_json_state, parse_http_endpoint,
+    resolve_lemonade_model_ref, terminate_pid, write_running_state,
 };
 use crate::{LLAMACPP_RECIPE, ServeHttpRequest};
 
@@ -298,7 +298,7 @@ fn summarize_startup_log_tail(log_path: Option<&Path>, limit: usize) -> String {
     if !log_path.is_file() {
         return format!("Lemonade startup log not found at {}", log_path.display());
     }
-    match tail_lines(log_path, limit) {
+    match rocm_core::tail_lines(log_path, limit, MAX_TAIL_READ) {
         Ok(lines) if lines.is_empty() => {
             format!("Lemonade startup log {} is empty", log_path.display())
         }

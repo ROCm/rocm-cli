@@ -759,7 +759,7 @@ fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
         recent_lines: if files.log_path.is_file() {
-            crate::state::tail_lines(&files.log_path, limit)?
+            rocm_core::tail_lines(&files.log_path, limit, crate::state::MAX_TAIL_READ)?
         } else {
             Vec::new()
         },

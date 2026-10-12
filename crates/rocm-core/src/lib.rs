@@ -5,12 +5,12 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 #[cfg(windows)]
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -2067,6 +2067,61 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
         return stdout;
     }
     "no output".to_owned()
+}
+
+/// Reads the last `limit` lines from a file, seeking near the end instead of
+/// reading the whole file for files larger than `max_tail_read`.
+///
+/// Shared by the engine adapters so the seek-boundary classification has one
+/// implementation: when the seek lands in the middle of a line, the first
+/// line read back is a partial fragment and must be dropped; when it lands
+/// exactly on a line boundary (the byte before the seek position is a
+/// newline), that first line is complete and must be kept. `max_tail_read`
+/// stays a parameter rather than a shared constant because each engine picks
+/// its own tail-read budget.
+pub fn tail_lines(path: &Path, limit: usize, max_tail_read: u64) -> Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let file_size = metadata.len();
+
+    let mut first_line_is_partial = false;
+    if file_size > max_tail_read {
+        let seek_pos = file_size - max_tail_read;
+        // Probe the byte preceding `seek_pos` to classify the first line, then
+        // leave the cursor at `seek_pos` for the buffered read below.
+        file.seek(SeekFrom::Start(seek_pos - 1))
+            .with_context(|| format!("failed to seek in {}", path.display()))?;
+        let mut probe = [0u8; 1];
+        file.read_exact(&mut probe)
+            .with_context(|| format!("failed to read from {}", path.display()))?;
+        first_line_is_partial = probe[0] != b'\n';
+    }
+
+    let reader = BufReader::new(file);
+    // Capped, not `VecDeque::with_capacity(limit)`: callers may pass
+    // `usize::MAX` to mean "no limit", which would try to allocate that
+    // capacity upfront. Real callers ask for small limits (tens to a few
+    // hundred lines), so capping still gives them a single allocation.
+    let mut lines: VecDeque<String> = VecDeque::with_capacity(limit.min(4096));
+    let mut skip_next = first_line_is_partial;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read lines from {}", path.display()))?;
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if lines.len() == limit {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+    Ok(lines.into_iter().collect())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -7626,5 +7681,98 @@ last_installed_runtime_id = "therock-release"
     fn command_failure_detail_reports_no_output_when_both_are_empty_or_whitespace() {
         let output = test_process_output("  \n", "   ");
         assert_eq!(command_failure_detail(&output), "no output");
+    }
+
+    const TEST_MAX_TAIL_READ: u64 = 4 * 1024 * 1024;
+
+    #[test]
+    fn tail_lines_returns_suffix() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "rocm-core-tail-{}-{}.log",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::write(&path, "a\nb\nc\n")?;
+        let lines = tail_lines(&path, 2, TEST_MAX_TAIL_READ)?;
+        fs::remove_file(&path).ok();
+        assert_eq!(lines, vec!["b".to_owned(), "c".to_owned()]);
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_keeps_first_line_when_seek_lands_on_boundary() -> Result<()> {
+        // Build a file where the tail window starts exactly on a line
+        // boundary: a prefix ending in '\n', followed by exactly
+        // TEST_MAX_TAIL_READ bytes of complete lines. The first windowed line
+        // must NOT be dropped. This is the regression case for issue #597.
+        let prefix = format!("{}\n", "p".repeat(63));
+        let mut tail = String::from("FIRSTLINE\n");
+        while tail.len() + 2 <= TEST_MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        while tail.len() < TEST_MAX_TAIL_READ as usize {
+            tail.push('z');
+        }
+        assert_eq!(tail.len(), TEST_MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-core-tail-boundary-{}-{}.log",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX, TEST_MAX_TAIL_READ)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("FIRSTLINE"),
+            "complete first line must be preserved when the seek lands on a newline boundary"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains('p')),
+            "bytes before the tail window must not appear"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_drops_partial_first_line_when_seek_lands_midline() -> Result<()> {
+        // The window starts in the middle of a line, so the leading fragment
+        // is partial and must be dropped.
+        let prefix = "p".repeat(64);
+        let mut tail = String::from("PARTIALFRAGMENT");
+        tail.push('\n');
+        tail.push_str("SECONDLINE\n");
+        while tail.len() < TEST_MAX_TAIL_READ as usize {
+            tail.push_str("y\n");
+        }
+        // Trim back to exactly TEST_MAX_TAIL_READ bytes so the window starts
+        // mid-line.
+        tail.truncate(TEST_MAX_TAIL_READ as usize);
+
+        let path = std::env::temp_dir().join(format!(
+            "rocm-core-tail-midline-{}-{}.log",
+            std::process::id(),
+            unix_time_millis()
+        ));
+        fs::write(&path, format!("{prefix}{tail}"))?;
+        let lines = tail_lines(&path, usize::MAX, TEST_MAX_TAIL_READ)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("SECONDLINE"),
+            "partial leading fragment must be dropped when the seek lands mid-line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_limit_zero_returns_empty_without_opening_file() -> Result<()> {
+        let path = Path::new("/does/not/exist/rocm-core-tail-limit-zero.log");
+        let lines = tail_lines(path, 0, TEST_MAX_TAIL_READ)?;
+        assert!(lines.is_empty());
+        Ok(())
     }
 }
