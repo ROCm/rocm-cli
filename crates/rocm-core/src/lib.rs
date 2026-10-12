@@ -7788,7 +7788,8 @@ last_installed_runtime_id = "therock-release"
         // All-POD `repr(C)` record, fully overwritten by the call below on
         // success and never read on failure.
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        let handle = file.as_raw_handle() as HANDLE;
+        if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
             bail!(
                 "failed to read the file identity of {}: {}",
                 path.display(),
