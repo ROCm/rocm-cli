@@ -144,7 +144,8 @@ mod tests {
     /// for .. {` also match, but sit outside any test body, where the scan
     /// does not look. Both directions are pinned by
     /// [`a_bare_type_entry_matches_a_whole_name_outside_type_positions`],
-    /// [`a_field_value_builds_the_guard_and_a_field_declaration_does_not`] and
+    /// [`a_field_value_builds_the_guard_and_a_field_declaration_does_not`],
+    /// [`a_construction_after_a_declared_item_is_still_flagged`] and
     /// [`holding_a_mutating_guard_still_needs_the_lock`].
     const MUTATIONS: [&str; 4] = [
         "set_var(",

@@ -111,26 +111,20 @@ all of which the scan reports nothing for:
   helper to that list, or it is outside the guard. A guard type whose `Drop`
   mutates the environment needs its type name listed too, as `UnsetKeyOnExit`
   is, because the test only ever names the type and never calls a `::new(`.
-  A bare name in that list is matched as any whole identifier except in a type
-  position — right after `<` or right before `>`, anywhere inside a `struct` or
-  `enum` declaration, or right after a `:` (not `::`) that is an ascription
-  rather than a struct-literal field initializer. A colon counts as a field
-  initializer when the innermost open bracket is a non-declaration `{` and the
-  field name follows `{`, `,` or the start of the line. So every construction
-  (`let _g = UnsetKeyOnExit;`, `drop(UnsetKeyOnExit)`, `Some(UnsetKeyOnExit)`,
-  `vec![UnsetKeyOnExit]`, `Holder { guard: UnsetKeyOnExit }` on one line or
-  split) is flagged, while a longer name, `Option<UnsetKeyOnExit>`, a parameter
-  typed `_x: UnsetKeyOnExit`, `let _g: UnsetKeyOnExit;` or a field declared
-  `guard: UnsetKeyOnExit` in a `struct` is not. That errs toward reporting: a
-  struct pattern (`let Holder { guard: UnsetKeyOnExit } = h;`), a later
-  parameter of a typed closure (`|a, g: UnsetKeyOnExit|`) and a `->
-  UnsetKeyOnExit` return type in a test body are flagged although they build
-  nothing; reword them.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
+
+A bare type name in `MUTATIONS` is matched wherever it can stand for a value
+rather than a type: `drop(UnsetKeyOnExit)` and `let _g = UnsetKeyOnExit;` are
+flagged, `Option<UnsetKeyOnExit>` and a parameter typed `_x: UnsetKeyOnExit` are
+not. The rule errs toward reporting, so a few type mentions it cannot tell from
+a construction, such as a struct pattern, are flagged although they build
+nothing; reword them. The full rule and its known over-reports are documented
+on `MUTATIONS` in
+[`xtask/src/env_mutation_contract.rs`](../xtask/src/env_mutation_contract.rs).
 
 Run the cross-platform smoke test:
 
