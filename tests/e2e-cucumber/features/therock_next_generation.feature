@@ -198,3 +198,26 @@ Feature: TheRock "next" ROCm 10 install layout
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0 with the toolchain
     Then the preview resolves the ROCm 10 pip index
     And the preview requests the gfx1200 device extras with the toolchain
+
+  # The regression this pins: torchaudio's published metadata names no ROCm
+  # build, so a pin to any ROCm 10 version but the newest resolved torchaudio
+  # from the newest build, and the install refused the mixed stack. The other
+  # scenarios publish one build per package and could not see it. The pinned
+  # build also publishes a torchaudio rebuild (`2.9.1.2`), the shape the live
+  # index uses, and the plan must take that rather than the original release.
+  @id:therock-next-11-older-pin-keeps-one-rocm-build
+  Scenario: therock-next-11 - A ROCm 10 wheel install pinned below the newest build installs only that build
+    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the preview resolves the ROCm 10 pip index
+    And every package in the preview is built for ROCm 10.0.0
+
+  # The refusal half of therock-next-11: when the pinned build publishes no
+  # torchaudio this host can install — here only a wheel for another platform —
+  # the install stops and says so instead of taking another build's torchaudio.
+  @id:therock-next-12-missing-torchaudio-build-refused
+  Scenario: therock-next-12 - A ROCm 10 wheel install refuses when the pinned build publishes no torchaudio
+    Given a ROCm 10 pip index fixture that publishes torchaudio only for a newer ROCm 10 build
+    When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
+    Then the install fails
+    And the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another
