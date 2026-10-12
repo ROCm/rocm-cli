@@ -539,9 +539,16 @@ mod tests {
 
     #[test]
     fn registry_records_tie_on_install_time_is_broken_on_the_runtime_key() {
+        // The file name mirrors the key's letters (`aaa` -> `zzz.json`), so
+        // path order is the reverse of key order: a sort that fell through to
+        // the path tiebreak without consulting the key would fail here.
         let record = |key: &str, installed_at: u128| {
+            let mirrored: String = key
+                .bytes()
+                .map(|byte| char::from(b'a' + b'z' - byte))
+                .collect();
             (
-                PathBuf::from(format!("{key}.json")),
+                PathBuf::from(format!("{mirrored}.json")),
                 serde_json::from_value::<TheRockFamilyManifest>(serde_json::json!({
                     "runtime_key": key,
                     "installed_at_unix_ms": installed_at,
