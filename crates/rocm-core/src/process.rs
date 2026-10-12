@@ -5,13 +5,15 @@
 //! Bounded command execution that captures output without deadlocking on it.
 
 use std::io::{ErrorKind, Read};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+
+use crate::examine::truncate_to_chars;
 
 /// How often the wait loop polls for the child's exit.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -46,29 +48,35 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// payload-sized quote, not to shorten diagnostics.
 const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 
-/// Truncate `value` to at most `max_chars` characters, appending a marker when
-/// truncated. Slices on char boundaries; a byte slice would panic when the cut
-/// lands inside a multibyte character.
-///
-/// Matches `examine.rs`'s `truncate_to_chars` and `host_gpu.rs`'s
-/// `truncate_diagnostic_line` — same shape, same visible marker — so a reader
-/// who has met one recognises the others.
-fn truncate_to_chars(value: String, max_chars: usize) -> String {
-    if value.chars().count() > max_chars {
-        let truncated: String = value.chars().take(max_chars).collect();
-        format!("{truncated}...[truncated]")
-    } else {
-        value
-    }
-}
-
 /// One captured stream: the bytes so far, whether its reader saw EOF, and the
 /// read error that stopped it, if one did.
+///
+/// # Lifetime of the reader thread
+///
+/// The thread outlives the call that started it whenever the drain grace runs
+/// out — that is the point of the grace — and it then lives until the pipe's
+/// last write end closes, which is the abandoned grandchild's business, not
+/// ours. What it must *not* do is keep growing: `take()` marks the capture
+/// abandoned, and from that moment the reader drains to EOF and discards, so a
+/// buffer nobody will read again cannot grow without bound in a daemon that
+/// probes every 60 seconds.
+///
+/// Discarding rather than closing the read end is deliberate. Dropping the pipe
+/// would send the still-writing grandchild `EPIPE`/`SIGPIPE`, which for the
+/// background helpers a sandboxed installer legitimately leaves behind would
+/// turn a leak we can bound into a behaviour change we cannot predict.
 #[derive(Clone)]
 struct Capture {
     buffer: Arc<Mutex<Vec<u8>>>,
     finished: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<std::io::Error>>>,
+    /// Set by `take()`: nothing will read this capture's bytes again.
+    ///
+    /// Read and written under `buffer`'s mutex, so "emptied and marked" is one
+    /// step as far as the reader is concerned. Checking it outside the lock
+    /// would leave the window where a reader that has just passed the check
+    /// appends to the buffer `take()` is in the middle of emptying.
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Capture {
@@ -82,6 +90,7 @@ impl Capture {
             buffer: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(AtomicBool::new(false)),
             failure: Arc::new(Mutex::new(None)),
+            abandoned: Arc::new(AtomicBool::new(false)),
         };
         let Some(mut pipe) = pipe else {
             capture.finished.store(true, Ordering::Release);
@@ -93,7 +102,16 @@ impl Capture {
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(read) => sink.lock().extend_from_slice(&chunk[..read]),
+                    Ok(read) => {
+                        // Keep draining once abandoned, but stop accumulating:
+                        // see the type's doc. The check shares the buffer's
+                        // lock with `take()`, so after `take()` returns this
+                        // buffer cannot grow by another byte.
+                        let mut buffer = sink.lock();
+                        if !sink.abandoned.load(Ordering::Acquire) {
+                            buffer.extend_from_slice(&chunk[..read]);
+                        }
+                    }
                     // `read_to_end` — what `wait_with_output` used before this
                     // function existed — retries an interrupted read and
                     // returns every other error. Treating either as EOF would
@@ -103,7 +121,11 @@ impl Capture {
                     // Round again rather than break: not the end of anything.
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => {
-                        *sink.failure() = Some(error);
+                        // Recorded only while someone is still listening: after
+                        // `take()` the failure slot is as unread as the buffer.
+                        if !sink.abandoned.load(Ordering::Acquire) {
+                            *sink.failure() = Some(error);
+                        }
                         break;
                     }
                 }
@@ -134,8 +156,18 @@ impl Capture {
     /// The bytes come back alongside any read error rather than instead of it,
     /// so a caller already reporting something else — a timeout — can still
     /// quote what it managed to collect.
+    ///
+    /// This is also the point of no return for the reader: whatever it collects
+    /// after this is discarded, because there is no second caller to hand it to.
     fn take(&self) -> (Vec<u8>, Option<std::io::Error>) {
-        let bytes = std::mem::take(&mut *self.lock());
+        let bytes = {
+            // Marked while the buffer is held, so the reader cannot append
+            // between the mark and the emptying and strand bytes in a buffer
+            // that is never read again.
+            let mut buffer = self.lock();
+            self.abandoned.store(true, Ordering::Release);
+            std::mem::take(&mut *buffer)
+        };
         (bytes, self.failure().take())
     }
 }
@@ -162,6 +194,11 @@ impl Capture {
 /// grandchild the child left behind, which holds the pipe's write end open so no
 /// EOF ever arrives — that is how an abandoned `sleep` comes to decide how long
 /// a 2-second probe takes.
+///
+/// The stdio configuration is this function's own: it sets null stdin and piped
+/// stdout/stderr on `command`, overriding whatever the caller set, because
+/// capturing both streams is the whole contract. Callers need not — and should
+/// not — set them.
 ///
 /// `label` names the subject in error messages (e.g. `"process"`,
 /// `"sandbox process"`).
@@ -201,24 +238,51 @@ pub fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) ->
     while !(stdout.is_finished() && stderr.is_finished()) && Instant::now() < drained_by {
         thread::sleep(POLL_INTERVAL.min(DRAIN_GRACE / 4));
     }
-    let (stdout, stdout_failure) = stdout.take();
-    let (stderr, stderr_failure) = stderr.take();
+    assemble_output(
+        status,
+        timed_out,
+        stdout.take(),
+        stderr.take(),
+        label,
+        timeout,
+    )
+}
 
+/// Turn what the wait loop and the two readers produced into the call's result.
+///
+/// Split out from [`run_with_timeout`] because it is the only way to test it.
+/// Every branch here is plain logic over values already in hand — which error
+/// wins, which stream gets quoted — but reaching it through a real child means
+/// making a pipe fail on demand, which needs a kernel having a bad day. Given
+/// the two `(bytes, error)` pairs directly, each branch is an ordinary unit
+/// test; see the cases at the bottom of this file.
+fn assemble_output(
+    status: ExitStatus,
+    timed_out: bool,
+    (stdout, stdout_failure): (Vec<u8>, Option<std::io::Error>),
+    (stderr, stderr_failure): (Vec<u8>, Option<std::io::Error>),
+    label: &str,
+    timeout: Duration,
+) -> Result<Output> {
     if timed_out {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
+        let quoted_stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        let quoted_stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
         // Truncated, not dropped: what the child managed to say before it
         // stalled is usually the whole explanation, and the timeout is named
         // first either way, so a reader who only sees the head still learns
         // which command gave up and why.
+        //
+        // stderr first because that is where a child explains itself; stdout
+        // only as a fallback, since a child whose whole output is data has
+        // nothing else to offer.
         bail!(
             "{label} exceeded {}s timeout: {}",
             timeout.as_secs(),
             truncate_to_chars(
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
+                if !quoted_stderr.is_empty() {
+                    quoted_stderr
+                } else if !quoted_stdout.is_empty() {
+                    quoted_stdout
                 } else {
                     "no output".to_owned()
                 },
@@ -464,6 +528,256 @@ mod tests {
             Some(ErrorKind::BrokenPipe),
             "a read that failed must be reported rather than passed off as EOF"
         );
+    }
+
+    /// A pipe that never ends until the test says so.
+    ///
+    /// Stoppable rather than genuinely endless so the reader thread finishes
+    /// with the test instead of spinning for the life of the test binary.
+    struct EndlessPipe {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Read for EndlessPipe {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.stop.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            // Paced so the test can interleave with the reader rather than
+            // racing a tight loop, and so a regression accumulates a size the
+            // assertion can see without the test allocating gigabytes.
+            thread::sleep(Duration::from_millis(1));
+            let filled = out.len().min(4096);
+            out[..filled].fill(b'x');
+            self.reads.fetch_add(1, Ordering::Release);
+            Ok(filled)
+        }
+    }
+
+    #[test]
+    fn an_abandoned_reader_stops_filling_a_buffer_nobody_will_read() {
+        // The shape this guards: the child exited but a grandchild still holds
+        // the write end, so `DRAIN_GRACE` expires, `take()` hands the caller
+        // what there is and the reader is left running. In `rocmd` — a daemon
+        // that probes amd-smi every 60s and runs MCP captures besides — a
+        // reader that kept appending would grow a `Vec` that nothing will ever
+        // read, for as long as the grandchild lives. There is no way to ask
+        // `run_with_timeout` for that state on demand, so the capture is driven
+        // directly, which is also where the invariant lives.
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture = Capture::draining(Some(EndlessPipe {
+            reads: Arc::clone(&reads),
+            stop: Arc::clone(&stop),
+        }));
+
+        let wait_for_reads = |target: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while reads.load(Ordering::Acquire) < target && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                reads.load(Ordering::Acquire) >= target,
+                "the reader stalled before {target} reads"
+            );
+        };
+
+        wait_for_reads(4);
+        let (bytes, failure) = capture.take();
+        // Establishes that the reader really was accumulating up to this point,
+        // so the emptiness asserted below is the flag working rather than a
+        // reader that never ran.
+        assert!(
+            !bytes.is_empty(),
+            "the reader must collect while someone is still listening"
+        );
+        assert!(failure.is_none(), "{failure:?}");
+
+        // Well past what fits in anything the implementation might buffer
+        // internally: 50 more 4KiB reads is ~200KB, which a regression leaves
+        // sitting in the buffer and a correct implementation discards.
+        wait_for_reads(reads.load(Ordering::Acquire) + 50);
+        let leaked = capture.lock().len();
+        assert_eq!(
+            leaked, 0,
+            "after `take()` nothing will read this buffer again, so a reader that keeps \
+             appending grows it without bound for the life of the daemon; {leaked} bytes \
+             accumulated"
+        );
+
+        stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !capture.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(capture.is_finished(), "the reader never finished");
+    }
+
+    /// A successful `ExitStatus` to feed `assemble_output`.
+    ///
+    /// `ExitStatus` has no portable public constructor; the per-platform
+    /// `ExitStatusExt` is the supported way to make one without spawning a
+    /// process purely to obtain it.
+    fn success_status() -> ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+        ExitStatus::from_raw(0)
+    }
+
+    fn read_failure() -> Option<std::io::Error> {
+        Some(std::io::Error::from(ErrorKind::BrokenPipe))
+    }
+
+    #[test]
+    fn a_read_failure_without_a_timeout_is_reported_rather_than_returned_as_output() {
+        // The silent short read this function exists to prevent: handing back
+        // `Ok` with a truncated buffer sends the caller off to parse half a
+        // JSON document and blame the document.
+        let error = assemble_output(
+            success_status(),
+            false,
+            (b"partial".to_vec(), read_failure()),
+            (Vec::new(), None),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a stream that failed to read must not come back as success");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed to read the output of process"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_failure_on_either_stream_is_reported() {
+        // stdout is checked first, so a stderr-only failure is a separate
+        // branch: `stdout_failure.or(stderr_failure)` reduced to
+        // `stdout_failure` would still pass the case above.
+        let error = assemble_output(
+            success_status(),
+            false,
+            (Vec::new(), None),
+            (b"partial".to_vec(), read_failure()),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a stderr stream that failed to read must not come back as success");
+
+        assert!(
+            format!("{error:#}").contains("failed to read the output of process"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_outranks_a_read_failure() {
+        // Killing the child is what broke the pipe, so a read error here is the
+        // symptom. Reporting it would name the consequence and hide the cause,
+        // and the caller would go looking for a kernel problem.
+        let error = assemble_output(
+            success_status(),
+            true,
+            (Vec::new(), read_failure()),
+            (b"the real explanation".to_vec(), read_failure()),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a timed-out call must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("exceeded 2s timeout"),
+            "the timeout is the cause and must be what is reported: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("the real explanation"),
+            "the child's own account must survive: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("failed to read the output of"),
+            "the read error is downstream of the kill and must not displace it: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_quotes_stderr_in_preference_to_stdout() {
+        let error = assemble_output(
+            success_status(),
+            true,
+            (b"stdout-data".to_vec(), None),
+            (b"stderr-explanation".to_vec(), None),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a timed-out call must fail");
+
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("stderr-explanation"),
+            "stderr is where a child explains itself: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("stdout-data"),
+            "quoting both would push the explanation behind a payload: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_falls_back_to_stdout_and_then_to_saying_there_was_none() {
+        // Every other timeout fixture writes to stderr, so without these two
+        // the fallback chain could be reordered or deleted unnoticed — and a
+        // child whose whole output is stdout is exactly the amd-smi case.
+        let error = assemble_output(
+            success_status(),
+            true,
+            (b"stdout-only".to_vec(), None),
+            (Vec::new(), None),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a timed-out call must fail");
+        assert!(
+            format!("{error:#}").contains("stdout-only"),
+            "a child that only wrote stdout must still be quoted: {error:#}"
+        );
+
+        let error = assemble_output(
+            success_status(),
+            true,
+            (Vec::new(), None),
+            (Vec::new(), None),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect_err("a timed-out call must fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("no output"),
+            "a silent child must say so rather than trailing a bare colon: {rendered:?}"
+        );
+        assert!(rendered.contains("exceeded 2s timeout"), "{rendered:?}");
+    }
+
+    #[test]
+    fn a_clean_run_returns_both_streams() {
+        let output = assemble_output(
+            success_status(),
+            false,
+            (b"out".to_vec(), None),
+            (b"err".to_vec(), None),
+            "process",
+            Duration::from_secs(2),
+        )
+        .expect("a clean run must succeed");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
     }
 
     #[cfg(unix)]

@@ -1334,9 +1334,11 @@ fn write_stub_payload(world: &E2eWorld) -> PathBuf {
 
 /// Install an executable stub `amd-smi` whose script body is `body`.
 ///
-/// The stub answers every probe the snapshot makes (`static` and `monitor`)
-/// with the same script: which probe it is does not matter to a test about
-/// output size, and branching on argv would only add a way to get it wrong.
+/// Most callers give a body that answers every probe the snapshot makes
+/// (`static` and `monitor`) the same way, because which probe it is does not
+/// matter to a test about output size. The exception is the scenario that needs
+/// the two probes to differ, which branches on `$1` — the subcommand, and the
+/// first argument at both call sites in `gather_gpu_snapshot`.
 fn write_amd_smi_stub(world: &E2eWorld, body: &str) {
     let stub = stub_bin_dir(world).join("amd-smi");
     std::fs::write(&stub, format!("#!/bin/sh\n{body}\n"))
@@ -1370,14 +1372,30 @@ async fn stub_amd_smi_that_stalls_after_printing(world: &mut E2eWorld) {
     write_amd_smi_stub(world, &format!("cat {}\nsleep 10", payload.display()));
 }
 
+#[given("amd-smi answers the first probe and then stalls on the second")]
+async fn stub_amd_smi_that_stalls_only_on_monitor(world: &mut E2eWorld) {
+    let payload = write_stub_payload(world);
+    // `gather_gpu_snapshot` runs `static` first and returns at the first probe
+    // that fails, so a stub that stalls on everything never reaches the
+    // `monitor` branch at all. Branching on the subcommand is the only way to
+    // get there: `static` answers normally, `monitor` prints and then stalls
+    // past the 2s probe budget.
+    //
+    // Same short sleep as the stall-everything stub above, and for the same
+    // reason: killing the stub shell does not reliably kill a `sleep` it
+    // forked.
+    write_amd_smi_stub(
+        world,
+        &format!(
+            "if [ \"$1\" = monitor ]; then\n  cat {payload}\n  sleep 10\nelse\n  cat {payload}\nfi",
+            payload = payload.display()
+        ),
+    );
+}
+
 #[when("the daemon gathers a bridge snapshot")]
 async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
-    let rocmd = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
-        panic!(
-            "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \
-             ROCM_CLI_BINARY, provide the matching prebuilt rocmd path explicitly"
-        )
-    });
+    let rocmd = crate::e2e::artifact_steps::rocmd_binary();
 
     let mut command = std::process::Command::new(rocmd);
     command.arg("bridge-snapshot");
@@ -1519,5 +1537,65 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
         length <= MAX_NOTE_CHARS,
         "the note must be bounded before it reaches the bridge snapshot and the automation \
          logs, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
+    );
+}
+
+#[then("the snapshot keeps the first probe's GPUs and explains the second with a bounded timeout")]
+async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no rocmd exit status recorded");
+    let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    assert_eq!(rc, 0, "rocmd bridge-snapshot failed:\n{stdout}\n{stderr}");
+
+    let snapshot: serde_json::Value = serde_json::from_str(stdout)
+        .unwrap_or_else(|error| panic!("bridge-snapshot did not emit JSON: {error}\n{stderr}"));
+    let gpu = &snapshot["gpu"];
+
+    // The distinguishing state of this half of `gather_gpu_snapshot`: the
+    // `static` probe answered, so amd-smi is available and its snapshot is
+    // whole; only `monitor` is missing. Asserting all three together is what
+    // makes this the `monitor` branch rather than examine-21's `static` one.
+    assert_eq!(
+        gpu["amd_smi_available"],
+        serde_json::Value::Bool(true),
+        "the first probe answered in full, so amd-smi is present: {gpu}"
+    );
+    assert_eq!(
+        gpu["static_snapshot"].as_array().map(Vec::len),
+        Some(STUB_GPU_COUNT),
+        "a probe that timed out must not cost the probe that succeeded its result: note={:?}",
+        gpu["note"]
+    );
+    assert_eq!(
+        gpu["monitor_snapshot"],
+        serde_json::Value::Null,
+        "the probe that timed out has no result to report: {gpu}"
+    );
+
+    let note = gpu["note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a degraded snapshot must explain itself: {gpu}"));
+
+    // The `monitor` branch renders `{error:#}` just as the `static` branch
+    // does, and nothing else reaches it. Reverting that one line leaves a note
+    // that names only the launch, so the timeout assertion below is what pins
+    // it.
+    assert!(
+        note.contains("failed to launch amd-smi monitor"),
+        "the note must say which of the two probes gave up: {note:?}"
+    );
+    assert!(
+        note.contains("exceeded 2s timeout"),
+        "the note must name the timeout rather than blaming the launch: {note:?}"
+    );
+    assert!(
+        note.contains("...[truncated]"),
+        "a shortened note must say so, or a reader takes the head for the whole: {note:?}"
+    );
+    let length = note.chars().count();
+    assert!(
+        length <= MAX_NOTE_CHARS,
+        "this note travels to the same automation and audit logs as examine-21's, so it needs \
+         the same bound, but amd-smi's {STUB_GPU_COUNT}-GPU payload produced {length} characters"
     );
 }

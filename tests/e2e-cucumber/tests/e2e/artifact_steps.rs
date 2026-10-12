@@ -42,7 +42,11 @@ fn xtask_command() -> Command {
     }
 }
 
-fn rocmd_binary() -> PathBuf {
+/// Resolve the `rocmd` under test.
+///
+/// `pub(crate)` because `examine_steps`'s bridge-snapshot step needs the same
+/// lookup, and a second copy of it drifted from this one before it was shared.
+pub(crate) fn rocmd_binary() -> PathBuf {
     let configured = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
         panic!(
             "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \

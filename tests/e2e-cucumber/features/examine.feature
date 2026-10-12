@@ -299,8 +299,9 @@ Feature: GPU detection and system inspection
   # A stub `amd-smi` on `PATH` reaches the same code, but only because the step
   # also points `HOME` at the isolated root. `resolve_amd_smi_binary` tries
   # `default_data_dir()/runtimes/registry` and then the home fallbacks, and both
-  # resolve through `runtime_home_dir()` -- the real `$HOME`, not
-  # `ROCM_CLI_DATA_DIR`, which `isolate_env` does not override. Without that
+  # resolve through `runtime_home_dir()` -- the real `$HOME`. `isolate_env` does
+  # set `ROCM_CLI_DATA_DIR`, but that does not redirect any of this:
+  # `default_data_dir()` never reads that variable. Without the overridden
   # `HOME`, a host with a managed SDK under `~/.rocm` would run the real
   # `amd-smi` and this scenario would fail for an unrelated reason.
   # Linux-only because the stub is a shell script.
@@ -332,3 +333,24 @@ Feature: GPU detection and system inspection
     Given amd-smi prints more than a pipe buffer holds and then stalls
     When the daemon gathers a bridge snapshot
     Then the snapshot reports amd-smi as unavailable with a bounded note naming the timeout
+
+  # The snapshot asks amd-smi twice -- `static`, then `monitor` -- and reports
+  # the first failure it meets. examine-21 covers a `static` that stalls, which
+  # returns before `monitor` is ever run; this is the other branch, and it is
+  # the one a real multi-GPU host hits more often, because `monitor -g all`
+  # carries per-GPU telemetry for every device.
+  #
+  # The result is a half-degraded snapshot rather than an absent one: amd-smi
+  # answered, so it is available and its `static` data stands; only the second
+  # probe is missing, and the note is the sole record of why. That note goes to
+  # the same automation and audit logs on the same 60s cycle, so it needs the
+  # same bound and the same account of the cause -- naming the launch alone
+  # would send a reader looking for a missing binary.
+  #
+  # Same stub mechanics and the same `HOME` caveat as examine-20 above, except
+  # that the stub answers the two probes differently.
+  @id:examine-telemetry-note-names-the-stalled-monitor-probe @requires-os:linux
+  Scenario: examine-22 - A stalled monitor probe keeps the static data and explains itself
+    Given amd-smi answers the first probe and then stalls on the second
+    When the daemon gathers a bridge snapshot
+    Then the snapshot keeps the first probe's GPUs and explains the second with a bounded timeout

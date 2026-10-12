@@ -121,11 +121,9 @@ pub(crate) fn gather_gpu_snapshot_for_config(config: &RocmCliConfig) -> CodexBri
 fn capture_amd_smi_json(args: &[&str]) -> Result<Value> {
     let amd_smi_binary = resolve_amd_smi_binary();
     let mut command = ProcessCommand::new(&amd_smi_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // No stdio here: `run_with_timeout` sets null stdin and piped stdout/stderr
+    // itself, since capturing both is its contract.
+    command.args(args);
     let output = rocm_core::process::run_with_timeout(command, AMD_SMI_PROBE_TIMEOUT, "process")
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
@@ -213,14 +211,12 @@ pub(crate) fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
+    // Stdio left to `run_with_timeout`, which sets it itself.
     command
         .args(args)
         .env("ROCM_CLI_CONFIG_DIR", &paths.config_dir)
         .env("ROCM_CLI_DATA_DIR", &paths.data_dir)
-        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("ROCM_CLI_CACHE_DIR", &paths.cache_dir);
     let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {

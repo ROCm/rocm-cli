@@ -12782,11 +12782,8 @@ fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Stdio left to `run_with_timeout`, which sets it itself.
+    command.args(args);
     apply_app_path_env(&mut command, paths);
     let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
