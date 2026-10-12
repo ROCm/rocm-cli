@@ -1812,11 +1812,12 @@ async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
 
 #[then("that serve reaches the engine launch again rather than being refused as already running")]
 async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
-    // The record is written before the engine is spawned, so a launch that dies
-    // leaves one behind. Left claiming the engine + model, it would read as a
-    // live service and the idempotency guard would answer every later serve of
-    // the same pair with the corpse — the user could never retry. Reaching the
-    // engine launch again, and dying there the same way, is the proof it did not.
+    // What the user sees of the retirement: a retry is not refused as already
+    // running, and reaches the engine launch again, dying there the same way.
+    // This is not what proves the record was retired — on Unix the record names
+    // the dead child, so the liveness refresh behind the idempotency guard would
+    // let a retry through even unretired. The `failed` status asserted by the
+    // previous step carries that claim on every lane.
     let output = serve_output(world);
     assert_ne!(
         world.cli_rc,
