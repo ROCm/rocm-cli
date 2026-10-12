@@ -18,11 +18,34 @@
 //! engines like llama-server already use.
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use rocm_core::AppPaths;
 
-use crate::service_launch::write_private_file_0600;
+/// Write `contents` to `path` with owner-only (0600) permissions on Unix so a
+/// secret is not world-readable. On non-Unix, default permissions apply.
+fn write_private_file_0600(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        std::io::Write::write_all(&mut file, contents)?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents)?;
+    }
+    Ok(())
+}
 
 /// Deterministic path of the 0600 endpoint key file for `service_id`.
 ///

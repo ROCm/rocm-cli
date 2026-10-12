@@ -5,12 +5,14 @@
 //! Spawn, attach to, and stream logs from a managed background service
 //! process, plus the endpoint-key/auth checks that gate it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change. This is the
-//! managed-service-spawning tail that was deliberately deferred out of the
-//! Phase 6a (ROCMAI-82) split — `start_managed_service`, `run_attached_service`,
-//! `spawn_managed_engine_child`, `stream_attached_logs`, and the rest of this
-//! file — entangled with still-crate-root launch helpers (`record_cli_audit_event`,
-//! and friends) — this is that later pass (ROCMAI-91, Phase 6b).
+//! Mechanically relocated from `main.rs` with no behavior change. This module
+//! is the managed-service-spawning tail that was deliberately deferred out of
+//! the Phase 6a (ROCMAI-82) split: `start_managed_service`,
+//! `run_attached_service`, `spawn_managed_engine_child`, `stream_attached_logs`,
+//! and the rest of this file. It was entangled with crate-root launch helpers
+//! — `record_cli_audit_event`, `existing_live_managed_service`, and the
+//! service-record-management cluster (stop/restart/remove/prune) — and
+//! separating them out is this later pass (ROCMAI-91, Phase 6b).
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly, and
@@ -18,12 +20,12 @@
 //! subcommand's enum and dispatch function usually do, per
 //! `docs/architecture.md`'s convention note). `record_cli_audit_event`,
 //! `existing_live_managed_service`, and the broader "service record management"
-//! cluster (stop/restart/remove/prune, reached from both `services()` and the
-//! chat/LLM sandbox tool-calling path) stay at the crate root too — reached via
-//! `crate::`, same as other mechanically relocated modules. Several functions
-//! here are `pub(crate)` specifically because `main.rs`, `serve_cmd.rs`,
-//! `automations.rs`, and `endpoint_keys.rs` all call into this cluster across
-//! the new module boundary.
+//! cluster (stop/restart/remove/prune, reached from `services()`; stop/restart
+//! are also reachable from the chat/LLM sandbox tool-calling path) stay at the
+//! crate root too — reached via `crate::`, same as other mechanically relocated
+//! modules. Several functions here are `pub(crate)` specifically because
+//! `main.rs`, `serve_cmd.rs`, and `automations.rs` all call into this cluster
+//! across the new module boundary.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -208,30 +210,6 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
              `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
              ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
         );
-    }
-    Ok(())
-}
-
-/// Write `contents` to `path` with owner-only (0600) permissions on Unix so a
-/// secret is not world-readable. On non-Unix, default permissions apply.
-pub(crate) fn write_private_file_0600(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, contents)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents)?;
     }
     Ok(())
 }

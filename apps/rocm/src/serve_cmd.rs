@@ -12,7 +12,7 @@
 //! is, via `use crate::DevicePolicyArg`.
 //!
 //! `collect_serve_notes` and `validate_pinned_gpu_index` stay in `main.rs`
-//! (no entanglement, but also no other module they belong with yet). The
+//! (no entanglement; a later pass can relocate them). The
 //! managed-service-spawning tail this file calls into — `start_managed_service`,
 //! `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,

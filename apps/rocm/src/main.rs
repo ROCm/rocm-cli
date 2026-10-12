@@ -40,10 +40,15 @@ mod uninstall;
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
 // mergeability); several helpers are re-imported for reasons other than
 // dispatch: `select_serve_engine` because `assess_model_for_host` calls it
-// directly, and `env_root_for_service`, `env_root_for_engine_install`,
+// directly, `env_root_for_service`, `env_root_for_engine_install`,
 // `runtime_manifest_for_selector`, `engine_manages_own_runtime`, and
 // `runtime_key_for_python` because other root-level commands outside
-// `dispatch()` call them directly.
+// `dispatch()` call them directly, `attach_background_stdio`,
+// `detach_background_command`, `managed_engine_startup_failure_detail`, and
+// `managed_service_process_command` because `restart_internal_managed_service`
+// (also outside `dispatch()`) calls them, and
+// `ensure_public_service_has_endpoint_key`/`is_loopback_host` because the
+// loopback/endpoint-key checks below call them directly.
 use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{
