@@ -11400,6 +11400,19 @@ fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<String> {
     if let Some(models_path) = chat_tool_value(tool_text, "models path") {
         lines.push(format!("  Models folder: {models_path}."));
     }
+    // A note about the install itself (an interrupted reinstall, which names
+    // the command that finishes it) comes before the `Running` section, whose
+    // own notes the line above already sums up.
+    for line in tool_text
+        .lines()
+        .take_while(|line| line.trim() != "Running")
+    {
+        if let Some(note) = line.trim().strip_prefix("note:").map(str::trim)
+            && !note.is_empty()
+        {
+            lines.push(format!("  Note: {note}."));
+        }
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
