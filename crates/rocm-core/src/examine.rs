@@ -2825,6 +2825,10 @@ fn filesystem_size(path: &str) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn filesystem_size(_path: &str) -> Option<(u64, u64)> {
     None
 }
