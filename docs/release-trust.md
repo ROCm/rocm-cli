@@ -273,6 +273,62 @@ skew telemetry but cannot select code or redirect a download. The data directory
 already holds the runtime registry and service records, so write access to it
 is already trusted.
 
+## Simulated Host Root
+
+rocm-cli decides what hardware it is running on by reading fixed host paths:
+`/dev/kfd`, the render nodes under `/dev/dri`, `/dev/dxg`, the KFD topology
+under `/sys/class/kfd`, the DRM cards under `/sys/class/drm`,
+`/sys/module/amdgpu` and its `version` file, `/proc/version`, `/proc/cpuinfo`,
+`/proc/meminfo`, `/proc/cmdline`, `/proc/modules`, `/proc/1/cgroup`, the
+container markers `/.dockerenv` and `/run/.containerenv`, the `/etc/os-release`
+behind the distro name `rocm examine` reports, the modprobe configuration
+directories `/etc/modprobe.d`, `/usr/lib/modprobe.d` and `/run/modprobe.d`, the
+WSL plumbing under `/usr/lib/wsl` (the `lib` directory and
+`lib/libdxcore.so`), and the WSL ROCDXG capability check, which looks for
+`lib/librocdxg.so` and `share/rocdxg/dids.conf` under `/opt/rocm` and under each
+discovered ROCm install. The E2E suite can point those reads at a directory it populated with a
+simulated host instead, but only in builds compiled with the `e2e-test-hooks`
+Cargo feature:
+
+```text
+ROCM_CLI_TEST_HOST_ROOT
+```
+
+Same model as the ComfyUI override above: in a build without
+`e2e-test-hooks`, `rocm_core::host_path` is the identity function and never
+reads the environment, so a release build always probes the real machine. The
+re-rooting changes only where the probes read; the CLI still names the logical
+path (`/dev/kfd`) when it reports a device. The dashboard test clock above is
+read from a state file by the same binary that ships, while this seam is
+compiled out; the difference is the one drawn there: the clock can skew
+telemetry but cannot select code or redirect a download, whereas a re-rooted
+hardware probe decides which plan runs against the real machine, so it must not
+exist in a shipped build.
+
+Some reads stay on the real machine even in a hook build:
+
+- ROCm install discovery itself. Which installs exist, and the paths and
+  versions `rocm examine` reports for them, always come from the real host: the
+  CLI prints those paths and can write them into a shell rc file. The one
+  re-rooted read under them is the ROCDXG file check above, which looks for its
+  two files under each discovered install's path inside the simulated root.
+- The `/usr/lib/wsl/lib` loader entry an engine is launched with, and programs
+  the probes execute, such as `ldconfig`.
+- Every package-manager plan, which reads the real `/etc/os-release`: the
+  OpenMPI install hints, and the driver, OpenMPI and runtime-library installs
+  `rocm` runs before serving. Their commands run against the real machine, so a
+  simulated host must not pick the distro they are built for.
+- Process liveness under `/proc/<pid>` and `/dev/shm` sizing. Both describe
+  this process's own environment, not the hardware.
+
+One check is routed but keeps the real device as a veto: the `rocm dash`
+pre-flight that decides whether to start `amd-smi`. Because it gates a real
+process, `amd-smi` runs only when both the real `/dev/kfd` and the simulated
+host's `/dev/kfd` are readable. A simulated host can hide the GPU from the
+dashboard, but cannot start `amd-smi` on a machine without one. On WSL the
+pre-flight still accepts the CLI's GPU-reachability verdict instead of a device
+node, as it always has, so the veto does not apply there.
+
 ## Remaining Owner Step
 
 The repo still needs a real project-owned public signing key and matching
