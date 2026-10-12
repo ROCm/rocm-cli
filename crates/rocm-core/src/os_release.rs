@@ -4,10 +4,8 @@
 
 //! Reading `/etc/os-release`.
 //!
-//! The one parser every reader in the workspace uses — the driver plan, the
-//! package installs it approves (`ensure_openmpi_for_vllm`,
-//! `ensure_torch_runtime_dep`), `rocm examine`, the OpenMPI hint, and the host
-//! distro name — so they cannot read the same file as different distros.
+//! The one parser every reader of the file uses, so no two of them can read
+//! the same file as different distros.
 //!
 //! The reference is a POSIX shell sourcing the file: `os-release(5)` defines the
 //! format as shell-compatible assignments, and the WSL probe in
@@ -16,7 +14,7 @@
 //! > **either the value `sh` would assign, or `None` — never anything else.**
 //!
 //! It returns `sh`'s value for every file made only of blank lines, `#`
-//! comments, and assignments the spec allows:
+//! comments, and assignments the spec allows, with the one exception below:
 //!
 //! * a value bare, in double quotes, or in single quotes;
 //! * inside double quotes, the backslash sequences `\"`, `\\`, `` \` `` and
@@ -27,6 +25,11 @@
 //! * a `#` comment after the value, separated from it by a space or tab;
 //! * an empty value (`ID=`), which assigns the empty string;
 //! * a later assignment replacing an earlier one.
+//!
+//! The exception is a bare value ending in an escaped blank (`K=a\ `, which
+//! `sh` reads as `a `): trailing spaces and tabs are trimmed before the value
+//! is decoded, so the backslash is left dangling and the file is refused. That
+//! is the safe side of the rule, and quoting the value avoids it.
 //!
 //! **Any other line makes the whole file unreadable** — every field is `None`,
 //! not just the one the line names, and [`parse`] reports that line. To `sh`
@@ -40,11 +43,13 @@
 //!
 //! A line other than a blank or a comment is one of those unless it is a valid
 //! shell name, `=`, and a value with none of: an unterminated quote; anything
-//! after a closing quote but spaces, tabs and a `#` comment; a space or tab
-//! between `=` and the value; an unquoted `$` or `` ` ``, anywhere outside
-//! single quotes; in a bare value, any unquoted quote, `;`, `|`, `&`, `<`, `>`,
-//! `(`, `)`, or trailing lone `\`, or a `~` at the start or after a `:` (which
-//! `sh` expands to a home directory); or any control character.
+//! after the value but spaces, tabs and a `#` comment (so `K= x` runs `x`,
+//! while `K= #c` assigns the empty string); an unquoted `$` or `` ` ``,
+//! anywhere outside single quotes; in a bare value, any unquoted quote, `;`,
+//! `|`, `&`, `<`, `>`, `(`, `)`, or trailing lone `\`, or an unescaped `~` at
+//! the start or after an unescaped `:` (which `sh` expands to a home
+//! directory); or any control character other than a tab, C1 controls
+//! included.
 //!
 //! The control-character rule is deliberate rather than an omission, and it is
 //! what a CRLF file trips: `sh` reads `ID=ubuntu\r` as `ubuntu\r`, a value that
@@ -53,8 +58,10 @@
 //! an ordinary character, as it is to `sh`.
 //!
 //! What `None` means downstream: never a plan for a distro the file does not
-//! declare. When the whole file is unreadable, the driver plan and `rocm
-//! examine` say which line, rather than reporting an unsupported distro.
+//! declare. A caller that reports on the file reads it through [`parse`] or
+//! [`id_and_id_like`], so an unreadable file is reported by the line that made
+//! it so rather than as an unsupported distro; [`field`] is for a caller that
+//! only needs the value.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -279,6 +286,8 @@ mod tests {
             "VERSION_ID=\"24$X\"\n",
             "VERSION_ID=24;x\n",
             "VERSION_ID=24>x\n",
+            "VERSION_ID=24<x\n",
+            "VERSION_ID=24)x\n",
             "VERSION_ID=24|x\n",
             "VERSION_ID=24&x\n",
             "VERSION_ID=(24)\n",
@@ -323,6 +332,34 @@ mod tests {
         }
     }
 
+    /// To `sh`, a line whose left-hand side is not a valid name is a command,
+    /// not an assignment, so it makes the whole file unreadable — `ID` below
+    /// it included.
+    #[test]
+    fn a_line_naming_no_valid_variable_makes_the_file_unreadable() {
+        for text in [
+            "1A=x\nID=ubuntu\n",
+            "VERSION-ID=x\nID=ubuntu\n",
+            "=x\nID=ubuntu\n",
+            "I.D=x\nID=ubuntu\n",
+        ] {
+            assert_eq!(field(text, "ID"), None, "{text:?}");
+        }
+        // Underscores and digits after the first character are a valid name.
+        assert_eq!(field("_A1=x\n", "_A1").as_deref(), Some("x"));
+    }
+
+    /// `sh` expands a `~` only where it is unquoted at the start of a bare
+    /// value or right after an unquoted `:`. Anywhere else — after an escaped
+    /// character, or after an escaped `:` — it is an ordinary character.
+    #[test]
+    fn a_tilde_sh_does_not_expand_is_kept() {
+        assert_eq!(field("K=\\a~\n", "K").as_deref(), Some("a~"));
+        assert_eq!(field("K=a\\:~\n", "K").as_deref(), Some("a:~"));
+        assert_eq!(field("K=a~\n", "K").as_deref(), Some("a~"));
+        assert_eq!(field("K=\\~\n", "K").as_deref(), Some("~"));
+    }
+
     /// `\r` is not whitespace to `sh`: `ID=ubuntu\r` assigns `ubuntu\r`, which
     /// matches no distro and would reach a terminal. A control character in a
     /// value therefore makes the file malformed — so a CRLF file reads as
@@ -333,6 +370,10 @@ mod tests {
             "ID=ubuntu\r\nVERSION_ID=24.04\r\n",
             "ID=\"ub\u{1b}[2Kuntu\"\n",
             "ID='ub\u{7}untu'\n",
+            // DEL, and a C1 control (CSI): neither is a blank to `sh`, and a
+            // terminal acts on both.
+            "ID='ub\u{7f}untu'\n",
+            "ID='ub\u{9b}2Juntu'\n",
         ] {
             assert_eq!(field(text, "ID"), None, "{text:?}");
         }
@@ -498,9 +539,10 @@ mod tests {
         }
     }
 
-    /// The parser checked against `sh` itself. Unix-only: there is no POSIX
-    /// shell on a Windows runner, and these would be dead code there.
-    #[cfg(unix)]
+    /// The parser checked against `sh` itself. Linux-only: there is no POSIX
+    /// shell on a Windows runner, and other Unixes are not supported hosts —
+    /// the oracle was verified against `dash` and `bash` only.
+    #[cfg(target_os = "linux")]
     mod sh_oracle {
         use super::*;
         use std::fmt::Write as _;
@@ -518,9 +560,8 @@ mod tests {
         impl ScratchDir {
             fn new(tag: &str) -> Self {
                 let dir = std::env::temp_dir().join(format!(
-                    "rocm-os-release-{tag}-{}-{}",
-                    std::process::id(),
-                    crate::unix_time_millis()
+                    "rocm-os-release-{tag}-{}",
+                    crate::test_support::unique_suffix()
                 ));
                 std::fs::create_dir_all(&dir).unwrap();
                 Self(dir)
@@ -671,6 +712,9 @@ mod tests {
             "a:a",
             r"\~",
             "a~",
+            // Neither `~` follows an unquoted start or an unquoted `:`.
+            r"\a~",
+            r"a\:~",
             "'~'",
             // A `#` comment after a blank ends the value, for every value form;
             // a `#` that does not follow a blank is part of the value.
@@ -731,7 +775,12 @@ mod tests {
         }
 
         /// The files that run a command, checked against `sh` too, for every key
-        /// they mention.
+        /// they mention. A regression guard for the fail-closed rule — that no
+        /// such file reads as a value `sh` does not assign — not coverage of
+        /// which lines count as commands: every case here also passes for a
+        /// parser that refuses everything. The line rules are pinned by
+        /// `a_file_that_runs_a_command_reads_as_absent_throughout` and the
+        /// right-hand-side sweep above.
         #[test]
         fn a_file_that_runs_a_command_never_reads_as_something_sh_does_not_assign() {
             let dir = ScratchDir::new("commands");

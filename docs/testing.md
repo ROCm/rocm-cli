@@ -1440,20 +1440,52 @@ otherwise.
 
 ## /etc/os-release
 
-Every reader of `/etc/os-release` (the driver plan, `rocm examine`, the
-OpenMPI/libatomic/libnuma hints and the host distro name) goes through
-`rocm_core::os_release`, which returns the value `sh` would assign or nothing.
-A line that is not a plain assignment makes the whole file unreadable: the
-driver plan then has policy `unreadable_os_release`, plans no commands, and its
-reason names the line; `rocm examine` leaves the distro empty and records the
-same line in `probe_failures`.
+Every Rust reader of `/etc/os-release` parses it with
+[`os_release.rs`](../crates/rocm-core/src/os_release.rs), which returns the
+value `sh` would assign or nothing: the driver plan
+([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
+libatomic and libnuma install plans `rocm` runs before serving and the hints
+naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
+examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+and the distro name it prints
+([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+`rocm diagnose --distro` run from Windows, which has the WSL distribution's own
+`sh` source the file and reports what it assigned.
+
+A line that is not a plain assignment makes the whole file unreadable, and
+each reader names that line instead of reporting an unknown distro:
+
+- `rocm install driver`: policy `unreadable_os_release`, no commands, and a
+  reason naming the line.
+- The OpenMPI, libatomic and libnuma installs and hints: no commands, and the
+  line ahead of the manual-install advice.
+- `rocm examine`: `distro: Linux (/etc/os-release line N is not a plain
+  assignment: "…")`; with `--json`, also an empty `distro_id` and
+  `distro_version`, the same line in `probe_failures`, and `status: degraded`
+  on an otherwise healthy GPU host.
+
+A CRLF file is unreadable too: `sh` would assign `ubuntu\r`.
 
 ```bash
 cargo test -p rocm-core --lib os_release
+cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
+cargo test -p rocm-core --lib openmpi::tests
 cargo test -p rocm --bin rocm os_release
 ```
 
-The parser tests that compare against `/bin/sh` itself are Unix-only.
+The parser tests that compare against `/bin/sh` itself are Linux-only.
+
+`rocm examine` reads the file through the simulated host root (see Simulated
+Host Root in [release-trust.md](release-trust.md)), so scenarios
+`examine-20` to `examine-22` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[012] '
+```
+
+The install plans deliberately read the real file, so no scenario plants one
+for them; their parsing is covered by the unit tests above.
 
 ## Model Fit Preflight
 

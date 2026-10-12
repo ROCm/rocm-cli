@@ -3068,13 +3068,23 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 mod tests {
     use super::*;
 
+    /// A Linux host with an AMD GPU, so `compute_status` turns on the probe
+    /// failures alone.
+    fn linux_host_with_a_gpu() -> Examination {
+        Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        }
+    }
+
     /// The message and the state it describes, asserted together: an
-    /// unreadable os-release names its line in `probe_failures` *and* leaves
-    /// the distro unreported — and a readable one reports the distro with no
-    /// failure recorded.
+    /// unreadable os-release names its line in `probe_failures`, leaves the
+    /// distro unreported, and makes the examination `degraded` — and a readable
+    /// one reports the distro with no failure recorded and stays `ok`.
     #[test]
     fn an_unreadable_os_release_names_its_line_instead_of_a_distro() {
-        let mut e = Examination::default();
+        let mut e = linux_host_with_a_gpu();
         record_distro(
             &mut e,
             "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
@@ -3088,14 +3098,16 @@ mod tests {
             ]
         );
         assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
 
-        let mut e = Examination::default();
+        let mut e = linux_host_with_a_gpu();
         record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
         assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
         assert_eq!(
             (e.distro_id.as_str(), e.distro_version.as_str()),
             ("ubuntu", "24.04")
         );
+        assert_eq!(e.compute_status(), "ok");
 
         // No file at all is not a failure: there is nothing to fix.
         let mut e = Examination::default();

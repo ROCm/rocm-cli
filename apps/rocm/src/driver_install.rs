@@ -1781,11 +1781,9 @@ mod tests {
 
     /// How a distro quotes its `/etc/os-release` must not change the plan.
     ///
-    /// `os-release(5)` allows single or double quotes, but the parser stripped
-    /// only `"`: `ID='ubuntu'` read as `'ubuntu'` and `VERSION_ID='24.04'` as
-    /// `'24.04'`, so a spec-valid file read as an unsupported distro. Every
-    /// supported distro, rewritten in single quotes, must plan exactly as it
-    /// does in double quotes.
+    /// `os-release(5)` allows single or double quotes, so every supported
+    /// distro, rewritten in single quotes, must plan exactly as it does in
+    /// double quotes.
     #[test]
     fn a_single_quoted_os_release_builds_the_same_plan() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
@@ -1821,8 +1819,8 @@ mod tests {
 
     /// An unreadable os-release is refused as itself: the reason names the
     /// offending line, and it is asserted together with what it claims — no
-    /// plan, no commands — and against the reason it replaced, which blamed the
-    /// distro.
+    /// distro, no commands, nothing that mutates — and against an "unsupported
+    /// distro" reason, which would blame the distro instead.
     #[test]
     fn an_unreadable_os_release_names_its_line_and_plans_nothing() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
@@ -1840,6 +1838,26 @@ mod tests {
         assert!(!plan.supported);
         assert!(plan.commands.is_empty(), "{:?}", plan.commands);
         assert_eq!(plan.policy, "unreadable_os_release");
+        // Nothing about the distro is claimed — not the `ubuntu`, `24.04` or
+        // `noble` the file assigns before the command — and the plan changes
+        // nothing, so it neither mutates nor needs a reboot. The one check it
+        // offers is the command that names the line.
+        assert_eq!(
+            (
+                plan.os_id.as_str(),
+                plan.version_id.as_str(),
+                plan.codename.as_str()
+            ),
+            ("", "", "")
+        );
+        assert!(!plan.mutating);
+        assert!(!plan.reboot_required);
+        assert!(
+            plan.preflight_checks.is_empty(),
+            "{:?}",
+            plan.preflight_checks
+        );
+        assert_eq!(plan.checks, vec!["rocm examine".to_owned()]);
 
         // The rendered plan says so on one line, and does not also claim the
         // distro is unsupported.
@@ -1856,10 +1874,8 @@ mod tests {
     }
 
     /// With a duplicated key, the plan is built from the last assignment — the
-    /// one a shell keeps, and the one `rocm examine` reports, since both now
-    /// read through `rocm_core::os_release`. The driver plan used to take the
-    /// first, so on this file it planned for Debian 12 while `rocm examine`
-    /// reported Ubuntu.
+    /// one a shell keeps, and the one `rocm examine` reports, since both read
+    /// through `rocm_core::os_release`.
     #[test]
     fn a_duplicated_os_release_key_is_planned_from_its_last_assignment() {
         let _env = ScopedTestEnv::with_amd_overrides_cleared();
