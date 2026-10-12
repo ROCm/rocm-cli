@@ -867,7 +867,7 @@ fn wait_for_service_ready(
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     #[test]
     fn a_fresh_runtime_state_records_this_daemons_start_time() {
         // `rocm uninstall` refuses to signal a daemon pid it cannot prove is

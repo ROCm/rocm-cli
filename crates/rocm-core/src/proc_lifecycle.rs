@@ -428,7 +428,15 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
             dwHighDateTime: 0,
         };
         let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        // SAFETY: `handle` is a live process handle opened above and closed below;
+        // the four out-pointers reference initialized FILETIMEs on this stack.
+        let ok = GetProcessTimes(
+            handle,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        );
         CloseHandle(handle);
         if ok == 0 {
             return None;

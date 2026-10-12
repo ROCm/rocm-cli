@@ -4333,6 +4333,14 @@ impl ManagedServiceRecord {
         {
             self.engine_pid = Some(pid);
             self.engine_start_ticks = state.get(ticks_key).and_then(serde_json::Value::as_u64);
+            // An engine that names `server_pid` without its own ticks, but whose
+            // `server_pid` is its launcher `pid`, is identified by `start_ticks`.
+            if self.engine_start_ticks.is_none()
+                && state.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(pid))
+            {
+                self.engine_start_ticks =
+                    state.get("start_ticks").and_then(serde_json::Value::as_u64);
+            }
         }
         // Adopt the engine's inference verification so the CLI side does not
         // re-probe a service the engine healthcheck already confirmed.

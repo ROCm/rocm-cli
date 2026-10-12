@@ -36118,6 +36118,16 @@ install therock";
 
         let mut report = ManagedServiceStopReport::default();
         stop_background_helper_with(&paths, &mut report, |_| {
+            rocm_core::TerminationOutcome::Unverified
+        });
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(
+            report.failed[0].remedy,
+            StopFailureRemedy::ConfirmTheDaemonPid
+        );
+
+        let mut report = ManagedServiceStopReport::default();
+        stop_background_helper_with(&paths, &mut report, |_| {
             rocm_core::TerminationOutcome::Graceful
         });
         assert!(report.failed.is_empty(), "{report:?}");
@@ -36208,6 +36218,43 @@ install therock";
             report.failed[0].remedy,
             StopFailureRemedy::ConfirmTheServicePid
         );
+    }
+
+    #[test]
+    fn the_tickless_pid_advice_names_ids_and_a_manual_action_that_works() {
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![FailedManagedServiceStop {
+                service_id: "svc-tickless".to_owned(),
+                reason: "r".to_owned(),
+                remedy: StopFailureRemedy::ConfirmTheServicePid,
+            }],
+            warnings: Vec::new(),
+            helper_stopped: false,
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert!(message.contains("Stop-Process -Id <pid>"), "{message}");
+        assert!(!message.contains("services remove"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vllm_shaped_record_with_a_distinct_engine_pid_carries_engine_ticks() {
+        let (root, paths) = test_paths("vllm-engine-ticks");
+        let mut record = managed_record_for_pid(&paths, std::process::id(), Some(7));
+        record.engine_pid = None;
+        fs::create_dir_all(&root).unwrap();
+        record.status = "running".to_owned();
+        record.engine_state_path = root.join("engine-state.json");
+        fs::write(
+            &record.engine_state_path,
+            serde_json::json!({"status": "running", "pid": 4242, "server_pid": 4242, "start_ticks": 99}).to_string(),
+        )
+        .unwrap();
+        record.refresh_from_engine_state().unwrap();
+        fs::remove_dir_all(root).ok();
+        assert_eq!(record.engine_pid, Some(4242));
+        assert_eq!(record.engine_start_ticks, Some(99));
     }
 
     #[test]

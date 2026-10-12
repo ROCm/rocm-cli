@@ -93,12 +93,12 @@ impl StopFailureRemedy {
                 ids.join(", ")
             ),
             Self::ConfirmTheServicePid => format!(
-                "The record was written before start times were recorded, so its pid cannot be \
-                 proven to still be the server (the pid may have been reused after a reboot) and \
-                 it was left alone. Check what each pid is ({}): if it is your server, stop it \
-                 yourself, or with `rocm services stop <id> --yes` once you have confirmed it, \
-                 then re-run uninstall; if it is something else, delete the stale record with \
-                 `rocm services remove <id> --yes`.",
+                "No start time was recorded for a live pid of each service listed, so it cannot \
+                 be proven to still be the server (the pid may have been reused after a reboot) \
+                 and it was left alone: {}. Check what those pids are. If one is your server, \
+                 stop it yourself (`kill <pid>` on Linux, `Stop-Process -Id <pid>` on Windows). \
+                 If it is something else, delete the service's record file under the data \
+                 directory's `services` folder by hand. Then re-run uninstall.",
                 ids.join(", ")
             ),
             Self::StopTheDaemon => "The background helper restarts managed services on its own, \
@@ -494,8 +494,7 @@ pub(crate) fn stop_managed_services_with(
         let unprovable: Vec<u32> = entries
             .into_iter()
             .filter(|(pid, ticks)| {
-                record_predates_start_ticks(*ticks)
-                    && rocm_core::process_start_ticks(*pid).is_some()
+                record_predates_start_ticks(*ticks) && rocm_core::process_is_running(*pid)
             })
             .map(|(pid, _)| pid)
             .collect();

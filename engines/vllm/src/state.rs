@@ -145,7 +145,9 @@ pub(crate) fn write_running_state(
             // Kernel start-time of the launcher PID, captured while it is alive.
             // Paired with `pid`, it identifies this exact process across PID
             // recycling so a later stop never signals a reused PID.
-            "start_ticks": rocm_core::process_start_ticks(pid)
+            "start_ticks": rocm_core::process_start_ticks(pid),
+            // `server_pid` is this same process, so the stop path can verify it.
+            "server_start_ticks": rocm_core::process_start_ticks(pid)
         }),
     )
 }
