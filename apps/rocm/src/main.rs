@@ -5232,7 +5232,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     }
     if !yes {
         bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+            service_hints::service_action_hint("remove", service_id)
         );
     }
 
@@ -5248,7 +5249,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
 
@@ -27645,13 +27647,14 @@ install therock";
         // same file's `service_actions_require_yes_and_render_sandbox_result`
         // proves this exact form (`rocm services stop <id> --yes`) is the one
         // the approval gate itself recommends. That running this form actually
-        // stops the service is proven by
-        // `@id:service-stop-yes-stops-a-running-service`
-        // (`tests/e2e-cucumber/features/service_stop.feature`), which plants a
-        // running record and asserts it is left `stopped` — not by
-        // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which
-        // runs this same invocation as best-effort teardown and never asserts
-        // success.
+        // clears *this* refusal — a service reused without the key it is now
+        // being asked to require — is proven by
+        // `@id:serve-require-api-key-refuses-unauthenticated-reuse`
+        // (`tests/e2e-cucumber/features/model_serving.feature`, serve-24),
+        // which reproduces this exact condition, runs the printed hint, and
+        // asserts the record is left `stopped` — not by `stop_managed_services`
+        // in `tests/e2e-cucumber/tests/e2e.rs`, which runs this same
+        // invocation as best-effort teardown and never asserts success.
         assert!(
             message.contains("rocm services stop lemonade-qwen-3000 --yes"),
             "the refusal must name the way out, with the service to stop, directly runnable with --yes: {message}"

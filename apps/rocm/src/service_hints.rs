@@ -5,14 +5,16 @@
 //! The one place every `rocm services <action> <id> --yes` hint is built.
 //!
 //! `main.rs`, `remote/mod.rs`, and `serve_summary.rs` each used to format this
-//! string by hand, and twice that drifted: a hint printed without `--yes` even
-//! though the command it names refuses without it (#417, #601, #604). A
-//! caller that needs this text calls a function here instead of writing
-//! another `format!`.
+//! string by hand, and it drifted: `serve_summary.rs`'s stop row printed the
+//! hint without `--yes`, even though the command it names refuses without it
+//! (#417). A caller that needs this text calls a function here instead of
+//! writing another `format!`.
 
 /// The directly-runnable `rocm services <action> <id> --yes` hint for a local
-/// managed service. `action` is `"stop"` or `"restart"` — whatever
-/// [`crate::service_action_command`] returns for the gate in question.
+/// managed service. `action` is typically `"stop"` or `"restart"` — whatever
+/// [`crate::service_action_command`] returns for the gate in question — but
+/// any `rocm services` subcommand name that takes `--yes` works, e.g.
+/// `"remove"`.
 pub(crate) fn service_action_hint(action: &str, service_id: &str) -> String {
     format!("rocm services {action} {service_id} --yes")
 }

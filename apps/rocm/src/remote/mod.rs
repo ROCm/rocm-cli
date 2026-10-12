@@ -1550,10 +1550,13 @@ mod tests {
         // proves this exact form (`rocm services stop <id> --yes`) is the one
         // the approval gate itself recommends on the local side, and this
         // message tells the user to run the same CLI's own `services stop` on
-        // the remote. That running this form actually stops the service is
-        // proven by `@id:service-stop-yes-stops-a-running-service`
-        // (`tests/e2e-cucumber/features/service_stop.feature`), which plants a
-        // running record and asserts it is left `stopped` — not by
+        // the remote. That running this form actually clears *this* refusal —
+        // a service the remote reused instead of starting fresh — is proven on
+        // the remote's own CLI by
+        // `@id:remote-serve-refuses-reusing-already-serving-session`
+        // (`tests/e2e-cucumber/features/remote.feature`, remote-15), which
+        // reproduces this exact condition over the container, runs the printed
+        // hint there, and asserts the service is actually gone — not by
         // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which
         // runs this same invocation as best-effort teardown and never asserts
         // success.
@@ -2061,9 +2064,10 @@ mod tests {
         assert!(
             transport.calls().iter().any(|call| matches!(
                 call,
-                TransportCall::Exec { command, .. } if command.contains("services stop svc-1")
+                TransportCall::Exec { command, .. } if command.contains("services stop svc-1 --yes")
             )),
-            "the started model should have been stopped: {:?}",
+            "the started model should have been stopped with the same directly-runnable form \
+             the hint prints, --yes included: {:?}",
             transport.calls()
         );
         let _ = std::fs::remove_dir_all(root);
