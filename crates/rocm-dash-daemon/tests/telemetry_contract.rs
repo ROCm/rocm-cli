@@ -102,6 +102,211 @@ use rocm_dash_daemon::bench_ring::BenchRing;
 use rocm_dash_daemon::runner::{self, RunnerOptions};
 use rocm_dash_daemon::snapshot_ring::SnapshotRing;
 
+/// Read-only Lemonade fixture with a mutable health body. The fixture records
+/// unexpected requests, including any attempt to manage or stop the server.
+async fn lemonade_fixture(
+    health: Arc<Mutex<String>>,
+    unexpected: Arc<AtomicU64>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let health = health.clone();
+            let unexpected = unexpected.clone();
+            tokio::spawn(async move {
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..n]);
+                let body = if request.starts_with("GET /api/v1/health ") {
+                    health.lock().unwrap().clone()
+                } else if request.starts_with("GET /api/v1/stats ") {
+                    r#"{"tokens_per_second":42.0}"#.to_string()
+                } else {
+                    unexpected.fetch_add(1, Ordering::Relaxed);
+                    "{}".to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn lemonade_multiple_models_keep_identity_and_do_not_share_last_request_rate() {
+    let health = Arc::new(Mutex::new(r#"{"status":"ok","all_models_loaded":[{"model_name":"Model-A"},{"model_name":"Model-B"},{"model_name":"Model-A"}]}"#.to_string()));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let (port, server) = lemonade_fixture(health.clone(), unexpected.clone()).await;
+    let (tx, mut rx) = broadcast::channel(64);
+    let opts = RunnerOptions {
+        enable_lemonade: true,
+        lemonade_port: port,
+        disable_vllm_metrics: false,
+        discovery_tick: TICK,
+        instance_tick: TICK,
+        ..RunnerOptions::default()
+    };
+    let task = spawn_runner(tx, opts).await;
+    let result = wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2).then(|| snap.instances.clone())
+    })
+    .await;
+    if result.is_err() {
+        task.abort();
+        server.abort();
+    }
+    let rows = result.expect("two deduplicated loaded model rows");
+    assert!(rows.iter().all(|row| row.gen_tps.is_none()));
+    let model_a_id = rows
+        .iter()
+        .find(|row| row.model_name == "Model-A")
+        .unwrap()
+        .container_id
+        .clone();
+    let model_b_id = rows
+        .iter()
+        .find(|row| row.model_name == "Model-B")
+        .unwrap()
+        .container_id
+        .clone();
+    assert_ne!(model_a_id, model_b_id);
+    *health.lock().unwrap() = r#"{"status":"ok","model_loaded":"Model-B","all_models_loaded":[{"model_name":"Model-B"},{"model_name":"Model-A"}]}"#.to_string();
+    wait_for_snapshot(&mut rx, |snap| {
+        let a = snap
+            .instances
+            .iter()
+            .find(|row| row.container_id == model_a_id)?;
+        let b = snap
+            .instances
+            .iter()
+            .find(|row| row.container_id == model_b_id)?;
+        (a.gen_tps.is_none() && b.gen_tps.is_none()).then_some(())
+    })
+    .await
+    .expect("last access is not last request; multiple loaded models have no attributable rate");
+    *health.lock().unwrap() =
+        r#"{"status":"ok","all_models_loaded":[{"model_name":"Model-A"}]}"#.to_string();
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 1
+            && snap.instances[0].container_id == model_a_id
+            && snap.instances[0].gen_tps == Some(42.0))
+        .then_some(())
+    })
+    .await
+    .expect("unloaded model disappears; singleton receives rate");
+    *health.lock().unwrap() =
+        r#"{"status":"ok","model_loaded":"Model-A","all_models_loaded":["Model-A","Model-B"]}"#
+            .to_string();
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2 && snap.instances.iter().all(|row| row.gen_tps.is_none()))
+            .then_some(())
+    })
+    .await
+    .expect("adding another model clears previously attributed rate immediately");
+    *health.lock().unwrap() =
+        r#"{"status":"error","all_models_loaded":["Model-A","Model-B"]}"#.to_string();
+    wait_for_snapshot(&mut rx, |snap| snap.instances.is_empty().then_some(()))
+        .await
+        .expect("non-ok health never remains ready");
+    *health.lock().unwrap() = r#"{"status":"ok","all_models_loaded":["Model-A"]}"#.to_string();
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 1 && snap.instances[0].container_id == model_a_id).then_some(())
+    })
+    .await
+    .expect("healthy recovery restores the same model identity");
+    *health.lock().unwrap() = r#"{"status":"ok","all_models_loaded":[]}"#.to_string();
+    wait_for_snapshot(&mut rx, |snap| snap.instances.is_empty().then_some(()))
+        .await
+        .expect("healthy router without loaded models is not serving");
+    task.abort();
+    server.abort();
+    assert_eq!(
+        unexpected.load(Ordering::Relaxed),
+        0,
+        "only read-only health/stats requests are allowed"
+    );
+}
+
+#[tokio::test]
+async fn lemonade_managed_nondefault_port_scrapes_even_when_external_discovery_disabled() {
+    let health = Arc::new(Mutex::new(
+        r#"{"status":"ok","model_loaded":"Model-A"}"#.to_string(),
+    ));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let (port, server) = lemonade_fixture(health, unexpected.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("managed.json"), format!(r#"{{"service_id":"managed-lemonade","engine":"lemonade","model_ref":"model-alias","canonical_model_id":"Model-A","host":"127.0.0.1","port":{port},"status":"ready"}}"#)).unwrap();
+    let (tx, mut rx) = broadcast::channel(64);
+    let opts = RunnerOptions {
+        services_dir: Some(dir.path().to_path_buf()),
+        enable_lemonade: false,
+        discovery_tick: TICK,
+        instance_tick: TICK,
+        ..RunnerOptions::default()
+    };
+    let task = spawn_runner(tx, opts).await;
+    let result = wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 1
+            && snap.instances[0].container_id == "managed-lemonade"
+            && snap.instances[0].gen_tps == Some(42.0))
+        .then_some(())
+    })
+    .await;
+    task.abort();
+    server.abort();
+    result.expect("managed Lemonade is scraped at its registry port without external discovery");
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn lemonade_external_endpoint_deduplicates_managed_owner_then_reappears_after_record_removal()
+{
+    let health = Arc::new(Mutex::new(r#"{"status":"ok","all_models_loaded":[{"model_name":"Model-A"},{"model_name":"Model-B"}]}"#.to_string()));
+    let unexpected = Arc::new(AtomicU64::new(0));
+    let (port, server) = lemonade_fixture(health, unexpected.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("managed.json");
+    std::fs::write(&record, format!(r#"{{"service_id":"managed-lemonade","engine":"lemonade","model_ref":"Model-A","host":"localhost","port":{port},"status":"ready"}}"#)).unwrap();
+    let (tx, mut rx) = broadcast::channel(64);
+    let opts = RunnerOptions {
+        services_dir: Some(dir.path().to_path_buf()),
+        enable_lemonade: true,
+        lemonade_port: port,
+        discovery_tick: TICK,
+        instance_tick: TICK,
+        ..RunnerOptions::default()
+    };
+    let task = spawn_runner(tx, opts).await;
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 1
+            && snap.instances[0].container_id == "managed-lemonade"
+            && snap.instances[0].gen_tps.is_none())
+        .then_some(())
+    })
+    .await
+    .expect("managed endpoint is not duplicated or assigned ambiguous stats");
+    std::fs::remove_file(record).unwrap();
+    wait_for_snapshot(&mut rx, |snap| {
+        (snap.instances.len() == 2
+            && snap
+                .instances
+                .iter()
+                .all(|row| row.container_id != "managed-lemonade" && row.gen_tps.is_none()))
+        .then_some(())
+    })
+    .await
+    .expect("removing the registry file does not stop an externally reachable server");
+    task.abort();
+    server.abort();
+    assert_eq!(unexpected.load(Ordering::Relaxed), 0);
+}
+
 // ── Timing constants ────────────────────────────────────────────────────────
 
 const TICK: Duration = Duration::from_millis(200);

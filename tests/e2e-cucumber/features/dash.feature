@@ -639,3 +639,48 @@ Feature: Interactive dashboard
     When the user closes the Diagnose screen
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  @id:dash-lemonade-managed-inference-journey @requires-os:linux @requires-gpu @requires-engine:lemonade
+  Scenario: dash-38 - A real managed Lemonade GPU model responds to inference and appears in the dashboard
+    Given the dashboard watches only managed services
+    And a GGUF model is being served on lemonade
+    Then the model responds to inference requests
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the real managed Lemonade model is displayed
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as a managed runtime installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the model responds to inference requests
+
+  @id:dash-lemonade-external-protocol-discovery @requires-os:linux
+  Scenario: dash-39 - External Lemonade protocol discovery displays every loaded model without adopting the service
+    Given an external Lemonade protocol fixture has two loaded models
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both external protocol models are displayed with truthful throughput
+    When the user selects engine status in the Serving view
+    Then Lemonade is shown as externally running without a managed installation
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+    And the external protocol fixture remains alive after dashboard quit
+
+  @id:dash-lemonade-external-protocol-transitions @requires-os:linux
+  Scenario: dash-40 - External Lemonade protocol models disappear on unload and failure and return on reload
+    Given an external Lemonade protocol fixture has two loaded models
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then both external protocol models are displayed with truthful throughput
+    When the external protocol fixture keeps only its first model loaded
+    Then the single external protocol model displays its throughput
+    When the external protocol fixture unloads every model
+    Then neither external protocol model is displayed
+    When the external protocol fixture reloads both models
+    Then both external protocol models are displayed with truthful throughput
+    When the external protocol fixture becomes unreachable
+    Then neither external protocol model is displayed
+    When the user selects engine status in the Serving view
+    Then Serving actions are displayed
+    When the user quits the dashboard
+    Then the dashboard exits successfully

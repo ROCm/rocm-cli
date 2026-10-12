@@ -36,8 +36,6 @@ pub use backend_alignment::LEMONADE_BACKEND_ALIGNMENT_DISABLED_ENV;
 pub(crate) const ENGINE_NAME: &str = "lemonade";
 pub(crate) const DEFAULT_HOST: &str = "127.0.0.1";
 pub(crate) const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507-GGUF";
-pub(crate) const DEFAULT_MODEL_REPO_DIR: &str = "models--unsloth--Qwen3-4B-Instruct-2507-GGUF";
-pub(crate) const DEFAULT_MODEL_GGUF: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
 pub(crate) const LLAMACPP_RECIPE: &str = "llamacpp";
 pub(crate) const ROCM_BACKEND_NAME: &str = "rocm";
 #[cfg(feature = "e2e-test-hooks")]
@@ -454,7 +452,11 @@ fn launch_service(mut request: LaunchRequest) -> Result<LaunchResponse> {
     let endpoint_url = crate::state::endpoint_url(&request.host, request.port);
     let serve_request = ServeHttpRequest {
         service_id: request.service_id.clone(),
-        model_ref: crate::state::resolve_lemonade_model_ref(&request.model_ref),
+        model_ref: if runtime_is_linux() {
+            request.model_ref.clone()
+        } else {
+            crate::state::resolve_lemonade_model_ref(&request.model_ref)
+        },
         host: request.host.clone(),
         port: request.port,
         device_policy: request
@@ -510,27 +512,27 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     process_env.gpu_indices = request.gpu_indices.clone();
     let log_path = request.log_path.as_deref();
     crate::state::write_running_state(&request, &runtime, std::process::id(), None, "starting")?;
-    // A canonical Hugging Face checkpoint (owner/repo:variant) cannot be served under its
-    // exact name through Lemonade's model router (Lemonade renames registered models and
-    // its registry has several naming quirks). Download the GGUF and run a packaged
-    // llama-server on it directly with `--alias`, which serves it under exactly that name.
-    if let Some(checkpoint) = crate::direct_llama::parse_hf_checkpoint(&request.model_ref) {
-        return crate::direct_llama::serve_hf_checkpoint(
-            &request,
-            &runtime,
-            &process_env,
-            log_path,
-            &checkpoint,
-        );
-    }
-    if runtime_is_linux()
-        && let Some(server) = crate::direct_llama::find_llama_server_binary(&runtime.manifest)
+    let paths = AppPaths::discover()?;
+    let direct_model = if runtime_is_linux()
+        || crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some()
     {
-        crate::direct_llama::ensure_direct_llama_model_available(
+        crate::direct_llama::resolve_direct_llama_model(&runtime.manifest, &request.model_ref)?
+    } else {
+        None
+    };
+    // Only models with a validated direct GGUF resolution bypass the router.
+    // Recipe-backed/non-GGUF names must use Lemonade rather than substitute a model.
+    if (runtime_is_linux()
+        || crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some())
+        && let Some(model) = direct_model.as_ref()
+        && let Some(server) = crate::direct_llama::direct_serve_binary(&runtime.manifest)
+    {
+        let model_path = crate::direct_llama::ensure_direct_llama_model_available(
             &request,
             &runtime,
             &process_env,
             log_path,
+            model,
         )?;
         let backend = crate::direct_llama::llama_server_backend_label(&server);
         return crate::process::serve_direct_llama_server(
@@ -538,10 +540,20 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
             &runtime,
             &process_env,
             &server,
+            &model_path,
             log_path,
-            &anyhow!("using Lemonade packaged {backend} llama-server directly on Linux"),
+            &anyhow!("using Lemonade packaged {backend} llama-server directly"),
         );
     }
+    if crate::direct_llama::parse_hf_checkpoint(&request.model_ref).is_some() {
+        bail!(
+            "no selected GPU llama-server backend `{}` is installed under {} for direct serving of `{}`",
+            runtime.manifest.backend_name,
+            runtime.manifest.runtime_dir.display(),
+            request.model_ref
+        );
+    }
+    let router_model_ref = crate::state::resolve_lemonade_model_ref(&request.model_ref);
     let mut child = crate::process::spawn_lemond(
         &runtime.manifest,
         &request.host,
@@ -577,7 +589,7 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         &runtime.manifest,
         &request.host,
         request.port,
-        &request.model_ref,
+        &router_model_ref,
         &backend,
         request.engine_recipe.as_ref(),
         log_path,
@@ -586,32 +598,21 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
     let router_ready = load_result.is_ok()
         && crate::process::query_loaded_model_endpoint(
             &crate::state::endpoint_url(&request.host, request.port),
-            &request.model_ref,
+            &router_model_ref,
             &backend,
         )
         .unwrap_or(false)
         && crate::process::query_chat_smoke_endpoint(
             &request.host,
             request.port,
-            &request.model_ref,
+            &router_model_ref,
         )
         .unwrap_or(false);
     if let Err(error) = load_result {
-        if runtime_is_linux()
-            && let Some(direct_server) =
-                crate::direct_llama::find_llama_server_binary(&runtime.manifest)
-        {
-            let _ = crate::state::terminate_pid(child.id(), true);
-            let _ = child.wait();
-            return crate::process::serve_direct_llama_server(
-                &request,
-                &runtime,
-                &process_env,
-                &direct_server,
-                log_path,
-                &error,
-            );
-        }
+        // A load failure is not a router compatibility failure. Preserve it rather
+        // than masking it with direct serving of a cached model.
+        let _ = crate::state::terminate_pid(child.id(), true);
+        let _ = child.wait();
         return Err(error).with_context(|| {
             format!(
                 "failed to load {} with Lemonade {LLAMACPP_RECIPE}:{backend}",
@@ -623,17 +624,19 @@ fn serve_http(mut request: ServeHttpRequest) -> Result<()> {
         let error = anyhow!(
             "Lemonade load completed but the endpoint did not report a {LLAMACPP_RECIPE}:{backend}-loaded model"
         );
+        let _ = crate::state::terminate_pid(child.id(), true);
+        let _ = child.wait();
         if runtime_is_linux()
-            && let Some(direct_server) =
-                crate::direct_llama::find_llama_server_binary(&runtime.manifest)
+            && let Some(model) = direct_model.as_ref()
+            && let Some(model_path) = crate::direct_llama::direct_llama_model_path(&paths, model)?
+            && let Some(direct_server) = crate::direct_llama::direct_serve_binary(&runtime.manifest)
         {
-            let _ = crate::state::terminate_pid(child.id(), true);
-            let _ = child.wait();
             return crate::process::serve_direct_llama_server(
                 &request,
                 &runtime,
                 &process_env,
                 &direct_server,
+                &model_path,
                 log_path,
                 &error,
             );

@@ -636,6 +636,10 @@ rocm logs --search error timeout")]
         status: bool,
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
+    ///
+    /// Discovers loaded models from local Lemonade at 127.0.0.1:13305 by default.
+    /// Configure dashboard.daemon.enable_lemonade, lemonade_host, and lemonade_port
+    /// in config.json. Discovery is read-only: quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]

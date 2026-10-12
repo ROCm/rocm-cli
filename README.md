@@ -230,6 +230,19 @@ Live mode reads telemetry over a Unix domain socket, so it requires Linux or
 WSL2. Use `rocm dash --demo` for a synthetic session that runs anywhere without a
 GPU or daemon.
 
+On Linux and WSL, the embedded daemon also discovers loaded models from a
+separately running local Lemonade server at `127.0.0.1:13305`. Configure
+`dashboard.daemon.lemonade_host` and `dashboard.daemon.lemonade_port` in
+`config.json` for another endpoint, or set `dashboard.daemon.enable_lemonade`
+to `false` to disable external discovery. A healthy server with no loaded models
+does not count as a running model. Discovery does not register an external server
+as a managed service or give ROCm CLI ownership of its process.
+
+The engine pane distinguishes a ROCm CLI-managed Lemonade installation from an
+externally running server. When installation detection is unavailable, it shows
+an unchecked status rather than claiming Lemonade is not installed. Installation
+status does not depend on GPU telemetry.
+
 ## Configure ROCm and serve a model
 
 Before serving a model, check whether a managed ROCm runtime is already
@@ -818,7 +831,12 @@ can:
 Which model form to pass depends on the engine your GPU selects. The Lemonade
 engine (Ryzen AI or Radeon) serves llama.cpp **GGUF** models. Pass a GGUF repo
 with an explicit quantization variant, for example,
-`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`.
+`rocm serve unsloth/Qwen3-0.6B-GGUF:Q4_0`. Lemonade also accepts registered
+GGUF names such as `Qwen3-0.6B-GGUF`, or the `qwen-smoke` alias. Direct serving
+resolves their checkpoint and quantization from the installed Lemonade catalog
+and uses the selected GPU backend, including Vulkan when that is the supported
+backend. It does not substitute the default model or select a stale ROCm
+backend merely because its binary is still on disk.
 
 The vLLM engine (Instinct) serves
 **safetensors** repos, such as `rocm serve Qwen/Qwen2.5-1.5B-Instruct`.

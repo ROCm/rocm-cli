@@ -9,6 +9,7 @@ pub mod fixture_binary;
 pub mod harness_diagnostics;
 pub mod http_server;
 pub mod installer_fixture;
+pub mod lemonade_protocol;
 pub mod loopback_http;
 pub mod mock_server;
 pub mod model_id;

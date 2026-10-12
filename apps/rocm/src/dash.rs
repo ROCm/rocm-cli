@@ -58,10 +58,11 @@ pub fn runner_options(
         instance_tick: Duration::from_secs_f64(d.instance_tick_secs),
         disable_vllm_metrics: false,
         vllm_metrics_host: "127.0.0.1".into(),
-        // Lemonade discovery stays opt-in (mirrors a no-flag embedded daemon).
-        enable_lemonade: false,
-        lemonade_host: "127.0.0.1".into(),
-        lemonade_port: 13305,
+        // Read-only discovery of local external Lemonade; managed registry
+        // discovery remains independent of this switch.
+        enable_lemonade: d.enable_lemonade,
+        lemonade_host: d.lemonade_host.clone(),
+        lemonade_port: d.lemonade_port,
         persist_dir: Some(paths.telemetry_state_dir()),
         // D7 seam consumer: managed services from `rocm serve --managed`.
         services_dir: Some(paths.services_dir()),
@@ -256,6 +257,19 @@ fn automation_summaries(config: &RocmCliConfig) -> Vec<AutomationSummary> {
         .collect()
 }
 
+/// Read-only managed-engine inventory, independent of GPU telemetry and
+/// endpoint liveness. An unavailable detect response means unknown, not absent.
+fn lemonade_managed_installed(paths: &AppPaths) -> Option<bool> {
+    let detect = crate::engine_request::<_, rocm_engine_protocol::DetectResponse>(
+        Some(paths),
+        "lemonade",
+        rocm_engine_protocol::EngineMethod::Detect,
+        &rocm_engine_protocol::DetectRequest::default(),
+    )
+    .ok()?;
+    Some(detect.installed && detect.managed_env == Some(true))
+}
+
 /// Resolve the TUI args from the unified config + environment.
 ///
 /// MUST be called on a synchronous thread *before* any tokio runtime is entered:
@@ -326,6 +340,7 @@ pub fn resolved_args(
         // `resolved_args` itself has no opinion, so this always starts `false`
         // here.
         launcher_hosted: false,
+        lemonade_managed_installed: lemonade_managed_installed(paths),
     }
 }
 
@@ -1076,6 +1091,26 @@ async fn maybe_spawn_embedded_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lemonade_discovery_defaults_and_overrides_reach_daemon() {
+        let default = runner_options(&RocmCliConfig::default(), &paths(), false);
+        assert!(default.enable_lemonade);
+        assert_eq!(default.lemonade_host, "127.0.0.1");
+        assert_eq!(default.lemonade_port, 13305);
+        let config: RocmCliConfig = serde_json::from_str(
+            r#"{
+            "dashboard": {"daemon": {"enable_lemonade": false,
+                "lemonade_host": "localhost", "lemonade_port": 14567}}
+        }"#,
+        )
+        .unwrap();
+        let overridden = runner_options(&config, &paths(), false);
+        assert!(!overridden.enable_lemonade);
+        assert_eq!(overridden.lemonade_host, "localhost");
+        assert_eq!(overridden.lemonade_port, 14567);
+        assert_eq!(overridden.services_dir, Some(paths().services_dir()));
+    }
 
     fn cfg() -> RocmCliConfig {
         RocmCliConfig::default()

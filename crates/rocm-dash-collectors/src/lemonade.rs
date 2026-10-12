@@ -9,7 +9,8 @@
 //!   `time_to_first_token`, `tokens_per_second`, `input_tokens`, `output_tokens`,
 //!   `prompt_tokens`, `decode_token_times[]`. (No KV-cache / running / waiting —
 //!   Lemonade does not expose those; those `InstanceSample` fields stay `None`.)
-//! - `GET /api/v1/health` → `status` + `model_loaded` (most-recent model name).
+//! - `GET /api/v1/health` → `status` + `all_models_loaded`. Legacy servers
+//!   report only `model_loaded` (most recent access, including load/inference).
 //!
 //! The parsers (`parse_stats`, `parse_health_model`) are **pure** (serde only)
 //! and the deterministic, fixture-tested anchor. The async scrape
@@ -51,13 +52,74 @@ pub struct LemonadeStats {
     pub decode_token_times: Option<Vec<f64>>,
 }
 
-/// `/api/v1/health` response — liveness + the most-recently-loaded model name.
+/// Lemonade health response. `all_models_loaded`, when present, is the
+/// authoritative loaded set. Older servers report only `model_loaded`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LemonadeHealth {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub model_loaded: Option<String>,
+    #[serde(default)]
+    pub all_models_loaded: Option<Vec<serde_json::Value>>,
+}
+
+impl LemonadeHealth {
+    /// Sorted, deduplicated loaded model names, only from a healthy response.
+    /// An empty router is healthy but does not constitute a serving model.
+    pub fn loaded_models(&self) -> Vec<String> {
+        if self.status.as_deref() != Some("ok") {
+            return Vec::new();
+        }
+        let names: Vec<&str> = match &self.all_models_loaded {
+            Some(models) => models
+                .iter()
+                .filter_map(|model| {
+                    model.as_str().or_else(|| {
+                        ["model_name", "id", "name"]
+                            .into_iter()
+                            .filter_map(|field| {
+                                model.get(field).and_then(serde_json::Value::as_str)
+                            })
+                            .find(|name| !name.trim().is_empty())
+                    })
+                })
+                .collect(),
+            None => self.model_loaded.as_deref().into_iter().collect(),
+        };
+        names
+            .into_iter()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Singleton attribution for server-global last-request stats. Health's
+    /// `model_loaded` means last access (load OR inference), not last request,
+    /// so it cannot disambiguate multiple loaded models. A conflicting explicit
+    /// name also rejects the singleton fallback.
+    pub fn stats_model(&self) -> Option<String> {
+        let loaded = self.loaded_models();
+        if loaded.len() != 1 {
+            return None;
+        }
+        if let Some(last) = self
+            .model_loaded
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return loaded.into_iter().find(|name| name == last);
+        }
+        if loaded.len() == 1 {
+            loaded.into_iter().next()
+        } else {
+            None
+        }
+    }
 }
 
 /// PURE: parse a `/api/v1/stats` body into an [`InstanceSample`].
@@ -89,11 +151,23 @@ pub fn parse_stats_struct(body: &str) -> LemonadeStats {
     object_or_default(body)
 }
 
-/// PURE: extract the loaded model name from a `/api/v1/health` body, if present
-/// and non-empty. Malformed JSON → `None`, never panics.
+/// PURE: parse a health body, rejecting invalid/wrong-shape input to default.
+pub fn parse_health(body: &str) -> LemonadeHealth {
+    let Ok(value @ serde_json::Value::Object(_)) = serde_json::from_str(body) else {
+        return LemonadeHealth::default();
+    };
+    if value
+        .get("all_models_loaded")
+        .is_some_and(|models| !models.is_array())
+    {
+        return LemonadeHealth::default();
+    }
+    serde_json::from_value(value).unwrap_or_default()
+}
+
+/// PURE: first loaded model from a valid healthy response, for legacy callers.
 pub fn parse_health_model(body: &str) -> Option<String> {
-    let health: LemonadeHealth = object_or_default(body);
-    health.model_loaded.filter(|s| !s.is_empty())
+    parse_health(body).loaded_models().into_iter().next()
 }
 
 /// Deserialize a JSON **object** body into `T`, returning `T::default()` for any
@@ -115,16 +189,25 @@ pub fn lemonade_container_id(host: &str, port: u16) -> String {
     format!("lemonade-{host}-{port}")
 }
 
-/// PURE: build a `DiscoveredService` for a Lemonade endpoint. Lemonade is a
-/// single local server (no tensor-parallel sharding metadata), so TP = 1.
+/// A model identity within an external endpoint. Encoding the model's UTF-8
+/// bytes avoids separator collisions and keeps identity stable across reorder.
+pub fn lemonade_model_id(host: &str, port: u16, model_name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut id = format!("{}-model-", lemonade_container_id(host, port));
+    for byte in model_name.as_bytes() {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+/// PURE: build metadata for an external loaded model.
 ///
-/// Every call site only constructs this after `/api/v1/health` has already
-/// answered (see `LemonadeCollector::discover`), so a successfully-built
-/// service is by definition reachable and serving — mark it `Ready` rather
-/// than the generic `Running`.
+/// Callers must establish healthy loaded-model evidence first; answering HTTP
+/// alone is insufficient.
+/// An empty name is Unknown, never Ready. Lemonade exposes no TP metadata.
 pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredService {
     DiscoveredService {
-        container_id: lemonade_container_id(host, port),
+        container_id: lemonade_model_id(host, port, model_name),
         container_name: "lemonade".to_string(),
         model_name: if model_name.is_empty() {
             "lemonade".to_string()
@@ -133,7 +216,11 @@ pub fn lemonade_service(host: &str, port: u16, model_name: &str) -> DiscoveredSe
         },
         port: Some(port),
         tensor_parallel_size: 1,
-        status: rocm_dash_core::metrics::InstanceStatus::Ready,
+        status: if model_name.trim().is_empty() {
+            rocm_dash_core::metrics::InstanceStatus::Unknown
+        } else {
+            rocm_dash_core::metrics::InstanceStatus::Ready
+        },
         ..Default::default()
     }
 }
@@ -172,17 +259,35 @@ impl LemonadeCollector {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}:{}{path}", self.host, self.port)
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("http://{host}:{}{path}", self.port)
     }
 
     async fn get_text(&self, path: &str) -> Result<String> {
         let url = self.url(path);
-        let resp = self
+        let mut resp = self
             .client
             .get(&url)
             .send()
             .await
             .map_err(|e| CollectorError::Transport(format!("GET {url}: {e}")))?;
+        // Router versions expose either /api/v1 or /v1. Only a missing route
+        // warrants compatibility fallback, never an authentication or health
+        // failure. This does not add a llama-server metrics protocol.
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            && let Some(legacy_path) = path.strip_prefix("/api")
+        {
+            resp = self
+                .client
+                .get(self.url(legacy_path))
+                .send()
+                .await
+                .map_err(|e| CollectorError::Transport(format!("GET {legacy_path}: {e}")))?;
+        }
         if !resp.status().is_success() {
             return Err(CollectorError::Transport(format!(
                 "GET {url}: status {}",
@@ -199,25 +304,35 @@ impl LemonadeCollector {
         Ok(parse_stats(&self.get_text(LEMONADE_STATS_PATH).await?))
     }
 
-    /// Scrape `/api/v1/health` → the loaded model name (if any).
-    pub async fn fetch_health_model(&self) -> Result<Option<String>> {
-        Ok(parse_health_model(
-            &self.get_text(LEMONADE_HEALTH_PATH).await?,
-        ))
+    /// Fetch the health payload. Invalid payloads carry no loaded models.
+    pub async fn fetch_health(&self) -> Result<LemonadeHealth> {
+        Ok(parse_health(&self.get_text(LEMONADE_HEALTH_PATH).await?))
     }
 
-    /// Probe the endpoint: if `/api/v1/health` answers, return a `DiscoveredService`
-    /// for it (model name from health, falling back to "lemonade"); otherwise
-    /// `None` (endpoint absent/unreachable) — a clean no-op, no panic.
+    /// First loaded model for compatibility callers.
+    pub async fn fetch_health_model(&self) -> Result<Option<String>> {
+        Ok(self
+            .fetch_health()
+            .await?
+            .loaded_models()
+            .into_iter()
+            .next())
+    }
+
+    /// Discover every healthy loaded model; empty/unhealthy/unreachable → no rows.
+    pub async fn discover_models(&self) -> Vec<DiscoveredService> {
+        self.fetch_health()
+            .await
+            .unwrap_or_default()
+            .loaded_models()
+            .iter()
+            .map(|model| lemonade_service(&self.host, self.port, model))
+            .collect()
+    }
+
+    /// First loaded row for compatibility callers. The runner uses all rows.
     pub async fn discover(&self) -> Option<DiscoveredService> {
-        match self.fetch_health_model().await {
-            Ok(model) => Some(lemonade_service(
-                &self.host,
-                self.port,
-                model.as_deref().unwrap_or(""),
-            )),
-            Err(_) => None,
-        }
+        self.discover_models().await.into_iter().next()
     }
 }
 
@@ -240,8 +355,76 @@ mod tests {
         "status": "ok",
         "version": "9.3.3",
         "model_loaded": "Llama-3.2-1B-Instruct-Hybrid",
-        "all_models_loaded": []
+        "all_models_loaded": [{"model_name":"Llama-3.2-1B-Instruct-Hybrid"}]
     }"#;
+
+    #[test]
+    fn loaded_set_and_stats_attribution_are_conservative() {
+        let health = parse_health(
+            r#"{"status":"ok","all_models_loaded":[" Model-B ",{"id":"Model-A"},{"name":"Model-B"},{"model_name":"","id":"Model-C"},null,7,{}]}"#,
+        );
+        assert_eq!(health.loaded_models(), ["Model-A", "Model-B", "Model-C"]);
+        assert_eq!(health.stats_model(), None);
+        let health = parse_health(
+            r#"{"status":"ok","model_loaded":"Model-B","all_models_loaded":["Model-A","Model-B"]}"#,
+        );
+        assert_eq!(
+            health.stats_model(),
+            None,
+            "last access can be a load, not a request"
+        );
+        for body in [
+            r#"{"status":"ok","all_models_loaded":["Model-A"]}"#,
+            r#"{"status":"ok","model_loaded":"Model-A"}"#,
+        ] {
+            assert_eq!(parse_health(body).stats_model().as_deref(), Some("Model-A"));
+        }
+        assert_eq!(
+            parse_health(
+                r#"{"status":"ok","model_loaded":"Model-B","all_models_loaded":["Model-A"]}"#
+            )
+            .stats_model(),
+            None
+        );
+        for body in [
+            r#"{"status":"ok","all_models_loaded":{},"model_loaded":"Model-A"}"#,
+            r#"{"status":"bad","model_loaded":"Model-A"}"#,
+            r#"{"model_loaded":"Model-A"}"#,
+        ] {
+            assert!(parse_health(body).loaded_models().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn health_http_failure_never_falls_back_to_successful_route() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for status in [401, 403, 500, 503] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/health"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"status":"ok","model_loaded":"Model-A"}"#),
+                )
+                .expect(0)
+                .mount(&server)
+                .await;
+            let collector = LemonadeCollector::new(
+                "127.0.0.1",
+                server.address().port(),
+                Duration::from_secs(1),
+            );
+            assert!(collector.discover_models().await.is_empty());
+            server.verify().await;
+        }
+    }
 
     #[test]
     fn parse_stats_maps_tokens_per_second_to_gen_tps() {
@@ -299,13 +482,84 @@ mod tests {
         let inst = lemonade_instance("127.0.0.1", LEMONADE_PORT, &model, STATS_FIXTURE);
         assert_eq!(inst.model_name, "Llama-3.2-1B-Instruct-Hybrid");
         assert_eq!(inst.container_name, "lemonade");
-        assert_eq!(inst.container_id, "lemonade-127.0.0.1-13305");
+        assert_eq!(
+            inst.container_id,
+            lemonade_model_id("127.0.0.1", 13305, &model)
+        );
         assert_eq!(inst.port, Some(13305));
         assert_eq!(inst.gen_tps, Some(33.33));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
         // Lemonade exposes no KV/req metrics → those stay None on the Instance.
         assert_eq!(inst.kv_cache_usage_pct, None);
         assert_eq!(inst.running_reqs, None);
+    }
+
+    #[tokio::test]
+    async fn discovery_rejects_invalid_health_and_healthy_empty_router() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        for body in [
+            "not json",
+            "{}",
+            "[]",
+            "null",
+            r#"{"status":"error","model_loaded":"Model-A"}"#,
+            r#"{"status":"ok","all_models_loaded":[]}"#,
+            r#"{"status":"ok","all_models_loaded":[],"model_loaded":"Old-Model"}"#,
+            r#"{"status":"ok","model_loaded":"   "}"#,
+        ] {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LEMONADE_HEALTH_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            assert!(
+                collector.discover().await.is_none(),
+                "health {body:?} must not advertise a serving model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_recognizes_modern_loaded_model_without_legacy_field() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(LEMONADE_HEALTH_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"ok","all_models_loaded":[{"model_name":"Model-A"}]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        assert_eq!(collector.discover().await.unwrap().model_name, "Model-A");
+    }
+
+    #[tokio::test]
+    async fn discovery_accepts_v1_health_only_when_api_prefix_is_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"status":"ok","model_loaded":"Model-A"}"#),
+            )
+            .mount(&server)
+            .await;
+        let collector =
+            LemonadeCollector::new("127.0.0.1", server.address().port(), Duration::from_secs(1));
+        assert_eq!(collector.discover().await.unwrap().model_name, "Model-A");
     }
 
     #[tokio::test]

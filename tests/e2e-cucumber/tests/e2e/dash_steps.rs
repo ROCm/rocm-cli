@@ -52,6 +52,216 @@ const fn session(world: &mut E2eWorld) -> &mut TuiSession {
         .expect("no interactive TUI session is open for this scenario")
 }
 
+// This is a protocol contract journey: CLI, embedded daemon and TUI are real;
+// the HTTP service is a named protocol fixture, not GPU inference.
+const PROTOCOL_MODELS: [&str; 2] = ["Protocol-Qwen-4B", "Protocol-Phi-3B"];
+
+#[given("an external Lemonade protocol fixture has two loaded models")]
+async fn external_lemonade_protocol(world: &mut E2eWorld) {
+    let server = e2e_cucumber::lemonade_protocol::LemonadeProtocolServer::start(&PROTOCOL_MODELS);
+    configure_lemonade_discovery(world, server.port());
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    assert!(
+        !root.join("data/services").exists(),
+        "no managed service may be planted"
+    );
+    world.lemonade_protocol = Some(server);
+}
+
+fn configure_lemonade_discovery(world: &E2eWorld, port: u16) {
+    // Exercise serde defaults: enable_lemonade and lemonade_host are omitted.
+    // Socket isolation comes from the PTY driver's HOME/XDG environment.
+    write_dashboard_config(
+        world,
+        serde_json::json!({
+            "dashboard": { "daemon": { "lemonade_port": port,
+                "discovery_tick_secs": 0.1, "instance_tick_secs": 0.1 } }
+        }),
+    );
+}
+
+#[given("the dashboard watches only managed services")]
+async fn dashboard_managed_only(world: &mut E2eWorld) {
+    // An unrelated live endpoint on the default port must not supply the
+    // model or external-running status in this real managed-service journey.
+    write_dashboard_config(
+        world,
+        serde_json::json!({"dashboard": {"daemon": {"enable_lemonade": false}}}),
+    );
+}
+
+fn write_dashboard_config(world: &E2eWorld, config: serde_json::Value) {
+    let root = world.isolated_root.as_ref().expect("isolated root").path();
+    let dir = root.join("config");
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&config).expect("serialize config"),
+    )
+    .expect("write config");
+}
+
+#[then("both external protocol models are displayed with truthful throughput")]
+async fn external_models_visible(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "both protocol models, with unknown unattributable throughput",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|model| {
+                    screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, model) == Some("—"))
+                })
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("external models should be discovered");
+}
+
+fn protocol_tps_cell<'a>(line: &'a str, model: &str) -> Option<&'a str> {
+    let mut cells = line.split_whitespace().skip_while(|cell| *cell != model);
+    cells.next()?;
+    cells.next()
+}
+
+#[when("the external protocol fixture keeps only its first model loaded")]
+async fn external_single_model(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS[..1]);
+}
+
+#[then("the single external protocol model displays its throughput")]
+async fn external_single_model_rate(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "single protocol model with unambiguous throughput",
+            |screen| {
+                !screen.contains(PROTOCOL_MODELS[1])
+                    && screen
+                        .lines()
+                        .any(|line| protocol_tps_cell(line, PROTOCOL_MODELS[0]) == Some("38"))
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("single loaded model owns endpoint stats");
+}
+
+#[when("the external protocol fixture unloads every model")]
+async fn external_unload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&[]);
+}
+
+#[then("neither external protocol model is displayed")]
+async fn external_models_absent(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "unloaded external models disappear",
+            |screen| {
+                PROTOCOL_MODELS.iter().all(|m| !screen.contains(m))
+                    && screen.contains("no serving models discovered")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("stale external models must disappear");
+}
+
+#[when("the external protocol fixture reloads both models")]
+async fn external_reload(world: &mut E2eWorld) {
+    world
+        .lemonade_protocol
+        .as_ref()
+        .expect("fixture")
+        .set_loaded(&PROTOCOL_MODELS);
+}
+
+#[when("the external protocol fixture becomes unreachable")]
+async fn external_unreachable(world: &mut E2eWorld) {
+    drop(world.lemonade_protocol.take());
+}
+
+#[then("the external protocol fixture remains alive after dashboard quit")]
+async fn external_survives_quit(world: &mut E2eWorld) {
+    let fixture = world.lemonade_protocol.as_ref().expect("fixture");
+    let response = reqwest::get(format!("{}/api/v1/health", fixture.base_url()))
+        .await
+        .expect("dashboard quit must leave external service alive");
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.expect("health JSON");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(
+        body["all_models_loaded"].as_array().expect("models").len(),
+        2
+    );
+    let services = world
+        .isolated_root
+        .as_ref()
+        .expect("root")
+        .path()
+        .join("data/services");
+    assert!(
+        !services.exists()
+            || std::fs::read_dir(services)
+                .expect("services")
+                .next()
+                .is_none(),
+        "discovery must not adopt an external fixture as a managed service"
+    );
+}
+
+#[when("the user selects engine status in the Serving view")]
+async fn engine_status_pane(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.use_detail_size().expect("enlarge dashboard");
+    tui.send_until("3", "● Serving", default_timeout())
+        .await
+        .expect("Serving view");
+    tui.send("gj").expect("select Engines action");
+}
+
+#[then("Lemonade is shown as externally running without a managed installation")]
+async fn external_installation_truth(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen_where(
+            "external versus managed engine state",
+            |screen| {
+                screen.contains("Lemonade — externally running")
+                    && screen.contains("Managed runtime — not installed")
+            },
+            default_timeout(),
+        )
+        .await
+        .expect("engine status must distinguish external service and managed install");
+}
+
+#[then("the real managed Lemonade model is displayed")]
+async fn real_lemonade_visible(world: &mut E2eWorld) {
+    // The preceding real inference assertion identifies this scenario's model.
+    // Direct llama-server need not expose Lemonade stats: missing throughput is
+    // truthful and must not cause us to invent a rate to satisfy this journey.
+    session(world)
+        .wait_for_screen("Qwen3-0.6B", default_timeout())
+        .await
+        .expect("dashboard must display this scenario's real served model");
+}
+
+#[then("Lemonade is shown as a managed runtime installation")]
+async fn real_lemonade_installed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Lemonade — managed runtime installed", default_timeout())
+        .await
+        .expect("managed engine Detect evidence must reach dashboard");
+}
+
 // ── Given ──────────────────────────────────────────────────────────
 
 #[given("interactive chat uses an offline assistant")]

@@ -17,7 +17,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use crate::backend_alignment::LemonadeRuntime;
-use crate::direct_llama::{direct_llama_model_path, llama_server_backend_label};
+use crate::direct_llama::llama_server_backend_label;
 use crate::install::LemonadeInstallManifest;
 use crate::runtime_dir::{ParentRuntimeEnvironment, child_runtime_dir_var};
 use crate::state::{
@@ -440,21 +440,23 @@ pub(crate) fn run_lemonade_model_load(
 /// GGUF file, exposing the model under `request.model_ref` via `--alias`. This is how
 /// a canonical Hugging Face name is served under exactly that name — Lemonade's router
 /// renames registered models, but an llama-server alias is a free-form string.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_direct_llama_server(
     request: &ServeHttpRequest,
     runtime: &LemonadeRuntime,
     process_env: &LemonadeProcessEnvironment,
     server: &Path,
+    model_path: &Path,
     log_path: Option<&Path>,
     reason: &anyhow::Error,
 ) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let model_path = direct_llama_model_path(&paths, &request.model_ref).with_context(|| {
-        format!(
-            "Lemonade downloaded model `{}` was not found for direct serving",
-            request.model_ref
-        )
-    })?;
+    if !model_path.is_file() {
+        bail!(
+            "GGUF for `{}` is missing at {}",
+            request.model_ref,
+            model_path.display()
+        );
+    }
     if !server.is_file() {
         bail!("Lemonade llama-server is missing at {}", server.display());
     }
@@ -484,22 +486,7 @@ pub(crate) fn serve_direct_llama_server(
         push_existing_path(&mut direct_env.library_entries, server_dir.to_path_buf());
     }
 
-    let mut command = ProcessCommand::new(server);
-    command
-        .arg("-m")
-        .arg(&model_path)
-        .arg("--host")
-        .arg(&request.host)
-        .arg("--port")
-        .arg(request.port.to_string())
-        .arg("--n-gpu-layers")
-        .arg("999")
-        .arg("--alias")
-        .arg(&request.model_ref)
-        .stdin(Stdio::null());
-    if let Some(engine_recipe) = request.engine_recipe.as_ref() {
-        command.args(&engine_recipe.required_flags);
-    }
+    let mut command = direct_llama_server_command(request, server, model_path);
     // Packaged llama-server is raw llama.cpp — it does not read `LEMONADE_API_KEY`.
     // When `rocm serve` protects a public endpoint, hand llama-server the *existing*
     // CLI-managed 0600 key file via `--api-key-file` (a path, not the value, so the
@@ -589,6 +576,30 @@ pub(crate) fn serve_direct_llama_server(
     }
 }
 
+fn direct_llama_server_command(
+    request: &ServeHttpRequest,
+    server: &Path,
+    model_path: &Path,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(server);
+    command
+        .arg("-m")
+        .arg(model_path)
+        .arg("--host")
+        .arg(&request.host)
+        .arg("--port")
+        .arg(request.port.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--alias")
+        .arg(&request.model_ref)
+        .stdin(Stdio::null());
+    if let Some(recipe) = request.engine_recipe.as_ref() {
+        command.args(&recipe.required_flags);
+    }
+    command
+}
+
 fn wait_for_openai_models_ready(
     host: &str,
     port: u16,
@@ -636,7 +647,7 @@ fn models_payload_has_loaded_model(value: &Value, model_ref: &str) -> bool {
                 ["id", "model", "name"]
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(Value::as_str))
-                    .any(|loaded| model_names_match(loaded, model_ref))
+                    .any(|loaded| loaded == model_ref)
             })
         })
 }
@@ -827,6 +838,75 @@ mod tests {
         assert!(!models_payload_has_ready_model(
             &registered,
             "Qwen3-0.6B-GGUF",
+            "vulkan"
+        ));
+    }
+
+    #[test]
+    fn serving_direct_command_preserves_alias_model_path_and_gpu_backend() {
+        let request = ServeHttpRequest {
+            service_id: "test".to_owned(),
+            model_ref: "qwen-smoke".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11435,
+            device_policy: rocm_engine_protocol::DevicePolicy::GpuRequired,
+            gpu_indices: vec![0],
+            runtime_id: None,
+            env_id: None,
+            state_path: PathBuf::from("test-state"),
+            log_path: None,
+            engine_recipe: Some(EngineRecipeHint {
+                required_flags: vec!["--ctx-size".to_owned(), "8192".to_owned()],
+                ..EngineRecipeHint::default()
+            }),
+        };
+        let server = Path::new("runtime/bin/llamacpp/vulkan/llama-build/llama-server");
+        let model = Path::new("cache/model-Q4_0.gguf");
+        let command = direct_llama_server_command(&request, server, model);
+        assert_eq!(command.get_program(), server.as_os_str());
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "-m",
+                "cache/model-Q4_0.gguf",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "11435",
+                "--n-gpu-layers",
+                "999",
+                "--alias",
+                "qwen-smoke",
+                "--ctx-size",
+                "8192"
+            ]
+        );
+        assert_eq!(llama_server_backend_label(server), "vulkan");
+        assert!(
+            parse_models_ready(r#"{"data":[{"id":"qwen-smoke"}]}"#, &request.model_ref).unwrap()
+        );
+        assert!(
+            !parse_models_ready(r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#, &request.model_ref)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn serving_regression_direct_readiness_requires_requested_alias() {
+        assert!(parse_models_ready(r#"{"data":[{"id":"qwen-smoke"}]}"#, "qwen-smoke").unwrap());
+        assert!(
+            !parse_models_ready(r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#, "qwen-smoke").unwrap()
+        );
+        // The router deliberately normalizes known aliases, unlike direct serving.
+        assert!(models_payload_has_ready_model(
+            &json!({"data": [{
+                "id": "Qwen3-0.6B-GGUF", "recipe_options": {"llamacpp_backend": "vulkan"}
+            }]}),
+            "qwen-smoke",
             "vulkan"
         ));
     }
