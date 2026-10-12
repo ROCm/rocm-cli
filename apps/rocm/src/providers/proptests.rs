@@ -6,8 +6,8 @@
 //!
 //! Each property re-frames one of the SSE bodies the unit tests in
 //! `providers.rs` already use (plus the same shape with CRLF line endings and
-//! multi-byte UTF-8 content): it re-chunks it, truncates it, or interrupts its
-//! reads. None of them generates SSE text from scratch.
+//! multi-byte UTF-8 content): it re-chunks it, truncates it, stalls it, or
+//! interrupts its reads. None of them generates SSE text from scratch.
 
 use super::*;
 use proptest::prelude::*;
@@ -127,6 +127,20 @@ impl Read for InterruptingReader {
     }
 }
 
+/// A reader that returns `bytes` and then fails every later read with
+/// `ErrorKind::TimedOut` — an engine that stalled mid-answer without closing the
+/// connection, as the socket's receive timeout reports it.
+struct StallsAfter(Cursor<Vec<u8>>);
+
+impl Read for StallsAfter {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.read(buf)? {
+            0 if !buf.is_empty() => Err(std::io::Error::from(ErrorKind::TimedOut)),
+            read => Ok(read),
+        }
+    }
+}
+
 /// A reader whose first `read` fails with `ErrorKind::Interrupted`.
 struct FirstCallInterrupted(Cursor<Vec<u8>>, bool);
 
@@ -150,6 +164,26 @@ fn chunked_events<R: BufRead>(reader: &mut R) -> Result<Vec<ProviderStreamEvent>
     read_chunked_sse_body(reader, &mut emitter)?;
     emitter.finish()?;
     Ok(events)
+}
+
+/// Read `body` through the same framing dispatch the live client uses, with
+/// `headers` choosing the framing.
+fn framed_events<R: BufRead>(reader: &mut R, headers: &str) -> Result<Vec<ProviderStreamEvent>> {
+    let mut events = Vec::new();
+    let mut on_event = |event: ProviderStreamEvent| {
+        events.push(event);
+        Ok(())
+    };
+    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
+    read_sse_body(reader, headers, &mut emitter)?;
+    emitter.finish()?;
+    Ok(events)
+}
+
+const CHUNKED_HEADERS: &str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+fn content_length_headers(length: usize) -> String {
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n")
 }
 
 fn close_delimited_events<R: Read>(reader: &mut R) -> Result<Vec<ProviderStreamEvent>> {
@@ -216,6 +250,58 @@ proptest! {
         let mut reader = BufReader::new(EofSpinGuard::new(wire[..cut].to_vec()));
         let error = chunked_events(&mut reader).unwrap_err();
         prop_assert_eq!(error.to_string(), LOCAL_STREAM_TRUNCATED);
+    }
+
+    /// A `Content-Length` body cut short ends with the same error as a chunked
+    /// one, wherever the cut lands.
+    #[test]
+    fn fixed_length_reader_fails_on_a_truncated_body(
+        fixture in 0..OPENAI_FIXTURES.len(),
+        cut in any::<usize>(),
+    ) {
+        let body = OPENAI_FIXTURES[fixture].as_bytes();
+        let cut = cut % body.len();
+        let mut reader = BufReader::new(EofSpinGuard::new(body[..cut].to_vec()));
+        let result = framed_events(&mut reader, &content_length_headers(body.len()));
+        prop_assert!(result.is_err(), "truncated at {} of {} finished cleanly", cut, body.len());
+        prop_assert_eq!(result.unwrap_err().to_string(), LOCAL_STREAM_TRUNCATED);
+    }
+
+    /// Only an end-of-stream is reported as the engine closing the connection.
+    /// A stream that stalls until the read times out, in either framing and
+    /// wherever the stall lands, fails with the timeout and without the
+    /// truncation message.
+    #[test]
+    fn a_stalled_stream_is_not_reported_as_a_closed_one(
+        fixture in 0..OPENAI_FIXTURES.len(),
+        offsets in prop::collection::vec(any::<usize>(), 0..32),
+        cut in any::<usize>(),
+    ) {
+        let body = OPENAI_FIXTURES[fixture].as_bytes();
+        let (wire, _) = chunk_encode(body, &offsets);
+        // Stall anywhere before the terminating chunk's trailer, whose read
+        // error the chunked reader deliberately ignores.
+        let chunked_cut = cut % (wire.len() - "\r\n".len());
+        let fixed_cut = cut % body.len();
+        for (headers, bytes) in [
+            (CHUNKED_HEADERS.to_owned(), wire[..chunked_cut].to_vec()),
+            (content_length_headers(body.len()), body[..fixed_cut].to_vec()),
+        ] {
+            let mut reader = BufReader::new(StallsAfter(Cursor::new(bytes)));
+            let error = framed_events(&mut reader, &headers)
+                .expect_err("a stalled stream is not a success");
+            let timed_out = error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == ErrorKind::TimedOut)
+            });
+            prop_assert!(timed_out, "lost the timeout: {:#}", error);
+            prop_assert!(
+                !format!("{error:#}").contains(LOCAL_STREAM_TRUNCATED),
+                "a stall was reported as a closed connection: {:#}",
+                error
+            );
+        }
     }
 
     /// A transient `Interrupted` read is retried, not surfaced as a failed

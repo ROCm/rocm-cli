@@ -662,21 +662,36 @@ fn stream_json_from_local_endpoint(
         bail!("local provider returned {status_line}");
     }
 
-    let transfer_encoding = header_value(&headers, "Transfer-Encoding");
-    let chunked = transfer_encoding
-        .as_deref()
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let content_length = header_value(&headers, "Content-Length")
-        .and_then(|value| value.trim().parse::<usize>().ok());
     let mut emitter = OpenAiSseEmitter::new(on_event);
-    if chunked {
-        read_chunked_sse_body(&mut reader, &mut emitter)?;
-    } else if let Some(length) = content_length {
-        read_fixed_sse_body(&mut reader, length, &mut emitter)?;
-    } else {
-        read_close_delimited_sse_body(&mut reader, &mut emitter)?;
-    }
+    read_sse_body(&mut reader, &headers, &mut emitter)?;
     emitter.finish()
+}
+
+/// Read a streamed response body in whichever framing `headers` declare:
+/// chunked, `Content-Length`, or delimited by the connection closing.
+fn read_sse_body<R: BufRead>(
+    reader: &mut R,
+    headers: &str,
+    emitter: &mut OpenAiSseEmitter<'_>,
+) -> Result<()> {
+    let chunked = header_value(headers, "Transfer-Encoding")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
+    let content_length = header_value(headers, "Content-Length")
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    if chunked {
+        read_chunked_sse_body(reader, emitter)
+    } else if let Some(length) = content_length {
+        read_fixed_sse_body(reader, length, emitter).map_err(body_truncated_at_eof)
+    } else {
+        // For this framing the connection closing *is* the end of the body, so
+        // end-of-stream is success here and the transport cannot tell a
+        // finished answer from one cut off mid-way. That asymmetry with the
+        // two framings above is deliberate: the only signal left is whether
+        // `data: [DONE]` arrived, and `OpenAiSseEmitter::finish` does not
+        // require it for any framing today. Making it required is a protocol
+        // policy for every engine, not a transport fix.
+        read_close_delimited_sse_body(reader, emitter)
+    }
 }
 
 fn header_value(headers: &str, name: &str) -> Option<String> {
@@ -726,12 +741,15 @@ fn read_close_delimited_sse_body<R: Read>(
     }
 }
 
-const LOCAL_STREAM_TRUNCATED: &str = "local provider closed the connection before the final chunk; \
-     the streamed response is incomplete";
+const LOCAL_STREAM_TRUNCATED: &str = "local provider closed the connection before the streamed response finished; \
+     the response is incomplete";
 
-/// Report an end-of-stream inside a chunk (its size line, data or CRLF) the
-/// same way as one between chunks: either way the engine went away mid-answer.
-fn chunked_body_truncated_at_eof(error: anyhow::Error) -> anyhow::Error {
+/// Report an end-of-stream before a body's declared end — inside a chunk (its
+/// size line, data or CRLF) or short of its `Content-Length` — the same way as
+/// one between chunks: either way the engine went away mid-answer. Any other
+/// error (a read timeout, a reset connection, a malformed line) passes through
+/// unchanged, so it is not mislabelled as the engine closing the connection.
+fn body_truncated_at_eof(error: anyhow::Error) -> anyhow::Error {
     let at_eof = error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
@@ -776,12 +794,12 @@ fn read_chunked_sse_body<R: BufRead>(
             let _ = reader.read_line(&mut trailer);
             break;
         }
-        read_fixed_sse_body(reader, size, emitter).map_err(chunked_body_truncated_at_eof)?;
+        read_fixed_sse_body(reader, size, emitter).map_err(body_truncated_at_eof)?;
         let mut crlf = [0_u8; 2];
         reader
             .read_exact(&mut crlf)
             .context("failed to read local provider chunk terminator")
-            .map_err(chunked_body_truncated_at_eof)?;
+            .map_err(body_truncated_at_eof)?;
         if crlf != *b"\r\n" {
             bail!("invalid local provider chunk terminator");
         }
@@ -2776,6 +2794,24 @@ mod tests {
     /// test run; a fixed reader returns as soon as it reads EOF.
     const TRUNCATED_STREAM_BOUND: Duration = Duration::from_secs(10);
 
+    /// The test server's result, waiting at most `TRUNCATED_STREAM_BOUND` for
+    /// it. The server blocks in `accept` with no timeout, so a plain `join`
+    /// hangs whenever the client returned without connecting (say, it no
+    /// longer resolved the ready service); this turns that into a failure
+    /// that names it. The bound only bites in that case: the server returns
+    /// as soon as it has written its response, before the client reads EOF.
+    fn served_request_within_bound(server: thread::JoinHandle<Result<String>>) -> Result<String> {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(server.join());
+        });
+        match receiver.recv_timeout(TRUNCATED_STREAM_BOUND) {
+            Ok(Ok(served)) => served,
+            Ok(Err(_)) => bail!("the test server thread panicked"),
+            Err(_) => bail!("the client returned without ever sending the chat request"),
+        }
+    }
+
     #[test]
     fn local_provider_stream_chat_fails_when_engine_dies_mid_chunked_stream() -> Result<()> {
         let (root, paths, server) =
@@ -2805,18 +2841,17 @@ mod tests {
             let _ = sender.send((result.map_err(|error| format!("{error:#}")), received));
         });
         let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        if outcome.is_ok() {
-            // Joined only after the client returned: the server blocks in
-            // `accept` with no timeout, so a client that never connected would
-            // otherwise hang the test instead of failing it.
-            server.join().expect("server thread should not panic")?;
-        }
+        let served = served_request_within_bound(server);
         let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
         fs::remove_dir_all(root).ok();
 
+        // A regressed (spinning) client thread cannot be stopped from here; it
+        // keeps spinning until the test binary exits. Under nextest, which CI
+        // uses on Linux, that is this test's own process.
         let (result, received) = outcome.map_err(|_| {
             anyhow::anyhow!("chat stream never returned after the engine closed the connection")
         })?;
+        served?;
         let error = result.expect_err("a stream cut off before its final chunk is not a success");
         assert!(
             error.contains(LOCAL_STREAM_TRUNCATED),
@@ -2851,10 +2886,7 @@ mod tests {
             let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
         });
         let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        if outcome.is_ok() {
-            // See the chat-stream test above for why this joins only now.
-            server.join().expect("server thread should not panic")?;
-        }
+        let served = served_request_within_bound(server);
         fs::remove_dir_all(root).ok();
 
         let metrics = outcome.map_err(|_| {
@@ -2862,6 +2894,10 @@ mod tests {
                 "the serve smoke test never returned after the engine closed the connection"
             )
         })?;
+        // Empty metrics are also what a smoke test that never reached the
+        // engine returns, so this is what makes the assertion below mean
+        // "the engine died mid-answer" rather than "nothing happened".
+        served?;
         assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
         let rendered =
             crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {
