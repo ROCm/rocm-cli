@@ -333,9 +333,11 @@ Feature: Interactive dashboard
   # process's working directory, so a scenario could never drive a
   # folder-browser flow (here, onboarding's Adopt existing) into a
   # scenario-chosen path. This proves `TuiSession::spawn_in` actually threads
-  # that cwd into the live child by asserting the real folder browser opens
-  # rooted at it — using a directory name with a space, the motivating case
-  # for #501.
+  # that cwd into the live child: it plants a child directory with a space in
+  # its name (the motivating case for #501) under the scenario's cwd, and
+  # asserts the real folder browser lists it — a fixed-length entry label, not
+  # the host-length-dependent full path the browser's header would otherwise
+  # show (and could silently clip).
   @id:dash-onboarding-adopt-honors-spawn-cwd @requires-os:linux
   Scenario: dash-25 - Adopt existing opens the folder browser rooted at the session's own working directory
     When the user opens the dashboard in a scenario-owned folder

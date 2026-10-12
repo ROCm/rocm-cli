@@ -9,7 +9,6 @@
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -135,26 +134,34 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
-/// The scenario-owned directory `dash-25` spawns `dash` into, and later
-/// re-derives to assert against — a space in the name is the motivating case
-/// for #501 (the harness previously could not land the spawned process in a
-/// path the folder browser would navigate for a scenario to assert against).
-fn adopt_scenario_folder(world: &E2eWorld) -> PathBuf {
-    world
+/// The name of a child directory `dash-25` plants under the scenario's cwd,
+/// and later asserts the folder browser lists — a space in the name is the
+/// motivating case for #501 (the harness previously could not land the
+/// spawned process in a path a scenario controls). The browser's entry list
+/// labels children by `file_name()` alone (`build_entries` in
+/// `folder_browser.rs`), not their full path, so asserting on this fixed,
+/// short label stays robust however long the host's own temp directory is —
+/// unlike the folder browser's *header* line, which renders `current_dir`
+/// verbatim in an unwrapped `Paragraph` and would silently clip (and falsely
+/// fail this scenario) on a long enough temp path. The header's actual width
+/// varies with the PTY geometry in effect when the browser opens (this
+/// scenario's own `open_observe_view` step resizes it before onboarding
+/// starts), so no single column count is safe to assume here.
+const ADOPT_SCENARIO_CHILD: &str = "adopt me";
+
+#[when("the user opens the dashboard in a scenario-owned folder")]
+async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
+    let root = world
         .isolated_root
         .as_ref()
         .expect("no isolated root")
         .path()
-        .join("adopt me")
-}
-
-#[when("the user opens the dashboard in a scenario-owned folder")]
-async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
-    let dir = adopt_scenario_folder(world);
-    std::fs::create_dir_all(&dir)
-        .unwrap_or_else(|e| panic!("failed to create scenario-owned folder {dir:?}: {e}"));
-    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &dir)
-        .unwrap_or_else(|e| panic!("failed to open the dashboard in {dir:?}: {e}"));
+        .to_path_buf();
+    let child = root.join(ADOPT_SCENARIO_CHILD);
+    std::fs::create_dir_all(&child)
+        .unwrap_or_else(|e| panic!("failed to create scenario-owned folder {child:?}: {e}"));
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {root:?}: {e}"));
     world.tui = Some(session);
 }
 
@@ -1157,11 +1164,14 @@ async fn install_folder_browser_displayed(world: &mut E2eWorld) {
 
 #[then("the existing-folder browser shows the scenario-owned folder")]
 async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
-    // The browser's header renders `current_dir` verbatim
-    // (`draw_folder_browser`), which is itself seeded from
-    // `std::env::current_dir()` — so this marker is only reachable if
-    // `spawn_in` actually set the child's working directory to our folder.
-    let marker = adopt_scenario_folder(world).display().to_string();
+    // The browser lists `ADOPT_SCENARIO_CHILD` as a child entry only if it's
+    // browsing our scenario's own cwd (seeded from `std::env::current_dir()`
+    // in `onboarding.rs`'s `AdoptExisting` arm) — so this is only reachable if
+    // `spawn_in` actually set the child process's working directory to our
+    // scenario root, exactly as the full path would prove, but without
+    // depending on the host's temp-directory length (see
+    // `ADOPT_SCENARIO_CHILD`'s doc comment).
+    let marker = format!("{ADOPT_SCENARIO_CHILD}/");
     session(world)
         .wait_for_screen(&marker, default_timeout())
         .await
