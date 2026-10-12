@@ -36,6 +36,21 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 ```{include} ../../wsl.md
 :start-after: "## Diagnosing A WSL Host"
 :relative-docs: rocm-docs/
+:end-before: "To inspect a distro without installing anything in it"
+```
+
+<!-- The prose below is a deliberate copy of the docs/wsl.md sentence, with the
+     cross-reference retargeted to this site. Its last line is reused as the
+     `:start-after:` anchor for the next include, which also matches the
+     original sentence in docs/wsl.md; edit both together. -->
+To inspect a distro without installing anything in it, install ROCm CLI on
+Windows (see the Windows steps in the
+[installation guide](installation.md#windows-x86_64-powershell))
+and run this from PowerShell:
+
+```{include} ../../wsl.md
+:start-after: "and run this from PowerShell:"
+:relative-docs: rocm-docs/
 :end-before: "## What `rocm examine` Reports On WSL"
 ```
 
