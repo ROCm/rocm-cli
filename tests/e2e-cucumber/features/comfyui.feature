@@ -129,4 +129,4 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
     Then the ComfyUI install succeeds
     And ComfyUI's dependencies were installed into the runtime
     And the runtime's torch stack is unchanged
-    And no CUDA nvidia packages were added to the runtime
+    And no nvidia-* packages were added to the runtime

@@ -599,13 +599,10 @@ fn sole_runtime_python(world: &E2eWorld) -> PathBuf {
 }
 
 /// The runtime's interpreter, expected exactly at `<install_root>/bin/python`
-/// (`Scripts/python.exe` on Windows): the product creates the venv at `install_root`.
+/// (the scenario is native-Linux only): the product creates the venv at `install_root`.
 /// No fallback search, so a missing interpreter is reported rather than replaced by
 /// an unrelated one.
 fn find_venv_python(root: &Path) -> Option<PathBuf> {
-    #[cfg(windows)]
-    let candidate = root.join("Scripts").join("python.exe");
-    #[cfg(not(windows))]
     let candidate = root.join("bin").join("python");
     candidate.is_file().then_some(candidate)
 }
@@ -819,7 +816,7 @@ async fn assert_torch_unchanged(world: &mut E2eWorld) {
     );
 }
 
-#[then("no CUDA nvidia packages were added to the runtime")]
+#[then("no nvidia-* packages were added to the runtime")]
 async fn assert_no_nvidia_packages(world: &mut E2eWorld) {
     let python = sole_runtime_python(world);
     let nvidia = nvidia_distributions(&python);
