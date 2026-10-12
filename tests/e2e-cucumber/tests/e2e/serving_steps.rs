@@ -1721,14 +1721,20 @@ const MANAGED_ENGINE_STARTUP_FAILURE_ENV: &str = "ROCM_E2E_MANAGED_ENGINE_STARTU
 #[then("serving fails and names the engine's own log")]
 async fn assert_startup_death_names_log(world: &mut E2eWorld) {
     let output = serve_output(world);
+    // A binary built without `rocm/e2e-test-hooks` never arms the scripted death:
+    // on a GPU lane it launches a real engine, which this exit-code check is the
+    // first to notice — so it names the feature as the likely cause.
     assert_ne!(
         world.cli_rc,
         Some(0),
-        "an engine that died at startup must fail the serve:\n{output}"
+        "an engine that died at startup must fail the serve (if it did not die at \
+         all, check the binary under test was built with `rocm/e2e-test-hooks`):\n{output}"
     );
     // See the note in assert_lemonade_preparation_retry_is_bounded: the seam that
     // scripts the death also waives the no-GPU pre-flight, so this refusal can
-    // only appear when the binary under test was built without the feature.
+    // only appear when the binary under test was built without the feature. That
+    // diagnosis is specific to a host with no usable GPU, where the pre-flight is
+    // what stops such a binary.
     assert!(
         !output.contains("no usable AMD GPU detected"),
         "serve stopped at the no-GPU pre-flight, so the binary under test was \
@@ -1758,12 +1764,15 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         .path()
         .join("data")
         .join("services");
-    let log_paths: Vec<String> = std::fs::read_dir(&services)
+    let records: Vec<serde_json::Value> = std::fs::read_dir(&services)
         .unwrap_or_else(|e| panic!("no services dir at {}: {e}", services.display()))
         .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
         .filter_map(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
         .filter(|record| record["engine"] == "lemonade")
-        .filter_map(|record| record["log_path"].as_str().map(str::to_owned))
+        .collect();
+    let log_paths: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["log_path"].as_str())
         .collect();
     assert!(
         !log_paths.is_empty(),
@@ -1771,34 +1780,47 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         services.display()
     );
     assert!(
-        log_paths.iter().any(|path| output.contains(path.as_str())),
+        log_paths.iter().any(|path| output.contains(path)),
         "expected the failure to name the engine's own service log {log_paths:?}:\n{output}"
+    );
+    // Read raw from disk, not through `rocm services`, whose liveness refresh
+    // would rewrite the very status pinned here. On Unix the record already names
+    // the (dead) child before the startup check, so a refresh would demote an
+    // unretired record to `stopped` and let a retry through anyway — only the
+    // status the launch itself wrote tells a retired record from a forgotten one.
+    let statuses: Vec<&str> = records
+        .iter()
+        .filter_map(|record| record["status"].as_str())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["failed"],
+        "the failed launch must retire its record as `failed`, not leave it claiming \
+         the engine and model"
     );
 }
 
-#[then("the failed launch does not block the next serve")]
-async fn assert_failed_launch_does_not_block_retry(world: &mut E2eWorld) {
-    // The record is written before the engine is spawned, so a launch that dies
-    // leaves one behind. If it is not retired, it reads as a live service and the
-    // idempotency guard refuses every later serve of the same engine + model —
-    // the user could never retry. Re-arm the seam: the runner consumes the
-    // scenario env on each invocation.
+#[when("the user serves the same model again")]
+async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
+    // Re-arm the scripted death: the runner consumes the scenario env on each
+    // invocation, and the retry has to die the same way to be recognisable.
     world
         .command_env
         .push((MANAGED_ENGINE_STARTUP_FAILURE_ENV, "1".into()));
-    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
-        world,
-        &[
-            "serve",
-            "Qwen3-0.6B-GGUF",
-            "--engine",
-            "lemonade",
-            "--managed",
-        ],
-    );
-    let output = format!("{stdout}\n{stderr}");
+    user_serves_with_lemonade(world).await;
+}
+
+#[then("that serve reaches the engine launch again rather than being refused as already running")]
+async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
+    // The record is written before the engine is spawned, so a launch that dies
+    // leaves one behind. Left claiming the engine + model, it would read as a
+    // live service and the idempotency guard would answer every later serve of
+    // the same pair with the corpse — the user could never retry. Reaching the
+    // engine launch again, and dying there the same way, is the proof it did not.
+    let output = serve_output(world);
     assert_ne!(
-        rc, 0,
+        world.cli_rc,
+        Some(0),
         "the retry should fail the same way, not succeed:\n{output}"
     );
     assert!(
