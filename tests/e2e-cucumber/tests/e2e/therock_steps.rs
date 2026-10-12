@@ -48,6 +48,23 @@ const NEXT_TORCH_VERSION: &str = "2.10.0+rocm10.0.0";
 const NEXT_TORCHVISION_VERSION: &str = "0.25.0+rocm10.0.0";
 const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 
+/// A newer ROCm 10 build published beside `NEXT_ROCM_VERSION`, for the scenario
+/// that pins the older one.
+const NEWER_NEXT_ROCM_VERSION: &str = "10.1.0";
+const NEWER_NEXT_TORCH_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERSION: &str = "2.9.2+rocm10.1.0";
+/// A rebuild of `NEXT_TORCHAUDIO_VERSION`, published the way the live index
+/// publishes torchaudio rebuilds: as a fourth release segment.
+const NEXT_TORCHAUDIO_REBUILD_VERSION: &str = "2.9.1.2+rocm10.0.0";
+/// A still newer rebuild of the same build, published only as a wheel no host
+/// running this suite can install (another CPython and OS).
+const NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION: &str = "2.9.1.3+rocm10.0.0";
+
+/// The tag every fixture wheel carries unless a scenario says otherwise.
+const ANY_WHEEL_TAG: &str = "py3-none-any";
+const FOREIGN_WHEEL_TAG: &str = "cp39-cp39-macosx_11_0_arm64";
+
 const CURRENT_ROCM_VERSION: &str = "7.10.0";
 const CURRENT_TORCH_VERSION: &str = "2.9.0+rocm7.10.0";
 const CURRENT_TORCHVISION_VERSION: &str = "0.24.0+rocm7.10.0";
@@ -127,21 +144,37 @@ fn aggregate_root_html() -> String {
 /// One PEP 503 package page with PEP 658 metadata. The metadata lets uv resolve
 /// the published dependency contract without downloading a wheel.
 fn write_wheel_index(served: &Path, package: &str, version: &str, requires: &[String]) {
-    let file_name = format!("{package}-{version}-py3-none-any.whl");
-    let html =
-        format!("<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>\n");
+    write_wheel_index_builds(
+        served,
+        package,
+        &[(version, ANY_WHEEL_TAG, requires.to_vec())],
+    );
+}
+
+/// [`write_wheel_index`] for a page that lists several published builds, each
+/// as `(version, wheel tag, requirements)`.
+fn write_wheel_index_builds(served: &Path, package: &str, builds: &[(&str, &str, Vec<String>)]) {
+    let mut html = String::new();
+    for (version, wheel_tag, requires) in builds {
+        let file_name = format!("{package}-{version}-{wheel_tag}.whl");
+        writeln!(
+            html,
+            "<a href=\"{file_name}\" data-dist-info-metadata=\"true\">{file_name}</a>"
+        )
+        .expect("write fixture HTML");
+        let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
+        if matches!(package, "rocm" | "torch" | "torchvision") {
+            metadata.push_str("Provides-Extra: device-gfx1200\n");
+        }
+        if package == "rocm" {
+            metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
+        }
+        for requirement in requires {
+            writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
+        }
+        write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
+    }
     write_fixture(&served.join("index.html"), &html);
-    let mut metadata = format!("Metadata-Version: 2.3\nName: {package}\nVersion: {version}\n");
-    if matches!(package, "rocm" | "torch" | "torchvision") {
-        metadata.push_str("Provides-Extra: device-gfx1200\n");
-    }
-    if package == "rocm" {
-        metadata.push_str("Provides-Extra: libraries\nProvides-Extra: devel\n");
-    }
-    for requirement in requires {
-        writeln!(metadata, "Requires-Dist: {requirement}").expect("write fixture metadata");
-    }
-    write_fixture(&served.join(format!("{file_name}.metadata")), &metadata);
 }
 
 fn write_pip_index(served: &Path, versions: [(&str, &str); 4]) {
@@ -198,6 +231,13 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
             ("torchaudio", NEXT_TORCHAUDIO_VERSION),
         ],
     );
+    serve_pip_fixtures(world);
+}
+
+/// Serves `therock-pip-fixtures/` and points both the canonical release and
+/// the ROCm 10 pip bases at it, through the explicit trust gate.
+fn serve_pip_fixtures(world: &mut E2eWorld) {
+    let served = root(world).join("therock-pip-fixtures");
     world.artifact_server = Some(LoopbackServer::start(&served));
     allow_base_overrides(world);
     let current = current_pip_base(world);
@@ -208,6 +248,72 @@ async fn pip_index_fixtures(world: &mut E2eWorld) {
     world
         .command_env
         .push(("ROCM_CLI_THEROCK_NEXT_PIP_BASE", next.into()));
+}
+
+/// Two ROCm 10 builds on one ROCm 10 index, with each package's dependency
+/// contract shaped like the live preview index's: torch requires its exact
+/// `rocm` build and torchvision its exact torch, so pinning `rocm` carries both
+/// — but torchaudio requires neither, so nothing in its metadata ties it to a
+/// build. `torchaudio` lists the torchaudio builds the index publishes, each
+/// with its wheel tag.
+fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
+    let served = root(world).join("therock-pip-fixtures").join("next");
+    write_fixture(&served.join("index.html"), &aggregate_root_html());
+    let builds = [
+        (
+            NEXT_ROCM_VERSION,
+            NEXT_TORCH_VERSION,
+            NEXT_TORCHVISION_VERSION,
+        ),
+        (
+            NEWER_NEXT_ROCM_VERSION,
+            NEWER_NEXT_TORCH_VERSION,
+            NEWER_NEXT_TORCHVISION_VERSION,
+        ),
+    ];
+    let rocm = builds.map(|(rocm, ..)| (rocm, ANY_WHEEL_TAG, Vec::new()));
+    let torch =
+        builds.map(|(rocm, torch, _)| (torch, ANY_WHEEL_TAG, vec![format!("rocm=={rocm}")]));
+    let torchvision = builds.map(|(_, torch, torchvision)| {
+        (torchvision, ANY_WHEEL_TAG, vec![format!("torch=={torch}")])
+    });
+    let torchaudio = torchaudio
+        .iter()
+        .map(|(version, wheel_tag)| (*version, *wheel_tag, Vec::new()))
+        .collect::<Vec<_>>();
+    write_wheel_index_builds(&served.join("rocm"), "rocm", &rocm);
+    write_wheel_index_builds(&served.join("torch"), "torch", &torch);
+    write_wheel_index_builds(&served.join("torchvision"), "torchvision", &torchvision);
+    write_wheel_index_builds(&served.join("torchaudio"), "torchaudio", &torchaudio);
+    serve_pip_fixtures(world);
+}
+
+/// The older build also carries a torchaudio rebuild, as the live index does,
+/// and a newer rebuild still that this host cannot install.
+#[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
+async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
+    serve_two_next_builds(
+        world,
+        &[
+            (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+            (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
+            (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+            (NEWER_NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+        ],
+    );
+}
+
+/// The pinned build's only torchaudio is a wheel this host cannot install, so
+/// for this Python and platform it publishes none.
+#[given("a ROCm 10 pip index fixture that publishes torchaudio only for a newer ROCm 10 build")]
+async fn pip_index_fixture_without_pinned_torchaudio(world: &mut E2eWorld) {
+    serve_two_next_builds(
+        world,
+        &[
+            (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+            (NEWER_NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+        ],
+    );
 }
 
 /// Registry key for the planted manifest below. Filename-safe (no `:`), same
@@ -672,6 +778,26 @@ async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
+async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user previews a tarball SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn preview_pinned_tarball_install(world: &mut E2eWorld) {
     preview_ok(
@@ -846,9 +972,24 @@ fn assert_version_resolution_extras(world: &mut E2eWorld, include_devel: bool) {
     };
     let expected = format!(
         "version_resolution_specs: rocm[{extras},device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
-         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] torchaudio"
+         torch[device-{RAW_ARCH}] torchvision[device-{RAW_ARCH}] \
+         torchaudio=={NEXT_TORCHAUDIO_VERSION}"
     );
     assert_contains(world, &expected, "version resolution extras");
+}
+
+#[then("every package in the preview is built for ROCm 10.0.0")]
+async fn preview_installs_one_rocm_build(world: &mut E2eWorld) {
+    // The whole line: one package from the newer build is the regression, and
+    // which package drifts depends on whose metadata fails to name its build.
+    // torchaudio is the build's newest rebuild, not its original release.
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEXT_TORCHAUDIO_REBUILD_VERSION}"
+    );
+    assert_contains(world, &expected, "single ROCm build");
 }
 
 #[then("the preview resolves the ROCm 10 tarball catalog")]
@@ -896,6 +1037,44 @@ async fn install_fails(world: &mut E2eWorld) {
         rc != 0,
         "expected a refusal, but the install succeeded:\n{}",
         stdout(world)
+    );
+}
+
+#[then(
+    "the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another"
+)]
+async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    // This sentence is only produced where the torchaudio pin is chosen, before
+    // `uv` runs, so it places the failure there rather than at any later check.
+    assert!(
+        reported.contains(&format!(
+            "no torchaudio built for ROCm {NEXT_ROCM_VERSION} is published for this Python and platform"
+        )),
+        "the refusal did not name the missing torchaudio build:\n{reported}"
+    );
+    // The sentence above is what tells the pin refused; these are a second,
+    // cheaper guard. The refusal names no version, so neither fallback build —
+    // the pinned ROCm build's wheel for another platform, or the newer ROCm
+    // build's — can appear unless the pin error was swallowed and resolution
+    // carried on with one of them.
+    for fallback in [
+        NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION,
+        NEWER_NEXT_TORCHAUDIO_VERSION,
+    ] {
+        assert!(
+            !reported.contains(fallback),
+            "resolution continued with torchaudio {fallback}:\n{reported}"
+        );
+    }
+    // Likewise for a swallowed error: no install plan was printed.
+    assert!(
+        !reported.contains("package_specs:"),
+        "the refusal still printed an install plan:\n{reported}"
     );
 }
 

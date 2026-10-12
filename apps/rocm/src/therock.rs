@@ -2183,14 +2183,22 @@ const fn therock_sdk_extras(include_devel: bool) -> &'static str {
 /// The requirement lines handed to `uv pip compile` to pick a mutually
 /// installable version set on the ROCm 10 (`next`) layout.
 ///
-/// Unversioned for torch/torchvision/torchaudio on purpose: choosing those
-/// versions is what the resolve is for. The `rocm` extras, though, must match
-/// the ones [`therock_pip_package_specs`] will install — resolving against
-/// `devel` for someone who did not ask for it constrains the chosen versions by
-/// a toolchain they declined, and can fail the whole install with a
-/// toolchain-resolution error on a default `rocm install sdk`.
+/// torch and torchvision are unversioned on purpose: choosing those versions is
+/// what the resolve is for, and their published metadata depends on the exact
+/// `rocm` build, so the `rocm` pin carries them to the matching `+rocm<build>`.
+/// torchaudio's metadata names no `rocm` build, so left unversioned it resolves
+/// to the newest build on the index — which is a different ROCm build for every
+/// pin but the newest — and the caller pins it to `torchaudio_version`, already
+/// chosen from this build's published torchaudio wheels.
+///
+/// The `rocm` extras must match the ones [`therock_pip_package_specs`] will
+/// install — resolving against `devel` for someone who did not ask for it
+/// constrains the chosen versions by a toolchain they declined, and can fail the
+/// whole install with a toolchain-resolution error on a default
+/// `rocm install sdk`.
 fn published_pip_requirements(
     rocm_version: &str,
+    torchaudio_version: &str,
     device_target: &str,
     include_devel: bool,
 ) -> Vec<String> {
@@ -2202,7 +2210,7 @@ fn published_pip_requirements(
         ),
         format!("torch[{device_extra}]"),
         format!("torchvision[{device_extra}]"),
-        "torchaudio".to_owned(),
+        format!("torchaudio=={torchaudio_version}"),
     ]
 }
 
@@ -3098,14 +3106,30 @@ fn resolve_pip_runtime_from_index(
                 );
                 format!("no TheRock rocm package was found for {requested} in {index_url}")
             })?;
+        // Chosen here, not by `uv`: see `published_pip_requirements`.
+        let torchaudio_versions = load_simple_index_versions(
+            paths,
+            index_url,
+            "torchaudio",
+            Some(wheel_compatibility),
+            download_timeout_secs,
+        )?;
+        let torchaudio_version = torchaudio_pin(&torchaudio_versions, &rocm_version, index_url)?;
         // The canonical branch below budgets one `download_timeout_secs` per
         // package (rocm, then torch, torchvision, torchaudio: 4 sequential HTTP
-        // fetches). `uv pip compile` resolves that same four-package metadata
-        // set in one subprocess call, so it needs a comparable aggregate
-        // budget, not the single-fetch one — reusing the bare per-fetch value
-        // here would make a startup check that budgets 2s per fetch reliably
-        // time out a call doing 4 fetches' worth of work.
-        let requirements = published_pip_requirements(&rocm_version, device_target, include_devel);
+        // fetches). `uv pip compile` still fetches metadata for all four
+        // packages in one subprocess call — the torchaudio listing above only
+        // chose its version — so it needs a comparable aggregate budget, not
+        // the single-fetch one: reusing the bare per-fetch value here would make
+        // a startup check that budgets 2s per fetch reliably time out a call
+        // doing 4 fetches' worth of work. That listing is one more fetch on top,
+        // with its own single-fetch budget.
+        let requirements = published_pip_requirements(
+            &rocm_version,
+            &torchaudio_version,
+            device_target,
+            include_devel,
+        );
         let versions = resolve_published_pip_package_versions(
             paths,
             index_url,
@@ -3771,6 +3795,150 @@ fn select_latest_stack_package(
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| compare_version_strings(left, right));
     candidates.pop()
+}
+
+/// The torchaudio version to pin for `rocm_version`: [`latest_build_for_rocm`],
+/// or a refusal saying whether no build for it is published at all or the
+/// published builds' versions could not be read — the second is not the first,
+/// and reporting it as "none published" would send the user to the wrong place.
+fn torchaudio_pin(published: &[String], rocm_version: &str, index_url: &str) -> Result<String> {
+    let built_for_rocm = package_versions_matching_rocm(published, rocm_version);
+    if built_for_rocm.is_empty() {
+        bail!(
+            "no torchaudio built for ROCm {rocm_version} is published for this Python and platform in {index_url}"
+        );
+    }
+    latest_build_for_rocm(published, rocm_version).with_context(|| {
+        format!(
+            "torchaudio builds for ROCm {rocm_version} are published in {index_url}, but none has a PEP 440 version ROCm CLI can order: {}",
+            built_for_rocm.join(", ")
+        )
+    })
+}
+
+/// The newest of `versions` built for exactly `rocm_version`, chosen the way
+/// `uv` would choose among them: in PEP 440 order, with final releases ahead of
+/// any pre-release.
+///
+/// Nothing on the index pairs a torchaudio build with a torch build, so this
+/// assumes the newest torchaudio of a ROCm build is the one built against that
+/// build's torch — the same choice `uv` made unaided when the pinned build was
+/// also the newest one on the index.
+///
+/// Not [`select_latest_stack_package`]: [`parse_version`] reads only
+/// `major.minor.patch` and rejects the rest, and torchaudio publishes rebuilds
+/// as extra release segments (`2.11.0.2`, `2.11.0.3`), so that would drop every
+/// rebuild and settle on the original `2.11.0` build.
+fn latest_build_for_rocm(versions: &[String], rocm_version: &str) -> Option<String> {
+    package_versions_matching_rocm(versions, rocm_version)
+        .into_iter()
+        .filter_map(|version| package_release_key(&version).map(|key| (key, version)))
+        .max_by(|(left, _), (right, _)| (left.is_final(), left).cmp(&(right.is_final(), right)))
+        .map(|(_, version)| version)
+}
+
+/// A PEP 440 version, less its `+local` label, as a value whose derived order is
+/// PEP 440's: field order is comparison order, and each enum's variants are
+/// declared lowest first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PackageReleaseKey {
+    epoch: u64,
+    /// Trailing zeros dropped, so `2.11` and `2.11.0` compare equal.
+    release: Vec<u64>,
+    pre: PreRelease,
+    post: Option<u64>,
+    dev: DevRelease,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PreRelease {
+    /// `X.devN` with no pre- or post-release sorts below every `X` pre-release.
+    DevOnly,
+    /// `a` = 0, `b` = 1, `rc` = 2.
+    Pre(u8, u64),
+    Final,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DevRelease {
+    Dev(u64),
+    Absent,
+}
+
+impl PackageReleaseKey {
+    /// `uv` only picks a pre-release (including any `.devN`) when no final
+    /// release is available; a post-release counts as final.
+    fn is_final(&self) -> bool {
+        self.pre == PreRelease::Final && self.dev == DevRelease::Absent
+    }
+}
+
+/// Parses the normalized PEP 440 form a package index publishes
+/// (`[N!]N(.N)*[{a|b|rc}N][.postN][.devN][+local]`), already percent-decoded
+/// by [`parse_simple_index_versions`]. Anything else is `None`, and is skipped
+/// rather than guessed at.
+fn package_release_key(version: &str) -> Option<PackageReleaseKey> {
+    fn number(rest: &mut &str) -> Option<u64> {
+        let len = rest.chars().take_while(char::is_ascii_digit).count();
+        let (digits, tail) = rest.split_at(len);
+        *rest = tail;
+        digits.parse().ok()
+    }
+
+    let public = version.split('+').next().unwrap_or_default();
+    let (epoch, mut rest) = match public.split_once('!') {
+        Some((epoch, rest)) => (epoch.parse().ok()?, rest),
+        None => (0, public),
+    };
+
+    let mut release = vec![number(&mut rest)?];
+    while let Some(tail) = rest.strip_prefix('.')
+        && tail.starts_with(|ch: char| ch.is_ascii_digit())
+    {
+        rest = tail;
+        release.push(number(&mut rest)?);
+    }
+    while release.len() > 1 && release.last() == Some(&0) {
+        release.pop();
+    }
+
+    let mut pre = None;
+    for (tag, kind) in [("rc", 2), ("a", 0), ("b", 1)] {
+        if let Some(tail) = rest.strip_prefix(tag) {
+            rest = tail;
+            pre = Some((kind, number(&mut rest)?));
+            break;
+        }
+    }
+    let post = match rest.strip_prefix(".post") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    let dev = match rest.strip_prefix(".dev") {
+        Some(tail) => {
+            rest = tail;
+            Some(number(&mut rest)?)
+        }
+        None => None,
+    };
+    if !rest.is_empty() {
+        return None;
+    }
+
+    Some(PackageReleaseKey {
+        epoch,
+        release,
+        pre: match (pre, post, dev) {
+            (Some((kind, number)), ..) => PreRelease::Pre(kind, number),
+            (None, None, Some(_)) => PreRelease::DevOnly,
+            (None, ..) => PreRelease::Final,
+        },
+        post,
+        dev: dev.map_or(DevRelease::Absent, DevRelease::Dev),
+    })
 }
 
 fn package_versions_matching_rocm(versions: &[String], rocm_version: &str) -> Vec<String> {
@@ -8267,6 +8435,142 @@ mod tests {
         Ok(())
     }
 
+    /// The live ROCm 10 index publishes torchaudio rebuilds as a fourth release
+    /// segment beside the original build, for more than one ROCm build at once.
+    #[test]
+    fn torchaudio_pin_is_the_newest_rebuild_of_the_requested_rocm_build() {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.1.0",
+            "2.11.0.2+rocm10.1.0",
+            "2.11.0.3+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.1.0").as_deref(),
+            Some("2.11.0.3+rocm10.1.0")
+        );
+        assert_eq!(latest_build_for_rocm(&published, "10.2.0"), None);
+    }
+
+    /// Mirrors uv's default: a pre-release is only chosen when no final
+    /// release exists for that build, and a post-release counts as final.
+    #[test]
+    fn torchaudio_pin_prefers_final_releases_like_uv() {
+        let published = [
+            "2.12.0a0+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+            "2.11.0+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0.2+rocm10.0.0")
+        );
+
+        let only_pre = ["2.12.0a0+rocm10.0.0", "2.12.0a1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&only_pre, "10.0.0").as_deref(),
+            Some("2.12.0a1+rocm10.0.0")
+        );
+
+        let post = ["2.11.0+rocm10.0.0", "2.11.0.post1+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&post, "10.0.0").as_deref(),
+            Some("2.11.0.post1+rocm10.0.0")
+        );
+    }
+
+    /// Each PEP 440 suffix number compares as a number, and the suffixes rank
+    /// `.devN` < `aN` < `bN` < `rcN` < final < `.postN`, with a `.devN` on any
+    /// of them ranking just below it. Pairs are `(older, newer)`.
+    #[test]
+    fn torchaudio_pin_orders_versions_as_pep_440_does() {
+        for (older, newer) in [
+            ("2.12.0a9", "2.12.0a10"),
+            ("2.12.0rc2", "2.12.0rc10"),
+            ("2.11.0.post9", "2.11.0.post10"),
+            ("2.12.0.dev1", "2.12.0.dev2"),
+            ("2.12.0.dev1", "2.12.0a1"),
+            ("2.12.0a1", "2.12.0b1"),
+            ("2.12.0b1", "2.12.0rc1"),
+            ("2.12.0rc1.dev3", "2.12.0rc1"),
+            ("2.11.0.post1.dev0", "2.11.0.post1"),
+            ("2.11.0", "2.11.0.post1.dev0"),
+            ("2.11", "2.11.0.1"),
+            ("9.0.0", "1!2.0.0"),
+        ] {
+            assert!(
+                package_release_key(&format!("{older}+rocm10.0.0"))
+                    < package_release_key(&format!("{newer}+rocm10.0.0")),
+                "{older} must order below {newer}"
+            );
+        }
+        assert_eq!(
+            package_release_key("2.11+rocm10.0.0"),
+            package_release_key("2.11.0+rocm10.0.0"),
+            "trailing zero release segments are insignificant"
+        );
+    }
+
+    /// A version the parser cannot read is left out, never guessed at: a newer
+    /// unreadable build must not win the pin.
+    #[test]
+    fn torchaudio_pin_skips_versions_it_cannot_read() -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.0.0",
+            "2.12.0-local-hack+rocm10.0.0",
+            "2.11.0.2+rocm10.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            torchaudio_pin(&published, "10.0.0", "https://index.test")?,
+            "2.11.0.2+rocm10.0.0"
+        );
+        Ok(())
+    }
+
+    /// The two refusals name different problems, so each says which one it is.
+    #[test]
+    fn torchaudio_pin_refusal_says_whether_the_build_is_missing_or_unreadable() {
+        let other_build = ["2.11.0.3+rocm10.1.0"].map(str::to_owned);
+        let missing = torchaudio_pin(&other_build, "10.0.0", "https://index.test")
+            .expect_err("no torchaudio for the pinned build must refuse")
+            .to_string();
+        assert!(
+            missing.contains("no torchaudio built for ROCm 10.0.0 is published"),
+            "{missing}"
+        );
+
+        let unreadable = ["2.12.0-local-hack+rocm10.0.0"].map(str::to_owned);
+        let unreadable = torchaudio_pin(&unreadable, "10.0.0", "https://index.test")
+            .expect_err("an unreadable-only build must refuse")
+            .to_string();
+        assert!(
+            unreadable.contains("none has a PEP 440 version")
+                && unreadable.contains("2.12.0-local-hack+rocm10.0.0")
+                && !unreadable.contains("no torchaudio built"),
+            "{unreadable}"
+        );
+    }
+
+    /// A post-release that is itself a dev build is still a pre-release to
+    /// `uv`, so a final release wins over it.
+    #[test]
+    fn torchaudio_pin_treats_a_dev_post_release_as_a_pre_release() {
+        let published = ["2.11.0+rocm10.0.0", "2.11.0.post1.dev0+rocm10.0.0"].map(str::to_owned);
+        assert_eq!(
+            latest_build_for_rocm(&published, "10.0.0").as_deref(),
+            Some("2.11.0+rocm10.0.0")
+        );
+    }
+
     #[test]
     fn uv_metadata_plan_rejects_mixed_rocm_builds() {
         let error = parse_uv_compiled_package_versions(
@@ -8577,21 +8881,24 @@ mod tests {
     /// extras.
     #[test]
     fn version_resolution_requests_the_toolchain_only_when_asked() {
-        let runtime_only = published_pip_requirements("10.0.0", "gfx1200", false);
+        let runtime_only =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", false);
         assert_eq!(
             runtime_only[0], "rocm[libraries,device-gfx1200]==10.0.0",
             "a default install must not resolve against the toolchain: {runtime_only:?}"
         );
 
-        let with_devel = published_pip_requirements("10.0.0", "gfx1200", true);
+        let with_devel =
+            published_pip_requirements("10.0.0", "2.11.0.2+rocm10.0.0", "gfx1200", true);
         assert_eq!(
             with_devel[0], "rocm[libraries,devel,device-gfx1200]==10.0.0",
             "--devel must reach the resolved requirements: {with_devel:?}"
         );
 
-        // Only the `rocm` requirement carries the toolchain axis; the torch
-        // stack is unversioned here because choosing those versions is what the
-        // resolve is for.
+        // Only the `rocm` requirement carries the toolchain axis. torch and
+        // torchvision are unversioned because choosing those versions is what
+        // the resolve is for; torchaudio is pinned because its metadata does not
+        // follow the `rocm` pin (see `published_pip_requirements`).
         assert_eq!(
             runtime_only[1..],
             with_devel[1..],
@@ -8602,7 +8909,7 @@ mod tests {
             [
                 "torch[device-gfx1200]".to_owned(),
                 "torchvision[device-gfx1200]".to_owned(),
-                "torchaudio".to_owned(),
+                "torchaudio==2.11.0.2+rocm10.0.0".to_owned(),
             ]
         );
     }
@@ -8619,6 +8926,7 @@ mod tests {
         for include_devel in [false, true] {
             let requirements = published_pip_requirements(
                 &resolution.package_versions.rocm,
+                &resolution.package_versions.torchaudio,
                 "gfx942",
                 include_devel,
             );
@@ -8629,6 +8937,13 @@ mod tests {
                 "resolution and install must request the same rocm extras for \
                  include_devel={include_devel}: {requirements:?} vs {:?}",
                 composition.package_specs
+            );
+            // torchaudio is the one stack package resolution pins rather than
+            // leaving to `uv`, so it has to be the very build install names.
+            assert_eq!(
+                requirements[3], composition.package_specs[3],
+                "resolution and install must name the same torchaudio for \
+                 include_devel={include_devel}"
             );
         }
     }

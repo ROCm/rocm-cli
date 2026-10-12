@@ -474,10 +474,12 @@ rather than resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
 `rocm examine` to see the arch this machine reports.
 
-For ROCm 10, `install sdk` asks `uv` to resolve Torch, torchvision, and
-torchaudio from their published dependency metadata, then validates that every
-selected framework package carries the same ROCm build identifier before it
-creates or changes a managed runtime.
+For ROCm 10, `install sdk` pins torchaudio to the newest build published for
+the requested ROCm version (its metadata names no ROCm build, so nothing else
+would) and stops with an error when that version publishes none, asks `uv` to
+resolve Torch and torchvision from their published dependency metadata
+alongside it, then validates that every selected framework package carries the
+same ROCm build identifier before it creates or changes a managed runtime.
 
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
 `install sdk` resolves the same release and nightly sources as before. It doesn't
