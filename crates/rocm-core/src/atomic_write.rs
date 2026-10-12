@@ -226,6 +226,10 @@ fn keep_existing_permissions(path: &Path, tmp: &Path) -> Result<()> {
 /// to the replacement, so there is nothing to copy by hand.
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn keep_existing_permissions(_path: &Path, _tmp: &Path) -> Result<()> {
     Ok(())
 }
@@ -263,6 +267,10 @@ fn sync_parent_dir(path: &Path) {
 /// Windows has no directory handle to flush; `ReplaceFileW` and `MoveFileExW`
 /// update the directory through the journaling filesystem.
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn sync_parent_dir(_path: &Path) {}
 
 /// Rename `tmp` over `path`, replacing an existing file.
