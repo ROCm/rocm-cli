@@ -45,8 +45,9 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
     };
 
     // Builds the shared `PlatformReport` set once for both outputs below
-    // (ROCMAI-484); see `load_platform_reports`'s doc for what each output
-    // still parses `inputs` for independently of it.
+    // (ROCMAI-484); see `generate_consolidated_from_reports`'s and
+    // `consolidated_summary_markdown_from_reports`'s docs for what each
+    // output still parses `inputs` for independently of it.
     let reports = e2e_report::load_platform_reports(&inputs);
 
     e2e_report::generate_consolidated_from_reports(&reports, &inputs, html_out, &meta)

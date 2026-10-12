@@ -869,10 +869,13 @@ fn report_sort_key(r: &PlatformReport) -> (&str, &str, bool, Option<&str>) {
 /// Shared by [`generate_consolidated_from_reports`] and
 /// [`consolidated_summary_markdown_from_reports`], so a caller producing both
 /// outputs from the same `inputs` in one process (e.g. `xtask`'s
-/// `e2e_report::run`) builds this set, and reads each platform's on-disk
-/// files, only once instead of once per output (ROCMAI-484). The
-/// expectation grid and scenario reference sections still parse `inputs`
-/// independently of this set.
+/// `e2e_report::run`) runs `PlatformReport::load` — and so reads each
+/// platform's `commands.jsonl` — once instead of once per output
+/// (ROCMAI-484). The expectation grid and scenario reference sections parse
+/// `inputs` independently of this set on every call; see
+/// [`generate_consolidated_from_reports`] and
+/// [`consolidated_summary_markdown_from_reports`] for what each output still
+/// parses `inputs` for.
 pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport> {
     let mut reports: Vec<PlatformReport> = inputs
         .iter()
@@ -1895,6 +1898,49 @@ mod tests {
                 ("Alpha", "Zulu", false, None),
                 ("Beta", "Able", false, None),
             ]
+        );
+    }
+
+    #[test]
+    fn report_sort_key_uses_manifest_channel_not_artifact_name_channel() {
+        // `effective_channel()` prefers the manifest's `versions.channel` over
+        // the artifact-name fallback `desc.channel_from_name` — see its own
+        // doc comment. Every fixture in the test above leaves `versions.channel`
+        // at its default `None`, so `effective_channel()` always falls through
+        // to `channel_from_name` there, and a sort key reading
+        // `channel_from_name` directly instead of calling `effective_channel()`
+        // would still pass it. This fixture gives the two sources conflicting
+        // values so the sort key is pinned to the one that must win.
+        fn mk(channel_from_name: Option<&'static str>, manifest_channel: Option<&str>) -> PlatformReport {
+            PlatformReport {
+                desc: Descriptor {
+                    platform: "Alpha".to_string(),
+                    os: "Able".to_string(),
+                    known_bugs: false,
+                    channel_from_name,
+                },
+                label: String::new(),
+                features: Vec::new(),
+                stats: Stats::new(),
+                xfail: XfailReport::default(),
+                is_known_bugs: false,
+                commands: Vec::new(),
+                tally: None,
+                versions: PlatformVersions {
+                    channel: manifest_channel.map(str::to_string),
+                    ..Default::default()
+                },
+            }
+        }
+
+        let artifact_only = mk(Some("nightly"), None);
+        let manifest_disagrees = mk(Some("nightly"), Some("release"));
+
+        assert_eq!(report_sort_key(&artifact_only).3, Some("nightly"));
+        assert_eq!(
+            report_sort_key(&manifest_disagrees).3,
+            Some("release"),
+            "report_sort_key must use the manifest's channel, not the artifact-name fallback, when both are present"
         );
     }
 
