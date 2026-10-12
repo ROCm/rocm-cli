@@ -875,7 +875,7 @@ fn wait_for_vllm_ready(
     }
 }
 /// Reads the last N lines from a log file and returns them as a formatted string.
-/// Handles large files by seeking to near the end and reading backwards.
+/// Delegates the seek/tail logic to `rocm_core::tail_lines`.
 fn summarize_startup_log_tail(log_path: &Path, limit: usize) -> Result<String> {
     let lines = rocm_core::tail_lines(log_path, limit, MAX_TAIL_READ)?;
     if lines.is_empty() {

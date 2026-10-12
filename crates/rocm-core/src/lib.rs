@@ -2103,14 +2103,33 @@ pub fn tail_lines(path: &Path, limit: usize, max_tail_read: u64) -> Result<Vec<S
         first_line_is_partial = probe[0] != b'\n';
     }
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     // Capped, not `VecDeque::with_capacity(limit)`: callers may pass
     // `usize::MAX` to mean "no limit", which would try to allocate that
     // capacity upfront. Real callers ask for small limits (tens to a few
     // hundred lines), so capping still gives them a single allocation.
     let mut lines: VecDeque<String> = VecDeque::with_capacity(limit.min(4096));
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("failed to read lines from {}", path.display()))?;
+    // Read raw bytes rather than `BufRead::lines()`: when the seek above lands
+    // inside a multi-byte UTF-8 character, the leading fragment is invalid
+    // UTF-8 on its own. `lines()` would surface that as an `Err` and abort the
+    // whole read before `first_line_is_partial` gets a chance to drop exactly
+    // that fragment. Decoding lossily keeps the drop-the-fragment logic in
+    // charge of it instead.
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut raw_line)
+            .with_context(|| format!("failed to read lines from {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+        if raw_line.last() == Some(&b'\n') {
+            raw_line.pop();
+            if raw_line.last() == Some(&b'\r') {
+                raw_line.pop();
+            }
+        }
         if first_line_is_partial {
             first_line_is_partial = false;
             continue;
@@ -2118,7 +2137,7 @@ pub fn tail_lines(path: &Path, limit: usize, max_tail_read: u64) -> Result<Vec<S
         if lines.len() == limit {
             lines.pop_front();
         }
-        lines.push_back(line);
+        lines.push_back(String::from_utf8_lossy(&raw_line).into_owned());
     }
     Ok(lines.into_iter().collect())
 }
@@ -7753,6 +7772,37 @@ last_installed_runtime_id = "therock-release"
             lines.first().map(String::as_str),
             Some("SECONDLINE"),
             "partial leading fragment must be dropped when the seek lands mid-line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tail_lines_drops_fragment_when_seek_lands_inside_a_multibyte_utf8_char() -> Result<()> {
+        // '█' (U+2588) encodes as the 3 bytes E2 96 88. Pick max_tail_read so
+        // the seek lands one byte into that character: the probe byte (the
+        // preceding byte) is the character's own first byte, so it is
+        // correctly classified as partial, but the bytes read back from the
+        // seek position start mid-character and are not valid UTF-8 on their
+        // own.
+        let first_line = format!("{}\n", "p".repeat(10));
+        let second_line = "\u{2588}REST\n";
+        let third_line = "THIRD\n";
+        let content = format!("{first_line}{second_line}{third_line}");
+
+        let seek_pos = first_line.len() as u64 + 1;
+        let max_tail_read = content.len() as u64 - seek_pos;
+
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-utf8-{}.log", unique_suffix()));
+        fs::write(&path, &content)?;
+        let lines = tail_lines(&path, usize::MAX, max_tail_read);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines?,
+            vec!["THIRD".to_owned()],
+            "a seek landing inside a multi-byte UTF-8 character must drop the \
+             partial leading fragment instead of erroring out the whole read"
         );
         Ok(())
     }
