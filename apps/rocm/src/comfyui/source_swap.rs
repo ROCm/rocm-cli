@@ -61,9 +61,11 @@ pub(super) const PRESERVED_SOURCE_ENTRIES: &[&str] = &[
 /// [`PRESERVED_SOURCE_ENTRIES`] that existed before that swap began (so a
 /// re-run reports what was really the user's rather than what the interrupted
 /// run may already have added from the release), the names of the release
-/// that run was installing, and the entries of the user's it set aside (so a
+/// that run was installing, the entries of the user's it set aside (so a
 /// re-run neither mistakes that release's code for the user's nor the user's
-/// entry for release code).
+/// entry for release code), and, in an install with no usable
+/// [`RELEASE_RECORD`], the entries it was about to replace (so a re-run lists
+/// the ones the interrupted run already deleted).
 pub(super) const SWAP_MARKER: &str = ".rocm-cli-reinstall-in-progress";
 
 /// The top-level names the installed release shipped, one per line, written
@@ -88,6 +90,7 @@ const ENTRY_POINT: &str = "main.py";
 /// Marker lines that are not a preserved entry's name.
 const MARKER_RELEASE: &str = "release\t";
 const MARKER_SET_ASIDE: &str = "set-aside\t";
+const MARKER_REPLACED: &str = "replaced\t";
 
 /// What a swap did with the existing folder's entries.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -170,6 +173,8 @@ pub(super) fn swap_interrupted(source: &Path) -> bool {
 /// the release only adds what is missing (see [`add_missing_entries`]).
 /// Preserved entries, and every entry no release shipped, are never moved,
 /// copied, overwritten, deleted or written through when they are symlinks.
+/// A release without `main.py` at its top is refused before anything at
+/// `source` changes.
 pub(super) fn install_release_tree(new_tree: &Path, source: &Path) -> Result<SwapReport> {
     install_release_tree_with(new_tree, source, &mut |_| Ok(()))
 }
@@ -195,6 +200,15 @@ fn install_release_tree_removing_with(
     remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<SwapReport> {
     let new_names = release_names(new_tree)?;
+    // Not a ComfyUI release, or one laid out differently: installing it would
+    // remove the installed code and put nothing startable in its place.
+    if !new_names.iter().any(|name| name == ENTRY_POINT) {
+        bail!(
+            "the downloaded ComfyUI release has no {ENTRY_POINT} at the top of {}; nothing \
+             was changed",
+            new_tree.display()
+        );
+    }
     if fs::symlink_metadata(source).is_err() {
         let parent = source
             .parent()
@@ -217,8 +231,12 @@ fn install_release_tree_removing_with(
 
     let mut report = SwapReport::default();
     let marker = source.join(SWAP_MARKER);
+    // Whether this run continues an interrupted one whose record of its plan
+    // could be read.
+    let mut resumed = false;
     let mut plan = if swap_interrupted(source) {
         let (plan, warning) = read_marker(&marker);
+        resumed = warning.is_none();
         report.warnings.extend(warning);
         plan
     } else {
@@ -238,9 +256,15 @@ fn install_release_tree_removing_with(
     // renamed, so a re-run can tell the two apart.
     if let Some(recorded) = &recorded {
         for name in &new_names {
-            let known = recorded.contains(name)
-                || plan.release.contains(name)
-                || plan.set_aside.iter().any(|(planned, _)| planned == name);
+            let known = recorded.iter().any(|owned| same_entry_name(owned, name))
+                || plan
+                    .release
+                    .iter()
+                    .any(|owned| same_entry_name(owned, name))
+                || plan
+                    .set_aside
+                    .iter()
+                    .any(|(planned, _)| same_entry_name(planned, name));
             if !known && fs::symlink_metadata(source.join(name)).is_ok() {
                 let new_name = set_aside_name(source, name, &plan, unix_seconds());
                 plan.set_aside.push((name.clone(), new_name));
@@ -248,6 +272,39 @@ fn install_release_tree_removing_with(
         }
     }
     plan.release.extend(new_names.iter().cloned());
+
+    // What a ComfyUI release shipped here: the installed release's recorded
+    // names, plus the new release's and an interrupted run's (which also
+    // covers whatever part of them that run already moved in, and an install
+    // from before the record existed).
+    let mut release_owned: BTreeSet<OsString> = plan.release.clone();
+    release_owned.extend(recorded.iter().flatten().cloned());
+    release_owned.extend(GENERATED_FROM_RELEASE.iter().map(OsString::from));
+    let is_release_owned = |name: &OsStr| {
+        release_owned
+            .iter()
+            .any(|owned| same_entry_name(owned, name))
+    };
+
+    // Without a record, what is about to be replaced is listed before any of
+    // it goes, and kept in the marker: a re-run after an interruption reports
+    // the run's list, not what happens to be left in the folder.
+    if !resumed && recorded.is_none() {
+        plan.replaced = read_dir(source)?
+            .into_iter()
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                !is_preserved(name)
+                    && !name.to_string_lossy().starts_with(CLI_FILE_PREFIX)
+                    && is_release_owned(name)
+            })
+            .collect();
+    }
+    report.replaced = plan
+        .replaced
+        .iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
     write_atomically(&marker, &plan.render(), step)?;
     for (name, new_name) in &plan.set_aside {
         let (from, to) = (source.join(name), source.join(new_name));
@@ -265,14 +322,6 @@ fn install_release_tree_removing_with(
         }
     }
 
-    // What a ComfyUI release shipped here: the installed release's recorded
-    // names, plus the new release's and an interrupted run's (which also
-    // covers whatever part of them that run already moved in, and an install
-    // from before the record existed).
-    let mut release_owned: BTreeSet<OsString> = plan.release.clone();
-    release_owned.extend(recorded.iter().flatten().cloned());
-    release_owned.extend(GENERATED_FROM_RELEASE.iter().map(OsString::from));
-
     let mut to_remove = Vec::new();
     for entry in read_dir(source)? {
         let name = entry.file_name();
@@ -280,14 +329,14 @@ fn install_release_tree_removing_with(
         if is_preserved(&name)
             || text == SWAP_MARKER
             || text == RELEASE_RECORD
-            || plan.set_aside.iter().any(|(_, new_name)| *new_name == name)
+            || plan
+                .set_aside
+                .iter()
+                .any(|(_, new_name)| same_entry_name(new_name, &name))
         {
             continue;
         }
-        if release_owned.contains(&name) {
-            if recorded.is_none() {
-                report.replaced.push(text.clone().into_owned());
-            }
+        if is_release_owned(&name) {
             to_remove.push(entry.path());
         } else if text.starts_with(COPY_IN_PROGRESS_PREFIX) {
             to_remove.push(entry.path());
@@ -334,6 +383,8 @@ struct SwapPlan {
     kept: Vec<&'static str>,
     release: BTreeSet<OsString>,
     set_aside: Vec<(OsString, OsString)>,
+    /// Sorted, as `release` is.
+    replaced: BTreeSet<OsString>,
 }
 
 impl SwapPlan {
@@ -351,6 +402,11 @@ impl SwapPlan {
                 new_name.to_string_lossy()
             )
         }));
+        lines.extend(
+            self.replaced
+                .iter()
+                .map(|name| format!("{MARKER_REPLACED}{}", name.to_string_lossy())),
+        );
         lines.join("\n")
     }
 
@@ -367,6 +423,10 @@ impl SwapPlan {
             if let Some(name) = line.strip_prefix(MARKER_RELEASE) {
                 if is_single_entry_name(name) {
                     plan.release.insert(OsString::from(name));
+                }
+            } else if let Some(name) = line.strip_prefix(MARKER_REPLACED) {
+                if is_single_entry_name(name) {
+                    plan.replaced.insert(OsString::from(name));
                 }
             } else if let Some((name, new_name)) = line
                 .strip_prefix(MARKER_SET_ASIDE)
@@ -414,7 +474,22 @@ fn set_aside_name(source: &Path, name: &OsStr, plan: &SwapPlan, seconds: u64) ->
 fn is_preserved(name: &OsStr) -> bool {
     PRESERVED_SOURCE_ENTRIES
         .iter()
-        .any(|preserved| name == *preserved)
+        .any(|preserved| same_entry_name(name, OsStr::new(preserved)))
+}
+
+/// Whether two names at the top of `source/` name the same entry. A Windows
+/// file system does not tell names apart by case, so neither does this there:
+/// a user's `readme.md` and a release's `README.md` are one file.
+fn same_entry_name(left: &OsStr, right: &OsStr) -> bool {
+    names_match(left, right, cfg!(windows))
+}
+
+fn names_match(left: &OsStr, right: &OsStr, ignore_case: bool) -> bool {
+    if ignore_case {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
 }
 
 /// The release's own top-level names, without the preserved ones.
@@ -1431,6 +1506,125 @@ mod tests {
         Ok(())
     }
 
+    /// An install from before the record, reinstalled and stopped before each
+    /// filesystem change in turn, then run again: the re-run lists everything
+    /// the swap replaced, including what the interrupted run already deleted
+    /// (`main.py` goes first) and after the new record is written.
+    #[test]
+    fn interrupted_swap_without_a_record_still_lists_everything_it_replaced() -> Result<()> {
+        let mut interrupted_at = 0;
+        loop {
+            let dir = TestDir::new("interrupt-legacy");
+            let source = legacy_used_source(&dir.0);
+            let tree = new_release(&dir.0);
+            let mut steps = 0;
+            let first = install_release_tree_with(&tree, &source, &mut |_| {
+                steps += 1;
+                if steps > interrupted_at {
+                    Err(io::Error::other("interrupted"))
+                } else {
+                    Ok(())
+                }
+            });
+            if let Ok(report) = first {
+                assert_eq!(report.replaced, ["__pycache__", "comfy", "main.py"]);
+                break;
+            }
+
+            let rerun_tree = dir.0.join("extract-2").join("ComfyUI-master");
+            write(&rerun_tree, &NEW_RELEASE);
+            let report = install_release_tree(&rerun_tree, &source)?;
+
+            assert_new_release_installed(&source);
+            assert_user_files_intact(&source);
+            assert_eq!(
+                report.replaced,
+                ["__pycache__", "comfy", "main.py"],
+                "after an interruption at step {interrupted_at}"
+            );
+            interrupted_at += 1;
+        }
+        Ok(())
+    }
+
+    /// A release without `main.py` at its top (not ComfyUI, or a different
+    /// layout) is refused before anything changes: the installed code, the
+    /// user's files and the record stay, no marker is written, and no install
+    /// is created where there was none.
+    #[test]
+    fn a_release_without_main_py_changes_nothing() -> Result<()> {
+        let dir = TestDir::new("no-main");
+        let source = used_source(&dir.0);
+        let record_before = read(&source.join(RELEASE_RECORD));
+        let tree = dir.0.join("extract").join("ComfyUI-master");
+        write(
+            &tree,
+            &[("README.md", "not comfyui"), ("comfy/x.py", "code")],
+        );
+
+        let error = install_release_tree(&tree, &source)
+            .expect_err("a release without main.py must be refused");
+
+        assert!(
+            format!("{error:#}").contains("has no main.py")
+                && format!("{error:#}").contains("nothing was changed"),
+            "{error:#}"
+        );
+        assert_eq!(read(&source.join("main.py")).as_deref(), Some("old main"));
+        assert!(source.join("comfy/dropped_file.py").is_file());
+        assert_user_files_intact(&source);
+        assert!(!swap_interrupted(&source));
+        assert_eq!(read(&source.join(RELEASE_RECORD)), record_before);
+
+        let fresh = dir.0.join("fresh").join("source");
+        install_release_tree(&tree, &fresh).expect_err("refused for a fresh install too");
+        assert!(!fresh.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn names_match_ignores_case_only_when_asked() {
+        let (upper, lower) = (OsStr::new("README.md"), OsStr::new("readme.md"));
+        assert!(names_match(upper, lower, true));
+        assert!(!names_match(upper, lower, false));
+        assert!(names_match(upper, upper, false));
+        assert!(!names_match(upper, OsStr::new("README.txt"), true));
+        assert_eq!(same_entry_name(upper, lower), cfg!(windows));
+    }
+
+    /// Windows: an install from before the record holding the user's
+    /// `readme.md`, and a release shipping `README.md`. They are one file
+    /// there, so it is listed as replaced, not as left in place, and the
+    /// release's copy is what remains.
+    #[cfg(windows)]
+    #[test]
+    fn names_differing_only_in_case_are_one_entry_on_windows() -> Result<()> {
+        let dir = TestDir::new("case");
+        let source = legacy_used_source(&dir.0);
+        write(&source, &[("readme.md", "user readme")]);
+        let tree = new_release(&dir.0);
+        write(&tree, &[("README.md", "release readme")]);
+
+        let report = install_release_tree(&tree, &source)?;
+
+        assert!(
+            report.replaced.contains(&"readme.md".to_owned()),
+            "{report:?}"
+        );
+        assert!(
+            !report
+                .left_in_place
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("readme.md")),
+            "{report:?}"
+        );
+        assert_eq!(
+            read(&source.join("README.md")).as_deref(),
+            Some("release readme")
+        );
+        Ok(())
+    }
+
     /// An unreadable record does not stop the swap: it falls back to the new
     /// release's names, lists what that replaced, and says why.
     #[test]
@@ -1567,7 +1761,10 @@ mod tests {
              set-aside\tapp\t../escaped\n\
              set-aside\t/abs\tx\n\
              set-aside\tapp\ta/b\n\
-             set-aside\tapp\tapp.rocm-cli-kept-1",
+             set-aside\tapp\tapp.rocm-cli-kept-1\n\
+             replaced\t../outside\n\
+             replaced\ta/b\n\
+             replaced\tcomfy",
         );
 
         assert_eq!(plan.kept, ["models"]);
@@ -1578,6 +1775,10 @@ mod tests {
         assert_eq!(
             plan.set_aside,
             [(OsString::from("app"), OsString::from("app.rocm-cli-kept-1"))]
+        );
+        assert_eq!(
+            plan.replaced.into_iter().collect::<Vec<_>>(),
+            [OsString::from("comfy")]
         );
     }
 
