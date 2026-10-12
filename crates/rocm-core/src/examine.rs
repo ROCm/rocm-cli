@@ -5611,6 +5611,49 @@ mod tests {
         assert!(cgroup_only.in_container);
         assert_eq!(cgroup_only.container_kind, "container");
     }
+
+    /// Both `/etc/os-release` reads `rocm examine` makes — the distro fields
+    /// and the distro name — answer from a simulated host root, and through the
+    /// shared parser: a planted single-quoted file naming a distro no runner
+    /// has reads as that distro. A read that bypassed the root would report the
+    /// runner's distro; one that bypassed the parser would keep the quotes.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn os_release_reads_follow_the_simulated_host_root() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-os-release-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        std::fs::write(
+            root.join("etc/os-release"),
+            "ID='planted'\nVERSION_ID='0.1'\nPRETTY_NAME='Planted 0.1'\n",
+        )
+        .expect("write planted os-release");
+
+        let (examined, name) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut examined = Examination::default();
+            probe_os(&mut examined);
+            (examined, crate::host_gpu::detect_distro_name())
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            (
+                examined.distro_id.as_str(),
+                examined.distro_version.as_str()
+            ),
+            ("planted", "0.1")
+        );
+        assert_eq!(name.as_deref(), Some("Planted 0.1"));
+    }
 }
 
 /// Property tests for the driver-side text readers above; a child module so it

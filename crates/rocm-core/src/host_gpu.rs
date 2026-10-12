@@ -1885,7 +1885,7 @@ fn detect_kernel_version() -> Option<String> {
     }
 }
 
-fn detect_distro_name() -> Option<String> {
+pub(crate) fn detect_distro_name() -> Option<String> {
     if runtime_is_windows() {
         return Some("Windows".to_owned());
     }
