@@ -1759,6 +1759,10 @@ jobs:
     needs: release-readiness-nightly
     if: ${{ always() && needs.release-readiness-nightly.result == 'success' }}
     steps:
+      # Needed because the prompt below is read from the repo
+      # (system-prompt-file), not just the downloaded facts artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Download release-readiness facts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1773,6 +1777,7 @@ jobs:
         run: npm install -g @github/copilot
 
       - name: Draft narrative
+        id: draft
         uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
@@ -1782,7 +1787,15 @@ jobs:
           prompt: "{{facts}}"
           file_input: |
             facts: release-readiness/facts.json
-          response-file: release-readiness/narrative.md
+
+      # `response-file` is an *output* of ai-inference (a path it already
+      # wrote the response to), not an input — write it to the path the next
+      # job expects instead of guessing the action picked that path itself.
+      - name: Save narrative
+        if: always() && steps.draft.outputs.response
+        run: printf '%s\n' "$NARRATIVE" > release-readiness/narrative.md
+        env:
+          NARRATIVE: ${{ steps.draft.outputs.response }}
 
       - name: Upload narrative
         if: always()
