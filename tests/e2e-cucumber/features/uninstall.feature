@@ -1,0 +1,42 @@
+Feature: Uninstall
+
+  # `rocm uninstall` removes the config, data and cache folders ROCm CLI uses.
+  # `install_lifecycle.feature` covers a full uninstall of a released install,
+  # but those scenarios are @lifecycle (skipped by default, OS-mutating). These
+  # cover what the plan does with the folders it is pointed at, so they run on
+  # the mock lane every PR.
+  #
+  # Every scenario passes --keep-binaries (the binary under test must survive)
+  # and points HOME, the uv cache and the Hugging Face cache at the scenario's
+  # own folder, so an uninstall can never reach the runner's shared caches.
+  #
+  # Linux-only, and the behaviour they pin is only claimed for Linux: on
+  # Windows a directory symlink or junction needs `remove_dir` rather than
+  # `remove_file`, which `rocm uninstall` does not do yet and nothing here
+  # verifies.
+
+  @id:uninstall-trailing-slash-link-unlinks-only @requires-os:linux
+  Scenario: uninstall-01 - A linked cache folder written with a trailing slash is unlinked, not emptied
+    Given the cache folder is a link to another folder holding the user's files
+    When the user uninstalls only the cache, writing its folder with a trailing slash
+    Then the uninstall succeeds
+    And the uninstall reports the cache link as removed
+    And the cache link is gone
+    And the folder the link pointed to still holds the user's files
+
+  @id:uninstall-dangling-link-is-removed @requires-os:linux
+  Scenario: uninstall-02 - A cache folder that is a broken link is listed and really removed
+    Given the cache folder is a link to a folder that no longer exists
+    When the user uninstalls only the cache
+    Then the uninstall succeeds
+    And the uninstall reports the cache link as removed
+    And the cache link is gone
+
+  @id:uninstall-unreadable-root-stops-before-removing @requires-os:linux
+  Scenario: uninstall-03 - A cache folder that cannot be checked stops the uninstall before anything is removed
+    Given the config folder holds the user's files
+    And the cache folder is reached through a link that points at itself
+    When the user uninstalls the config and the cache
+    Then the uninstall fails
+    And the error names the cache folder it could not check
+    And the config folder still holds the user's files

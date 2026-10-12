@@ -571,8 +571,8 @@ log for each `rocm serve --managed` launch, kept after the server stops.
 them. It also lists the `uv` package cache, the Hugging Face model cache, and
 downloaded models. Those last three are shared with other tools, and no
 `rocm storage` command removes them. `rocm uninstall` removes downloaded models
-along with the data directory unless you pass `--keep-data`; see
-[Logs and cleanup](#logs-and-cleanup).
+along with the data directory. On a default installation, keeping them takes
+both `--keep-data` and `--keep-config`; see [Logs and cleanup](#logs-and-cleanup).
 
 ### Inference engines
 
@@ -952,9 +952,17 @@ unless you keep that category, so on a default installation a flag doesn't
 protect its files by itself. To keep your settings and data, pass `--keep-config`
 and `--keep-data` together. Run with `--dry-run` first to confirm what is kept.
 
+On Linux, if a config, data, or cache folder is a link to somewhere else (for
+example a cache moved to a bigger disk), `rocm uninstall` removes the link and
+leaves the folder it points to alone, whether or not the setting ends in a `/`.
+
+If `rocm uninstall` cannot check whether one of those folders is there (for
+example, a link on the way loops back on itself), it stops with an error naming
+the folder before anything is removed.
+
 When you run `rocm` from a cargo `target` build, `uninstall` skips binary
-removal. Pass `--force-dev-binaries` to remove the debug and release binaries
-beside it.
+removal. Pass `--force-dev-binaries` to remove the ROCm CLI binaries in that build
+directory.
 
 Before removing anything, `uninstall` prints warnings about two situations:
 

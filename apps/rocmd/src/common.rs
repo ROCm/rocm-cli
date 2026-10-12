@@ -5,7 +5,7 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, daemon_binary_path,
+    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, command_failure_detail, daemon_binary_path,
     default_engine_for_platform, format_host_port, load_recent_automation_events,
     resolve_amd_smi_binary, unix_time_millis,
 };
@@ -211,18 +211,10 @@ pub(crate) fn run_command_with_timeout(
             let output = child
                 .wait_with_output()
                 .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             bail!(
                 "process exceeded {}s timeout: {}",
                 timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
+                command_failure_detail(&output)
             );
         }
         thread::sleep(Duration::from_millis(50));

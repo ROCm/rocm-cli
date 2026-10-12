@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `comfyui` and `therock`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
@@ -10,6 +15,9 @@ mod cli_report;
 mod comfyui;
 mod dash;
 mod dash_seam;
+// Unix-only: its generators plant symlinks with `std::os::unix::fs::symlink`.
+#[cfg(all(test, unix))]
+mod deletion_properties;
 mod driver_install;
 mod endpoint_keys;
 mod engines_cmd;
@@ -56,15 +64,15 @@ use rocm_core::{
     ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
-    detect_host_gfx_target, detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs,
-    format_host_port, format_http_base_url, interactive_terminal, load_model_recipe_registry,
-    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
-    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
-    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
-    normalize_therock_family, platform_matches_gfx_family,
-    preferred_serve_engine_for_host_gpu_summary, process_is_running, read_http_response_bounded,
-    resolve_builtin_model_recipe, runtime_install_root_is_protected,
+    builtin_watchers, command_failure_detail, connect_tcp_stream, daemon_binary_path,
+    default_engine_for_platform, detect_host_gfx_target, detect_host_gpu_summary,
+    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
+    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
+    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
+    managed_service_endpoint_readiness, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
+    platform_matches_gfx_family, preferred_serve_engine_for_host_gpu_summary, process_is_running,
+    read_http_response_bounded, resolve_builtin_model_recipe, runtime_install_root_is_protected,
     runtime_python_executable_in_env, uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
@@ -1306,6 +1314,10 @@ fn reset_sigpipe() {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
 
 /// Run `f` with SIGPIPE temporarily ignored, restoring the previous
@@ -6813,6 +6825,13 @@ pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The real host's `/etc/os-release`.
+///
+/// Deliberately not routed through `rocm_core::host_path`: every caller builds
+/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
+/// against the real machine, so a simulated host root must not choose its
+/// distro. The descriptive distro name `examine` reports comes from
+/// `rocm_core::detect_distro_name`, which does follow a simulated root.
 pub(crate) fn read_os_release() -> Result<String> {
     fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
 }
@@ -13066,18 +13085,10 @@ fn run_command_with_timeout(
             let output = child
                 .wait_with_output()
                 .context("failed to collect timed-out child process output")?;
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
             bail!(
                 "process exceeded {}s timeout: {}",
                 timeout.as_secs(),
-                if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    stdout
-                } else {
-                    "no output".to_owned()
-                }
+                command_failure_detail(&output)
             );
         }
         thread::sleep(Duration::from_millis(50));
@@ -17874,11 +17885,20 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 .push(format!("{kind} removal disabled by command line flag"));
             continue;
         }
-        if path.exists() {
-            plan.actions.push(UninstallPlanEntry { kind, path });
-        } else {
-            plan.skipped
-                .push(format!("{kind} path not present: {}", path.display()));
+        // Planned under the spelling `remove_path` acts on, so the review names
+        // the entry that is actually removed, and `dir/` and `dir` dedup to one
+        // line. Existence is the entry's own, not its target's: a dangling link
+        // is listed and then really removed, instead of reported as absent.
+        // A failed check is not an absence either: it fails the plan, so the
+        // uninstall stops before removing anything instead of leaving a folder
+        // that may still be on disk out of the review.
+        match existing_entry(&path)
+            .with_context(|| format!("failed to check the {kind} folder {}", path.display()))?
+        {
+            Some((entry, _)) => plan.actions.push(UninstallPlanEntry { kind, path: entry }),
+            None => plan
+                .skipped
+                .push(format!("{kind} path not present: {}", path.display())),
         }
     }
 
@@ -18117,12 +18137,77 @@ fn is_dev_binary_layout(path: &Path) -> bool {
         == Some("target")
 }
 
-fn remove_path(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+/// `path` respelled so it names the final entry itself.
+///
+/// A trailing separator (`link/`) or a trailing `.` (`link/.`) makes the kernel
+/// resolve a final symlink, so `symlink_metadata` reports the link's *target*
+/// directory and a recursive delete walks into it. Rebuilding the path from its
+/// components drops exactly those spellings (plus repeated separators and
+/// interior `.`), none of which otherwise change which entry is named. `..` is
+/// kept: dropping it lexically would change the meaning through a link.
+fn entry_path(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
+/// Does `path`'s text end in a separator or a final `.` (`x/`, `x/.`)? The
+/// kernel only lets such a spelling name a directory, so `notes.txt/` names
+/// nothing even though `notes.txt` exists.
+fn spelled_as_directory(path: &Path) -> bool {
+    let text = path.as_os_str().as_encoded_bytes();
+    let is_separator = |byte: u8| std::path::is_separator(char::from(byte));
+    match text {
+        [.., last] if is_separator(*last) => true,
+        [.., before, b'.'] => is_separator(*before),
+        _ => false,
     }
-    let metadata =
-        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+}
+
+/// The entry `path` names, as [`entry_path`] spells it, with its own
+/// (link-not-followed) metadata — or `None` when nothing is there.
+///
+/// A spelling that can only name a directory (see [`spelled_as_directory`])
+/// names nothing when the entry is a regular file, so that counts as absent
+/// rather than letting the respelling turn `notes.txt/` into `notes.txt`. A
+/// symlink is still the entry: it is what [`remove_path`] unlinks.
+fn existing_entry(path: &Path) -> io::Result<Option<(PathBuf, fs::Metadata)>> {
+    let entry = entry_path(path);
+    // Not `path.exists()`: that follows links, so a dangling link would read as
+    // already gone, be skipped, and still be reported as removed by the caller.
+    // "Not a directory" means a folder on the way is really a file (as in
+    // `notes.txt/../x`), so the path names nothing, the same as "not found".
+    // Any other failure is a real error, not an absence.
+    let metadata = match fs::symlink_metadata(&entry) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if spelled_as_directory(path) && !metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    Ok(Some((entry, metadata)))
+}
+
+/// Remove the entry `path` names: a file or symlink is unlinked (never
+/// followed, however `path` is spelled), a real directory is removed
+/// recursively, and an entry that is already gone is a no-op.
+///
+/// Normalizing here rather than only at plan time covers every caller —
+/// `rocm uninstall` and `rocm storage remove-downloads` — whatever spelling
+/// their plan carries.
+fn remove_path(path: &Path) -> Result<()> {
+    let Some((path, metadata)) =
+        existing_entry(path).with_context(|| format!("failed to stat {}", path.display()))?
+    else {
+        return Ok(());
+    };
+    let path = path.as_path();
     if metadata.file_type().is_symlink() || metadata.is_file() {
         fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))?;
     } else if metadata.is_dir() {
@@ -19025,6 +19110,10 @@ fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
     None
 }
@@ -29194,6 +29283,47 @@ install therock";
         assert!(vram_capacity_is_meaningful(Some("gfx1151"), 2));
         // An unknown target is never treated as unified memory.
         assert!(vram_capacity_is_meaningful(None, 1));
+    }
+
+    /// The package-manager plans run against the real machine, so a simulated
+    /// host root must not change the distro they are built for: under a root
+    /// whose `/etc/os-release` names a different distro, `read_os_release`
+    /// still returns the real file.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn read_os_release_ignores_a_simulated_host_root() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-os-release-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        fs::write(
+            root.join("etc/os-release"),
+            "ID=planted-distro\nVERSION_ID=\"99.9\"\n",
+        )
+        .expect("write planted os-release");
+
+        let read = {
+            let mut env = ScopedTestEnv::new();
+            env.set(
+                rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
+                &root.to_string_lossy(),
+            );
+            read_os_release().unwrap_or_default()
+        };
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !read.contains("planted-distro"),
+            "read the simulated root's os-release: {read:?}"
+        );
+        assert_eq!(
+            read,
+            fs::read_to_string("/etc/os-release").unwrap_or_default()
+        );
     }
 
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
