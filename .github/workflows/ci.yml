@@ -891,8 +891,9 @@ jobs:
     # single source of truth in .pre-commit-config.yaml — hygiene + Python (ruff)
     # + Shell (shellcheck) + cargo fmt (rustfmt only, no compile).
     # `--no-group local-tools` skips the hooks that need a full Rust compile,
-    # hawkeye, or PowerShell — those have their own jobs (clippy, build-and-test,
-    # license-headers, powershell-lint).
+    # hawkeye, lychee, PowerShell, or commit-history/signing access — those have
+    # their own jobs (clippy, build-and-test, license-headers, docs-links,
+    # powershell-lint, commit-signatures).
     name: prek (lint / hygiene)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -1358,6 +1359,9 @@ jobs:
         with:
           args: --config lychee.toml './**/*.md'
           fail: true
+          # Explicit, so an action bump can't silently drift from the version
+          # CONTRIBUTING.md pins for the local `lychee` prek hook — bump both.
+          lycheeVersion: v0.24.2
 
   docs-build:
     name: Sphinx docs build (-W)
