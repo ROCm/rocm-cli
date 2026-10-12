@@ -1573,7 +1573,11 @@ async fn plant_unauthenticated_lemonade_service(world: &mut E2eWorld) {
         .expect("scenario has no isolated root")
         .path();
     let services_dir = root.join("data").join("services");
-    let states_dir = root.join("data").join("engines").join(REUSE_REFUSAL_ENGINE).join("state");
+    let states_dir = root
+        .join("data")
+        .join("engines")
+        .join(REUSE_REFUSAL_ENGINE)
+        .join("state");
     std::fs::create_dir_all(&services_dir).expect("failed to create services dir");
     std::fs::create_dir_all(&states_dir).expect("failed to create engine state dir");
 
@@ -1642,7 +1646,9 @@ async fn assert_refused_with_stop_hint(world: &mut E2eWorld) {
         "the refusal must say why it refused: {output}"
     );
     assert!(
-        output.contains(&format!("rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes")),
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
         "the refusal must name the way out, directly runnable with --yes: {output}"
     );
 }

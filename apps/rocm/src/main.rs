@@ -4534,7 +4534,10 @@ fn run_attached_service(
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
-            println!("  stop: {}", service_hints::service_stop_hint(&report.service_id));
+            println!(
+                "  stop: {}",
+                service_hints::service_stop_hint(&report.service_id)
+            );
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
