@@ -143,6 +143,11 @@ fn resolve_symlink_target(path: &Path) -> Result<PathBuf> {
 
 /// Write `bytes` to a fresh temp sibling of `path` and return it, for a caller
 /// that must do more with the file than publish it.
+///
+/// Unlike [`write_file_atomically`], `path` is taken as given: a symbolic link
+/// there is not resolved, so the temp file sits next to the link. Publishing
+/// it over that `path` with `publish_temp_file` would replace the link with
+/// a regular file; use [`write_file_atomically`] when the link must survive.
 pub fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     stage_file_for_atomic_publish_with(path, bytes, |attempt| {
@@ -261,12 +266,20 @@ fn sync_parent_dir(path: &Path) {
 fn sync_parent_dir(_path: &Path) {}
 
 /// Rename `tmp` over `path`, replacing an existing file.
+///
+/// Public only as the default for [`write_file_atomically_with_publish`]'s
+/// test seam; production code calls [`write_file_atomically`].
+#[doc(hidden)]
 #[cfg(not(windows))]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
 /// Rename `tmp` over `path`, replacing an existing file.
+///
+/// Public only as the default for [`write_file_atomically_with_publish`]'s
+/// test seam; production code calls [`write_file_atomically`].
+#[doc(hidden)]
 #[cfg(windows)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
     if path.try_exists()? {
