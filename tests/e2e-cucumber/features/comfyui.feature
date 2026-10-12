@@ -115,9 +115,11 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # real `install sdk`. NOT @lifecycle: that tag is for OS-mutating
   # release scenarios and no lane sets E2E_INCLUDE_LIFECYCLE on a GPU host, so
   # combining it with @nightly would make this scenario unreachable on every lane;
-  # it touches the OS only as much as runtime-01's `install sdk --yes` does (installing
-  # missing torch system libraries), and otherwise only its own isolated runtime
-  # prefix. Native Linux only (@requires-os:linux @requires-bare-metal; WSL2 reports
+  # its Given step's `install sdk --yes` grants system-package consent, so beyond
+  # runtime-01's torch system libraries it also runs the preferred-engine auto install
+  # (for vLLM families: a sudo OpenMPI package install when missing, then a full vLLM
+  # engine install into the runtime), which adds nightly time; otherwise it touches only
+  # its own isolated runtime prefix. Native Linux only (@requires-os:linux @requires-bare-metal; WSL2 reports
   # linux, so the first tag alone would not exclude it) until a Windows/WSL2 run of
   # `comfyui install` has been seen. If that gate is lifted, note the `nvidia-*` check has
   # no teeth on Windows (PyPI's Windows torch wheels are CPU builds).
