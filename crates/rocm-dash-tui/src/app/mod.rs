@@ -1271,7 +1271,14 @@ mod tests {
         // (unlike `//`, not stripped below) would false-positive; a
         // reference whose type is fully inferred, with the identifier
         // never written out as text anywhere, can't be caught by scanning
-        // text rather than parsing it.
+        // text rather than parsing it. Unlike those two, which only
+        // over-fire or miss safely, the line-stripping below has no
+        // string-literal awareness: a name placed after a `//` that's
+        // actually inside a string literal (e.g. on a line with a
+        // `"http://..."` value) would be silently dropped from the scan
+        // and let a real violation pass. Currently harmless -- no line
+        // here combines the two -- but worth knowing this guard doesn't
+        // cover.
         const SCROLLBAR_NAMES: [&str; 4] =
             ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
 
