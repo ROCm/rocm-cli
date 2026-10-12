@@ -1911,7 +1911,10 @@ mod tests {
         // `channel_from_name` directly instead of calling `effective_channel()`
         // would still pass it. This fixture gives the two sources conflicting
         // values so the sort key is pinned to the one that must win.
-        fn mk(channel_from_name: Option<&'static str>, manifest_channel: Option<&str>) -> PlatformReport {
+        fn mk(
+            channel_from_name: Option<&'static str>,
+            manifest_channel: Option<&str>,
+        ) -> PlatformReport {
             PlatformReport {
                 desc: Descriptor {
                     platform: "Alpha".to_string(),
