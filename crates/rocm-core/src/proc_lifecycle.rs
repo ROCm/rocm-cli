@@ -406,8 +406,9 @@ pub fn process_start_ticks(pid: u32) -> Option<u64> {
     parse_start_ticks(&stat)
 }
 
-/// On Windows the start-time is the process creation `FILETIME` (100 ns ticks
-/// since 1601). It is opaque to the identity comparison, which only checks
+/// On Windows the start-time is the process creation `FILETIME`.
+///
+/// It counts 100 ns ticks since 1601. It is opaque to the identity comparison, which only checks
 /// equality, and it is what lets a recycled PID be told from the recorded one.
 #[cfg(windows)]
 #[must_use]
