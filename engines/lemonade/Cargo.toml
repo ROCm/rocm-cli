@@ -35,4 +35,4 @@ ureq = { version = "2.12", features = ["json", "native-certs"] }
 # deflate implementation. Only `deflate` is needed: the embeddable zip stores
 # entries with deflate or no compression, and the narrow feature set keeps the
 # extractor's dependency surface small.
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
