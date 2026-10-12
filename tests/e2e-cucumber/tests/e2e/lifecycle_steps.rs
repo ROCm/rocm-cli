@@ -54,6 +54,9 @@ pub struct LifecycleState {
     smoke_config: Option<PathBuf>,
     smoke_data: Option<PathBuf>,
     smoke_cache: Option<PathBuf>,
+    /// The shell profile contents seeded before install, which uninstall must
+    /// restore exactly.
+    profile_before_install: Option<String>,
 }
 
 impl Drop for LifecycleState {
@@ -342,6 +345,16 @@ fn assert_missing(path: &Path) {
     );
 }
 
+/// Assert a path is gone within a few seconds. On Windows the running `rocm.exe`
+/// may only be deleted as the uninstalling process exits.
+async fn assert_missing_soon(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while path.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    assert_missing(path);
+}
+
 // ── Given: setup ───────────────────────────────────────────────────────
 
 #[given("a freshly built release tree")]
@@ -384,6 +397,7 @@ async fn given_release_tree(world: &mut E2eWorld) {
         smoke_config: None,
         smoke_data: None,
         smoke_cache: None,
+        profile_before_install: None,
     });
 }
 
@@ -429,6 +443,29 @@ async fn given_isolated_dirs(world: &mut E2eWorld) {
     seed_isolated_dirs(world);
 }
 
+#[given("the shell profile already holds the user's own settings")]
+async fn given_profile_user_settings(world: &mut E2eWorld) {
+    let st = state(world);
+    let profile = st.home_dir.join(".bashrc");
+    let contents = "# the user's own settings\nexport ROCM_E2E_USER_SETTING=1\n".to_owned();
+    std::fs::write(&profile, &contents).expect("failed to seed the shell profile");
+    state_mut(world).profile_before_install = Some(contents);
+}
+
+#[given("a signed bundle installed updating the user PATH")]
+async fn given_installed_updating_user_path(world: &mut E2eWorld) {
+    package_with_key_file(world).await;
+    when_install_update_user_path(world).await;
+    then_user_path_updated(world).await;
+}
+
+#[given("another program is installed in the install directory")]
+async fn given_other_program(world: &mut E2eWorld) {
+    let install_dir = state(world).install_dir.clone();
+    std::fs::write(install_dir.join("other-tool"), "#!/bin/sh\n")
+        .expect("failed to seed another program");
+}
+
 #[given("the user PATH is captured for restoration")]
 async fn given_capture_user_path(world: &mut E2eWorld) {
     #[cfg(windows)]
@@ -450,6 +487,8 @@ fn seed_isolated_dirs(world: &mut E2eWorld) {
     let cache = root.join("smoke-cache");
     for dir in [&config, &data, &cache] {
         std::fs::create_dir_all(dir).expect("failed to create isolated smoke dir");
+        std::fs::write(dir.join("state-marker"), "seeded by the scenario\n")
+            .expect("failed to seed isolated smoke state");
     }
     let st = state_mut(world);
     st.smoke_config = Some(config);
@@ -908,6 +947,9 @@ async fn when_uninstall(world: &mut E2eWorld) {
     let rocm = installed_binary(&st.install_dir, "rocm");
     let mut cmd = Command::new(&rocm);
     cmd.arg("uninstall").arg("--yes");
+    // Uninstall undoes the installer's shell-profile change, so it must see the
+    // scenario's HOME, never the runner's real one.
+    cmd.env("HOME", &st.home_dir);
     apply_smoke_env(&mut cmd, st);
     let output = cmd.output().expect("failed to run uninstall");
     let combined = format!(
@@ -915,7 +957,9 @@ async fn when_uninstall(world: &mut E2eWorld) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    state_mut(world).last_output = combined;
+    let st = state_mut(world);
+    st.last_output = combined;
+    st.last_rc = output.status.code().unwrap_or(-1);
 }
 
 #[when("the user uninstalls from the installed binary keeping config data and cache")]
@@ -930,6 +974,7 @@ async fn when_uninstall_keep(world: &mut E2eWorld) {
         "--keep-data",
         "--keep-cache",
     ]);
+    cmd.env("HOME", &st.home_dir);
     apply_smoke_env(&mut cmd, st);
     let output = cmd.output().expect("failed to run uninstall");
     let combined = format!(
@@ -1186,20 +1231,162 @@ async fn then_examine_isolated(world: &mut E2eWorld) {
     }
 }
 
-#[then("uninstall reports skipping the running executable on Windows")]
-async fn then_skip_running_exe(world: &mut E2eWorld) {
-    let out = &state(world).last_output;
-    assert!(
-        out.contains("skipping running executable on Windows"),
-        "uninstall did not report the running-executable skip:\n{out}"
+#[then("the installed rocm binary that ran uninstall is gone")]
+async fn then_running_rocm_gone(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    let rocm = installed_binary(&st.install_dir, "rocm");
+    // Matched by file name: the program reports its own path, which on Windows
+    // may be spelled differently (long vs 8.3 short) from the scenario's.
+    let own_name = format!(
+        "{}rocm{}",
+        std::path::MAIN_SEPARATOR,
+        std::env::consts::EXE_SUFFIX
     );
+    let reported = out.lines().any(|line| {
+        line.starts_with("removed binary ")
+            && (line.ends_with(&own_name)
+                || line.ends_with(&format!("{own_name} as this command exits")))
+    });
+    assert!(
+        reported && out.contains("uninstall complete"),
+        "uninstall did not report removing its own binary:\n{out}"
+    );
+    assert_missing_soon(&rocm).await;
 }
 
 #[then("the installed rocm and rocmd binaries are gone")]
 async fn then_binaries_gone(world: &mut E2eWorld) {
     let st = state(world);
-    assert_missing(&installed_binary(&st.install_dir, "rocm"));
+    assert_missing_soon(&installed_binary(&st.install_dir, "rocm")).await;
     assert_missing(&installed_binary(&st.install_dir, "rocmd"));
+}
+
+#[then("the shell profile is back to the user's own settings")]
+async fn then_profile_restored(world: &mut E2eWorld) {
+    let st = state(world);
+    let before = st
+        .profile_before_install
+        .as_deref()
+        .expect("the shell profile was not seeded");
+    let profile = st.home_dir.join(".bashrc");
+    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_eq!(
+        contents, before,
+        "uninstall did not restore the shell profile to its pre-install contents"
+    );
+    let out = &st.last_output;
+    assert!(
+        out.contains("removed the rocm-cli PATH lines from"),
+        "uninstall did not report removing the PATH lines:\n{out}"
+    );
+}
+
+#[then("the shell profile still adds the install directory to PATH")]
+async fn then_profile_kept(world: &mut E2eWorld) {
+    let profile = state(world).home_dir.join(".bashrc");
+    let contents = std::fs::read_to_string(&profile).unwrap_or_default();
+    assert_eq!(
+        contents.matches("# >>> rocm-cli path >>>").count(),
+        1,
+        "the rocm-cli PATH block is no longer in the profile:\n{contents}"
+    );
+}
+
+#[then("the record of the installer's PATH change is still in the install directory")]
+async fn then_path_record_kept(world: &mut E2eWorld) {
+    // The kept change stays undoable by a later uninstall only while its
+    // record survives.
+    assert_exists(&state(world).install_dir.join(".rocm-cli-path-edit"));
+}
+
+#[then("the record of the installer's PATH change is gone")]
+async fn then_path_record_gone(world: &mut E2eWorld) {
+    assert_missing(&state(world).install_dir.join(".rocm-cli-path-edit"));
+}
+
+#[then("the other program is still in the install directory")]
+async fn then_other_program_kept(world: &mut E2eWorld) {
+    assert_exists(&state(world).install_dir.join("other-tool"));
+}
+
+#[then("uninstall reports keeping the PATH change for the other program")]
+async fn then_reports_path_kept(world: &mut E2eWorld) {
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("PATH change left in place") && out.contains("other-tool"),
+        "uninstall did not explain keeping the PATH change:\n{out}"
+    );
+}
+
+#[then("the install directory is not on the user PATH")]
+async fn then_install_dir_off_user_path(world: &mut E2eWorld) {
+    #[cfg(windows)]
+    {
+        let st = state(world);
+        let current = capture_user_path();
+        let target = st.install_dir.to_string_lossy().to_lowercase();
+        let on_path = current.split(';').any(|entry| {
+            entry.trim().to_lowercase().trim_end_matches('\\') == target.trim_end_matches('\\')
+        });
+        assert!(!on_path, "install dir is still on the user PATH: {current}");
+        let out = &st.last_output;
+        assert!(
+            out.contains("from your user PATH"),
+            "uninstall did not report removing the user PATH entry:\n{out}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = world;
+    }
+}
+
+#[when("the user uninstalls from the installed binary keeping the binaries")]
+async fn when_uninstall_keep_binaries(world: &mut E2eWorld) {
+    let st = state(world);
+    let rocm = installed_binary(&st.install_dir, "rocm");
+    let mut cmd = Command::new(&rocm);
+    cmd.args(["uninstall", "--yes", "--keep-binaries"]);
+    cmd.env("HOME", &st.home_dir);
+    apply_smoke_env(&mut cmd, st);
+    let output = cmd.output().expect("failed to run uninstall");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let st = state_mut(world);
+    st.last_output = combined;
+    st.last_rc = output.status.code().unwrap_or(-1);
+}
+
+#[given("the shell profile cannot be rewritten")]
+async fn given_profile_unwritable(world: &mut E2eWorld) {
+    // Uninstall writes the edited profile beside the original before swapping
+    // it in; a folder in that spot makes the write fail, even for root.
+    let home = state(world).home_dir.clone();
+    std::fs::create_dir_all(home.join(".bashrc.rocm-uninstall.tmp"))
+        .expect("failed to block the profile rewrite");
+}
+
+#[when("the shell profile can be rewritten again")]
+async fn when_profile_writable(world: &mut E2eWorld) {
+    let home = state(world).home_dir.clone();
+    std::fs::remove_dir(home.join(".bashrc.rocm-uninstall.tmp"))
+        .expect("failed to unblock the profile rewrite");
+}
+
+#[then("uninstall fails saying the PATH change could not be undone")]
+async fn then_uninstall_fails_path(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    assert_ne!(st.last_rc, 0, "uninstall succeeded:\n{out}");
+    assert!(
+        out.contains("could not undo the installer's PATH change")
+            && out.contains("`rocm uninstall` again"),
+        "uninstall did not explain the PATH failure:\n{out}"
+    );
 }
 
 #[then("the install manifest is gone")]
@@ -1210,8 +1397,8 @@ async fn then_manifest_gone(world: &mut E2eWorld) {
 
 #[then("the non-running installed rocmd binary is gone")]
 async fn then_rocmd_gone(world: &mut E2eWorld) {
-    // The keep-config uninstall skips the running rocm executable on Windows but
-    // must still remove the non-running rocmd binary (old acceptance-script check).
+    // The keep-config uninstall still removes the binaries, rocmd included
+    // (old acceptance-script check).
     let st = state(world);
     assert_missing(&installed_binary(&st.install_dir, "rocmd"));
 }
@@ -1223,9 +1410,8 @@ async fn then_xdg_gone(world: &mut E2eWorld) {
         .into_iter()
         .flatten()
     {
-        // Uninstall purges the CLI's own state; the top-level isolated dir may
-        // remain but its rocm-cli subtree must be gone.
-        let rocm_cli = dir.join("rocm-cli");
-        assert_missing(&rocm_cli);
+        // The isolated dirs are the CLI's config, data, and cache directories
+        // themselves (`ROCM_CLI_*_DIR`), so uninstall removes each one whole.
+        assert_missing(dir);
     }
 }

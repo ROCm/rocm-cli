@@ -80,7 +80,9 @@ add a demo. Until the demo-gifs workflow has run once, these links 404.
 
 The installer downloads a prebuilt bundle, verifies its SHA-256 checksum,
 installs the `rocm` and `rocmd` binaries into `~/.local/bin`, and adds that
-directory to your shell `PATH`. Rerun it any time to upgrade.
+directory to your shell `PATH`. Rerun it any time to upgrade. `rocm uninstall`
+removes the binaries, and undoes the `PATH` change too when no other program
+lives in that directory.
 
 ### Linux and WSL (x86_64)
 
@@ -946,7 +948,18 @@ rocm logs [--service <service-id>] [--search TERM ...]
 
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
+               [--force-dev-binaries]
 ```
+
+`rocm uninstall` lists what it will do and asks before doing it (`--yes` skips
+the question, `--dry-run` only lists). It removes the config, data, and cache
+directories and the installed binaries, including the running `rocm.exe` on
+Windows. It also undoes the `PATH` change the installer made: the marked block
+in your shell profile, or the user `PATH` entry the Windows installer recorded
+adding. That change stays when other programs live in the same folder, since
+they may rely on it (the review names them), and with `--keep-binaries`. A
+`PATH` line you wrote yourself is never touched. If the `PATH` change cannot be
+undone, the binaries are left in place so you can run `rocm uninstall` again.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and

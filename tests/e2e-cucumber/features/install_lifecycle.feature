@@ -121,15 +121,18 @@ Feature: Release install lifecycle
     And the installed config still selects the vllm default engine
 
   @id:lifecycle-linux-uninstall-full-purge @lifecycle @requires-os:linux
-  Scenario: lifecycle-09 - Linux - uninstall removes binaries, manifest, and XDG state
+  Scenario: lifecycle-09 - Linux - uninstall removes binaries, manifest, XDG state, and the installer's PATH change
     Given a freshly built release tree
     And a generated signing keypair
+    And the shell profile already holds the user's own settings
     And a signed bundle installed with the shell profile updated
     And the installed binary has isolated XDG directories with state
     When the user uninstalls from the installed binary
     Then the installed rocm and rocmd binaries are gone
     And the install manifest is gone
     And the isolated XDG config, data, and cache state is gone
+    And the shell profile is back to the user's own settings
+    And the record of the installer's PATH change is gone
 
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
 
@@ -255,7 +258,7 @@ Feature: Release install lifecycle
     And the install manifest is present
 
   @id:lifecycle-windows-installed-binary-smoke @lifecycle @requires-os:windows
-  Scenario: lifecycle-22 - Windows - the installed binary honors isolated directories and keeps the running executable on uninstall
+  Scenario: lifecycle-22 - Windows - the installed binary honors isolated directories and removes itself on uninstall
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
@@ -269,6 +272,65 @@ Feature: Release install lifecycle
     When the installed rocm examine runs with the isolated environment
     Then examine reads only the isolated config, data, and cache directories
     When the user uninstalls from the installed binary keeping config data and cache
-    Then uninstall reports skipping the running executable on Windows
+    Then the installed rocm binary that ran uninstall is gone
     And the non-running installed rocmd binary is gone
     And the install manifest is gone
+
+  # ── Uninstall: PATH changes and background processes ────────────────────
+
+  @id:lifecycle-linux-uninstall-keeps-shared-path @lifecycle @requires-os:linux
+  Scenario: lifecycle-23 - Linux - uninstall keeps the shell PATH change while another program shares the install directory
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the shell profile updated
+    And the installed binary has isolated XDG directories with state
+    And another program is installed in the install directory
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the other program is still in the install directory
+    And the shell profile still adds the install directory to PATH
+    And uninstall reports keeping the PATH change for the other program
+    And the record of the installer's PATH change is still in the install directory
+
+  @id:lifecycle-windows-uninstall-restores-user-path @lifecycle @requires-os:windows
+  Scenario: lifecycle-24 - Windows - uninstall takes the install directory back off the user PATH
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the user PATH is captured for restoration
+    And a signed bundle installed updating the user PATH
+    And the installed binary has isolated directories with state
+    When the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the install directory is not on the user PATH
+    And the record of the installer's PATH change is gone
+
+  @id:lifecycle-linux-uninstall-keep-binaries-keeps-path @lifecycle @requires-os:linux
+  Scenario: lifecycle-25 - Linux - uninstall that keeps the binaries keeps the shell PATH change
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the shell profile updated
+    And the installed binary has isolated XDG directories with state
+    When the user uninstalls from the installed binary keeping the binaries
+    Then the installed command exits successfully
+    And the installed rocm and rocmd binaries are present
+    And the shell profile still adds the install directory to PATH
+    And the record of the installer's PATH change is still in the install directory
+
+  @id:lifecycle-linux-uninstall-path-failure-keeps-binaries @lifecycle @requires-os:linux
+  Scenario: lifecycle-26 - Linux - uninstall that cannot undo the PATH change keeps the binaries for a retry
+    Given a freshly built release tree
+    And a generated signing keypair
+    And the shell profile already holds the user's own settings
+    And a signed bundle installed with the shell profile updated
+    And the installed binary has isolated XDG directories with state
+    And the shell profile cannot be rewritten
+    When the user uninstalls from the installed binary
+    Then uninstall fails saying the PATH change could not be undone
+    And the installed rocm and rocmd binaries are present
+    And the shell profile still adds the install directory to PATH
+    And the record of the installer's PATH change is still in the install directory
+    When the shell profile can be rewritten again
+    And the user uninstalls from the installed binary
+    Then the installed rocm and rocmd binaries are gone
+    And the shell profile is back to the user's own settings
+    And the record of the installer's PATH change is gone

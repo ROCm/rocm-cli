@@ -294,6 +294,16 @@ EOF
   printf '%s\n' "updated:${profile}"
 }
 
+# Add one line to the record of the PATH change this installer made, unless it
+# is already there.
+record_path_edit() {
+  record="${INSTALL_DIR}/.rocm-cli-path-edit"
+  if [ -f "${record}" ] && grep -qxF "$1" "${record}"; then
+    return 0
+  fi
+  printf '%s\n' "$1" >> "${record}"
+}
+
 ensure_installer_process_path() {
   case ":${PATH}:" in
     *:"${INSTALL_DIR}":*)
@@ -511,6 +521,15 @@ case ":${PATH}:" in
       profile_path="$(profile_path_for_shell)"
       path_expr="$(path_expr_for_profile "${INSTALL_DIR}")"
       profile_result="$(append_path_snippet "${profile_path}" "$(shell_name)" "${path_expr}")" || true
+      # Record where the marked block lives, and how it spells this folder, so
+      # `rocm uninstall` can take it out again. Only the installer's own block
+      # is recorded: a PATH line the user wrote themselves stays theirs. Lines
+      # are added, not replaced, so a block an earlier install wrote from
+      # another shell is still on record.
+      if grep -F "# >>> rocm-cli path >>>" "${profile_path}" >/dev/null 2>&1; then
+        record_path_edit "profile ${profile_path}"
+        record_path_edit "path-expr ${path_expr}"
+      fi
       case "${profile_result}" in
         updated:*)
           echo "shell profile updated:"

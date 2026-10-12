@@ -648,6 +648,12 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    ///
+    /// Removes the config, data, and cache directories and the installed
+    /// binaries, including the running rocm.exe on Windows. It also undoes the
+    /// PATH change the installer made (its marked shell-profile block, or the
+    /// user PATH entry it recorded adding on Windows), unless other programs
+    /// share the install folder.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -655,7 +661,7 @@ rocm logs --search error timeout")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries.
+        /// Keep installed rocm-cli binaries, and the installer's PATH change.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -13595,6 +13601,13 @@ struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
     skipped: Vec<String>,
     warnings: Vec<String>,
+    /// Installer PATH changes `rocm uninstall` undoes.
+    path_edits: Vec<uninstall::PathEdit>,
+    /// The installer's record of its PATH change, removed once that change is
+    /// undone.
+    path_record: Option<PathBuf>,
+    /// The running executable, on Windows, which is deleted as the command exits.
+    self_delete: Option<PathBuf>,
 }
 
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
@@ -13612,18 +13625,33 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 current_exe.display()
             ));
         } else {
-            for path in collect_installed_binary_candidates(&current_exe)? {
-                if rocm_core::runtime_is_windows() && path == current_exe {
-                    plan.skipped.push(format!(
-                        "skipping running executable on Windows: {}",
-                        path.display()
-                    ));
+            let binaries = collect_installed_binary_candidates(&current_exe)?;
+            for path in &binaries {
+                // Windows will not unlink a running image; it is deleted as
+                // the command exits instead.
+                if cfg!(windows) && *path == current_exe {
+                    plan.self_delete = Some(path.clone());
+                    continue;
+                }
+                // The PATH record goes only once its change is undone; see
+                // `uninstall::plan_path_edits`.
+                if path.file_name().and_then(|name| name.to_str())
+                    == Some(uninstall::PATH_EDIT_RECORD)
+                {
                     continue;
                 }
                 plan.actions.push(UninstallPlanEntry {
                     kind: "binary",
-                    path,
+                    path: path.clone(),
                 });
+            }
+            if let Some(bin_dir) = current_exe.parent() {
+                uninstall::plan_path_edits(
+                    &mut plan,
+                    bin_dir,
+                    &binaries,
+                    rocm_core::runtime_home_dir().as_deref(),
+                );
             }
         }
     }
@@ -13726,14 +13754,16 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
     let mut output = String::new();
     let _ = writeln!(output, "Uninstall review");
     let _ = writeln!(output);
-    if plan.actions.is_empty() {
+    let removals = uninstall::removal_count(plan);
+    if uninstall::plan_is_empty(plan) {
         let _ = writeln!(output, "Nothing managed by rocm-cli would be removed.");
-    } else {
-        let _ = writeln!(output, "{} item(s) would be removed:", plan.actions.len());
+    } else if removals > 0 {
+        let _ = writeln!(output, "{removals} item(s) would be removed:");
         for entry in &plan.actions {
             let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
         }
     }
+    uninstall::render_extra_plan(&mut output, plan);
     if !plan.warnings.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "Please review:");
@@ -13863,7 +13893,7 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
 }
 
 fn is_rocm_install_entry_name(name: &str) -> bool {
-    if name == ".rocm-cli-manifest" {
+    if name == ".rocm-cli-manifest" || name == uninstall::PATH_EDIT_RECORD {
         return true;
     }
     let normalized = name.strip_suffix(".exe").unwrap_or(name);

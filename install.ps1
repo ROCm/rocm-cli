@@ -527,6 +527,12 @@ function Add-InstallDirToUserPath {
     if (-not $userPathAlreadyConfigured) {
         $newUserPath = Add-PathListEntry $userPath $Path
         [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+        # Record the entry so `rocm uninstall` can take it out again. Only an
+        # entry this installer added is recorded; one that was already on the
+        # user PATH stays the user's.
+        $recordPath = Join-Path $Path ".rocm-cli-path-edit"
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($recordPath, "user-path $Path`n", $utf8NoBom)
     }
 
     $processPathAlreadyConfigured = Test-PathInList $env:Path $Path
