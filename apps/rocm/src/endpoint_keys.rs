@@ -22,6 +22,8 @@ use std::path::PathBuf;
 
 use rocm_core::AppPaths;
 
+use crate::service_launch::write_private_file_0600;
+
 /// Deterministic path of the 0600 endpoint key file for `service_id`.
 ///
 /// Delegates to the shared helper in `rocm-engine-protocol` so `rocmd` (which
@@ -36,7 +38,7 @@ pub(crate) fn endpoint_key_file_path(paths: &AppPaths, service_id: &str) -> Path
 /// existing value.
 pub(crate) fn store_endpoint_api_key(paths: &AppPaths, service_id: &str, key: &str) -> Result<()> {
     let path = endpoint_key_file_path(paths, service_id);
-    crate::service_launch::write_private_file_0600(&path, key.as_bytes())
+    write_private_file_0600(&path, key.as_bytes())
         .with_context(|| format!("failed to write endpoint API key file {}", path.display()))
 }
 

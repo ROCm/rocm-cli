@@ -8,9 +8,9 @@
 //! Mechanically relocated from `main.rs` with no behavior change. This is the
 //! managed-service-spawning tail that was deliberately deferred out of the
 //! Phase 6a (ROCMAI-82) split — `start_managed_service`, `run_attached_service`,
-//! `spawn_managed_engine_child`, `stream_attached_logs`, and the other
-//! still-crate-root launch helpers (`record_cli_audit_event`, and friends) they
-//! were entangled with — this is that later pass (ROCMAI-91, Phase 6b).
+//! `spawn_managed_engine_child`, `stream_attached_logs`, and the rest of this
+//! file — entangled with still-crate-root launch helpers (`record_cli_audit_event`,
+//! and friends) — this is that later pass (ROCMAI-91, Phase 6b).
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly, and
