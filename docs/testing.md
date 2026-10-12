@@ -516,7 +516,15 @@ is best effort per service — every failure is named, its record is put back on
 the runtime it actually ran on, and the command exits non-zero. After a failure
 the service is read back: one that is still live stays counted under
 `services_on_previous_runtime`, and one that is not is reported as stopped by
-the attempt. The error says which is which.
+the attempt. The error says which is which. `services_restarted` lists only
+servers that answered an inference request after the restart; one that was
+respawned but had not answered when the restart stopped waiting (45 seconds) is
+listed under `services_restarted_not_yet_serving` instead, and does not fail the
+command.
+
+Activating the runtime that is already active changes nothing: the report prints
+`changed_from_runtime_key: <unchanged>` and the existing rollback target is kept,
+so the activation command in the report's own note can be run safely.
 
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.

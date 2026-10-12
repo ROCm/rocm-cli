@@ -5862,7 +5862,7 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
             println!("  runtime_key: {}", result.runtime_key);
             println!(
                 "  changed_from_runtime_key: {}",
-                result.previous_runtime_key.as_deref().unwrap_or("<unset>")
+                changed_from_runtime_key_text(&result)
             );
             print!(
                 "{}",
@@ -6127,11 +6127,27 @@ pub(crate) struct RuntimeActivationResult {
     runtime_id: String,
     runtime_key: String,
     previous_runtime_key: Option<String>,
+    /// The runtime asked for was already the active one, so nothing was
+    /// switched and `previous_runtime_key` is the rollback target the earlier
+    /// activation recorded, not a runtime this call left.
+    reactivated: bool,
     /// What the live local servers were running on when this activation
-    /// happened. Read from disk, never assumed: the activation report used to
-    /// print a fixed "running services keep their recorded runtime" note
-    /// whether or not a single service existed.
+    /// happened. Read from disk, never assumed: a fixed "running services keep
+    /// their recorded runtime" note would be printed whether or not a single
+    /// service existed.
     services: runtime_services::RuntimeServiceReconciliation,
+}
+
+/// What `changed_from_runtime_key:` says in the activation report.
+///
+/// A re-activation left nothing, so naming the rollback target it retained
+/// would claim the user just came from it.
+fn changed_from_runtime_key_text(result: &RuntimeActivationResult) -> &str {
+    if result.reactivated {
+        "<unchanged>"
+    } else {
+        result.previous_runtime_key.as_deref().unwrap_or("<unset>")
+    }
 }
 
 /// The persisted state an activation replaces, captured before the first
@@ -6443,12 +6459,12 @@ pub(crate) fn activate_runtime(
     // Re-selecting the runtime already in use is a no-op to the user: they have
     // not left anything, so there is no new rollback target — and no reason to
     // forget the one the activation that put them here recorded. Deriving the
-    // target from `current` unconditionally used to clear it, silently removing
+    // target from `current` unconditionally would clear it, silently removing
     // the recovery path that activation had just offered.
-    let (previous_runtime_key, previous_runtime_id) = if current
+    let reactivating_active_runtime = current
         .as_ref()
-        .is_some_and(|current| current.runtime_key == manifest.runtime_key)
-    {
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
+    let (previous_runtime_key, previous_runtime_id) = if reactivating_active_runtime {
         let runtime_key = config.previous_runtime_key.clone();
         let runtime_id = runtime_key
             .as_deref()
@@ -6473,7 +6489,14 @@ pub(crate) fn activate_runtime(
     // Read the live services before anything is written, so an unreadable
     // services folder refuses the activation instead of half-applying it.
     let services =
-        runtime_services::reconcile_services_for_runtime(paths, &manifests, &manifest.runtime_key)?;
+        runtime_services::reconcile_services_for_runtime(paths, &manifests, &manifest.runtime_key)
+            .with_context(|| {
+                format!(
+                    "the local server records could not be read, so the switch to `{}` was not \
+                     made and the previously active runtime is unchanged",
+                    manifest.runtime_key
+                )
+            })?;
     let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(manifest.runtime_id.clone());
@@ -6501,6 +6524,7 @@ pub(crate) fn activate_runtime(
         runtime_id: manifest.runtime_id.clone(),
         runtime_key: manifest.runtime_key.clone(),
         previous_runtime_key,
+        reactivated: reactivating_active_runtime,
         services,
     })
 }
@@ -6527,7 +6551,14 @@ fn rollback_runtime(
         .filter(|_| new_previous_key.is_some());
 
     let services =
-        runtime_services::reconcile_services_for_runtime(paths, &manifests, &previous.runtime_key)?;
+        runtime_services::reconcile_services_for_runtime(paths, &manifests, &previous.runtime_key)
+            .with_context(|| {
+                format!(
+                    "the local server records could not be read, so the rollback to `{}` was not \
+                     made and the previously active runtime is unchanged",
+                    previous.runtime_key
+                )
+            })?;
     let snapshot = ActivationSnapshot::capture(paths, config);
 
     config.default_runtime_id = Some(previous.runtime_id.clone());
@@ -6555,6 +6586,7 @@ fn rollback_runtime(
         runtime_id: previous.runtime_id.clone(),
         runtime_key: previous.runtime_key.clone(),
         previous_runtime_key: new_previous_key,
+        reactivated: false,
         services,
     })
 }
@@ -9484,12 +9516,12 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
     // write the failed-activation restore uses, and it is strictly stronger than
     // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
     // sharing violation when another process holds the marker open. The helper
-    // falls back to `ReplaceFileW` there. The destination is never removed
-    // first, on any platform — that would leave a window with no marker at all,
-    // which runtime resolution and the storage retention holds both read as
-    // "nothing is active" — and a failed publish takes its temp file with it,
-    // so a retried activation cannot strand one in the folder `rocm runtimes`
-    // reads.
+    // uses `ReplaceFileW` there whenever the destination exists. The
+    // destination is never removed first, on any platform — that would leave a
+    // window with no marker at all, which runtime resolution and the storage
+    // retention holds both read as "nothing is active" — and a failed publish
+    // takes its temp file with it, so a retried activation cannot strand one in
+    // the folder `rocm runtimes` reads.
     therock::write_file_atomically(
         &path,
         &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
@@ -15857,6 +15889,51 @@ fn apply_restart_runtime_pin(record: &mut ManagedServiceRecord, runtime_pin: Opt
     }
 }
 
+/// Load the record a restart relaunches from, with the caller's runtime pin
+/// applied after the load's own refresh.
+///
+/// Everything a restart can say about WHICH runtime the child comes back on is
+/// decided here and in [`restart_child_argv`], and neither spawns anything, so
+/// `restart_internal_managed_service` is only the stop, the spawn and the
+/// readiness wait around them. That split is what lets a test reach the part of
+/// a restart that matters for a move without an engine: dropping the pin from
+/// this function, or from the caller that supplies it, changes the argv a test
+/// reads off [`restart_child_argv`].
+fn load_service_for_restart(
+    paths: &AppPaths,
+    service_id: &str,
+    runtime_pin: Option<&str>,
+) -> Result<ManagedServiceRecord> {
+    let mut record = load_managed_service(paths, service_id)?;
+    apply_restart_runtime_pin(&mut record, runtime_pin);
+    Ok(record)
+}
+
+/// The argv a restarted child is launched with, read entirely off the record.
+///
+/// Every field comes from the record rather than from a parameter on purpose: a
+/// restart's runtime is whatever the record says after
+/// [`load_service_for_restart`], and an input here that bypassed it would let a
+/// test assert a runtime the restart never uses.
+fn restart_child_argv(record: &ManagedServiceRecord) -> Result<Vec<String>> {
+    let policy = parse_device_policy(record.device_policy.as_deref())?;
+    let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
+    builtin_engine_serve_http_args(
+        &record.engine,
+        &record.service_id,
+        &record.canonical_model_id,
+        &record.host,
+        record.port,
+        &policy,
+        &record.gpu_indices,
+        record.runtime_id.as_deref(),
+        record.env_id.as_deref(),
+        recipe.as_ref(),
+        &record.engine_state_path,
+        Some(&record.log_path),
+    )
+}
+
 /// Stop a managed service and bring it back up.
 ///
 /// `runtime_pin` is for callers whose whole reason for restarting is to MOVE the
@@ -15875,8 +15952,7 @@ fn restart_internal_managed_service(
     service_id: &str,
     runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
-    let mut record = load_managed_service(paths, service_id)?;
-    apply_restart_runtime_pin(&mut record, runtime_pin);
+    let mut record = load_service_for_restart(paths, service_id, runtime_pin)?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
     // deletes the key file (correct on a real stop), but a restart must bring the
     // service back on the same public host with the same auth. Capture it first and
@@ -15899,7 +15975,10 @@ fn restart_internal_managed_service(
     // the record writes below; if the restart bails before one of those, the
     // marker stays set on disk — correct, since then the stop is what stands.
     record.stop_requested_unix_ms = None;
-    let policy = parse_device_policy(record.device_policy.as_deref())?;
+    // Still after the stop, like the device-policy refusal inside it always was:
+    // the callers' "stopped by the attempt" report and pin restore both cover a
+    // restart that gets this far and fails.
+    let serve_args = restart_child_argv(&record)?;
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -15911,21 +15990,6 @@ fn restart_internal_managed_service(
     }
     let current_exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
-    let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
-    let serve_args = builtin_engine_serve_http_args(
-        &record.engine,
-        &record.service_id,
-        &record.canonical_model_id,
-        &record.host,
-        record.port,
-        &policy,
-        &record.gpu_indices,
-        record.runtime_id.as_deref(),
-        record.env_id.as_deref(),
-        recipe.as_ref(),
-        &record.engine_state_path,
-        Some(&record.log_path),
-    )?;
     let engine_envs_root = env_root_for_service(
         paths,
         &record.engine,
@@ -21238,6 +21302,87 @@ pub(crate) mod tests {
             parse_device_policy(Some(DevicePolicyArg::CpuOnly.as_policy_str())).is_err(),
             "cpu_only must be rejected"
         );
+    }
+
+    fn parse_runtimes(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "runtimes"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    /// The two restart flags as `activate` and `rollback` parsed them.
+    fn runtimes_restart_flags(args: &[&str]) -> (bool, bool) {
+        match parse_runtimes(args).expect("flags parse").command {
+            Some(Command::Runtimes {
+                command:
+                    Some(
+                        RuntimesCommand::Activate {
+                            restart_services,
+                            yes,
+                            ..
+                        }
+                        | RuntimesCommand::Rollback {
+                            restart_services,
+                            yes,
+                        },
+                    ),
+            }) => (restart_services, yes),
+            other => panic!("expected runtimes activate or rollback, got {other:?}"),
+        }
+    }
+
+    // `--yes` approves a restart, so on its own it asks for something that was
+    // never requested. Mutation: removing `requires = "restart_services"` from
+    // either subcommand's `yes` makes that subcommand's argv parse and fails
+    // the loop on it.
+    #[test]
+    fn runtimes_activate_and_rollback_refuse_yes_without_restart_services() {
+        for args in [&["activate", "x", "--yes"][..], &["rollback", "--yes"][..]] {
+            let error = parse_runtimes(args)
+                .expect_err("a bare --yes has nothing to approve and must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "expected a missing-argument refusal for {args:?}"
+            );
+            assert!(
+                error.to_string().contains("restart-services"),
+                "the refusal must name the flag that is missing for {args:?}:\n{error}"
+            );
+        }
+    }
+
+    // Mutation: making `--restart-services` conflict with `--yes`, or dropping
+    // the `yes` field from either variant, fails the pair assertions.
+    #[test]
+    fn runtimes_restart_flags_parse_together_and_alone() {
+        for prefix in [&["activate", "x"][..], &["rollback"][..]] {
+            let mut together = prefix.to_vec();
+            together.extend(["--restart-services", "--yes"]);
+            assert_eq!(
+                runtimes_restart_flags(&together),
+                (true, true),
+                "{together:?}"
+            );
+
+            let mut alone = prefix.to_vec();
+            alone.push("--restart-services");
+            assert_eq!(runtimes_restart_flags(&alone), (true, false), "{alone:?}");
+
+            assert_eq!(runtimes_restart_flags(prefix), (false, false), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn runtimes_activate_parses_the_runtime_it_was_given() {
+        let cli = parse_runtimes(&["activate", "release-pip-x", "--restart-services", "--yes"])
+            .expect("activate parses");
+        match cli.command {
+            Some(Command::Runtimes {
+                command: Some(RuntimesCommand::Activate { runtime, .. }),
+            }) => assert_eq!(runtime, "release-pip-x"),
+            other => panic!("expected runtimes activate, got {other:?}"),
+        }
     }
 
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -29956,6 +30101,72 @@ install therock";
         Ok(())
     }
 
+    // The install report is only as honest as the reconciliation that reaches
+    // it: a server still on the runtime the install just replaced has to survive
+    // `finalize_successful_sdk_install` into the finalization the report renders.
+    // The service is planted under the same rebased paths the production
+    // activation reads its service records from.
+    // Mutation: replacing `services: activation.services` with a default
+    // reconciliation in `finalize_successful_sdk_install` fails the `stale`
+    // assertion and the rendered-count assertion.
+    #[test]
+    fn sdk_install_finalization_carries_the_servers_left_on_the_replaced_runtime() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization-services");
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let newest = write_test_pip_runtime(
+            &paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let activation_paths = paths
+            .clone()
+            .with_managed_root(newest.install_root.clone(), false);
+        activation_paths.ensure()?;
+        plant_service_record_on_runtime(
+            &activation_paths,
+            "svc-sdk-stale",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let finalized = finalize_successful_sdk_install(&paths)?
+            .context("sdk install finalization should select the newest runtime")?;
+        let rendered = render_sdk_install_success(&finalized);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(finalized.runtime_key, NEW_RUNTIME_KEY);
+        assert_eq!(
+            finalized.services.stale,
+            vec![runtime_services::RuntimeServiceEntry {
+                service_id: "svc-sdk-stale".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+            }],
+            "the server still on the replaced runtime must be carried into the \
+             finalization: {:?}",
+            finalized.services
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1")
+                && rendered.contains(&format!(
+                    "- svc-sdk-stale engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+                )),
+            "the install report names the server the install left behind:\n{rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn render_runtimes_text_reports_missing_configured_active_runtime() -> Result<()> {
         let (root, paths) = test_paths("runtime-active-missing");
@@ -30444,11 +30655,11 @@ install therock";
         Ok(())
     }
 
-    /// Before this fix, a vLLM record whose engine state file carried a
-    /// `runtime_id` — the way a real engine always writes it — and also had an
-    /// `env_id` was silently classified as `Matches` and never reported. This
-    /// test would have FAILED with the old `None if record.env_id.is_some()`
-    /// arm in place.
+    /// A vLLM record whose engine state file carries a `runtime_id` — the way a
+    /// real engine always writes it — and also has an `env_id` is classified by
+    /// that runtime like any other record, so it is reported when it differs
+    /// from the one being activated. Treating `env_id` as a pin would classify
+    /// it `Matches` and never report it, which makes this test fail.
     #[test]
     fn runtime_activation_reports_env_pinned_service_the_engine_recorded_a_runtime_for()
     -> Result<()> {
@@ -30474,8 +30685,8 @@ install therock";
         // Overwrite the engine state file with a realistic payload that carries
         // a non-empty `runtime_id`. `refresh_from_engine_state` reads this and
         // sets `record.runtime_id`, which is then what `classify_service_runtime_state`
-        // sees — so the `None` arm no longer applies and the old `env_id` guard
-        // no longer hides it.
+        // sees — so the record is judged by its runtime, and the `env_id` it
+        // also carries does not hide it.
         fs::write(
             &record.engine_state_path,
             serde_json::to_vec(&serde_json::json!({
@@ -30854,30 +31065,6 @@ install therock";
         Ok(())
     }
 
-    /// Rebuild the child's argv the way `restart_internal_managed_service`
-    /// does: from the record as that function holds it, after its own load and
-    /// after `apply_restart_runtime_pin`. Every field is read off the record for
-    /// that reason — a helper that took the runtime key as a parameter would
-    /// assert nothing about which record state the restart actually sees.
-    fn restart_child_argv_for_record(record: &ManagedServiceRecord) -> Result<Vec<String>> {
-        let policy = parse_device_policy(record.device_policy.as_deref())?;
-        let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
-        builtin_engine_serve_http_args(
-            &record.engine,
-            &record.service_id,
-            &record.canonical_model_id,
-            &record.host,
-            record.port,
-            &policy,
-            &record.gpu_indices,
-            record.runtime_id.as_deref(),
-            record.env_id.as_deref(),
-            recipe.as_ref(),
-            &record.engine_state_path,
-            Some(&record.log_path),
-        )
-    }
-
     /// The value following `flag` in an argv, or `None` when the flag is absent.
     fn argv_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         let index = args.iter().position(|arg| arg == flag)?;
@@ -30894,21 +31081,33 @@ install therock";
     /// differ — and it is the child's argv that decides which runtime comes back
     /// up.
     ///
-    /// The setup is what makes this non-vacuous, and it is the case the MI300X
-    /// lane failed on rather than an invented one. The service being moved is
+    /// The setup is what makes this non-vacuous, and it is the state a live
+    /// restart really sees rather than an invented one. The service being moved is
     /// still running when the restart loads its record, so its engine state file
     /// still describes it, and `refresh_from_engine_state` re-adopts that
     /// process's `runtime_id` and `env_id` over the pin
-    /// `pin_service_record_to_runtime` had just written. `without_pin` below is
-    /// that load: the disk says the new runtime, the loaded record says the old
-    /// one, and the argv carries no `--runtime-id` at all because the revived
-    /// `env_id` suppresses it. Deleting the body of `apply_restart_runtime_pin`
-    /// makes `with_pin` identical to it, and the last two assertions fail.
+    /// `pin_service_record_to_runtime` had just written. The `None` load at the
+    /// end is that load: the argv carries no `--runtime-id` at all because the
+    /// revived `env_id` suppresses it.
     ///
-    /// What it does not reach: that `restart_internal_managed_service` calls
-    /// `apply_restart_runtime_pin` at all, or that the child launched with this
-    /// argv loads that runtime. The first needs a spawn, the second a GPU —
-    /// `runtime-lifecycle-10` is where both are observed.
+    /// The restart is the production `restart_service_onto_runtime_with`, handed
+    /// a stand-in that does what `restart_internal_managed_service` does up to
+    /// the spawn — `load_service_for_restart`, then `restart_child_argv` — and
+    /// then fails. Two things are guarded:
+    ///
+    /// - that `load_service_for_restart` applies the pin it is given: removing
+    ///   the `apply_restart_runtime_pin` call inside it leaves the revived
+    ///   `env_id` in place, and the `--runtime-id` and `--env-id` assertions
+    ///   fail;
+    /// - that `restart_service_onto_runtime_with` hands the key to the restart:
+    ///   passing `None` instead of `Some(runtime_key)` fails the assertion on the
+    ///   pin the stand-in was given, and with it the `--runtime-id` assertion.
+    ///
+    /// The failing stand-in also drives the restore path, so the record on disk
+    /// is read back to be on the runtime it ran on.
+    ///
+    /// What it does not reach is that a real child launched with this argv loads
+    /// the runtime, which needs a GPU: `runtime-lifecycle-12` observes that.
     #[test]
     fn pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv() -> Result<()> {
         let (root, paths) = test_paths("service-runtime-pin-argv");
@@ -30923,56 +31122,85 @@ install therock";
             Some("custom-env"),
         )?;
         // The outgoing process's own state, in the shape vLLM writes it: the
-        // family form it resolved, and an `env_id` it records on every launch
-        // whether or not the user asked for one.
+        // exact key it was launched with, the family form it resolved that to,
+        // and an `env_id` it records on every launch whether or not the user
+        // asked for one.
         fs::write(
             &planted.engine_state_path,
             serde_json::to_vec(&serde_json::json!({
                 "status": "starting",
+                "requested_runtime_id": OLD_RUNTIME_KEY,
                 "runtime_id": "therock-release:gfx120X-all",
                 "env_id": "custom-env",
             }))?,
         )?;
+        let handed_pin = RefCell::new(None::<String>);
+        let observed_argv = RefCell::new(None::<Vec<String>>);
 
-        runtime_services::pin_service_record_to_runtime(&paths, "svc-argv", NEW_RUNTIME_KEY)?;
-        // Read before the load below, which may itself write the refreshed
-        // record back over the pin.
-        let on_disk = fs::read_to_string(paths.service_manifest_path("svc-argv"))?;
-        let mut loaded_for_restart = load_managed_service(&paths, "svc-argv")?;
-        let without_pin = restart_child_argv_for_record(&loaded_for_restart)?;
-        apply_restart_runtime_pin(&mut loaded_for_restart, Some(NEW_RUNTIME_KEY));
-        let with_pin = restart_child_argv_for_record(&loaded_for_restart)?;
+        let error = runtime_services::restart_service_onto_runtime_with(
+            &paths,
+            "svc-argv",
+            NEW_RUNTIME_KEY,
+            |restart_paths, service_id, pin| -> Result<ManagedServiceRecord> {
+                *handed_pin.borrow_mut() = pin.map(ToOwned::to_owned);
+                let record = load_service_for_restart(restart_paths, service_id, pin)?;
+                *observed_argv.borrow_mut() = Some(restart_child_argv(&record)?);
+                bail!("stop here: the argv is what is under test");
+            },
+        )
+        .expect_err("the stand-in restart always fails");
+        let handed_pin = handed_pin.into_inner();
+        let observed_argv = observed_argv.into_inner();
+        // Read the file itself: a load would refresh the record from the engine
+        // state again and hide what the restore wrote.
+        let on_disk: ManagedServiceRecord =
+            serde_json::from_slice(&fs::read(paths.service_manifest_path("svc-argv"))?)?;
+        let unpinned = load_service_for_restart(&paths, "svc-argv", None)?;
+        let unpinned_argv = restart_child_argv(&unpinned)?;
         let _ = fs::remove_dir_all(&root);
 
         assert!(
-            on_disk.contains(NEW_RUNTIME_KEY),
-            "the pin reached the record on disk, so what follows is the refresh \
-             undoing it rather than the write never happening: {on_disk}"
+            format!("{error:#}").contains("stop here"),
+            "the stand-in's own failure must reach the caller:\n{error:#}"
         );
         assert_eq!(
-            argv_flag_value(&without_pin, "--runtime-id"),
-            None,
-            "the record loaded for the restart has had the outgoing process's \
-             `env_id` restored over the pin, and that alone drops the runtime \
-             pin from the child's argv: {without_pin:?}"
+            handed_pin.as_deref(),
+            Some(NEW_RUNTIME_KEY),
+            "the key has to be passed to the restart as well as written to the \
+             record: the restart's own load refreshes the record from the \
+             outgoing process's state and undoes the write"
         );
+        let argv = observed_argv.context("the stand-in restart never built an argv")?;
         assert_eq!(
-            argv_flag_value(&without_pin, "--env-id"),
-            Some("custom-env"),
-            "which is the engine's own env coming back, not the user's: {without_pin:?}"
-        );
-        assert_eq!(
-            argv_flag_value(&with_pin, "--runtime-id"),
+            argv_flag_value(&argv, "--runtime-id"),
             Some(NEW_RUNTIME_KEY),
             "re-applying the pin after the refresh is what makes the restarted \
-             child load the runtime that was just activated: {with_pin:?}"
+             child load the runtime that was just activated: {argv:?}"
         );
         assert_eq!(
-            argv_flag_value(&with_pin, "--env-id"),
+            argv_flag_value(&argv, "--env-id"),
             None,
             "clearing `env_id` is half the pin, not tidying: leaving it set \
-             would suppress the `--runtime-id` asserted above: {with_pin:?}"
+             would suppress the `--runtime-id` asserted above: {argv:?}"
         );
+        assert_eq!(
+            argv_flag_value(&unpinned_argv, "--runtime-id"),
+            None,
+            "without the pin the same record is restarted with no `--runtime-id`, \
+             because the outgoing process's `env_id` is restored over it; this is \
+             what makes the assertions above mean something: {unpinned_argv:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&unpinned_argv, "--env-id"),
+            Some("custom-env"),
+            "which is the engine's own env coming back, not the user's: {unpinned_argv:?}"
+        );
+        assert_eq!(
+            on_disk.runtime_id.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the failed restart must put the record back on the runtime it ran on"
+        );
+        assert_eq!(on_disk.env_id.as_deref(), Some("custom-env"));
         Ok(())
     }
 
@@ -31206,6 +31434,69 @@ install therock";
         );
     }
 
+    // A respawn is "serving" only when the restart saw an inference request
+    // succeed, which is the one way it leaves the record at `ready`. The other
+    // statuses it can return — the endpoint lists the model, or nothing answered
+    // within the wait — are a server that was moved and not yet confirmed, and
+    // neither is rolled back: the record keeps naming the runtime it was moved to.
+    // Mutation: matching `running` or `starting` as well as `ready` in
+    // `restart_service_onto_runtime_with` makes the outcomes list differ.
+    #[test]
+    fn a_restart_counts_as_serving_only_when_the_respawned_server_is_ready() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-outcome");
+        paths.ensure()?;
+        let mut outcomes = Vec::new();
+        let mut recorded_runtimes = Vec::new();
+        for (service_id, status) in [
+            ("svc-ready", "ready"),
+            ("svc-running", "running"),
+            ("svc-starting", "starting"),
+        ] {
+            plant_service_record_on_runtime(
+                &paths,
+                service_id,
+                "vllm",
+                "starting",
+                std::process::id(),
+                Some(OLD_RUNTIME_KEY),
+                None,
+            )?;
+            outcomes.push(runtime_services::restart_service_onto_runtime_with(
+                &paths,
+                service_id,
+                NEW_RUNTIME_KEY,
+                |restart_paths, id, _pin| {
+                    let mut record = load_managed_service(restart_paths, id)?;
+                    status.clone_into(&mut record.status);
+                    Ok(record)
+                },
+            )?);
+            recorded_runtimes.push(load_managed_service(&paths, service_id)?.runtime_id);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            outcomes,
+            vec![
+                runtime_services::ServiceRestartOutcome::Serving,
+                runtime_services::ServiceRestartOutcome::NotConfirmed {
+                    status: "running".to_owned()
+                },
+                runtime_services::ServiceRestartOutcome::NotConfirmed {
+                    status: "starting".to_owned()
+                },
+            ]
+        );
+        assert!(
+            recorded_runtimes
+                .iter()
+                .all(|runtime| runtime.as_deref() == Some(NEW_RUNTIME_KEY)),
+            "a respawned server stays recorded on the runtime it was moved to, \
+             confirmed or not: {recorded_runtimes:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_failed_activation_restores_the_marker_it_replaced() -> Result<()> {
         let (root, paths) = test_paths("activation-snapshot-restore");
@@ -31247,8 +31538,9 @@ install therock";
     /// above asserts the bytes come back; swapping `write_file_atomically` for a
     /// bare `fs::write` satisfies that and leaves the arm that runs *after
     /// something already failed* able to strand a truncated marker. The inode is
-    /// the observable difference, so this is Unix-only — the same limitation the
-    /// residual records for the equivalent `rocm-core` test.
+    /// the observable difference, so this test reads it on Unix only; the
+    /// equivalent `rocm-core` config-save test also has a Windows variant that
+    /// reads the file identity instead.
     #[cfg(unix)]
     #[test]
     fn restoring_a_marker_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
@@ -31336,19 +31628,74 @@ install therock";
         Ok(())
     }
 
-    // The double-fault arm of `restore_after_failed_activation` — the restore
-    // itself failing — has no test written. It is reachable: make
-    // `data_dir/runtimes/` non-writable while leaving a readable `active.json`
-    // inside it, and `capture` returns `Contents`, the config save succeeds
-    // (`config_dir` is a different directory), the marker write fails on
-    // `create_new`, and the restore then fails writing the same marker back.
-    // Planting a directory — the trick `runtime-lifecycle-11` uses — does not
-    // substitute, because it makes `capture` read `Unreadable`, whose restore
-    // is the no-op. So the setup needs permissions, which root ignores; the
-    // repo's answer to that is to skip under root rather than to give up, as
-    // `therock::tests` does for its own read-only-parent case. Not written
-    // because the arm's message is short enough to read correctly by
-    // inspection, not because it cannot be.
+    // A restore that fails too must say so and name the way out, rather than
+    // claim the previous runtime is still the active one. The marker's parent is
+    // made a regular file, so writing the captured bytes back fails at
+    // `create_dir_all` on every platform without needing privileges.
+    // Mutation: returning the single-fault message from the `Err(restore_error)`
+    // arm of `restore_after_failed_activation` makes the second assertion fail.
+    #[test]
+    fn a_restore_that_fails_too_names_both_failures_and_how_to_recover() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-double-fault");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        assert!(
+            matches!(snapshot.marker, MarkerSnapshot::Contents(_)),
+            "only a captured marker is written back, which is the restore that can fail"
+        );
+        // Stand in for a half-applied activation: the config moved on, in memory
+        // and on disk.
+        config.default_runtime_id = Some("therock-release:gfx1100".to_owned());
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        let marker_parent = active_runtime_marker_path(&paths)
+            .parent()
+            .context("active runtime marker path has no parent directory")?
+            .to_path_buf();
+        fs::remove_dir_all(&marker_parent)?;
+        fs::write(&marker_parent, b"not a directory")?;
+
+        let error = restore_after_failed_activation(
+            &paths,
+            &mut config,
+            snapshot,
+            anyhow::anyhow!("marker write failed"),
+        );
+        let rendered = format!("{error:#}");
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("marker write failed"),
+            "the failure that started the rollback must survive:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("restoring the previous state failed too"),
+            "a restore that failed must not be reported as one that worked:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("rocm runtimes list"),
+            "the user needs the command that shows the disagreeing state:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("the previously active runtime is still the active one"),
+            "that sentence is only true when the restore worked:\n{rendered}"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the in-memory config is put back before anything that can fail"
+        );
+        assert_eq!(config.previous_runtime_key, None);
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the config half of the restore still happened"
+        );
+        Ok(())
+    }
 
     #[test]
     fn reactivating_the_active_runtime_keeps_the_rollback_target() -> Result<()> {
@@ -31403,6 +31750,96 @@ install therock";
              the user last switched away from"
         );
         Ok(())
+    }
+
+    // The rollback target's runtime can be uninstalled while it is still the
+    // recorded target. Re-activating the active runtime then keeps the recorded
+    // key but cannot name an id for a runtime that is no longer registered. The
+    // two runtimes have different ids so that an id taken from the active
+    // runtime instead of the target is visible.
+    // Mutation: resolving `previous_runtime_id` from `current` rather than from
+    // `manifests` makes the marker carry the active runtime's id and fails the
+    // `previous_runtime_id` assertion; reporting `reactivated: false` for a
+    // re-activation fails the `reactivated.reactivated` assertion.
+    #[test]
+    fn reactivating_after_the_rollback_target_was_uninstalled_records_no_id_for_it() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-reactivate-uninstalled-target");
+        paths.ensure()?;
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all-old",
+            "7.12.0",
+            10,
+        )?;
+        let new_manifest = write_test_pip_runtime(
+            &paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all-new",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)?;
+        let switched = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        fs::remove_file(runtime_manifest_path(&paths, OLD_RUNTIME_KEY))?;
+
+        let reactivated = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        let marker: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !switched.reactivated,
+            "moving between two runtimes is a switch"
+        );
+        assert!(
+            reactivated.reactivated,
+            "asking for the runtime that is already active switches nothing"
+        );
+        assert_eq!(marker.runtime_key, NEW_RUNTIME_KEY);
+        assert_eq!(
+            marker.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the recorded rollback target is kept as the key it was recorded under"
+        );
+        assert_eq!(
+            marker.previous_runtime_id, None,
+            "no registered runtime has that key any more, so there is no id to \
+             record for it; the active runtime's id `{}` is not the target's",
+            new_manifest.runtime_id
+        );
+        assert_eq!(
+            persisted.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_activation_report_says_unchanged_only_when_nothing_was_switched() {
+        let result = |reactivated: bool, previous: Option<&str>| RuntimeActivationResult {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: NEW_RUNTIME_KEY.to_owned(),
+            previous_runtime_key: previous.map(ToOwned::to_owned),
+            reactivated,
+            services: runtime_services::RuntimeServiceReconciliation::default(),
+        };
+        let reactivated_with_target = result(true, Some(OLD_RUNTIME_KEY));
+        let switched = result(false, Some(OLD_RUNTIME_KEY));
+        let first_activation = result(false, None);
+
+        // Mutation: dropping the `reactivated` branch of
+        // `changed_from_runtime_key_text` fails this first assertion.
+        assert_eq!(
+            changed_from_runtime_key_text(&reactivated_with_target),
+            "<unchanged>",
+            "naming the retained rollback target would claim the user just came from it"
+        );
+        assert_eq!(changed_from_runtime_key_text(&switched), OLD_RUNTIME_KEY);
+        assert_eq!(changed_from_runtime_key_text(&first_activation), "<unset>");
     }
 
     #[test]
@@ -33146,7 +33583,12 @@ install therock";
         // Verify that the reconciliation section is printed even when no services
         // are stale, so callers can distinguish "looked and found nothing" from
         // "never looked" — the same guarantee `runtimes activate` provides.
-        let finalized = sdk_install_finalization();
+        // A previous runtime is recorded, so the rollback hint is printed too and
+        // the ordering below has two things to order.
+        let finalized = SdkInstallFinalization {
+            previous_runtime_key: Some("wheel-gfx942-7.12.0".to_owned()),
+            ..sdk_install_finalization()
+        };
         let rendered = render_sdk_install_success(&finalized);
         assert!(
             rendered.contains("services_on_previous_runtime:"),
@@ -33159,13 +33601,18 @@ install therock";
         );
         // The reconciliation must appear before any rollback hint, matching the
         // ordering the `runtimes activate` handler uses.
-        let recon_pos = rendered.find("services_on_previous_runtime:").unwrap();
-        if let Some(rollback_pos) = rendered.find("rocm runtimes rollback") {
-            assert!(
-                recon_pos < rollback_pos,
-                "reconciliation section must precede the rollback hint:\n{rendered}"
-            );
-        }
+        // Mutation: printing the hint before the reconciliation section fails the
+        // position comparison; dropping the hint fails the `expect`.
+        let recon_pos = rendered
+            .find("services_on_previous_runtime:")
+            .expect("the reconciliation section is printed");
+        let rollback_pos = rendered
+            .find("rocm runtimes rollback")
+            .expect("a recorded previous runtime prints the rollback hint");
+        assert!(
+            recon_pos < rollback_pos,
+            "reconciliation section must precede the rollback hint:\n{rendered}"
+        );
     }
 
     #[test]
@@ -34873,6 +35320,7 @@ install therock";
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
+            reactivated: false,
             // No live services: this test is about the rollback hint, and an
             // empty reconciliation is what an update on a machine with nothing
             // serving produces.
@@ -34898,6 +35346,7 @@ install therock";
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: None,
+            reactivated: false,
             services: runtime_services::RuntimeServiceReconciliation::default(),
         };
         let mut rendered = String::new();
@@ -35031,10 +35480,17 @@ install therock";
         }
     }
 
-    /// The exact-match arm of `classify_service_runtime_state` — the record's
-    /// runtime IS the one being activated — had only indirect coverage. It is
-    /// the arm that keeps a server already on the target runtime out of the
-    /// report, so breaking it would stop and respawn servers for nothing.
+    /// How `classify_service_runtime_state` sorts a record against the runtime
+    /// being activated when the manifest list is complete: a server already on
+    /// that runtime matches, the same record is stale once a different runtime
+    /// is activated, a family id shared by two installs is reported rather than
+    /// guessed, one that resolves to a single install matches that install, and
+    /// a record naming no runtime is unknown.
+    ///
+    /// It does not isolate the exact-key fast path: `runtime_manifest_for_selector`
+    /// resolves an exact key too, so every exact-key assertion here still holds
+    /// without that arm. `a_record_naming_the_active_runtime_matches_without_any_manifest_to_resolve_it`
+    /// covers it.
     #[test]
     fn classifying_a_service_against_the_runtime_it_already_runs_on() {
         let (root, paths) = test_paths("classify-service-runtime-state");
@@ -35134,6 +35590,48 @@ install therock";
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // The exact-key arm of `classify_service_runtime_state` answers from the
+    // record alone, so it still holds for a caller whose manifest list does not
+    // contain the key. With the full list the arm cannot be told apart from the
+    // resolution below it, because that resolves an exact key too; an empty list
+    // is where it is the only thing that can say `Matches`.
+    // Mutation: deleting the `Some(recorded) if recorded == runtime_key` arm
+    // makes the `Matches` assertion fail, since nothing is left to resolve the
+    // key.
+    #[test]
+    fn a_record_naming_the_active_runtime_matches_without_any_manifest_to_resolve_it() {
+        let (_root, paths) = test_paths("classify-service-runtime-state-no-manifests");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-classify-empty",
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            9,
+            "managed",
+            1,
+            Some(NEW_RUNTIME_KEY.to_owned()),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &[], NEW_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Matches,
+            "a record that names the runtime being activated needs no manifest to say so"
+        );
+
+        record.runtime_id = Some(OLD_RUNTIME_KEY.to_owned());
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &[], NEW_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: OLD_RUNTIME_KEY.to_owned()
+            },
+            "a different recorded runtime is stale however short the manifest list is"
+        );
     }
 
     #[cfg(unix)]

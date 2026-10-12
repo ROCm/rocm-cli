@@ -74,11 +74,14 @@ Feature: Runtime lifecycle state machine
   # instead of leaving it alone. The shortest command sequence that exposes this
   # is three activations in a row, which is why none of the hand-written
   # examples above caught it: every one- and two-command sequence conforms.
+  # The report also says nothing changed, rather than naming the retained rollback
+  # target as the runtime the user came from.
   @id:runtime-lifecycle-reactivating-keeps-rollback-target
   Scenario: runtime-lifecycle-08 - Re-selecting the runtime already in use keeps the rollback target
     Given two registered runtimes with the second active after the first
     When the user activates the second runtime again
-    Then the second runtime is still the one in use
+    Then the report says the runtime did not change
+    And the second runtime is still the one in use
     And the first runtime is still the rollback target
 
   # A selector that matched installed runtime keys only by letter case used to
@@ -97,13 +100,11 @@ Feature: Runtime lifecycle state machine
     When the user activates one of them by its exact key
     Then that exact runtime becomes active
 
-  # Activating used to close its report with one fixed sentence — "running
-  # services keep their recorded runtime until they are restarted" — printed
-  # whether or not a single local server existed, so it could neither name a
-  # server that was really left behind nor stay quiet when none was. The report
-  # is now derived from the on-disk service records: the same planted server is
-  # silent (`services_on_previous_runtime: 0`) while the runtime it recorded is
-  # the one being activated, and is named once activating moves past it.
+  # The activation report is derived from the on-disk service records, not from
+  # a fixed sentence about "running services" printed whether or not a single
+  # local server existed: the same planted server is silent
+  # (`services_on_previous_runtime: 0`) while the runtime it recorded is the one
+  # being activated, and is named once activating moves past it.
   @id:runtime-lifecycle-activate-names-services-left-behind
   Scenario: runtime-lifecycle-10 - Activating names the local servers left on the previous runtime
     Given two registered runtimes and a local server recorded on the first
@@ -111,7 +112,7 @@ Feature: Runtime lifecycle state machine
     Then the activation reports no local server left on a previous runtime
     When the user activates the second runtime
     Then the activation names the local server left on the first runtime
-    And the activation does not print the old fixed note about running services
+    And the activation does not print a fixed note about running services
 
   # `--restart-services` stops and respawns live local servers, so it needs the
   # same explicit approval every other service mutation takes — and the refusal
@@ -125,12 +126,16 @@ Feature: Runtime lifecycle state machine
 
   # Full success path for `--restart-services --yes`: a running managed server is
   # stopped and respawned onto the runtime just activated, exits the command with
-  # rc=0, and the report names it under `services_restarted` rather than
-  # `services_on_previous_runtime`.
+  # rc=0, and the report lists it as restarted — under `services_restarted` once
+  # it answers an inference request, under `services_restarted_not_yet_serving`
+  # while the model is still loading, which the endpoint step then waits out —
+  # rather than under `services_on_previous_runtime`.
   #
-  # The closing step reads the record back through `refresh_from_engine_state`,
-  # which adopts the runtime the engine really launched with, and asserts the
-  # activation finds nothing left behind. What it does NOT do is police the
+  # The closing steps re-activate the runtime, which reads the record back
+  # through `refresh_from_engine_state` and so adopts the runtime the engine
+  # really launched with, and assert the activation finds nothing left behind
+  # and no server whose runtime went unrecorded — so a server that came back on
+  # the wrong runtime is named there. What they do NOT do is police the
   # pin-before-restart order inside `restart_service_onto_runtime`: an engine
   # that resolved a runtime for itself reports the manifest's family id, and
   # `classify_service_runtime_state` resolves an unambiguous family id back to
@@ -160,31 +165,32 @@ Feature: Runtime lifecycle state machine
     And a model is being served on GPU
     And the running service is recorded on a different runtime
     When the user activates the current runtime restarting services with confirmation
-    Then the activation exits 0 and names the service under services_restarted
-    And the restarted service list is empty for services_on_previous_runtime
+    Then the activation exits 0 and reports the service as restarted
+    And the activation reports no local server left on a previous runtime
     And the model endpoint responds after the restart
-    And re-activating that runtime reports the service already on it
+    When the user re-activates that runtime
+    Then the activation reports no local server left on a previous runtime
+    And the activation reports no local server with an unrecorded runtime
 
-  # The other half of this change: the live services are read BEFORE either of
-  # the activation's two writes, so a services folder that cannot be read
-  # refuses the switch while the previous runtime is still fully in place —
-  # rather than failing partway and leaving the config and the marker naming
-  # different runtimes. Unit tests cover the snapshot that undoes a half-applied
-  # write; this covers the refusal a user actually meets, and that the runtime
-  # they were on is still the one a serve would pick up.
+  # The live services are read BEFORE either of the activation's two writes, so
+  # a services folder that cannot be read refuses the switch while the previous
+  # runtime is still fully in place — rather than failing partway and leaving the
+  # config and the marker naming different runtimes. The refusal says the switch
+  # was not made. Unit tests cover the snapshot that undoes a half-applied write;
+  # this covers the refusal a user actually meets, and that the runtime they were
+  # on is still the one a serve would pick up.
   @id:runtime-lifecycle-activate-refused-when-services-unreadable
   Scenario: runtime-lifecycle-13 - An unreadable service record refuses the activation and changes nothing
     Given two registered runtimes and none active
     And the first runtime is active
     And the local service records cannot be read
     When the user tries to activate the second runtime
-    Then the activation is refused and the first runtime is still active
+    Then the activation is refused, saying the switch was not made, and the first runtime is still active
 
   # `rollback` carries the same `--restart-services` / `--yes` pair as `activate`,
-  # and the same ordering requirement: refuse before the switch, not after. It
-  # had no scenario, so moving that guard below `rollback_runtime` — where the
-  # equivalent call sat on `activate` before this change — would have switched
-  # the runtime and then declined the restarts, with nothing failing.
+  # and the same ordering requirement: refuse before the switch, not after.
+  # Moving that guard below `rollback_runtime` would switch the runtime and then
+  # decline the restarts, so the scenario checks the runtime stayed where it was.
   #
   # The refusal also has to name `rollback`, not `activate`. The hint is built
   # from a per-command string, so the copy-paste that names the wrong command is
@@ -220,3 +226,37 @@ Feature: Runtime lifecycle state machine
     Given two registered runtimes and a local server recording no runtime
     When the user activates the second runtime
     Then the activation counts the server under services_with_unrecorded_runtime
+
+  # `--yes` approves a restart, so without `--restart-services` it has nothing to
+  # approve. A silent no-op would let the user believe they had asked for a
+  # restart they did not get, so both commands refuse it — which a user sees as
+  # the exit code and the message, and which must leave the runtime alone.
+  @id:runtime-lifecycle-yes-without-restart-services-refused
+  Scenario: runtime-lifecycle-17 - --yes without --restart-services is refused on activate and rollback
+    Given two registered runtimes with the second active after the first
+    When the user tries to activate the first runtime with only --yes
+    Then the CLI refuses the bare --yes and names --restart-services
+    And the second runtime is still the one in use
+    And the first runtime is still the rollback target
+    When the user tries to roll back with only --yes
+    Then the CLI refuses the bare --yes and names --restart-services
+    And the second runtime is still the one in use
+    And the first runtime is still the rollback target
+
+  # A restart failure does not undo the switch, and it must not be reported as
+  # a success or as a stopped server. A restart is refused before it stops
+  # anything when the server is bound publicly with no endpoint key, so the
+  # server is still up on the runtime it recorded: the command fails, the report
+  # names the failure and still counts that server as left behind, the switch
+  # stands, and the record is not rewritten to claim a runtime it never loaded.
+  # Mock lane: the refusal comes before any engine is touched, so no GPU or
+  # engine is needed. The restart that does stop and respawn a server is
+  # `runtime-lifecycle-12`.
+  @id:runtime-lifecycle-failed-service-restart-is-reported
+  Scenario: runtime-lifecycle-18 - A refused server restart is reported and the server stays on its recorded runtime
+    Given two registered runtimes and a publicly bound local server recorded on the first
+    When the user activates the second runtime restarting services with confirmation
+    Then the activation fails naming the server it could not restart
+    And the server is still counted as left on the first runtime
+    And the switch to the second runtime was kept
+    And the server record still names the first runtime

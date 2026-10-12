@@ -475,9 +475,9 @@ recorded:
 
 ```
   services_on_previous_runtime: 2
-    - svc-a engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
-    - svc-b engine=vllm recorded_runtime=release-wheel-gfx942-7-12-0
-  note: those keep serving on their recorded runtime until they are restarted; run `rocm runtimes activate release-wheel-gfx942-7-13-0 --restart-services --yes` to move them
+    - svc-a engine=vllm recorded_runtime=<old-runtime-key>
+    - svc-b engine=vllm recorded_runtime=<old-runtime-key>
+  note: those keep serving on their recorded runtime until they are restarted; run `rocm runtimes activate <runtime-key> --restart-services --yes` to move them
 ```
 
 When nothing is left behind the count is `services_on_previous_runtime: 0`. A
@@ -491,19 +491,43 @@ a runtime without taking `--restart-services` themselves — which is why the no
 names the `rocm runtimes activate` invocation that does, rather than a flag to
 add to whatever was just run.
 
+The note's command re-activates the runtime that is already active, which moves
+the servers without moving the runtime. Re-activating the active runtime prints
+`changed_from_runtime_key: <unchanged>` and keeps the existing rollback target.
+
 Add `--restart-services` to move those servers onto the newly active runtime
 rather than leave them behind; each one is put on the new runtime and then
-restarted, so it comes back serving from it. Moving a server also clears any
-`env_id` stored in its record; the engine writes its own back on the next
-launch. That restarts running servers, so it requires `--yes` and never
-prompts, the same as `rocm services restart <service-id> --yes`. Servers are
-handled one at a time and a failure does not stop the rest: every failure is
-named in the summary, its record is put back on the runtime it last ran on, and
-the command exits with an error. After a failure the server is read back: one
-that is still live stays counted under `services_on_previous_runtime`, and one
-that is not is reported as stopped by the attempt. The error says which is
-which. Read `rocm services logs <service-id>` first — a restart that just
-failed is likely to fail the same way again — then start a stopped server with
+restarted. Moving a server also clears any `env_id` stored in its record; the
+engine writes its own back on the next launch. That restarts running servers,
+so it requires `--yes` and never prompts, the same as
+`rocm services restart <service-id> --yes`.
+
+After each restart the command waits up to 45 seconds for the server to answer
+an inference request, and the summary lists the outcomes separately:
+
+```
+  services_restarted: 1
+    - svc-a
+  services_restarted_not_yet_serving: 1
+    - svc-b status=starting (check `rocm services logs svc-b` if it does not come up)
+  services_restart_failed: 1
+    - svc-c: <error>
+```
+
+- `services_restarted` lists servers that answered an inference request.
+- `services_restarted_not_yet_serving` lists servers that were respawned but had
+  not answered when the wait ended. The command still exits 0 for these; if one
+  does not come up, check `rocm services logs <service-id>`.
+- `services_restart_failed` lists servers that could not be restarted, and the
+  command exits with an error.
+
+Servers are handled one at a time and a failure does not stop the rest: every
+failure is named in the summary and its record is put back on the runtime it
+last ran on. After a failure the server is read back: one that is still live
+stays counted under `services_on_previous_runtime`, and one that is not is
+reported as stopped by the attempt. The error says which is which. Read
+`rocm services logs <service-id>` first — a restart that just failed is likely
+to fail the same way again — then start a stopped server with
 `rocm services restart <service-id> --yes` once the cause is fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an

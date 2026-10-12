@@ -64,6 +64,31 @@ pub(crate) struct FailedServiceRestart {
     pub(crate) error: String,
 }
 
+/// A local server that was respawned onto the newly active runtime but did not
+/// confirm it was serving before the restart gave up waiting.
+///
+/// Not a failure: the process is up on the runtime the user asked for, and a
+/// large model can take longer than the restart waits. But it is not a success
+/// either, and counting it as one reports a server as moved when the late
+/// failures a different runtime is most likely to cause (an ABI mismatch, an
+/// out-of-memory on load) are exactly what has not shown up yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnconfirmedServiceRestart {
+    pub(crate) service_id: String,
+    /// The record's status when the restart returned (`starting` or `running`).
+    pub(crate) status: String,
+}
+
+/// How a restart that did not error ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ServiceRestartOutcome {
+    /// An inference request succeeded against the respawned server.
+    Serving,
+    /// The server was respawned but had not confirmed inference by the time the
+    /// restart stopped waiting; `status` is what the record was left at.
+    NotConfirmed { status: String },
+}
+
 /// The live local servers seen at activation time, grouped by what the
 /// activation means for them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -72,8 +97,13 @@ pub(crate) struct RuntimeServiceReconciliation {
     pub(crate) stale: Vec<RuntimeServiceEntry>,
     /// Live services whose runtime cannot be derived from their record.
     pub(crate) unknown: Vec<RuntimeServiceEntry>,
-    /// Stale services successfully moved onto the new runtime.
+    /// Stale services moved onto the new runtime AND confirmed serving there.
     pub(crate) restarted: Vec<String>,
+    /// Stale services respawned onto the new runtime that had not confirmed
+    /// serving when the restart stopped waiting. Their records name the new
+    /// runtime, so they are no longer in `stale`; they are listed apart so that
+    /// `services_restarted` only ever means a server that answered.
+    pub(crate) unconfirmed: Vec<UnconfirmedServiceRestart>,
     /// Stale services that could not be moved. Their records are put back on
     /// the runtime they recorded before the attempt. Whether the service itself
     /// is still up depends on how far the attempt got, so each one that is
@@ -120,6 +150,10 @@ pub(crate) fn classify_service_runtime_state(
         return ServiceRuntimeState::Matches;
     }
     match record.runtime_id.as_deref() {
+        // A fast path that answers from the record alone. The resolution below
+        // also accepts an exact key, but only when `manifests` contains it, so
+        // this arm is what keeps the answer right for a caller that passes a
+        // partial list.
         Some(recorded) if recorded == runtime_key => ServiceRuntimeState::Matches,
         // The recorded value is not guaranteed to be an exact runtime key.
         // Every launch path records one, but `refresh_from_engine_state`
@@ -137,8 +171,8 @@ pub(crate) fn classify_service_runtime_state(
         // `--restart-services`, moved) even when the server is already on the
         // runtime being activated. That is the conservative direction — the
         // record genuinely does not say which version — and it shrinks as
-        // records are rewritten, since `refresh_from_engine_state` now prefers
-        // the engine's exact `requested_runtime_id` over the family form.
+        // records are rewritten, since `refresh_from_engine_state` prefers the
+        // engine's exact `requested_runtime_id` over the family form.
         Some(recorded)
             if runtime_manifest_for_selector(manifests, recorded)
                 .is_some_and(|manifest| manifest.runtime_key == runtime_key) =>
@@ -198,8 +232,8 @@ pub(crate) fn reconcile_services_for_runtime(
 /// Render the service half of an activation/rollback report.
 ///
 /// Always prints a count, including `services_on_previous_runtime: 0`, so a
-/// clean switch is distinguishable from a report that simply forgot to look —
-/// which is exactly what the old fixed note could not tell a user.
+/// clean switch is distinguishable from a report that simply forgot to look,
+/// which a fixed note about running services could not be.
 pub(crate) fn render_runtime_service_reconciliation(
     services: &RuntimeServiceReconciliation,
     active_runtime_key: &str,
@@ -241,6 +275,20 @@ pub(crate) fn render_runtime_service_reconciliation(
             let _ = writeln!(output, "    - {service_id}");
         }
     }
+    if !services.unconfirmed.is_empty() {
+        let _ = writeln!(
+            output,
+            "  services_restarted_not_yet_serving: {}",
+            services.unconfirmed.len()
+        );
+        for entry in &services.unconfirmed {
+            let _ = writeln!(
+                output,
+                "    - {} status={} (check `rocm services logs {}` if it does not come up)",
+                entry.service_id, entry.status, entry.service_id
+            );
+        }
+    }
     if !services.failed.is_empty() {
         let _ = writeln!(
             output,
@@ -263,9 +311,8 @@ pub(crate) fn render_runtime_service_reconciliation(
     // where re-running it with the flag would switch the runtime a second time
     // (`rocm runtimes rollback`). Activating the runtime that is already active
     // is the one invocation that moves the servers without moving the runtime —
-    // and `activate_runtime` now leaves `previous_runtime_key` alone on that
-    // path, so following this note no longer destroys the rollback target the
-    // next line offers.
+    // and `activate_runtime` leaves `previous_runtime_key` alone on that path,
+    // so following this note keeps the rollback target the next line offers.
     if !services.stale.is_empty() && !services.restart_attempted {
         let _ = writeln!(
             output,
@@ -295,6 +342,12 @@ pub(crate) fn ensure_service_restart_approved(
 
 /// Move every stale live service onto the newly active runtime.
 ///
+/// Each service ends in exactly one of three places: moved and confirmed
+/// serving (`restarted`), respawned onto the new runtime without having
+/// confirmed it serves there yet (`unconfirmed`), or not moved (`failed`, and
+/// also `stale` when the server is still up). Only the last is a failure; an
+/// unconfirmed restart is reported but does not fail the command.
+///
 /// Best-effort per service: one failure does not abandon the rest, and the
 /// caller reports every failure and exits non-zero.
 pub(crate) fn restart_stale_runtime_services(
@@ -303,16 +356,22 @@ pub(crate) fn restart_stale_runtime_services(
     services: &mut RuntimeServiceReconciliation,
 ) {
     // `services_on_previous_runtime` counts `stale`, so an entry stays there
-    // only while the claim it makes is still true. A service that was moved, or
-    // that the attempt took down, is no longer a live server serving from the
-    // previous runtime and must not be counted as one — but neither is the
-    // converse safe to assume: a restart refused BEFORE the stop leaves the
-    // server up, and dropping it would under-report a live server on the old
-    // runtime just as badly. So each entry is drained, and only put back when
-    // the service is read back as still running.
+    // only while the claim it makes is still true. A service that was moved
+    // (confirmed serving or not), or that the attempt took down, is no longer a
+    // live server serving from the previous runtime and must not be counted as
+    // one — but neither is the converse safe to assume: a restart refused
+    // BEFORE the stop leaves the server up, and dropping it would under-report
+    // a live server on the old runtime just as badly. So each entry is drained,
+    // and only put back when the service is read back as still running.
     for mut entry in std::mem::take(&mut services.stale) {
         match restart_service_onto_runtime(paths, &entry.service_id, runtime_key) {
-            Ok(()) => services.restarted.push(entry.service_id),
+            Ok(ServiceRestartOutcome::Serving) => services.restarted.push(entry.service_id),
+            Ok(ServiceRestartOutcome::NotConfirmed { status }) => {
+                services.unconfirmed.push(UnconfirmedServiceRestart {
+                    service_id: entry.service_id,
+                    status,
+                });
+            }
             Err(error) => {
                 services.failed.push(FailedServiceRestart {
                     service_id: entry.service_id.clone(),
@@ -373,16 +432,16 @@ pub(crate) fn service_still_serving(
 /// a line earlier is therefore overwritten in memory before the argv is built,
 /// and the restored `env_id` alone is enough to drop `--runtime-id`, which
 /// brings the service back up on the runtime it was already using while the
-/// record claims the new key — the very bug this path exists to fix. The MI300X
-/// lane caught exactly this: a restart the report counted as successful came
-/// back on the engine's own resolution, and re-activating named the service as
-/// still on the previous runtime.
+/// record claims the new key — the very bug this path exists to fix. Without the
+/// argument a restart the report counts as successful comes back on the
+/// engine's own resolution, and re-activating names the service as still on the
+/// previous runtime.
 ///
 /// Asserted, not merely argued, by
 /// `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`
 /// in `main.rs`, which builds the child's argv from a record loaded over a live
 /// engine state file, with and without the pin. The e2e scenario
-/// `runtime-lifecycle-10` covers the user-visible success path but cannot
+/// `runtime-lifecycle-12` covers the user-visible success path but cannot
 /// separate the two orders on its own — see the note on its closing step.
 ///
 /// The record's `env_id` is cleared in the same write, and that is equally
@@ -394,6 +453,13 @@ pub(crate) fn service_still_serving(
 /// record claimed the new key. The engine writes its own `env_id` back into its
 /// state on the next launch, so nothing is lost by dropping it here.
 ///
+/// The result has three shapes. `Ok(Serving)` is a respawn that answered an
+/// inference request. `Ok(NotConfirmed { status })` is a respawn that had not
+/// confirmed one when the restart stopped waiting: the server is up and the
+/// record keeps naming the new runtime, but nothing has shown it loads there,
+/// so the caller reports it apart from the ones that did. `Err` is a restart
+/// that did not happen.
+///
 /// On failure the record is put back on the runtime it last actually ran on.
 /// What a failure leaves behind is not decided here: the attempt may be refused
 /// before anything is stopped (leaving the service up on the runtime it
@@ -404,15 +470,39 @@ pub(crate) fn restart_service_onto_runtime(
     paths: &AppPaths,
     service_id: &str,
     runtime_key: &str,
-) -> Result<()> {
+) -> Result<ServiceRestartOutcome> {
+    restart_service_onto_runtime_with(
+        paths,
+        service_id,
+        runtime_key,
+        restart_internal_managed_service,
+    )
+}
+
+/// [`restart_service_onto_runtime`] with the restart itself supplied, so a test
+/// can observe what the restart is handed — the pin — without an engine to stop
+/// and respawn. Production always passes `restart_internal_managed_service`.
+pub(crate) fn restart_service_onto_runtime_with(
+    paths: &AppPaths,
+    service_id: &str,
+    runtime_key: &str,
+    restart: impl FnOnce(&AppPaths, &str, Option<&str>) -> Result<ManagedServiceRecord>,
+) -> Result<ServiceRestartOutcome> {
     let previous_pin = pin_service_record_to_runtime(paths, service_id, runtime_key)?;
     // The key is handed to the restart as well as written to the record. The
     // write is what the report and a failed restart's restore are read from; the
     // argument is what survives the refresh the restart's own load performs
     // against the outgoing process's engine state. Dropping either one brings
     // the service back on the runtime it was already using.
-    match restart_internal_managed_service(paths, service_id, Some(runtime_key)) {
-        Ok(_) => Ok(()),
+    match restart(paths, service_id, Some(runtime_key)) {
+        // `ready` is the one status `restart_internal_managed_service` only sets
+        // after an inference request succeeded. Anything else — `running` (the
+        // endpoint lists the model) or `starting` (nothing answered within the
+        // wait) — means the respawn happened but nothing has been confirmed.
+        Ok(record) if record.status == "ready" => Ok(ServiceRestartOutcome::Serving),
+        Ok(record) => Ok(ServiceRestartOutcome::NotConfirmed {
+            status: record.status,
+        }),
         // A restore that fails is reported with the restart failure rather than
         // swallowed: silently keeping the new key would leave the record
         // describing a runtime the service never loaded, which is the state
@@ -479,23 +569,33 @@ pub(crate) fn restore_service_record_pin(
 pub(crate) fn service_restart_audit_outcome(
     services: &RuntimeServiceReconciliation,
 ) -> (&'static str, String) {
+    let restarted = services.restarted.len();
+    let not_yet_serving = services.unconfirmed.len();
     if services.failed.is_empty() {
-        let restarted = services.restarted.len();
-        let detail = if restarted == 0 {
+        let mut detail = if restarted == 0 {
             String::new()
         } else {
             format!(" services_restarted={restarted}")
         };
+        if not_yet_serving > 0 {
+            let _ = write!(
+                detail,
+                " services_restarted_not_yet_serving={not_yet_serving}"
+            );
+        }
         return ("info", detail);
     }
-    (
-        "warn",
-        format!(
-            " services_restarted={} services_restart_failed={}",
-            services.restarted.len(),
-            services.failed.len()
-        ),
-    )
+    let mut detail = format!(
+        " services_restarted={restarted} services_restart_failed={}",
+        services.failed.len()
+    );
+    if not_yet_serving > 0 {
+        let _ = write!(
+            detail,
+            " services_restarted_not_yet_serving={not_yet_serving}"
+        );
+    }
+    ("warn", detail)
 }
 
 /// Fail the command when any requested restart did not happen, naming every
@@ -568,6 +668,116 @@ mod tests {
             service_id: service_id.to_owned(),
             error: "restart refused".to_owned(),
         }
+    }
+
+    fn unconfirmed(service_id: &str, status: &str) -> UnconfirmedServiceRestart {
+        UnconfirmedServiceRestart {
+            service_id: service_id.to_owned(),
+            status: status.to_owned(),
+        }
+    }
+
+    // A server that was respawned but has not answered yet is neither a success
+    // nor a leftover, so it gets its own section; counting it under
+    // `services_restarted` would say a server moved when nothing has shown it
+    // loads the new runtime.
+    // Mutation: rendering `unconfirmed` entries under the `services_restarted`
+    // header, or not rendering them, fails these assertions.
+    #[test]
+    fn a_restart_not_yet_serving_is_rendered_apart_from_a_confirmed_one() {
+        let services = RuntimeServiceReconciliation {
+            unconfirmed: vec![unconfirmed("svc-slow", "starting")],
+            restart_attempted: true,
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        let rendered = render_runtime_service_reconciliation(&services, "rt-new");
+
+        assert!(
+            rendered.contains("  services_restarted_not_yet_serving: 1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "    - svc-slow status=starting (check `rocm services logs svc-slow` if it does \
+                 not come up)\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("services_restarted:"),
+            "nothing confirmed serving, so nothing is counted as restarted:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "a respawned server is no longer on the previous runtime:\n{rendered}"
+        );
+        assert!(!rendered.contains("services_restart_failed"), "{rendered}");
+    }
+
+    #[test]
+    fn confirmed_and_unconfirmed_restarts_each_get_their_own_section() {
+        let services = RuntimeServiceReconciliation {
+            restarted: vec!["svc-ok".to_owned()],
+            unconfirmed: vec![unconfirmed("svc-slow", "running")],
+            restart_attempted: true,
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        let rendered = render_runtime_service_reconciliation(&services, "rt-new");
+
+        let confirmed_at = rendered
+            .find("  services_restarted: 1\n    - svc-ok\n")
+            .expect("the confirmed restart is listed under services_restarted");
+        let unconfirmed_at = rendered
+            .find("  services_restarted_not_yet_serving: 1\n    - svc-slow status=running")
+            .expect("the unconfirmed restart is listed under its own header");
+        assert!(confirmed_at < unconfirmed_at, "{rendered}");
+    }
+
+    // Mutation: dropping the `unconfirmed` branch of `service_restart_audit_outcome`
+    // leaves the detail empty or without the second count and fails both
+    // assertions.
+    #[test]
+    fn unconfirmed_restarts_are_counted_in_the_audit_detail_at_info() {
+        let only_unconfirmed = RuntimeServiceReconciliation {
+            unconfirmed: vec![unconfirmed("svc-slow", "starting")],
+            restart_attempted: true,
+            ..RuntimeServiceReconciliation::default()
+        };
+        let both = RuntimeServiceReconciliation {
+            restarted: vec!["svc-ok".to_owned()],
+            unconfirmed: vec![unconfirmed("svc-slow", "starting")],
+            restart_attempted: true,
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        assert_eq!(
+            service_restart_audit_outcome(&only_unconfirmed),
+            ("info", " services_restarted_not_yet_serving=1".to_owned()),
+            "an unconfirmed restart is not a failure, so it stays at info"
+        );
+        assert_eq!(
+            service_restart_audit_outcome(&both),
+            (
+                "info",
+                " services_restarted=1 services_restarted_not_yet_serving=1".to_owned()
+            )
+        );
+    }
+
+    // An unconfirmed restart is not a failure: the command exits zero.
+    // Mutation: making `bail_on_failed_service_restarts` also fail on
+    // `unconfirmed` entries fails the `is_ok` assertion.
+    #[test]
+    fn an_unconfirmed_restart_does_not_fail_the_command() {
+        let services = RuntimeServiceReconciliation {
+            unconfirmed: vec![unconfirmed("svc-slow", "starting")],
+            restart_attempted: true,
+            ..RuntimeServiceReconciliation::default()
+        };
+
+        assert!(bail_on_failed_service_restarts(&services).is_ok());
     }
 
     #[test]

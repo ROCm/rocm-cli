@@ -254,13 +254,53 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
-The rest of this section needs a **vLLM** server running on the currently active
-runtime, on Linux or WSL. Nothing earlier in this document leaves one up:
-section 3 serves Lemonade and then stops it on both of its branches, and the
-block just above stops whatever was left. Start one now and leave it running:
+The rest of this section needs a **vLLM** server running, on Linux or WSL, and
+two runtimes to move it between. Nothing earlier in this document sets either
+up: section 3 serves Lemonade and then stops it on both of its branches, the
+block just above stops whatever was left, and section 2 leaves one runtime.
+
+**Get two distinct runtime keys.** A wheel runtime key is built from the
+channel, the version and a fingerprint of the exact packages installed, in the
+shape `release-wheel-multi-arch-<version>-<hash>`; `--prefix` is not part of it.
+A second `rocm install sdk` with the same options therefore resolves to the same
+key and replaces the first runtime instead of adding one. Change something that
+is part of the package set. `--devel` does that: per its help text, passing it
+over a plain install of the same version creates a second side-by-side runtime
+and activates it. Leave `--prefix` off so the new runtime gets its own managed
+folder rather than reusing section 2's:
+
+```powershell
+rocm install sdk --channel release --format wheel --devel --approve-replacing-active-default
+rocm runtimes list
+```
+
+If section 2's runtime was itself installed with `--devel`, drop `--devel` here
+and pass `--version <other-version>` instead, using a version the release
+channel publishes. `rocm runtimes list` must now show two keys. Call the one
+section 2 left `<runtime_key_a>` and the new one `<runtime_key_b>`, copied as
+printed.
+
+**Install vLLM into each runtime.** vLLM is installed per runtime, into that
+runtime's own `engines` folder, so a runtime without it can neither serve nor
+receive a moved server; skipping this makes the steps below fail early:
 
 ```bash
-rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed
+rocm engines install vllm --runtime-id <runtime_key_a> --yes
+rocm engines install vllm --runtime-id <runtime_key_b> --yes
+```
+
+`--yes` approves required system-package installs such as OpenMPI, which can
+call `sudo`. If the `install sdk` report above already printed an
+`engine auto-install` block for vLLM, that runtime has it; `--reinstall` is the
+flag that forces a reinstall when the engine already exists.
+
+**Start from runtime A.** Make it the active runtime and start a server on it.
+`--runtime-id` names the runtime explicitly, so the server's recorded runtime
+does not depend on any saved engine preference:
+
+```bash
+rocm runtimes activate <runtime_key_a>
+rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed --runtime-id <runtime_key_a>
 rocm services
 ```
 
@@ -270,26 +310,30 @@ brings its own runtime and is deliberately never counted by the reconciler, so
 every step below would report `services_on_previous_runtime: 0`, print no
 `note:` line to read the next command from, and verify nothing.
 
-Switching runtimes does not move a server that is already running. Check what an
-activation says about the server you just started. `<other_runtime_key>` below
-means the runtime the server is **not** recorded on — run `rocm runtimes list`
-and take any key that is not the active one; section 2 installed a second
-runtime so there is one:
+Switching runtimes does not move a server that is already running. Activate
+runtime B without the restart flag and read what the report says about the
+server you just started:
 
 ```powershell
 rocm services
-rocm runtimes activate <other_runtime_key>
+rocm runtimes activate <runtime_key_b>
 ```
 
-The server keeps serving on the runtime it started with, so it is now named
-under `services_on_previous_runtime`. Move it with the command the report's own
+The server keeps serving on the runtime it started with, so the report must
+read `services_on_previous_runtime: 1` and name it with
+`recorded_runtime=<runtime_key_a>`. Move it with the command the report's own
 note gives you — which is a second `activate` of the key that is *already*
 active:
 
 ```powershell
-rocm runtimes activate <other_runtime_key> --restart-services --yes
+rocm runtimes activate <runtime_key_b> --restart-services --yes
 rocm runtimes list
 ```
+
+That report must read `services_restarted: 1` (or, if the server had not
+answered an inference request within the 45-second wait,
+`services_restarted_not_yet_serving: 1`; see `rocm services logs <service-id>`)
+and `changed_from_runtime_key: <unchanged>`.
 
 Run these in this order. Each step sets up the next, and a step run against a
 runtime the server is already recorded on has nothing to move: the reconciler
@@ -303,8 +347,10 @@ alone. `rocm runtimes list` must still show one afterwards — an activation tha
 cleared it would break the `next step: if this causes problems, run rocm
 runtimes rollback` line printed directly beneath the note.
 
-Now the server is recorded on `<other_runtime_key>`, so rolling back is a real
-switch away from it and exercises the same restart path from the other command:
+Now the server is recorded on `<runtime_key_b>`, so rolling back is a real
+switch away from it and exercises the same restart path from the other command.
+It restarts the server onto `<runtime_key_a>`, which is why that runtime needed
+vLLM too:
 
 ```powershell
 rocm runtimes rollback --restart-services --yes

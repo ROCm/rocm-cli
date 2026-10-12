@@ -40,6 +40,8 @@ const IMPORT_KEY: &str = "release-tarball-gfx1151";
 /// Service id of the planted local server. Fixed by `write_service_record_with`,
 /// which names both the record and its `service_id` `e2e-mock`; the activation
 /// report prints it, so the assertion has to use the same literal.
+/// The GPU scenario's server is launched by the CLI and has a generated id
+/// instead, which is why its steps read ids back from the records.
 const SERVICE_ID: &str = "e2e-mock";
 /// Engine of the planted record, also fixed by `write_service_record_with`.
 /// Deliberately NOT `lemonade`: an engine that manages its own runtime records
@@ -92,6 +94,18 @@ fn registry_dir(world: &E2eWorld) -> PathBuf {
         .join("registry")
 }
 
+/// The managed-service record folder (`<data>/services/`) under the scenario's
+/// isolated data dir.
+fn services_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("data")
+        .join("services")
+}
+
 /// A minimal valid read-only tarball runtime manifest (matches the CLI's on-disk
 /// schema). Written as plain JSON — black-box, not a typed import from the crates.
 fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String {
@@ -119,7 +133,8 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String
 /// than a second hand-written JSON shape, so this cannot drift from what `rocm
 /// serve --managed` writes.
 ///
-/// Three details make it count, and all three are load-bearing:
+/// Three details make it count, and all three are load-bearing. `host` is the
+/// one other thing a caller varies: `None` is loopback, as for any local server.
 ///
 /// - `runtime_id` holds a runtime KEY, not the `therock-release:<family>`
 ///   runtime_id form the manifest carries. The on-disk field is named
@@ -136,11 +151,13 @@ fn runtime_manifest_json(key: &str, family: &str, install_root: &Path) -> String
 ///   concerned, but only `ready`/`running` records get an HTTP readiness probe,
 ///   which here would reach for a port nothing serves. Planting mid-startup
 ///   keeps the scenario hermetic and off the network.
-fn plant_live_service_on_runtime(world: &E2eWorld, recorded_runtime_key: &'static str) {
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let services = root.path().join("data").join("services");
+fn plant_live_service_on_runtime(
+    world: &E2eWorld,
+    recorded_runtime_key: &'static str,
+    host: Option<&'static str>,
+) {
     write_service_record_with(
-        &services,
+        &services_dir(world),
         SERVICE_MODEL,
         SERVICE_PORT,
         ServiceRecordOptions {
@@ -148,17 +165,69 @@ fn plant_live_service_on_runtime(world: &E2eWorld, recorded_runtime_key: &'stati
             startup_phase: Some("loading"),
             supervisor_pid: std::process::id(),
             runtime_id: Some(recorded_runtime_key),
+            host,
             ..ServiceRecordOptions::default()
         },
     );
 }
 
+/// The `service_id` of every service record in the isolated services folder.
+///
+/// For the GPU scenario, whose server is launched by the CLI under a generated
+/// id the feature cannot name. Files that are not service records (logs, key
+/// files, anything unparseable) are skipped.
+fn recorded_service_ids(world: &E2eWorld) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(services_dir(world)) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter_map(|value| {
+            value
+                .get("service_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// A planted service record read back as JSON, to see what the CLI left on disk.
+fn read_service_record(world: &E2eWorld, service_id: &str) -> serde_json::Value {
+    let path = services_dir(world).join(format!("{service_id}.json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not valid JSON: {error}", path.display()))
+}
+
+/// The service ids named under one section of the activation report, in order.
+///
+/// `section` is the header without its leading indent or colon
+/// (`services_restarted`). The entries are the `    - <id>` lines directly
+/// beneath the header; the id is the first word of each, minus the `:` the
+/// failure section puts after it. The header is matched with its colon, so
+/// `services_restarted` does not pick up `services_restarted_not_yet_serving`.
+fn ids_listed_under<'a>(report: &'a str, section: &str) -> Vec<&'a str> {
+    let header = format!("  {section}:");
+    report
+        .lines()
+        .skip_while(|line| !line.starts_with(&header))
+        .skip(1)
+        .map_while(|line| line.strip_prefix("    - "))
+        .filter_map(|entry| entry.split_whitespace().next())
+        .map(|id| id.trim_end_matches(':'))
+        .collect()
+}
+
 /// The runtime key recorded in the isolated `config.json`.
 ///
-/// The marker sibling above cannot be used by the scenario that breaks the
-/// marker on purpose. The config is the right file to read there anyway: it is
-/// written first, so it is the half that would be left naming the new runtime
-/// if the restore did not run.
+/// The marker (see [`active_runtime_key`]) cannot be used by the scenario that
+/// breaks the marker on purpose. The config is the right file to read there
+/// anyway: it is written first, so it is the half that would be left naming the
+/// new runtime if the restore did not run.
 fn config_active_runtime_key(world: &E2eWorld) -> Option<String> {
     let config_dir = world
         .isolate_env()
@@ -274,19 +343,28 @@ async fn two_runtimes_and_service_on_first(world: &mut E2eWorld) {
     // the scenario: while the first runtime is the one being activated the
     // server is on it (nothing left behind), and activating the second leaves it
     // behind without anything about the server itself having changed.
-    plant_live_service_on_runtime(world, FIRST_KEY);
+    plant_live_service_on_runtime(world, FIRST_KEY, None);
+}
+
+#[given("two registered runtimes and a publicly bound local server recorded on the first")]
+async fn two_runtimes_and_public_service_on_first(world: &mut E2eWorld) {
+    plant_runtime(world, FIRST_KEY, "gfx942");
+    plant_runtime(world, SECOND_KEY, "gfx1100");
+    // `0.0.0.0` with no endpoint key file planted is the whole setup. Restarting
+    // a public bind that has no key is refused before the stop, so the
+    // activation's restart fails while the server is left up on the first
+    // runtime — a failed restart that needs no engine to produce.
+    plant_live_service_on_runtime(world, FIRST_KEY, Some("0.0.0.0"));
 }
 
 #[given("two registered runtimes and a local server recording no runtime")]
 async fn two_runtimes_and_service_without_runtime(world: &mut E2eWorld) {
     plant_runtime(world, FIRST_KEY, "gfx942");
     plant_runtime(world, SECOND_KEY, "gfx1100");
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let services = root.path().join("data").join("services");
     // `runtime_id: None` is the whole setup — a record that predates runtime
     // pinning and so says nothing about which runtime its server loaded.
     write_service_record_with(
-        &services,
+        &services_dir(world),
         SERVICE_MODEL,
         SERVICE_PORT,
         ServiceRecordOptions {
@@ -302,9 +380,11 @@ async fn two_runtimes_and_service_without_runtime(world: &mut E2eWorld) {
 /// path.
 ///
 /// Same reasoning as [`services_cannot_be_read`]: permissions are no obstacle
-/// to a root CI lane, while `create_new` against an existing directory fails on
-/// both supported platforms. Planted AFTER the first activation, so the marker
-/// it replaces was written normally.
+/// to a root CI lane. The marker is written to a temp file and then published by
+/// renaming it onto the marker path; the temp file is created without trouble,
+/// but a rename onto a path occupied by a directory is refused on both supported
+/// platforms. Planted AFTER the first activation, so the marker it replaces was
+/// written normally.
 #[given("the active runtime marker cannot be written")]
 async fn marker_cannot_be_written(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
@@ -335,12 +415,7 @@ async fn first_runtime_active(world: &mut E2eWorld) {
 /// lanes run as root, where a read-only directory is no obstacle at all).
 #[given("the local service records cannot be read")]
 async fn services_cannot_be_read(world: &mut E2eWorld) {
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let unreadable = root
-        .path()
-        .join("data")
-        .join("services")
-        .join("unreadable.json");
+    let unreadable = services_dir(world).join("unreadable.json");
     std::fs::create_dir_all(&unreadable)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", unreadable.display()));
 }
@@ -410,6 +485,60 @@ async fn activate_current_restart_services(world: &mut E2eWorld) {
         world,
         &["runtimes", "activate", &key, "--restart-services", "--yes"],
     );
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user activates the second runtime restarting services with confirmation")]
+async fn activate_second_restart_services(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "runtimes",
+            "activate",
+            SECOND_KEY,
+            "--restart-services",
+            "--yes",
+        ],
+    );
+    record(world, stdout, stderr, rc);
+}
+
+/// `--yes` approves a restart, so on its own it has nothing to approve; clap
+/// refuses it at parse time (`requires = "restart_services"`).
+#[when("the user tries to activate the first runtime with only --yes")]
+async fn activate_first_with_only_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm(world, &["runtimes", "activate", FIRST_KEY, "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user tries to roll back with only --yes")]
+async fn rollback_with_only_yes(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "rollback", "--yes"]);
+    record(world, stdout, stderr, rc);
+}
+
+/// Re-runs the plain activation of whichever runtime is active now: the one
+/// invocation that reads every server's record back without moving the runtime.
+///
+/// The endpoint check in the GPU scenario proves a server is serving; it cannot
+/// prove WHICH runtime that server loaded. The reconciler refreshes every record
+/// from the engine state before classifying it, and `refresh_from_engine_state`
+/// adopts the runtime the ENGINE actually launched with, overwriting the pin the
+/// restart wrote. So a respawn that came back on a runtime that does not resolve
+/// to the activated one is named as left behind by this report, and one that came
+/// back recording no runtime is named under `services_with_unrecorded_runtime` —
+/// neither of which the restart's own `services_restarted: 1` line, written
+/// before the record is re-read, can tell apart from a clean move. The
+/// pin-before-restart order is not proven here; see the scenario's comment.
+///
+/// Not vacuous through a dead service: a service that is not live is skipped by
+/// the reconciler and would also read as zero, but the scenario's endpoint check
+/// fails first if the server is not serving.
+#[when("the user re-activates that runtime")]
+async fn reactivate_current_runtime(world: &mut E2eWorld) {
+    let key = active_runtime_key(world);
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", &key]);
     record(world, stdout, stderr, rc);
 }
 
@@ -530,6 +659,22 @@ async fn first_active_again(world: &mut E2eWorld) {
     assert!(
         out.contains("runtime rolled back") && out.contains(&format!("runtime_key: {FIRST_KEY}")),
         "expected rollback to {FIRST_KEY}, got:\n{out}"
+    );
+}
+
+#[then("the report says the runtime did not change")]
+async fn report_says_runtime_unchanged(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    // The rollback target is retained, so the report could be tempted to name it
+    // here; it must not, because the user has not left the runtime they are on.
+    assert!(
+        out.contains("  changed_from_runtime_key: <unchanged>"),
+        "re-selecting the runtime already in use changed nothing, and the report \
+         must say so, got:\n{out}"
+    );
+    assert!(
+        !out.contains(&format!("changed_from_runtime_key: {FIRST_KEY}")),
+        "the report must not claim the user came from {FIRST_KEY}, got:\n{out}"
     );
 }
 
@@ -732,18 +877,29 @@ async fn uninstall_dry_run_reports_plan(world: &mut E2eWorld) {
 async fn activation_reports_no_stale_services(world: &mut E2eWorld) {
     let out = ok_output(world);
     // The count is printed even at zero, which is the whole point: "looked, and
-    // there is nothing on the old runtime" has to be distinguishable from a
-    // report that never looked — the failure mode of the fixed note this
-    // replaced.
+    // there is nothing on the previous runtime" has to be distinguishable from a
+    // report that never looked.
     assert!(
         out.contains("  services_on_previous_runtime: 0"),
-        "the planted server records the runtime being activated, so nothing is \
+        "every live server is on the runtime being activated, so nothing is \
          left behind and the count must be 0, got:\n{out}"
     );
     assert!(
-        !out.contains(SERVICE_ID),
+        ids_listed_under(&out, "services_on_previous_runtime").is_empty(),
         "a server already on the activated runtime must not be listed as left \
          behind, got:\n{out}"
+    );
+}
+
+#[then("the activation reports no local server with an unrecorded runtime")]
+async fn activation_reports_no_unrecorded_services(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    // The line is only printed when a live server's record names no runtime, so
+    // its absence is the claim.
+    assert!(
+        !out.contains("services_with_unrecorded_runtime"),
+        "a restart re-pins the record, so the runtime it names must be readable \
+         back — an unrecorded runtime here means the respawn lost it:\n{out}"
     );
 }
 
@@ -754,9 +910,8 @@ async fn activation_names_stale_service(world: &mut E2eWorld) {
         out.contains("  services_on_previous_runtime: 1"),
         "one live server still records {FIRST_KEY}, got:\n{out}"
     );
-    // The regression in full: not just a count, but WHICH server, on WHICH
-    // engine, still serving on WHICH runtime — none of which the old fixed note
-    // could say.
+    // Not just a count, but WHICH server, on WHICH engine, still serving on
+    // WHICH runtime — none of which a fixed note could say.
     assert!(
         out.contains(&format!(
             "    - {SERVICE_ID} engine={SERVICE_ENGINE} recorded_runtime={FIRST_KEY}"
@@ -770,32 +925,36 @@ async fn activation_names_stale_service(world: &mut E2eWorld) {
     );
 }
 
-#[then("the activation does not print the old fixed note about running services")]
+#[then("the activation does not print a fixed note about running services")]
 async fn activation_drops_the_old_fixed_note(world: &mut E2eWorld) {
     let out = ok_output(world);
     assert!(
         !out.contains("running services keep their recorded runtime"),
-        "the fixed note was printed whether or not any server existed and said \
-         nothing about real state; it must not come back alongside the \
-         state-derived report, got:\n{out}"
+        "a fixed note is printed whether or not any server exists and says \
+         nothing about real state; the report must come from the service \
+         records alone, got:\n{out}"
     );
 }
 
-#[then("the activation exits 0 and names the service under services_restarted")]
+#[then("the activation exits 0 and reports the service as restarted")]
 async fn activation_names_restarted_service(world: &mut E2eWorld) {
     let out = ok_output(world);
+    // The respawn is what this step asserts. Whether the server had already
+    // answered an inference request when the restart stopped waiting depends on
+    // how long the model takes to load, so a server still loading is listed under
+    // `services_restarted_not_yet_serving` rather than `services_restarted`; the
+    // next steps are what wait for it to serve.
+    let confirmed = ids_listed_under(&out, "services_restarted");
+    let loading = ids_listed_under(&out, "services_restarted_not_yet_serving");
+    let listed: Vec<&str> = confirmed.into_iter().chain(loading).collect();
+    // The count alone would be satisfied by any id. The CLI generated this
+    // server's id, so it is read back from the service records and the one entry
+    // listed has to be that one.
+    let recorded = recorded_service_ids(world);
     assert!(
-        out.contains("  services_restarted: 1"),
-        "expected one service reported restarted under services_restarted, got:\n{out}"
-    );
-}
-
-#[then("the restarted service list is empty for services_on_previous_runtime")]
-async fn activation_previous_runtime_count_is_zero(world: &mut E2eWorld) {
-    let out = ok_output(world);
-    assert!(
-        out.contains("  services_on_previous_runtime: 0"),
-        "expected zero services left on the previous runtime after restart, got:\n{out}"
+        matches!(listed.as_slice(), [id] if recorded.iter().any(|known| known.as_str() == *id)),
+        "expected the one restarted entry to be the recorded service \
+         (recorded: {recorded:?}, listed: {listed:?}), got:\n{out}"
     );
 }
 
@@ -831,13 +990,27 @@ async fn model_endpoint_responds_after_restart(world: &mut E2eWorld) {
     );
 }
 
-#[then("the activation is refused and the first runtime is still active")]
+#[then(
+    "the activation is refused, saying the switch was not made, and the first runtime is still active"
+)]
 async fn activation_refused_leaves_runtime_alone(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
     assert!(
         rc != 0,
         "reading the services is what fails, and it happens before either \
          write, so the activation must be refused outright:\n{}",
+        combined(world)
+    );
+    // The refusal has to tell the user what did not happen. Without the context
+    // the bare read error ("failed to read ...unreadable.json") says nothing about
+    // whether the switch was made; the files below are what prove it was not.
+    let expected = format!(
+        "the local server records could not be read, so the switch to `{SECOND_KEY}` was \
+         not made and the previously active runtime is unchanged"
+    );
+    assert!(
+        combined(world).contains(&expected),
+        "expected the refusal to say the switch was not made, got:\n{}",
         combined(world)
     );
     // Both files, not the printed output. The marker is what the next serve
@@ -889,57 +1062,6 @@ async fn rollback_restart_refused_without_yes(world: &mut E2eWorld) {
     );
 }
 
-#[then("re-activating that runtime reports the service already on it")]
-async fn reactivating_reports_the_service_already_on_the_runtime(world: &mut E2eWorld) {
-    // The endpoint check above proves a server is serving; it cannot prove WHICH
-    // runtime that server loaded. This step reads that back: the reconciler
-    // refreshes every record from the engine state before classifying it, so a
-    // server the activation left behind is named here rather than merely
-    // implied.
-    //
-    // What this step does NOT prove is the pin-before-restart order inside
-    // `restart_service_onto_runtime`. A child launched without `--runtime-id`
-    // resolves a runtime itself and reports the manifest's family id, and
-    // `classify_service_runtime_state` resolves an unambiguous family id back to
-    // the install carrying it — so on a tree with one install of the family the
-    // transposed order also reports zero here. That order is asserted by the
-    // unit test
-    // `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`
-    // in `apps/rocm/src/main.rs`, which compares the child's argv under both.
-    //
-    // What re-running the activation does catch: the reconciler reads every
-    // record through `load_managed_services`, whose `refresh_from_engine_state`
-    // adopts the runtime the ENGINE actually launched with, overwriting the pin.
-    // A respawn that came back on a runtime which does not resolve to the one
-    // just activated is named here as left behind, and one that came back
-    // recording no runtime at all is named under
-    // `services_with_unrecorded_runtime` — neither of which the report's
-    // `services_restarted: 1` line, written before the record is re-read, can
-    // tell apart from a clean move.
-    //
-    // Not vacuous through a dead service: a service that is not live is skipped
-    // by the reconciler and would also produce a zero count — but the preceding
-    // step fails first if the endpoint is not serving.
-    let key = active_runtime_key(world);
-    let (stdout, stderr, rc) = crate::run_rocm(world, &["runtimes", "activate", &key]);
-    record(world, stdout, stderr, rc);
-    let out = ok_output(world);
-    assert!(
-        out.contains("services_on_previous_runtime: 0"),
-        "the restarted server must read back as being on the runtime that was \
-         just activated; a non-zero count here is the respawn having come back \
-         on a runtime that does not resolve to it:\n{}",
-        combined(world)
-    );
-    assert!(
-        !out.contains("services_with_unrecorded_runtime"),
-        "the restart re-pins the record, so the runtime it names must be \
-         readable back — an unrecorded runtime here means the respawn lost \
-         it:\n{}",
-        combined(world)
-    );
-}
-
 #[then("the CLI refuses the restart and the second runtime stays active")]
 async fn restart_services_refused_without_yes(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no command rc recorded");
@@ -981,7 +1103,7 @@ async fn restart_services_refused_without_yes(world: &mut E2eWorld) {
 /// Two files carry the runtime key for each service:
 ///
 /// - The service record JSON (`<data>/services/<id>.json`) holds `runtime_id`.
-/// - The engine state file (`<data>/services/<id>.state.json`) holds
+/// - The engine state file (`<data>/engines/<engine>/state/<id>.json`) holds
 ///   `requested_runtime_id`, which `refresh_from_engine_state` adopts into the
 ///   record on every `load_managed_services` call, overwriting `runtime_id`.
 ///
@@ -991,22 +1113,15 @@ async fn restart_services_refused_without_yes(world: &mut E2eWorld) {
 /// file's absolute path, so there is no need to guess it.
 fn mark_services_on_other_runtime(world: &E2eWorld) {
     const PLACEHOLDER: &str = "other-runtime";
-    let root = world.isolated_root.as_ref().expect("no isolated root");
-    let services_dir = root.path().join("data").join("services");
-    let entries = std::fs::read_dir(&services_dir)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", services_dir.display()));
+    let folder = services_dir(world);
+    let entries = std::fs::read_dir(&folder)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", folder.display()));
     for entry in entries.flatten() {
         let path = entry.path();
-        // Only process service record JSON files; skip engine state files
-        // (*.state.json) and log files (*.log).
+        // Only JSON files can be service records; skip logs and key files. The
+        // engine state files live outside this folder, so a `service_id` is what
+        // tells a record from any other JSON that happens to be here.
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.contains(".state."))
-        {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -1018,10 +1133,13 @@ fn mark_services_on_other_runtime(world: &E2eWorld) {
         let Some(obj) = value.as_object_mut() else {
             continue;
         };
+        if !obj.contains_key("service_id") {
+            continue;
+        }
         // The state file is rewritten from the path the record names, so it is
         // read out of `obj` before the record is rewritten below.
         if let Some(state_path) = obj.get("engine_state_path").and_then(|v| v.as_str()) {
-            rewrite_engine_state_runtime(std::path::Path::new(state_path), PLACEHOLDER);
+            rewrite_engine_state_runtime(Path::new(state_path), PLACEHOLDER);
         }
         // Rewrite the service record.
         obj.insert(
@@ -1043,7 +1161,7 @@ fn mark_services_on_other_runtime(world: &E2eWorld) {
 /// JSON object is left alone, and the caller's record rewrite still stands. The
 /// scenario's own assertions report the resulting mismatch with the CLI output
 /// attached, which is more useful than a panic here that would hide it.
-fn rewrite_engine_state_runtime(state_path: &std::path::Path, placeholder: &str) {
+fn rewrite_engine_state_runtime(state_path: &Path, placeholder: &str) {
     let Ok(state_text) = std::fs::read_to_string(state_path) else {
         return;
     };
@@ -1125,5 +1243,125 @@ async fn activation_counts_unrecorded_runtime_service(world: &mut E2eWorld) {
     assert!(
         output.contains("recorded_runtime=<unset>"),
         "the entry must say the runtime is unset rather than naming one:\n{output}"
+    );
+}
+
+#[then("the CLI refuses the bare --yes and names --restart-services")]
+async fn bare_yes_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    assert!(
+        rc != 0,
+        "`--yes` with nothing to approve must be refused, got rc=0:\n{}",
+        combined(world)
+    );
+    assert!(
+        combined(world).contains("--restart-services"),
+        "the refusal must name the flag `--yes` depends on, got:\n{}",
+        combined(world)
+    );
+    // The state the callers' next steps check is what proves nothing ran: a
+    // refusal printed after a switch would read the same.
+    assert!(
+        !combined(world).contains("runtime activated")
+            && !combined(world).contains("runtime rolled back"),
+        "a refused command must not report a switch:\n{}",
+        combined(world)
+    );
+}
+
+#[then("the activation fails naming the server it could not restart")]
+async fn activation_fails_naming_unrestarted_server(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no command rc recorded");
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        rc != 0,
+        "a requested restart that did not happen must fail the command:\n{}",
+        combined(world)
+    );
+    assert!(
+        out.contains("  services_restart_failed: 1"),
+        "expected the report to count one failed restart, got:\n{out}"
+    );
+    assert_eq!(
+        ids_listed_under(&out, "services_restart_failed"),
+        [SERVICE_ID],
+        "the failed restart must name the server, got:\n{out}"
+    );
+    // The reason is the one the planted record triggers: a public bind with no
+    // endpoint key is refused before anything is stopped.
+    assert!(
+        out.contains("has no endpoint API key"),
+        "expected the report to carry the restart's own refusal, got:\n{out}"
+    );
+    // The closing error is where the exit code gets its explanation, and it must
+    // not tell the user a live server is down.
+    assert!(
+        combined(world).contains(&format!(
+            "These are still serving from the runtime they recorded, and stay counted under \
+             services_on_previous_runtime: {SERVICE_ID}."
+        )),
+        "expected the error to say the server is still serving from its recorded \
+         runtime, got:\n{}",
+        combined(world)
+    );
+    assert!(
+        !out.contains("  services_restarted:"),
+        "nothing was restarted, so nothing may be listed as restarted, got:\n{out}"
+    );
+}
+
+#[then("the server is still counted as left on the first runtime")]
+async fn server_still_counted_on_first_runtime(world: &mut E2eWorld) {
+    let out = world.cli_output.clone().unwrap_or_default();
+    assert!(
+        out.contains("  services_on_previous_runtime: 1"),
+        "the refused restart left the server up on {FIRST_KEY}, so it is still \
+         counted as left behind, got:\n{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "    - {SERVICE_ID} engine={SERVICE_ENGINE} recorded_runtime={FIRST_KEY}"
+        )),
+        "expected the server named with the runtime it is still on, got:\n{out}"
+    );
+    // The advice to add `--restart-services` is for a user who has not tried it.
+    assert!(
+        !out.contains("note: those keep serving on their recorded runtime"),
+        "a restart was just attempted, so the report must not tell the user to \
+         attempt it, got:\n{out}"
+    );
+}
+
+#[then("the switch to the second runtime was kept")]
+async fn switch_kept_despite_failed_restart(world: &mut E2eWorld) {
+    // A restart failure does not undo the switch; both files must agree on it.
+    assert_eq!(
+        active_runtime_key(world),
+        SECOND_KEY,
+        "the runtime was switched before the restart was attempted:\n{}",
+        combined(world)
+    );
+    assert_eq!(
+        config_active_runtime_key(world).as_deref(),
+        Some(SECOND_KEY),
+        "the config and the marker must agree on the switch:\n{}",
+        combined(world)
+    );
+}
+
+#[then("the server record still names the first runtime")]
+async fn server_record_still_names_first_runtime(world: &mut E2eWorld) {
+    let record = read_service_record(world, SERVICE_ID);
+    assert_eq!(
+        record.get("runtime_id").and_then(serde_json::Value::as_str),
+        Some(FIRST_KEY),
+        "a server that did not move must not be described by a runtime it never \
+         loaded:\n{record}"
+    );
+    assert_eq!(
+        record.get("status").and_then(serde_json::Value::as_str),
+        Some("starting"),
+        "the restart was refused before the stop, so the record must still be \
+         the live one it was:\n{record}"
     );
 }

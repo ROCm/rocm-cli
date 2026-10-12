@@ -689,6 +689,13 @@ pub struct ServiceRecordOptions {
     /// on. Set it when a scenario needs the CLI to see a server still on a
     /// *different* runtime than the one being activated.
     pub runtime_id: Option<&'static str>,
+    /// The bind address recorded for the service. `None` (the default) keeps
+    /// the loopback `127.0.0.1` every other scenario relies on. Set a public
+    /// address such as `0.0.0.0` when a scenario needs the CLI to treat the
+    /// service as publicly bound: restarting one with no endpoint key is
+    /// refused before anything is stopped, which makes a failed restart
+    /// observable without an engine.
+    pub host: Option<&'static str>,
 }
 
 impl Default for ServiceRecordOptions {
@@ -699,6 +706,7 @@ impl Default for ServiceRecordOptions {
             supervisor_pid: 0,
             engine_pid: None,
             runtime_id: None,
+            host: None,
         }
     }
 }
@@ -719,8 +727,9 @@ pub fn write_service_record(services_dir: &Path, model: &str, port: u16) {
 ///
 /// See [`ServiceRecordOptions`] -- e.g. a "still loading" status/startup_phase,
 /// `supervisor_pid`/`engine_pid` pointed at a live process so the CLI's
-/// liveness overlay doesn't mark the planted record dead, or a `runtime_id`
-/// naming the runtime the service was launched against.
+/// liveness overlay doesn't mark the planted record dead, a `runtime_id`
+/// naming the runtime the service was launched against, or a non-loopback
+/// `host`.
 pub fn write_service_record_with(
     services_dir: &Path,
     model: &str,
@@ -736,7 +745,7 @@ pub fn write_service_record_with(
         "engine": "vllm",
         "model_ref": model,
         "canonical_model_id": model,
-        "host": "127.0.0.1",
+        "host": options.host.unwrap_or("127.0.0.1"),
         "port": port,
         "endpoint_url": http_server::loopback_url(port)
             .join("v1")

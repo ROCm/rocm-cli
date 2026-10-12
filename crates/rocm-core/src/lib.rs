@@ -2650,64 +2650,26 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
-    /// Persist the config atomically: write a sibling temp file, then rename it
-    /// over the real one.
+    /// Persist the config by replacing it: write a sibling temp file, then
+    /// rename it over `config.json`.
     ///
-    /// A bare `fs::write` truncates the existing config first, so a failure
-    /// partway through (full disk, crash, killed process) leaves a truncated or
-    /// empty `config.json` — and `load` hard-errors on a file it cannot parse,
-    /// which loses every setting the user has. A rename over the destination
-    /// replaces it in one step on both supported platforms, so a concurrent
-    /// reader sees either the old config or the new one, never a half-written
-    /// one. (That is replacement atomicity, not durability: the bytes are not
-    /// fsynced before the rename, so a power loss can still surface the new
-    /// name with unflushed contents.)
+    /// Guarantees: an interrupted save (full disk, crash, killed process) can
+    /// never leave a truncated or empty `config.json`, which `load` refuses to
+    /// parse, and a reader sees either the old file or the new one. The
+    /// destination is never removed first, because `load` reads a missing
+    /// `config.json` as "no config" and answers with defaults.
     ///
-    /// This is NOT the same write the active-runtime marker uses.
-    /// `write_active_runtime_marker` calls `therock::write_file_atomically`.
-    /// On Unix the two agree — that helper also publishes with `fs::rename`.
-    /// They diverge only on Windows, where it calls `ReplaceFileW` as the
-    /// primary path whenever the destination already exists, falling back to
-    /// `fs::rename` only when it does not.
+    /// The temp file is `config.json.tmp-<millis>-<pid>`; the pid keeps two
+    /// `rocm` processes saving in the same millisecond apart. It is removed if
+    /// the write or the rename fails.
     ///
-    /// The gap that leaves here is narrower than "rename cannot replace an open
-    /// file". An ordinary reader does not block `fs::rename` at all: Rust opens
-    /// with `FILE_SHARE_READ | WRITE | DELETE`, and `MoveFileExW` replaces a
-    /// destination whose open handles all share delete. What it is refused by is
-    /// some *other* process holding the destination WITHOUT `FILE_SHARE_DELETE`
-    /// — the antivirus and indexer case — which raises a sharing violation.
-    /// `fs::rename`'s `SetFileInformationByHandle` fallback does not rescue
-    /// that; it is gated on `ACCESS_DENIED` and is there to get past a readonly
-    /// attribute, not an open handle. `ReplaceFileW` does survive it, by
-    /// renaming the destination aside before the replacement takes its name, and
-    /// it preserves the destination's ACLs, which a rename does not. That helper lives in `apps/rocm`, and `rocm-core` cannot depend
-    /// on the binary crate that contains it, so this path keeps its own.
-    ///
-    /// Closing the gap means moving the helper down into `rocm-core`.
-    /// `windows-sys` is already a Windows-target dependency here and now
-    /// carries `Win32_Storage_FileSystem` (the test gate below needs it), so
-    /// nothing is missing on the dependency side — but the move is
-    /// the whole staging/publishing family in `therock.rs` — around ten
-    /// functions, its `#[cfg]` arms and its existing call sites — not one
-    /// function, and `apps/rocmd` carries a second, already-drifted copy that
-    /// the same follow-up should fold in. It belongs on the Windows lane rather
-    /// than folded in here, and is tracked as a follow-up on the PR that
-    /// introduced this note.
-    ///
-    /// One smaller difference, not worth closing on its own: that helper
-    /// reserves its temp name with `OpenOptions::create_new`, retrying on
-    /// collision, while this writes a `<ts>-<pid>` name with `fs::write`, which
-    /// would truncate a colliding file rather than refuse it. The pid keeps
-    /// concurrent processes apart, so it is latent rather than reachable on
-    /// today's single-threaded save path.
-    ///
-    /// The ACL difference costs little here: the API keys are not in this file.
-    /// Endpoint keys have their own, written owner-only on Unix (default
-    /// permissions elsewhere), and provider keys go to the OS credential store
-    /// with no plaintext fallback. `config.json` is not secret-free, though — a
-    /// configured `dashboard.daemon.token` is serialized into it. Nothing in the
-    /// CLI narrows its mode, so the user affected is one who tightened it by
-    /// hand.
+    /// Not guaranteed:
+    /// - Durability. The bytes are not fsynced before the rename, so a power
+    ///   loss can still surface the new name with unflushed contents.
+    /// - Replacing a `config.json` that another process holds open without
+    ///   delete sharing. On Windows the rename then fails with a sharing
+    ///   violation, the save returns that error, and the old config stays in
+    ///   place.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
@@ -4298,15 +4260,16 @@ impl ManagedServiceRecord {
         {
             endpoint_url.clone_into(&mut self.endpoint_url);
         }
-        // `requested_runtime_id` is the selector the launch actually pinned —
-        // an exact runtime key. `runtime_id` is only what the engine resolved
-        // that to, which for a TheRock runtime is the manifest's family id
-        // (`therock-release:gfx120X-all`), shared by every installed version of
-        // that family. Adopting the resolved form would throw away the version
+        // `requested_runtime_id` is the selector the launch asked for: an exact
+        // runtime key or a family id, whichever was requested. `runtime_id` is
+        // only what the engine resolved that to, which for a TheRock runtime is
+        // the manifest's family id (`therock-release:gfx120X-all`), shared by
+        // every installed version of that family. When the launch pinned an
+        // exact key, adopting the resolved form would throw away the version
         // the service is really on, and the record is what a restart re-pins
         // and what runtime activation compares against. Prefer the requested
         // value, falling back to the resolved one for engines that record only
-        // that.
+        // that. A blank value in either field is ignored.
         if let Some(runtime_id) = ["requested_runtime_id", "runtime_id"]
             .into_iter()
             .filter_map(|key| state.get(key).and_then(serde_json::Value::as_str))
@@ -7766,22 +7729,20 @@ last_installed_runtime_id = "therock-release"
     fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
         use std::os::unix::fs::MetadataExt;
 
-        // The inode is the observable difference between the two
-        // implementations, and the reason the doc comment can promise what it
+        // The inode is the observable difference between a rewrite in place and
+        // a replacement, and the reason the doc comment can promise what it
         // promises. A `fs::write` over the live path truncates and refills the
         // SAME file, so a reader holding it open — or one that opens it mid-save
         // — can see an empty or half-written config, which `load` hard-errors
         // on. A rename publishes a DIFFERENT file over the name, so a reader
         // sees either the old config or the new one and never the gap between.
         //
-        // The sibling test above, which only checks that no temp file is left
-        // behind, holds just as well for an implementation with no temp file at
-        // all — it cannot tell the two apart.
+        // The sibling test above only checks that no temp file is left behind,
+        // which holds just as well for an implementation with no temp file at
+        // all, so it cannot tell the two apart.
         //
-        // The `#[cfg(windows)]` function of the same name below is the Windows
-        // counterpart, reading the same identity through
-        // `GetFileInformationByHandle`, so this guarantee is not asserted on
-        // Unix alone.
+        // The `#[cfg(windows)]` function of the same name below asserts the same
+        // guarantee through `GetFileInformationByHandle`.
         let (root, paths) = temp_app_paths("config-save-replaces");
         let mut config = RocmCliConfig {
             default_engine: Some("vllm".to_owned()),
@@ -7811,11 +7772,8 @@ last_installed_runtime_id = "therock-release"
     ///
     /// Read through `GetFileInformationByHandle` rather than
     /// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
-    /// `file_index` accessors are still unstable behind the `windows_by_handle`
-    /// feature gate and so cannot be called on the pinned stable toolchain —
-    /// using them failed the Windows lane with `error[E0658]` while every other
-    /// lane stayed green, because nothing else in the workspace builds this
-    /// `#[cfg(windows)]` arm.
+    /// `file_index` accessors are unstable behind the `windows_by_handle`
+    /// feature gate and so cannot be called on the pinned stable toolchain.
     #[cfg(windows)]
     #[allow(unsafe_code)] // Win32 FFI
     fn windows_file_identity(path: &Path) -> Result<(u32, u64)> {
@@ -7850,16 +7808,13 @@ last_installed_runtime_id = "therock-release"
         // together with the volume serial number is this platform's file
         // identity, the way an inode is on Unix: a `fs::write` over the live
         // path refills the SAME file and keeps the pair, while a
-        // publish-by-rename puts a DIFFERENT file behind the name. Without
-        // this, the only test that can tell the two implementations apart was
-        // `#[cfg(unix)]`, and a Windows-only regression to a plain `fs::write`
-        // would pass every gate.
+        // publish-by-rename puts a DIFFERENT file behind the name. This keeps a
+        // Windows-only regression to a plain `fs::write` from passing every
+        // gate.
         //
-        // Unlike the `MetadataExt` accessors this replaces, the identity here is
-        // not optional: `GetFileInformationByHandle` either fills both fields or
-        // fails, and a failure is a test error rather than a silently skipped
-        // assertion. The previous shape could not have distinguished "Windows
-        // declined to report an identity" from "the test asserted nothing".
+        // The identity is not optional: `GetFileInformationByHandle` either
+        // fills both fields or fails, and a failure is a test error rather than
+        // a silently skipped assertion.
         let (root, paths) = temp_app_paths("config-save-replaces");
         let mut config = RocmCliConfig {
             default_engine: Some("vllm".to_owned()),
@@ -7885,7 +7840,7 @@ last_installed_runtime_id = "therock-release"
     }
 
     #[test]
-    fn engine_state_refresh_keeps_the_exact_runtime_key_the_launch_pinned() -> Result<()> {
+    fn engine_state_refresh_keeps_the_runtime_selector_the_launch_requested() -> Result<()> {
         let (root, paths) = temp_app_paths("record-runtime-pin");
         let mut record = ManagedServiceRecord::new(
             &paths,
@@ -7909,7 +7864,8 @@ last_installed_runtime_id = "therock-release"
         )?;
         // What a vLLM server writes: `runtime_id` is the manifest's family id,
         // shared by every installed version of that family, while
-        // `requested_runtime_id` is the exact key the launch pinned.
+        // `requested_runtime_id` is the selector the launch asked for, here an
+        // exact runtime key.
         fs::write(
             &record.engine_state_path,
             serde_json::to_vec(&serde_json::json!({
@@ -7974,6 +7930,56 @@ last_installed_runtime_id = "therock-release"
             record.runtime_id.as_deref(),
             Some("lemonade-embeddable-8.1.11")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_ignores_a_blank_requested_runtime_id() -> Result<()> {
+        // A blank selector names no runtime, so adopting it would leave the
+        // record with an empty runtime that matches nothing and that a restart
+        // would re-pin. Both an empty string and whitespace must fall through
+        // to the resolved `runtime_id`.
+        for (blank, name) in [("", "empty"), ("   ", "whitespace")] {
+            let (root, paths) = temp_app_paths(&format!("record-runtime-blank-{name}"));
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                "svc-runtime-blank",
+                "lemonade",
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "127.0.0.1",
+                9,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            fs::create_dir_all(
+                record
+                    .engine_state_path
+                    .parent()
+                    .expect("engine state path has a parent"),
+            )?;
+            fs::write(
+                &record.engine_state_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "running",
+                    "runtime_id": "lemonade-embeddable-8.1.11",
+                    "requested_runtime_id": blank,
+                }))?,
+            )?;
+
+            let refreshed = record.refresh_from_engine_state()?;
+            let _ = fs::remove_dir_all(&root);
+
+            assert!(refreshed, "{name}: the engine state must still be adopted");
+            assert_eq!(
+                record.runtime_id.as_deref(),
+                Some("lemonade-embeddable-8.1.11"),
+                "{name}: a blank requested_runtime_id must fall through to runtime_id"
+            );
+        }
         Ok(())
     }
 
