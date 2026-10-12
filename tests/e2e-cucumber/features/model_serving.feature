@@ -349,7 +349,9 @@ Feature: Model serving
   # waiting on a server that would never come up. This pins the Windows check
   # alongside the Unix one, plus the retirement of the failed launch's record
   # that both now share — read off the record itself, since on Unix the record
-  # of a dead child would let a retry through even unretired. The engine is
+  # of a dead child would let a retry through even unretired. On Windows it also
+  # checks that record names no pid: the spawn saw the child die, and a pid
+  # recorded without a start-time token could later be reused. The engine is
   # scripted to die at startup in test builds (`rocm/e2e-test-hooks`), which also
   # waives the no-GPU pre-flight and engine preparation so this reaches a real
   # spawn without GPU hardware or a runtime download — the death itself is real,
