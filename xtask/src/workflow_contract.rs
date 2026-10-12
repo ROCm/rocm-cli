@@ -1430,6 +1430,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// A block scalar (`name: >`, `name: |-`, …) is read from the
     /// more-indented lines that follow, joined with single spaces, so a
     /// wrapped name is not mistaken for the indicator.
+    /// That only approximates YAML, which keeps a `|` name's line breaks and
+    /// folds a blank line in a `>` one to a newline; callers only match a
+    /// name's prefix or print it.
     fn step_name(step: &str) -> String {
         let Some((at, value)) = step_key_line(step, "name") else {
             return String::new();
@@ -1481,10 +1484,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// Every `GPU preflight` step block in `text`, in file order: each job's
     /// `steps:` items whose name starts `GPU preflight`, jobs in file order.
     ///
-    /// Found through `job_steps`/`step_name` like every other step lookup here,
-    /// so a name wrapped into a block scalar (`name: >-`) is found exactly like
-    /// a one-line one, and a `- name: GPU preflight` line in a comment or some
-    /// step's script is not a step.
+    /// Found through `job_steps`/`step_name`, the parser the preflight presence
+    /// check uses, so the two cannot disagree about what a step is: a name
+    /// wrapped into a block scalar (`name: >-`) is found exactly like a one-line
+    /// one, and a `- name: GPU preflight` line in a comment or some step's
+    /// script is not a step. A job with no `steps:` list contributes nothing.
     fn gpu_preflight_steps(text: &str) -> Vec<String> {
         job_ids(text)
             .into_iter()
@@ -5491,7 +5495,10 @@ permissions:
 
     /// A wrapped step name must not read as its block-scalar indicator: with
     /// `name: >` taken literally, the GPU-preflight lookup would report the
-    /// step missing from a job that has it.
+    /// step missing from a job that has it. A blank line among or after the
+    /// wrapped lines does not end the name. This parser joins the lines with
+    /// single spaces, so `Spaced out` is its reading where YAML would fold the
+    /// blank line to a newline; callers only match a name's prefix.
     #[test]
     fn a_block_scalar_step_name_is_read_from_its_wrapped_lines() {
         let block = "    steps:\n\
@@ -5500,6 +5507,13 @@ permissions:
                      \x20         (bounded wait)\n\
                      \x20       run: |\n\
                      \x20         echo wait\n\
+                     \x20     - name: >-\n\
+                     \x20         Spaced\n\
+                     \n\
+                     \x20         out\n\
+                     \n\
+                     \x20       run: |\n\
+                     \x20         echo spaced\n\
                      \x20     - uses: actions/checkout@v4\n\
                      \x20       name: |\n\
                      \x20         Check out\n\
@@ -5513,14 +5527,25 @@ permissions:
             .collect();
         assert_eq!(
             names,
-            ["GPU preflight (bounded wait)", "Check out", "Plain"]
+            [
+                "GPU preflight (bounded wait)",
+                "Spaced out",
+                "Check out",
+                "Plain"
+            ]
         );
     }
 
     /// The preflight lookup every script check reads from must see a wrapped
-    /// name exactly like a one-line one: matched on the raw `- name:` text, a
-    /// preflight named through `name: >-` drops out of the APU, twin-drift and
-    /// script-extraction checks without any of them noticing.
+    /// name exactly like a one-line one. Matched on the raw `- name:` text, a
+    /// preflight named through `name: >-` is not found, and the checks that
+    /// read the lookup then fail on a block count or an `.expect` that points
+    /// at a removed lane or the extractor, not at the name's form.
+    ///
+    /// It must return only preflight steps, and only real ones: a step with
+    /// another name, a commented-out preflight, and a `- name: GPU preflight`
+    /// line inside some step's script are all left out, and a job with no
+    /// `steps:` list (one that only `uses:` a reusable workflow) adds nothing.
     #[test]
     fn a_gpu_preflight_with_a_block_scalar_name_is_still_found() {
         let workflow = "on: push\n\
@@ -5528,21 +5553,40 @@ permissions:
                         \x20 wrapped:\n\
                         \x20   runs-on: [self-hosted]\n\
                         \x20   steps:\n\
+                        \x20     - uses: actions/checkout@v4\n\
+                        \x20   # a comment at the steps: indent does not end them\n\
                         \x20     - name: >-\n\
                         \x20         GPU preflight\n\
+                        \n\
                         \x20         (bounded wait)\n\
                         \x20       run: |\n\
                         \x20         echo wrapped\n\
+                        \x20     # - name: GPU preflight (disabled)\n\
+                        \x20     - name: Generate the report\n\
+                        \x20       run: |\n\
+                        \x20         cat <<'YAML'\n\
+                        \x20         - name: GPU preflight (inside a script)\n\
+                        \x20         YAML\n\
+                        \x20 reusable:\n\
+                        \x20   uses: ./.github/workflows/other.yml\n\
                         \x20 plain:\n\
                         \x20   runs-on: [self-hosted]\n\
                         \x20   steps:\n\
                         \x20     - name: GPU preflight (bounded wait)\n\
                         \x20       run: |\n\
-                        \x20         echo plain\n";
+                        \x20         echo plain\n\
+                        \x20     - name: Run the suite\n\
+                        \x20       run: |\n\
+                        \x20         echo suite\n";
         let scripts: Vec<String> = gpu_preflight_steps(workflow)
             .iter()
-            .filter_map(|step| run_block(step))
-            .map(|body| body.join("\n").trim().to_owned())
+            .map(|step| {
+                run_block(step)
+                    .expect("every preflight step here has a `run: |` block")
+                    .join("\n")
+                    .trim()
+                    .to_owned()
+            })
             .collect();
         assert_eq!(scripts, ["echo wrapped", "echo plain"]);
     }
