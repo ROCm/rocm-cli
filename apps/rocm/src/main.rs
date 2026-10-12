@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `comfyui` and `therock`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
