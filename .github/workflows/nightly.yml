@@ -1685,3 +1685,190 @@ jobs:
           git add "$page"
           git commit -m "Update E2E support matrix from nightly run ${GITHUB_RUN_NUMBER}"
           git push origin HEAD
+
+  # Computes a mechanical GO/NO-GO release-readiness verdict and status table
+  # from this run's own build/E2E results and the commits/known issues since
+  # the last release tag (`cargo xtask release-readiness`). The verdict and
+  # table never depend on the narrative job below, so a failed or skipped
+  # narrative still gets a correct, if less readable, page published.
+  release-readiness-nightly:
+    name: Release readiness (facts + table)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: read
+    needs:
+      - nightly
+      - windows-nightly
+      - e2e-report-nightly
+    if: always()
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `git describe --tags` and the commit range since the last release
+          # tag both need the full history, not the default shallow clone.
+          fetch-depth: 0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      - name: Download consolidated nightly report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-consolidated-report-nightly
+          path: consolidated
+
+      - name: Compute release-readiness facts + table
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-readiness
+          since_tag=$(git describe --tags --abbrev=0 --match 'v*')
+          cargo xtask release-readiness \
+            --since-tag "$since_tag" \
+            --e2e-report consolidated/support-matrix.md \
+            --nightly-result "${{ needs.nightly.result }}" \
+            --windows-result "${{ needs.windows-nightly.result }}" \
+            --out release-readiness/facts.json \
+            --table-out release-readiness/table.md
+          cat release-readiness/table.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release-readiness facts + table
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-readiness-nightly
+          path: release-readiness/
+
+  # Drafts prose (feature/fix summaries, a "Considerations for Next Release"
+  # paragraph) from the facts computed above; never counts, PR numbers, or the
+  # verdict, which stay 100% mechanical. Allowed to fail without blocking the
+  # table from publishing — the next job tolerates a missing narrative.md.
+  #
+  # Needs a Copilot-licensed PAT in the `COPILOT_PAT` secret: the Copilot CLI
+  # that actions/ai-inference shells out to does not accept a bare
+  # `GITHUB_TOKEN`. See .github/prompts/release-readiness-narrative.txt for
+  # the system prompt.
+  release-readiness-narrative:
+    name: Release readiness (narrative)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    needs: release-readiness-nightly
+    if: ${{ always() && needs.release-readiness-nightly.result == 'success' }}
+    steps:
+      - name: Download release-readiness facts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install GitHub Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Draft narrative
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          model: claude-sonnet-4.5
+          system-prompt-file: .github/prompts/release-readiness-narrative.txt
+          prompt: "{{facts}}"
+          file_input: |
+            facts: release-readiness/facts.json
+          response-file: release-readiness/narrative.md
+
+      - name: Upload narrative
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-readiness-narrative
+          path: release-readiness/narrative.md
+          if-no-files-found: ignore
+
+  # Mirrors publish-e2e-wiki: same branch/repo guard, same degenerate-output
+  # guard, same wiki clone/commit/push. Publishes the mechanical table plus
+  # the narrative (if the narrative job produced one) to its own wiki page.
+  publish-release-readiness-wiki:
+    name: Publish release readiness to wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    needs:
+      - release-readiness-nightly
+      - release-readiness-narrative
+    if: ${{ !cancelled() && needs.release-readiness-nightly.result == 'success' && github.repository == 'ROCm/rocm-cli' && github.ref == 'refs/heads/main' }}
+    concurrency:
+      group: publish-release-readiness-wiki
+      cancel-in-progress: false
+    steps:
+      - name: Download release-readiness table
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-readiness-nightly
+          path: release-readiness
+
+      - name: Download narrative (if the narrative job produced one)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: release-readiness-narrative
+          path: release-readiness
+
+      - name: Push page to the wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Same reasoning as publish-e2e-wiki: publish only when the status
+          # table is present, so any degenerate output leaves the last good
+          # page in place.
+          if ! grep -q '^| Area | Evidence | Status |' release-readiness/table.md; then
+            echo "::warning::No status table in the release-readiness output; leaving the wiki page unchanged."
+            exit 0
+          fi
+          page=Release-Readiness.md
+          {
+            echo "# Release readiness (latest nightly)"
+            echo
+            echo "_Overwritten by the nightly workflow; do not edit by hand._"
+            echo
+            echo "- Run: [${GITHUB_RUN_NUMBER}](${RUN_URL})"
+            echo "- Commit: [\`${GITHUB_SHA::12}\`](${COMMIT_URL})"
+            echo "- Date: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo
+            cat release-readiness/table.md
+            echo
+            if [ -f release-readiness/narrative.md ]; then
+              echo "## Narrative"
+              echo
+              cat release-readiness/narrative.md
+            else
+              echo "_Narrative generation did not complete this run; see the mechanical table above._"
+            fi
+          } > "/tmp/${page}"
+
+          wiki="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          # GitHub creates the wiki's git repo only when the first page is
+          # saved in the web UI, so a never-used wiki cannot be cloned or
+          # pushed to. Fail with the prerequisite rather than a bare 128.
+          if ! git clone --depth 1 "$wiki" wiki; then
+            echo "::error::Cannot clone the wiki. If this is the first run, enable the wiki in repo settings and create its first page once in the web UI (GitHub does not create the wiki git repo until then); otherwise it may be a transient network failure, so re-run the job."
+            exit 1
+          fi
+          cp "/tmp/${page}" "wiki/${page}"
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$page"
+          git commit -m "Update release readiness from nightly run ${GITHUB_RUN_NUMBER}"
+          git push origin HEAD

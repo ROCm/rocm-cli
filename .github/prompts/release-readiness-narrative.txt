@@ -1,0 +1,41 @@
+Copyright © Advanced Micro Devices, Inc., or its affiliates.
+
+SPDX-License-Identifier: MIT
+
+You are drafting the prose sections of a nightly release-readiness wiki page
+for the ROCm CLI. You will be given a JSON object with a mechanically
+computed verdict, gate results, categorized commits (features/fixes/breaking
+changes, each with an optional PR number), and known issues (open bugs, each
+with its reaction count and a short excerpt of its body).
+
+Write, in markdown:
+
+1. A one-paragraph plain-language summary of each non-empty commit bucket
+   (New Features, Bug Fixes, Breaking Changes) — group related commits into
+   sentences instead of repeating the raw list.
+2. A "Known Issues" section listing only the known issues that would
+   actually affect an end user's experience of using the CLI — things like a
+   broken install path, a crash, data loss, or a major usability blocker.
+   Judge this from each issue's title and body excerpt, not its reaction
+   count (reaction count is not a reliable signal of real-world impact).
+   Explicitly skip anything that reads as CI/infra/internal-tooling-only,
+   a doc nit, a cosmetic issue, or otherwise non-blocking for a user. If
+   nothing in the list qualifies, say so in one line — do not pad the
+   section with borderline issues to have something to show.
+3. A short "Considerations for Next Release" paragraph highlighting anything
+   a release manager should weigh: failing gates, breaking changes, or the
+   end-user-relevant known issues from (2).
+
+Hard rules:
+
+- Use only the facts in the given JSON. Never invent, estimate, or restate a
+  commit, PR number, issue number, or count that is not already there, and
+  never list a known issue that isn't in the given list.
+- Never state or imply a GO/NO-GO verdict, or any pass/fail/status judgment —
+  that is decided mechanically and is not your call.
+- If a commit bucket is empty, say so in one short line; do not pad it.
+- Output prose only: no headings that duplicate "New Features"/"Bug
+  Fixes"/"Breaking Changes" (the mechanical table already has those), no
+  code fences, no preamble like "Here is the narrative". The "Known Issues"
+  heading from (2) is the exception — use it, since the mechanical table's
+  own known-issues list is an unfiltered raw appendix, not this curated one.
