@@ -392,7 +392,8 @@ set, the address and the link are printed instead, which is also what
 happens on a machine with no mail client. It is not combinable with
 `--json`, which exists for scripts, and a script is not a person who can
 read a mail before sending it. Note that a mail carries your address, which
-the report itself does not.
+the report itself does not. The dashboard offers the same path on its Diagnose
+screen: `p` shows the report, and `s` asks before it runs `--report --send`.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported, not the
 ranking position noted above, which isn't a stable name. Run it with no id

@@ -52,14 +52,16 @@ pub const VERBS: &[Verb] = &[
         icon: "⚕",
         label: "Diagnose & fix  (doctor)",
         action: KeyAction::OpenExamine,
-        summary: "Read-only environment check that flags what needs fixing.",
+        summary: "Checks the environment and can prepare a Doctor report.",
         steps: &[
-            "Run `rocm examine` (one job, no approval)",
+            "Run the check (no approval)",
             "Review runtime / driver / permission checks",
             "Re-run after fixes with r",
+            "Prepare a Doctor report (p): shown first, sent only on approval",
         ],
         cmd: "rocm examine",
-        read_only: true,
+        // The report can be sent, behind an approval, so this verb is not read-only.
+        read_only: false,
         badge: None,
     },
     Verb {
@@ -252,6 +254,30 @@ mod tests {
         assert_eq!(verb_action(5), KeyAction::Nothing);
         // Out-of-range is a safe no-op.
         assert_eq!(verb_action(99), KeyAction::Nothing);
+    }
+
+    #[test]
+    fn the_diagnose_verb_is_not_read_only_because_it_can_send_a_report() {
+        let diagnose = VERBS
+            .iter()
+            .find(|v| v.action == KeyAction::OpenExamine)
+            .expect("the Diagnose verb");
+        assert!(!diagnose.read_only, "the Doctor report can be sent");
+        assert!(
+            !diagnose.summary.starts_with("Read-only"),
+            "the summary must agree with the flag: {}",
+            diagnose.summary
+        );
+        // The pane prints its footer from the flag, so check what is drawn too.
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.active_tab = ActiveTab::Rocm;
+        s.rocm_sel = 2;
+        let out = render(&s, 120, 40);
+        assert!(
+            out.contains("Mutating actions ask before they run"),
+            "{out}"
+        );
+        assert!(!out.contains("Read-only — nothing is changed"), "{out}");
     }
 
     #[test]
