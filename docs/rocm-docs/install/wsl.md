@@ -43,3 +43,8 @@ the other platforms, see [Installing ROCm CLI](installation.md).
 :start-after: "## What `rocm examine` Reports On WSL"
 :end-before: "## Install UX Recommendations"
 ```
+
+## Next steps
+
+To install the managed TheRock runtime and serve a model, see
+[Getting started](../getting-started.md).

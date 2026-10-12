@@ -28,32 +28,8 @@ rocm diagnose
 rocm diagnose --json
 ```
 
-From Windows PowerShell, inspect a distro without installing anything in it:
-
-```powershell
-rocm diagnose --distro          # the only distro installed
-rocm diagnose --distro Ubuntu   # a named one
-```
-
-With `--distro`, ROCm CLI runs on Windows and calls `wsl.exe` to run a short
-read-only script inside the distro and collect diagnostic data. It then checks
-that data against the same WSL checks as a run from inside the distro, except
-those that need information it cannot collect (see the following list).
-Nothing is installed in the distro, and neither ROCm CLI nor Python needs to be
-there. That matters because the distro you are checking is usually not set up
-yet.
-
-The `--distro` form sees less than a run from inside the distro, so prefer the
-in-distro form where you can:
-
-- The `--distro` form probes the conventional ROCm roots (`/opt/rocm*`,
-  `/usr/local/rocm*`) but cannot honor a `$ROCM_PATH` pointing elsewhere. The
-  probe runs under `/bin/sh -c` through `wsl.exe --exec`, a non-login,
-  non-interactive shell, so nothing exported from a shell profile is set.
-- For the same reason, the `--distro` form collects no environment, so the
-  checks that read one (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the framework
-  and ROCm version pairing) do not run. It reports on the WSL GPU stack, not on
-  the whole installation.
+To check a distro from Windows without installing anything in it, see
+"Diagnosing a WSL host" later on this page.
 
 ## Install ROCDXG In WSL
 
@@ -144,14 +120,14 @@ sudo make install
 sudo ldconfig
 ```
 
-For legacy ROCm releases, set:
+If you use a legacy ROCm release (7.2.4 and earlier) instead of the managed
+TheRock runtime, set:
 
 ```bash
 export HSA_ENABLE_DXG_DETECTION=1
 ```
 
-ROCK/TheRock 7.13 and newer should not require that variable, but setting it is
-still useful for compatibility checks while the WSL path is being hardened.
+TheRock 7.13 and newer should not require this variable.
 
 ## TheRock Runtime Env In WSL
 
@@ -204,15 +180,18 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the prerequisites above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
-Two entries outside this list also apply here. `fix-19-shm-too-small` is not a
-WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
+Two entries outside this list also apply when you run `rocm diagnose` inside the
+distro: `fix-19-shm-too-small` and `fix-18-comgr-conflict`. A `--distro` run
+skips both (see "Diagnose a distro from Windows" later in this section).
+
+`fix-19-shm-too-small` is not a WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
 serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
 can meet it on an otherwise healthy stack. Its guidance names the container and
 bare-metal cases; under WSL2 the remedy is the host one, remounting `/dev/shm`
 larger and adding the matching `/etc/fstab` line inside the distro.
 
-`fix-18-comgr-conflict` also applies here: a wheel copy and a system copy of
-the code object manager library collide on WSL2 exactly as they do on bare
+`fix-18-comgr-conflict` also applies on WSL2: a wheel copy and a system copy of
+the code object manager library collide there exactly as they do on bare
 metal, through the same `LD_LIBRARY_PATH`/loader-cache search, so the finding
 is not specific to either platform.
 
@@ -228,10 +207,61 @@ the report:
 - `fix-wsl-6` **abstains** when WSL interop cannot reach the Windows host, rather
   than reading "could not ask" as "driver is too old". Inside a container, or
   with interop switched off, the host driver is reported as unknown and no
-  finding blames it.
+  finding blames it. It also abstains on WSL 1, which has no GPU path for a
+  driver to serve.
 - `fix-wsl-5` **abstains** when the distro release cannot be parsed. An
   unreadable release is not evidence of a supported one, but it is not evidence
-  of an old one either.
+  of an old one either. It also abstains on any distro other than Ubuntu, because
+  the floor is defined only for Ubuntu.
+
+### Diagnose a distro from Windows
+
+To inspect a distro without installing anything in it, install ROCm CLI on
+Windows (see the Windows steps in the installation guide) and run this from
+PowerShell:
+
+```powershell
+rocm diagnose --distro          # the only distro installed
+rocm diagnose --distro Ubuntu   # a named distro
+```
+
+Name the distro whenever more than one is installed. Without a name, the
+command stops and lists the installed distros.
+
+ROCm CLI runs on Windows and calls `wsl.exe` to run a short read-only script
+inside the distro and collect diagnostic data. It then checks that data against
+the WSL catalog, except for the checks that need data it cannot collect.
+Nothing is installed in the distro, and neither ROCm CLI nor Python needs to be
+there. That matters because the distro you are checking is usually not set up
+yet.
+
+The script runs under `/bin/sh -c` through `wsl.exe --exec`. That shell is
+non-login and non-interactive, so it never reads your shell profile, and it
+collects a fixed set of data. This leaves three limits:
+
+- **Fixed ROCm locations.** The script checks only the conventional ROCm roots
+  (`/opt/rocm*`, `/usr/local/rocm*`) and cannot honor a `$ROCM_PATH` set
+  elsewhere.
+- **No environment checks.** The script collects no environment, so the checks
+  that read one do not run: `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the
+  framework and ROCm version pairing.
+- **No library or shared-memory checks.** The script does not collect the data
+  that `fix-18-comgr-conflict` and `fix-19-shm-too-small` need, so those two do
+  not run either.
+
+`--distro` therefore reports on the WSL GPU stack only. For a full diagnosis,
+run `rocm diagnose` inside the distro. `--distro` also cannot be combined with
+`--model` or `--report`, because both describe the machine running the command.
+
+If the command reports `could not inspect '<name>'; the distribution may be
+stopped or unreachable`, `wsl.exe` could not run the script in the distro. To
+see WSL's own error message, run:
+
+```powershell
+wsl -d <name> --exec /bin/sh -c "echo ok"
+```
+
+Resolve that error first, then run `rocm diagnose --distro` again.
 
 ## What `rocm examine` Reports On WSL
 
