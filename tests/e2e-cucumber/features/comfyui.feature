@@ -25,12 +25,22 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # nothing at all, indistinguishable from a hang. This scenario's harness
   # runs non-interactively by construction, so it can assert that streaming
   # directly, on the success path (the failure path is `comfyui-01` above).
+  #
+  # This scenario also runs the install through to a saved manifest (unlike
+  # comfyui-01, which fails before one is written), so it doubles as the e2e
+  # coverage for `folder:` naming the ComfyUI source checkout consistently in
+  # both `install` and `status` output -- a user-observable line that AGENTS.md
+  # requires a Gherkin scenario for, not just the unit tests that assert each
+  # command's `folder:` line in isolation.
   @id:comfyui-uv-install-progress-streamed @requires-os:linux
   Scenario: comfyui-02 - A dependency install streams progress output
     Given a ready ROCm runtime with a ComfyUI checkout pending dependencies
     And the ComfyUI dependency install with uv prints progress and succeeds
     When the user installs ComfyUI
     Then the CLI succeeds and shows the install progress
+    And the install output's folder: line names the ComfyUI source checkout
+    When the user checks ComfyUI status
+    Then status names the same ComfyUI source folder as the install
 
   # `rocm comfyui install` picks the ROCm runtime to install into. When more than
   # one managed runtime is ready and none is activated as the default, the CLI

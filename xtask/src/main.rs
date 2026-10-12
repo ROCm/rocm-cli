@@ -5,10 +5,10 @@
 //! Repository task runner.
 //!
 //! Provides release-artifact signing, the MANIFEST.md dependency-table
-//! generator, third-party-notices generation, commit-trust verification, and
-//! PowerShell linting. Each command's implementation lives in its own module;
-//! this file holds only the CLI definition and dispatch. Run via the workspace
-//! alias `cargo xtask <command>`.
+//! generator, third-party-notices generation, commit-trust verification,
+//! PowerShell linting, and markdown-link checking. Each command's
+//! implementation lives in its own module; this file holds only the CLI
+//! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
 mod catalog;
@@ -19,6 +19,7 @@ mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
 mod env_mutation_contract;
+mod lychee;
 mod manifest;
 mod package;
 mod paths;
@@ -138,6 +139,14 @@ pub(crate) enum Command {
         /// Skip silently when cargo-about is missing or not the pinned version, instead of
         /// failing. For the local git hook; conflicts with --check so CI's gate always runs.
         #[arg(long, conflicts_with = "check")]
+        if_available: bool,
+    },
+    /// Check that every local markdown link resolves, with lychee and the committed
+    /// `lychee.toml` (the local counterpart of the `docs-links` CI job).
+    Lychee {
+        /// Warn and pass when lychee is not installed, instead of failing. For the
+        /// local git hook; the `docs-links` CI job stays the gate.
+        #[arg(long)]
         if_available: bool,
     },
     /// Verify that commits in a range are cryptographically signed and carry a
@@ -277,6 +286,7 @@ fn run() -> Result<()> {
             check,
             if_available,
         } => tpn::run(check, if_available)?,
+        Command::Lychee { if_available } => lychee::run(if_available)?,
         Command::VerifyCommits {
             base,
             require_verified,
