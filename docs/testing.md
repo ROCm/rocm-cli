@@ -1777,3 +1777,45 @@ afterwards. `engine`/`engine_version` carry the same distinction: a host a
 probe found no engine on reports `"engine": "none"`, while a host whose engine
 probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
 since a probe that never ran cannot say an engine is absent.
+
+## Doctor Skill Eval Replays
+
+The rocm-doctor skill's behavioural evals (`skills/rocm-doctor/evals/`) run on
+grading machines that have no `rocm` binary. An agent following the skill stops
+at the install offer there, so a case can only grade what the agent does before a
+diagnosis exists. A case that grades how the agent reads a diagnosis, or what it
+does on an older CLI, needs a `rocm` to talk to.
+
+`evals/hooks.py` supplies one. For a case that has a directory under
+`evals/fixtures/`, the hook writes a stub `rocm` into a temporary directory, puts
+it first on `PATH`, and removes it afterwards. The stub replays recorded output for
+`rocm --version`, `rocm fix --json` and `rocm diagnose`, and refuses every other
+command with exit code 2, so a replay cannot change a machine or send anything. A
+case with no fixture directory runs as before, with no `rocm` on `PATH`.
+
+The recordings are generated, not typed in:
+
+```bash
+cargo xtask eval-fixtures          # write skills/rocm-doctor/evals/fixtures/*/replies.json
+cargo xtask eval-fixtures --check  # fail if any recording is missing, stale, or unexpected
+```
+
+The manifest comes from the compiled catalog and each diagnosis from
+`rocm_core::run_diagnose`, run over the recorded examination in
+`tests/remote-ssh/examination.json`, so a catalog change cannot leave a stale
+recording behind. CI runs the check, and `cargo test -p xtask` runs it too. Read the
+diff after regenerating: a recording that changed is output the skill is now graded
+against. What an older CLI printed cannot be generated. It was recorded once from a
+real older build and lives in `evals/fixtures/recorded/`.
+
+To add a case, add an entry to `evals/fixtures/cases.json` (the case id, `current`
+or `older`, and the error text the agent would pass as the symptom), run the
+command above, and add the case to `evals/evals.json` with the same id. A directory
+that no case owns fails the check, and the command never deletes one: remove it by
+hand.
+
+Two limits worth knowing. A replay says what the catalog says for a recorded host
+with no GPU data, so it grades how the agent reads and relays an answer, not whether
+the CLI is right about a real machine. And the Windows launcher is a `rocm.cmd` shim
+that this repository has no Windows lane to run; the first run of the amd/skills
+Windows leg is what shows whether it works.

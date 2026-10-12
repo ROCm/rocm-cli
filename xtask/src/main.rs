@@ -19,6 +19,7 @@ mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
 mod env_mutation_contract;
+mod eval_fixtures;
 mod lychee;
 mod manifest;
 mod package;
@@ -108,6 +109,14 @@ pub(crate) enum Command {
     Catalog {
         /// Verify the published manifest is current without writing; exit
         /// non-zero if it would change.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Regenerate the recorded `rocm` output the rocm-doctor skill evals replay
+    /// from the compiled catalog (skills/rocm-doctor/evals/fixtures/).
+    EvalFixtures {
+        /// Verify the committed recordings are current without writing; exit
+        /// non-zero if any is missing, stale, or unexpected.
         #[arg(long)]
         check: bool,
     },
@@ -280,6 +289,7 @@ fn run() -> Result<()> {
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
         Command::Catalog { check } => catalog::run(check)?,
+        Command::EvalFixtures { check } => eval_fixtures::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
         Command::Tpn {
