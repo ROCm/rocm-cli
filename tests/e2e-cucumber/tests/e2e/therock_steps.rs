@@ -53,7 +53,20 @@ const NEXT_TORCHAUDIO_VERSION: &str = "2.9.1+rocm10.0.0";
 const NEWER_NEXT_ROCM_VERSION: &str = "10.1.0";
 const NEWER_NEXT_TORCH_VERSION: &str = "2.11.0+rocm10.1.0";
 const NEWER_NEXT_TORCHVISION_VERSION: &str = "0.26.0+rocm10.1.0";
-const NEWER_NEXT_TORCHAUDIO_VERSION: &str = "2.9.2+rocm10.1.0";
+/// The newer build's torchaudio, shaped like the live `whl-next` index's
+/// `+rocm10.1.0` builds: an original release (CPU-only on the live index), the
+/// hardware-verified rebuild, and a newer rebuild sharing the same label. The
+/// verified one is the release `rocm_engine_vllm::verified_torchaudio_release`
+/// records for ROCm 10.1 (the vLLM ROCm 10.x discover-build table's exact
+/// torchaudio pin); this fixture has to change with it.
+const NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION: &str = "2.11.0+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION: &str = "2.11.0.2+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION: &str = "2.11.0.3+rocm10.1.0";
+const NEWER_NEXT_TORCHAUDIO_VERSIONS: [&str; 3] = [
+    NEWER_NEXT_TORCHAUDIO_ORIGINAL_VERSION,
+    NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+    NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION,
+];
 /// A rebuild of `NEXT_TORCHAUDIO_VERSION`, published the way the live index
 /// publishes torchaudio rebuilds: as a fourth release segment.
 const NEXT_TORCHAUDIO_REBUILD_VERSION: &str = "2.9.1.2+rocm10.0.0";
@@ -289,31 +302,26 @@ fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
 }
 
 /// The older build also carries a torchaudio rebuild, as the live index does,
-/// and a newer rebuild still that this host cannot install.
+/// and a newer rebuild still that this host cannot install. The newer build
+/// carries a hardware-verified torchaudio with a newer rebuild beside it.
 #[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
 async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
-    serve_two_next_builds(
-        world,
-        &[
-            (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
-            (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
-            (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
-            (NEWER_NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
-        ],
-    );
+    let mut torchaudio = vec![
+        (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
+        (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
+    ];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
 }
 
 /// The pinned build's only torchaudio is a wheel this host cannot install, so
 /// for this Python and platform it publishes none.
 #[given("a ROCm 10 pip index fixture that publishes torchaudio only for a newer ROCm 10 build")]
 async fn pip_index_fixture_without_pinned_torchaudio(world: &mut E2eWorld) {
-    serve_two_next_builds(
-        world,
-        &[
-            (NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG),
-            (NEWER_NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
-        ],
-    );
+    let mut torchaudio = vec![(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG)];
+    torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
+    serve_two_next_builds(world, &torchaudio);
 }
 
 /// Registry key for the planted manifest below. Filename-safe (no `:`), same
@@ -778,6 +786,26 @@ async fn preview_pinned_wheel_install_with_group_family(world: &mut E2eWorld) {
     );
 }
 
+#[when("the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0")]
+async fn preview_newer_pinned_wheel_install(world: &mut E2eWorld) {
+    preview_ok(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEWER_NEXT_ROCM_VERSION,
+            "--dry-run",
+        ],
+    );
+}
+
 #[when("the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0")]
 async fn try_preview_pinned_wheel_install(world: &mut E2eWorld) {
     preview(
@@ -992,6 +1020,63 @@ async fn preview_installs_one_rocm_build(world: &mut E2eWorld) {
     assert_contains(world, &expected, "single ROCm build");
 }
 
+/// The `torchaudio_selection:` line, which must name the very torchaudio the
+/// `package_specs:` line installs: the two are asserted together so a note that
+/// describes one build while the plan installs another fails here.
+fn assert_torchaudio_selection(world: &E2eWorld, torchaudio: &str, description: &str) {
+    assert_contains(
+        world,
+        &format!("torchaudio=={torchaudio}"),
+        "torchaudio in the install plan",
+    );
+    assert_contains(
+        world,
+        &format!("torchaudio_selection: torchaudio {torchaudio}, {description}"),
+        "torchaudio selection note",
+    );
+}
+
+#[then(
+    "the preview says its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn preview_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // ROCm 10.0 has no verified torchaudio recorded, so the newest build is
+    // pinned and the plan says that is all it is.
+    assert_torchaudio_selection(
+        world,
+        NEXT_TORCHAUDIO_REBUILD_VERSION,
+        &format!(
+            "the newest build published for ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, \
+             because no torchaudio release is recorded as verified for this ROCm line"
+        ),
+    );
+}
+
+#[then(
+    "the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild"
+)]
+async fn preview_installs_verified_torchaudio(world: &mut E2eWorld) {
+    let expected = format!(
+        "package_specs: rocm[libraries,device-{RAW_ARCH}]=={NEWER_NEXT_ROCM_VERSION} \
+         torch[device-{RAW_ARCH}]=={NEWER_NEXT_TORCH_VERSION} \
+         torchvision[device-{RAW_ARCH}]=={NEWER_NEXT_TORCHVISION_VERSION} \
+         torchaudio=={NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION}"
+    );
+    assert_contains(world, &expected, "verified torchaudio plan");
+    assert_torchaudio_selection(
+        world,
+        NEWER_NEXT_TORCHAUDIO_VERIFIED_VERSION,
+        &format!("the build verified on hardware for ROCm {NEWER_NEXT_ROCM_VERSION}"),
+    );
+    // Recency picked the newer rebuild before; it must appear nowhere now.
+    assert!(
+        !stdout(world).contains(NEWER_NEXT_TORCHAUDIO_NEWEST_VERSION)
+            && !stdout(world).contains("not hardware-verified"),
+        "the preview still names the newer rebuild or an unverified note:\n{}",
+        stdout(world)
+    );
+}
+
 #[then("the preview resolves the ROCm 10 tarball catalog")]
 async fn preview_resolves_next_tarball_catalog(world: &mut E2eWorld) {
     let base = next_tarball_base(world);
@@ -1062,10 +1147,9 @@ async fn failure_names_the_missing_torchaudio_build(world: &mut E2eWorld) {
     // the pinned ROCm build's wheel for another platform, or the newer ROCm
     // build's — can appear unless the pin error was swallowed and resolution
     // carried on with one of them.
-    for fallback in [
-        NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION,
-        NEWER_NEXT_TORCHAUDIO_VERSION,
-    ] {
+    for fallback in
+        std::iter::once(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION).chain(NEWER_NEXT_TORCHAUDIO_VERSIONS)
+    {
         assert!(
             !reported.contains(fallback),
             "resolution continued with torchaudio {fallback}:\n{reported}"

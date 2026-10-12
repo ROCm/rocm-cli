@@ -474,12 +474,19 @@ rather than resolved to a guess, because the ROCm 10 packages publish one
 payload per exact arch and there is no bucket payload to fall back to. Run
 `rocm examine` to see the arch this machine reports.
 
-For ROCm 10, `install sdk` pins torchaudio to the newest build published for
-the requested ROCm version (its metadata names no ROCm build, so nothing else
-would) and stops with an error when that version publishes none, asks `uv` to
-resolve Torch and torchvision from their published dependency metadata
-alongside it, then validates that every selected framework package carries the
-same ROCm build identifier before it creates or changes a managed runtime.
+For ROCm 10, `install sdk` pins torchaudio itself, because its metadata names
+no ROCm build. When a torchaudio release has been verified on hardware for the
+requested ROCm line (the same one the vLLM ROCm 10.x install pins; today only
+ROCm 10.1 has one), it pins that build. Otherwise, or when that build isn't
+published for this Python and platform, it pins the newest build published for
+the requested ROCm version, and the `torchaudio_selection:` line in the plan
+says that build isn't hardware-verified. Newest isn't always right: the index
+has published a CPU-only torchaudio under the same `+rocm` label as working
+builds. It stops with an error when the requested version publishes no
+torchaudio. It then asks `uv` to resolve Torch and torchvision from their
+published dependency metadata alongside it, and validates that every selected
+framework package carries the same ROCm build identifier before it creates or
+changes a managed runtime.
 
 Nothing about this happens on its own. Without a `--version` of 10 or newer,
 `install sdk` resolves the same release and nightly sources as before. It doesn't

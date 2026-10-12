@@ -162,7 +162,10 @@ Expected result:
 - pip installs pinned `rocm`, `torch`, and `torchvision` requirements with
   exactly one `device-<detected-gfx-target>` extra (`rocm` also requests
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned
-  `torchaudio` from the TheRock index. On a host with no detectable AMD GPU the
+  `torchaudio` from the TheRock index. For ROCm 10, the plan's
+  `torchaudio_selection:` line says whether that torchaudio is the
+  hardware-verified build for the ROCm line (10.1: `2.11.0.2`) or the newest
+  published one, which it marks as not hardware-verified. On a host with no detectable AMD GPU the
   preview reports `device_target: undetermined` and a real install refuses
   rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
