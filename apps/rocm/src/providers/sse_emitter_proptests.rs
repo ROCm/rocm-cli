@@ -6,78 +6,100 @@
 //! and `AnthropicSseEmitter`): however the bytes of a stream arrive, the
 //! emitted events are the ones the whole body produces in one piece.
 //!
-//! The fixtures are the SSE bodies the unit tests in `providers.rs` already
-//! use, plus the same shapes with CRLF line endings (what Python SSE servers
-//! emit by default) and multi-byte UTF-8 content, so that a split can land
-//! between `\r` and `\n` and inside a UTF-8 sequence, and bodies whose last
-//! line is cut off before its terminator, so that `finish()` has a partial line
-//! to flush. None of them generates SSE text from scratch. The transport readers
-//! that feed these emitters (chunked and close-delimited bodies) are not covered
-//! here.
+//! OpenAI fixture 1 is the body of `parses_openai_sse_chat_events` in
+//! `providers.rs`. The others are written here, in the shapes those servers
+//! send, to reach what that one body does not: CRLF line endings (what Python
+//! SSE servers emit by default), multi-byte UTF-8 content so that a split can
+//! land inside a UTF-8 sequence, `data:` with no space before content, a
+//! role-only delta, a usage chunk with empty `choices`, a `message.content`
+//! chunk, Anthropic's `message_start` and `content_block_start` events, lines
+//! after the end of the stream, and bodies whose last line is cut off before
+//! its terminator, so that `finish()` has a partial line to flush. None of them
+//! generates SSE text from scratch. The transport readers that feed these
+//! emitters (chunked and close-delimited bodies) are not covered here.
+//!
+//! The CRLF fixtures check that both line parsers trim the `\r`. The emitters'
+//! own `trim_end_matches('\r')` is redundant with that trim, so no test here can
+//! observe it, and a split between `\r` and `\n` is not a separate hazard: the
+//! emitters break lines on `\n` alone.
 //!
 //! Split invariance alone cannot see a defect that changes the whole-body result
 //! and every split result alike, such as `finish()` dropping the partial last
-//! line. So each fixture also carries the text it must produce.
+//! line. So each fixture also carries the exact events it must produce.
 
 use super::*;
+use crate::test_support::proptest_cases;
 use proptest::prelude::*;
 
-/// `(body, the text its events must concatenate to)`.
-const OPENAI_FIXTURES: &[(&str, &str)] = &[
+/// A body, and the `(content, done)` events it must produce.
+type Fixture = (&'static str, &'static [(&'static str, bool)]);
+
+const OPENAI_FIXTURES: &[Fixture] = &[
     // providers.rs `parses_openai_sse_chat_events`.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n",
-        "hello",
+        &[("hel", false), ("lo", false), ("", true)],
     ),
     // Same body, CRLF line endings.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",
-        "hello",
+        &[("hel", false), ("lo", false), ("", true)],
     ),
-    // Multi-byte content (2-, 3- and 4-byte sequences), CRLF, no space after
-    // `data:`, a role-only first delta, and a usage chunk with empty choices.
+    // Multi-byte content (2-, 3- and 4-byte sequences), CRLF, a role-only first
+    // delta (its empty content is still an event), content after `data:` with
+    // no space, and a usage chunk with empty choices (no event).
     (
-        "data:{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\u{e9} \u{6f22}\u{5b57} \u{1f680}\"}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \u{4e16}\u{754c}\"}}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\r\n\r\ndata: [DONE]\r\n\r\n",
-        "caf\u{e9} \u{6f22}\u{5b57} \u{1f680} \u{4e16}\u{754c}",
+        "data:{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\r\n\r\ndata:{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\u{e9} \u{6f22}\u{5b57} \u{1f680}\"}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \u{4e16}\u{754c}\"}}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\r\n\r\ndata: [DONE]\r\n\r\n",
+        &[
+            ("", false),
+            ("caf\u{e9} \u{6f22}\u{5b57} \u{1f680}", false),
+            (" \u{4e16}\u{754c}", false),
+            ("", true),
+        ],
+    ),
+    // A `message.content` chunk (the non-delta shape some servers send), then
+    // lines after `[DONE]`: neither a late chunk nor a second `[DONE]` may
+    // reach the caller.
+    (
+        "data: {\"choices\":[{\"message\":{\"content\":\"wh\u{f6}le\"}}]}\n\ndata: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n",
+        &[("wh\u{f6}le", false), ("", true)],
     ),
     // The stream closes in the middle of its last line: no terminator and no
     // `[DONE]`, so that line's content reaches the caller only through
     // `finish()`.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo \u{1f680}\"}}]}",
-        "hello \u{1f680}",
+        &[("hel", false), ("lo \u{1f680}", false), ("", true)],
     ),
     // The same cut-off tail on a CRLF stream, after the `\r` of the last line.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r",
-        "hello",
+        &[("hel", false), ("lo", false), ("", true)],
     ),
 ];
 
-/// `(body, the text its events must concatenate to)`.
-const ANTHROPIC_FIXTURES: &[(&str, &str)] = &[
-    // The opening `message_start` and `content_block_start` (empty text) that
-    // Anthropic streams send, two multi-byte deltas, and `message_stop`.
+const ANTHROPIC_FIXTURES: &[Fixture] = &[
+    // The opening `message_start` and `content_block_start` (empty text, which
+    // is no event) that Anthropic streams send, two multi-byte deltas, and
+    // `message_stop`.
     (
         "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\r\n\r\nevent: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h\u{e9}l\u{1f680}\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
-        "h\u{e9}l\u{1f680}lo",
+        &[("h\u{e9}l\u{1f680}", false), ("lo", false), ("", true)],
+    ),
+    // A `content_block_start` that carries text, after `data:` with no space
+    // (Anthropic sends it empty, but the parser reads it when it is not), then
+    // lines after `message_stop`: neither a late delta nor a late `error` may
+    // reach the caller or fail the finished stream.
+    (
+        "event: content_block_start\ndata:{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"H\u{e9}\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"y\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"late\"}}\n\n",
+        &[("H\u{e9}", false), ("y", false), ("", true)],
     ),
     // The stream closes in the middle of its last line, before `message_stop`.
     (
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" th\u{e9}re\"}}",
-        "hi th\u{e9}re",
+        &[("hi", false), (" th\u{e9}re", false), ("", true)],
     ),
 ];
-
-/// Case count for the randomized property: `default`, unless `PROPTEST_CASES`
-/// (proptest's own knob, which an explicit count would otherwise override)
-/// asks for a longer run.
-fn cases(default: u32) -> u32 {
-    std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
 
 fn openai_events_from_pieces(pieces: &[&[u8]]) -> Vec<ProviderStreamEvent> {
     let mut events = Vec::new();
@@ -107,28 +129,6 @@ fn anthropic_events_from_pieces(pieces: &[&[u8]]) -> Vec<ProviderStreamEvent> {
     events
 }
 
-/// The whole-body result every split is compared with must itself be right:
-/// the expected text, and exactly one `done` event, at the end.
-fn assert_whole_body_events(events: &[ProviderStreamEvent], expected: &str, fixture: &str) {
-    assert_eq!(
-        events
-            .iter()
-            .map(|e| e.content.as_str())
-            .collect::<String>(),
-        expected,
-        "text of {fixture:?}"
-    );
-    assert_eq!(
-        events.iter().filter(|e| e.done).count(),
-        1,
-        "done events of {fixture:?}"
-    );
-    assert!(
-        events.last().is_some_and(|e| e.done),
-        "last event of {fixture:?} is not done"
-    );
-}
-
 /// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
 fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
     let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
@@ -144,25 +144,19 @@ fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
     pieces
 }
 
-/// How many split points landed in each place a line emitter is most likely to
-/// get wrong.
+/// How many single split points landed in each place a line emitter is most
+/// likely to get wrong.
 #[derive(Default, Debug)]
 struct SplitReach {
-    total: usize,
     mid_utf8: usize,
-    mid_crlf: usize,
     mid_data_prefix: usize,
 }
 
 impl SplitReach {
     fn record(&mut self, bytes: &[u8], cut: usize) {
-        self.total += 1;
         if cut > 0 && cut < bytes.len() {
             if bytes[cut] & 0b1100_0000 == 0b1000_0000 {
                 self.mid_utf8 += 1;
-            }
-            if bytes[cut - 1] == b'\r' && bytes[cut] == b'\n' {
-                self.mid_crlf += 1;
             }
             let line_start = bytes[..cut]
                 .iter()
@@ -176,47 +170,52 @@ impl SplitReach {
     }
 }
 
-/// Every single split point, and every pair of split points, of every fixture:
-/// exhaustive, so mid-UTF-8 and mid-CRLF splits are guaranteed to be reached
-/// rather than hoped for.
-#[test]
-fn sse_emitters_are_invariant_under_every_one_and_two_point_split() {
-    let mut reach = SplitReach::default();
-    for (fixture, expected) in OPENAI_FIXTURES {
+/// Check the whole body of each fixture against its expected events, then
+/// every one- and two-point split of it against the whole body.
+fn sweep_splits(
+    fixtures: &[Fixture],
+    events_from_pieces: fn(&[&[u8]]) -> Vec<ProviderStreamEvent>,
+    reach: &mut SplitReach,
+) {
+    for (fixture, expected) in fixtures {
         let bytes = fixture.as_bytes();
-        let whole = openai_events_from_pieces(&[bytes]);
-        assert_whole_body_events(&whole, expected, fixture);
+        let whole = events_from_pieces(&[bytes]);
+        let expected: Vec<ProviderStreamEvent> = expected
+            .iter()
+            .map(|&(content, done)| ProviderStreamEvent {
+                content: content.to_owned(),
+                done,
+            })
+            .collect();
+        assert_eq!(whole, expected, "events of {fixture:?}");
         for a in 0..=bytes.len() {
             reach.record(bytes, a);
             assert_eq!(
-                openai_events_from_pieces(&split_at_offsets(bytes, &[a])),
+                events_from_pieces(&split_at_offsets(bytes, &[a])),
                 whole,
-                "split at {a}"
+                "split at {a} of {fixture:?}"
             );
             for b in a..=bytes.len() {
                 assert_eq!(
-                    openai_events_from_pieces(&split_at_offsets(bytes, &[a, b])),
+                    events_from_pieces(&split_at_offsets(bytes, &[a, b])),
                     whole,
-                    "split at {a},{b}"
+                    "split at {a},{b} of {fixture:?}"
                 );
             }
         }
     }
-    for (fixture, expected) in ANTHROPIC_FIXTURES {
-        let bytes = fixture.as_bytes();
-        let whole = anthropic_events_from_pieces(&[bytes]);
-        assert_whole_body_events(&whole, expected, fixture);
-        for a in 0..=bytes.len() {
-            reach.record(bytes, a);
-            assert_eq!(
-                anthropic_events_from_pieces(&split_at_offsets(bytes, &[a])),
-                whole,
-                "split at {a}"
-            );
-        }
-    }
+}
+
+/// Every single split point, and every pair of split points, of every fixture
+/// of both emitters: exhaustive, so mid-UTF-8 and mid-`data:` splits are
+/// guaranteed to be reached rather than hoped for.
+#[test]
+fn sse_emitters_are_invariant_under_every_one_and_two_point_split() {
+    let mut reach = SplitReach::default();
+    sweep_splits(OPENAI_FIXTURES, openai_events_from_pieces, &mut reach);
+    sweep_splits(ANTHROPIC_FIXTURES, anthropic_events_from_pieces, &mut reach);
     eprintln!("single-split reach: {reach:?}");
-    assert!(reach.mid_utf8 > 0 && reach.mid_crlf > 0 && reach.mid_data_prefix > 0);
+    assert!(reach.mid_utf8 > 0 && reach.mid_data_prefix > 0);
     // Each emitter has a fixture whose last line is left for `finish()`.
     for fixtures in [OPENAI_FIXTURES, ANTHROPIC_FIXTURES] {
         assert!(fixtures.iter().any(|(body, _)| !body.ends_with('\n')));
@@ -335,6 +334,7 @@ fn sse_line() -> impl Strategy<Value = String> {
 #[derive(Debug, Default)]
 struct ParserReach {
     samples: u32,
+    openai_choices_empty: u32,
     openai_delta_content: u32,
     openai_message_content: u32,
     openai_choices_not_an_array: u32,
@@ -358,6 +358,10 @@ impl ParserReach {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(data.trim()) else {
             return;
         };
+        bump(
+            &mut self.openai_choices_empty,
+            v["choices"].as_array().is_some_and(Vec::is_empty),
+        );
         let first = &v["choices"][0];
         bump(
             &mut self.openai_delta_content,
@@ -378,7 +382,11 @@ impl ParserReach {
         );
         bump(
             &mut self.anthropic_block_start_text,
-            kind == Some("content_block_start") && v["content_block"]["text"].is_string(),
+            // Production drops an empty start text, so only non-empty counts.
+            kind == Some("content_block_start")
+                && v["content_block"]["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()),
         );
         bump(
             &mut self.anthropic_message_stop,
@@ -425,6 +433,7 @@ fn sse_line_inputs_reach_every_field_reading_branch() {
     // 1% of the sample: under every measured share, well above zero.
     let floor = reach.samples / 100;
     for (branch, hits) in [
+        ("openai empty choices", reach.openai_choices_empty),
         ("openai delta.content", reach.openai_delta_content),
         ("openai message.content", reach.openai_message_content),
         (
@@ -436,7 +445,7 @@ fn sse_line_inputs_reach_every_field_reading_branch() {
             reach.anthropic_delta_text,
         ),
         (
-            "anthropic content_block_start text",
+            "anthropic content_block_start non-empty text",
             reach.anthropic_block_start_text,
         ),
         ("anthropic message_stop", reach.anthropic_message_stop),
@@ -459,7 +468,7 @@ fn sse_line_inputs_reach_every_field_reading_branch() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases(1024)))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(1024)))]
 
     /// No line panics either line parser: arbitrary text, and `data:` lines
     /// whose JSON has the fields the parsers read, in arbitrary shapes.
@@ -467,6 +476,45 @@ proptest! {
     fn sse_line_parsers_never_panic(line in sse_line()) {
         let _ = parse_openai_sse_line(&line);
         let _ = parse_anthropic_sse_line(&line);
+    }
+}
+
+/// An Anthropic `error` event fails the stream with the server's message (or a
+/// placeholder when it sends none), after the text that came before it has
+/// reached the caller. `sse_line_parsers_never_panic` reaches this branch but
+/// can only fail on a panic, not on a wrong result.
+#[test]
+fn anthropic_error_event_fails_the_stream() {
+    for (error, reported) in [
+        (
+            "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+            "Anthropic provider stream failed: Overloaded",
+        ),
+        (
+            "{\"type\":\"error\",\"error\":{}}",
+            "Anthropic provider stream failed: unknown Anthropic stream error",
+        ),
+    ] {
+        let body = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"par\"}}}}\n\nevent: error\ndata: {error}\n\n"
+        );
+        let mut events = Vec::new();
+        let mut on_event = |event: ProviderStreamEvent| {
+            events.push(event);
+            Ok(())
+        };
+        let mut emitter = AnthropicSseEmitter::new(&mut on_event);
+        let failure = emitter
+            .push_bytes(body.as_bytes())
+            .expect_err("an error event fails the stream");
+        assert_eq!(failure.to_string(), reported);
+        assert_eq!(
+            events,
+            [ProviderStreamEvent {
+                content: "par".to_owned(),
+                done: false,
+            }]
+        );
     }
 }
 
@@ -495,11 +543,20 @@ fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
             Ok(())
         };
         let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-        let pushed = emitter.push_bytes(body.as_bytes());
-        let finished = emitter.finish();
+        let result = emitter
+            .push_bytes(body.as_bytes())
+            .and_then(|()| emitter.finish());
         assert!(
-            pushed.is_err() || finished.is_err(),
+            result.is_err(),
             "stream with an in-band error finished cleanly with {events:?}"
+        );
+        // The text produced before the failure still reaches the caller.
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| e.content.as_str())
+                .collect::<String>(),
+            "partial"
         );
     }
 }
