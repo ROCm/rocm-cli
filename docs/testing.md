@@ -108,23 +108,15 @@ all of which the scan reports nothing for:
   different scope, so the scan cannot see the two together. It matches call
   text, so a wrapper hides the mutation until the wrapper itself is named in the
   scanner's `MUTATIONS` list, as `RestoredEnvVar::set(` is. Add a new restoring
-  helper to that list, or it is outside the guard. A guard type whose `Drop`
-  mutates the environment needs its type name listed too, as `UnsetKeyOnExit`
-  is, because the test only ever names the type and never calls a `::new(`.
+  helper to that list, or it is outside the guard. A guard whose `Drop` mutates
+  the environment hides its mutation the same way: list the call that builds
+  it, as `UnsetKeyOnExit::arm(` is, and build it through a named call rather
+  than as a bare unit struct, which leaves no call text to match.
 - A harness attribute that does not end in `test`, such as `#[test_case(..)]` or
   `#[rstest]`. Neither is used in this tree.
 - `#[cfg_attr(unix, test)]`, for the same reason: the attribute's path reads as
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
-
-A bare type name in `MUTATIONS` is matched wherever it can stand for a value
-rather than a type: `drop(UnsetKeyOnExit)` and `let _g = UnsetKeyOnExit;` are
-flagged, `Option<UnsetKeyOnExit>` and a parameter typed `_x: UnsetKeyOnExit` are
-not. The rule errs toward reporting, so a few type mentions it cannot tell from
-a construction, such as a struct pattern, are flagged although they build
-nothing; reword them. The full rule and its known over-reports are documented
-on `MUTATIONS` in
-[`xtask/src/env_mutation_contract.rs`](../xtask/src/env_mutation_contract.rs).
 
 Run the cross-platform smoke test:
 

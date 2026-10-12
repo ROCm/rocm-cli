@@ -64,6 +64,7 @@ mod tests {
     use super::RestoredEnvVar;
     use std::ffi::OsString;
     use std::path::Path;
+    use std::sync::MutexGuard;
 
     /// Serializes the env mutation below, as the contract guard requires.
     static TEST_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -78,9 +79,19 @@ mod tests {
     /// it fails, which is exactly when someone would be looking at it.
     ///
     /// Holding one mutates the environment from a `Drop` impl the contract
-    /// guard cannot see, so `UnsetKeyOnExit` is named in its `MUTATIONS` list:
-    /// a test that holds one without the lock is flagged like a direct call.
+    /// guard cannot see, so the call that builds one, `UnsetKeyOnExit::arm(`,
+    /// is named in its `MUTATIONS` list: a test that arms one without taking a
+    /// `*_TEST_LOCK` is flagged like a direct call.
     struct UnsetKeyOnExit;
+
+    impl UnsetKeyOnExit {
+        /// Takes the caller's lock guard by reference, so arming one without
+        /// holding a lock does not compile. Any `Mutex<()>` guard satisfies
+        /// the type; which lock it is stays the contract guard's to check.
+        const fn arm(_lock: &MutexGuard<'_, ()>) -> Self {
+            Self
+        }
+    }
 
     impl Drop for UnsetKeyOnExit {
         #[allow(unsafe_code)] // std::env::remove_var is unsafe in edition 2024
@@ -105,10 +116,10 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // std::env::set_var/remove_var are unsafe in edition 2024
     fn dropping_the_guard_restores_the_previous_state() {
-        let _guard = TEST_ENV_TEST_LOCK
+        let lock = TEST_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _unset_on_exit = UnsetKeyOnExit;
+        let _unset_on_exit = UnsetKeyOnExit::arm(&lock);
 
         // SAFETY: serialized by the lock above, and nothing else reads this key.
         unsafe { std::env::remove_var(KEY) };
@@ -155,10 +166,10 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
     fn unwinding_past_the_guard_restores_the_previous_state() {
-        let _guard = TEST_ENV_TEST_LOCK
+        let lock = TEST_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _unset_on_exit = UnsetKeyOnExit;
+        let _unset_on_exit = UnsetKeyOnExit::arm(&lock);
 
         // SAFETY: serialized by the lock above, and nothing else reads this key.
         unsafe { std::env::set_var(KEY, "before") };
