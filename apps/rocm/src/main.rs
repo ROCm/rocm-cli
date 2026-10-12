@@ -25084,10 +25084,11 @@ install therock";
     }
 
     /// The restart's counterpart of the launch test above: a death the spawn
-    /// itself saw keeps the dead child off the record, which is retired still
-    /// naming the previous run's pid — the restart is counted and the stop's
-    /// marker cleared, since a child did spawn, but nothing points a later stop at
-    /// a pid that may be reused.
+    /// itself saw keeps the dead child off the record, which is retired naming
+    /// only the previous run's pids, as the stop left them. The restart is counted
+    /// and the stop's marker cleared, since a child did spawn. The old pids carry
+    /// whatever exposure to pid reuse the stopped record already had; the change
+    /// adds none.
     #[test]
     fn a_restart_the_spawn_saw_die_keeps_the_dead_child_off_record() -> Result<()> {
         let (root, paths) = test_paths("managed-restart-observed-death");
@@ -27277,11 +27278,16 @@ install therock";
         ExitStatus::from_raw(code << 8)
     }
 
-    /// The pid a stand-in spawn reports for its "child". Above Linux's pid limit
-    /// and not a multiple of four, which every Windows pid is, so no process ever
-    /// has it and nothing can be signalled through it; and
-    /// distinct from every pid a fixture record starts with, so a record naming it
-    /// can only have been written after the spawn.
+    /// The pid a stand-in spawn reports for its "child". No process ever has it:
+    /// it is above Linux's pid limit, and not a multiple of four, which every
+    /// Windows pid is. It is also distinct from every pid a fixture record starts
+    /// with, so a record naming it can only have been written after the spawn.
+    ///
+    /// Above `i32::MAX` too, which is what keeps a stop from signalling through
+    /// it today: `process_is_running` rejects it, so a verified stop reports it
+    /// gone. The raw signalling helpers in `rocm-core` do not range-check, and
+    /// would turn it into a negative `kill` target (a process group), so a test
+    /// must never hand it to them directly.
     pub(crate) const fn stand_in_child_pid() -> u32 {
         3_999_999_999
     }
