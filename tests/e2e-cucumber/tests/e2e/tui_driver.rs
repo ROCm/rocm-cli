@@ -233,6 +233,12 @@ impl TuiSession {
             cmd.arg(arg);
         }
         if let Some(dir) = cwd {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "spawn_in target {} is not a directory",
+                    dir.display()
+                ));
+            }
             cmd.cwd(dir);
         }
         // Inherit the parent environment first, then overlay the isolation and
