@@ -6,7 +6,7 @@
 //!
 //! `AppPaths` (the config/data/cache root discovery and its derived
 //! per-engine/per-service subpaths), the configured managed-root override,
-//! engine plugin directories, and the generic env-flag boolean parser.
+//! and engine plugin directories.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
