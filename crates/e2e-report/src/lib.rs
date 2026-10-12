@@ -8,6 +8,7 @@
 //! `e2e-cucumber` test harness and `xtask` can depend on it without pulling the
 //! harness's heavy tree (cucumber/axum/reqwest/tokio) into `xtask`.
 
+mod command_coverage;
 mod components;
 mod consolidated;
 mod parse;

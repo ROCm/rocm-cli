@@ -400,7 +400,13 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          while [ "$SECONDS" -lt "$deadline" ]; do
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
             # rocm-smi itself can hang on a wedged driver — bound it with timeout.
             out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
             # Parse the byte value AFTER the colon; the line prefix "GPU[0]" would
@@ -521,7 +527,13 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          while [ "$SECONDS" -lt "$deadline" ]; do
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
             out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
             total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
             used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
@@ -619,7 +631,13 @@ jobs:
           min_free=$(( MIN_FREE_GIB * 1024 * 1024 * 1024 ))
           deadline=$(( SECONDS + CEILING_SECS ))
           reason="rocm-smi never returned within its timeout (driver wedged or GPU absent)"
-          while [ "$SECONDS" -lt "$deadline" ]; do
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
             out=$(timeout 15 rocm-smi --showmeminfo vram 2>/dev/null) || { sleep 5; continue; }
             total=$(printf '%s\n' "$out" | grep -i 'VRAM Total Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
             used=$(printf '%s\n' "$out" | grep -i 'VRAM Total Used Memory' | sed 's/.*: *//' | grep -oE '[0-9]+' | tail -1)
@@ -744,7 +762,13 @@ jobs:
           # Neither is ever set from a call that was merely cut short.
           combined=1
           gtt_absent=0
-          while [ "$SECONDS" -lt "$deadline" ]; do
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
             out=""
             rc=0
             if [ "$combined" -eq 1 ]; then
@@ -1378,7 +1402,13 @@ jobs:
           # See the native Ubuntu lane for both memos.
           combined=1
           gtt_absent=0
-          while [ "$SECONDS" -lt "$deadline" ]; do
+          # Check the deadline only after a poll, never before the first one.
+          # $SECONDS counts whole wall-clock seconds, so a short ceiling can
+          # lapse before the loop is entered, and the verdict below would then
+          # describe a reading that was never taken.
+          first_poll=1
+          while [ "$first_poll" -eq 1 ] || [ "$SECONDS" -lt "$deadline" ]; do
+            first_poll=0
             out=""
             rc=0
             if [ "$combined" -eq 1 ]; then
