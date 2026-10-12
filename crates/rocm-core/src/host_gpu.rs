@@ -263,7 +263,7 @@ fn capture_optional_command_candidate_with_timeout(
 }
 
 fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
-    if !crate::paths::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
+    if !crate::runtime::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
         return;
     }
     eprintln!(

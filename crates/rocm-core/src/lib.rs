@@ -1584,7 +1584,7 @@ pub fn builtin_model_recipe_registry() -> ModelRecipeRegistry {
 
 pub fn load_model_recipe_registry() -> Result<ModelRecipeRegistry> {
     let configured_index = env_path_override("ROCM_CLI_MODEL_RECIPE_INDEX_PATH");
-    if configured_index.is_none() && paths::env_flag("ROCM_CLI_REQUIRE_MODEL_RECIPE_SIGNATURE") {
+    if configured_index.is_none() && runtime::env_flag("ROCM_CLI_REQUIRE_MODEL_RECIPE_SIGNATURE") {
         bail!(
             "signed model recipe index is required but ROCM_CLI_MODEL_RECIPE_INDEX_PATH is not configured"
         );
