@@ -6,13 +6,11 @@
 //! process, plus the endpoint-key/auth checks that gate it.
 //!
 //! Mechanically relocated from `main.rs` with no behavior change. This is the
-//! cluster `serve_cmd.rs`'s own header doc comment (from Phase 6a, ROCMAI-82)
-//! named as deliberately deferred — "the managed-service-spawning tail
-//! (`start_managed_service` and `run_attached_service`... `spawn_managed_engine_child`,
-//! called only from `main.rs` itself) is entangled with other still-crate-root
-//! launch helpers (`stream_attached_logs`, `record_cli_audit_event`, and friends)
-//! that have not been relocated yet... a later pass can relocate them along with
-//! their test module" — this is that later pass (ROCMAI-91, Phase 6b).
+//! managed-service-spawning tail that was deliberately deferred out of the
+//! Phase 6a (ROCMAI-82) split — `start_managed_service`, `run_attached_service`,
+//! `spawn_managed_engine_child`, and the other still-crate-root launch helpers
+//! (`stream_attached_logs`, `record_cli_audit_event`, and friends) they were
+//! entangled with — this is that later pass (ROCMAI-91, Phase 6b).
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly, and
@@ -645,7 +643,7 @@ pub(crate) fn start_managed_service(
 /// Reproduce the original plain, line-by-line managed-launch output. Used for
 /// non-interactive output (piped, CI, the chat assistant's `serve --managed`),
 /// where the animated summary is inappropriate. The interactive path renders the
-/// summary table via [`serve_summary`] instead.
+/// summary table via [`crate::serve_summary`] instead.
 pub(crate) fn print_managed_launch_plain(
     report: &ManagedLaunchReport,
     endpoint_api_key: Option<&str>,
@@ -710,7 +708,7 @@ fn render_endpoint_client_config(endpoint_url: &str, api_key: &str) -> String {
 /// `true` when the file-based runtime state says the daemon is `running` AND its
 /// recorded `daemon_pid` is a live process — i.e. a second spawn must be guarded.
 /// A missing state file, `running=false`, or a dead/zero pid returns `false`.
-pub(crate) fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
+fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
     Ok(AutomationRuntimeState::load(paths)?
         .is_some_and(|state| state.running && rocm_core::process_is_running(state.daemon_pid)))
 }
