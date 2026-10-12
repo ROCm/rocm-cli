@@ -501,8 +501,8 @@ fn spawn_long_lived_child() -> std::process::Child {
 ///
 /// Black-box on purpose — a process the CLI can find only through its record,
 /// exactly as a real managed vLLM server appears to `rocm uninstall`. The record
-/// carries no start-time token (the legacy shape), so the CLI's verified
-/// termination treats it as a best-effort match and stops it.
+/// carries the supervisor start time, so the CLI's verified
+/// termination verifies it against the recorded start time and stops it.
 #[given("a local server this machine manages is running")]
 async fn given_managed_server_running(world: &mut E2eWorld) {
     let services_dir = state(world)
@@ -528,6 +528,19 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
             engine_pid: Some(server.id()),
         },
     );
+    // A record written by a current `rocmd` carries the supervisor's start time;
+    // a tick-less live record is refused by uninstall rather than killed.
+    let record_path = services_dir.join("e2e-mock.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).expect("failed to read record"))
+            .expect("failed to parse record");
+    record["supervisor_start_ticks"] =
+        serde_json::json!(rocm_core::process_start_ticks(server.id()));
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to rewrite record");
     state_mut(world).managed_server = Some(server);
 }
 
