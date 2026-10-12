@@ -1085,20 +1085,25 @@ mod tests {
     /// A bare type entry is a whole identifier outside a type position, not a
     /// substring and not an allow-list of construction shapes.
     ///
-    /// The flagged half are all ways to build a value of the unit struct, and
-    /// each one was missed by the earlier rule that required the next
-    /// character to be `;`, `(`, `{` or `::`. The reassignment is the shape
-    /// that rule hid on BOTH of its lines: the declaration is a type mention,
-    /// and the construction is followed by `)`.
+    /// The flagged half are ways to build a value of the unit struct, most of
+    /// them followed by `)`, `]` or `,` rather than by a `;`, so a rule keyed
+    /// on the next character would miss them. The last two also mention the
+    /// type in a type position — the reassignment on the line before its
+    /// construction, the ascribed `let` on the SAME line — and each must still
+    /// be flagged once: a line is judged on every occurrence of the name, not
+    /// only on its first.
     ///
     /// In the other half, each shape defeats one part of the rule on its own:
     /// the longer name fails the boundary after the match, the prefixed one
     /// fails the boundary before it, and the rest are whole identifiers in a
-    /// type position — after `<`, before `>`, after an ascription `:` — with
-    /// blanks around them for the spellings rustfmt would normalise away. The
+    /// type position — after `<`, before `>`, after an ascription `:`. The
     /// first and last generic arguments of a multi-argument type sit next to
     /// only ONE angle bracket, which is what makes each of the `<` and `>`
     /// carve-outs necessary on its own: `Vec<..>` alone is caught by either.
+    /// The same holds for the blanks rustfmt would normalise away:
+    /// `Option< T >` is rejected by either carve-out, so the one-sided
+    /// spellings `BTreeMap< T, u8>` and `BTreeMap<u8, T >` are what pin that
+    /// blanks are skipped before the name and after it.
     #[test]
     fn a_bare_type_entry_matches_a_whole_name_outside_type_positions() {
         for line in [
@@ -1109,6 +1114,7 @@ mod tests {
             "std::mem::forget(UnsetKeyOnExit);",
             "let _p = test_env::UnsetKeyOnExit;",
             "let mut g: Option<UnsetKeyOnExit> = None;\n        g = Some(UnsetKeyOnExit);",
+            "let _g: UnsetKeyOnExit = UnsetKeyOnExit;",
         ] {
             let hits = env_mutations_in_unserialized_tests(&unguarded_test(line));
             assert_eq!(hits.len(), 1, "`{line}` builds the guard: {hits:?}");
@@ -1122,6 +1128,8 @@ mod tests {
             "let _v: Vec<UnsetKeyOnExit> = Vec::new();",
             "let _r: Result<UnsetKeyOnExit, ()> = Err(());",
             "let _m: BTreeMap<u8, UnsetKeyOnExit> = BTreeMap::new();",
+            "let _m: BTreeMap< UnsetKeyOnExit, u8> = BTreeMap::new();",
+            "let _m: BTreeMap<u8, UnsetKeyOnExit > = BTreeMap::new();",
             "fn f(_x: UnsetKeyOnExit) {}",
             "fn f(_x : UnsetKeyOnExit) {}",
         ] {
@@ -1167,6 +1175,33 @@ mod tests {
         ] {
             let hits = env_mutations_in_unserialized_tests(&unguarded_test(body));
             assert!(hits.is_empty(), "`{body}` holds no such guard: {hits:?}");
+        }
+    }
+
+    /// A `struct`/`enum` keyword marks the next bracket as a declaration's
+    /// only until its item ends; a construction after that item is flagged.
+    ///
+    /// A unit or tuple struct ends at its `;` without ever opening a `{`, so
+    /// that `;` is what ends it: otherwise the next statement's `(` reads as
+    /// part of the declaration and the guard built inside it is missed, on
+    /// the next line or on the same one.
+    ///
+    /// The `}` that closes a block ends it too. Valid code reaches a `}` with
+    /// the keyword still pending only through a raw identifier: `r#struct` is
+    /// an ordinary name, but the scan reads its last five letters as the
+    /// keyword, and a block whose tail it is closes straight after. Without
+    /// that reset, the `(` of the `Some(..)` after it opens a "declaration".
+    #[test]
+    fn a_construction_after_a_declared_item_is_still_flagged() {
+        for body in [
+            "struct Marker;\n        drop(UnsetKeyOnExit);",
+            "struct Marker; drop(UnsetKeyOnExit);",
+            "struct Pair(u8, u8);\n        drop(UnsetKeyOnExit);",
+            "let r#struct = 1;\n        let _pair = ({ r#struct }, Some(UnsetKeyOnExit));",
+        ] {
+            let hits = env_mutations_in_unserialized_tests(&unguarded_test(body));
+            assert_eq!(hits.len(), 1, "`{body}` builds the guard: {hits:?}");
+            assert_eq!(hits[0].call, "UnsetKeyOnExit");
         }
     }
 
