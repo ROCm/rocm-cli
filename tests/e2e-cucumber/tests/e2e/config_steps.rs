@@ -266,13 +266,25 @@ async fn version_without_data_dir(world: &mut E2eWorld) {
 
 #[when("the user checks the CLI version with the data folder the refusal suggested")]
 async fn version_with_suggested_data_dir(world: &mut E2eWorld) {
-    // The Then before this one asserted the refusal suggested exactly this
-    // value, so this runs the advice as printed.
-    let folder = custom_rocm_folder(world);
-    let folder = folder.to_str().expect("sandbox path is UTF-8");
+    // Take the value from the refusal itself, so this runs the advice as
+    // printed rather than a value the test already knows.
+    let folder = suggested_data_dir(world);
     let (stdout, stderr, rc) =
-        crate::run_rocm_with_env(world, &["version"], &[("ROCM_CLI_DATA_DIR", folder)]);
+        crate::run_rocm_with_env(world, &["version"], &[("ROCM_CLI_DATA_DIR", &folder)]);
     record(world, stdout, stderr, rc);
+}
+
+/// The `ROCM_CLI_DATA_DIR` value the last refusal told the user to set, read
+/// from its stderr: "setting ROCM_CLI_DATA_DIR=<folder> lets commands ...".
+fn suggested_data_dir(world: &E2eWorld) -> String {
+    let stderr = world.cli_stderr.as_deref().unwrap_or("");
+    let (_, rest) = stderr
+        .split_once("setting ROCM_CLI_DATA_DIR=")
+        .unwrap_or_else(|| panic!("the refusal suggested no ROCM_CLI_DATA_DIR value:\n{stderr}"));
+    let (folder, _) = rest
+        .split_once(" lets commands")
+        .unwrap_or_else(|| panic!("cannot find the end of the suggested value:\n{stderr}"));
+    folder.to_owned()
 }
 
 #[when(
