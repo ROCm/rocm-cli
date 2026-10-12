@@ -9,6 +9,7 @@
 
 use cucumber::{given, then, when};
 use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
@@ -131,6 +132,29 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     // populates with no GPU and no daemon — a stable, mock-tier target.
     let session = TuiSession::spawn(world, &["dash", "--demo"])
         .unwrap_or_else(|e| panic!("failed to open the dashboard: {e}"));
+    world.tui = Some(session);
+}
+
+/// The scenario-owned directory `dash-25` spawns `dash` into, and later
+/// re-derives to assert against — a space in the name is the motivating case
+/// for #501 (the harness previously could not land the spawned process in a
+/// path the folder browser would navigate for a scenario to assert against).
+fn adopt_scenario_folder(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("adopt me")
+}
+
+#[when("the user opens the dashboard in a scenario-owned folder")]
+async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
+    let dir = adopt_scenario_folder(world);
+    std::fs::create_dir_all(&dir)
+        .unwrap_or_else(|e| panic!("failed to create scenario-owned folder {dir:?}: {e}"));
+    let session = TuiSession::spawn_in(world, &["dash", "--demo"], &dir)
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {dir:?}: {e}"));
     world.tui = Some(session);
 }
 
@@ -415,6 +439,15 @@ async fn choose_install_rocm_sdk(world: &mut E2eWorld) {
     session(world)
         .send("\r")
         .unwrap_or_else(|e| panic!("failed to choose Install ROCm SDK: {e}"));
+}
+
+#[when("the user chooses to adopt an existing folder")]
+async fn choose_adopt_existing_folder(world: &mut E2eWorld) {
+    // "Adopt an existing ROCm folder" is the choose-menu's second entry, one
+    // `Down` past the default "Install ROCm SDK (pip)".
+    session(world)
+        .send("j\r")
+        .unwrap_or_else(|e| panic!("failed to choose Adopt an existing folder: {e}"));
 }
 
 #[when("the user browses for an install folder")]
@@ -1120,6 +1153,19 @@ async fn install_folder_browser_displayed(world: &mut E2eWorld) {
         .wait_for_screen("Pick an install folder", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
+}
+
+#[then("the existing-folder browser shows the scenario-owned folder")]
+async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
+    // The browser's header renders `current_dir` verbatim
+    // (`draw_folder_browser`), which is itself seeded from
+    // `std::env::current_dir()` — so this marker is only reachable if
+    // `spawn_in` actually set the child's working directory to our folder.
+    let marker = adopt_scenario_folder(world).display().to_string();
+    session(world)
+        .wait_for_screen(&marker, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the existing-folder browser did not show {marker:?}: {e}"));
 }
 
 #[then("the Configure step shows the chosen folder instead of the placeholder")]
