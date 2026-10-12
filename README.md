@@ -201,22 +201,30 @@ rocm install sdk
 ```
 
 This downloads TheRock ROCm wheels and a matching PyTorch stack into a managed
-environment. On machines with an existing ROCm install, `rocm examine` will
-show it as `legacy_rocm_status: detected_unmanaged` — running `rocm install sdk`
-creates a separate managed runtime alongside it. Running the command when a
-managed runtime is already the active default asks first, because the new
-install takes over as the active default; see
+environment. Running `rocm install sdk` creates a managed runtime alongside any
+legacy install.
+
+ROCm CLI supports ROCm 7.14, 10.0, and 10.1. Without `--version`,
+`rocm install sdk` currently installs ROCm 7.14. To install ROCm 10.0 or 10.1,
+add `--version`. If ROCm CLI can't tell which exact GPU arch this computer has,
+or you want a different one, also add `--family` with the raw `gfx` code from
+`rocm examine`. For example: `--version 10.1.0 --family gfx1200`.
+
+Running `rocm install sdk` when a managed runtime is already the active default
+asks first, because the new install takes over as the active default; see
 [ROCm installation](https://github.com/ROCm/rocm-cli/blob/main/README.md#rocm-installation)
-for that gate and the flags that approve it without a prompt.
+for that gate, the flags that approve it without a prompt, and the ROCm 10 and
+newer requirements.
 
 Then serve a model:
+
 
 ```
 rocm serve qwen
 ```
 
 `qwen` is a built-in alias for a small assistant model that serves out of the
-box. You can also serve any compatible Hugging Face model directly — see
+box. You can also serve any compatible Hugging Face model directly. See
 [Model serving](#model-serving) for the GGUF-vs-safetensors rule, since which
 form works depends on the engine your GPU selects.
 
@@ -317,13 +325,13 @@ by rocm-cli.
 If no managed runtime is the active default, `install sdk` doesn't prompt.
 Otherwise it asks first, because the new install becomes the active default.
 The prompt applies to any install, including a `--family` or `--channel` you
-haven't installed before.
+haven't installed before, just as it does for a same-family upgrade.
 
 To approve without a prompt, for example in scripts or CI, where the prompt
 would otherwise refuse:
 
-- `--approve-replacing-active-default` approves the change of active default
-  only. The refusal message recommends it, and ROCm CLI's own non-interactive
+- `--approve-replacing-active-default` approves the change of active default.
+  The refusal message recommends it, and ROCm CLI's own non-interactive
   surfaces (chat, MCP, and the dashboard) pass it.
 - `--yes` gives the same approval and also approves installing required system
   packages, such as OpenMPI for vLLM. That requires `sudo`, so use it only where
@@ -338,8 +346,8 @@ same-version reinstall reuses the same root.
 
 `--prefix` changes this. The folder you name is used as-is for every version, so
 successive installs into one prefix replace each other in place. If the venv
-already there no longer runs its own Python, it is removed outright and rebuilt. The
-approval prompt doesn't cover this, because it asks only about changing the
+already there no longer runs its own Python, it is removed outright and rebuilt.
+The approval prompt doesn't cover this, because it asks only about changing the
 active default runtime, not about what a named prefix loses.
 
 #### Driver installation
@@ -351,14 +359,16 @@ package.
 
 `update` checks for a newer ROCm package.
 
-| Flag | Effect |
+| Flag | Description |
 | --- | --- |
-| `--apply` | Installs the update. Needs no approval flag, because selecting a runtime to update is the approval. Leaves the active default alone unless you add `--activate`. |
+| `--apply` | Installs the update. Never prompts and needs no approval flag, because selecting a runtime to update is the approval. Leaves the active default alone unless you add `--activate`. |
 | `--dry-run` | Previews what `--apply` would do without changing anything. Doesn't require `--apply`. |
 | `--runtime`, `--activate` | Require `--apply` or `--dry-run`. |
 | `--json` | Prints the check result as a single line of JSON instead of text. Conflicts with `--apply` and `--dry-run`. |
 | `--timeout-secs` | Bounds the network calls of the check. Requires `--json`. Conflicts with `--apply`. |
 | `--yes` | Accepted for consistency with other mutating commands, but grants nothing on `update`. The approval line the update path prints never credits it. |
+
+#### ROCm 10 and newer
 
 ROCm 10 and newer ship from a different source layout. You opt in by passing two
 things together: pin the version with `--version`, and name the exact GPU arch,
@@ -378,9 +388,10 @@ torchaudio from their published dependency metadata, then validates that every
 selected framework package carries the same ROCm build identifier before it
 creates or changes a managed runtime.
 
-Without a `--version` of 10 or newer, `install sdk` resolves the same release
-and nightly sources as before. It doesn't retry against the ROCm 10 sources when
-a lookup finds nothing; it tells you what it couldn't find instead.
+Nothing about this happens on its own. Without a `--version` of 10 or newer,
+`install sdk` resolves the same release and nightly sources as before. It doesn't
+quietly retry against the ROCm 10 sources when a lookup finds nothing; it tells
+you what it couldn't find instead.
 
 ### Runtime management
 
