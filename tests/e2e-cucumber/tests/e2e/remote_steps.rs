@@ -577,6 +577,24 @@ async fn given_serving_machine(world: &mut E2eWorld) {
     assert_eq!(world.cli_rc, Some(0), "serve failed:\n{}", said(world));
 }
 
+/// Plants a service directly on the machine, bypassing `rocm remote serve`
+/// entirely, so no local session is recorded for it.
+///
+/// `serve_with_transport`'s `session::exists` guard is purely local — keyed on
+/// the machine and port, with nothing to do with what is actually running
+/// remotely — so a `Given`/`When` pair that both call `rocm remote serve`
+/// trips that guard on the second call and never reaches
+/// `discover_started_service`'s "reused instead of started" refusal this
+/// scenario means to exercise. Calling the stand-in CLI straight on the
+/// container, the way an operator's own `rocm serve` or an earlier *unmanaged*
+/// `remote serve` run would leave it, reproduces the actual precondition: a
+/// service already live on the port with no session of ours beside it.
+#[given("the machine is already serving a model, started outside any session")]
+async fn given_pre_existing_service_on_machine(world: &mut E2eWorld) {
+    given_reachable_machine(world).await;
+    machine(world).exec(&["rocm", "serve", "test-model", "--port", "11434"]);
+}
+
 #[when("the user serves a model on that machine")]
 async fn when_serve_on_machine(world: &mut E2eWorld) {
     let env = world.remote_env.clone();
