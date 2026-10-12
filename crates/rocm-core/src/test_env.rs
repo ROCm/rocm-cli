@@ -137,9 +137,10 @@ mod tests {
 
     /// The path the module docs promise: a test that panics while holding the
     /// guard still gets its previous value back. An explicit `drop` runs the
-    /// same destructor today, but only an unwind proves the restore survives a
-    /// change such as `panic = "abort"`, under which destructors stop running
-    /// on panic and this test aborts instead of passing.
+    /// same destructor, but only an unwind exercises it while the thread is
+    /// panicking: a `Drop` that skips the restore when
+    /// [`std::thread::panicking`] is true passes
+    /// `dropping_the_guard_restores_the_previous_state` and fails this test.
     ///
     /// The panic is raised with [`std::panic::resume_unwind`], which unwinds
     /// without calling the panic hook, so a passing run prints no panic message
