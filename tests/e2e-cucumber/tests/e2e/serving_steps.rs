@@ -1798,6 +1798,26 @@ async fn assert_startup_death_names_log(world: &mut E2eWorld) {
         "the failed launch must retire its record as `failed`, not leave it claiming \
          the engine and model"
     );
+    // On Windows the spawn itself watches the child, so a child it saw die is
+    // never put on record: off Linux a recorded pid carries no start-time token,
+    // and a later stop of this record could signal whatever process reused it.
+    // This lane is the only one that runs that branch for real.
+    if cfg!(windows) {
+        let pids: Vec<(serde_json::Value, serde_json::Value)> = records
+            .iter()
+            .map(|record| {
+                (
+                    record["supervisor_pid"].clone(),
+                    record["engine_pid"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pids,
+            [(serde_json::json!(0), serde_json::Value::Null)],
+            "a child the spawn saw die must not be named by the retired record"
+        );
+    }
 }
 
 #[when("the user serves the same model again")]
