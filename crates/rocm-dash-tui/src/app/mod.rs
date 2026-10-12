@@ -29,6 +29,8 @@ mod event_loop;
 mod scrollbar;
 mod slash;
 mod summary;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 // Re-exports restoring the pre-split `crate::app::*` public surface. A
