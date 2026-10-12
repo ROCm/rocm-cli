@@ -254,6 +254,9 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
+`restart` starts the server again only once its stop has confirmed every
+recorded process gone; otherwise it reports that and starts nothing.
+
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
 up: section 3 serves Lemonade and then stops it on both of its branches, the

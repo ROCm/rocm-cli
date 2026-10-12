@@ -1244,6 +1244,11 @@ cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
 cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
 cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
 cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
+cargo test -p rocm --bin rocm restart_does_not_start_an_engine_over_an_unconfirmed_stop
+cargo test -p rocm --bin rocm restart_readiness_write_keeps_a_stop_asked_for_while_it_waited
+cargo test -p rocm --bin rocm restart_readiness_write_leaves_a_stop_that_finished_meanwhile
+cargo test -p rocm --bin rocm restart_reports_a_child_it_could_not_record_and_writes_nothing
+cargo test -p rocm --bin rocm restarted_child_record_names_the_runtime_the_restart_was_pinned_to
 ```
 
 Server recovery never restarts a service with a standing stop request
@@ -1254,7 +1259,11 @@ confirmed. Without that, an unconfirmed stop — which leaves the status at
 anything, and the supervisor's and a restart's later writes re-read the
 record and never clear it. Each stop also re-reads the record before its own
 final write, and confirms the stop only if that record still names the
-processes it handled.
+processes it handled. `rocm services restart` (and the `restart_server`
+sandbox tool) starts a new engine only after its stop is confirmed; otherwise
+it reports the unconfirmed stop and starts nothing. Its own later writes are
+applied to the record as it is on disk, and only while it still reads as the
+restart left it, so a stop asked for during the restart keeps its marker.
 
 Automation GPU-metrics event tests:
 
