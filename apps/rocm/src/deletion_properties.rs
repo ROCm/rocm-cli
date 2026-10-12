@@ -826,7 +826,7 @@ fn uninstall_removes_exactly_what_the_review_lists() {
 /// however spelled, is only unlinked). Shrinks to one root naming `$HOME`.
 /// Tracked in #531; un-ignore this when that guard lands.
 #[test]
-#[ignore = "finding: rocm uninstall applies no guard to config/data/cache roots (#531)"]
+#[ignore = "known gap: rocm uninstall applies no guard to config/data/cache roots (#531)"]
 fn uninstall_never_deletes_a_folder_rocm_cli_did_not_create() {
     if let Err(error) = run_uninstall_property(case_count(), true) {
         panic!("{error}");

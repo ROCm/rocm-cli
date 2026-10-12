@@ -237,7 +237,7 @@ proptest! {
 /// modprobe directive, yet it is read as one. The fix for #506 should
 /// un-ignore this, and can then let `blacklist_line` draw an empty separator.
 #[test]
-#[ignore = "known defect: a directive with no whitespace before the module is read as a blacklist (#506)"]
+#[ignore = "known gap: a directive with no whitespace before the module is read as a blacklist (#506)"]
 fn a_blacklist_directive_needs_whitespace_before_the_module() {
     for line in ["blacklistamdgpu", "  blacklistamdgpu # why"] {
         assert!(!line_blacklists_amdgpu(line), "{line:?}");

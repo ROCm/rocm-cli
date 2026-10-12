@@ -125,24 +125,52 @@ If the workspace is already built:
 python scripts/smoke_local.py --skip-build
 ```
 
+### Property tests
+
+`proptest` properties run with the rest of `cargo test`. Each runs proptest's
+default of 256 cases unless its module sets its own count, and
+`PROPTEST_CASES` overrides both for a deeper local run:
+
+```bash
+PROPTEST_CASES=20000 cargo test -p rocm --bin rocm proptests
+```
+
+A module that sets its own count reads it through `proptest_cases` in
+[test_support.rs](../apps/rocm/src/test_support.rs) (in `rocm-core`, the
+`cases` helper in
+[examine_driver_proptests.rs](../crates/rocm-core/src/examine_driver_proptests.rs)),
+because an explicit `with_cases` otherwise overrides `PROPTEST_CASES`. The
+uninstall properties set their count from their own knob instead,
+`ROCM_DELETION_PROP_CASES`, described under Uninstall And Download Removal
+below, and ignore `PROPTEST_CASES`.
+
 ### Known-gap reproducers
 
 Most `#[ignore]` attributes in the tree gate on the environment: a GPU, a live
-server, an API key. One other use is allowed: a test that pins a defect which
-is filed but not yet fixed. Such a test fails on purpose today, so it is
-committed ignored, with the reason naming the issue:
+server, an API key or interactive login, or a test that is unsafe to run
+alongside others. The other use is a test that pins a defect which is filed
+but not yet fixed. Such a test fails on purpose today, so it is committed
+ignored, and its reason starts with `known gap:` and ends with the issue
+number:
 
 ```rust
 #[ignore = "known gap: in-band SSE error payloads are dropped and the stream reports a clean finish (#516)"]
 ```
 
-The issue must name the test, and its fix un-ignores it. Neither CI job passes
-`--include-ignored`, so nothing reports when the gap closes or the test drifts;
-the issue is the only link back. List the open ones with:
+The prefix is a rule, not a convention, because it is the only way to find
+these tests. No CI test run passes `--include-ignored` (not the nextest runs,
+not the Windows `cargo test` run, not the coverage run), so nothing reports
+when a gap closes or a test drifts. The test's doc comment names the issue,
+the issue names the test, and the fix un-ignores it. List the open ones with:
 
 ```bash
-git grep -n 'ignore = "known gap'
+git grep -n 'ignore = "known gap:'
 ```
+
+Such a test is ignored rather than inverted with `#[should_panic]`. An
+inverted test would assert the defect as passing behaviour and go red with an
+unrelated-looking message once the fix lands; an ignored one states the
+behaviour wanted, so un-ignoring it is the fix's acceptance test.
 
 A gap in user-observable CLI behaviour that an e2e scenario covers is tracked
 with an xfail row in `tests/e2e-cucumber/expectations.toml` instead.
