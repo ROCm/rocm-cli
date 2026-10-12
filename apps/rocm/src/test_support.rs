@@ -25,6 +25,16 @@ pub(crate) fn unique_suffix() -> String {
     )
 }
 
+/// Case count for a property test: `default`, unless `PROPTEST_CASES`
+/// (proptest's own knob, which an explicit `with_cases` would otherwise
+/// override) asks for a longer run.
+pub(crate) fn proptest_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Call `make_root` from many threads at once, remove what it made, and
 /// assert no two calls returned the same root.
 ///

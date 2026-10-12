@@ -25,20 +25,17 @@
 //! is no CPU fallback). With neither a non-zero amd-smi count nor any telemetry
 //! row there is nothing to rank, so no pin is returned rather than assuming
 //! device 0.
+//!
+//! The property pins which ordinals may be chosen, not which of them is: the
+//! ranking among choosable, unpinned GPUs (lowest idle one first, then the most
+//! free VRAM, then the lowest index) is left to the example tests next to
+//! `select_auto_gpu_index` in `main.rs`.
 
 use super::*;
+use crate::test_support::proptest_cases;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
-
-/// Case count: `default`, unless `PROPTEST_CASES` (proptest's own knob, which
-/// an explicit count would otherwise override) asks for a longer run.
-fn cases(default: u32) -> u32 {
-    std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
 
 /// Ordinals are drawn from `0..ORDINALS`: room for sparse sets, and for a row to
 /// sit at or above a smaller amd-smi count.
@@ -55,8 +52,9 @@ fn visible_strategy() -> impl Strategy<Value = Option<Vec<u32>>> {
     prop_oneof![Just(None), ordinal_set().prop_map(Some)]
 }
 
-/// The amd-smi `list` count. `Some(0)` (amd-smi ran and saw nothing) is its
-/// own arm so the zero-count paths are reached often.
+/// The amd-smi `list` count. `detect_gpu_count` maps an empty list to `None`,
+/// so production never passes `Some(0)`; `select_auto_gpu_index` still accepts
+/// it and must treat it as no count, which is why it is its own arm here.
 fn detected_strategy() -> impl Strategy<Value = Option<usize>> {
     prop_oneof![
         Just(None),
@@ -80,6 +78,11 @@ fn row_strategy(index: u32) -> impl Strategy<Value = GpuVramUsage> {
     })
 }
 
+/// Rows for the given ordinals, which may repeat: `parse_gpu_vram_usage` falls
+/// back to a device's array position only when its `gpu` field is absent, so
+/// two rows can name one ordinal. Repeats are what separate the row count from
+/// the ordinals the rows name, the one shape where an amd-smi count that is
+/// missing (rather than merely larger) changes what may be chosen.
 fn rows_for(indices: Vec<u32>) -> impl Strategy<Value = Vec<GpuVramUsage>> {
     indices
         .into_iter()
@@ -88,14 +91,16 @@ fn rows_for(indices: Vec<u32>) -> impl Strategy<Value = Vec<GpuVramUsage>> {
         .prop_shuffle()
 }
 
-/// Telemetry: absent, present with no rows, rows for an arbitrary (usually
-/// sparse) ordinal set, or rows for a dense `0..k` (the unmasked shape, which
-/// the arbitrary arm would otherwise make rare).
+/// Telemetry: absent, present with no rows, rows for arbitrary ordinals
+/// (usually sparse, often repeated), or rows for a dense `0..k` (the unmasked
+/// shape, which the arbitrary arm would otherwise make rare).
 fn vram_strategy() -> impl Strategy<Value = Option<Vec<GpuVramUsage>>> {
     prop_oneof![
         Just(None),
         Just(Some(Vec::new())),
-        ordinal_set().prop_flat_map(rows_for).prop_map(Some),
+        prop::collection::vec(0..ORDINALS, 0..=ORDINALS as usize)
+            .prop_flat_map(rows_for)
+            .prop_map(Some),
         (1..=ORDINALS)
             .prop_flat_map(|k| rows_for((0..k).collect()))
             .prop_map(Some),
@@ -154,6 +159,7 @@ struct AutoReach {
     mask_hides_some_rows: u32,
     listed_range_adds_unreported: u32,
     row_beyond_listed_count: u32,
+    unlisted_rows_outnumber_their_ordinals: u32,
     busy_and_free_choosable: u32,
     every_choosable_busy: u32,
     known_devices_all_hidden: u32,
@@ -207,6 +213,14 @@ impl AutoReach {
                 rows.iter().any(|&i| (i as usize) >= n),
             );
         }
+        // Without a non-zero count the rows' own length is the only count, and
+        // repeated rows make it name ordinals no row reports.
+        bump(
+            &mut self.unlisted_rows_outnumber_their_ordinals,
+            listed.is_none()
+                && rows.iter().all(|&i| (i as usize) < rows.len())
+                && (0..rows.len() as u32).any(|i| !rows.contains(&i)),
+        );
         bump(
             &mut self.busy_and_free_choosable,
             busy_choosable > 0 && busy_choosable < choosable.len(),
@@ -260,6 +274,10 @@ fn auto_selection_inputs_reach_every_contract_shape() {
             reach.row_beyond_listed_count,
         ),
         (
+            "no listed count, rows outnumber their ordinals",
+            reach.unlisted_rows_outnumber_their_ordinals,
+        ),
+        (
             "busy and free both choosable",
             reach.busy_and_free_choosable,
         ),
@@ -276,7 +294,7 @@ fn auto_selection_inputs_reach_every_contract_shape() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(cases(4096)))]
+    #![proptest_config(ProptestConfig::with_cases(proptest_cases(4096)))]
 
     #[test]
     fn auto_selection_honours_mask_range_and_busy_set(
@@ -285,10 +303,6 @@ proptest! {
         let picked = select_auto_gpu_index(detected, visible.as_deref(), &busy, vram.as_deref());
         let choosable = choosable(detected, visible.as_deref(), vram.as_deref());
 
-        let any_row = vram.as_ref().is_some_and(|rows| !rows.is_empty());
-        if detected.unwrap_or(0) == 0 && !any_row {
-            prop_assert!(picked.is_empty(), "nothing to rank, yet picked {picked:?}");
-        }
         match picked.as_slice() {
             [] => prop_assert!(
                 choosable.is_empty(),
@@ -312,8 +326,8 @@ proptest! {
     #[test]
     fn explicit_index_is_accepted_only_inside_the_visible_set(
         index in 0u32..10,
-        // `detect_gpu_count` maps an empty amd-smi list to `None`, never
-        // `Some(0)`; `validate_pinned_gpu_index` relies on that (`count - 1`).
+        // `Some(0)` is outside `validate_pinned_gpu_index`'s precondition:
+        // `detect_gpu_count` never returns it (see `detected_strategy`).
         detected in prop::option::of(1usize..8),
         visible in visible_strategy(),
         mask_active in any::<bool>(),
