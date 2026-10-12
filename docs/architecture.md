@@ -43,6 +43,7 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 - [`logging.rs`](../apps/rocm/src/logging.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`provider_keys.rs`](../apps/rocm/src/provider_keys.rs) — full domain extraction.
 - [`providers.rs`](../apps/rocm/src/providers.rs) — full domain extraction (no dedicated command enum; invoked from the existing chat/config command flows).
+- [`runtime_services.rs`](../apps/rocm/src/runtime_services.rs) — full domain extraction; reads the live local servers at activation time, classifies each against the runtime being activated, renders the report, and moves stale ones with `--restart-services`.
 - [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs) — mechanical relocation, owns private types (Phase 6a): `serve()`, plus engine-recipe overrides.
 - [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) — full domain extraction.
 - [`storage.rs`](../apps/rocm/src/storage.rs) — full domain extraction.
