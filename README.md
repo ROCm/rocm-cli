@@ -163,9 +163,22 @@ Pick a row with the arrow keys and `Enter`; press `q` — or `Ctrl-C`, which qui
 from the launcher and the dashboard alike and restores your terminal — to quit.
 The one exception is the dashboard's console for a **running** job, where
 `Ctrl-C` keeps its existing meaning of "cancel this job" and does not quit; once
-that job finishes, `Ctrl-C` quits there too. On a non-interactive terminal (or
-piped output), `rocm` prints a one-shot status summary instead of opening the
-launcher.
+that job finishes, `Ctrl-C` quits there too. If a model is still being served
+when you press `q`, it asks first — from the launcher, and from a dashboard or
+chat session you opened directly (`rocm dash` / `rocm chat`). Opening the
+dashboard or chat *from inside the launcher* skips that inner prompt, since
+`q` there just returns you to the launcher menu; the launcher's own `q` is
+what asks before it actually quits. Either way, quitting leaves the model
+running in the background, it just won't happen by surprise. From the
+dashboard's own copy of that prompt, pressing `s` instead jumps straight to
+the Services overlay, pre-focused on the model, so
+you can stop it there rather than quitting with it left running (the
+launcher's copy doesn't offer this jump, since it has no live Services overlay
+of its own to jump to — open the dashboard first). Unlike `q`, `Ctrl-C` always
+quits immediately without asking — except from a running job's console, where
+it keeps the "cancel this job" meaning described above instead. On a
+non-interactive terminal (or piped output), `rocm` prints a one-shot status
+summary instead of opening the launcher.
 
 ## Interactive interfaces
 

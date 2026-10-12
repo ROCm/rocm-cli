@@ -351,3 +351,107 @@ Feature: Interactive dashboard
     When the user closes onboarding setup
     And the user quits the dashboard
     Then the dashboard exits successfully
+
+  # #145: quitting used to leave a served model running in the background
+  # with no warning at all. Declining first, then confirming, in the same
+  # scenario pins both halves of the fix with one launch.
+  @id:dash-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-26 - Quitting while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt offers to open Services for the serving model
+    When the user presses s to manage the serving model
+    Then the services overlay opens showing the managed model
+    When the user closes the managed services overlay
+    And the user quits the dashboard
+    Then the dashboard exits successfully
+    And the managed model is still listed as running
+
+  # #145: the launcher front door is a second, independent quit entry point
+  # from the dashboard's own — same bug (quitting silently left a served
+  # model running), same fix. Mirrors dash-26 for the launcher's copy of the
+  # prompt: declining first, then confirming, pins both halves with one launch.
+  @id:dash-launcher-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-27 - Quitting the launcher while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    Then the launcher shows the model serving
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running
+
+  # AGENTS.md §3: the quit prompt's remediation line names a real, fillable
+  # command (`dash-26` already pins the exact string) — prove it actually
+  # works, not just that the text is right. This runs the literal command a
+  # user would copy from the prompt and checks the registry `rocm services`
+  # itself reads, independent of whether the TUI's own live view has caught up
+  # to the external change by the time the scenario ends.
+  @id:dash-quit-prompt-stop-command-actually-works @requires-os:linux
+  Scenario: dash-28 - Running the quit prompt's printed stop command actually stops the model
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    And the quit prompt shows the real stop command for the managed model
+    When the user declines the quit prompt
+    And the user runs the quit prompt's stop command
+    Then the managed model is no longer listed as running
+    When the user quits the dashboard
+    Then the dashboard exits successfully
+
+  # #145: `/quit` in chat shares the exact same `request_quit` gate as the
+  # dashboard's `q` and the launcher's own `q`, but had no scenario coverage of
+  # its own before this — only the `q` path did. `rocm chat` is the same
+  # dashboard with the Chat tab focused (`run_chat` calls the same
+  # `run_async`), so the model being served here is exactly as real as it is
+  # in dash-26.
+  @id:dash-chat-quit-confirm-when-serving @requires-os:linux
+  Scenario: dash-29 - Quitting chat with /quit while a model is being served asks for confirmation first
+    Given a running managed model is available locally
+    And interactive chat uses an offline assistant
+    When the user opens interactive chat
+    And the user tries to quit chat
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user declines the quit prompt
+    Then the managed model is still listed as running
+    When the user quits interactive chat
+    Then interactive chat exits successfully
+    And the managed model is still listed as running
+
+  # #145: the launcher is a persistent hub — escalating into the full
+  # dashboard ("Open full dashboard") and quitting FROM THERE used to ask
+  # "Still serving — quit anyway?" a second time, and approving it only
+  # returned to the launcher menu, which then immediately asked the identical
+  # question again on its own next `q` — a prompt whose "yes" didn't actually
+  # exit the process at all. Only the launcher's own copy of the prompt may
+  # ever govern the real exit; the escalated dashboard's own `q` must return
+  # straight to the launcher menu with no prompt of its own.
+  @id:dash-launcher-hosted-dashboard-quit-is-not-asked-twice @requires-os:linux
+  Scenario: dash-30 - Quitting a dashboard opened from the launcher does not ask twice
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user opens the dashboard from the launcher
+    And the user quits back to the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running

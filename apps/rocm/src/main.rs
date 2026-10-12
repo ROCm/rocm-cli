@@ -2308,6 +2308,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                         top_p,
                         max_tokens,
                     },
+                    false,
                 );
             }
             // Resolve the prompt from `--prompt` or, when it is omitted and
@@ -2574,7 +2575,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             replay,
             demo,
             chat_mock,
-        }) => dash::run(replay, demo, chat_mock),
+        }) => dash::run(replay, demo, chat_mock, false),
         Some(Command::Bench { command }) => match command {
             BenchCommand::Load {
                 endpoint,
@@ -26822,7 +26823,7 @@ install therock";
         // interactive target). Coercing to the fn pointer fails to compile if
         // the entrypoint is removed or its signature drifts; casting the pointer
         // to an address gives the binding a real effect (no underscore-bind).
-        let target: fn(bool, ChatInferenceParams) -> Result<()> = dash::run_chat;
+        let target: fn(bool, ChatInferenceParams, bool) -> Result<()> = dash::run_chat;
         assert_ne!(target as usize, 0);
     }
 

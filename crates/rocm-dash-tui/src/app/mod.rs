@@ -37,6 +37,7 @@ mod types;
 // `pub(crate)` item with no caller through that path isn't re-exported just
 // because it was reachable there pre-split (see the removed
 // `NO_CHAT_BACKEND_MSG` re-export this rule cost).
+pub(crate) use actions::request_quit;
 pub use actions::{KeyAction, handle_mouse, tab_bar_hit};
 pub(crate) use event_loop::{
     HOME_UPDATE_CHECK_JOB_ID, SHUTTING_DOWN, exit_on_ctrl_c, is_ctrl_c, lock_terminal_writer,
@@ -70,6 +71,12 @@ pub struct AppState {
     pub history: VecDeque<Snapshot>,
     pub bench_rows: VecDeque<BenchmarkRow>,
     pub instances: HashMap<String, Instance>,
+    /// Set once the daemon's first instance snapshot has landed (see
+    /// `push_snapshot`). Until then, `instances` being empty says nothing
+    /// about whether anything is actually serving — it may simply not have
+    /// arrived yet — which is what `has_live_instance` consults a live
+    /// registry read for (issue #145).
+    pub(crate) has_received_snapshot: bool,
     pub active_tab: ActiveTab,
     pub modal: Modal,
     /// Cursor into the Esc main-menu rows (Options / Help / Quit).
@@ -191,6 +198,21 @@ pub struct AppState {
     /// registry read at launch (see `ResolvedArgs::services_past_attempts`).
     /// Rendered by the services overlay so failed servers are not invisible.
     pub services_past_attempts: usize,
+    /// Set from `ResolvedArgs::managed_registry_probe`: the bin-injected live
+    /// registry-read seam `has_live_instance` / `has_stoppable_managed_instance`
+    /// / `quit_confirm_open_services_key` consult, rather than a snapshot
+    /// frozen at launch (issue #145). `Some` on every bin path — this is
+    /// never `None`, including under `--demo`/`--replay`/`--chat-mock`.
+    /// `--demo`/`--replay` are made safe by `simulated` (see
+    /// `has_live_instance`), not by this being absent; `--chat-mock` is NOT
+    /// `simulated` and deliberately does read this live (see dash-29). See
+    /// `live_registry_snapshot` and `registry_probe::ManagedRegistryProbe`.
+    pub managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
+    /// Set from `ResolvedArgs::launcher_hosted`: `true` when this session was
+    /// opened from the pre-dashboard launcher, which owns the quit decision
+    /// that actually exits the process. See the field doc on
+    /// `ResolvedArgs::launcher_hosted` and `actions::request_quit`.
+    pub(crate) launcher_hosted: bool,
     /// Last body area used by the most recent draw. Mouse hit-tests resolve
     /// pointer coordinates against this rect (filled by `ui::draw`).
     pub last_body_area: Option<ratatui::layout::Rect>,
@@ -257,6 +279,14 @@ pub struct AppState {
     /// A surfaced mutating-tool approval awaiting the operator's decision
     /// (Phase 4). `Some` ⇒ the approval modal is open and owns keyboard focus.
     pub(crate) approval: Option<PendingApproval>,
+    /// A quit attempted while an instance was still serving (this host's own
+    /// managed instance, or one Docker-/Lemonade-discovered from an external
+    /// daemon), from any of `request_quit`'s entry points: `q`, the Esc main
+    /// menu's `Quit` row,
+    /// `/quit`/`/exit` in chat, or the pre-dashboard launcher's own `q`/Esc.
+    /// `Some` ⇒ the confirm-before-quit prompt is open and owns keyboard
+    /// focus, the same way `approval` does.
+    pub(crate) quit_confirm: Option<crate::ui::approval::ApprovalChoice>,
     /// The chat LLM backend currently selected (Phase 8). Defaults to `Local`.
     pub(crate) active_provider: ChatProvider,
     /// Edge: a pending `/provider` switch. Raised by `handle_slash_command`,
@@ -299,6 +329,7 @@ impl AppState {
             history: VecDeque::with_capacity(HISTORY_CAP),
             bench_rows: VecDeque::with_capacity(BENCH_CAP),
             instances: HashMap::new(),
+            has_received_snapshot: false,
             active_tab: ActiveTab::default(),
             modal: Modal::None,
             menu_sel: 0,
@@ -342,6 +373,8 @@ impl AppState {
             replay: None,
             simulated: false,
             services_past_attempts: 0,
+            managed_registry_probe: None,
+            launcher_hosted: false,
             last_body_area: None,
             last_tab_bar_area: None,
             last_footer_chips: Vec::new(),
@@ -368,6 +401,7 @@ impl AppState {
             slash_tool: None,
             plan_request: None,
             approval: None,
+            quit_confirm: None,
             active_provider: ChatProvider::default(),
             provider_switch: None,
             update_status: UpdateStatus::Unknown,
@@ -394,6 +428,7 @@ impl AppState {
         self.config_manager = None;
         self.bench_run = None;
         self.approval = None;
+        self.quit_confirm = None;
         // A fresh overlay starts its console at the top.
         self.console_scroll = 0;
         self.console_hscroll = 0;
@@ -596,14 +631,208 @@ impl AppState {
         self.approval.is_some()
     }
 
-    /// Whether *either* gating layer owns the screen: an open manager overlay
-    /// or a pending chat approval. This exact `||` is what every input path
-    /// that swallows for one must also swallow for the other — two call sites
-    /// wrote it out by hand before this existed, each with its own copy of
-    /// this same reasoning; a third forgetting one half would reopen the
-    /// class of bug `approval_pending`'s own doc comment describes.
+    /// True when *some* instance is actively serving from the user's point of
+    /// view, whether this host's own registry manages it or it was
+    /// Docker-/Lemonade-discovered from an external daemon — the gate for the
+    /// confirm-before-quit prompt.
+    ///
+    /// Always `false` under `simulated` (`--demo`/`--replay`): a demo session
+    /// synthesizes `Instance { status: Running, .. }` entries so the Serving
+    /// tab has something to show, but nothing is actually running, so warning
+    /// before quitting would print a false claim (AGENTS.md §3, issue #145's
+    /// own prompt text: "it keeps running in the background after you quit").
+    ///
+    /// Otherwise ORs in a *live* registry read (`live_registry_snapshot`)
+    /// until the daemon's first instance snapshot lands
+    /// (`has_received_snapshot`): `instances` starts empty and is only
+    /// populated once that snapshot arrives (see `push_snapshot`), so a `q`
+    /// pressed in that startup window would otherwise see this return `false`
+    /// even though a model actually was being served, simply because the live
+    /// state hadn't arrived yet. On a host whose dashboard-embedded daemon
+    /// client never connects at all (Windows — `client.rs`'s connect path is
+    /// unix-only), `has_received_snapshot` never flips, so the live read
+    /// stays authoritative for the entire session rather than only a brief
+    /// startup window — the registry read is cheap and re-run every time this
+    /// is called, so there is no staleness to outlive. Once a snapshot lands
+    /// on a host where the daemon does connect, `instances` is authoritative
+    /// and the registry read is no longer consulted for THIS question (a
+    /// model that legitimately stops later in the session is still reflected
+    /// correctly) — but `has_stoppable_managed_instance` below still reads it
+    /// live for a different question (which ids are reachable), unconditionally.
+    pub(crate) fn has_live_instance(&self) -> bool {
+        if self.simulated {
+            return false;
+        }
+        self.instances.values().any(|i| i.status.is_serving())
+            || (!self.has_received_snapshot && self.live_registry_snapshot().has_live_service)
+    }
+
+    /// Read the bin-injected live registry probe now, or a default (empty,
+    /// nothing live) snapshot when none was injected (demo/replay/mock).
+    /// Single call site for the registry-read seam so `has_live_instance`,
+    /// `has_stoppable_managed_instance`, `quit_confirm_open_services_key`, and
+    /// `ui::quit_confirm_body` all read the exact same live classification
+    /// rather than each unwrapping `managed_registry_probe` by hand.
+    pub(crate) fn live_registry_snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
+        self.managed_registry_probe
+            .as_ref()
+            .map_or_else(Default::default, |probe| probe.snapshot())
+    }
+
+    /// Whether at least one currently-serving instance is one this host's own
+    /// registry manages (a live read — see `live_registry_snapshot`) — i.e.
+    /// one `rocm services stop` can actually reach. Shared by
+    /// `ui::quit_confirm_body` (whether to show the "press s" hint) and
+    /// `quit_confirm_open_services_key` (whether `s` does anything), so the
+    /// two can't drift on when stopping is actually offered.
+    pub(crate) fn has_stoppable_managed_instance(&self) -> bool {
+        let managed_ids = self.live_registry_snapshot().managed_ids;
+        self.instances
+            .values()
+            .any(|i| i.status.is_serving() && managed_ids.contains(&i.container_id))
+    }
+
+    /// Whether the confirm-before-quit prompt is open. Mirrors
+    /// [`approval_pending`](Self::approval_pending): the event loop gives it
+    /// its own match arm above the normal per-tab dispatch, so no overlay can
+    /// pre-empt the decision.
+    pub(crate) const fn quit_confirm_pending(&self) -> bool {
+        self.quit_confirm.is_some()
+    }
+
+    /// Open the confirm-before-quit prompt with the shared default choice
+    /// (Approve — the user already asked to quit; this just confirms it).
+    /// Closes any operational overlay first, mirroring `open_approval`, so the
+    /// prompt owns focus alone. Also closes any open `modal` (Esc menu,
+    /// Options, Detail, ThemePicker, Help, …): `q` reaches `KeyAction::Quit`
+    /// from inside every one of those (see their per-modal arms above this
+    /// impl in `actions.rs`), and declining must land back on the plain
+    /// dashboard, not strand the user inside whatever was open when they
+    /// pressed `q`. `close_overlays` also resets console scroll position —
+    /// accepted here the same way it already is for `open_approval`, which
+    /// has called it for exactly this reason since before issue #145.
+    pub(crate) fn open_quit_confirm(&mut self) {
+        self.close_overlays();
+        self.modal = Modal::None;
+        self.quit_confirm = Some(crate::ui::approval::ApprovalChoice::default());
+    }
+
+    /// Route a key to the open quit-confirm prompt: move the cursor and
+    /// return a verdict if the key resolved one. No-op returning `None` when
+    /// no prompt is open.
+    pub(crate) fn on_quit_confirm_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> Option<crate::ui::approval::ApprovalVerdict> {
+        let choice = self.quit_confirm.as_mut()?;
+        let (new_choice, verdict) = crate::ui::approval::approval_key(code, *choice);
+        *choice = new_choice;
+        verdict
+    }
+
+    /// Resolve a key against the open quit-confirm prompt to completion:
+    /// routes it via [`on_quit_confirm_key`](Self::on_quit_confirm_key), and
+    /// on a verdict also applies the verdict's side effect — clearing the
+    /// prompt on Deny/Cancel (Approve leaves it for the caller, which is
+    /// about to exit anyway). Returns `Some(true)` on Approve (caller should
+    /// exit), `Some(false)` on Deny/Cancel (prompt closed, caller continues),
+    /// or `None` while the cursor merely moved / an irrelevant key arrived
+    /// (prompt stays open). Shared by the dashboard event loop
+    /// (`app::event_loop`) and the pre-dashboard launcher
+    /// (`ui::launcher::handle_launcher_key`) so the two can't drift apart on
+    /// what a quit-confirm verdict actually does.
+    pub(crate) fn resolve_quit_confirm_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> Option<bool> {
+        use crate::ui::approval::ApprovalVerdict;
+        match self.on_quit_confirm_key(code)? {
+            ApprovalVerdict::Approve => Some(true),
+            ApprovalVerdict::Deny | ApprovalVerdict::Cancel => {
+                self.quit_confirm = None;
+                Some(false)
+            }
+        }
+    }
+
+    /// The quit-confirm prompt's `s` ("stop…") key (issue #145): rather than
+    /// only warning that a model keeps running, jump straight to the Services
+    /// overlay — pre-focused on a managed instance that's actually serving —
+    /// so the user can stop it there through its own proven approval+job+
+    /// console flow (`ui::services_manager`), instead of only being told the
+    /// shell command to run themselves.
+    ///
+    /// Dashboard-only: the pre-dashboard launcher shares this prompt's text
+    /// but has no live Services overlay to jump to (it isn't connected to a
+    /// daemon and has no `services` field rendering path of its own), so its
+    /// own key routing never calls this. Returns `true` when handled — the
+    /// caller must not also resolve `code` through
+    /// [`resolve_quit_confirm_key`](Self::resolve_quit_confirm_key) in that
+    /// case. Returns `false` (prompt not open, key isn't `s`, or nothing
+    /// stoppable is currently serving) when the caller should fall through to
+    /// that normal resolution instead.
+    ///
+    /// The row-finding `position` closure below necessarily re-checks
+    /// `is_serving() && managed_ids.contains(..)` per row (it needs to know
+    /// WHICH row, not just whether one exists), but the short-circuit above
+    /// it calls [`has_stoppable_managed_instance`](Self::has_stoppable_managed_instance)
+    /// for real, so the two can't drift on the top-level "is there anything
+    /// to jump to at all" decision — only on the mechanical per-row lookup
+    /// that decision alone can't answer.
+    pub(crate) fn quit_confirm_open_services_key(
+        &mut self,
+        code: crossterm::event::KeyCode,
+    ) -> bool {
+        if !self.quit_confirm_pending() || code != crossterm::event::KeyCode::Char('s') {
+            return false;
+        }
+        if !self.has_stoppable_managed_instance() {
+            return false;
+        }
+        let managed_ids = self.live_registry_snapshot().managed_ids;
+        let rows = crate::ui::services_manager::service_rows(&self.instances);
+        let Some(selected) = rows.iter().position(|r| {
+            managed_ids.contains(&r.id)
+                && self
+                    .instances
+                    .get(&r.id)
+                    .is_some_and(|i| i.status.is_serving())
+        }) else {
+            return false;
+        };
+        self.close_overlays();
+        self.services = Some(crate::ui::services_manager::ServicesManagerState {
+            selected,
+            ..Default::default()
+        });
+        true
+    }
+
+    /// Whether a modal that owns the body absolutely — no console, nothing to
+    /// pan or fall through to — is open: the chat approval or the quit-confirm
+    /// prompt. Unlike [`overlay_or_approval`](Self::overlay_or_approval), this
+    /// deliberately excludes [`has_open_overlay`](Self::has_open_overlay): a
+    /// manager overlay's job console is still a legitimate scroll/drag target,
+    /// where these two never are.
+    pub(crate) const fn blocks_body_absolutely(&self) -> bool {
+        self.approval_pending() || self.quit_confirm_pending()
+    }
+
+    /// Whether *any* gating layer owns the screen: an open manager overlay, a
+    /// pending chat approval, or a pending quit-confirm prompt. This exact
+    /// `||` is what every input path that swallows for one must also swallow
+    /// for the others — call sites wrote it out by hand before this existed,
+    /// each with its own copy of this same reasoning; forgetting one would
+    /// reopen the class of bug `approval_pending`'s own doc comment
+    /// describes. Composed from [`has_open_overlay`](Self::has_open_overlay)
+    /// and [`blocks_body_absolutely`](Self::blocks_body_absolutely) rather
+    /// than repeating their two sub-conditions by hand, so a future third
+    /// "owns-the-screen" gate only has to be added to one of the two
+    /// functions, not to both. The name predates the quit-confirm prompt;
+    /// kept as-is to avoid rippling a rename through every call site's
+    /// comments.
     pub(crate) const fn overlay_or_approval(&self) -> bool {
-        self.has_open_overlay() || self.approval_pending()
+        self.has_open_overlay() || self.blocks_body_absolutely()
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
@@ -1005,9 +1234,27 @@ impl AppState {
     /// Open the approval modal for a surfaced mutating-tool intent (Phase 4).
     /// Closes any operational overlay first so the modal owns focus alone.
     pub(crate) fn open_approval(&mut self, intent: crate::tool_exec::ApprovalIntent) {
+        // Also refuse while a quit-confirm prompt is open (issue #145): it is
+        // delivered asynchronously off a chat-agent event, independent of any
+        // keypress, so it can otherwise arrive after the user already asked
+        // to quit. Letting it through would silently race the two modals —
+        // `quit_confirm` would still be what's drawn (rendered last), but the
+        // approval would be what every keystroke actually resolves, so a `y`
+        // meant to confirm the quit would instead approve an unreviewed
+        // mutating tool call. The already-open, user-initiated quit decision
+        // wins; the model already got its "surfaced for approval" tool
+        // result regardless (`agent/tools.rs`), so discarding here — same as
+        // the second-approval-while-one-pending case below — never leaves it
+        // waiting on a reply that won't come.
         if self.approval.is_some() {
             self.chat.push(ChatTurn::error(
                 "An action is already awaiting approval; the new request was discarded. Resolve the open approval first.",
+            ));
+            return;
+        }
+        if self.quit_confirm_pending() {
+            self.chat.push(ChatTurn::error(
+                "An action was proposed while quitting was being confirmed; the request was discarded.",
             ));
             return;
         }
@@ -1171,7 +1418,11 @@ impl AppState {
     }
 
     fn push_snapshot(&mut self, snap: Snapshot) {
-        // Snapshots carry the daemon's current instance set — treat them as truth.
+        // Snapshots carry the daemon's current instance set — treat them as
+        // truth, and from here on `instances` alone is authoritative for
+        // `has_live_instance` (issue #145's startup-race fallback stops
+        // mattering the moment real data exists).
+        self.has_received_snapshot = true;
         self.instances.clear();
         for inst in &snap.instances {
             self.instances
@@ -1887,6 +2138,20 @@ mod tests {
 
     // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
 
+    /// Install a static live-registry probe (the test-only stand-in for the
+    /// bin-injected seam — see `registry_probe::StaticManagedRegistrySnapshot`)
+    /// on `state`, so a test can exercise the live-read gates without a real
+    /// registry on disk.
+    fn with_registry_probe(state: &mut AppState, has_live_service: bool, managed_ids: &[&str]) {
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+        state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
+            ManagedRegistrySnapshot {
+                has_live_service,
+                managed_ids: managed_ids.iter().map(|s| (*s).to_string()).collect(),
+            },
+        )));
+    }
+
     // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
 
     #[test]
@@ -2015,6 +2280,23 @@ mod tests {
         let mut s = st();
         assert_eq!(s.handle_slash_command("/exit"), SlashOutcome::Handled);
         assert!(s.should_quit);
+    }
+
+    #[test]
+    fn slash_quit_opens_confirm_prompt_instead_when_a_model_is_serving() {
+        // Issue #145: `/quit` is gated the same way the `q` key is — it must
+        // not bypass the confirm prompt just because it came from chat.
+        let mut s = st();
+        s.instances.insert(
+            "vllm-1".into(),
+            rocm_dash_core::metrics::Instance {
+                status: rocm_dash_core::metrics::InstanceStatus::Ready,
+                ..Default::default()
+            },
+        );
+        assert_eq!(s.handle_slash_command("/quit"), SlashOutcome::Handled);
+        assert!(!s.should_quit);
+        assert!(s.quit_confirm.is_some());
     }
 
     #[test]
@@ -2162,6 +2444,8 @@ mod tests {
             tool_executor: None,
             bench_results_dir: None,
             services_past_attempts: 0,
+            managed_registry_probe: None,
+            launcher_hosted: false,
         }
     }
 
@@ -3035,6 +3319,195 @@ mod tests {
     }
 
     #[test]
+    fn close_overlays_clears_pending_quit_confirm() {
+        // Mirrors close_overlays_clears_pending_approval: quit_confirm is the
+        // sibling gating layer and must be cleared the same way, or a future
+        // path that reaches close_overlays() while it's open would leave a
+        // stale, undismissable prompt.
+        let mut s = st();
+        s.open_quit_confirm();
+        assert!(
+            s.quit_confirm.is_some(),
+            "quit_confirm pending before close"
+        );
+        s.close_overlays();
+        assert!(
+            s.quit_confirm.is_none(),
+            "close_overlays must clear quit_confirm"
+        );
+    }
+
+    #[test]
+    fn open_quit_confirm_closes_other_overlays() {
+        // Mirrors open_approval's own close_overlays() call: the
+        // confirm-before-quit prompt owns focus alone, the same way chat
+        // approval does.
+        let mut s = st();
+        s.runtime_manager = Some(crate::ui::runtime_manager::RuntimeManagerState::default());
+        s.open_quit_confirm();
+        assert!(
+            s.runtime_manager.is_none(),
+            "open_quit_confirm must close any open overlay first"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_trusts_a_live_registry_read_before_first_real_snapshot_lands() {
+        // Issue #145 startup race: `instances` starts empty and is only
+        // populated once the daemon's first snapshot arrives, so without a
+        // live registry read a `q` pressed in that window saw no live
+        // instance and quit with no confirm prompt even if a model actually
+        // was being served. Also covers the Windows case (no daemon ever
+        // connects, so no snapshot ever arrives): the live read stays
+        // authoritative for the entire session, not just a startup window.
+        let mut s = st();
+        assert!(s.instances.is_empty());
+        assert!(!s.has_live_instance(), "nothing seeded, nothing serving");
+
+        with_registry_probe(&mut s, true, &[]);
+        assert!(
+            s.has_live_instance(),
+            "the live registry read must stand in before the first snapshot"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_stops_trusting_the_registry_read_once_a_real_snapshot_lands() {
+        // The registry read must not outrank a real daemon snapshot once one
+        // has arrived: with an empty (nothing-serving) snapshot, `instances`
+        // is authoritative and the registry read is no longer consulted for
+        // this question — even though the probe would still say something
+        // is live if asked.
+        let mut s = st();
+        with_registry_probe(&mut s, true, &[]);
+        assert!(s.has_live_instance());
+
+        s.apply_event(Event::Snapshot(Snapshot::default()));
+        assert!(
+            !s.has_live_instance(),
+            "a real (even empty) snapshot must retire the registry-read fallback"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_is_always_false_under_simulated() {
+        // `--demo`/`--replay` synthesize `Instance { status: Running, .. }`
+        // entries (the Serving tab needs something to show), but nothing is
+        // actually running, so the quit-confirm gate must never trust them —
+        // otherwise it prints "it keeps running in the background" when
+        // nothing does (AGENTS.md §3, issue #145).
+        let mut s = st();
+        s.simulated = true;
+        s.instances.insert(
+            "id0".to_string(),
+            rocm_dash_core::metrics::Instance {
+                container_id: "id0".to_string(),
+                status: rocm_dash_core::metrics::InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut s, true, &[]);
+        assert!(
+            !s.has_live_instance(),
+            "a simulated session must never report a live instance, \
+             whether from a snapshot or the registry-read fallback"
+        );
+    }
+
+    #[test]
+    fn has_live_instance_ignores_a_non_serving_instance() {
+        // Regression guard: a seeded instance whose status is not
+        // Ready/Running (Starting/Stopped/Error/Unknown) must not make
+        // `has_live_instance` report true — only `is_serving()` statuses
+        // count, matching the quit-confirm prompt's own claim that something
+        // is actually being served.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for status in [
+            InstanceStatus::Starting { phase: None },
+            InstanceStatus::Stopped,
+            InstanceStatus::Error,
+            InstanceStatus::Unknown,
+        ] {
+            let mut s = st();
+            s.instances.insert(
+                "id0".to_string(),
+                Instance {
+                    container_id: "id0".to_string(),
+                    status,
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !s.has_live_instance(),
+                "status {status:?} must not count as a live instance"
+            );
+        }
+    }
+
+    #[test]
+    fn has_stoppable_managed_instance_ignores_a_non_serving_managed_instance() {
+        // Regression guard: a managed id in the live registry snapshot whose
+        // instance status is not Ready/Running must not make this report
+        // true — matching `has_live_instance`'s own `is_serving()` gate, so
+        // the quit-confirm prompt never offers to jump to Services for
+        // something that isn't actually running.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for status in [
+            InstanceStatus::Starting { phase: None },
+            InstanceStatus::Stopped,
+            InstanceStatus::Error,
+            InstanceStatus::Unknown,
+        ] {
+            let mut s = st();
+            s.instances.insert(
+                "svc-managed".to_string(),
+                Instance {
+                    container_id: "svc-managed".to_string(),
+                    status,
+                    ..Default::default()
+                },
+            );
+            with_registry_probe(&mut s, true, &["svc-managed"]);
+            assert!(
+                !s.has_stoppable_managed_instance(),
+                "status {status:?} must not count as stoppable"
+            );
+        }
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_ignores_a_non_serving_managed_instance() {
+        // Regression guard, same predicate as the sibling test above but
+        // through the actual `s`-key handler: a managed id that isn't
+        // currently serving must not make `s` open Services.
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        for status in [
+            InstanceStatus::Starting { phase: None },
+            InstanceStatus::Stopped,
+            InstanceStatus::Error,
+            InstanceStatus::Unknown,
+        ] {
+            let mut s = st();
+            s.instances.insert(
+                "svc-managed".to_string(),
+                Instance {
+                    container_id: "svc-managed".to_string(),
+                    status,
+                    ..Default::default()
+                },
+            );
+            with_registry_probe(&mut s, true, &["svc-managed"]);
+            s.open_quit_confirm();
+            assert!(
+                !s.quit_confirm_open_services_key(KeyCode::Char('s')),
+                "status {status:?} must not make `s` open Services"
+            );
+            assert!(s.services.is_none());
+        }
+    }
+
+    #[test]
     fn second_approval_request_is_discarded_while_one_pending() {
         // Two mutating calls in one turn must not clobber: the operator could
         // otherwise approve args they never saw.
@@ -3056,6 +3529,33 @@ mod tests {
         let pa = s.approval.as_ref().expect("first approval still pending");
         assert_eq!(pa.name, "install_sdk");
         assert_eq!(pa.arguments["prefix"], "~/rocm");
+        assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
+    }
+
+    #[test]
+    fn approval_request_is_discarded_while_quit_confirm_is_pending() {
+        // Issue #145 regression: a chat-agent tool call surfacing for
+        // approval must not land while the user is already mid-decision on
+        // quitting — the quit-confirm prompt is what's drawn (rendered
+        // last), but without this guard every keystroke would still resolve
+        // the approval instead, so a `y` meant to confirm the quit would
+        // silently approve an unreviewed mutating tool call.
+        let mut s = st();
+        s.open_quit_confirm();
+        s.open_approval(crate::tool_exec::ApprovalIntent {
+            title: "Install ROCm".to_string(),
+            body: vec!["rocm install sdk".to_string()],
+            name: "install_sdk".to_string(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(
+            s.approval.is_none(),
+            "approval must be discarded, not opened"
+        );
+        assert!(
+            s.quit_confirm.is_some(),
+            "quit-confirm must still own the screen"
+        );
         assert_eq!(s.chat.last().unwrap().role, ChatRole::Error);
     }
 

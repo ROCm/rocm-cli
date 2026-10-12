@@ -226,6 +226,23 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
     fx
 }
 
+/// Hand off `ResolvedArgs`'s live registry-read seam and launcher-hosted flag
+/// onto `AppState` (issue #145). `event_loop` calls this directly (rather
+/// than inlining the two assignments) so a regression test can exercise the
+/// actual call site instead of constructing an `AppState` and setting the
+/// fields by hand — the same reasoning as `apply_startup_focus` below: `run`/
+/// `event_loop` are only reachable through the full async terminal loop, so
+/// a silently dropped hand-off here would otherwise go uncaught by anything
+/// but the `@requires-os:linux` e2e lane.
+fn seed_registry_probe_and_hosting(
+    state: &mut AppState,
+    managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
+    launcher_hosted: bool,
+) {
+    state.managed_registry_probe = managed_registry_probe;
+    state.launcher_hosted = launcher_hosted;
+}
+
 /// The dashboard's entire startup gate: an overlay opens only when an
 /// explicit `Focus` was resolved from the command line. `event_loop` calls
 /// this directly (rather than inlining the `match`) so a regression test can
@@ -802,6 +819,12 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
     state.bench_results_dir = args.bench_results_dir.clone();
     // Managed-service records that are no longer running, counted by the bin.
     state.services_past_attempts = args.services_past_attempts;
+    // Live registry-read seam and launcher-hosting flag (issue #145).
+    seed_registry_probe_and_hosting(
+        &mut state,
+        args.managed_registry_probe.clone(),
+        args.launcher_hosted,
+    );
     // Focused host: open exactly the overlay for the requested flow (Examine
     // also auto-runs its read-only job). `Focus::Setup` opens the onboarding
     // overlay — the same wizard `rocm bootstrap setup` routes to.
@@ -1129,6 +1152,28 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
                                 state.on_approval_declined();
                             }
                             None => { /* cursor moved or key ignored — modal stays open */ }
+                        }
+                    }
+                    // The quit-confirm prompt (issue #145), when open, owns
+                    // every remaining key the same way the approval modal
+                    // above does — nothing behind it can pre-empt the
+                    // decision. Only the Ctrl-C arm above outranks it, for
+                    // the same reason it outranks the approval modal.
+                    Some(Ok(CtEvent::Key(k))) if state.quit_confirm_pending() => {
+                        // `s`: jump to the Services overlay and stop it there,
+                        // rather than only resolving an Approve/Deny/Cancel
+                        // verdict. Checked first so it can't be shadowed by
+                        // `resolve_quit_confirm_key`'s own key handling; it
+                        // already mutated `state` (prompt closed, overlay
+                        // opened) when it returns `true`, so there is nothing
+                        // further to resolve for this key.
+                        //
+                        // `Some(false)`: Deny/Cancel already closed the prompt.
+                        // `None`: cursor moved or key ignored — prompt stays open.
+                        if !state.quit_confirm_open_services_key(k.code)
+                            && state.resolve_quit_confirm_key(k.code) == Some(true)
+                        {
+                            break;
                         }
                     }
                     // De-modal back-out: on any tab, when an inline manager is
@@ -2127,6 +2172,36 @@ mod tests {
         assert!(
             s.onboarding.is_some(),
             "an explicit Focus::Setup must open onboarding"
+        );
+    }
+
+    #[test]
+    fn seed_registry_probe_and_hosting_wires_both_fields_onto_state() {
+        // Regression guard: this hand-off is otherwise only reachable through
+        // a full async `event_loop` run, so a silent no-op here (the call
+        // site deleted, or the fields swapped) would not fail any other
+        // test. Each half (the bin producing the probe, `AppState::
+        // has_live_instance`/`ui::quit_confirm_body` consuming it) is tested
+        // elsewhere; this is the wiring between them.
+        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
+
+        let mut s = st();
+        assert!(s.managed_registry_probe.is_none());
+        assert!(!s.launcher_hosted);
+
+        let probe: crate::registry_probe::SharedManagedRegistryProbe =
+            std::sync::Arc::new(StaticManagedRegistrySnapshot(ManagedRegistrySnapshot {
+                has_live_service: true,
+                managed_ids: std::iter::once("svc-a".to_string()).collect(),
+            }));
+        seed_registry_probe_and_hosting(&mut s, Some(probe.clone()), true);
+
+        assert!(s.launcher_hosted);
+        assert_eq!(
+            s.managed_registry_probe
+                .as_ref()
+                .map(|p| std::sync::Arc::ptr_eq(p, &probe)),
+            Some(true)
         );
     }
 

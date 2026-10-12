@@ -12,7 +12,7 @@ use e2e_cucumber::mock_server::{MetricsMode, MockServer, ServiceRecordOptions};
 use std::time::{Duration, Instant};
 
 use crate::E2eWorld;
-use crate::e2e::tui_driver::{TermSignal, TuiSession, default_timeout};
+use crate::e2e::tui_driver::{QUIT_CONFIRM_MARKER, TermSignal, TuiSession, default_timeout};
 /// The exact prompt `send_managed_model_message` types, and the string the
 /// corresponding `Then` step (`managed_chat_request_carried_prompt`) asserts
 /// the mock actually received — so the two can never silently drift apart.
@@ -619,6 +619,259 @@ async fn quit_dashboard(world: &mut E2eWorld) {
     quit_tui(world, "the dashboard").await;
 }
 
+/// Send the plain quit gesture and nothing else — unlike `quit_dashboard`,
+/// this does not wait for (or resolve) the quit-confirm prompt that may open
+/// (issue #145), since the point of this step is to observe that prompt.
+#[when("the user tries to quit the dashboard")]
+async fn try_quit_dashboard(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+/// Chat counterpart of `try_quit_dashboard`: `/quit` shares the exact same
+/// `request_quit` gate as the dashboard's `q` and the launcher's own `q`
+/// (issue #145) — `rocm chat` is the same dashboard with the Chat tab focused
+/// (`run_chat` calls the same `run_async`) — but had no scenario coverage of
+/// its own before this. Sends `/quit` and nothing else: unlike
+/// `quit_interactive_chat`, this does not resolve the prompt that may open,
+/// since the point of this step is to observe it.
+#[when("the user tries to quit chat")]
+async fn try_quit_chat(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Wait for the accepted, empty chat surface before typing so the input is
+    // ready to receive focus — mirrors `send_gpu_message`'s own wait.
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat surface never became ready: {e}"));
+    // `i` focuses the input (a fresh session starts unfocused — slash commands
+    // are plain text input, same as a chat message); then the command, then
+    // Enter to submit it (`handle_slash_command` routes `/quit` to the shared
+    // gate, same as a plain `q` keypress on the dashboard).
+    tui.send("i")
+        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    tui.send("/quit")
+        .unwrap_or_else(|e| panic!("failed to type /quit: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit /quit: {e}"));
+}
+
+#[then("the dashboard asks whether to quit while a model is still being served")]
+async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
+/// Proves the prompt's remediation line itself (not just that some prompt
+/// appeared) names a command that is real: the fixture's own managed-service
+/// record always carries `"service_id": "e2e-mock"` (`mock_server.rs`'s
+/// `write_service_record_with`), so this checks for the literal, fillable
+/// `rocm services stop e2e-mock --yes` — not a `<id>` placeholder or a bare
+/// mention of the model name — directly answering AGENTS.md §3's rule that a
+/// remediation command must be asserted, not just its wording.
+///
+/// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
+/// as a separate line from the model-name row above it, since commit
+/// c30f00d4) rather than trailing the model name on one combined line, so at
+/// this PTY's width it is not expected to word-wrap. Whitespace is still
+/// collapsed to single spaces before matching — this also merges the row
+/// boundary between the model-name line and the command line into one
+/// contiguous string — so the match is robust to that line break (and to any
+/// wrap that does occur) without depending on exact column positions.
+#[then("the quit prompt shows the real stop command for the managed model")]
+async fn quit_confirm_shows_real_stop_command(world: &mut E2eWorld) {
+    let expected = "rocm services stop e2e-mock --yes";
+    session(world)
+        .wait_for_screen_where(
+            &format!("the quit prompt shows {expected:?}"),
+            |screen| {
+                screen
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .contains(expected)
+            },
+            default_timeout(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Issue #145's actual stop action, not just the warning: `s` on the
+/// dashboard's quit-confirm prompt is meant to close it and open the Services
+/// overlay instead of resolving an Approve/Deny/Cancel verdict
+/// (`AppState::quit_confirm_open_services_key`). Sent exactly once — the
+/// prompt is already confirmed open by the preceding `Then` step, so there is
+/// no startup race to retry through, the same reasoning `open_services_overlay`
+/// gives for its own single send.
+#[when("the user presses s to manage the serving model")]
+async fn quit_confirm_presses_s_to_manage(world: &mut E2eWorld) {
+    session(world)
+        .send("s")
+        .unwrap_or_else(|e| panic!("failed to send the manage-service key: {e}"));
+}
+
+/// Proves the hint that makes `s` discoverable is actually on screen before
+/// it's pressed, not just that pressing it happens to work
+/// (`services_overlay_opens_showing_managed_model` only proves the latter).
+/// `quit_confirm_request`'s own `offer_stop_action` doc comment is what gates
+/// this to the dashboard's copy of the prompt — the launcher's copy shares
+/// the same body text but passes `false` and must never show it (see
+/// `rocm_dash_tui::ui::launcher::tests::launcher_renders_the_quit_confirm_prompt_when_open`,
+/// the unit-level counterpart for that half).
+#[then("the quit prompt offers to open Services for the serving model")]
+async fn quit_confirm_offers_services_hint(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen("Press s to open Services", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit prompt never offered the Services hint: {e}"));
+}
+
+/// Proves `s` actually did something, not just that it was sent: the
+/// quit-confirm prompt's own marker must be gone (it closed, rather than
+/// merely sitting underneath whatever rendered), the Services overlay's own
+/// title must be on screen (`SERVICES_OVERLAY_TITLE`, drawn only by that
+/// overlay), and the overlay's own row must show the fixture's real service
+/// id (`e2e-mock` — `draw_services_manager` renders `r.id` as its own
+/// column, `services_manager.rs`).
+///
+/// The id, not the model name: the model name is already on screen from the
+/// earlier `the managed model is displayed` step and would still read true
+/// from the dimmed Observe background behind a centered modal that doesn't
+/// fully cover it (see `close_services_overlay`'s own comment on exactly
+/// this), so a model-name match alone wouldn't prove the overlay's own
+/// content, only that it rendered on top of something that already had it.
+#[then("the services overlay opens showing the managed model")]
+async fn services_overlay_opens_showing_managed_model(world: &mut E2eWorld) {
+    let tui = session(world);
+    tui.wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the quit prompt never closed after `s`: {e}"));
+    tui.wait_for_screen(SERVICES_OVERLAY_TITLE, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("`s` never opened the services overlay: {e}"));
+    tui.wait_for_screen("e2e-mock", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the services overlay did not show its own row: {e}"));
+}
+
+/// Launcher counterpart of `try_quit_dashboard`: the launcher's own `q`/Esc
+/// is a second, independent quit entry point (issue #145) and must not wait
+/// for (or resolve) the prompt it may open, since the point of this step is
+/// to observe that prompt.
+#[when("the user tries to quit the launcher")]
+async fn try_quit_launcher(world: &mut E2eWorld) {
+    session(world)
+        .send("q")
+        .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
+}
+
+/// Launcher counterpart of `quit_confirm_is_displayed`: same marker, same
+/// prompt (`ui::launcher::draw`'s own quit_confirm arm renders the identical
+/// `ui::quit_confirm_body`), reached from the launcher's own event loop
+/// instead of the dashboard's.
+#[then("the launcher asks whether to quit while a model is still being served")]
+async fn launcher_quit_confirm_is_displayed(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_screen(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never appeared: {e}"));
+}
+
+#[when("the user declines the quit prompt")]
+async fn decline_quit_prompt(world: &mut E2eWorld) {
+    session(world)
+        .send("n")
+        .unwrap_or_else(|e| panic!("failed to decline the quit prompt: {e}"));
+    // The prompt's own body names the serving model (`quit_confirm_body` in
+    // `ui/mod.rs`), so the very next assertion — "the managed model is
+    // displayed" (dash-26) or "the launcher shows the model serving"
+    // (dash-27; a different step, same risk) — could pass on the prompt's
+    // own text even if `n` did nothing and the prompt never actually closed.
+    // Wait for it to actually leave the screen so that assertion proves the
+    // decline worked, not just that the model's name is on screen somewhere.
+    session(world)
+        .wait_until_gone(QUIT_CONFIRM_MARKER, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("quit-confirm prompt never closed after declining: {e}"));
+}
+
+/// Whether `services list --json` currently lists the scenario's model as
+/// `ready`/`running` — the same statuses `Instance::status.is_serving()`
+/// treats as live on the TUI side. Shared by the "still listed as running"
+/// and "no longer listed as running" `Then` steps below so the two assert the
+/// literal opposite of the same live read rather than each re-deriving it
+/// (and risking drifting on what "running" means).
+///
+/// `--json` (no `--all`) rather than the plain `--all` table: `--all` also
+/// keeps stopped/failed records around, so a substring match against it would
+/// pass even if the service had actually stopped and merely left its record
+/// behind.
+fn managed_model_is_listed_as_running(world: &E2eWorld) -> (bool, String) {
+    let (stdout, _, _) = crate::run_rocm(world, &["services", "list", "--json"]);
+    let model = world
+        .model_name
+        .as_deref()
+        .expect("no model name set")
+        .to_lowercase();
+    let records: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("services list --json did not parse: {e}\n{stdout}"));
+    let found = records.as_array().into_iter().flatten().any(|record| {
+        let names_model = [record.get("model_ref"), record.get("canonical_model_id")]
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .any(|v| v.to_lowercase().contains(&model));
+        let is_running = record
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| matches!(s, "ready" | "running"));
+        names_model && is_running
+    });
+    (found, stdout)
+}
+
+/// Proves the prompt's own claim ("it keeps running in the background after
+/// you quit") against actual state, not just its wording (AGENTS.md §3) — a
+/// plain CLI check against the managed-service registry, run after the TUI
+/// process has already exited (or, for the declined-prompt assertion earlier
+/// in the same scenario, while it's still open).
+#[then("the managed model is still listed as running")]
+async fn managed_model_still_listed_as_running(world: &mut E2eWorld) {
+    let (found, stdout) = managed_model_is_listed_as_running(world);
+    assert!(
+        found,
+        "model not listed as ready/running — quitting (or declining) must not stop it:\n{stdout}"
+    );
+}
+
+/// Proves the quit prompt's own remediation line — the real, fillable
+/// `rocm services stop <id> --yes` command (`quit_confirm_shows_real_stop_command`
+/// pins the string) — actually clears the condition it warns about, not just
+/// that the text is right (AGENTS.md §3). Runs the exact command a user would
+/// copy from the prompt, as a plain CLI invocation independent of the TUI
+/// under test (the fixture's own managed-service record always carries
+/// `"service_id": "e2e-mock"` — `mock_server.rs`'s `write_service_record_with`).
+#[when("the user runs the quit prompt's stop command")]
+async fn run_quit_prompt_stop_command(world: &mut E2eWorld) {
+    crate::run_rocm_ok(world, &["services", "stop", "e2e-mock", "--yes"]);
+}
+
+/// The negation of `managed_model_still_listed_as_running`: proves the stop
+/// command above actually took effect on the registry `rocm services` itself
+/// reads, not merely that the CLI invocation exited zero.
+#[then("the managed model is no longer listed as running")]
+async fn managed_model_no_longer_listed_as_running(world: &mut E2eWorld) {
+    let (found, stdout) = managed_model_is_listed_as_running(world);
+    assert!(
+        !found,
+        "model still listed as ready/running after running the prompt's own \
+         stop command — the remediation it prints does not actually work:\n{stdout}"
+    );
+}
+
 #[when("the user quits interactive chat")]
 async fn quit_interactive_chat(world: &mut E2eWorld) {
     quit_tui(world, "interactive chat").await;
@@ -668,10 +921,23 @@ async fn quit_back_to_launcher(world: &mut E2eWorld) {
     // session" state where a per-session signal watcher would have gone deaf.
     tui.send("q")
         .unwrap_or_else(|e| panic!("failed to quit the dashboard: {e}"));
+    // A launcher-hosted session (dash-30) must exit on this one `q` with no
+    // confirm prompt of its own, even while a model is serving — only the
+    // launcher's own gate should ever show it. If `AppState::launcher_hosted`
+    // failed to suppress the dashboard's own gate, this session would open
+    // its own quit-confirm prompt instead of exiting, and the launcher front
+    // door below would never come back — the panic message names that
+    // specific failure mode so a timeout here reads as "the double-prompt
+    // regression" rather than an unexplained hang.
     tui.wait_for_screen("Set up this system", default_timeout())
         .await
         .unwrap_or_else(|e| {
-            panic!("the launcher front door did not return after the session: {e}")
+            panic!(
+                "the launcher front door did not return after the session — \
+                 if a quit-confirm prompt is still showing instead, \
+                 `AppState::launcher_hosted` failed to suppress this \
+                 session's own gate (issue #145's double-prompt fix): {e}"
+            )
         });
 }
 

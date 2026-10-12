@@ -14,6 +14,7 @@ pub mod client;
 pub mod jobs;
 pub mod llm;
 pub mod reconnect;
+pub mod registry_probe;
 pub mod replay;
 pub mod skills;
 pub mod tool_exec;
