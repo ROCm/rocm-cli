@@ -65,4 +65,5 @@ and run this from PowerShell:
 ## Next steps
 
 To install the managed TheRock runtime and serve a model, see
-[Getting started](../getting-started.md).
+[Getting started](../getting-started.md). For the options of `rocm examine`,
+`rocm diagnose`, and `rocm fix`, see the [Command reference](../commands.md).

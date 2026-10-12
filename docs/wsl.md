@@ -49,7 +49,7 @@ verifies that `/opt/rocm/lib/librocdxg.so` exists and is visible to the linker.
 No reboot is needed: ROCDXG is userspace.
 
 Confirm afterwards with
-[`rocm examine`](rocm-docs/commands.md#examine), which should report
+`rocm examine`, which should report
 `driver_status: wsl_rocdxg_ready`.
 
 The download is verified before it is installed. `rocm install driver` carries a
@@ -80,10 +80,14 @@ unverified.
 ### Doing it by hand
 
 The equivalent manual steps, for reference or for a host where the CLI is not
-installed yet. The `sha256sum -c` line is the same trust anchor that
-`rocm install driver` uses. Do not skip it, because `apt install` runs the
-package's maintainer scripts as root. Set `ROCDXG_VERSION` to the release you
-want and `ROCDXG_SHA256` to the digest published with that release:
+installed yet. Do not skip the `sha256sum -c` line, because `apt install` runs
+the package's maintainer scripts as root. `rocm install driver` checks the
+download against a digest pinned in the ROCm CLI source
+(`ROCDXG_PINNED_DIGESTS` in `apps/rocm/src/driver_install.rs`), which also
+catches a replaced release asset. A digest read from the release page at
+install time catches only a corrupted download. For a version listed in
+`ROCDXG_PINNED_DIGESTS`, use the pinned digest. Set `ROCDXG_VERSION` to the
+release you want and `ROCDXG_SHA256` to its digest:
 
 ```bash
 ROCDXG_VERSION=<version>
@@ -121,14 +125,14 @@ sudo make install
 sudo ldconfig
 ```
 
-If you use a legacy ROCm release (7.2.4 and earlier) instead of the managed
-TheRock runtime, set:
+If you use a legacy ROCm release instead of the managed TheRock runtime, set:
 
 ```bash
 export HSA_ENABLE_DXG_DETECTION=1
 ```
 
-TheRock 7.13 and newer should not require this variable.
+TheRock 7.13 and newer should not require this variable, but setting it on a
+newer release is harmless.
 
 ## TheRock Runtime Env In WSL
 
@@ -158,7 +162,7 @@ and apply that environment before launching HIP apps such as Lemonade's bundled
 
 ## Diagnosing A WSL Host
 
-[`rocm diagnose`](rocm-docs/commands.md#diagnose-and-fix) has a separate set of
+`rocm diagnose` has a separate set of
 WSL checks, called the WSL catalog, distinct from the bare-metal Linux ones.
 The bare-metal checks (render group, `/dev/kfd`, `modprobe amdgpu`, `iommu=pt`)
 never run here: WSL has no `amdgpu` module and no `/dev/kfd`, so a finding
@@ -181,10 +185,13 @@ The WSL entries, in the order a broken stack usually reveals them:
 | `fix-wsl-5-distro-too-old` | The distro release is below the floor in the [prerequisites](#prerequisites) above |
 | `fix-wsl-6-host-driver-too-old` | The distro-side plumbing is complete but the Windows host driver is missing or too old |
 
-Two entries outside this list also apply when you run `rocm diagnose` inside the
-distro: `fix-19-shm-too-small` and `fix-18-comgr-conflict`. A `--distro` run
-skips both (see [Diagnose a distro from Windows](#diagnose-a-distro-from-windows)
-later in this section).
+The shared checks that read the environment or the ROCm install also run on WSL,
+such as `fix-1-arch`, `fix-2-unset-override`, `fix-6-path`, `fix-8-wheel-rocm`,
+and `fix-16-vllm-oom`. Two more entries that are not environment checks apply
+when you run `rocm diagnose` inside the distro: `fix-19-shm-too-small` and
+`fix-18-comgr-conflict`. A `--distro` run skips both (see
+[Diagnose a distro from Windows](#diagnose-a-distro-from-windows) later in this
+section).
 
 `fix-19-shm-too-small` is not a WSL entry, but WSL2 ships the same 64 MiB `/dev/shm` a container does, and a
 serving workload needs gigabytes of it. It reports below 1 GiB, so a WSL2 user
@@ -198,7 +205,7 @@ metal, through the same `LD_LIBRARY_PATH`/loader-cache search, so the finding
 is not specific to either platform.
 
 Every WSL remedy is print-only.
-[`rocm fix <id>`](rocm-docs/commands.md#diagnose-and-fix) shows the commands and
+`rocm fix <id>` shows the commands and
 does not run them: they either install packages with `sudo`, edit loader configuration, or
 belong to the Windows host, and none of that meets the bar an auto-applied fix
 has to clear. On WSL the CLI carries out exactly one catalog entry itself,
@@ -221,7 +228,7 @@ the report:
 
 To inspect a distro without installing anything in it, install ROCm CLI on
 Windows (see the Windows steps in the
-[installation guide](rocm-docs/install/installation.md#windows-x86_64-powershell))
+[installation guide](../README.md#windows-x86_64-powershell))
 and run this from PowerShell:
 
 ```powershell
@@ -241,11 +248,17 @@ yet.
 
 The script runs under `/bin/sh -c` through `wsl.exe --exec`. That shell is
 non-login and non-interactive, so it never reads your shell profile, and it
-collects a fixed set of data. This leaves three limits:
+collects a fixed set of data. This leaves four limits:
 
-- **Fixed ROCm locations.** The script checks only the conventional ROCm roots
-  (`/opt/rocm*`, `/usr/local/rocm*`) and cannot honor a `$ROCM_PATH` set
-  elsewhere.
+- **Fixed ROCm locations.** The script looks for the ROCDXG files only in the
+  conventional ROCm roots (`/opt/rocm*`, `/usr/local/rocm*`) and cannot honor a
+  `$ROCM_PATH` set elsewhere.
+- **`rocminfo` on the default PATH only.** The script finds `rocminfo` with
+  `command -v`, and the default WSL `PATH` has neither `/opt/rocm/bin` nor a
+  TheRock virtual environment. When the script does not find `rocminfo`, the
+  `fix-wsl-6` case "plumbing complete but no GPU enumerated" cannot fire, so
+  `--distro` can miss a host-driver fault that `rocm diagnose` inside the
+  distro reports.
 - **No environment checks.** The script collects no environment, so the checks
   that read one do not run: `HSA_OVERRIDE_GFX_VERSION`, `PATH`, and the
   framework and ROCm version pairing.
@@ -269,19 +282,22 @@ Resolve that error first, then run `rocm diagnose --distro` again.
 
 ## What `rocm examine` Reports On WSL
 
-[`rocm examine`](rocm-docs/commands.md#examine) detects WSL cheaply and reports
-the following. The text report shows a subset; the rest appear in `rocm examine --json`.
+`rocm examine` detects WSL cheaply and reports the following. The text report
+shows a subset. Four items appear only in `rocm examine --json`, and are marked
+below.
 
 - `wsl: true`
-- WSL distro and version, and whether the release clears the supported floor
-- WSL major version (1 or 2)
+- WSL distro and version
+- whether the release clears the supported floor (`--json` only)
+- WSL major version, 1 or 2 (`--json` only)
 - `/dev/dxg` presence
 - `/usr/lib/wsl/lib/libdxcore.so` presence
 - `librocdxg.so` presence, resolved across every ROCm install rather than
   assuming `/opt/rocm`
 - `librocdxg` linker-cache visibility from `ldconfig -p`
 - the Windows host AMD driver version, when WSL interop can reach the host
-- whether `HSA_ENABLE_DXG_DETECTION` is set
+  (`--json` only)
+- whether `HSA_ENABLE_DXG_DETECTION` is set (`--json` only)
 - managed TheRock runtime count and active default runtime
 
 The driver, device-node, and group probes stay skipped. In the `--json` output,
