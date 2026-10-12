@@ -391,18 +391,17 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
             // External endpoint evidence is live; managed installation evidence
             // is a separate launch-time Detect snapshot. GPU metadata carries
             // neither verdict and must never imply an absent engine.
-            let external_running = state.instances.values().any(|i| {
-                i.container_name == "lemonade"
-                    && i.container_id.starts_with("lemonade-")
-                    && i.status.is_serving()
-            });
+            let external_running = state
+                .instances
+                .values()
+                .any(|i| i.is_external_lemonade() && i.status.is_serving());
             let lemon = if external_running {
                 "Lemonade — externally running"
             } else {
                 match state.lemonade_managed_installed {
                     Some(true) => "Lemonade — managed runtime installed",
                     Some(false) => "Lemonade — managed runtime not installed",
-                    None => "Lemonade — open to check",
+                    None => "Lemonade — unknown, run `rocm engines list`",
                 }
             };
             lines.push(Line::from(vec![
@@ -413,19 +412,32 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
                 let managed = match state.lemonade_managed_installed {
                     Some(true) => "Managed runtime — installed",
                     Some(false) => "Managed runtime — not installed",
-                    None => "Managed runtime — open to check",
+                    None => "Managed runtime — unknown, run `rocm engines list`",
                 };
                 lines.push(Line::from(Span::styled(
                     managed,
                     Style::default().fg(theme.muted),
                 )));
             }
-            // The daemon doesn't surface vLLM detection yet — open the manager to
-            // check rather than claiming a status we don't have.
+            // The daemon doesn't surface vLLM detection yet. `rocm engines list`
+            // prints each engine's Detect result, so point there rather than
+            // claiming a status we don't have.
             lines.push(Line::from(vec![
                 Span::styled("· ", Style::default().fg(theme.muted)),
-                Span::styled("vLLM — open to check", Style::default().fg(theme.muted)),
+                Span::styled(
+                    "vLLM — unknown, run `rocm engines list`",
+                    Style::default().fg(theme.muted),
+                ),
             ]));
+            // The managed-runtime verdict is a launch-time snapshot: installing
+            // from the Engines overlay does not update it. The test
+            // `managed_install_verdict_is_not_changed_by_live_events` proves it.
+            if state.lemonade_managed_installed.is_some() {
+                lines.push(Line::from(Span::styled(
+                    "Install status is read at startup. Restart the dashboard to refresh.",
+                    Style::default().fg(theme.muted),
+                )));
+            }
             (lines, false)
         }
         KeyAction::OpenServeWizard => {
@@ -452,13 +464,15 @@ fn live_lines(action: KeyAction, state: &AppState, theme: &Theme) -> (Vec<Line<'
             let running: Vec<_> = state
                 .instances
                 .values()
-                .filter(|i| i.status.is_serving())
+                .filter(|i| {
+                    crate::ui::services_manager::is_listed_service(i) && i.status.is_serving()
+                })
                 .collect();
-            let mut lines = vec![head(format!("Running now — {}", running.len()))];
+            let mut lines = vec![head(format!("Managed running — {}", running.len()))];
             let mut any_held = false;
             if running.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    "  none running",
+                    "  no managed services running",
                     Style::default().fg(theme.muted),
                 )));
             } else {
@@ -512,6 +526,94 @@ mod tests {
             .join("\n")
     }
 
+    fn glyph_of(state: &AppState, needle: &str) -> String {
+        let (lines, _) = live_lines(KeyAction::OpenEngineManager, state, &Theme::default());
+        let line = lines
+            .iter()
+            .find(|l| l.to_string().contains(needle))
+            .unwrap_or_else(|| panic!("no line containing {needle:?}"));
+        line.spans[0].content.to_string()
+    }
+
+    #[test]
+    fn lemonade_line_glyph_is_check_only_when_installed() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.lemonade_managed_installed = Some(true);
+        assert_eq!(
+            glyph_of(&state, "Lemonade — managed runtime installed"),
+            "✓ "
+        );
+        state.lemonade_managed_installed = Some(false);
+        assert_eq!(
+            glyph_of(&state, "Lemonade — managed runtime not installed"),
+            "· "
+        );
+        state.lemonade_managed_installed = None;
+        assert_eq!(glyph_of(&state, "Lemonade — unknown"), "· ");
+    }
+
+    #[test]
+    fn external_running_lemonade_line_has_check_glyph() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.instances.insert(
+            "x".into(),
+            Instance {
+                managed: false,
+                container_id: "x".into(),
+                container_name: "lemonade".into(),
+                status: InstanceStatus::Ready,
+                ..Instance::default()
+            },
+        );
+        assert_eq!(glyph_of(&state, "Lemonade — externally running"), "✓ ");
+    }
+
+    #[test]
+    fn startup_snapshot_note_shown_only_with_a_verdict() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        assert!(!engine_text(&state).contains("read at startup"));
+        state.lemonade_managed_installed = Some(false);
+        let text = engine_text(&state);
+        // This pins the wording only. That the status really is captured once
+        // at startup is proved by
+        // `managed_install_verdict_is_not_changed_by_live_events`.
+        assert!(
+            text.contains("Install status is read at startup. Restart the dashboard to refresh."),
+            "{text}"
+        );
+        assert!(
+            text.contains("vLLM — unknown, run `rocm engines list`"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn managed_install_verdict_is_not_changed_by_live_events() {
+        // Proves the claim the pane's "read at startup" note makes: the verdict
+        // is set once from the startup args (`event_loop.rs`) and no later
+        // daemon event rewrites it, so the note is true.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus, Snapshot};
+        use rocm_dash_core::protocol::Event;
+
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.lemonade_managed_installed = Some(false);
+        let managed = Instance {
+            managed: true,
+            container_id: "svc".into(),
+            container_name: "lemonade".into(),
+            status: InstanceStatus::Ready,
+            ..Instance::default()
+        };
+        state.apply_event(Event::InstanceDiscovered(managed));
+        state.apply_event(Event::Snapshot(Snapshot::default()));
+        state.apply_event(Event::InstanceGone {
+            container_id: "svc".into(),
+        });
+        assert_eq!(state.lemonade_managed_installed, Some(false));
+        assert!(engine_text(&state).contains("Lemonade — managed runtime not installed"));
+    }
+
     #[test]
     fn installed_stopped_managed_lemonade_is_installed_without_gpu_metadata() {
         let mut state = AppState::new("unix:/unused".into(), "dark".into());
@@ -544,12 +646,85 @@ mod tests {
         );
         let text = engine_text(&state);
         assert!(text.contains("Lemonade — externally running"));
-        assert!(text.contains("Managed runtime — open to check"));
+        assert!(text.contains("Managed runtime — unknown, run `rocm engines list`"));
         state.lemonade_managed_installed = Some(true);
         assert!(engine_text(&state).contains("Managed runtime — installed"));
         state.instances.get_mut(&id).unwrap().status = InstanceStatus::Stopped;
         assert!(engine_text(&state).contains("Lemonade — managed runtime installed"));
         assert!(!engine_text(&state).contains("externally running"));
+    }
+
+    #[test]
+    fn external_lemonade_verdict_uses_ownership_not_id_prefix() {
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        let id = "svc-ordinary-id".to_owned();
+        state.instances.insert(
+            id.clone(),
+            Instance {
+                managed: false,
+                container_id: id.clone(),
+                container_name: "lemonade".into(),
+                status: InstanceStatus::Ready,
+                ..Instance::default()
+            },
+        );
+        assert!(engine_text(&state).contains("Lemonade — externally running"));
+        let external = state.instances.remove(&id).unwrap();
+        assert!(!engine_text(&state).contains("externally running"));
+        state.instances.insert(
+            "lemonade-looks-external".into(),
+            Instance {
+                managed: true,
+                container_id: "lemonade-looks-external".into(),
+                ..external
+            },
+        );
+        assert!(!engine_text(&state).contains("externally running"));
+    }
+
+    fn services_text(state: &AppState) -> String {
+        live_lines(KeyAction::OpenServices, state, &Theme::default())
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn serving(id: &str, managed: bool) -> rocm_dash_core::metrics::Instance {
+        rocm_dash_core::metrics::Instance {
+            managed,
+            container_id: id.into(),
+            model_name: format!("model-{id}"),
+            status: rocm_dash_core::metrics::InstanceStatus::Ready,
+            ..rocm_dash_core::metrics::Instance::default()
+        }
+    }
+
+    #[test]
+    fn services_preview_ignores_external_only_instances() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        for id in ["ext-a", "ext-b"] {
+            state.instances.insert(id.into(), serving(id, false));
+        }
+        let text = services_text(&state);
+        assert!(text.contains("Managed running — 0"), "{text}");
+        assert!(text.contains("no managed services running"), "{text}");
+        assert!(!text.contains("model-ext"), "{text}");
+        // Same set the overlay would list.
+        assert!(crate::ui::services_manager::service_rows(&state.instances).is_empty());
+    }
+
+    #[test]
+    fn services_preview_counts_only_managed_instances() {
+        let mut state = AppState::new("unix:/unused".into(), "dark".into());
+        state.instances.insert("ext".into(), serving("ext", false));
+        state.instances.insert("own".into(), serving("own", true));
+        let text = services_text(&state);
+        assert!(text.contains("Managed running — 1"), "{text}");
+        assert!(text.contains("model-own"), "{text}");
+        assert!(!text.contains("model-ext"), "{text}");
     }
 
     #[test]
@@ -561,7 +736,10 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("Lemonade — open to check"), "{text}");
+        assert!(
+            text.contains("Lemonade — unknown, run `rocm engines list`"),
+            "{text}"
+        );
         assert!(
             !text.contains("not installed"),
             "missing GPU metadata is not installation evidence"

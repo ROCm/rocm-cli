@@ -23,12 +23,15 @@
 //! (`EngineKind::default_port`, `docker.rs`, `lemonade.rs`) remain only as a
 //! fallback for *unmanaged/external* discovery.
 //!
-//! **Co-located scope (known limitation):** scrape targets carry only a port;
-//! the runner's vLLM collector scrapes `opts.vllm_metrics_host` (default
-//! `127.0.0.1`), so `record.host` is honored only for the co-located daemon
-//! (the same assumption the Docker-discovery path already makes). A managed
-//! service on a non-loopback host is surfaced but its metrics are scraped at the
-//! local address. Per-host scrape targeting is tracked as a D7 follow-up.
+//! **Lifecycle ownership:** only this registry seam marks discovered services
+//! as managed. External protocol and container discovery remain read-only;
+//! instance ids and engine markers are not evidence of lifecycle ownership.
+//!
+//! **Host scope:** managed Lemonade telemetry honors `record.host` and port.
+//! The vLLM collector still scrapes `opts.vllm_metrics_host` (default
+//! `127.0.0.1`) at the record's port, so a non-loopback vLLM service is surfaced
+//! but its metrics use the configured collector host. External Lemonade
+//! discovery uses its own configured host and port.
 
 use std::collections::HashSet;
 use std::fs;
@@ -163,6 +166,7 @@ pub fn discovered_from_record(record: &ServiceRecord) -> Option<DiscoveredServic
         record.model_ref.clone()
     };
     Some(DiscoveredService {
+        managed: true,
         container_id: record.service_id.clone(),
         container_name: record.service_id.clone(),
         model_name,
@@ -213,22 +217,70 @@ pub struct ManagedLemonadeTarget {
     pub canonical_model_id: String,
 }
 
-/// Whether two co-located HTTP bindings address the same service. Wildcard
-/// binds are reachable through loopback; unrelated remote hosts are not aliases.
-pub fn endpoints_match(left_host: &str, left_port: u16, right_host: &str, right_port: u16) -> bool {
-    fn normalized(host: &str) -> String {
-        let host = host
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_ascii_lowercase();
-        match host.as_str() {
-            "" | "localhost" | "127.0.0.1" | "0.0.0.0" => "ipv4-loopback".into(),
-            "::" | "::1" => "ipv6-loopback".into(),
-            _ => host,
-        }
+/// The loopback families a bind host is reachable through. `::` is a
+/// dual-stack wildcard (both loopbacks); `::1` is IPv6-only; `localhost`,
+/// empty, `127.0.0.1` and `0.0.0.0` are IPv4-only. No DNS is resolved.
+enum HostReach {
+    Loopback { v4: bool, v6: bool },
+    Other(String),
+}
+
+fn normalized_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn host_reach(host: &str) -> HostReach {
+    let host = normalized_host(host);
+    match host.as_str() {
+        "" | "localhost" | "127.0.0.1" | "0.0.0.0" => HostReach::Loopback {
+            v4: true,
+            v6: false,
+        },
+        "::" => HostReach::Loopback { v4: true, v6: true },
+        "::1" => HostReach::Loopback {
+            v4: false,
+            v6: true,
+        },
+        _ => HostReach::Other(host),
     }
-    left_port == right_port && normalized(left_host) == normalized(right_host)
+}
+
+/// Whether two co-located HTTP bindings address the same service. Wildcard
+/// binds are reachable through loopback (`::` through both families); unrelated
+/// remote hosts are not aliases.
+pub fn endpoints_match(left_host: &str, left_port: u16, right_host: &str, right_port: u16) -> bool {
+    if left_port != right_port {
+        return false;
+    }
+    match (host_reach(left_host), host_reach(right_host)) {
+        (HostReach::Loopback { v4: l4, v6: l6 }, HostReach::Loopback { v4: r4, v6: r6 }) => {
+            (l4 && r4) || (l6 && r6)
+        }
+        (HostReach::Other(left), HostReach::Other(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The host a collector should dial for a registry bind host: wildcards are not
+/// valid destinations on every platform, so `::` is reached through `::1`.
+pub fn scrape_host(host: &str) -> String {
+    match normalized_host(host).as_str() {
+        "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "::1" => "::1".to_string(),
+        host => host.to_string(),
+    }
+}
+
+/// Whether a collector cached for `cached_host` may serve `target_host`.
+///
+/// `endpoints_match` is deliberately non-transitive (`::` covers `127.0.0.1`), so
+/// a match alone is not enough: the cached collector dials a fixed address, and
+/// reusing it for a target in another address family probes the wrong listener.
+pub fn cached_collector_reusable(cached_host: &str, target_host: &str) -> bool {
+    scrape_host(cached_host) == scrape_host(target_host)
 }
 
 /// Convert the loaded registry records into a [`ManagedDiscovery`] — the pure core of the daemon's managed-service discovery tick.
@@ -251,9 +303,12 @@ pub fn discover_managed_services(records: &[ServiceRecord]) -> ManagedDiscovery 
             continue;
         };
         if engine_kind_for(record) == Some(EngineKind::Lemonade) {
+            // Keep a `::` bind as `::`: it is dual-stack, which only
+            // `endpoints_match` can see. The runner dials it via `scrape_host`.
             let host = match record.host.trim() {
                 "" | "localhost" | "0.0.0.0" => "127.0.0.1".to_string(),
-                "::" | "[::]" | "[::1]" => "::1".to_string(),
+                "[::]" => "::".to_string(),
+                "[::1]" => "::1".to_string(),
                 host => host.to_string(),
             };
             out.lemonade.push(ManagedLemonadeTarget {
@@ -283,17 +338,78 @@ mod tests {
 
     #[test]
     fn endpoint_matching_does_not_conflate_distinct_ports_hosts_or_ip_families() {
-        assert!(endpoints_match("localhost", 13305, "127.0.0.1", 13305));
-        assert!(endpoints_match("0.0.0.0", 13305, "127.0.0.1", 13305));
-        assert!(endpoints_match("[::]", 13305, "::1", 13305));
-        assert!(!endpoints_match("::1", 13305, "127.0.0.1", 13305));
+        let same = [
+            ("localhost", "127.0.0.1"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("", "127.0.0.1"),
+            ("[::]", "::1"),
+            ("::", "::1"),
+            ("::", "127.0.0.1"),
+            ("[::]", "localhost"),
+            ("::", "0.0.0.0"),
+            ("::", "::"),
+            ("::1", "[::1]"),
+            ("Remote.Example", "remote.example"),
+        ];
+        for (l, r) in same {
+            assert!(endpoints_match(l, 13305, r, 13305), "{l} ~ {r}");
+            assert!(endpoints_match(r, 13305, l, 13305), "{r} ~ {l}");
+        }
+        let distinct = [
+            ("::1", "127.0.0.1"),
+            ("::1", "localhost"),
+            ("::1", "0.0.0.0"),
+            ("::1", ""),
+            ("::", "remote.example"),
+            ("127.0.0.1", "remote.example"),
+            ("remote.example", "other.example"),
+        ];
+        for (l, r) in distinct {
+            assert!(!endpoints_match(l, 13305, r, 13305), "{l} !~ {r}");
+            assert!(!endpoints_match(r, 13305, l, 13305), "{r} !~ {l}");
+        }
+        assert!(!endpoints_match("::", 13306, "::", 13305));
         assert!(!endpoints_match("127.0.0.1", 13306, "127.0.0.1", 13305));
-        assert!(!endpoints_match(
-            "remote.example",
-            13305,
-            "127.0.0.1",
-            13305
-        ));
+    }
+
+    #[test]
+    fn cached_collector_is_reused_only_when_it_dials_the_same_host() {
+        // Same dialed address: reuse across spelling differences.
+        for (cached, target) in [
+            ("127.0.0.1", "localhost"),
+            ("0.0.0.0", "127.0.0.1"),
+            ("::", "[::]"),
+            ("::1", "::"),
+            ("remote.example", "remote.example"),
+        ] {
+            assert!(
+                cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+        // `endpoints_match` accepts these, but the cached collector would dial
+        // the other address family.
+        for (cached, target) in [("::", "127.0.0.1"), ("127.0.0.1", "::"), ("::", "0.0.0.0")] {
+            assert!(endpoints_match(cached, 13305, target, 13305));
+            assert!(
+                !cached_collector_reusable(cached, target),
+                "{cached} -> {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn dual_stack_bind_keeps_its_host_and_is_dialed_through_ipv6_loopback() {
+        let record: ServiceRecord = serde_json::from_str(
+            r#"{"service_id":"s","engine":"lemonade","model_ref":"m","host":"::","port":13305,"status":"ready"}"#,
+        )
+        .unwrap();
+        let disc = discover_managed_services(&[record]);
+        assert_eq!(disc.lemonade[0].host, "::");
+        assert_eq!(scrape_host("::"), "::1");
+        assert_eq!(scrape_host("[::]"), "::1");
+        assert_eq!(scrape_host("0.0.0.0"), "127.0.0.1");
+        assert_eq!(scrape_host("10.0.0.5"), "10.0.0.5");
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -404,6 +520,7 @@ mod tests {
         .unwrap();
         let records = load_service_records(&dir);
         let svc = discovered_from_record(&records[0]).expect("live record converts");
+        assert!(svc.managed, "registry discovery proves lifecycle ownership");
         assert_eq!(svc.port, Some(8123));
         assert_eq!(svc.container_id, "svc-hot");
         assert_eq!(svc.model_name, "meta-llama/Llama-3.1-8B");

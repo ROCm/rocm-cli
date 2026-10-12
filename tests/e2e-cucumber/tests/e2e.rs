@@ -845,6 +845,67 @@ pub fn run_rocm(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
     )
 }
 
+/// Like [`run_rocm`], but gives up after `timeout` instead of blocking forever.
+///
+/// [`run_rocm`] uses `Command::output`, which waits for the pipes to close. A
+/// `rocm serve --managed` that leaves a supervisor holding an inherited pipe, or
+/// that never returns, therefore stalls the whole lane with no report. Here the
+/// child writes to files, so an inherited handle cannot keep us waiting, and the
+/// child is killed once the deadline passes. A timeout is reported as rc `-1`
+/// with a note appended to stderr.
+pub fn run_rocm_bounded(
+    world: &E2eWorld,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> (String, String, i32) {
+    use std::process::Stdio;
+
+    let binary = rocm_binary();
+    let dir = tempfile::tempdir().expect("temp dir for bounded command output");
+    let out_path = dir.path().join("stdout");
+    let err_path = dir.path().join("stderr");
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(args);
+    world.isolate_cmd(&mut cmd);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::from(
+        std::fs::File::create(&out_path).expect("stdout file"),
+    ));
+    cmd.stderr(Stdio::from(
+        std::fs::File::create(&err_path).expect("stderr file"),
+    ));
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {binary}: {e}"));
+    let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait on rocm") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    let rc = status.and_then(|s| s.code()).unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&std::fs::read(&out_path).unwrap_or_default()).to_string();
+    let mut stderr =
+        String::from_utf8_lossy(&std::fs::read(&err_path).unwrap_or_default()).to_string();
+    if timed_out {
+        stderr = format!(
+            "{stderr}\n`rocm {}` did not return within {}s and was killed\n",
+            args.join(" "),
+            timeout.as_secs()
+        );
+    }
+    record_command(world.current_scenario.as_deref(), args, rc, &stdout);
+    (stdout, stderr, rc)
+}
+
 /// Run `rocm`, returning stdout, and panic with the full diagnostic bundle
 /// ([`cli_failure_report`]) if it exits non-zero.
 ///
