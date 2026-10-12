@@ -496,6 +496,10 @@ Expected result:
   that the reinstall is refused until `rocm comfyui stop`. The reinstall is
   then refused and names `rocm comfyui stop`; after running that, the
   reinstall goes ahead.
+- With no archive cached, start ComfyUI (`rocm comfyui start`) from another
+  terminal while the reinstall is still downloading: once the download
+  finishes, the reinstall is refused before it replaces any code, names
+  `rocm comfyui stop`, and the ComfyUI folder is unchanged.
 - With ComfyUI stopped (which removes rocm-cli's saved record of it), create
   `apps/comfyui/state/running.json` under rocm-cli's data folder containing
   only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI

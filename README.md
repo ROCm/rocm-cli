@@ -847,16 +847,20 @@ An install made before rocm-cli recorded what its release shipped has nothing
 to tell release code from your entries. There, the entries with the names the
 new release ships are deleted and replaced instead, including one of yours of
 the same name, and the reinstall lists them under `replaced:`; everything else
-is left in place.
+is left in place. On Windows, names that differ only in case (`readme.md`,
+`README.md`) count as the same entry, as they do on its file systems.
 
 The new copy is unpacked before the existing one is touched, so a failed
-download leaves the install as it was. `--reinstall --dry-run` names the folder
+download, or a download that is not a ComfyUI release (no `main.py` at its
+top), leaves the install as it was. `--reinstall --dry-run` names the folder
 whose code would be replaced, which of the kept folders it holds, and whether
 an entry of yours named like the new release's code would be set aside or
 replaced; which entries those are is only known once the new release is
 downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
-launched is running, and its dry run says so; stop it with `rocm comfyui stop`
-first. If rocm-cli's saved record of that ComfyUI cannot be read, the
+launched is running or still starting, and its dry run says so; stop it with
+`rocm comfyui stop` first. This is checked before the download and again just
+before the code is replaced, so a ComfyUI started during the download is
+caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
 reinstall says so and is not refused, since `stop` cannot read it either. If a
 reinstall is interrupted part-way, or stops part-way (because a file it must
 delete or move is in use, say), `start` refuses to launch the half-replaced

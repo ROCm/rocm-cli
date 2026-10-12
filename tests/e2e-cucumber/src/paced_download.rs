@@ -54,12 +54,30 @@ impl PacedDownloadServer {
         chunk_size: usize,
         delay: Duration,
     ) -> Self {
+        Self::start_with_on_request(root, paced_file, contents, chunk_size, delay, || {})
+    }
+
+    /// [`Self::start`], running `on_request` each time the paced file is
+    /// requested, before any of it is sent: a scenario can change what the
+    /// client finds once it has started downloading.
+    pub fn start_with_on_request(
+        root: &Path,
+        paced_file: &str,
+        contents: Vec<u8>,
+        chunk_size: usize,
+        delay: Duration,
+        on_request: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
         let contents = Arc::new(contents);
+        let on_request = Arc::new(on_request);
         let route = format!("/{paced_file}");
         let app = Router::new()
             .route(
                 &route,
-                get(move || std::future::ready(paced_response(contents, chunk_size, delay))),
+                get(move || {
+                    on_request();
+                    std::future::ready(paced_response(contents, chunk_size, delay))
+                }),
             )
             .fallback_service(ServeDir::new(root));
         Self {

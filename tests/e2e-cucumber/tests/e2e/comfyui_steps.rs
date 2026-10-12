@@ -46,13 +46,16 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
-//! `comfyui-05` to `comfyui-11` cover `--reinstall` over a used install: one
+//! `comfyui-05` to `comfyui-12` cover `--reinstall` over a used install: one
 //! file of the user's in every entry of `source/` a reinstall keeps, plus
 //! release code. The new release comes from the same loopback server
 //! (unpaced), at a path that 404s for the failed-download case. Each `Then`
 //! that checks a printed claim about what was kept also checks the files.
-//! `comfyui-08` plants a running stand-in in the saved state and runs the
-//! `rocm comfyui stop` the refusal names before reinstalling again.
+//! `comfyui-08` plants a running stand-in in the saved state, with a port
+//! held open so it reads as running, and runs the `rocm comfyui stop` the
+//! refusal names before reinstalling again. `comfyui-12` plants it from the
+//! loopback server once the download has started, so only the check just
+//! before the swap can see it.
 //! `comfyui-11` makes the runtime's GPU check fail after the swap, then pass,
 //! and runs the command the failed reinstall names.
 //! `comfyui-08` and `comfyui-09` also ask `rocm` for ComfyUI's status in plain
@@ -728,6 +731,17 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
 /// torch stack, so the dependency install is filtered down to nothing and
 /// skipped — this scenario is about the swap, not the `uv` step.
 async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str, extra: &[(&str, &str)]) {
+    serve_comfyui_release_with(world, served_path, extra, || {}).await;
+}
+
+/// [`serve_comfyui_release`], running `on_request` when the release is
+/// requested, before any of it is sent.
+async fn serve_comfyui_release_with(
+    world: &mut E2eWorld,
+    served_path: &str,
+    extra: &[(&str, &str)],
+    on_request: impl Fn() + Send + Sync + 'static,
+) {
     let build_dir = root(world).join("comfyui-fixture").join("release-build");
     let release = build_dir.join("ComfyUI-master");
     for (relative, contents) in [
@@ -746,12 +760,13 @@ async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str, extra: &
     let contents = build_gzip_tarball(&build_dir, "comfyui-release.tar.gz", "ComfyUI-master").await;
     let served = root(world).join("comfyui-fixture").join("release-serve");
     std::fs::create_dir_all(&served).expect("failed to create the archive fixture serve root");
-    world.paced_download_server = Some(PacedDownloadServer::start(
+    world.paced_download_server = Some(PacedDownloadServer::start_with_on_request(
         &served,
         "archive/comfyui-release.tar.gz",
         contents,
         1 << 20,
         Duration::ZERO,
+        on_request,
     ));
     let base = world
         .paced_download_server
@@ -820,15 +835,26 @@ async fn comfyui_code_is_newer_release(world: &mut E2eWorld) {
         !source.join("comfy/dropped_upstream.py").exists(),
         "code the new release does not ship must be gone"
     );
-    let app_root = source.parent().expect("source has a parent");
-    let leftovers: Vec<_> = std::fs::read_dir(app_root)
-        .expect("failed to read the ComfyUI folder")
-        .map(|entry| entry.expect("dir entry").file_name())
-        .filter(|name| name != "source" && name.to_string_lossy().starts_with("source"))
-        .collect();
+    assert_staging_folder_empty(world);
+}
+
+/// Nothing is left in the staging folder (`<app>/extract`) the release is
+/// unpacked into before it is installed.
+fn assert_staging_folder_empty(world: &E2eWorld) {
+    let extract = comfyui_source_dir(world)
+        .parent()
+        .expect("source has a parent")
+        .join("extract");
+    let left: Vec<_> = match std::fs::read_dir(&extract) {
+        Ok(entries) => entries
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("failed to read {}: {error}", extract.display()),
+    };
     assert!(
-        leftovers.is_empty(),
-        "the previous code must be removed once the swap is done: {leftovers:?}"
+        left.is_empty(),
+        "the staging folder must be emptied once the release is installed: {left:?}"
     );
 }
 
@@ -958,6 +984,11 @@ async fn preview_names_replaced_and_kept(world: &mut E2eWorld) {
         stdout.contains(&format!("  keeps: {KEPT_LIST}\n")),
         "the preview must name what is kept, got:\n{stdout}"
     );
+    // No reinstall was interrupted here, so the preview claims none was.
+    assert!(
+        !stdout.contains("interrupted"),
+        "the preview must not claim an interrupted reinstall, got:\n{stdout}"
+    );
     // Every folder the preview promises to keep exists in this install, so
     // the promise is about real content (the dry run itself changes nothing;
     // `comfyui-05` proves a real reinstall keeps them).
@@ -982,38 +1013,86 @@ async fn preview_command_includes_reinstall(world: &mut E2eWorld) {
     );
 }
 
-/// Starts a detached long-lived process to stand in for a running ComfyUI and
-/// records it the way `rocm comfyui start` does (`<data>/apps/comfyui/state/
-/// running.json`), pointing at the planted install's `source/`. Detached via
-/// the shell so that once `rocm comfyui stop` kills it, init reaps it and it
-/// does not linger as a zombie the CLI's liveness check would still see. It
-/// exits on its own if the scenario fails before stopping it.
-#[given("the ComfyUI that rocm-cli started is running from that install")]
+/// A ComfyUI started with `rocm comfyui start` that has loaded and answers on
+/// its port, which rocm-cli reads as running. The port is held open on the
+/// World for the rest of the scenario.
+#[given("the ComfyUI that rocm-cli started is running from that install and answering on its port")]
 async fn comfyui_running_from_install(world: &mut E2eWorld) {
-    plant_running_stand_in(world);
+    let port = hold_answering_port(world);
+    plant_running_state(world, spawn_stand_in(), port);
 }
 
-/// The same stand-in, planted after a reinstall: its port does not answer,
-/// so rocm-cli sees it as still loading.
-#[when("a ComfyUI started by rocm-cli is still loading from that install")]
+/// A ComfyUI started with `rocm comfyui start` that is still loading: its
+/// process is alive but nothing answers on its port yet, which rocm-cli reads
+/// as starting.
+#[given("a ComfyUI started by rocm-cli is still loading from that install")]
 async fn comfyui_loading_from_install(world: &mut E2eWorld) {
-    plant_running_stand_in(world);
-}
-
-fn plant_running_stand_in(world: &mut E2eWorld) {
-    let output = std::process::Command::new("sh")
-        .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
-        .output()
-        .expect("failed to start the stand-in ComfyUI process");
-    let pid: u32 = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .expect("the shell printed the stand-in's pid");
     // A port nothing listens on, so the CLI's view rests on the process alone.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("failed to pick a free port")
         .port();
+    plant_running_state(world, spawn_stand_in(), port);
+}
+
+/// `rocm comfyui start` is run while a reinstall downloads the newer release:
+/// the server records the started ComfyUI, answering on its port, when the
+/// download begins, which is after the reinstall's first check that nothing
+/// runs from the folder. Only the first request does, so a later reinstall
+/// that downloads again finds nothing new started.
+#[given(
+    "a newer ComfyUI release is available, and ComfyUI is started from that install while it downloads"
+)]
+async fn comfyui_started_during_download(world: &mut E2eWorld) {
+    let port = hold_answering_port(world);
+    let path = running_state_path(world);
+    let state = running_state_json(world, spawn_stand_in(), port);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    serve_comfyui_release_with(world, "archive/comfyui-release.tar.gz", &[], move || {
+        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            write_fixture(&path, &state);
+        }
+    })
+    .await;
+}
+
+/// Binds a loopback port that answers connections for the rest of the
+/// scenario.
+fn hold_answering_port(world: &mut E2eWorld) -> u16 {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind a loopback port");
+    let port = listener.local_addr().expect("bound port").port();
+    world.comfyui_port_listener = Some(listener);
+    port
+}
+
+/// Starts a detached long-lived process to stand in for a running ComfyUI.
+/// Detached via the shell so that once `rocm comfyui stop` kills it, init
+/// reaps it and it does not linger as a zombie the CLI's liveness check would
+/// still see. It exits on its own if the scenario fails before stopping it.
+fn spawn_stand_in() -> u32 {
+    let output = std::process::Command::new("sh")
+        .args(["-c", "sleep 120 >/dev/null 2>&1 & echo $!"])
+        .output()
+        .expect("failed to start the stand-in ComfyUI process");
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .expect("the shell printed the stand-in's pid")
+}
+
+/// Where `rocm comfyui start` records the ComfyUI it started.
+fn running_state_path(world: &E2eWorld) -> PathBuf {
+    data_dir(world)
+        .join("apps")
+        .join("comfyui")
+        .join("state")
+        .join("running.json")
+}
+
+/// The record `rocm comfyui start` saves, for process `pid` serving on
+/// `port` from the planted install's `source/`.
+fn running_state_json(world: &E2eWorld, pid: u32, port: u16) -> String {
     let source = comfyui_source_dir(world);
     let state = serde_json::json!({
         "app_id": "comfyui",
@@ -1026,14 +1105,36 @@ fn plant_running_stand_in(world: &mut E2eWorld) {
         "log_path": source.parent().expect("source has a parent").join("logs").join("start.log"),
         "started_at_unix_ms": 1u64,
     });
+    serde_json::to_string_pretty(&state).expect("state serialises")
+}
+
+fn plant_running_state(world: &E2eWorld, pid: u32, port: u16) {
     write_fixture(
-        &data_dir(world)
-            .join("apps")
-            .join("comfyui")
-            .join("state")
-            .join("running.json"),
-        &serde_json::to_string_pretty(&state).expect("state serialises"),
+        &running_state_path(world),
+        &running_state_json(world, pid, port),
     );
+}
+
+#[then("the newer release had downloaded before the reinstall was refused")]
+async fn release_downloaded_before_refusal(world: &mut E2eWorld) {
+    let app_root = comfyui_source_dir(world)
+        .parent()
+        .expect("source has a parent")
+        .to_path_buf();
+    // The CLI keeps the downloaded archive; that it is there shows the
+    // refusal came after the download, from the check just before the swap.
+    assert!(
+        app_root
+            .join("downloads")
+            .join("ComfyUI-master.tar.gz")
+            .is_file(),
+        "the reinstall must have downloaded the release before it was refused"
+    );
+    assert!(
+        running_state_path(world).is_file(),
+        "ComfyUI was recorded as started while the release downloaded"
+    );
+    assert_staging_folder_empty(world);
 }
 
 #[then("the reinstall is refused and names rocm comfyui stop")]
@@ -1305,7 +1406,7 @@ async fn gpu_check_fails(world: &mut E2eWorld) {
     );
 }
 
-#[when("the runtime's AMD GPU check passes again")]
+#[given("the runtime's AMD GPU check passes again")]
 async fn gpu_check_passes_again(world: &mut E2eWorld) {
     write_gpu_probe_shim(&runtime_python(world));
 }

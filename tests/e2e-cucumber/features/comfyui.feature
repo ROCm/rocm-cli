@@ -147,12 +147,17 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # the scenario runs exactly that and proves the same reinstall then goes
   # through. Once it is reinstalled, a ComfyUI started from it that has not
   # answered on its port yet is "starting" to a plain-words status question,
-  # which must not advise starting a second one.
+  # which must not advise starting a second one. (A ComfyUI that is still
+  # starting also blocks a reinstall; the unit test
+  # `reinstall_is_refused_while_comfyui_starts_until_it_is_stopped` covers it.)
+  #
+  # Steps that set up state in the middle of a scenario are `Given`, as in
+  # comfyui-09 and comfyui-11.
   @id:comfyui-reinstall-refused-while-running @requires-os:linux
   Scenario: comfyui-08 - A ComfyUI reinstall waits until the running ComfyUI is stopped
     Given a ComfyUI install holding the user's models, workflows, images and custom nodes
     And a newer ComfyUI release is available to download
-    And the ComfyUI that rocm-cli started is running from that install
+    And the ComfyUI that rocm-cli started is running from that install and answering on its port
     When the user previews reinstalling ComfyUI
     Then the preview says the reinstall is refused until ComfyUI is stopped
     And the existing ComfyUI code and the user's files are untouched
@@ -163,8 +168,8 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
-    When a ComfyUI started by rocm-cli is still loading from that install
-    And the user asks in plain words for ComfyUI's status
+    Given a ComfyUI started by rocm-cli is still loading from that install
+    When the user asks in plain words for ComfyUI's status
     Then the answer says ComfyUI is installed and starting and does not advise starting it
 
   # A reinstall killed while it replaces the code leaves a half-replaced
@@ -218,7 +223,26 @@ Feature: ComfyUI install reports progress and makes failures actionable
     Then the reinstall fails and names what it replaced and the command that finishes the install
     And ComfyUI's code is the newer release
     And the user's own files are untouched
-    When the runtime's AMD GPU check passes again
-    And the user runs the command the reinstall named
+    Given the runtime's AMD GPU check passes again
+    When the user runs the command the reinstall named
     Then ComfyUI is installed and its AMD GPU check is ready
     And the user's own files are untouched
+
+  # The reinstall checks that no ComfyUI runs from the folder before it
+  # downloads, and again just before it replaces the code: a ComfyUI started
+  # during a long download would otherwise be running the code the swap
+  # replaces. Here it is started once the download has begun, so only the
+  # second check can catch it. `rocm comfyui stop`, which the refusal names,
+  # then lets the same reinstall through.
+  @id:comfyui-reinstall-rechecks-running-before-swap @requires-os:linux
+  Scenario: comfyui-12 - A ComfyUI started while a reinstall downloads stops the reinstall before it replaces any code
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And a newer ComfyUI release is available, and ComfyUI is started from that install while it downloads
+    When the user reinstalls ComfyUI
+    Then the reinstall is refused and names rocm comfyui stop
+    And the newer release had downloaded before the reinstall was refused
+    And the existing ComfyUI code and the user's files are untouched
+    When the user stops ComfyUI
+    And the user reinstalls ComfyUI
+    Then the reinstall reports the user's folders as kept and they still hold the user's files
+    And ComfyUI's code is the newer release
