@@ -158,10 +158,14 @@ async fn open_dashboard_in_scenario_folder(world: &mut E2eWorld) {
         .path()
         .to_path_buf();
     let child = root.join(ADOPT_SCENARIO_CHILD);
-    std::fs::create_dir_all(&child)
-        .unwrap_or_else(|e| panic!("failed to create scenario-owned folder {child:?}: {e}"));
+    std::fs::create_dir_all(&child).unwrap_or_else(|e| {
+        panic!(
+            "failed to create scenario-owned folder {}: {e}",
+            child.display()
+        )
+    });
     let session = TuiSession::spawn_in(world, &["dash", "--demo"], &root)
-        .unwrap_or_else(|e| panic!("failed to open the dashboard in {root:?}: {e}"));
+        .unwrap_or_else(|e| panic!("failed to open the dashboard in {}: {e}", root.display()));
     world.tui = Some(session);
 }
 
