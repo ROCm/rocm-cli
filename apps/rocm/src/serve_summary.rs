@@ -236,8 +236,9 @@ pub(crate) fn oom_memory_note(
     // way.
     //
     // `None` is also the "this tail shows no OOM" answer, so it doubles as the
-    // OOM gate: asking `vllm_log_shows_oom` first would evaluate the same
-    // predicate over the same string twice.
+    // OOM gate; there is no separate classifier predicate to ask first. It also
+    // skips the lines rocm-cli wrote into that log itself, so the note quotes
+    // the user's error rather than the engine hint sitting above it.
     let symptom = rocm_core::vllm_oom_diagnose_symptom(log_tail)?;
     let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
         symptom
@@ -502,29 +503,37 @@ mod tests {
 
     #[test]
     fn oom_signatures_are_detected_case_insensitively() {
-        // The signatures the ticket calls out, plus casing variants the engine
-        // log can emit.
-        assert!(rocm_core::vllm_log_shows_oom(
-            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
-        ));
-        assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
-        assert!(rocm_core::vllm_log_shows_oom(
-            "RuntimeError: CUDA out of memory"
-        ));
+        // Asserted through this module's own `oom_memory_note`, not against the
+        // shared `rocm-core` predicate directly: a test that only re-checked the
+        // core function would stay green with every line of this file reverted,
+        // which is what the previous spelling of these two tests did.
+        for log_tail in [
+            "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.",
+            "HIP OUT OF MEMORY",
+            "RuntimeError: CUDA out of memory",
+        ] {
+            assert!(
+                oom_memory_note("starting", log_tail, false).is_some(),
+                "a failed serve whose log shows {log_tail:?} must carry the memory note"
+            );
+        }
     }
 
     #[test]
     fn unrelated_failures_are_not_flagged_as_oom() {
-        assert!(!rocm_core::vllm_log_shows_oom(
-            "OSError: model weights not found; check the model id"
-        ));
-        assert!(!rocm_core::vllm_log_shows_oom(""));
-        // vLLM's generic EngineCore wrapper is the terminal line for *any*
-        // startup crash, not just OOM; treating it as an OOM signature would
-        // misreport unrelated failures as memory exhaustion.
-        assert!(!rocm_core::vllm_log_shows_oom(
-            "ERROR Engine core initialization failed"
-        ));
+        for log_tail in [
+            "OSError: model weights not found; check the model id",
+            "",
+            // vLLM's generic EngineCore wrapper is the terminal line for *any*
+            // startup crash, not just OOM; treating it as an OOM signature would
+            // misreport unrelated failures as memory exhaustion.
+            "ERROR Engine core initialization failed",
+        ] {
+            assert!(
+                oom_memory_note("starting", log_tail, false).is_none(),
+                "a failure whose log shows {log_tail:?} must not be called an OOM"
+            );
+        }
     }
 
     #[test]

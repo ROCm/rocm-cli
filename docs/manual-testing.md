@@ -384,10 +384,12 @@ the refusal names.
    already running and hands back its endpoint. Nothing is launched and no GPU
    is pinned.
 
-3. With the same mask, ask for a *different* model, and for a different engine:
+3. With the same mask, ask for a *different* model, and for a different engine.
+   Pick a name that does **not** overlap the running one as a substring — if the
+   live service is `qwen3-8b-instruct`, do not use `qwen` here:
 
    ```bash
-   HIP_VISIBLE_DEVICES= rocm serve <a different model> --engine lemonade --managed
+   HIP_VISIBLE_DEVICES= rocm serve <a non-overlapping model> --engine lemonade --managed
    ```
 
    Expected result: `no usable AMD GPU detected; rocm serve requires a GPU under
@@ -395,6 +397,12 @@ the refusal names.
    `Preparing lemonade for GPU serving…` line, no engine download, no runtime
    manifest written. A live service for another model must not soften the
    refusal or pull engine preparation in front of it.
+
+   The non-overlapping name matters: model matching is deliberately lenient, so
+   an overlapping name (`qwen` against a live `qwen3-8b-instruct`) *does* let
+   engine preparation run before the refusal. That is documented behaviour, not
+   a defect — see the reuse section of the README — so testing it with an
+   overlapping name proves nothing about this step.
 
 4. Stop the service (`rocm services stop <service-id> --yes`) and repeat step 2.
 

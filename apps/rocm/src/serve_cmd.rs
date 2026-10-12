@@ -675,9 +675,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // refuses the no-GPU / no-runtime case with its usual message.
     //
     // The outermost condition is `any_live_managed_service_for_model`, and it is
-    // first for a reason: it reads the managed-service records and nothing else,
-    // so it is the only thing this block costs on the ordinary launch. Everything
-    // it guards has side effects that must not precede the bail —
+    // first for a reason: it is decided from the managed-service records alone,
+    // with no engine round-trip and no install, so it is the only thing this
+    // block costs on the ordinary launch. It is not literally record reads and
+    // nothing else — `load_managed_services` refreshes liveness first, so each
+    // live record can cost a probe and a `record.write()`. The bail below is
+    // where that full cost is stated, and it is the qualified claim, not this
+    // one. Everything this condition guards has side effects that must not
+    // precede the bail —
     //
     //   - the pre-gate matches on the model, not just the engine, because the
     //     probe body is real engine work (a `ResolveModel` round-trip, and for a

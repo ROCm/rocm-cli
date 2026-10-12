@@ -1263,8 +1263,11 @@ Focused unit coverage — what counts as a vLLM OOM, and which log line is route
 into the printed `rocm diagnose --symptom` command:
 
 ```bash
-cargo test -p rocm-core vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures
+cargo test -p rocm-core vllm_oom_gate_matches_allocator_signatures_but_not_generic_failures
 cargo test -p rocm-core vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom
+cargo test -p rocm-core every_rendered_line_break_keeps_the_gate_in_step_with_the_scorer
+cargo test -p rocm-core the_engine_hint_is_never_quoted_back_as_the_users_own_line
+cargo test -p rocm-engine-vllm the_hint_never_quotes_itself_back_on_a_second_read_of_the_shared_log
 cargo test -p rocm-core quotable_in_single_quotes_rejects_quote_and_control_bearing_symptoms
 cargo test -p rocm-core the_stripper_follows_the_escape_grammar_not_just_the_colour_case
 ```
@@ -1295,6 +1298,14 @@ check that discriminates the `already_running` clause of that gate: it passes a
 log path that *does* contain an OOM signature. The reuse E2E scenario below
 cannot, because the real reuse path reports no log path at all and the note is
 withheld on that ground alone.
+
+The pre-gate has three conditions, and each has a test that fails when only that
+condition is broken — `reuse_pregate_still_keys_on_the_engine` for the engine,
+`reuse_pregate_admits_a_match_on_the_raw_model_ref_alone` for the
+`record.model_ref` arm (every other positive case also matches on the canonical
+id, so without it that arm was deletable with the suite green), and
+`reuse_pregate_rejects_a_record_that_is_no_longer_live` for
+`managed_service_is_live`, which the shared helper otherwise always satisfies.
 
 The fault-injection feature must never reach a shipped binary:
 

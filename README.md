@@ -620,9 +620,12 @@ it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
 `--gpu <index>` — warning that lowering the reservation will not help if the
 model simply does not fit, and printing a
 `rocm diagnose --symptom '<your failing line>'` command for the full
-busy-GPU-versus-model-too-large breakdown. See
-[docs/vllm.md](docs/vllm.md) for the flag itself and the
-quoting rule the printed command follows.
+busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
+in a shell-quoted argument intact — one containing an apostrophe or terminal
+control bytes — is replaced by a canonical vLLM OOM symptom, which reports the
+same cause. See
+[docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
+flag itself and the quoting rule the printed command follows.
 
 The note is deliberately narrow, so its absence is not evidence that memory was
 fine. It appears only when all of the following hold:
@@ -666,10 +669,27 @@ previously always failed.
 
 The exemption is limited to that case, and nothing else about `gpu_required`
 changes. The reused service was vetted against the policy at its own launch,
-and the reusing invocation launches no process, pins no GPU, and does no GPU
-work. A live service for a *different* model does not soften the refusal, and
-neither does a live service for a different engine — those still fail fast with
-the usual message and prepare nothing.
+and the reusing invocation launches no process and does no GPU work. A live
+service for a different engine does not soften the refusal, and neither does one
+for a model whose name does not overlap — those still fail fast with the usual
+message and prepare nothing.
+
+Two limits are worth stating exactly, because they are easy to read as stronger
+than they are:
+
+- **Model names are matched leniently.** The check that decides whether reuse is
+  even worth asking about uses the same two-way substring match the service
+  listings use, so a live `qwen3-8b-instruct` service opens it for
+  `rocm serve qwen`. On a GPU-less host that invocation then does engine
+  preparation — possibly printing `Preparing <engine> for GPU serving…` and
+  installing — *before* the refusal it ultimately gets. Leniency is deliberate:
+  tightening it would silently break legitimate reuse by short name. Only a
+  model name that does not overlap is guaranteed to refuse with nothing
+  prepared.
+- **`--gpu <index>` is still validated.** The exemption skips the no-usable-GPU
+  bail, not the pinned-index check that follows it, so `rocm serve <model> --gpu 0`
+  is still refused when GPU 0 is not visible, even with a reusable service
+  running. The exemption applies as described under the default `--gpu auto`.
 
 Manage background servers started with `--managed`:
 

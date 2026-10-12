@@ -252,13 +252,26 @@ a tiny model. rocm-cli helps in three ways:
   reservation, e.g. `--gpu-memory-utilization 0.5`, or targeting a less-busy GPU
   with `--gpu <index>`, and points at `rocm diagnose --symptom '<the error>'`
   for the full conditional remediation (busy GPU vs. a model that does not fit).
+  "Shows an out-of-memory error" means a line carrying an allocator-shaped
+  signature — `HIP out of memory`, `CUDA out of memory`, `hipErrorOutOfMemory`,
+  or a `torch.OutOfMemoryError` corroborated by an allocator message. A bare
+  `HIP error: out of memory`, a kernel OOM-killer line, or vLLM's generic
+  `EngineCore` wrapper deliberately gets no memory hint: each of those also
+  appears for failures that have nothing to do with memory, and the same
+  threshold governs `rocm diagnose`, so hinting here would contradict the
+  diagnosis there.
+
   The printed command quotes your actual failing line when it can be rendered as
   one intact single-quoted argument; a line carrying an apostrophe or terminal
   control bytes falls back to the canonical symptom below rather than handing you
   a command whose quoting the log text broke. The same rule applies to the
   `rocm serve` summary's out-of-memory note, which builds the same command from
   the same engine log — both surfaces share one guard, so neither can hand you a
-  half-quoted command the other rejects.
+  half-quoted command the other rejects. Lines rocm-cli wrote into that log
+  itself are skipped when picking the line, so the note quotes *your* error
+  rather than the hint printed above it: the supervisor and the engine share one
+  log file, and the engine's failure — hint included — is appended to it after
+  the error that caused it.
 
 Explicitly, the workaround for an OOM on a shared card is:
 

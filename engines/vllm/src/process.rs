@@ -757,8 +757,17 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     // diagnosable by construction.
     //
     // No line means the tail carries no OOM, so the helper's `None` is the OOM
-    // gate too: asking `vllm_log_shows_oom` first would evaluate the same
-    // predicate over the same string a second time.
+    // gate too; there is no separate classifier predicate to ask first.
+    //
+    // The helper also skips lines rocm-cli wrote into the log itself, which
+    // matters precisely here: this hint is rendered into the engine's bail, the
+    // CLI writes that whole error back into the same shared log, and the hint
+    // quotes the user's line and names the allocator keywords, so it scores as
+    // an OOM just as strongly as the real line does. Being last, it would win
+    // the newest-first scan on the next read — and it contains `'`, so the
+    // printed command would fall back to the canonical symptom in every real
+    // run. That is why the two markers below come from shared constants rather
+    // than being spelled out here.
     let Some(symptom) = rocm_core::vllm_oom_diagnose_symptom(log_tail) else {
         return String::new();
     };
@@ -773,9 +782,11 @@ fn oom_utilization_hint(log_tail: &str) -> String {
         rocm_core::VLLM_OOM_CANONICAL_SYMPTOM.to_owned()
     };
     format!(
-        "\n\nDetected an out-of-memory failure ({symptom_line}). {}\n\
-         For conditional remediation, run `rocm diagnose --symptom '{symptom}'`.",
-        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT
+        "\n\n{}{symptom_line}). {}\n\
+         For conditional remediation, run `{} '{symptom}'`.",
+        rocm_core::VLLM_OOM_DETECTED_PREFIX,
+        rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+        rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
     )
 }
 
@@ -1057,11 +1068,51 @@ mod tests {
         );
         Ok(())
     }
+    /// The OOM gate [`oom_utilization_hint`] itself uses. There is no separate
+    /// classifier predicate in `rocm-core`: the selector returning `Some` *is*
+    /// the gate, so these tests assert against the function that ships.
+    fn detects_oom(log: &str) -> bool {
+        rocm_core::vllm_oom_diagnose_symptom(log).is_some()
+    }
+
+    #[test]
+    fn the_hint_never_quotes_itself_back_on_a_second_read_of_the_shared_log() {
+        // A managed launch shares one log between the supervisor and the engine.
+        // The engine bails with `startup_log_context`, which embeds *this* hint,
+        // and the CLI then writes that whole error back into the same file. So
+        // on the read that drives the serve summary the hint is in the log, it
+        // is last, and it scores as an OOM just as strongly as the real line.
+        //
+        // That is the end-to-end shape of the bug: the newest-first scan picked
+        // this sentence, which contains `'`, the quoting guard rejected it, and
+        // the note fell back to the canonical symptom in every real run — so the
+        // "we quote your own failing line" promise never once held in the field.
+        // A unit test on the hint alone cannot see it; only feeding the hint
+        // back through the selector can.
+        let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let hint = oom_utilization_hint(real_line);
+        assert!(!hint.is_empty(), "the real line must produce a hint");
+
+        let second_read = format!("{real_line}\nError: launch failed{hint}\n");
+        let symptom = rocm_core::vllm_oom_diagnose_symptom(&second_read)
+            .expect("the real OOM line must still be found under the hint");
+        assert_eq!(
+            symptom,
+            format!("vllm: {real_line}"),
+            "the user's own line must win over the hint rocm-cli wrote itself"
+        );
+        assert!(
+            rocm_core::quotable_in_single_quotes(&symptom),
+            "and it must survive the quoting guard, or the printed command falls \
+             back to the canonical symptom exactly as it did before this fix"
+        );
+    }
+
     #[test]
     fn oom_utilization_hint_fires_on_out_of_memory_log_tails() {
         // The exact PyTorch/HIP signature from the field report.
         let torch = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-        assert!(rocm_core::vllm_log_shows_oom(torch));
+        assert!(detects_oom(torch));
         let hint = oom_utilization_hint(torch);
         assert!(
             hint.contains("--gpu-memory-utilization"),
@@ -1080,10 +1131,8 @@ mod tests {
         );
 
         // Detection is case-insensitive and also matches the spaced phrasing.
-        assert!(rocm_core::vllm_log_shows_oom("HIP OUT OF MEMORY"));
-        assert!(rocm_core::vllm_log_shows_oom(
-            "RuntimeError: CUDA out of memory"
-        ));
+        assert!(detects_oom("HIP OUT OF MEMORY"));
+        assert!(detects_oom("RuntimeError: CUDA out of memory"));
     }
 
     #[test]
@@ -1147,10 +1196,7 @@ mod tests {
         let mut routed_verbatim = 0;
         let mut fell_back = 0;
         for (line, expected) in accepted_lines {
-            assert!(
-                rocm_core::vllm_log_shows_oom(line),
-                "detector must accept: {line:?}"
-            );
+            assert!(detects_oom(line), "detector must accept: {line:?}");
             let hint = oom_utilization_hint(line);
             let symptom = quoted_symptom_argument(&hint);
             assert_eq!(
@@ -1207,7 +1253,7 @@ mod tests {
         ];
         for line in rejected_lines {
             assert!(
-                !rocm_core::vllm_log_shows_oom(line),
+                !detects_oom(line),
                 "detector must reject sub-threshold line: {line}"
             );
             assert!(
@@ -1237,7 +1283,7 @@ mod tests {
             "ERROR 09-14 12:00:01 engine.py:389] torch.OutOfMemoryError: HIP out of memory. ",
             "Tried to allocate 7.21 GiB. GPU 0 can't allocate the model's weights."
         );
-        assert!(rocm_core::vllm_log_shows_oom(log_tail));
+        assert!(detects_oom(log_tail));
         let hint = oom_utilization_hint(log_tail);
 
         // The rendered command must be one intact single-quoted argument: no
@@ -1347,7 +1393,7 @@ mod tests {
     #[test]
     fn oom_utilization_hint_stays_quiet_for_unrelated_failures() {
         let unrelated = "ValueError: model architecture 'FooForCausalLM' is not supported";
-        assert!(!rocm_core::vllm_log_shows_oom(unrelated));
+        assert!(!detects_oom(unrelated));
         assert!(
             oom_utilization_hint(unrelated).is_empty(),
             "non-OOM failures must not carry a memory hint"
@@ -1358,7 +1404,7 @@ mod tests {
         // weights, OOM, ...); treating it as an OOM signature would misreport
         // those unrelated failures as memory exhaustion.
         let wrapper_only = "ERROR Engine core initialization failed";
-        assert!(!rocm_core::vllm_log_shows_oom(wrapper_only));
+        assert!(!detects_oom(wrapper_only));
         assert!(
             oom_utilization_hint(wrapper_only).is_empty(),
             "the generic EngineCore wrapper alone must not be treated as OOM"

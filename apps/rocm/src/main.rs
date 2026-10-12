@@ -442,10 +442,14 @@ rocm model --verbose"
     /// `rocm services logs <service-id>`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
-    /// usable AMD GPU, before preparing any engine. Reusing an already-running managed
-    /// server for the same engine and model is the one exception: it launches nothing and
-    /// pins no GPU, so it is allowed through. A live server for a different model or
-    /// engine does not soften the refusal.
+    /// usable AMD GPU. Reusing an already-running managed server for the same engine and
+    /// model is the one exception: it launches nothing, so it is allowed through. A live
+    /// server for a different engine, or for a model whose name does not overlap, does
+    /// not soften the refusal, and nothing is prepared before it. Model names are matched
+    /// leniently, so a live server whose name overlaps the one you asked for (`qwen` for a
+    /// running `qwen3-8b-instruct`) does let engine preparation run before the refusal.
+    /// With an explicit --gpu the index is still validated after the exception, so a
+    /// pinned GPU that is not visible is refused even when a reusable server exists.
     #[command(after_help = "EXAMPLES:\n  \
 rocm serve qwen\n  \
 rocm serve qwen --engine vllm --port 8000\n  \
@@ -3744,12 +3748,33 @@ fn simulate_oom_managed_launch(
     record.gpu_indices = gpu_indices.to_vec();
     record.status = "starting".to_owned();
     record.write()?;
-    // A real allocator OOM signature (the same torch/HIP line
-    // `rocm_core::vllm_log_shows_oom` matches) in the log this invocation owns, so
-    // the summary renders memory guidance for a launch that actually OOM'd.
+    // A real allocator OOM signature in the log this invocation owns, so the
+    // summary renders memory guidance for a launch that actually OOM'd.
+    //
+    // The engine's own error block is reproduced below it, because that is what
+    // a real managed launch leaves on disk, and leaving it out hid a bug this
+    // scenario should have caught: the supervisor and the engine share one log,
+    // so when vLLM OOMs the engine bails with its startup-log context — which
+    // embeds rocm-cli's own OOM hint — and `exit_code_for` writes that whole
+    // error back into the same file, *after* the real line. A fixture carrying
+    // only the raw OOM line can never see the newest-first scan land on
+    // rocm-cli's own sentence instead of the user's error.
+    let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
     fs::write(
         &record.log_path,
-        "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
+        format!(
+            "{real_line}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
+             \n\
+             Last 50 lines of startup log:\n\
+             {real_line}\n\
+             \n\
+             {}{real_line}). {}\n\
+             For conditional remediation, run `{} 'vllm: {real_line}'`.\n",
+            rocm_core::VLLM_OOM_DETECTED_PREFIX,
+            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
+            rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+        ),
     )
     .with_context(|| format!("failed to write {}", record.log_path.display()))?;
     Ok(ManagedLaunchReport {
@@ -27711,6 +27736,28 @@ install therock";
         queried_engine: &str,
         queried_model_ref: &str,
     ) -> Result<bool> {
+        reuse_pregate_for_record(
+            label,
+            record_model_ref,
+            record_canonical_model_id,
+            queried_engine,
+            queried_model_ref,
+            "starting",
+        )
+    }
+
+    /// As [`reuse_pregate_for`], but with the record's `status` chosen by the
+    /// caller so the liveness arm of the pre-gate can be discriminated. Every
+    /// other test plants a live record, which left `managed_service_is_live`
+    /// deletable with the suite still green.
+    fn reuse_pregate_for_record(
+        label: &str,
+        record_model_ref: &str,
+        record_canonical_model_id: &str,
+        queried_engine: &str,
+        queried_model_ref: &str,
+        record_status: &str,
+    ) -> Result<bool> {
         let (root, paths) = test_paths(label);
         paths.ensure()?;
         let mut record = ManagedServiceRecord::new(
@@ -27727,7 +27774,7 @@ install therock";
             None,
             None,
         );
-        record.status = "starting".to_owned();
+        record.status = record_status.to_owned();
         record.engine_pid = Some(std::process::id());
         record.write()?;
 
@@ -27814,6 +27861,53 @@ install therock";
             )?,
             "the OOM reuse scenario's planted service must unlock the reuse probe"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_admits_a_match_on_the_raw_model_ref_alone() -> Result<()> {
+        // Discriminates the `record.model_ref` arm. Every other positive case
+        // also matches on `canonical_model_id` (`"qwen-canonical"` contains
+        // `"qwen"`, and the rest use identical fields), so deleting that arm
+        // left the whole suite green. Here the canonical id shares nothing with
+        // the query, so only the raw ref can open the gate — which is the case
+        // that matters in practice: a user types the name they launched with
+        // before the engine has reported any canonical id for it.
+        assert!(
+            reuse_pregate_for(
+                "reuse-pregate-model-ref-only",
+                "qwen",
+                "unrelated-canonical-id",
+                "lemonade",
+                "qwen",
+            )?,
+            "a match on the record's raw model ref alone must unlock the reuse probe"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reuse_pregate_rejects_a_record_that_is_no_longer_live() -> Result<()> {
+        // Discriminates the `managed_service_is_live(record)` arm. The shared
+        // helper otherwise always plants a live record, so deleting that arm
+        // also left the suite green. A stopped or failed service cannot be
+        // reused, so letting its record open the gate would drag the
+        // `ResolveModel` round-trip and any self-managed engine install in front
+        // of the no-usable-GPU bail for nothing — exactly the fail-fast contract
+        // the pre-gate exists to keep.
+        for status in ["stopped", "failed"] {
+            assert!(
+                !reuse_pregate_for_record(
+                    &format!("reuse-pregate-{status}"),
+                    "qwen",
+                    "qwen-canonical",
+                    "lemonade",
+                    "qwen",
+                    status,
+                )?,
+                "a {status} service must not unlock the reuse probe"
+            );
+        }
         Ok(())
     }
 

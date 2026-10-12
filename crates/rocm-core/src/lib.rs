@@ -4436,16 +4436,53 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
      <fraction greater than 0 and at most 1>` (e.g. 0.5 for a small model), or target a less-busy \
      GPU with `--gpu <index>`.";
 
-/// Whether a vLLM startup-log tail carries a genuine out-of-memory failure.
+/// Lead-in of the vLLM engine's own post-failure out-of-memory hint.
 ///
-/// Classifies the tail with the *same* rule as the `rocm diagnose` vLLM-OOM
-/// checker (`check_16_vllm_oom`, reached through
-/// [`vllm_oom_symptom_is_diagnosable`]) so the pre-launch low-VRAM note, the
-/// post-failure serve summary, and `rocm diagnose` never disagree on what counts
-/// as a vLLM OOM. The tail is vLLM's own process output, so the checker's
-/// required vLLM anchor is supplied by context: each line is scored as
-/// `vllm: <line>`, and the tail is an OOM iff some line clears the checker's
-/// `MIN_SCORE_FOR_MATCH` threshold.
+/// Public because two crates have to agree on it byte for byte:
+/// `rocm-engine-vllm` renders its hint with this prefix, and
+/// [`vllm_oom_diagnose_symptom`] recognises it in order *not* to quote
+/// rocm-cli's own sentence back at the user as though the engine had printed
+/// it. See [`is_rocm_authored_log_line`].
+pub const VLLM_OOM_DETECTED_PREFIX: &str = "Detected an out-of-memory failure (";
+
+/// The `rocm diagnose` invocation the OOM surfaces print, as it appears in text.
+///
+/// Shared for the same reason as [`VLLM_OOM_DETECTED_PREFIX`]: it is how a line
+/// rocm-cli authored is told apart from a line the engine printed.
+pub const VLLM_OOM_DIAGNOSE_COMMAND: &str = "rocm diagnose --symptom";
+
+/// Whether this log segment is text *rocm-cli itself* wrote into the engine log,
+/// rather than output the engine produced.
+///
+/// A managed launch shares one log between the supervisor and the engine: when
+/// vLLM OOMs, the engine bails with its startup-log context — which already
+/// carries this crate's own OOM hint — and the CLI then writes that whole error
+/// back into the same file. The hint quotes the user's failing line and names
+/// the allocator keywords, so it scores as an OOM just as strongly as the real
+/// line does, and it lands *after* it. A newest-first scan would therefore
+/// always select rocm-cli's own sentence, which contains `'` and backticks, so
+/// [`quotable_in_single_quotes`] would reject it and the printed command would
+/// fall back to [`VLLM_OOM_CANONICAL_SYMPTOM`] every single time in real use —
+/// exactly the "quote the user's real line" promise the note is built on.
+///
+/// Matching on rocm-cli's own wording is deliberate, rather than truncating the
+/// tail at the engine's `Error:` block: the error block also *echoes* the log
+/// tail verbatim, and those echoed lines are the user's real output and remain
+/// legitimate choices. Only the sentences this crate composed are excluded.
+/// vLLM never prints either marker.
+///
+/// Pinned by `the_engine_hint_is_never_quoted_back_as_the_users_own_line`.
+fn is_rocm_authored_log_line(segment: &str) -> bool {
+    segment.contains(VLLM_OOM_DETECTED_PREFIX) || segment.contains(VLLM_OOM_DIAGNOSE_COMMAND)
+}
+
+/// Whether one log segment carries a genuine out-of-memory failure, scored with
+/// the *same* rule as the `rocm diagnose` vLLM-OOM checker (`check_16_vllm_oom`,
+/// reached through [`vllm_oom_symptom_is_diagnosable`]) so the engine hint, the
+/// post-failure serve summary and `rocm diagnose` never disagree on what counts
+/// as a vLLM OOM. The segment is vLLM's own process output, so the checker's
+/// required vLLM anchor is supplied by context: it is scored as
+/// `vllm: <segment>` and clears the checker's `MIN_SCORE_FOR_MATCH` or not.
 ///
 /// This deliberately rejects a bare `out of memory` with no allocator-shaped
 /// signature — a kernel OOM-killer line, a dependency's log, or an unrelated
@@ -4454,35 +4491,51 @@ pub const VLLM_GPU_MEMORY_UTILIZATION_HINT: &str = "vLLM reserves ~90% of the GP
 /// in the tail. A real vLLM/HIP allocation failure (`HIP out of memory`,
 /// `CUDA out of memory`, `hipErrorOutOfMemory`, or `torch.OutOfMemoryError`
 /// corroborated by an allocator message) still clears it.
-pub fn vllm_log_shows_oom(log: &str) -> bool {
-    vllm_log_segments(log)
-        .any(|segment| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {segment}")))
+///
+/// Scoring each [`terminal::rendered_lines`] row of the segment, rather than the
+/// segment whole, is what actually keeps this in step with the checker.
+/// [`vllm_anchored_lines`] re-splits the string it is handed with
+/// `rendered_lines` and keeps only the rows carrying the `vllm` anchor — and
+/// `rendered_lines` ends a row on far more than the `\n`/`\r` that
+/// [`vllm_log_segments`] splits on: every non-`SGR` CSI (`ESC[2K`, `ESC[1A`),
+/// `ESC E`/`ESC D`, `VT`, `FF`, `U+0085` and `U+2028`/`U+2029`. So a real
+/// repaint such as `Loading weights: 90%\r\x1b[2Ktorch.OutOfMemoryError: ...`
+/// becomes the segment `\x1b[2Ktorch.OutOfMemoryError: ...`, which the checker
+/// renders as `["vllm: ", "torch.OutOfMemoryError: ..."]`. Only the *empty*
+/// anchored row would be scored, the tail would read as "no OOM", and both the
+/// engine hint and the serve-summary note would silently vanish for the shape of
+/// failure they exist to explain. Anchoring each rendered row instead closes
+/// that gap for the whole break set at once, rather than for `\r` alone.
+///
+/// This costs nothing on the quoting side, and provably so: a segment that
+/// `rendered_lines` splits into more than one row must contain a control
+/// character or an `ESC`, and [`quotable_in_single_quotes`] rejects every one of
+/// those. So a multi-row segment can only ever reach the printed command as the
+/// canonical fallback — it can never be stripped into a runnable lookalike of
+/// the user's error. The raw segment, control bytes intact, is still what
+/// [`vllm_oom_diagnose_symptom`] returns, so that guard keeps working.
+fn segment_shows_oom(segment: &str) -> bool {
+    terminal::rendered_lines(segment)
+        .iter()
+        .any(|row| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {row}")))
 }
 
-/// The log tail split the way the diagnostic will split it.
+/// The log tail split into candidate symptom lines.
 ///
-/// [`diagnose::vllm_oom_symptom_is_diagnosable`] re-splits with
-/// [`terminal::rendered_lines`], which ends a line on a bare `\r` as well as on
-/// `\n`, and then keeps only the segments carrying the `vllm` anchor. Anchoring
-/// a whole physical line once is therefore not enough: vLLM draws its progress
-/// bar with carriage returns, so a real failure arrives as
-/// `Loading weights: 90%\rtorch.OutOfMemoryError: ...` on a single `\n` line.
-/// The anchor lands on the progress segment, the allocator exception becomes an
-/// unanchored segment and is dropped, and the tail reads as "no OOM here" --
-/// silently withdrawing both the engine hint and the serve-summary note for the
-/// most common shape of the failure they exist to explain.
+/// Splits on `\r` as well as `\n` because vLLM draws its progress bar with bare
+/// carriage returns, so a real failure arrives as
+/// `Loading weights: 90%\rtorch.OutOfMemoryError: ...` on a single `\n` line and
+/// the exception has to become a candidate in its own right.
 ///
-/// Splitting on `\r` here, and anchoring each segment separately, keeps the two
-/// sides agreeing about where this line ends.
-///
-/// Deliberately a raw `split('\r')` and *not* [`terminal::rendered_lines`],
-/// even though that is what the diagnostic re-splits with. `rendered_lines`
-/// also discards escape sequences and other control bytes, and the segment
-/// returned here becomes the `--symptom` argument: sanitising it means
+/// Deliberately a raw split and *not* [`terminal::rendered_lines`], even though
+/// that is what the diagnostic re-splits with. `rendered_lines` also discards
+/// escape sequences and other control bytes, and the segment returned here
+/// becomes the `--symptom` argument: sanitising it means
 /// [`quotable_in_single_quotes`] only ever sees clean text, never rejects it,
 /// and the canonical-symptom fallback stops firing — so a colourised OOM line
-/// would be stripped into a lookalike and printed rather than refused. Scoring
-/// is unaffected, because the diagnostic strips its own copy regardless.
+/// would be stripped into a lookalike and printed rather than refused. Keeping
+/// the raw bytes here and doing the *scoring* on rendered rows inside
+/// [`segment_shows_oom`] is what lets both properties hold at once.
 fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
     log.lines()
         .flat_map(|line| line.split('\r'))
@@ -4494,17 +4547,16 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 /// `None` when the tail carries no OOM line to route.
 ///
 /// Returns the user's actual failing line (so `diagnose` echoes their real
-/// error), selected with the *same* rule [`vllm_log_shows_oom`] classifies the
-/// tail with, so whatever comes back is diagnosable by construction. Shared by
-/// the vLLM engine's post-failure hint and the `rocm` CLI serve summary so both
-/// surfaces route to `diagnose` identically instead of hand-rolling the line
-/// selection twice.
+/// error), selected with [`segment_shows_oom`], which is the checker's own rule,
+/// so whatever comes back is diagnosable by construction. Shared by the vLLM
+/// engine's post-failure hint and the `rocm` CLI serve summary so both surfaces
+/// route to `diagnose` identically instead of hand-rolling the line selection
+/// twice. It is also the OOM *gate* for both: `None` is the "this tail is not an
+/// OOM" answer, so no caller needs a separate predicate first.
 ///
-/// `None` *is* the "this tail is not an OOM" answer, so callers use it as the
-/// OOM gate directly rather than testing [`vllm_log_shows_oom`] first and then
-/// asking for the line: the two are the same predicate over the same string, so
-/// a caller that did both would evaluate it twice and carry a branch that can
-/// never be taken.
+/// Lines rocm-cli wrote into the log itself are skipped — see
+/// [`is_rocm_authored_log_line`] for why the newest-first scan would otherwise
+/// always land on this crate's own hint instead of the user's error.
 ///
 /// Scanning with `.rev()` is deliberate, not incidental: when several lines of
 /// the tail mention running out of memory, the *last* one is the proximate
@@ -4527,10 +4579,11 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 #[must_use]
 pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
     vllm_log_segments(log_tail)
+        .filter(|segment| !is_rocm_authored_log_line(segment))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .find(|segment| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {segment}")))
+        .find(|segment| segment_shows_oom(segment))
         .map(|segment| format!("vllm: {segment}"))
 }
 
@@ -7705,20 +7758,28 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
+    /// The OOM gate both production surfaces actually use. There is no separate
+    /// classifier predicate: `vllm_oom_diagnose_symptom(..).is_some()` *is* the
+    /// gate, so these threshold assertions are made against the function that
+    /// ships rather than against a parallel one no caller reaches.
+    fn log_shows_oom(log: &str) -> bool {
+        vllm_oom_diagnose_symptom(log).is_some()
+    }
+
     #[test]
-    fn vllm_log_shows_oom_matches_allocator_signatures_but_not_generic_failures() {
+    fn vllm_oom_gate_matches_allocator_signatures_but_not_generic_failures() {
         // A real allocator message (the `MIN_SCORE_FOR_MATCH`-clearing shape the
         // `rocm diagnose` vLLM-OOM checker recognises) is a genuine OOM, whichever
         // module path the exception carries.
-        assert!(vllm_log_shows_oom(
+        assert!(log_shows_oom(
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB."
         ));
-        assert!(vllm_log_shows_oom(
+        assert!(log_shows_oom(
             "torch.cuda.OutOfMemoryError: CUDA out of memory"
         ));
-        assert!(vllm_log_shows_oom("RuntimeError: hipErrorOutOfMemory"));
+        assert!(log_shows_oom("RuntimeError: hipErrorOutOfMemory"));
         // Case-insensitive.
-        assert!(vllm_log_shows_oom("HIP OUT OF MEMORY"));
+        assert!(log_shows_oom("HIP OUT OF MEMORY"));
 
         // Sub-threshold on their own — the same lines the diagnose checker keeps
         // below `MIN_SCORE_FOR_MATCH` so a stray OOM phrase does not carry the
@@ -7727,28 +7788,109 @@ last_installed_runtime_id = "therock-release"
         //
         // The bare exception class every PyTorch OOM raises, with no allocator
         // message to corroborate it.
-        assert!(!vllm_log_shows_oom("TORCH.OUTOFMEMORYERROR"));
+        assert!(!log_shows_oom("TORCH.OUTOFMEMORYERROR"));
         // A spaced "out of memory" with no allocator anchor phrase.
-        assert!(!vllm_log_shows_oom("HIP error: out of memory"));
+        assert!(!log_shows_oom("HIP error: out of memory"));
         // A kernel OOM-killer line from an unrelated subprocess must NOT drive
         // the vLLM memory note.
-        assert!(!vllm_log_shows_oom(
+        assert!(!log_shows_oom(
             "Out of memory: Killed process 4242 (python)"
         ));
         // The generic EngineCore wrapper is NOT an OOM signature.
-        assert!(!vllm_log_shows_oom(
+        assert!(!log_shows_oom(
             "EngineCore failed: engine core initialization failed"
         ));
-        assert!(!vllm_log_shows_oom("OSError: model weights not found"));
-        assert!(!vllm_log_shows_oom(""));
+        assert!(!log_shows_oom("OSError: model weights not found"));
+        assert!(!log_shows_oom(""));
+    }
+
+    #[test]
+    fn every_rendered_line_break_keeps_the_gate_in_step_with_the_scorer() {
+        // The scorer (`vllm_anchored_lines`) re-splits with `rendered_lines`,
+        // which ends a row on far more than the `\n`/`\r` the segmenter splits
+        // on. Splitting the log on `\r` alone therefore left the anchor on an
+        // empty leading piece for every *other* break, the tail scored as "no
+        // OOM", and both the engine hint and the serve-summary note silently
+        // vanished. Each prefix below is a separate `rendered_lines` boundary.
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        for (label, break_seq) in [
+            ("bare CR", "\r"),
+            ("erase-line CSI after a CR repaint", "\r\u{1b}[2K"),
+            ("cursor-up CSI", "\u{1b}[1A"),
+            ("NEL escape", "\u{1b}E"),
+            ("IND escape", "\u{1b}D"),
+            ("vertical tab", "\u{b}"),
+            ("form feed", "\u{c}"),
+            ("C1 NEL", "\u{85}"),
+            ("line separator", "\u{2028}"),
+            ("paragraph separator", "\u{2029}"),
+        ] {
+            let tail = format!("Loading weights: 90%{break_seq}{exception}\n");
+            assert!(
+                log_shows_oom(&tail),
+                "{label}: an allocator exception after this break must still read as an OOM"
+            );
+            let symptom = vllm_oom_diagnose_symptom(&tail)
+                .unwrap_or_else(|| panic!("{label}: an OOM tail must select a line"));
+            assert!(
+                diagnose::vllm_oom_symptom_is_diagnosable(&symptom),
+                "{label}: the selected line must stay diagnosable"
+            );
+            // The raw bytes survive selection, so a segment carrying an escape
+            // is still refused by the quoting guard and falls back to the
+            // canonical symptom rather than being stripped into a runnable
+            // lookalike of the user's error.
+            if break_seq.contains('\u{1b}') && !break_seq.starts_with('\r') {
+                assert!(
+                    !terminal::quotable_in_single_quotes(&symptom),
+                    "{label}: an escape-bearing symptom must not pass the quoting guard"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_engine_hint_is_never_quoted_back_as_the_users_own_line() {
+        // A managed launch shares one log between the supervisor and the engine,
+        // and the engine's bail (which embeds this crate's own OOM hint) is
+        // written back into it *after* the real failure. That hint quotes the
+        // user's line and names the allocator keywords, so it scores as an OOM
+        // too — and being last, a newest-first scan always selected it. Since it
+        // contains `'`, the quoting guard then rejected it and the printed
+        // command fell back to the canonical symptom in every real run, which is
+        // precisely the promise the note is built on.
+        let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let tail = format!(
+            "{real_line}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
+             \n\
+             Last 50 lines of startup log:\n\
+             {real_line}\n\
+             \n\
+             {VLLM_OOM_DETECTED_PREFIX}{real_line}). {VLLM_GPU_MEMORY_UTILIZATION_HINT}\n\
+             For conditional remediation, run `{VLLM_OOM_DIAGNOSE_COMMAND} \
+             'vllm: {real_line}'`.\n"
+        );
+        let symptom = vllm_oom_diagnose_symptom(&tail).expect("the real OOM line is still found");
+        assert_eq!(
+            symptom,
+            format!("vllm: {real_line}"),
+            "the user's own failing line must win over rocm-cli's own hint"
+        );
+        // ...and because it is the user's real line, it is quotable, so the
+        // command the user is told to run actually carries their error.
+        assert!(
+            terminal::quotable_in_single_quotes(&symptom),
+            "the selected line must survive the quoting guard, or the note falls \
+             back to the canonical symptom exactly as it did before this fix"
+        );
     }
 
     #[test]
     fn vllm_oom_diagnose_symptom_selects_the_failing_line_or_reports_no_oom() {
-        // The selector and the classifier are one predicate: a tail
-        // `vllm_log_shows_oom` accepts always yields a line, and a tail it
-        // rejects always yields `None` — which is what lets callers use this as
-        // the OOM gate instead of asking the same question twice.
+        // The selector *is* the gate: a tail with an OOM always yields a line,
+        // and a tail without one always yields `None`, which is what lets
+        // callers use this directly instead of asking the same question twice.
         let tail = concat!(
             "  File \"/opt/vllm/worker.py\", line 212, in load_model\n",
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
@@ -7779,7 +7921,7 @@ last_installed_runtime_id = "therock-release"
         let repainted = "Loading weights: 90%\rtorch.OutOfMemoryError: HIP out of memory. \
                          Tried to allocate 7.21 GiB.\n";
         assert!(
-            vllm_log_shows_oom(repainted),
+            log_shows_oom(repainted),
             "an allocator exception after a progress-bar carriage return is still an OOM"
         );
         let repainted_symptom =
