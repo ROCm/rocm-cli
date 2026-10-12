@@ -20,8 +20,9 @@
 //! - production Rust string literals under `apps/`, `crates/` and `engines/`:
 //!   backtick spans naming `rocm …`, and literals that *start* with a command
 //!   (the `rocm_core::fix` RECIPES `commands`/`verify` fields, dashboard
-//!   "Runs:" lines). Comments and `#[cfg(test)]` items are skipped — they are
-//!   never printed;
+//!   "Runs:" lines). Comments, items gated on `cfg(test)` or
+//!   `cfg(all(test, …))`, and whole files declared only as test modules are
+//!   skipped — they are never printed;
 //! - `README.md`, `docs/**/*.md` and `skills/**/*.md` (inline backtick spans
 //!   and fenced code-block lines), and the VHS tapes under `docs/tapes/`.
 //!
@@ -186,6 +187,73 @@ fn command_literals(line: &str) -> Vec<String> {
     found
 }
 
+/// Whether `attr` is a whole-line `#[cfg(...)]` that compiles its item only
+/// under test: `#[cfg(test)]` or `#[cfg(all(test, ...))]`.
+fn is_test_cfg(attr: &str) -> bool {
+    (attr.starts_with("#[cfg(test)") || attr.starts_with("#[cfg(all(test")) && attr.ends_with(")]")
+}
+
+/// Files that `files` declare only as test modules (`#[cfg(test)] mod x;`,
+/// `#[cfg(all(test, unix))] mod x;`, following a `#[path = ...]` when one is
+/// given). Like a `*tests.rs` file they are test code throughout, but their
+/// names say nothing about it, so the declaration is the only reliable sign.
+fn test_only_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let Some(dir) = file.parent() else {
+            continue;
+        };
+        let is_mod_root = matches!(
+            file.file_name().and_then(|n| n.to_str()),
+            Some("main.rs" | "lib.rs" | "mod.rs")
+        );
+        let child_dir = if is_mod_root {
+            dir.to_path_buf()
+        } else {
+            dir.join(file.file_stem().unwrap_or_default())
+        };
+        let mut attrs: Vec<&str> = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with("#[") {
+                attrs.push(line);
+                continue;
+            }
+            if line.starts_with("//") {
+                continue;
+            }
+            let declared = line
+                .strip_prefix("pub(crate) ")
+                .or_else(|| line.strip_prefix("pub "))
+                .unwrap_or(line)
+                .strip_prefix("mod ")
+                .and_then(|rest| rest.strip_suffix(';'));
+            if let Some(name) = declared
+                && attrs.iter().any(|attr| is_test_cfg(attr))
+            {
+                let explicit = attrs.iter().find_map(|attr| {
+                    attr.strip_prefix("#[path = \"")
+                        .and_then(|rest| rest.strip_suffix("\"]"))
+                });
+                if let Some(path) = explicit {
+                    found.push(dir.join(path));
+                } else {
+                    found.push(child_dir.join(format!("{name}.rs")));
+                    found.push(child_dir.join(name).join("mod.rs"));
+                }
+            }
+            attrs.clear();
+        }
+    }
+    found
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect()
+}
+
 /// Production lines of a Rust file, with string continuations (`\` at end of
 /// line) joined the way the compiler joins them. Comments and `#[cfg(test)]`
 /// items are dropped: they are never printed to a user.
@@ -196,7 +264,7 @@ fn rust_production_lines(text: &str) -> Vec<(usize, String)> {
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
-        if line.trim() == "#[cfg(test)]" {
+        if is_test_cfg(line.trim()) {
             // Skip the gated item by brace depth (or to its `;`).
             let mut depth = 0i32;
             let mut seen_open = false;
@@ -376,7 +444,11 @@ pub(crate) fn source_advice() -> Vec<Advice> {
     for top in ["apps", "crates", "engines"] {
         walk(&root.join(top), &["rs"], &rust_skip, &mut rust_files);
     }
+    let test_only = test_only_module_files(&rust_files);
     for path in rust_files {
+        if std::fs::canonicalize(&path).is_ok_and(|path| test_only.contains(&path)) {
+            continue;
+        }
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -1655,4 +1727,64 @@ fn only_advised_text_makes_a_request_deliberate() {
         let found = findings(&[fixture(raw, Surface::CommandLine)]);
         assert!(found.is_empty(), "{raw}: {}", render_findings(&found));
     }
+}
+
+/// A file declared only as a test module is test code throughout, whatever it
+/// is named: its comments and fixtures are not advice to anyone running the
+/// CLI. Both declaration shapes in the tree are covered — a `cfg(all(test, …))`
+/// gate and a `#[path]` pointing outside the declaring file's own folder.
+#[test]
+fn test_only_module_files_follow_the_declaration() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    let src = root.path().join("app").join("src");
+    let shared = root.path().join("shared");
+    std::fs::create_dir_all(src.join("tool"))?;
+    std::fs::create_dir_all(&shared)?;
+    std::fs::write(
+        src.join("main.rs"),
+        "#[cfg(test)]\nmod helper;\n\
+         #[cfg(all(test, unix))]\n#[path = \"../../shared/props.rs\"]\nmod props;\n\
+         mod tool;\n#[cfg(not(test))]\nmod real;\n",
+    )?;
+    std::fs::write(src.join("tool.rs"), "#[cfg(test)]\nmod nested;\n")?;
+    for file in [
+        src.join("helper.rs"),
+        shared.join("props.rs"),
+        src.join("tool").join("nested.rs"),
+        src.join("real.rs"),
+    ] {
+        std::fs::write(file, "")?;
+    }
+
+    let mut found = test_only_module_files(&[src.join("main.rs"), src.join("tool.rs")]);
+    found.sort();
+    let mut expected = vec![
+        std::fs::canonicalize(src.join("helper.rs"))?,
+        std::fs::canonicalize(shared.join("props.rs"))?,
+        std::fs::canonicalize(src.join("tool").join("nested.rs"))?,
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+    Ok(())
+}
+
+/// An item gated on `cfg(all(test, …))` inside a production file is skipped
+/// like one gated on plain `cfg(test)`.
+#[test]
+fn an_item_gated_on_all_test_is_not_production_text() {
+    let text = "fn shown() { println!(\"rocm examine\"); }\n\
+                #[cfg(all(test, unix))]\n\
+                fn hidden() { println!(\"rocm frobnicate\"); }\n";
+    let lines: Vec<String> = rust_production_lines(text)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect();
+    assert!(
+        lines.iter().any(|line| line.contains("rocm examine")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("frobnicate")),
+        "{lines:?}"
+    );
 }

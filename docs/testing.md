@@ -137,8 +137,9 @@ places, and checks only what it finds:
 - the `--help` of every visible command: lines that start with a command
   (EXAMPLES rows) and inline backtick spans
 - production Rust string literals: backtick spans, literals that start with a
-  command, and labelled lines such as `next step: rocm …`. Comments and
-  `#[cfg(test)]` items are skipped.
+  command, and labelled lines such as `next step: rocm …`. Comments, items
+  gated on `cfg(test)` or `cfg(all(test, …))`, and whole files declared only
+  as test modules (following `#[path]`) are skipped.
 - `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
   code-block lines
 - the VHS tapes under `docs/tapes/`
