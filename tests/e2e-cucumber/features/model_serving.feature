@@ -348,7 +348,8 @@ Feature: Model serving
   # Unix; on Windows the launch was reported as a success and left the user
   # waiting on a server that would never come up. This pins the Windows check
   # alongside the Unix one, plus the retirement of the failed launch's record
-  # that both now share. The engine is
+  # that both now share — read off the record itself, since on Unix the record
+  # of a dead child would let a retry through even unretired. The engine is
   # scripted to die at startup in test builds (`rocm/e2e-test-hooks`), which also
   # waives the no-GPU pre-flight and engine preparation so this reaches a real
   # spawn without GPU hardware or a runtime download — the death itself is real,
@@ -365,4 +366,5 @@ Feature: Model serving
     Given the managed engine dies during startup
     When the user serves a model with Lemonade
     Then serving fails and names the engine's own log
-    And the failed launch does not block the next serve
+    When the user serves the same model again
+    Then that serve reaches the engine launch again rather than being refused as already running
