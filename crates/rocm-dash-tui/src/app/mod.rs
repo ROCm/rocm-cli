@@ -1243,6 +1243,7 @@ mod tests {
     use super::actions::run_approved;
     use super::chat::build_chat_agent;
     use super::summary::summarize_slash_tool;
+    use super::test_support::st;
     use super::types::NO_CHAT_BACKEND_MSG;
 
     #[test]
@@ -1806,10 +1807,6 @@ mod tests {
     }
 
     // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
-
-    fn st() -> AppState {
-        AppState::new("t".into(), "default-dark".into())
-    }
 
     // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
 
