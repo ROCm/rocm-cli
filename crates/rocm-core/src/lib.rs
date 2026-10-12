@@ -30,6 +30,7 @@ pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod hardware_root;
 pub mod host_gpu;
 pub mod managed_runtime;
 pub mod model_readiness;
@@ -63,6 +64,7 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
+pub use hardware_root::host_path;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
@@ -1348,7 +1350,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stdout_handle,
+            &raw mut stdout_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1364,7 +1366,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stderr_handle,
+            &raw mut stderr_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1414,7 +1416,7 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     unsafe {
         WaitForSingleObject(handle, INFINITE);
         let mut exit_code = 0;
-        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+        if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             CloseHandle(handle);
             bail!(
                 "failed to read process {pid} exit code: {}",
@@ -1597,7 +1599,7 @@ pub fn process_is_running(pid: u32) -> bool {
         return false;
     }
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 };
+    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
     unsafe {
         CloseHandle(handle);
     }
@@ -1693,6 +1695,10 @@ pub fn detach_command_session(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub fn detach_command_session(_command: &mut Command) {}
 
 #[cfg(windows)]
@@ -1736,12 +1742,12 @@ fn spawn_windows_no_inherit(
             command_line.as_mut_ptr(),
             null(),
             null(),
-            if std_handles.is_some() { 1 } else { 0 },
+            i32::from(std_handles.is_some()),
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &startup_info,
-            &mut process_info,
+            &raw const startup_info,
+            &raw mut process_info,
         )
     };
     if created == 0 {
@@ -2130,6 +2136,21 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
         bail!("{field_name} must not be empty");
     }
     Ok(())
+}
+
+/// Picks the best available detail string from a failed subprocess's
+/// captured output: stderr if non-blank after trimming, else stdout, else a
+/// literal "no output"; the result is trimmed.
+pub fn command_failure_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    "no output".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -5862,13 +5883,17 @@ mod tests {
 
     fn download_scratch(tag: &str) -> PathBuf {
         let dir = workspace_test_artifact_dir().join(format!(
-            "download-{tag}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "download-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("failed to create scratch dir");
         dir
+    }
+
+    #[test]
+    fn download_scratch_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| download_scratch("same-label"));
     }
 
     #[test]
@@ -8312,5 +8337,35 @@ last_installed_runtime_id = "therock-release"
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    fn test_exit_status() -> std::process::ExitStatus {
+        std::process::ExitStatus::default()
+    }
+
+    fn test_process_output(stdout: &str, stderr: &str) -> std::process::Output {
+        std::process::Output {
+            status: test_exit_status(),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn command_failure_detail_prefers_nonempty_stderr() {
+        let output = test_process_output("  stdout text\n", "  stderr text\n");
+        assert_eq!(command_failure_detail(&output), "stderr text");
+    }
+
+    #[test]
+    fn command_failure_detail_falls_back_to_stdout_when_stderr_is_whitespace_only() {
+        let output = test_process_output("  stdout text\n", "   \n\t  ");
+        assert_eq!(command_failure_detail(&output), "stdout text");
+    }
+
+    #[test]
+    fn command_failure_detail_reports_no_output_when_both_are_empty_or_whitespace() {
+        let output = test_process_output("  \n", "   ");
+        assert_eq!(command_failure_detail(&output), "no output");
     }
 }

@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Lets the E2E suite re-root the hardware probes under a simulated host; see
+# `src/hardware_root.rs`. Never enabled in a release build.
+e2e-test-hooks = []
+
 [build-dependencies]
 cc = "1"
 

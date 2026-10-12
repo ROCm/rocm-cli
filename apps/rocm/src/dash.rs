@@ -75,6 +75,11 @@ pub fn runner_options(
             rocm_core::is_wsl_host(),
             rocm_core::has_usable_amd_gpu(),
         ),
+        // The same `/dev/kfd` the rest of `rocm` probes, so a simulated E2E
+        // host can hide the GPU from the dashboard too. `host_path` is the
+        // identity outside an `e2e-test-hooks` build with a host root set, and
+        // the pre-flight still requires the real device either way.
+        amd_smi_host_kfd_device: rocm_core::host_path(rocm_dash_daemon::runner::KFD_DEVICE),
         test_clock_offset_path: dash_test_clock_offset_path(paths),
     }
 }
@@ -912,6 +917,10 @@ const fn should_spawn_daemon(args: &ResolvedArgs) -> bool {
 /// listening, so `rocm dash` works without a separate `rocm daemon` terminal.
 /// Returns the task handle + socket to clean up on exit, or `None` when an
 /// existing daemon was found (we connect to it instead).
+// One function with `#[cfg]` blocks inside, not a cfg-split pair: the unix
+// body awaits, the Windows body does not. Callers `.await` this either way,
+// so dropping `async` off unix would not compile.
+#[allow(clippy::unused_async)]
 async fn maybe_spawn_embedded_daemon(
     connect: &str,
     config: &RocmCliConfig,
@@ -1079,9 +1088,14 @@ mod tests {
     fn scratch_dir(name: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join(format!("{name}-{}", std::process::id()));
+            .join(format!("{name}-{}", crate::test_support::unique_suffix()));
         std::fs::remove_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn scratch_dir_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| scratch_dir("same-label"));
     }
 
     /// `AppPaths` rooted at a real directory, so the clock file's presence can
@@ -1218,6 +1232,21 @@ mod tests {
         let p = paths();
         let opts = runner_options(&cfg(), &p, false);
         assert!(!opts.amd_smi_skip_device_preflight);
+    }
+
+    /// Without a simulated host root the host-root view of `/dev/kfd` is the
+    /// real device, so the pre-flight is the single check it always was. A
+    /// build with `e2e-test-hooks` would honour a root set in the test
+    /// environment, so only the release configuration is pinned here.
+    #[cfg(not(feature = "e2e-test-hooks"))]
+    #[test]
+    fn runner_options_points_the_kfd_preflight_at_the_real_device() {
+        let p = paths();
+        let opts = runner_options(&cfg(), &p, false);
+        assert_eq!(
+            opts.amd_smi_host_kfd_device,
+            std::path::PathBuf::from("/dev/kfd")
+        );
     }
 
     /// Truth-tables the WSL gate as a pure function, independent of the test
