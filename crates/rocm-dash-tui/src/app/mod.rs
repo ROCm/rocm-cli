@@ -3539,6 +3539,7 @@ mod tests {
             Instance {
                 container_id: "svc-a".to_string(),
                 status: InstanceStatus::Stopped,
+                managed: true,
                 ..Default::default()
             },
         );
@@ -3547,6 +3548,7 @@ mod tests {
             Instance {
                 container_id: "svc-b".to_string(),
                 status: InstanceStatus::Running,
+                managed: true,
                 ..Default::default()
             },
         );

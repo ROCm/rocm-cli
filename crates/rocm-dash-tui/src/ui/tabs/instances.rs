@@ -115,7 +115,11 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         held && (inst.gen_tps.is_some_and(f64::is_finite)
             || inst.tokens_per_watt.is_some_and(f64::is_finite))
     });
-    let (table_area, legend_area) = if any_held {
+    let any_last_req = instances
+        .iter()
+        .take(visible_rows)
+        .any(|inst| inst.gen_tps_last_request && inst.gen_tps.is_some_and(f64::is_finite));
+    let (table_area, legend_area) = if any_held || any_last_req {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -198,7 +202,13 @@ pub fn draw_table(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if let Some(legend_area) = legend_area {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format::HELD_LEGEND,
+                match (any_held, any_last_req) {
+                    (true, true) => {
+                        format!("{}  ·  {}", format::HELD_LEGEND, format::LAST_REQ_LEGEND)
+                    }
+                    (true, false) => format::HELD_LEGEND.to_owned(),
+                    _ => format::LAST_REQ_LEGEND.to_owned(),
+                },
                 Style::default().fg(theme.muted),
             ))),
             legend_area,
@@ -472,7 +482,14 @@ fn draw_card(f: &mut Frame, area: Rect, inst: &Instance, theme: &Theme, selected
             format::tokens_per_watt_cell(inst.tokens_per_watt, inst.gen_tps_observation.as_ref()),
             Style::default().fg(theme.accent),
         ),
-        Span::styled(" · gen ", Style::default().fg(theme.muted)),
+        Span::styled(
+            if inst.gen_tps_last_request {
+                " · last req "
+            } else {
+                " · gen "
+            },
+            Style::default().fg(theme.muted),
+        ),
         Span::styled(
             format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
             Style::default().fg(theme.fg),
@@ -733,7 +750,14 @@ fn render_summary(
                 Style::default().fg(theme.accent),
             ),
             Span::raw("  "),
-            Span::styled("gen: ", muted),
+            Span::styled(
+                if inst.gen_tps_last_request {
+                    "last req tok/s: "
+                } else {
+                    "gen: "
+                },
+                muted,
+            ),
             Span::styled(
                 format::gen_tps_compact(inst.gen_tps, inst.gen_tps_observation.as_ref()),
                 fg,
@@ -974,6 +998,7 @@ mod tests {
 
     fn mk_inst(name: &str) -> Instance {
         Instance {
+            managed: false,
             container_id: format!("id-{name}"),
             container_name: name.to_string(),
             status: InstanceStatus::Running,
@@ -990,6 +1015,7 @@ mod tests {
             waiting_reqs: None,
             gen_tps: None,
             gen_tps_observation: None,
+            gen_tps_last_request: false,
             tokens_per_watt: None,
             ttft_ms: None,
             tpot_ms: None,
@@ -2189,6 +2215,50 @@ mod tests {
             out.contains("0 ") || out.contains("0\n") || out.contains("0*"),
             "zero gen_tps must render as '0', not '—'; got:\n{out}"
         );
+    }
+
+    fn last_req_inst(name: &str, last_request: bool) -> Instance {
+        let mut inst = mk_inst_obs(name, Some(37.5), Some(obs(ObservationFreshness::Fresh, 0)));
+        inst.gen_tps_last_request = last_request;
+        inst
+    }
+
+    #[test]
+    fn table_labels_a_last_request_rate_and_only_then() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, expect_legend) in [(true, true), (false, false)] {
+            let state = state_with_snap(last_req_inst("rate", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| draw_table(f, f.area(), &state, &state.theme))
+                .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains("38"), "the value itself still shows:\n{out}");
+            assert_eq!(
+                out.contains(format::LAST_REQ_LEGEND),
+                expect_legend,
+                "last_request={last_request}:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn detail_names_a_last_request_rate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (last_request, label) in [(true, "last req tok/s:"), (false, "gen:")] {
+            let state = state_with_snap(last_req_inst("rate-detail", last_request));
+            let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+            term.draw(|f| {
+                draw_detail(f, f.area(), &state, &state.theme);
+            })
+            .unwrap();
+            let out = buffer_text(&term);
+            assert!(out.contains(label), "{label:?} missing:\n{out}");
+            assert_eq!(out.contains("last req tok/s:"), last_request, "{out}");
+        }
     }
 
     #[test]

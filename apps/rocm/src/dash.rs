@@ -266,7 +266,17 @@ fn lemonade_managed_installed(paths: &AppPaths) -> Option<bool> {
         rocm_engine_protocol::EngineMethod::Detect,
         &rocm_engine_protocol::DetectRequest::default(),
     )
-    .ok()?;
+    .ok();
+    managed_installed_from_detect(detect.as_ref())
+}
+
+/// Pure verdict over a Detect result: `None` when Detect failed (unknown, not
+/// absent); otherwise installed only counts when the runtime is managed. A
+/// legacy response without `managed_env` is not proof of a managed install.
+fn managed_installed_from_detect(
+    detect: Option<&rocm_engine_protocol::DetectResponse>,
+) -> Option<bool> {
+    let detect = detect?;
     Some(detect.installed && detect.managed_env == Some(true))
 }
 
@@ -727,6 +737,7 @@ fn launcher_serving_instances(paths: &AppPaths) -> Vec<rocm_dash_core::metrics::
             model_name: svc.model_name,
             status: svc.status,
             port: svc.port,
+            managed: svc.managed,
             ..Default::default()
         })
         .collect()
@@ -1091,6 +1102,43 @@ async fn maybe_spawn_embedded_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detect(installed: bool, managed_env: Option<bool>) -> rocm_engine_protocol::DetectResponse {
+        let mut v = serde_json::json!({
+            "installed": installed, "env_id": null, "python_version": null,
+            "torch_version": null, "transformers_version": null,
+            "available_devices": [], "notes": [],
+            "capabilities": {"cpu": false, "rocm_gpu": false, "openai_compatible": true,
+                "tool_calling": false, "quantized_models": "", "reasoning_parser": false}
+        });
+        if let Some(m) = managed_env {
+            v["managed_env"] = m.into();
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn managed_installed_verdict_follows_detect_result() {
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(true)))),
+            Some(true)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, Some(false)))),
+            Some(false)
+        );
+        // Legacy response without the ownership field proves nothing managed.
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(true, None))),
+            Some(false)
+        );
+        assert_eq!(
+            managed_installed_from_detect(Some(&detect(false, Some(true)))),
+            Some(false)
+        );
+        // A failed Detect is unknown, never "not installed".
+        assert_eq!(managed_installed_from_detect(None), None);
+    }
 
     #[test]
     fn lemonade_discovery_defaults_and_overrides_reach_daemon() {
@@ -1945,6 +1993,9 @@ mod tests {
         assert_eq!(inst.model_name, "meta-llama/Llama-3.1-8B");
         assert_eq!(inst.port, Some(11435));
         assert_eq!(inst.status, rocm_dash_core::metrics::InstanceStatus::Ready);
+        // Registry records are owned by this CLI; the flag must survive the map
+        // so lifecycle surfaces treat the launcher row as managed.
+        assert!(inst.managed, "registry-owned record must stay managed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

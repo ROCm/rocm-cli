@@ -630,9 +630,10 @@ rocm logs --search error timeout")]
     },
     /// Launch the unified telemetry dashboard (TUI) with an embedded daemon.
     ///
-    /// Discovers loaded models from local Lemonade at 127.0.0.1:13305 by default.
-    /// Configure dashboard.daemon.enable_lemonade, lemonade_host, and lemonade_port
-    /// in config.json. Discovery is read-only: quitting leaves external servers running.
+    /// On Linux/WSL, discovers loaded models from local Lemonade at 127.0.0.1:13305
+    /// by default. Configure dashboard.daemon.enable_lemonade, lemonade_host, and
+    /// lemonade_port in config.json. External models have no Services stop/restart
+    /// controls; discovery is read-only and quitting leaves external servers running.
     Dash {
         /// Replay a recorded session NDJSON instead of connecting to a live daemon.
         #[arg(long, value_name = "FILE")]
@@ -11541,7 +11542,7 @@ fn lemonade_health_ready_for_model(body: &str, canonical_model_id: &str) -> bool
                     .into_iter()
                     .filter_map(|field| model.get(field).and_then(serde_json::Value::as_str))
                     .any(|loaded| service_model_names_match(loaded, canonical_model_id));
-                name_matches && service_model_reports_rocm_backend(model)
+                name_matches && service_model_reports_gpu_backend(model)
             })
         })
 }
@@ -11571,22 +11572,26 @@ fn model_list_ready_for_model(
 /// Whether a lemonade `/v1/models` entry is served on GPU. A stock `llama-server`
 /// (direct-serve) entry has no `recipe_options` and is accepted (that path only runs
 /// GPU backends); a Lemonade-router entry carries `recipe_options`, so it must report a
-/// ROCm backend — which keeps a registered-but-unloaded model (empty `recipe_options`)
+/// GPU backend (ROCm or Vulkan) — which keeps a registered-but-unloaded model (empty `recipe_options`)
 /// from reading as ready.
 fn service_model_gpu_ready(model: &serde_json::Value) -> bool {
     match model.get("recipe_options") {
         None => true,
-        Some(_) => service_model_reports_rocm_backend(model),
+        Some(_) => service_model_reports_gpu_backend(model),
     }
 }
 
-fn service_model_reports_rocm_backend(model: &serde_json::Value) -> bool {
+fn service_model_reports_gpu_backend(model: &serde_json::Value) -> bool {
     model
         .get("recipe_options")
         .and_then(|options| options.get("llamacpp_backend"))
         .or_else(|| model.get("llamacpp_backend"))
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|backend| backend.trim().to_ascii_lowercase().starts_with("rocm"))
+        .is_some_and(|backend| {
+            // The GPU backends the engine can select (ROCm, else Vulkan); never `cpu`.
+            let backend = backend.trim().to_ascii_lowercase();
+            backend.starts_with("rocm") || backend.starts_with("vulkan")
+        })
 }
 
 fn service_model_names_match(left: &str, right: &str) -> bool {
@@ -12146,6 +12151,30 @@ pub(crate) mod tests {
         assert_eq!(
             FrameworkProbe::from(FrameworkArg::Skip),
             FrameworkProbe::Skip
+        );
+    }
+
+    #[test]
+    fn dash_help_scopes_lemonade_discovery_to_linux_and_wsl() {
+        // The embedded daemon that does the discovery is Unix-only, so the help
+        // must not promise it on every platform. README.md says the same.
+        let help = Cli::command()
+            .find_subcommand_mut("dash")
+            .expect("dash subcommand")
+            .render_long_help()
+            .to_string();
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("On Linux/WSL, discovers loaded models from local Lemonade"),
+            "{help}"
+        );
+        // This pins the wording only. Scenario
+        // `@id:dash-lemonade-external-protocol-discovery` (dash-36) proves the
+        // claim: the external server receives no request beyond reads after the
+        // dashboard quits.
+        assert!(
+            flat.contains("quitting leaves external servers running"),
+            "{help}"
         );
     }
 
@@ -13233,6 +13262,49 @@ pub(crate) mod tests {
             &registered,
             "LiquidAI/LFM2.5-230M-GGUF:Q4_0"
         ));
+    }
+
+    #[test]
+    fn lemonade_router_readiness_accepts_any_gpu_backend_the_engine_selects() {
+        // The engine selects ROCm first and Vulkan otherwise, and records either as
+        // `backend_requested`; a router-served model on a Vulkan host must read as
+        // ready on both probe paths. CPU (or no backend) must never read as ready.
+        for (backend, ready) in [
+            ("rocm", true),
+            ("rocm-stable", true),
+            ("vulkan", true),
+            ("Vulkan", true),
+            ("cpu", false),
+            ("", false),
+        ] {
+            let health = json!({
+                "all_models_loaded": [{
+                    "model_name": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            let models = json!({
+                "data": [{
+                    "id": "Qwen3-0.6B-GGUF",
+                    "recipe_options": { "llamacpp_backend": backend }
+                }]
+            })
+            .to_string();
+            for (path, body) in [("/v1/health", &health), ("/v1/models", &models)] {
+                assert_eq!(
+                    service_http_readiness_response_ready(
+                        "lemonade",
+                        path,
+                        200,
+                        body,
+                        "Qwen3-0.6B-GGUF"
+                    ),
+                    ready,
+                    "{path} with backend `{backend}`"
+                );
+            }
+        }
     }
 
     #[test]

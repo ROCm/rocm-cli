@@ -56,7 +56,6 @@ pub struct GpuSystemInfo {
     pub memory_partition_mode: MemoryPartitionMode,
     pub compute_partition_mode: ComputePartitionMode,
     pub vram_per_logical_gpu_mb: u64,
-    pub lemond_version: Option<String>,
     pub llama_server_build: Option<String>,
     pub ccr_version: Option<String>,
     pub llamacpp_backend: Option<String>,
@@ -178,6 +177,10 @@ pub struct ObservationMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Instance {
+    /// Lifecycle ownership proven by discovery from a managed-service record.
+    /// Missing ownership in legacy snapshots is not permission to mutate.
+    #[serde(default)]
+    pub managed: bool,
     pub container_id: String,
     pub container_name: String,
     pub status: InstanceStatus,
@@ -201,6 +204,11 @@ pub struct Instance {
     /// Omitted from JSON when `None` to preserve wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gen_tps_observation: Option<ObservationMetadata>,
+    /// True when [`Instance::gen_tps`] is the endpoint's most recent completed
+    /// request rate (Lemonade `/stats`), which stays unchanged while the server is
+    /// idle, rather than a live counter rate. Omitted from JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gen_tps_last_request: bool,
     /// Efficiency: `gen_tps` ÷ summed power (W) of the GPUs this instance
     /// occupies. `None` when throughput or GPU power telemetry is unavailable.
     #[serde(default)]
@@ -217,6 +225,15 @@ pub struct Instance {
     pub launch_args: Vec<String>,
     pub env_vars: std::collections::BTreeMap<String, String>,
     pub log_file: Option<String>,
+}
+
+impl Instance {
+    /// External Lemonade discovery uses the engine marker, not the instance id.
+    /// This identifies provenance independently of the current serving status.
+    #[must_use]
+    pub fn is_external_lemonade(&self) -> bool {
+        !self.managed && self.container_name == "lemonade"
+    }
 }
 
 #[cfg(test)]
@@ -236,11 +253,50 @@ mod tests {
             "log_file": null
         }"#;
         let inst: Instance = serde_json::from_str(legacy).expect("legacy instance must parse");
+        assert!(
+            !inst.managed,
+            "legacy snapshots do not grant lifecycle control"
+        );
         assert_eq!(inst.gen_tps, None);
         assert_eq!(inst.tokens_per_watt, None);
         assert_eq!(inst.ttft_ms, None);
         assert_eq!(inst.tpot_ms, None);
         assert_eq!(inst.kv_cache_usage_pct, Some(42.0));
+    }
+
+    #[test]
+    fn instance_ownership_round_trips_and_defaults_to_false() {
+        assert!(!Instance::default().managed);
+        for managed in [false, true] {
+            let inst = Instance {
+                managed,
+                ..Instance::default()
+            };
+            let json = serde_json::to_value(&inst).expect("serialize");
+            assert_eq!(json["managed"], managed);
+            let back: Instance = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(back.managed, managed);
+        }
+    }
+
+    #[test]
+    fn external_lemonade_predicate_ignores_ids_and_requires_engine_marker() {
+        for id in ["svc-looks-managed", "lemonade-looks-external"] {
+            for managed in [false, true] {
+                for marker in ["lemonade", "vllm", ""] {
+                    let inst = Instance {
+                        managed,
+                        container_id: id.into(),
+                        container_name: marker.into(),
+                        ..Instance::default()
+                    };
+                    assert_eq!(
+                        inst.is_external_lemonade(),
+                        !managed && marker == "lemonade"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -309,6 +365,16 @@ mod tests {
             "WARMUP"
         );
         assert_eq!(InstanceStatus::Ready.label(), "READY");
+    }
+
+    #[test]
+    fn gpu_system_info_ignores_retired_lemond_version_key() {
+        // Recorded sessions written before the field was removed still carry
+        // the key. Unknown keys are ignored, so they must keep loading.
+        let mut value = serde_json::to_value(GpuSystemInfo::default()).expect("serialize");
+        value["lemond_version"] = serde_json::json!("10.4.0");
+        let info: GpuSystemInfo = serde_json::from_value(value).expect("deserialize old snapshot");
+        assert_eq!(info.llama_server_build, None);
     }
 
     #[test]
