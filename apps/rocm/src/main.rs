@@ -75,12 +75,12 @@ use crate::runtimes_cmd::{
     validate_runtime_manifest_for_activation,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
-#[cfg(test)]
-use crate::service_launch::SpawnedManagedEngine;
 use crate::service_launch::{
     ManagedEngineSpawnRequest, ManagedStartupRecord, SpawnManagedEngine,
     adopt_spawned_engine_child, spawn_managed_engine_process, watch_managed_engine_startup,
 };
+#[cfg(test)]
+use crate::service_launch::{ManagedEngineStartupCheck, SpawnedManagedEngine};
 use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
 use crate::uninstall::uninstall;
 
@@ -10951,6 +10951,7 @@ fn restart_internal_managed_service_with(
         paths,
         runtime_pin,
         expected: stopped_record,
+        child_on_record: false,
     };
     watch_managed_engine_startup(&mut on_record, spawned)?;
     let started = on_record.expected;
@@ -10970,20 +10971,35 @@ struct RestartStartupRecord<'a> {
     /// The record as this restart last left it on disk: its confirmed stop's,
     /// then, once the child is on record, the one naming it.
     expected: ManagedServiceRecord,
+    /// Whether `expected` names the child yet. A child the spawn already saw
+    /// die is never put on record, so its retirement is the restart's first
+    /// write.
+    child_on_record: bool,
 }
 
 impl ManagedStartupRecord for RestartStartupRecord<'_> {
     fn persist_spawned_child(&mut self, child_pid: u32) -> Result<()> {
         self.expected =
             record_restarted_child(self.paths, &self.expected, self.runtime_pin, child_pid)?;
+        self.child_on_record = true;
         Ok(())
     }
 
     /// Retire the record as `"failed"`. Writes nothing when it has changed
     /// since this restart last wrote it: whoever wrote since — a stop, another
     /// restart — holds a truer view than a retirement would.
+    ///
+    /// A child the spawn saw die is kept off the record, which is retired
+    /// naming the processes the confirmed stop left on it. The restart is
+    /// still counted, as `record_restarted_child` counts one that survives: a
+    /// child was spawned whether or not it survived startup, matching
+    /// `rocmd`'s own restart.
     fn retire(&mut self) -> Result<()> {
+        let count_restart = !self.child_on_record;
         if let Some(retired) = update_restarting_record(self.paths, &self.expected, |current| {
+            if count_restart {
+                current.reset_for_restart();
+            }
             current.status = "failed".to_owned();
         })? {
             self.expected = retired;
@@ -24908,7 +24924,15 @@ install therock";
     }
 
     /// A Lemonade service record as a previous run left it, for the restart
-    /// tests: `"ready"`, its launcher pid one that no longer runs, and no key.
+    /// tests: `"ready"`, no key, and still carrying the pending-stop marker of an
+    /// earlier stop that could not confirm.
+    ///
+    /// Its pid is this test process, which keeps that marker in the record the
+    /// restart loads — the load-time refresh settles a marker only once every
+    /// recorded pid is gone — while the restart's own stop never signals it,
+    /// since a stop skips the caller's pid. So the record in the restart's hands
+    /// carries a marker, and any of its writes that does not clear it puts the
+    /// marker back on disk.
     fn previous_lemonade_run(paths: &AppPaths, service_id: &str, port: u16) -> Result<()> {
         let mut record = ManagedServiceRecord::new(
             paths,
@@ -24919,12 +24943,13 @@ install therock";
             "127.0.0.1",
             port,
             "managed",
-            999_999_999,
+            std::process::id(),
             None,
             None,
             Some("gpu_required".to_owned()),
         );
         record.status = "ready".to_owned();
+        record.stop_requested_unix_ms = Some(1);
         record.write()
     }
 
@@ -25005,7 +25030,8 @@ install therock";
     /// A restart whose child survives its check: the record names that child as
     /// `"starting"` for the whole readiness wait — not the previous run's pid, and
     /// not `"running"` before the port is open — and the wait's verdict is what
-    /// the restart then records.
+    /// the restart then records, here a served inference that is latched as
+    /// verified.
     #[test]
     fn a_restarted_child_is_on_record_as_starting_for_the_readiness_wait() -> Result<()> {
         let (root, paths) = test_paths("managed-restart-survives-startup");
@@ -25018,7 +25044,7 @@ install therock";
             std::cell::RefCell::default();
         let wait = |_record: &ManagedServiceRecord, _key: Option<&str>| {
             *seen_during_wait.borrow_mut() = manifest_on_disk(&manifest_path);
-            EndpointReadiness::Listing
+            EndpointReadiness::Serving
         };
 
         let outcome = restart_internal_managed_service_with(
@@ -25047,13 +25073,54 @@ install therock";
             ("starting", stand_in_child_pid(), 1, None),
             "during the readiness wait the record must name the new child as starting"
         );
-        assert_eq!(
-            restarted.status, "running",
-            "the wait's verdict is recorded"
+        assert_eq!(restarted.status, "ready", "the wait's verdict is recorded");
+        let after = after.expect("the record is on disk");
+        assert_eq!(after.status, "ready");
+        assert!(
+            after.inference_verified_at_unix_ms.is_some(),
+            "a served inference is latched as verified"
         );
+        Ok(())
+    }
+
+    /// The restart's counterpart of the launch test above: a death the spawn
+    /// itself saw keeps the dead child off the record, which is retired still
+    /// naming the previous run's pid — the restart is counted and the stop's
+    /// marker cleared, since a child did spawn, but nothing points a later stop at
+    /// a pid that may be reused.
+    #[test]
+    fn a_restart_the_spawn_saw_die_keeps_the_dead_child_off_record() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-observed-death");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-5";
+        previous_lemonade_run(&paths, service_id, 11531)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &stand_in_spawn_observed(Some(exit_status_from_code(3))),
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.is_err(),
+            "a restart whose engine died at startup must fail"
+        );
+        let after = after.expect("the record is still on disk");
         assert_eq!(
-            after.map(|record| record.status),
-            Some("running".to_owned())
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.restart_count,
+                after.stop_requested_unix_ms,
+            ),
+            ("failed", std::process::id(), 1, None),
+            "retired without naming the dead child"
         );
         Ok(())
     }
@@ -25281,7 +25348,7 @@ install therock";
             *launched_argv.borrow_mut() = Some(request.args.to_vec());
             Ok(SpawnedManagedEngine {
                 pid: stand_in_child_pid(),
-                startup_exit: Box::new(|| Ok(None)),
+                startup: ManagedEngineStartupCheck::Observed(None),
             })
         };
         let wait = |_record: &ManagedServiceRecord, _key: Option<&str>| EndpointReadiness::Serving;
@@ -27210,10 +27277,13 @@ install therock";
         ExitStatus::from_raw(code << 8)
     }
 
-    /// The pid a stand-in spawn reports for its "child": this test process, which
-    /// is certainly alive and which a managed stop never signals.
-    pub(crate) fn stand_in_child_pid() -> u32 {
-        std::process::id()
+    /// The pid a stand-in spawn reports for its "child". Above Linux's pid limit
+    /// and not a multiple of four, which every Windows pid is, so no process ever
+    /// has it and nothing can be signalled through it; and
+    /// distinct from every pid a fixture record starts with, so a record naming it
+    /// can only have been written after the spawn.
+    pub(crate) const fn stand_in_child_pid() -> u32 {
+        3_999_999_999
     }
 
     /// What a stand-in startup check answers.
@@ -27227,10 +27297,11 @@ install therock";
     }
 
     /// A stand-in for [`spawn_managed_engine_process`] that starts nothing. It
-    /// reports [`stand_in_child_pid`] as the child and answers the startup check
-    /// with `startup` — after saving, into `seen_at_check`, what the service's
-    /// manifest said on disk at that moment. That snapshot is how these tests pin
-    /// what a launch or restart has persisted *before* its check runs.
+    /// reports [`stand_in_child_pid`] as the child with its startup check still
+    /// pending, as on Unix, and answers that check with `startup` — after saving,
+    /// into `seen_at_check`, what the service's manifest said on disk at that
+    /// moment. That snapshot is how these tests pin what a launch or restart has
+    /// persisted *before* its check runs.
     pub(crate) fn stand_in_spawn(
         manifest_path: PathBuf,
         seen_at_check: std::rc::Rc<std::cell::RefCell<Option<ManagedServiceRecord>>>,
@@ -27241,10 +27312,23 @@ install therock";
             let seen_at_check = std::rc::Rc::clone(&seen_at_check);
             Ok(SpawnedManagedEngine {
                 pid: stand_in_child_pid(),
-                startup_exit: Box::new(move || {
+                startup: ManagedEngineStartupCheck::Pending(Box::new(move || {
                     *seen_at_check.borrow_mut() = manifest_on_disk(&manifest_path);
                     startup()
-                }),
+                })),
+            })
+        }
+    }
+
+    /// A stand-in spawn whose startup check the spawn itself already answered with
+    /// `startup_exit`, as the Windows watched spawn does.
+    pub(crate) fn stand_in_spawn_observed(
+        startup_exit: Option<ExitStatus>,
+    ) -> impl Fn(&ManagedEngineSpawnRequest<'_>) -> Result<SpawnedManagedEngine> {
+        move |_request| {
+            Ok(SpawnedManagedEngine {
+                pid: stand_in_child_pid(),
+                startup: ManagedEngineStartupCheck::Observed(startup_exit),
             })
         }
     }

@@ -298,15 +298,17 @@ fn managed_engine_startup_failure_args() -> Vec<String> {
 /// next launch proceeds.
 ///
 /// On the launch path the record is persisted *before* the spawn, to claim the
-/// GPU for concurrent auto-selection, so it still carries the constructor's
-/// `"starting"` status and a `supervisor_pid` of 0 — and pid 0 is skipped by
-/// `recorded_service_pids`, so the liveness refresh cannot demote it either and
-/// the wedge is permanent. The restart path reaches this only for a child
-/// observed dead at startup: its record is pre-existing and its pid merely
-/// stale, which the liveness refresh would eventually clean up, and retiring it
-/// here is what makes that outcome immediate and identical on both paths. A
-/// restart that fails before it has spawned anything retires nothing — its
-/// record stays as the stop it began with wrote it.
+/// GPU for concurrent auto-selection, so until a child is put on record it still
+/// carries the constructor's `"starting"` status and a `supervisor_pid` of 0 —
+/// and pid 0 is skipped by `recorded_service_pids`, so the liveness refresh
+/// cannot demote it either and the wedge is permanent. That is the record every
+/// failure before the spawn retires, and the one a death the spawn itself
+/// observed retires too (see `watch_managed_engine_startup`). A death found by a
+/// check still pending retires a record already naming the dead child, which
+/// the liveness refresh would eventually demote; retiring it here makes that
+/// immediate. The restart path reaches this only for a child observed dead at
+/// startup. A restart that fails before it has spawned anything retires nothing
+/// — its record stays as the stop it began with wrote it.
 ///
 /// `"failed"` is also a status `rocmd` acts on, and that is intended: a failed
 /// launch *is* a failure. Its `server-recover` watcher is off until a user
@@ -314,10 +316,12 @@ fn managed_engine_startup_failure_args() -> Vec<String> {
 /// managed record whose status is `"failed"` — a launch retired here becomes
 /// eligible on its next tick (subject to the watcher's backoff), where the
 /// pid-0 `"starting"` record it replaces was eligible only after the 5-minute
-/// stale-`"starting"` window. Two consequences follow. A failed *restart* is
-/// restarted again rather than left down. And that recovery can race a user's
-/// own retry: `rocm serve` for the same engine + model mints a new service id,
-/// so both may try to bind the same port, and one of them loses.
+/// stale-`"starting"` window. Two consequences follow. A restart whose engine
+/// dies at startup is restarted again rather than left down; one that fails
+/// before spawning is not, because it leaves the record its stop wrote, which
+/// is not `"failed"`. And that recovery can race a user's own retry: `rocm
+/// serve` for the same engine + model mints a new service id, so both may try
+/// to bind the same port, and one of them loses.
 pub(crate) fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
     record.status = "failed".to_owned();
     record.write()
@@ -432,14 +436,17 @@ pub(crate) fn adopt_spawned_engine_child(record: &mut ManagedServiceRecord, chil
     // (most likely) alive: a stop pairs every recorded PID with its own token,
     // and the two PIDs diverge as soon as `rocmd` restarts the service — at
     // which point an engine PID recorded without one could only be signalled
-    // blind. A child that has already died yields `None`, which a stop treats
-    // as "unverifiable", not as a match.
+    // blind. `None` — a child already gone, or any platform but Linux, which
+    // has no start times to read — leaves a later stop unable to tell this
+    // child from a process that reuses its pid, and it signals a live pid it
+    // cannot verify. So a child already known to be dead is never adopted (see
+    // `watch_managed_engine_startup`).
     record.record_supervisor_identity(child_pid);
     record.record_engine_identity(child_pid);
 }
 
-/// Persist the just-spawned child as a `"starting"` service: its pid, its
-/// start-time token, and nothing left over from the record's previous state.
+/// Persist the just-spawned child as a `"starting"` service naming it: its pid
+/// and start-time token replace whatever pids the record carried before.
 pub(crate) fn persist_spawned_engine_child(
     record: &mut ManagedServiceRecord,
     child_pid: u32,
@@ -501,15 +508,26 @@ pub(crate) struct ManagedEngineSpawnRequest<'a> {
     pub(crate) log_path: &'a Path,
 }
 
-/// The startup check a spawned child still owes: `Ok(Some(status))` if it had
-/// already exited, `Ok(None)` if it is still running, and `Err` if that could
-/// not be told.
-pub(crate) type ManagedEngineStartupCheck = Box<dyn FnOnce() -> Result<Option<ExitStatus>>>;
+/// Where a spawned child's startup check stands when the spawn returns. Either
+/// way the answer is `Some(status)` if the child had already exited and `None`
+/// if it is still running.
+pub(crate) enum ManagedEngineStartupCheck {
+    /// Already answered by the spawn itself: Windows watches the child while its
+    /// process handle is still open, inside the spawn call.
+    // Only Windows builds one outside tests.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    Observed(Option<ExitStatus>),
+    /// Still owed, and able to fail: Unix settles, then `try_wait`s, and an `Err`
+    /// means the child's state could not be told.
+    // Only non-Windows builds one outside tests.
+    #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+    Pending(Box<dyn FnOnce() -> Result<Option<ExitStatus>>>),
+}
 
-/// A spawned managed engine child, and the startup check it still owes.
+/// A spawned managed engine child, and where its startup check stands.
 pub(crate) struct SpawnedManagedEngine {
     pub(crate) pid: u32,
-    pub(crate) startup_exit: ManagedEngineStartupCheck,
+    pub(crate) startup: ManagedEngineStartupCheck,
 }
 
 /// How the launch and restart paths start an engine child. Production passes
@@ -535,18 +553,16 @@ pub(crate) fn spawn_managed_engine_process(
         // `try_wait()` to lean on. Watch the process while its handle is still
         // open instead — the Windows helper does that internally, which is what
         // makes the check free of the PID-reuse race a later `OpenProcess` would
-        // have. The check has therefore already run by the time this returns;
-        // the closure only hands its answer on.
+        // have. The check has therefore already run by the time this returns.
         let spawn = rocm_core::spawn_detached_no_inherit_watching_startup(
             request.program,
             request.args,
             &env_refs,
             MANAGED_ENGINE_STARTUP_SETTLE,
         )?;
-        let startup_exit = managed_startup_exit(&spawn);
         Ok(SpawnedManagedEngine {
             pid: spawn.pid,
-            startup_exit: Box::new(move || Ok(startup_exit)),
+            startup: ManagedEngineStartupCheck::Observed(managed_startup_exit(&spawn)),
         })
     }
     #[cfg(not(windows))]
@@ -565,44 +581,62 @@ pub(crate) fn spawn_managed_engine_process(
         let mut child = command.spawn()?;
         Ok(SpawnedManagedEngine {
             pid: child.id(),
-            startup_exit: Box::new(move || {
+            startup: ManagedEngineStartupCheck::Pending(Box::new(move || {
                 thread::sleep(MANAGED_ENGINE_STARTUP_SETTLE);
                 child
                     .try_wait()
                     .context("failed to check managed engine startup state")
-            }),
+            })),
         })
     }
 }
 
-/// Put a freshly spawned child on record, then settle its startup check: fail
-/// (and retire the record) if it is observed dead, otherwise return its pid with
-/// the record on disk as `"starting"` and naming it.
+/// Put a freshly spawned child on record and settle its startup check: fail (and
+/// retire the record) if it is observed dead, otherwise return its pid with the
+/// record on disk as `"starting"` and naming it.
 ///
-/// The record is written *before* the check is consulted, so every way the check
-/// can end leaves a record that names the child. That matters most for a check
-/// that cannot answer — a Unix `try_wait` error — which fails the launch without
-/// retiring the record, because the child's state is unknown and freeing the
-/// engine + model could put a rival engine on its port. Without this write, what
-/// that error left on disk described no process at all: a launch record still at
-/// pid 0, which `rocm services stop` cannot reach and no liveness refresh can
-/// demote; or a restart record still naming the previous run's pids, which a
-/// pending-stop marker would then read as "stopped" and delete the endpoint key
-/// of a service that may be running. With it, a stop can reach the child and the
-/// liveness refresh reconciles the record either way.
+/// A check still pending is preceded by the write, so every way it can end leaves
+/// a record that names the child. That matters most for a check that cannot
+/// answer — a Unix `try_wait` error — which fails the launch without retiring the
+/// record, because the child's state is unknown and freeing the engine + model
+/// could put a rival engine on its port. Without the write, what that error left
+/// on disk described no process at all: a launch record still at pid 0, which
+/// `rocm services stop` cannot reach and no liveness refresh can demote; or a
+/// restart record still naming the previous run's pids, which a pending-stop
+/// marker would then read as "stopped" and delete the endpoint key of a service
+/// that may be running. With it, a stop can reach the child and the liveness
+/// refresh reconciles the record either way.
 ///
-/// The one exit that leaves the record not naming the child is that write itself
-/// failing, on either platform: the launch then bails with a child running and
-/// the record as it was before the spawn.
+/// A check the spawn already answered (Windows) is read first instead, and a
+/// child it saw die is never put on record: a dead child has nothing for a stop
+/// to reach, and off Linux its pid carries no start-time token, so a stop would
+/// signal whatever process reuses that pid. Its launch is retired at pid 0, its
+/// restart with the previous run's pids — as if the spawn had not happened. A
+/// pending check that then reports a death retires a record naming the child,
+/// which on Linux carries the token that keeps a stop off a recycled pid.
+///
+/// The one exit that leaves a live child unnamed is the write itself failing:
+/// the launch then bails with the record as it was before the spawn.
 pub(crate) fn watch_managed_engine_startup<R: ManagedStartupRecord + ?Sized>(
     record: &mut R,
     spawned: SpawnedManagedEngine,
 ) -> Result<u32> {
-    let SpawnedManagedEngine { pid, startup_exit } = spawned;
-    record.persist_spawned_child(pid)?;
-    // NOT routed through `retire_record_on_error`: the child is already spawned,
-    // and a failed query means its state is unknown, not that it died.
-    let startup_exit = startup_exit()?;
+    let SpawnedManagedEngine { pid, startup } = spawned;
+    let startup_exit = match startup {
+        ManagedEngineStartupCheck::Observed(startup_exit) => {
+            if startup_exit.is_none() {
+                record.persist_spawned_child(pid)?;
+            }
+            startup_exit
+        }
+        ManagedEngineStartupCheck::Pending(check) => {
+            record.persist_spawned_child(pid)?;
+            // NOT routed through `retire_record_on_error`: the child is already
+            // spawned, and a failed query means its state is unknown, not that it
+            // died.
+            check()?
+        }
+    };
     fail_managed_launch_if_engine_died(record, startup_exit)?;
     Ok(pid)
 }
@@ -1537,7 +1571,7 @@ mod tests {
     use crate::load_managed_services;
     use crate::tests::{
         exit_status_from_code, manifest_on_disk, spawn_must_not_be_reached, spawn_that_fails,
-        stand_in_child_pid, stand_in_spawn, test_paths,
+        stand_in_child_pid, stand_in_spawn, stand_in_spawn_observed, test_paths,
     };
 
     #[test]
@@ -2063,26 +2097,78 @@ mod tests {
 
     /// The converse at the real call site: a child that survives its check is
     /// recorded `"running"` under its own pid and handed back for the readiness
-    /// wait, so the check cannot reject a healthy launch.
+    /// wait, so the check cannot reject a healthy launch — whether the check was
+    /// still pending after the spawn (Unix) or answered inside it (Windows).
     #[test]
     fn a_launch_that_survives_its_startup_check_is_recorded_running() -> Result<()> {
-        let (root, paths) = test_paths("managed-launch-survives-startup");
+        for (index, observed) in [false, true].into_iter().enumerate() {
+            let (root, paths) = test_paths(&format!("managed-launch-survives-startup-{index}"));
+            paths.ensure()?;
+            let manifest_path = paths.service_manifest_path("lemonade-qwen-3000");
+            let outcome = if observed {
+                launch_qwen_on_lemonade(&paths, 11523, &stand_in_spawn_observed(None))
+            } else {
+                let spawn =
+                    stand_in_spawn(manifest_path.clone(), std::rc::Rc::default(), || Ok(None));
+                launch_qwen_on_lemonade(&paths, 11523, &spawn)
+            };
+            let after = manifest_on_disk(&manifest_path);
+            let _ = fs::remove_dir_all(root);
+
+            let ManagedSpawn::Spawned { child_pid, .. } = outcome? else {
+                panic!("a fresh launch must spawn, not find an existing service")
+            };
+            assert_eq!(child_pid, stand_in_child_pid());
+            let after = after.expect("the record is on disk");
+            assert_eq!(
+                (after.status.as_str(), after.supervisor_pid),
+                ("running", stand_in_child_pid()),
+                "observed by the spawn: {observed}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A death the spawn itself already saw (the Windows watched spawn) must not
+    /// put the dead child on record. Off Linux its pid carries no start-time
+    /// token, so a later `rocm services stop` on the retired record could not
+    /// tell it from a process that reused the pid, and would signal that one.
+    /// The launch is retired at pid 0 instead, exactly as if nothing had spawned.
+    #[test]
+    fn a_launch_the_spawn_saw_die_is_retired_without_naming_the_dead_child() -> Result<()> {
+        let (root, paths) = test_paths("managed-launch-observed-death");
         paths.ensure()?;
         let manifest_path = paths.service_manifest_path("lemonade-qwen-3000");
-        let spawn = stand_in_spawn(manifest_path.clone(), std::rc::Rc::default(), || Ok(None));
 
-        let outcome = launch_qwen_on_lemonade(&paths, 11523, &spawn);
+        let outcome = launch_qwen_on_lemonade(
+            &paths,
+            11530,
+            &stand_in_spawn_observed(Some(exit_status_from_code(3))),
+        );
         let after = manifest_on_disk(&manifest_path);
+        let still_claimed = existing_live_managed_service(&paths, "lemonade", "qwen-canonical");
         let _ = fs::remove_dir_all(root);
 
-        let ManagedSpawn::Spawned { child_pid, .. } = outcome? else {
-            panic!("a fresh launch must spawn, not find an existing service")
+        let Err(error) = outcome else {
+            panic!("an engine that died at startup must fail the launch")
         };
-        assert_eq!(child_pid, stand_in_child_pid());
-        let after = after.expect("the record is on disk");
+        assert!(
+            format!("{error:#}").contains("managed engine exited immediately"),
+            "{error:#}"
+        );
+        let after = after.expect("the record is still on disk");
         assert_eq!(
-            (after.status.as_str(), after.supervisor_pid),
-            ("running", stand_in_child_pid())
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.engine_pid
+            ),
+            ("failed", 0, None),
+            "a child the spawn saw die must not be named by the retired record"
+        );
+        assert!(
+            still_claimed.is_none(),
+            "a launch that died at startup must not keep claiming the engine+model"
         );
         Ok(())
     }
