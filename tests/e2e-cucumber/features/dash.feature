@@ -356,3 +356,6 @@ Feature: Interactive dashboard
     Then the onboarding setup choices are displayed
     When the user chooses to adopt an existing folder
     Then the existing-folder browser shows the scenario-owned folder
+    When the user closes onboarding setup
+    And the user quits the dashboard
+    Then the dashboard exits successfully
