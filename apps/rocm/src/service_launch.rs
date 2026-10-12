@@ -318,8 +318,10 @@ fn managed_engine_startup_failure_args() -> Vec<String> {
 /// pid-0 `"starting"` record it replaces was eligible only after the 5-minute
 /// stale-`"starting"` window. Two consequences follow. A restart whose engine
 /// dies at startup is restarted again rather than left down; one that fails
-/// before spawning is not, because it leaves the record its stop wrote, which
-/// is not `"failed"`. And that recovery can race a user's own retry: `rocm
+/// before spawning usually is not, because it leaves the record its stop wrote,
+/// which is `"stopped"` — unless that stop could not confirm, when the prior
+/// status stands, and a record recovery restarted for being `"failed"` stays
+/// `"failed"` and eligible. And that recovery can race a user's own retry: `rocm
 /// serve` for the same engine + model mints a new service id, so both may try
 /// to bind the same port, and one of them loses.
 pub(crate) fn mark_managed_launch_failed(record: &mut ManagedServiceRecord) -> Result<()> {
@@ -611,9 +613,16 @@ pub(crate) fn spawn_managed_engine_process(
 /// child it saw die is never put on record: a dead child has nothing for a stop
 /// to reach, and off Linux its pid carries no start-time token, so a stop would
 /// signal whatever process reuses that pid. Its launch is retired at pid 0, its
-/// restart with the previous run's pids — as if the spawn had not happened. A
-/// pending check that then reports a death retires a record naming the child,
-/// which on Linux carries the token that keeps a stop off a recycled pid.
+/// restart naming only the previous run's pids, as the stop left them — which
+/// carry that same exposure where they have no token, but no more than the
+/// stopped record already did. A pending check that then reports a death retires
+/// a record naming the child, which on Linux carries the token that keeps
+/// `rocm services stop` off a recycled pid.
+///
+/// This closes the window only for a child that dies inside the startup check.
+/// Every Windows child is recorded without a token, so one that dies later and
+/// has its pid reused is exposed in the same way; a creation-time token from the
+/// watched spawn would be the durable fix.
 ///
 /// The one exit that leaves a live child unnamed is the write itself failing:
 /// the launch then bails with the record as it was before the spawn.
