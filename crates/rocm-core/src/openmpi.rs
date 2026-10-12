@@ -823,6 +823,75 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
     }
 }
 
+/// One of the `build_*_install_plan` functions: a distribution's `ID` and
+/// `ID_LIKE` to the plan that installs one runtime on it.
+pub type InstallPlanBuilder = fn(&str, &str) -> SystemPackageInstallPlan;
+
+/// `build`'s plan for the distribution os-release `text` declares.
+///
+/// An unreadable file (see [`crate::os_release`]) plans nothing, and the
+/// reason names the line that made it unreadable, ahead of `build`'s own
+/// manual-install advice for an unknown distribution. Without that, the plan
+/// would blame the distribution for what is a fixable line in the file.
+#[must_use]
+pub fn plan_for_os_release(text: &str, build: InstallPlanBuilder) -> SystemPackageInstallPlan {
+    match crate::os_release::id_and_id_like(text) {
+        Ok((os_id, id_like)) => build(&os_id, &id_like),
+        Err(unreadable) => {
+            let mut plan = build("", "");
+            plan.reason = format!(
+                "/etc/os-release {unreadable}, so the distribution cannot be read. {}",
+                plan.reason
+            );
+            plan
+        }
+    }
+}
+
+/// The hint the `*_install_hint` functions give for os-release `text`: the
+/// commands `build` plans when the distribution is recognised, otherwise
+/// `manual` — followed, for an unreadable file, by the line that made it so.
+// Only the Linux hints read os-release at runtime; off Linux this is exercised
+// solely by the cross-platform unit tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn install_hint_for(text: &str, build: InstallPlanBuilder, manual: &str) -> String {
+    let plan = match crate::os_release::id_and_id_like(text) {
+        Ok((os_id, id_like)) => build(&os_id, &id_like),
+        Err(unreadable) => {
+            return format!(
+                "{manual}; /etc/os-release {unreadable}, so the distribution cannot be read"
+            );
+        }
+    };
+    if plan.supported && !plan.commands.is_empty() {
+        let rendered = plan
+            .commands
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" && ");
+        return format!("install it with `{rendered}`");
+    }
+    manual.to_owned()
+}
+
+/// The real host's `/etc/os-release`, empty when it cannot be read.
+///
+/// Not routed through [`crate::host_path`]: the hints name package-manager
+/// commands for the real machine, so a simulated host root must not choose
+/// their distribution.
+#[cfg(target_os = "linux")]
+fn real_os_release() -> String {
+    std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+}
+
+const OPENMPI_MANUAL_HINT: &str = "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)";
+const LIBATOMIC_MANUAL_HINT: &str =
+    "install your distribution's libatomic runtime package (providing libatomic.so.1)";
+const LIBNUMA_MANUAL_HINT: &str =
+    "install your distribution's numactl runtime package (providing libnuma.so.1)";
+
+/// Build a short, distro-aware hint describing how to install the OpenMPI
 /// runtime that vLLM requires, for embedding in user-facing error messages.
 ///
 /// On Linux it reads `/etc/os-release` and returns the package-manager command
@@ -832,20 +901,16 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
 pub fn install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
-        let plan = build_openmpi_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
-        }
+        install_hint_for(
+            &real_os_release(),
+            build_openmpi_install_plan,
+            OPENMPI_MANUAL_HINT,
+        )
     }
-    "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)".to_owned()
+    #[cfg(not(target_os = "linux"))]
+    {
+        OPENMPI_MANUAL_HINT.to_owned()
+    }
 }
 
 /// Build a short, distro-aware hint describing how to install the `libatomic`
@@ -857,20 +922,16 @@ pub fn install_hint() -> String {
 pub fn libatomic_install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
-        let plan = build_libatomic_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
-        }
+        install_hint_for(
+            &real_os_release(),
+            build_libatomic_install_plan,
+            LIBATOMIC_MANUAL_HINT,
+        )
     }
-    "install your distribution's libatomic runtime package (providing libatomic.so.1)".to_owned()
+    #[cfg(not(target_os = "linux"))]
+    {
+        LIBATOMIC_MANUAL_HINT.to_owned()
+    }
 }
 
 /// Build a short, distro-aware hint describing how to install the real `libnuma`
@@ -882,20 +943,16 @@ pub fn libatomic_install_hint() -> String {
 pub fn libnuma_install_hint() -> String {
     #[cfg(target_os = "linux")]
     {
-        let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-        let field = |key: &str| crate::os_release::field(&os_release, key).unwrap_or_default();
-        let plan = build_libnuma_install_plan(&field("ID"), &field("ID_LIKE"));
-        if plan.supported && !plan.commands.is_empty() {
-            let rendered = plan
-                .commands
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(" && ");
-            return format!("install it with `{rendered}`");
-        }
+        install_hint_for(
+            &real_os_release(),
+            build_libnuma_install_plan,
+            LIBNUMA_MANUAL_HINT,
+        )
     }
-    "install your distribution's numactl runtime package (providing libnuma.so.1)".to_owned()
+    #[cfg(not(target_os = "linux"))]
+    {
+        LIBNUMA_MANUAL_HINT.to_owned()
+    }
 }
 
 /// Build a non-mutating apt invocation for a planned `apt-get install` command.
@@ -1068,6 +1125,80 @@ mod tests {
         let hint = install_hint();
         assert!(!hint.trim().is_empty());
         assert!(hint.to_ascii_lowercase().contains("install"));
+    }
+
+    /// Every builder, as the package plans and hints call it.
+    const BUILDERS: [(&str, InstallPlanBuilder, &str); 3] = [
+        ("openmpi", build_openmpi_install_plan, OPENMPI_MANUAL_HINT),
+        (
+            "libatomic",
+            build_libatomic_install_plan,
+            LIBATOMIC_MANUAL_HINT,
+        ),
+        ("libnuma", build_libnuma_install_plan, LIBNUMA_MANUAL_HINT),
+    ];
+
+    /// The plan comes from the file's `ID` — and from `ID_LIKE` when `ID` names
+    /// a derivative — read as `sh` reads them: single quotes, and the last of
+    /// a duplicated key.
+    #[test]
+    fn a_plan_is_built_for_the_distribution_the_file_declares() {
+        for (label, build, _) in BUILDERS {
+            let apt = build("ubuntu", "");
+            let dnf = build("fedora", "");
+            assert_ne!(apt.package_manager, dnf.package_manager, "{label}");
+            for (text, expected) in [
+                ("ID='ubuntu'\n", &apt),
+                ("ID=fedora\nID=ubuntu\n", &apt),
+                // A derivative `ID` resolves through `ID_LIKE`.
+                ("ID=derivative\nID_LIKE='fedora'\n", &dnf),
+            ] {
+                assert_eq!(
+                    &plan_for_os_release(text, build),
+                    expected,
+                    "{label}: {text:?}"
+                );
+            }
+            // And the hints recommend the same commands the plans would run.
+            let hint = install_hint_for("ID=ubuntu\n", build, "manual");
+            assert!(hint.starts_with("install it with `"), "{label}: {hint}");
+            assert_eq!(
+                install_hint_for("ID=plan9\n", build, "manual"),
+                "manual",
+                "{label}"
+            );
+        }
+    }
+
+    /// The message and the plan it describes, together: an unreadable file
+    /// plans nothing, and both the plan's reason and the hint name the line
+    /// rather than blaming an unknown distribution.
+    #[test]
+    fn an_unreadable_file_plans_nothing_and_names_its_line() {
+        let text = "ID=ubuntu\nexport ID=debian\n";
+        for (label, build, manual) in BUILDERS {
+            let plan = plan_for_os_release(text, build);
+            assert!(!plan.supported, "{label}");
+            assert_eq!(plan.package_manager, None, "{label}");
+            assert!(plan.commands.is_empty(), "{label}");
+            assert!(plan.packages.is_empty(), "{label}");
+            assert!(
+                plan.reason.starts_with(
+                    "/etc/os-release line 2 is not a plain assignment: \"export ID=debian\", \
+                     so the distribution cannot be read. Could not map distribution"
+                ),
+                "{label}: {}",
+                plan.reason
+            );
+            assert_eq!(
+                install_hint_for(text, build, manual),
+                format!(
+                    "{manual}; /etc/os-release line 2 is not a plain assignment: \
+                     \"export ID=debian\", so the distribution cannot be read"
+                ),
+                "{label}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

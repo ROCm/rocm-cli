@@ -88,6 +88,25 @@ impl fmt::Display for UnreadableLine {
     }
 }
 
+impl std::error::Error for UnreadableLine {}
+
+/// The `ID` and `ID_LIKE` a package-manager plan is chosen by, each `""` when
+/// the file does not assign it — or the line that makes the file unreadable.
+///
+/// The one place the package plans and install hints look these keys up, so
+/// they cannot drift apart, and the file is parsed once for both.
+///
+/// # Errors
+///
+/// [`UnreadableLine`] when [`parse`] finds the file unreadable.
+pub fn id_and_id_like(text: &str) -> Result<(String, String), UnreadableLine> {
+    let mut fields = parse(text)?;
+    Ok((
+        fields.remove("ID").unwrap_or_default(),
+        fields.remove("ID_LIKE").unwrap_or_default(),
+    ))
+}
+
 /// The value of `key` in os-release `text`, as `sh` would assign it, or `None`.
 ///
 /// `None` when the key is absent, or when the file is unreadable — see

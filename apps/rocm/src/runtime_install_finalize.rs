@@ -202,10 +202,10 @@ pub(crate) fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
         return Ok(());
     }
 
-    let os_release = read_os_release().unwrap_or_default();
-    let os_id = rocm_core::os_release::field(&os_release, "ID").unwrap_or_default();
-    let id_like = rocm_core::os_release::field(&os_release, "ID_LIKE").unwrap_or_default();
-    let plan = rocm_core::openmpi::build_openmpi_install_plan(&os_id, &id_like);
+    let plan = rocm_core::openmpi::plan_for_os_release(
+        &read_os_release().unwrap_or_default(),
+        rocm_core::openmpi::build_openmpi_install_plan,
+    );
 
     println!("openmpi setup");
     println!(
@@ -297,7 +297,7 @@ struct TorchRuntimeDep {
     /// Detection probe: returns whether the dependency is already loadable.
     present: fn() -> bool,
     /// Builds the distro-aware install plan from the parsed os-release fields.
-    build_plan: fn(&str, &str) -> rocm_core::openmpi::SystemPackageInstallPlan,
+    build_plan: rocm_core::openmpi::InstallPlanBuilder,
 }
 
 /// Ensure the `libatomic` runtime that PyTorch's ROCm wheel links against is
@@ -377,10 +377,10 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
         return;
     }
 
-    let os_release = read_os_release().unwrap_or_default();
-    let os_id = rocm_core::os_release::field(&os_release, "ID").unwrap_or_default();
-    let id_like = rocm_core::os_release::field(&os_release, "ID_LIKE").unwrap_or_default();
-    let plan = (dep.build_plan)(&os_id, &id_like);
+    let plan = rocm_core::openmpi::plan_for_os_release(
+        &read_os_release().unwrap_or_default(),
+        dep.build_plan,
+    );
 
     println!("{} setup", dep.name);
     println!("  reason: {}", dep.reason);
@@ -390,8 +390,9 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
     println!("  detail: {}", plan.reason);
 
     if !plan.supported {
-        // The distro is unknown or the dependency ships with the base toolchain;
-        // nothing actionable to auto-install.
+        // The distro is unknown, or its release file is unreadable (the detail
+        // above names the line), or the dependency ships with the base
+        // toolchain; nothing actionable to auto-install.
         return;
     }
 
