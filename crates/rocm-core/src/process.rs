@@ -4,9 +4,10 @@
 
 //! Process-spawn and -terminate primitives.
 //!
-//! Detached/hidden-console spawn on both platforms, exit-wait and
-//! tree-terminate, and the exclusive `FileLock` used to serialize
-//! install/provisioning across processes.
+//! Hidden-console/detached spawn and exit-wait on Windows, process/process-tree
+//! termination on both platforms, and the exclusive `FileLock` used to
+//! serialize the daemon autostart path, the managed-launch GPU claim, and
+//! `uv` installs across processes.
 
 #[cfg(windows)]
 use anyhow::bail;
