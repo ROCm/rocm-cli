@@ -1739,8 +1739,9 @@ fn same_path_text(left: &Path, right: &Path) -> bool {
 /// it kept, replaced, set aside and left in place, and its warnings.
 ///
 /// Nothing at `source_path` is touched until the new tree is fully unpacked
-/// and `before_swap` has allowed it, so a failed download, a bad archive or a
-/// refusal from `before_swap` leaves an existing install as it was.
+/// and `before_swap` has allowed it, so a failed download, a bad archive, one
+/// that is not a ComfyUI release, or a refusal from `before_swap` leaves an
+/// existing install as it was.
 fn download_and_extract_source(
     app_root: &Path,
     source_path: &Path,
@@ -1773,36 +1774,47 @@ fn download_and_extract_source(
     let extract_root = app_root
         .join("extract")
         .join(format!("source-{}", unix_time_millis()));
-    let result = unpack_source_archive(&archive_path, &extract_root).and_then(|extracted| {
-        before_swap()?;
-        let report = source_swap::install_release_tree(&extracted, source_path)?;
-        writeln!(log, "Installed source at {}.", source_path.display())?;
-        for name in &report.kept {
-            writeln!(log, "Kept {name}.")?;
-        }
-        for name in &report.replaced {
-            writeln!(log, "Replaced {name}.")?;
-        }
-        for (name, new_name) in &report.set_aside {
-            writeln!(log, "Set aside {name} as {new_name}.")?;
-        }
-        for name in &report.left_in_place {
-            writeln!(log, "Left in place {name}.")?;
-        }
-        for warning in &report.warnings {
-            writeln!(log, "Warning: {warning}")?;
-        }
-        Ok(report)
-    });
+    // Replacing an install with something that is not ComfyUI would leave
+    // nothing startable where it was; a first install has nothing to lose.
+    let replaces_an_install = fs::symlink_metadata(source_path).is_ok();
+    let result = unpack_source_archive(&archive_path, &extract_root, replaces_an_install).and_then(
+        |extracted| {
+            before_swap()?;
+            let report = source_swap::install_release_tree(&extracted, source_path)?;
+            writeln!(log, "Installed source at {}.", source_path.display())?;
+            for name in &report.kept {
+                writeln!(log, "Kept {name}.")?;
+            }
+            for name in &report.replaced {
+                writeln!(log, "Replaced {name}.")?;
+            }
+            for (name, new_name) in &report.set_aside {
+                writeln!(log, "Set aside {name} as {new_name}.")?;
+            }
+            for name in &report.left_in_place {
+                writeln!(log, "Left in place {name}.")?;
+            }
+            for warning in &report.warnings {
+                writeln!(log, "Warning: {warning}")?;
+            }
+            Ok(report)
+        },
+    );
     fs::remove_dir_all(&extract_root).ok();
     Ok((source_url, result?))
 }
 
 /// Unpacks `archive_path` under `extract_root` and returns the archive's
-/// top-level folder. A cached archive that cannot be unpacked, or that is not
-/// a ComfyUI release (no `main.py` in that folder), is dropped, so the next
-/// attempt downloads a fresh copy instead of failing the same way.
-fn unpack_source_archive(archive_path: &Path, extract_root: &Path) -> Result<PathBuf> {
+/// top-level folder. With `require_main_py` (an install is there to be
+/// replaced), an archive that is not a ComfyUI release (no `main.py` in that
+/// folder) is refused. A cached archive that cannot be unpacked, or that is
+/// refused, is dropped, so the next attempt downloads a fresh copy instead of
+/// failing the same way.
+fn unpack_source_archive(
+    archive_path: &Path,
+    extract_root: &Path,
+    require_main_py: bool,
+) -> Result<PathBuf> {
     fs::create_dir_all(extract_root)
         .with_context(|| format!("failed to create {}", extract_root.display()))?;
     let archive = fs::File::open(archive_path)
@@ -1813,7 +1825,7 @@ fn unpack_source_archive(archive_path: &Path, extract_root: &Path) -> Result<Pat
         .with_context(|| format!("failed to extract {}", archive_path.display()))
         .and_then(|()| first_child_dir(extract_root))
         .and_then(|release| {
-            if release.join("main.py").is_file() {
+            if !require_main_py || release.join("main.py").is_file() {
                 Ok(release)
             } else {
                 bail!(
@@ -4732,7 +4744,7 @@ mod archive_properties {
         fs::copy(archive, &cached)?;
         let mut log = fs::File::create(layout.base.join("install.log"))?;
         let source_path = source_path_from_app_root(app_root);
-        download_and_extract_source(app_root, &source_path, &mut log)?;
+        download_and_extract_source(app_root, &source_path, &mut log, &|| Ok(()))?;
         fs::create_dir_all(models_folder_for_source(&source_path))?;
         Ok(())
     }

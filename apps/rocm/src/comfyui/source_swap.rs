@@ -173,8 +173,8 @@ pub(super) fn swap_interrupted(source: &Path) -> bool {
 /// the release only adds what is missing (see [`add_missing_entries`]).
 /// Preserved entries, and every entry no release shipped, are never moved,
 /// copied, overwritten, deleted or written through when they are symlinks.
-/// A release without `main.py` at its top is refused before anything at
-/// `source` changes.
+/// Over an existing `source`, a release without `main.py` at its top is
+/// refused before anything there changes.
 pub(super) fn install_release_tree(new_tree: &Path, source: &Path) -> Result<SwapReport> {
     install_release_tree_with(new_tree, source, &mut |_| Ok(()))
 }
@@ -200,17 +200,6 @@ fn install_release_tree_removing_with(
     remove: &dyn Fn(&Path) -> io::Result<()>,
 ) -> Result<SwapReport> {
     let new_names = release_names(new_tree)?;
-    // Not a ComfyUI release, or one laid out differently: installing it would
-    // remove the installed code and put nothing startable in its place.
-    // `install` already rejects such an archive while unpacking it (and drops
-    // the cached copy); this keeps the swap safe for any caller.
-    if !new_names.iter().any(|name| name == ENTRY_POINT) {
-        bail!(
-            "the downloaded ComfyUI release has no {ENTRY_POINT} at the top of {}; nothing \
-             was changed",
-            new_tree.display()
-        );
-    }
     if fs::symlink_metadata(source).is_err() {
         let parent = source
             .parent()
@@ -229,6 +218,17 @@ fn install_release_tree_removing_with(
     }
     if !source.is_dir() {
         bail!("{} exists but is not a folder", source.display());
+    }
+    // Not a ComfyUI release, or one laid out differently: installing it would
+    // remove the installed code and put nothing startable in its place.
+    // `install` already rejects such an archive while unpacking it (and drops
+    // the cached copy); this keeps the swap safe for any caller.
+    if !new_names.iter().any(|name| name == ENTRY_POINT) {
+        bail!(
+            "the downloaded ComfyUI release has no {ENTRY_POINT} at the top of {}; nothing \
+             was changed",
+            new_tree.display()
+        );
     }
 
     let mut report = SwapReport::default();
@@ -1550,8 +1550,7 @@ mod tests {
 
     /// A release without `main.py` at its top (not ComfyUI, or a different
     /// layout) is refused before anything changes: the installed code, the
-    /// user's files and the record stay, no marker is written, and no install
-    /// is created where there was none.
+    /// user's files and the record stay, and no marker is written.
     #[test]
     fn a_release_without_main_py_changes_nothing() -> Result<()> {
         let dir = TestDir::new("no-main");
@@ -1576,10 +1575,6 @@ mod tests {
         assert_user_files_intact(&source);
         assert!(!swap_interrupted(&source));
         assert_eq!(read(&source.join(RELEASE_RECORD)), record_before);
-
-        let fresh = dir.0.join("fresh").join("source");
-        install_release_tree(&tree, &fresh).expect_err("refused for a fresh install too");
-        assert!(!fresh.exists());
         Ok(())
     }
 

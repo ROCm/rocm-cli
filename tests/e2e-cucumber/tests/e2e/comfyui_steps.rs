@@ -543,7 +543,7 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     let build_dir = root(world).join("comfyui-fixture").join("archive-build");
     let source_dir = build_dir.join("ComfyUI-master");
     std::fs::create_dir_all(&source_dir).expect("failed to create ComfyUI source directory");
-    // Every ComfyUI release has it; an archive without one is refused.
+    // Every ComfyUI release has it; a reinstall refuses an archive without one.
     write_fixture(&source_dir.join("main.py"), "");
     write_fixture(
         &source_dir.join("requirements.txt"),
