@@ -12,6 +12,7 @@
 
 use crate::{AppPaths, unix_time_millis};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
     let root = workspace_test_artifact_dir().join(format!(
@@ -25,6 +26,18 @@ pub(crate) fn temp_app_paths(name: &str) -> (PathBuf, AppPaths) {
         cache_dir: root.join("cache"),
     };
     (root, paths)
+}
+
+/// Process id, wall-clock millis and a per-process counter, so two names
+/// minted in the same millisecond by the same process still differ.
+pub(crate) fn unique_suffix() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        unix_time_millis(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub(crate) fn workspace_test_artifact_dir() -> PathBuf {
