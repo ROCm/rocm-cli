@@ -360,6 +360,12 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_column_zero_comment_does_not_end_the_jobs_block() {
+        let text = "on: push\njobs:\n  first:\n    runs-on: x\n# ---- later lanes ----\n  second:\n    runs-on: y\nenv:\n  A: b\n";
+        assert_eq!(job_ids(text), ["first", "second"]);
+    }
+
     /// Extract the direct scalar entries from a named job-level mapping such as
     /// `env:`. Nested step mappings cannot satisfy this extractor.
     fn job_mapping(block: &str, mapping: &str) -> BTreeMap<String, String> {
@@ -475,8 +481,18 @@ mod tests {
             .unwrap_or_else(|| panic!("workflow declares a top-level {marker}"));
         let end = lines[start + 1..]
             .iter()
-            .position(|line| !line.is_empty() && !line.starts_with(char::is_whitespace))
+            // A column-0 `#` comment is not a key: it must not end the block,
+            // or every job after a section-divider comment would drop out.
+            .position(|line| {
+                !line.is_empty() && !line.starts_with(char::is_whitespace) && !line.starts_with('#')
+            })
             .map_or(lines.len(), |offset| start + 1 + offset);
+        // A comment just above the next key belongs to that key, not to this
+        // block, so trailing comment and blank lines are left out.
+        let mut end = end;
+        while end > start + 1 && (lines[end - 1].is_empty() || lines[end - 1].starts_with('#')) {
+            end -= 1;
+        }
         let mut block = lines[start]
             .strip_prefix(&marker)
             .expect("top-level key prefix was just matched")
@@ -718,14 +734,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     #[test]
     fn every_ci_job_declares_a_timeout() {
         let ci = read_workflow("ci.yml");
-        let jobs = top_level_block(&ci, "jobs");
-        let job_ids: Vec<&str> = jobs
-            .lines()
-            .filter(|line| indent_of(line) == 2 && !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.trim().strip_suffix(':'))
-            .collect();
+        let job_ids = job_ids(&ci);
         assert!(!job_ids.is_empty(), "expected at least one job in ci.yml");
-        for job in job_ids {
+        for job in &job_ids {
             let block = job_block(&ci, job);
             assert!(
                 block
