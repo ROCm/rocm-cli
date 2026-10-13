@@ -3410,8 +3410,9 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
     if let Some(raw_arch) = host_arch.as_deref()
         && gfx_target_has_no_rocm_build(raw_arch)
     {
+        let message = unsupported_host_gpu_message(raw_arch);
         let diagnostics = detect_host_gpu_diagnostics();
-        bail!("{}\n\n{diagnostics}", unsupported_host_gpu_message(raw_arch));
+        bail!("{message}\n\n{diagnostics}");
     }
 
     bail!(

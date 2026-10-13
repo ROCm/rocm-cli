@@ -104,9 +104,11 @@ pub fn extract_first_gfx_token(text: &str) -> Option<String> {
         })
 }
 
-/// Whether `gfx` names a GPU target the CLI recognizes but that no TheRock
-/// package family covers, so `normalize_therock_family` returns `None` for it
-/// on purpose rather than because the target is unknown.
+/// Whether `gfx` is a GPU target that is known to have no ROCm build.
+///
+/// This is the case when the CLI recognizes the target but no TheRock package
+/// family covers it, so `normalize_therock_family` returns `None` for it on
+/// purpose rather than because the target is unknown.
 ///
 /// Today that is gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
 /// APUs. Callers use it to say "detected, but not supported by ROCm" instead of
@@ -1764,7 +1766,10 @@ impl ExamineSummary {
     /// it `compatible_therock_family: <unknown>` reads like a probe failure, when
     /// the GPU was in fact recognized and simply has no ROCm build.
     fn rocm_support_line(&self) -> String {
-        match (self.detected_gfx_target.as_deref(), self.compatible_therock_family.as_deref()) {
+        match (
+            self.detected_gfx_target.as_deref(),
+            self.compatible_therock_family.as_deref(),
+        ) {
             (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => format!(
                 "  rocm_support: GPU detected ({gfx}) but not supported by ROCm; \
                  the Vulkan backend can still be used\n"
@@ -3399,9 +3404,18 @@ mod tests {
         // A feature-suffixed spelling, as KFD / rocminfo can report it.
         assert_eq!(normalize_therock_family("gfx90c:xnack-"), None);
         // The neighbouring Vega parts keep their families.
-        assert_eq!(normalize_therock_family("gfx900"), Some("gfx900".to_owned()));
-        assert_eq!(normalize_therock_family("gfx906"), Some("gfx906".to_owned()));
-        assert_eq!(normalize_therock_family("gfx90a"), Some("gfx90a".to_owned()));
+        assert_eq!(
+            normalize_therock_family("gfx900"),
+            Some("gfx900".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx906"),
+            Some("gfx906".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx90a"),
+            Some("gfx90a".to_owned())
+        );
     }
 
     #[test]
@@ -3421,14 +3435,23 @@ mod tests {
         // and has a mapped PCI ID, but it must not hide the discrete GPU.
         let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
                     AMD Radeon RX 6600\tPCI\\VEN_1002&DEV_73E0";
-        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx1032".to_owned()));
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1032".to_owned())
+        );
         // The name fallback also outranks the unsupported iGPU.
         let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
                     AMD Radeon RX 6800M\tPCI\\VEN_1002&DEV_9999";
-        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx1031".to_owned()));
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1031".to_owned())
+        );
         // Alone, the iGPU is still reported as gfx90c.
         let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636";
-        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx90c".to_owned()));
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx90c".to_owned())
+        );
     }
 
     #[test]
@@ -4531,12 +4554,18 @@ Class Name:                Display
         let family = normalize_therock_family("gfx90c");
         let summary = examine_summary_with_gpu(Some("gfx90c"), family.as_deref());
         let rendered = summary.render_text();
-        assert!(rendered.contains("detected_gfx_target: gfx90c"), "{rendered}");
+        assert!(
+            rendered.contains("detected_gfx_target: gfx90c"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("rocm_support: GPU detected (gfx90c) but not supported by ROCm"),
             "{rendered}"
         );
-        assert!(rendered.contains("the Vulkan backend can still be used"), "{rendered}");
+        assert!(
+            rendered.contains("the Vulkan backend can still be used"),
+            "{rendered}"
+        );
     }
 
     #[test]
