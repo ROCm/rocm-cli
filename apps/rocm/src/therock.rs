@@ -948,13 +948,15 @@ struct TarballIndexFile {
     mtime: f64,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+/// What [`parse_version`]'s strict grammar gate yields: only the parts a
+/// caller reads. The patch and stage number are still parsed, so a malformed
+/// one still fails the gate, but nothing orders by them here — ordering goes
+/// through [`VersionOrderKey`].
+#[derive(Debug, Clone)]
 struct ParsedVersion {
     major: u32,
     minor: u32,
-    patch: u32,
     stage: VersionStage,
-    stage_number: u64,
 }
 
 /// A version's position in the PEP 440 order, as produced by
@@ -962,9 +964,10 @@ struct ParsedVersion {
 ///
 /// Separate from [`ParsedVersion`] because the two answer different questions.
 /// `ParsedVersion` is what [`parse_version`]'s strict grammar gate yields, and
-/// its fixed `major`/`minor`/`patch` are read directly by the PyTorch stack
-/// matchers. This one exists only to be compared, so its release segment is a
-/// vector and it has no fields a caller would reach into.
+/// is never compared: the PyTorch stack matchers read its `major`, `minor` and
+/// `stage`, and the layout selection its `major`. This one exists only to be
+/// compared, so its release segment is a vector and it has no fields a caller
+/// would reach into.
 ///
 /// Field order is the comparison order, and it is PEP 440's: release segment
 /// first, then stage, then the stage's number.
@@ -6350,8 +6353,10 @@ fn validate_tarball_file_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Total order over published version strings — the single definition of
-/// "newer" for every "which build does the user get?" decision in this module.
+/// Total order over published version strings — the total order used for
+/// sorting candidates in this module's "which build does the user get?"
+/// decisions. It is not always the first key: [`select_tarball_candidate`]
+/// orders by upload time first and uses this only to break ties.
 ///
 /// Ordering is PEP 440's, because these strings come from a Python simple
 /// index: within one release `7.0.0.dev1` < `7.0.0a1` < `7.0.0b1` <
@@ -6455,7 +6460,12 @@ fn parse_version_for_ordering(value: &str) -> Option<VersionOrderKey> {
     }
 
     // An epoch (`1!2.0`) changes what the release numbers mean, so a version
-    // carrying one must not be ordered as though it did not.
+    // carrying one must not be ordered as though it did not. This check is
+    // redundant today and kept as documentation: the `!` is neither a release
+    // digit nor a stage label, so `parse_version_stage` below rejects every
+    // epoch anyway. That rejection is incidental, though; this is the line
+    // that states the rule, and it keeps holding if the stage parser ever
+    // accepts more.
     if value.contains('!') {
         return None;
     }
@@ -6563,15 +6573,18 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     if patch_len == 0 {
         return None;
     }
-    let patch = patch_and_rest[..patch_len].parse().ok()?;
+    // Parsed only to be validated: nothing reads the patch or stage number.
+    patch_and_rest[..patch_len].parse::<u32>().ok()?;
     let suffix = &patch_and_rest[patch_len..];
 
-    let (stage, stage_number) = if suffix.is_empty() {
-        (VersionStage::Stable, 0)
+    let stage = if suffix.is_empty() {
+        VersionStage::Stable
     } else if let Some(rest) = suffix.strip_prefix("rc") {
-        (VersionStage::Rc, rest.parse().ok()?)
+        rest.parse::<u64>().ok()?;
+        VersionStage::Rc
     } else if let Some(rest) = suffix.strip_prefix('a') {
-        (VersionStage::Alpha, rest.parse().ok()?)
+        rest.parse::<u64>().ok()?;
+        VersionStage::Alpha
     } else {
         return None;
     };
@@ -6579,9 +6592,7 @@ fn parse_version(value: &str) -> Option<ParsedVersion> {
     Some(ParsedVersion {
         major,
         minor,
-        patch,
         stage,
-        stage_number,
     })
 }
 
@@ -9045,6 +9056,50 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The registry load itself breaks install-time ties on the runtime key,
+    /// not only the sort helper it calls: the startup update check and
+    /// `runtimes_cmd::newest_installed_runtime_manifest` both take the first
+    /// entry `load_runtime_manifests` returns, and neither re-sorts.
+    ///
+    /// Both pairings of file name and runtime key are written, so whichever
+    /// file `read_dir` returns first holds `bbb` in one of them: a load that
+    /// kept the read order for a tie picks the wrong runtime there.
+    #[test]
+    fn registry_load_breaks_install_time_ties_on_the_runtime_key() -> Result<()> {
+        for (first_file_key, second_file_key) in [("aaa", "bbb"), ("bbb", "aaa")] {
+            let (root, paths) = test_paths("registry-load-tie");
+            let registry = runtime_registry_dir(&paths);
+            fs::create_dir_all(&registry)?;
+            for (file, key) in [("first", first_file_key), ("second", second_file_key)] {
+                fs::write(
+                    registry.join(format!("{file}.json")),
+                    serde_json::to_vec_pretty(&test_runtime_manifest(
+                        key,
+                        "therock-release:gfx120X-all",
+                        2_000,
+                    ))?,
+                )?;
+            }
+            let pairing = format!("files first={first_file_key}, second={second_file_key}");
+
+            let keys = load_runtime_manifests(&paths)?
+                .into_iter()
+                .map(|manifest| manifest.runtime_key)
+                .collect::<Vec<_>>();
+            assert_eq!(keys, ["aaa", "bbb"], "{pairing}");
+            assert_eq!(
+                crate::runtimes_cmd::newest_installed_runtime_manifest(&paths)?
+                    .map(|manifest| manifest.runtime_key)
+                    .as_deref(),
+                Some("aaa"),
+                "{pairing}"
+            );
+
+            let _ = fs::remove_dir_all(&root);
+        }
         Ok(())
     }
 

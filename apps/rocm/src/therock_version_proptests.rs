@@ -143,6 +143,24 @@ fn oracle(left: &str, right: &str) -> Option<Ordering> {
     Some(left.cmp(&right))
 }
 
+/// Whether `version` carries a stage directly on a two-component release, as
+/// `7.9rc1` does: the ordering parser reads the stage off the minor component.
+fn stage_rides_on_two_components(version: &str) -> bool {
+    let Some(key) = parse_version_for_ordering(version) else {
+        return false;
+    };
+    let release_text = version
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .next()
+        .unwrap_or_default();
+    key.stage != VersionStage::Stable
+        && release_text
+            .split('.')
+            .filter(|part| !part.is_empty())
+            .count()
+            == 2
+}
+
 // ---------------------------------------------------------------------------
 // Manifest generation
 // ---------------------------------------------------------------------------
@@ -656,6 +674,33 @@ fn compare_version_strings_orders_pep440_stages() {
         }
     }
 
+    // The alias labels and separated numerals sit where the ladder says, written
+    // out rather than derived: `preview` is a release candidate (not an alpha),
+    // `r` a post-release, and `rc.1` / `-rc-1` the same rc as `rc1`. Each of
+    // these only reaches its stage if the labels are tried longest first and
+    // the numeral's separator is dropped.
+    for (earlier, later) in [
+        ("7.0.0b1", "7.0.0preview1"),
+        ("7.0.0preview1", "7.0.0rc2"),
+        ("7.0.0b1", "7.0.0rc.1"),
+        ("7.0.0rc.1", "7.0.0rc2"),
+        ("7.0.0b1", "7.0.0-rc-1"),
+        ("7.0.0-rc-1", "7.0.0rc2"),
+        ("7.0.0", "7.0.0r1"),
+        ("7.0.0r1", "7.0.0.post2"),
+    ] {
+        assert_eq!(
+            compare_version_strings(earlier, later),
+            Ordering::Less,
+            "{earlier} must precede {later}"
+        );
+        assert_eq!(
+            compare_version_strings(later, earlier),
+            Ordering::Greater,
+            "{later} must follow {earlier}"
+        );
+    }
+
     // The pairs that used to form the cycle, stated directly.
     assert_eq!(
         compare_version_strings("7.0.0", "7.0.0b1"),
@@ -852,6 +897,33 @@ fn install_messages_treat_equal_spellings_as_one_version() {
     );
     assert!(text.starts_with("upgrade from installed"), "{text}");
 
+    // When one side cannot be identified there is no version relation, and the
+    // total order decides: the unreadable side sorts below every readable one,
+    // so it reads as the older side — never as a reinstall of the same build.
+    let unidentifiable = manifest(
+        "nightly-wheel-gfx120X-all-custom-build".to_owned(),
+        "nightly".to_owned(),
+        "wheel".to_owned(),
+        "gfx120X-all".to_owned(),
+        "custom-build".to_owned(),
+        false,
+        1_000,
+    );
+    let text = super::active_default_relation_text(
+        &unidentifiable,
+        super::TheRockChannel::Nightly,
+        "gfx120X-all",
+        "7.0.0",
+    );
+    assert!(text.starts_with("upgrade from installed"), "{text}");
+    let text = super::active_default_relation_text(
+        &active,
+        super::TheRockChannel::Nightly,
+        "gfx120X-all",
+        "custom-build",
+    );
+    assert!(text.starts_with("downgrade from installed"), "{text}");
+
     assert_eq!(
         super::repo_version_without_wheels(Some("7.0.0rc1"), "7.0.0-rc1"),
         None
@@ -916,6 +988,9 @@ fn compare_version_strings_accepts_pep440_spellings() {
         "7.0.0RC1",
         "7.0.0c1",
         "7.0.0pre1",
+        "7.0.0preview1",
+        "7.0.0rc.1",
+        "7.0.0-rc-1",
         "v7.0.0rc1",
     ] {
         assert_eq!(
@@ -932,6 +1007,7 @@ fn compare_version_strings_accepts_pep440_spellings() {
     assert_eq!(oracle("7.0.0alpha1", "7.0.0a1"), Some(Ordering::Equal));
     assert_eq!(oracle("7.0.0beta1", "7.0.0b1"), Some(Ordering::Equal));
     assert_eq!(oracle("7.0.0rev1", "7.0.0.post1"), Some(Ordering::Equal));
+    assert_eq!(oracle("7.0.0r1", "7.0.0.post1"), Some(Ordering::Equal));
     // An omitted stage numeral is zero, per PEP 440.
     assert_eq!(oracle("7.0.0rc", "7.0.0rc0"), Some(Ordering::Equal));
 
@@ -1151,11 +1227,10 @@ fn runtime_freshness_follows_the_version_order() {
         RuntimeFreshness::UpdateAvailable
     );
 
-    // A four-component installed version against an older index must not be
-    // offered an "update". Sorting an unreadable string low is safe for the
-    // "newest candidate" pickers and would be a downgrade offer here, which is
-    // why this caller requires both sides to be identifiable rather than
-    // reusing the sort order.
+    // A four-component installed version is read as a release
+    // (`7.2.4.70204` is `[7, 2, 4, 70204]`), so it orders above an older index
+    // and is not offered an "update". This pins four-component ordering in the
+    // verdict; it does not reach the unidentifiable arm below.
     let packaged = at("7.2.4.70204");
     assert_eq!(
         runtime_freshness(&packaged, "6.4.3", None, &packaged.runtime_key),
@@ -1164,7 +1239,10 @@ fn runtime_freshness_follows_the_version_order() {
 
     // A runtime adopted from an existing environment carries whatever its probe
     // reported. That cannot be ordered against an index version at all, so no
-    // update is offered rather than one that might be a downgrade.
+    // update is offered rather than one that might be a downgrade. Sorting an
+    // unreadable string low is safe for the "newest candidate" pickers and
+    // would be a downgrade offer here, which is why this caller requires both
+    // sides to be identifiable rather than reusing the sort order.
     let unidentifiable = at("custom-build");
     assert_eq!(
         runtime_freshness(&unidentifiable, "7.10.0", None, &unidentifiable.runtime_key),
@@ -1230,6 +1308,8 @@ fn generator_reach_report() {
     let mut pair_stage_rc = 0u32;
     let mut pair_stage_post = 0u32;
     let mut pair_update_downgrade_direction = 0u32;
+    let mut pair_two_distinct_unreadable = 0u32;
+    let mut pair_stage_on_two_components = 0u32;
 
     let pair = (version(), version());
     for _ in 0..SAMPLES {
@@ -1258,6 +1338,12 @@ fn generator_reach_report() {
         let right_key = parse_version_for_ordering(&right);
         if left_key.is_none() || right_key.is_none() {
             pair_unreadable_for_ordering += 1;
+        }
+        if left_key.is_none() && right_key.is_none() && left != right {
+            pair_two_distinct_unreadable += 1;
+        }
+        if stage_rides_on_two_components(&left) || stage_rides_on_two_components(&right) {
+            pair_stage_on_two_components += 1;
         }
         let keys = [&left_key, &right_key];
         if keys.into_iter().flatten().any(|key| key.release.len() >= 4) {
@@ -1384,6 +1470,14 @@ fn generator_reach_report() {
         pct(pair_update_downgrade_direction, pair_total)
     );
     println!(
+        "  two distinct unreadable strings     {pair_two_distinct_unreadable:>6} ({:.1}%)",
+        pct(pair_two_distinct_unreadable, pair_total)
+    );
+    println!(
+        "  stage on a two-component release    {pair_stage_on_two_components:>6} ({:.1}%)",
+        pct(pair_stage_on_two_components, pair_total)
+    );
+    println!(
         "  four-component (or longer) release  {pair_four_component_release:>6} ({:.1}%)",
         pct(pair_four_component_release, pair_total)
     );
@@ -1411,10 +1505,6 @@ fn generator_reach_report() {
     println!(
         "  equal installed_at_unix_ms          {set_with_timestamp_tie:>6} ({:.1}%)",
         pct(set_with_timestamp_tie, set_total)
-    );
-    println!(
-        "  duplicate runtime_key               {set_with_duplicate_key:>6} ({:.1}%)",
-        pct(set_with_duplicate_key, set_total)
     );
     println!(
         "  shared runtime_id                   {set_with_shared_runtime_id:>6} ({:.1}%)",
@@ -1457,6 +1547,27 @@ fn generator_reach_report() {
         pair_oracle_equal_strings_differ > SAMPLES / 200,
         "generator rarely produces two spellings of one version, so the update \
          verdict's equal-version arm goes unexercised"
+    );
+    // `latest` is in `VERSIONS` so the comparator's both-unreadable arm sees two
+    // different strings; without this floor, dropping it would go unnoticed.
+    assert!(
+        pair_two_distinct_unreadable > SAMPLES / 500,
+        "generator rarely pairs two distinct unreadable strings, so the \
+         comparator's both-unreadable arm only ever sees a string against itself"
+    );
+    // `7.9rc1` is in `VERSIONS` for the one ordering-parser branch nothing else
+    // reaches: a stage directly after the minor component.
+    assert!(
+        pair_stage_on_two_components > SAMPLES / 50,
+        "generator rarely produces a stage on a two-component release, so that \
+         parser branch goes unexercised"
+    );
+    // Not a reach floor: `manifest_set` drops a row whose key it has already
+    // produced, as the registry (one file per runtime key) would hold it, so a
+    // duplicate key never occurs. Asserted so the claim stays true.
+    assert_eq!(
+        set_with_duplicate_key, 0,
+        "manifest_set produced two manifests with one runtime_key"
     );
     assert!(
         set_with_timestamp_tie > SAMPLES / 20,
