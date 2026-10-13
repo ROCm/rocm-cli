@@ -1830,14 +1830,14 @@ async fn user_serves_the_same_model_again(world: &mut E2eWorld) {
     user_serves_with_lemonade(world).await;
 }
 
-#[then("that serve reaches the engine launch again rather than being refused as already running")]
+#[then("that serve reaches the engine launch again and fails the same way")]
 async fn assert_retry_reaches_the_engine_launch(world: &mut E2eWorld) {
-    // What the user sees of the retirement: a retry is not refused as already
-    // running, and reaches the engine launch again, dying there the same way.
-    // This is not what proves the record was retired — on Unix the record names
-    // the dead child, so the liveness refresh behind the idempotency guard would
-    // let a retry through even unretired. The `failed` status asserted by the
-    // previous step carries that claim on every lane.
+    // The retry reaches the engine launch again and dies there the same way. This
+    // step does not carry the retirement claim: on Unix the record names the dead
+    // child, so the liveness refresh behind the idempotency guard would let a
+    // retry through even unretired (only the Windows lane, whose dead launch is
+    // retired at pid 0, would turn it away). The `failed` status asserted by the
+    // previous step is what pins retirement, on every lane.
     let output = serve_output(world);
     assert_ne!(
         world.cli_rc,
