@@ -418,10 +418,12 @@ when changing it:
   [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
   with `normalize_therock_family` returning `None`. Do not simplify it to a bare
   target-name check. Every test that drives the refusal does so by naming the
-  target explicitly, and would otherwise keep passing after the `gfx90c` arm in
-  `normalize_therock_family` was deleted, because the refusal short-circuits
-  before the mapping is read. `no_rocm_build_implies_no_therock_family` pins
-  this.
+  target explicitly, and the conjunct is the only reason any of them is also
+  evidence about the mapping: it is what makes the refusal stop firing once the
+  mapping comes back. Were the predicate to carry its own copy of the target
+  name alone, the refusal would keep firing from that copy and those tests
+  would stay green across a reopened catch-all.
+  `no_rocm_build_implies_no_therock_family` pins the conjunct.
 - detection itself has no override — `detect_host_gfx_target` reads real sysfs
   or WMI — so no lane can fake the host half. The end-to-end coverage is
   `@id:runtime-install-sdk-refuses-unsupported-gpu-target` (`runtime-19` in
@@ -431,10 +433,49 @@ when changing it:
   `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
   [therock.rs](../apps/rocm/src/therock.rs).
 
-To check the mapping is still load-bearing, delete the `gfx90c` arm from
-`normalize_therock_family` and confirm the cucumber scenario goes red along with
-the unit tests. A mutant that only renames the arm will not do: confirm the
-edited file actually differs before concluding anything from a green run.
+The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
+end-to-end lane at all, and that gap is stated here rather than papered over.
+`runtime-19` opens the `--family` door. Do not read a green `runtime-19` as
+coverage of host detection.
+
+#### Which mutants each test actually kills
+
+Measured on Linux with `cargo test -p rocm-core -p rocm --all-targets
+--no-fail-fast` followed by `cargo xtask e2e -- -n "runtime-19"`. Re-run them
+rather than trusting this list if you change either function, and confirm the
+edited file really differs first: a mutant that fails to apply is
+indistinguishable from one that survived.
+
+1. **Delete the `gfx90c` arm from `normalize_therock_family`.** `runtime-19`
+   goes **red** — the first `Then` fails because the dry run now succeeds,
+   resolving `gfx90X-dcgpu`. Also red:
+   `gfx_target_has_no_rocm_build_names_only_gfx90c`,
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported`,
+   `windows_display_parser_prefers_a_supported_gpu_over_a_vega_igpu`,
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` and
+   `therock::requesting_gfx90c_by_name_fails_instead_of_installing_another_family`.
+   Note `no_rocm_build_implies_no_therock_family` does *not* fail here: the
+   predicate answers `false`, so the implication it asserts holds vacuously.
+2. **Reduce the predicate to `normalize_therock_family(gfx).is_none()`.**
+   `runtime-19` stays **green** — gfx90c still has no family, so the refusal
+   still fires. Caught at unit level only, by
+   `gfx_target_has_no_rocm_build_names_only_gfx90c` and
+   `examine_render_omits_the_support_note_for_supported_or_missing_gpus`, which
+   pin that the refusal is about gfx90c and not about every unmapped target.
+3. **Reduce the predicate to the bare `starts_with("gfx90c")` check and delete
+   the mapping arm.** `runtime-19` stays **green** through exactly the
+   regression it exists to catch. This is the drift the conjunct forbids, and
+   the only mutant `no_rocm_build_implies_no_therock_family` fires against;
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported` and
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` go red
+   with it.
+
+Read 1 and 3 together. `runtime-19` is evidence about the mapping, but only
+transitively, through the conjunct in the predicate — remove the conjunct and
+the scenario stops being evidence about anything but itself. The direct
+evidence about the mapping is the unit tests.
 
 ## ComfyUI TheRock GPU Acceptance
 

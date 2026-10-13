@@ -671,6 +671,17 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         "7420" | "7421" | "7422" | "7423" | "7424" | "743f" => Some("gfx1034"),
         // Vega-based APUs (Renoir / Lucienne / Cezanne / Barcelo): all gfx90c.
         // Radeon Vega 6/7/8 iGPUs in Ryzen 4000/5000/7020 mobile and desktop parts.
+        //
+        // All four are the `/* Renoir */` block of the upstream kernel's
+        // `drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c`, where they share
+        // `CHIP_RENOIR | AMD_IS_APU`. coreboot's `pci_ids.h` and OpenBSD's
+        // `amdgpu_devlist.h` carry the identical four. Per ID:
+        //   1636  Renoir    (CPU family 17h model 60h)
+        //   164c  Lucienne  (CPU family 17h model 68h)
+        //   1638  Cezanne   (CPU family 19h model 51h)
+        //   15e7  Barcelo   (CPU family 19h model 51h)
+        // Note 164c, not 164d: 164d is Yellow Carp / Rembrandt, a different
+        // ASIC, and is mapped to gfx1035 below.
         "1636" | "1638" | "164c" | "15e7" => Some("gfx90c"),
         // RDNA2 APUs.
         "163f" => Some("gfx1033"),
@@ -3444,13 +3455,23 @@ mod tests {
     /// happen to.
     ///
     /// "Has no ROCm build" and "normalizes to no family" are two statements
-    /// about the same fact, written in two places. If they are allowed to drift
-    /// the install path refuses a target that the resolver would happily map,
-    /// and — worse for the test suite — every test that drives the refusal
-    /// through `--family gfx90c` keeps passing after the gfx90c arm in
-    /// `normalize_therock_family` is deleted, because the refusal short-circuits
-    /// before the mapping is ever consulted. This is the assertion that makes
-    /// those tests evidence about the mapping.
+    /// about the same fact, written in two places. Today they cannot drift,
+    /// because the predicate is conjoined with the mapping rather than carrying
+    /// its own copy of the target name. Were that conjunct dropped, they could:
+    /// the install path would refuse a target the resolver happily maps, and —
+    /// worse for the test suite — every test that drives the refusal through
+    /// `--family gfx90c` would keep passing after the gfx90c arm in
+    /// `normalize_therock_family` was deleted, because the refusal would
+    /// short-circuit before the mapping was ever consulted. That is the
+    /// counterfactual, not a description of the current code; drop both and
+    /// `runtime-19` goes green through the regression it exists to catch, which
+    /// is the one mutant this test fires against. Measured — see the mutant
+    /// list under "GPU targets with no ROCm build" in `docs/testing.md`.
+    ///
+    /// Note this is an implication, so it holds vacuously when the predicate
+    /// answers `false`: it pins the two together but is not on its own the
+    /// evidence that gfx90c has no family. `normalize_therock_family_has_no_family_for_gfx90c`
+    /// is.
     #[test]
     fn no_rocm_build_implies_no_therock_family() {
         for target in [

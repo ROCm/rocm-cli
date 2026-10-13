@@ -385,13 +385,22 @@ Feature: Runtime configuration
   # where the target was asked from), but they share the wording the Thens pin
   # and both are gated on the same `gfx_target_has_no_rocm_build`.
   #
-  # That predicate is what makes this scenario evidence about the mapping rather
-  # than about itself: it answers `true` only when `normalize_therock_family`
-  # also answers `None`, so deleting the gfx90c arm there turns the refusal off
-  # at both doors at once. Were the predicate to name gfx90c on its own, the
-  # explicit door would keep refusing from its own copy of the target name and
-  # this scenario would stay green through exactly the regression it exists to
-  # catch.
+  # So this scenario is evidence that the refusal reaches the user intact
+  # through the `--family` door. The detected-host door -- the one a real Ryzen
+  # 4000/5000 laptop opens -- has no end-to-end lane at all; it is covered at
+  # unit level only.
+  #
+  # The scenario is evidence about the *mapping* too, but only transitively,
+  # and only because of how the predicate is written: it answers `true` only
+  # when `normalize_therock_family` also answers `None`, so deleting the gfx90c
+  # arm there turns the refusal off at both doors at once. Were the predicate to
+  # name gfx90c on its own, the explicit door would keep refusing from its own
+  # copy of the target name and this scenario would stay green through exactly
+  # the regression it exists to catch. Both halves of that are measured, not
+  # assumed -- see the mutant list under "GPU targets with no ROCm build" in
+  # docs/testing.md. The direct, non-transitive evidence about the mapping is
+  # the unit tests, and `no_rocm_build_implies_no_therock_family` is what keeps
+  # the predicate from drifting away from it.
   #
   # Asserting only that the command fails would pass on the old code too: an
   # unrecognized `--family` already fell through to host detection and failed on
