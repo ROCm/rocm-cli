@@ -4554,8 +4554,16 @@ fn device_readable(device: &Path) -> bool {
     fs::OpenOptions::new().read(true).open(device).is_ok()
 }
 
+/// Off-Linux counterpart of [`kfd_readable`]: see that function's docs for why
+/// the wave-through is load-bearing rather than a stub.
+///
+/// `const` because it has to be. The Windows lane builds with `-D warnings` and
+/// runs clippy, so `clippy::missing_const_for_fn` makes this a hard compile
+/// error there while the Linux lane — where the real body opens a device and
+/// cannot be `const` — never sees the lint. A `cfg`-selected pair of functions
+/// is linted per branch, not per name.
 #[cfg(not(target_os = "linux"))]
-fn kfd_readable(_device: &Path) -> bool {
+const fn kfd_readable(_device: &Path) -> bool {
     true
 }
 
