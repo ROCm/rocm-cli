@@ -213,7 +213,7 @@ enum Command {
         ///
         /// Requires `--report`, so the content is always shown before the
         /// mail is offered. Not combinable with `--json`, which is for
-        /// scripts, and a script is not a person who can read a form.
+        /// scripts, and a script is not a person who can read and send a mail.
         #[arg(long, requires = "report", conflicts_with = "json")]
         send: bool,
     },

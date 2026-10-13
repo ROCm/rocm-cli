@@ -509,7 +509,7 @@ pub(crate) fn build_report(paths: &AppPaths, config: &RocmCliConfig) -> Result<S
         "downloaded models",
         paths.data_dir.join("models"),
         Some(
-            "model files are slow to download again and may be yours; no `rocm storage` command removes them, but `rocm uninstall` removes them with the data folder"
+            "model files are slow to download again and may be yours; ROCm CLI never removes them"
                 .to_owned(),
         ),
     )];
@@ -594,7 +594,7 @@ pub(crate) fn render_report(report: &StorageReport) -> String {
     let _ = writeln!(output);
     let _ = writeln!(
         output,
-        "Shared with other tools or yours to keep (no `rocm storage` command removes them):"
+        "Shared with other tools (never removed by ROCm CLI):"
     );
     for usage in &report.shared_with_other_tools {
         let _ = writeln!(
@@ -1456,7 +1456,7 @@ mod tests {
         let rendered = render_report(&report);
         assert!(rendered.contains("in-use version=7.12.0"));
         assert!(rendered.contains("status: in use"));
-        assert!(rendered.contains("Shared with other tools or yours to keep"));
+        assert!(rendered.contains("Shared with other tools (never removed by ROCm CLI):"));
         assert!(rendered.contains("downloaded models"));
 
         let _ = std::fs::remove_dir_all(root);
