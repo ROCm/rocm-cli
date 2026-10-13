@@ -4864,4 +4864,252 @@ permissions:
             );
         }
     }
+
+    /// Every `shell: pwsh` step in `text` as `(name, step block)`.
+    ///
+    /// The step is found from its `shell: pwsh` line by walking up to the
+    /// nearest `- ` item shallower than it, so the key order inside the step
+    /// does not matter.
+    fn pwsh_steps(text: &str) -> Vec<(String, String)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut steps = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if strip_comment(line).trim() != "shell: pwsh" {
+                continue;
+            }
+            let shell_indent = indent_of(line);
+            let Some(start) = (0..at).rev().find(|&i| {
+                indent_of(lines[i]) < shell_indent && lines[i].trim_start().starts_with("- ")
+            }) else {
+                continue;
+            };
+            let step = step_block(&lines, start);
+            let item_indent = indent_of(lines[start]);
+            let name = step
+                .lines()
+                .find_map(|l| {
+                    let key_line = if indent_of(l) == item_indent {
+                        l.trim_start().strip_prefix("- ")?
+                    } else if indent_of(l) == item_indent + 2 {
+                        l.trim_start()
+                    } else {
+                        return None;
+                    };
+                    key_line.strip_prefix("name:")
+                })
+                .map(|value| strip_quotes(strip_comment(value).trim()))
+                .unwrap_or_default();
+            steps.push((name, step));
+        }
+        steps
+    }
+
+    /// PowerShell words that open a statement but are not a program to run.
+    const PWSH_KEYWORDS: [&str; 15] = [
+        "if", "elseif", "else", "foreach", "for", "while", "do", "switch", "function", "try",
+        "catch", "finally", "throw", "exit", "return",
+    ];
+
+    /// Whether a dedented, comment-free pwsh statement line runs an external
+    /// program: `python …`, `cargo …`, `gh …`, `.\tool.exe`, `& $exe …`.
+    ///
+    /// Deliberately rough, and erring towards "native": assignments and
+    /// variables (`$x = …`), keywords, braces, string literals piped
+    /// somewhere (`"k=v" | Out-File …`) and cmdlets (`Verb-Noun`, which start
+    /// upper-case) are not; a lower-case first word that is not a keyword is.
+    fn is_native_command_line(line: &str) -> bool {
+        let line = line.trim();
+        if line.starts_with('&') {
+            return true;
+        }
+        let first = line
+            .split(|c: char| c.is_whitespace() || c == '(' || c == '{')
+            .next()
+            .unwrap_or_default();
+        let Some(lead) = first.chars().next() else {
+            return false;
+        };
+        (lead.is_ascii_lowercase() || lead == '.')
+            && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
+    }
+
+    /// The statement lines of a pwsh `run: |` body, dedented, in order.
+    ///
+    /// Comments, blank lines, here-string bodies (`@'`/`@"` … `'@`/`"@`) and
+    /// backtick continuation lines are dropped: none of them starts a
+    /// statement.
+    fn pwsh_statement_lines(body: &[&str]) -> Vec<String> {
+        let mut statements = Vec::new();
+        let mut in_here_string = false;
+        let mut continued = false;
+        for raw in body {
+            let line = raw.trim();
+            if in_here_string {
+                in_here_string = !(line.starts_with("'@") || line.starts_with("\"@"));
+                continue;
+            }
+            let was_continued = continued;
+            continued = line.ends_with('`');
+            if was_continued || line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.ends_with("@'") || line.ends_with("@\"") {
+                in_here_string = true;
+            }
+            statements.push(line.to_string());
+        }
+        statements
+    }
+
+    /// The native-command lines in a pwsh body whose exit status nothing
+    /// reads: not the body's last statement, and not followed by a statement
+    /// that inspects `$LASTEXITCODE`.
+    fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
+        let statements = pwsh_statement_lines(body);
+        statements
+            .iter()
+            .enumerate()
+            .filter(|(i, line)| {
+                is_native_command_line(line)
+                    && statements
+                        .get(i + 1)
+                        .is_some_and(|next| !next.contains("$LASTEXITCODE"))
+            })
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    /// pwsh steps allowed to run a native command whose status is unread,
+    /// keyed by `(workflow, step name)`, each with the reason it is safe.
+    const PWSH_UNCHECKED_NATIVE_ALLOWED: [(&str, &str, &str); 3] = [
+        (
+            "ci.yml",
+            "Probe sccache cache backend",
+            "the probe decides for itself and ends in `exit 0`; the one unread \
+             status is a best-effort `sccache --stop-server` cleanup",
+        ),
+        (
+            "nightly.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+        (
+            "release.yml",
+            "Package Windows bundle",
+            "a failed `cargo xtask package` leaves no zip or signature, so the \
+             `Copy-Item`/`throw` on its outputs stops the step under the runner's \
+             `$ErrorActionPreference = 'stop'`",
+        ),
+    ];
+
+    /// GitHub runs a `shell: pwsh` body with `$ErrorActionPreference = 'stop'`
+    /// and then `exit $LASTEXITCODE`. A failing *cmdlet* stops the step, but a
+    /// failing *native command* does not: the script carries on, and only the
+    /// last native command's status decides the step. So in
+    ///
+    /// ```text
+    /// python a.py --self-test   # exits 1
+    /// python b.py --self-test   # exits 0
+    /// ```
+    ///
+    /// the step is green. Every native command that is not the body's last
+    /// statement must therefore have its `$LASTEXITCODE` read on the next
+    /// line, or be split into its own step (#633), or be allow-listed above
+    /// with the reason its failure still surfaces.
+    #[test]
+    fn no_pwsh_step_lets_a_failing_native_command_pass_unseen() {
+        let dir = repo_root().join(".github/workflows");
+        let mut workflows: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", dir.display()))
+            .map(|entry| entry.expect("workflow dir entry").path())
+            .filter(|path| {
+                path.extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+                })
+            })
+            .map(|path| {
+                path.file_name()
+                    .expect("a read_dir entry has a file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        workflows.sort();
+
+        let mut offenders = Vec::new();
+        let mut allowed_seen = Vec::new();
+        for workflow in &workflows {
+            let text = read_workflow(workflow);
+            for (name, step) in pwsh_steps(&text) {
+                let Some(body) = run_block(&step) else {
+                    continue; // a one-line `run:` is one command
+                };
+                let unchecked = unchecked_native_commands(&body);
+                if unchecked.is_empty() {
+                    continue;
+                }
+                if PWSH_UNCHECKED_NATIVE_ALLOWED
+                    .iter()
+                    .any(|(w, n, _)| w == workflow && *n == name)
+                {
+                    allowed_seen.push((workflow.clone(), name));
+                    continue;
+                }
+                offenders.push(format!("{workflow} step {name:?}: {unchecked:?}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these `shell: pwsh` steps run a native command whose failure the step \
+             would not report, because pwsh carries on and the step takes only the last \
+             command's exit code — split each into its own step, or check \
+             `$LASTEXITCODE` right after it:\n  {}",
+            offenders.join("\n  ")
+        );
+        // An allow-list entry that no longer matches anything exempts nothing
+        // and would quietly cover the next step to take that name.
+        for (workflow, name, _) in PWSH_UNCHECKED_NATIVE_ALLOWED {
+            assert!(
+                allowed_seen.iter().any(|(w, n)| w == workflow && n == name),
+                "{workflow} step {name:?} is allow-listed in \
+                 PWSH_UNCHECKED_NATIVE_ALLOWED but no longer has an unchecked native \
+                 command; drop the entry"
+            );
+        }
+    }
+
+    /// The masking shape #633 removed is still caught, and the shapes that
+    /// read the status are not.
+    #[test]
+    fn unchecked_native_commands_finds_the_masking_shape() {
+        let merged = [
+            "python .\\scripts\\comfyui_therock_gpu_test.py --self-test",
+            "python .\\scripts\\local_assistant_therock_gpu_test.py --self-test",
+            "python .\\scripts\\vllm_therock_gpu_test.py --self-test",
+        ];
+        assert_eq!(unchecked_native_commands(&merged), merged[..2].to_vec());
+
+        let checked = [
+            "$targetDir = if ($env:X) { $env:X } else { \"target\" }",
+            "# a comment",
+            "sccache --start-server",
+            "if ($LASTEXITCODE -ne 0) {",
+            "  Write-Output \"::warning::no cache\"",
+            "}",
+            "@'",
+            "cargo build   # inside a here-string, not a command",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+            "cargo xtask e2e",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "python .\\scripts\\release_readiness.py `",
+            "  --dist dist",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            unchecked_native_commands(&checked)
+        );
+    }
 }
