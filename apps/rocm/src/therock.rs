@@ -3366,40 +3366,47 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
 
     // An explicitly asked-for target that ROCm publishes no build for is
     // refused here rather than normalized. `normalize_therock_family` answers
-    // `None` for gfx90c, and `None` from these two branches means "fall
-    // through", so without this the user's `--family gfx90c` would be dropped
-    // and whatever GPU this host happens to have would be installed for
-    // instead. Unrecognized spellings keep falling through to detection, which
-    // is the long-standing behavior for a typo.
-    for (value, source) in [
-        (family_override, "--family"),
-        (env_override.as_deref(), "ROCM_CLI_THEROCK_FAMILY"),
-    ] {
-        if let Some(value) = value
-            && gfx_target_has_no_rocm_build(value)
-        {
-            bail!(unsupported_requested_target_message(value.trim(), source));
+    // `None` for gfx90c, and `None` from this branch means "fall through", so
+    // without this the user's `--family gfx90c` would be dropped and whatever
+    // GPU this host happens to have would be installed for instead.
+    // Unrecognized spellings keep falling through to detection, which is the
+    // long-standing behavior for a typo.
+    //
+    // The guard sits inside each source's own branch, not ahead of both, so a
+    // source is only ever refused when it is actually the one being consulted:
+    // a valid `--family` must resolve even if a stale `ROCM_CLI_THEROCK_FAMILY`
+    // left over from an earlier session happens to name gfx90c, and the
+    // reverse for an env value once `--family` isn't the one in play.
+    if let Some(value) = family_override {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "--family"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "manifest".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
         }
     }
 
-    if let Some(value) = family_override
-        && let Some(family) = normalize_therock_family(value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "manifest".to_owned(),
-            raw_arch: family_override_raw_arch(value),
-        });
-    }
-
-    if let Some(value) = env_override.as_deref()
-        && let Some(family) = normalize_therock_family(value)
-    {
-        return Ok(FamilyResolution {
-            family,
-            source: "env".to_owned(),
-            raw_arch: family_override_raw_arch(value),
-        });
+    if let Some(value) = env_override.as_deref() {
+        if gfx_target_has_no_rocm_build(value) {
+            bail!(unsupported_requested_target_message(
+                value.trim(),
+                "ROCM_CLI_THEROCK_FAMILY"
+            ));
+        }
+        if let Some(family) = normalize_therock_family(value) {
+            return Ok(FamilyResolution {
+                family,
+                source: "env".to_owned(),
+                raw_arch: family_override_raw_arch(value),
+            });
+        }
     }
 
     if let Some(family) = detect_managed_therock_family(paths) {
@@ -7699,6 +7706,39 @@ mod tests {
                 "asking for gfx90c must not resolve or offer `{family}`: {message}"
             );
         }
+    }
+
+    /// A valid `--family` must resolve even if `ROCM_CLI_THEROCK_FAMILY` is
+    /// stale and happens to name gfx90c.
+    ///
+    /// The no-build guard used to run ahead of both sources regardless of
+    /// which one would actually be consulted, so a leftover env value with no
+    /// bearing on this invocation could refuse an otherwise-valid `--family`.
+    /// The guard now lives inside each source's own branch, so it only fires
+    /// for the source actually being read.
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var is unsafe in edition 2024
+    fn cli_family_overrides_a_stale_env_value_naming_an_unsupported_gpu() {
+        let _guard = PROCESS_ENV_TEST_LOCK.lock().unwrap();
+        let old_env = std::env::var_os("ROCM_CLI_THEROCK_FAMILY");
+        unsafe {
+            std::env::set_var("ROCM_CLI_THEROCK_FAMILY", "gfx90c");
+        }
+
+        let (_root, paths) = test_paths("resolve-family-cli-overrides-stale-env");
+        let resolution = resolve_family(&paths, Some("gfx1103"));
+
+        unsafe {
+            match old_env {
+                Some(value) => std::env::set_var("ROCM_CLI_THEROCK_FAMILY", value),
+                None => std::env::remove_var("ROCM_CLI_THEROCK_FAMILY"),
+            }
+        }
+
+        let resolution = resolution
+            .expect("a valid --family must resolve even with an unrelated gfx90c env override set");
+        assert_eq!(resolution.family, "gfx110X-all");
+        assert_eq!(resolution.source, "manifest");
     }
 
     #[test]
