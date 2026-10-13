@@ -58,6 +58,10 @@ pub struct E2eWorld {
     /// scenario. Kept on the World so it remains alive while the real `rocm`
     /// subprocess downloads.
     pub paced_download_server: Option<PacedDownloadServer>,
+    /// The port a stand-in for a running ComfyUI answers on. Held on the World
+    /// so the port keeps answering, as a started ComfyUI's does, for the rest
+    /// of the scenario.
+    pub comfyui_port_listener: Option<std::net::TcpListener>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -264,6 +268,7 @@ impl Default for E2eWorld {
             mock: None,
             artifact_server: None,
             paced_download_server: None,
+            comfyui_port_listener: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,

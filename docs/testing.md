@@ -478,6 +478,70 @@ python3 scripts/comfyui_therock_gpu_test.py \
   --generate-cat
 ```
 
+## ComfyUI Reinstall
+
+`rocm comfyui install --reinstall` deletes only the top-level entries the
+installed ComfyUI release shipped in its `source/` folder (as recorded when it
+was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
+`input/`, `custom_nodes/`, `datasets/`, `extra_model_paths.yaml`), renames an
+entry of the user's that the new release starts shipping (`set aside:`) and
+leaves anything else in place. An install from before that record replaces
+the entries named like the new release's code and lists them (`replaced:`).
+It leaves the install untouched when the new source cannot be obtained or is
+not a ComfyUI release, or when ComfyUI is found running just before the swap;
+`start` refuses a folder whose swap was interrupted or stopped part-way, and
+the command it names finishes it. The swap is unit-tested directly, without a
+fake Python. Most of those tests also run on Windows: stopping the swap before
+each filesystem change in turn and checking that a re-run converges (with and
+without an entry to set aside), unknown entries and `datasets/` left in place,
+an unreadable or malformed release record or swap marker, an entry that
+cannot be removed, the copy taken when the release cannot be renamed into
+place across filesystems, `main.py` removed first and moved in last, a
+release without `main.py` refused before an existing install changes, and the
+`replaced:` list of an install with no record staying complete when its swap
+is interrupted at any step. The symlink tests (symlinked model folders, links
+inside them, loops, dangling links, copying links without following them), the
+inode/ctime test and a copy that fails part-way are Unix-only; the retry while
+another program holds a file and names that differ only in case are
+Windows-only:
+
+```bash
+cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::tests
+```
+
+The second filter covers the install-level tests: `reinstall_*`,
+`install_after_an_interrupted_reinstall_finishes_it`,
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
+`a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
+`a_failure_after_the_swap_names_what_it_replaced`,
+`only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it`,
+`swap_changes_summary_names_what_was_replaced_and_set_aside`,
+`a_plain_install_is_not_refused_while_comfyui_runs`,
+`plain_install_dry_run_previews_no_reinstall`,
+`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`.
+The running guard is tested against a ComfyUI answering on its port
+(`running`) and one whose process is up but whose port is not answering yet
+(`starting`).
+
+The e2e scenarios `comfyui-05` to `comfyui-13`
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
+GPU) cover the same through the built binary: what is kept, replaced and left
+in place (also when the saved run state is unreadable), a failed download, the
+dry run, a reinstall refused while ComfyUI runs (which the dry run says
+first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
+run, the answer to a plain-words status question
+(`rocm "what is the comfyui status"`) while ComfyUI starts and while a
+reinstall is unfinished, a folder of the user's set aside when the new release
+ships one of the same name, a reinstall that fails after the swap naming
+what it replaced and the command that finishes it, a ComfyUI started while
+the reinstall downloads, which the check just before the swap refuses, and a
+download that is not a ComfyUI release, which is neither installed nor kept:
+
+```bash
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
