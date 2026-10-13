@@ -4026,16 +4026,17 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// no failed transaction leaves a live reservation or a stray endpoint key.
 ///
 /// Order matters: a spawned child is terminated and confirmed dead *first*, so
-/// nothing is still holding the port or writing to the log when the artifacts —
-/// including the record that reserves the port for other launches — are removed.
+/// nothing is still holding the port or writing to the log by the time cleanup
+/// runs. If no child was ever spawned (`record.engine_pid` is still `None`),
+/// every artifact this attempt created is removed: there is nothing for
+/// `rocm services`/`rocm logs` to show. If a child did run, its record and log
+/// are kept instead (marked `status = "failed"`), since the error that led here
+/// already told the user to go inspect that log; only the endpoint key, which a
+/// failed attempt has no use for, is cleared.
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
-fn abandon_failed_managed_launch(
-    paths: &AppPaths,
-    record: &ManagedServiceRecord,
-    child_pid: Option<u32>,
-) {
-    if let Some(pid) = child_pid.filter(|pid| *pid != 0) {
+fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
+    if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
         let outcome = rocm_core::terminate_verified(
             &rocm_core::ProcessIdentity::capture(pid),
             rocm_core::KillScope::Tree,
@@ -4053,6 +4054,11 @@ fn abandon_failed_managed_launch(
             ),
             Some(&record.service_id),
         );
+        let mut failed = record.clone();
+        failed.status = "failed".to_owned();
+        let _ = failed.write();
+        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        return;
     }
     for path in [
         record.manifest_path.as_path(),
@@ -4231,10 +4237,11 @@ fn spawn_managed_engine_child(
             child_pid,
         }),
         Err(error) => {
-            // Pre-spawn failures reach here with nothing running; a post-spawn
-            // publication failure already terminated its child, and the removals
-            // are idempotent.
-            abandon_failed_managed_launch(paths, &record, None);
+            // The single cleanup choke point for every failure path below the
+            // record's first write: `record.engine_pid` tells it whether a child
+            // ever ran, so a pre-spawn failure deletes everything and a post-spawn
+            // one keeps the record and log (marked `status = "failed"`) instead.
+            abandon_failed_managed_launch(paths, &record);
             Err(error)
         }
     }
@@ -4347,6 +4354,9 @@ fn launch_managed_engine_child_locked(
             .spawn()
             .context("failed to launch managed engine process")?;
         let child_pid = child.id();
+        // Set before the immediate-exit check below, so a bail! here still leaves
+        // `record.engine_pid` telling cleanup that a child was spawned.
+        record.engine_pid = Some(child_pid);
         thread::sleep(Duration::from_millis(200));
         if let Some(status) = child
             .try_wait()
@@ -4369,7 +4379,10 @@ fn launch_managed_engine_child_locked(
     // proven endpoint. If it cannot be recorded it would be unsupervised and
     // invisible while holding the port, so terminate it rather than leak it.
     if let Err(error) = record.write() {
-        abandon_failed_managed_launch(paths, record, Some(child_pid));
+        // Cleanup is the caller's job now: `record.engine_pid` (set above) is
+        // already enough for `abandon_failed_managed_launch` to terminate this
+        // child, so there is nothing left for this inner path to do beyond
+        // surfacing the error.
         return Err(error.context("failed to publish the managed service record"));
     }
 
@@ -28067,8 +28080,10 @@ install therock";
     fn abandoned_launch_leaves_no_record_log_or_endpoint_key() -> Result<()> {
         let (root, paths) = test_paths("alloc-abandon-artifacts");
         paths.ensure()?;
-        let record =
+        let mut record =
             write_live_service_record(&paths, "lemonade-fail-1", "model-a", 11_435, "starting")?;
+        // Simulate a pre-spawn failure: nothing ever ran.
+        record.engine_pid = None;
         fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
         fs::write(&record.log_path, b"engine log")?;
         if let Some(parent) = record.engine_state_path.parent() {
@@ -28077,7 +28092,7 @@ install therock";
         fs::write(&record.engine_state_path, b"{}")?;
         endpoint_keys::store_endpoint_api_key(&paths, &record.service_id, "secret-key")?;
 
-        abandon_failed_managed_launch(&paths, &record, None);
+        abandon_failed_managed_launch(&paths, &record);
 
         let manifest_exists = record.manifest_path.exists();
         let log_exists = record.log_path.exists();
@@ -28114,7 +28129,7 @@ install therock";
     fn abandoned_launch_terminates_the_spawned_child() -> Result<()> {
         let (root, paths) = test_paths("alloc-abandon-child");
         paths.ensure()?;
-        let record =
+        let mut record =
             write_live_service_record(&paths, "lemonade-fail-2", "model-a", 11_435, "starting")?;
 
         // A real, long-lived child stands in for an engine process that was
@@ -28130,8 +28145,9 @@ install therock";
             .spawn()
             .expect("spawn sleeper child");
         let child_pid = child.id();
+        record.engine_pid = Some(child_pid);
 
-        abandon_failed_managed_launch(&paths, &record, Some(child_pid));
+        abandon_failed_managed_launch(&paths, &record);
 
         // On Unix a killed direct child stays a zombie — and therefore "running"
         // to a `kill(pid, 0)` probe — until its parent reaps it, so prove death
@@ -28152,8 +28168,11 @@ install therock";
         }
         // Reaped on every path, including the deadline path above.
         let _ = child.wait();
-        let manifest_exists = record.manifest_path.exists();
         let still_running = !terminated || process_is_running(child_pid);
+        let persisted = load_managed_services(&paths)
+            .expect("re-read manifests")
+            .into_iter()
+            .find(|candidate| candidate.service_id == record.service_id);
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -28161,7 +28180,13 @@ install therock";
             "a child that could not be published must be terminated"
         );
         assert!(!still_running, "the child pid must be gone after cleanup");
-        assert!(!manifest_exists, "its record must be removed as well");
+        let persisted = persisted.expect(
+            "a launch that spawned a child must keep its record so `rocm services`/`rocm logs` can show the attempt",
+        );
+        assert_eq!(
+            persisted.status, "failed",
+            "a spawned child's record must be marked failed, not deleted"
+        );
         Ok(())
     }
 

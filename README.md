@@ -556,6 +556,18 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--temperature TEMP] [--top-p PROB] [--max-tokens N]
 ```
 
+`--port` is optional on the default loopback host (`127.0.0.1`): omit it and
+`rocm serve` picks the first free port in `11435`-`11535`, checking both
+rocm-cli's own records and the OS so two servers never collide. The deployment
+summary shows `Port: automatic; endpoint shown after launch` while the launch
+is in flight and prints the concrete endpoint once the port is actually leased.
+Pass `--port` explicitly to pin one; an explicit loopback port already
+reserved or in use is rejected up front, naming the server holding it and how
+to free it (`rocm services stop <service-id> --yes`). `--host` to anything
+other than the default loopback address (`localhost`, `::1`, `0.0.0.0`, or any
+other address) requires an explicit `--port`: automatic selection only probes
+`127.0.0.1` and cannot promise a free port anywhere else.
+
 `--temperature` (>= 0.0), `--top-p` (0.0-1.0), and `--max-tokens` (> 0) set
 server-wide sampling defaults for the launched engine. They apply only to
 `vllm` and `lemonade`; other engines reject them. For vLLM they are folded
