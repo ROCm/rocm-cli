@@ -87,7 +87,8 @@ mod tests {
     impl UnsetKeyOnExit {
         /// Takes the caller's lock guard by reference, so arming one without
         /// holding a lock does not compile. Any `Mutex<()>` guard satisfies
-        /// the type; which lock it is stays the contract guard's to check.
+        /// the type; that some `*_TEST_LOCK` is taken stays the contract
+        /// guard's to check (it does not check which one).
         const fn arm(_lock: &MutexGuard<'_, ()>) -> Self {
             Self
         }
@@ -102,8 +103,8 @@ mod tests {
         }
     }
 
-    /// The restore is this type's whole purpose, and it is what the two callers
-    /// rely on to keep a panicking test from leaking a value into the next one.
+    /// The restore is this type's whole purpose, and it is what its callers
+    /// (in `fix`, `lib`, `examine` and `hardware_root`) rely on to keep a panicking test from leaking a value into the next one.
     ///
     /// Both prior states are needed, because they catch different mistakes:
     ///
