@@ -140,6 +140,10 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         {
             Some("gfx94X-dcgpu".to_owned())
         }
+        // gfx90c is the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
+        // APUs. TheRock publishes no build for it, so it must not fall into the
+        // data-center `gfx90X-dcgpu` catch-all below.
+        value if value.starts_with("gfx90c") => None,
         value if value.starts_with("gfx90") => Some("gfx90X-dcgpu".to_owned()),
         _ => None,
     }
@@ -633,6 +637,9 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         "73e0" | "73e1" | "73e2" | "73e3" | "73e8" | "73e9" | "73ea" | "73eb" | "73ec" | "73ed"
         | "73ef" => Some("gfx1032"),
         "7420" | "7421" | "7422" | "7423" | "7424" | "743f" => Some("gfx1034"),
+        // Vega-based APUs (Renoir / Lucienne / Cezanne / Barcelo): all gfx90c.
+        // Radeon Vega 6/7/8 iGPUs in Ryzen 4000/5000/7020 mobile and desktop parts.
+        "1636" | "1638" | "164c" | "15e7" => Some("gfx90c"),
         // RDNA2 APUs.
         "163f" => Some("gfx1033"),
         "164d" | "1681" => Some("gfx1035"),
@@ -3339,6 +3346,21 @@ mod tests {
         );
     }
 
+    /// gfx90c (Renoir / Lucienne / Cezanne / Barcelo Vega iGPUs) has no TheRock
+    /// build. It used to fall into the loose `gfx90` arm and come back as the
+    /// data-center family `gfx90X-dcgpu`, which `rocm install sdk` then offered.
+    #[test]
+    fn normalize_therock_family_has_no_family_for_gfx90c() {
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+        assert_eq!(normalize_therock_family("GFX90C"), None);
+        // A feature-suffixed spelling, as KFD / rocminfo can report it.
+        assert_eq!(normalize_therock_family("gfx90c:xnack-"), None);
+        // The neighbouring Vega parts keep their families.
+        assert_eq!(normalize_therock_family("gfx900"), Some("gfx900".to_owned()));
+        assert_eq!(normalize_therock_family("gfx906"), Some("gfx906".to_owned()));
+        assert_eq!(normalize_therock_family("gfx90a"), Some("gfx90a".to_owned()));
+    }
+
     #[test]
     fn known_therock_families_all_round_trip() {
         for family in known_therock_families() {
@@ -3378,6 +3400,11 @@ mod tests {
             ("164F", "gfx1103"),
             ("1900", "gfx1103"),
             ("1114", "gfx1152"),
+            // Vega APUs: Renoir, Cezanne, Lucienne, Barcelo.
+            ("1636", "gfx90c"),
+            ("1638", "gfx90c"),
+            ("164C", "gfx90c"),
+            ("15E7", "gfx90c"),
         ] {
             assert_eq!(
                 parse_windows_display_gfx_target(&format!(

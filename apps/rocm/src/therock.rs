@@ -3391,14 +3391,24 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    if let Some(raw_arch) = detect_host_gfx_target()
-        && let Some(family) = normalize_therock_family(&raw_arch)
+    let host_arch = detect_host_gfx_target();
+    if let Some(raw_arch) = host_arch.as_deref()
+        && let Some(family) = normalize_therock_family(raw_arch)
     {
         return Ok(FamilyResolution {
             family,
             source: "host".to_owned(),
-            raw_arch: Some(raw_arch),
+            raw_arch: Some(raw_arch.to_owned()),
         });
+    }
+
+    // A GPU was detected but belongs to no package family (for example the
+    // gfx90c Vega iGPU in Renoir/Cezanne APUs). Listing the recognized families
+    // would invite installing a build for different silicon, so say plainly
+    // that there is nothing to install for this GPU.
+    if let Some(raw_arch) = host_arch.as_deref() {
+        let diagnostics = detect_host_gpu_diagnostics();
+        bail!("{}\n\n{diagnostics}", unsupported_host_gpu_message(raw_arch));
     }
 
     bail!(
@@ -3407,6 +3417,18 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
          Recognized families: {}.\n\n{}",
         known_therock_families().join(", "),
         detect_host_gpu_diagnostics()
+    )
+}
+
+/// The install error for a detected GPU target that no TheRock package family
+/// covers. It deliberately does not list `--family` values: none of them was
+/// built for this GPU.
+fn unsupported_host_gpu_message(raw_arch: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
+         `rocm install sdk` has nothing to install for it.\n\
+         The GPU is detected but is not supported by ROCm; \
+         the Vulkan backend can still be used."
     )
 }
 
@@ -7580,6 +7602,29 @@ mod tests {
             normalize_therock_family("gfx1101"),
             Some("gfx110X-all".to_owned())
         );
+    }
+
+    #[test]
+    fn gfx90c_resolves_to_no_family_instead_of_the_datacenter_one() {
+        // gfx90c is the Vega iGPU in Renoir/Cezanne APUs. It used to normalize to
+        // `gfx90X-dcgpu`, so a plain `rocm install sdk` targeted data-center
+        // packages and the error listed that family as a `--family` choice.
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+    }
+
+    #[test]
+    fn unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families() {
+        let message = unsupported_host_gpu_message("gfx90c");
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("Vulkan"), "{message}");
+        assert!(!message.contains("--family"), "{message}");
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "the error must not offer `{family}` for an unsupported GPU: {message}"
+            );
+        }
     }
 
     #[test]

@@ -1140,12 +1140,12 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 
 /// Whether a gfx target belongs to an AMD APU family.
 ///
-/// APUs: gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
-/// Strix Halo). Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33)
-/// share the gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not
-/// match — otherwise they inflate `has_apu` and suppress `has_discrete_amd`,
-/// which gates the iGPU+dGPU collision fix. (Target -> product per LLVM
-/// AMDGPUUsage.)
+/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), gfx1103
+/// (Phoenix / Hawk Point) and the gfx115x parts (Strix Point / Strix Halo).
+/// Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) share the
+/// gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not match —
+/// otherwise they inflate `has_apu` and suppress `has_discrete_amd`, which gates
+/// the iGPU+dGPU collision fix. (Target -> product per LLVM AMDGPUUsage.)
 ///
 /// Two consumers rely on this, for different reasons:
 ///
@@ -1159,6 +1159,12 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// GPU on the host is integrated.
 pub fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
+    // gfx90c: the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo. Compared
+    // whole (up to a feature suffix) so other gfx90x data-center parts such as
+    // gfx90a stay discrete.
+    if g == "gfx90c" || g.starts_with("gfx90c:") {
+        return true;
+    }
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
         return true;
@@ -5344,6 +5350,16 @@ mod tests {
         assert!(!gfx_is_apu_family("gfx1100:xnack-"));
         // Degenerate inputs never match.
         assert!(!gfx_is_apu_family("gfx110"));
+
+        // Vega iGPU (Renoir / Lucienne / Cezanne / Barcelo) is an APU; the other
+        // gfx90x parts are not.
+        assert!(gfx_is_apu_family("gfx90c"));
+        assert!(gfx_is_apu_family("GFX90C"));
+        assert!(gfx_is_apu_family("gfx90c:xnack-"));
+        assert!(!gfx_is_apu_family("gfx90a"));
+        assert!(!gfx_is_apu_family("gfx908"));
+        assert!(!gfx_is_apu_family("gfx906"));
+        assert!(!gfx_is_apu_family("gfx90"));
         assert!(!gfx_is_apu_family(""));
     }
 
