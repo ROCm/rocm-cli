@@ -2,49 +2,72 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Split-invariance properties for the SSE line emitters (`OpenAiSseEmitter`
-//! and `AnthropicSseEmitter`): however the bytes of a stream arrive, the
-//! emitted events are the ones the whole body produces in one piece.
+//! Tests for the SSE line emitters (`OpenAiSseEmitter` and
+//! `AnthropicSseEmitter`) and the line parsers under them.
 //!
-//! OpenAI fixture 1 is the body of `parses_openai_sse_chat_events` in
-//! `providers.rs`. The others are written here, in the shapes those servers
-//! send, to reach what that one body does not: CRLF line endings (what Python
-//! SSE servers emit by default), multi-byte UTF-8 content so that a split can
-//! land inside a UTF-8 sequence, `data:` with no space before content, a
-//! role-only delta, a usage chunk with empty `choices`, a `message.content`
-//! chunk, Anthropic's `message_start` and `content_block_start` events, lines
-//! after the end of the stream, and bodies whose last line is cut off before
-//! its terminator, so that `finish()` has a partial line to flush. None of them
-//! generates SSE text from scratch. The transport readers that feed these
-//! emitters (chunked, `Content-Length` and close-delimited bodies) are covered
-//! by the sibling `proptests` module.
+//! - An exhaustive sweep over hand-written fixtures: every one- and two-point
+//!   split of each body produces the events (and the error, for a body that
+//!   fails) of the whole body, and the whole body produces the exact events
+//!   each fixture lists. OpenAI fixture 1 is the body of
+//!   `parses_openai_sse_chat_events` in `providers.rs`. The others are written
+//!   here, in the shapes those servers send, to reach what that one body does
+//!   not: CRLF line endings (what Python SSE servers emit by default),
+//!   multi-byte UTF-8 content so that a split can land inside a UTF-8 sequence,
+//!   `data:` with no space before content, a role-only delta, a usage chunk with
+//!   empty `choices`, a `message.content` chunk, malformed JSON, Anthropic's
+//!   `message_start`, `content_block_start` and `error` events, a non-text
+//!   delta, a `[DONE]` line in an Anthropic stream, lines after the end of the
+//!   stream, and bodies whose last line is cut off before its terminator, so
+//!   that `finish()` has a partial line to flush. Split invariance alone cannot
+//!   see a defect that changes the whole-body result and every split result
+//!   alike, such as `finish()` dropping the partial last line; the listed
+//!   events can.
+//! - Direct line-parser assertions on `\r`-terminated lines, and a test that an
+//!   error from the caller's callback stops either emitter.
+//! - A fuzz of both line parsers over generated `data:` lines (`sse_line()`),
+//!   which is a panic guard only: it asserts nothing about what a line parses
+//!   to. Its companion test checks that the generator keeps reaching every
+//!   field-reading branch, so the guard does not go quiet on one.
+//! - An ignored reproducer for #516 (in-band OpenAI error payloads).
 //!
-//! The CRLF fixtures check that both line parsers trim the `\r`. The emitters'
-//! own `trim_end_matches('\r')` is redundant with that trim, so no test here can
-//! observe it, and a split between `\r` and `\n` is not a separate hazard: the
-//! emitters break lines on `\n` alone.
+//! The transport readers the sibling `proptests` module covers (chunked,
+//! `Content-Length` and close-delimited bodies) feed only the OpenAI emitter,
+//! on the local-provider path. On the remote-provider path, the only one the
+//! Anthropic emitter has, both emitters are fed by `stream_json_with_headers`
+//! through `SseBytesEmitter`, which example tests in `providers.rs` exercise
+//! but no property does.
 //!
-//! Split invariance alone cannot see a defect that changes the whole-body result
-//! and every split result alike, such as `finish()` dropping the partial last
-//! line. So each fixture also carries the exact events it must produce.
+//! A trailing `\r` is trimmed in three places on the way to a parse: the
+//! emitters' `trim_end_matches('\r')`, then each parser's `line.trim()` and
+//! `data.trim()`. Each hides the others, so the CRLF fixtures prove only that
+//! at least one of them exists, and the direct parser assertions only that one
+//! of the parser's own two exists. A split between `\r` and `\n` is not a
+//! separate hazard: the emitters break lines on `\n` alone.
 
 use super::*;
-use crate::test_support::proptest_cases;
+use crate::test_support::{proptest_cases, split_at_offsets};
 use proptest::prelude::*;
 
-/// A body, and the `(content, done)` events it must produce.
-type Fixture = (&'static str, &'static [(&'static str, bool)]);
+/// A body, the `(content, done)` events it must produce, and the error the
+/// stream must then fail with, if it fails.
+type Fixture = (
+    &'static str,
+    &'static [(&'static str, bool)],
+    Option<&'static str>,
+);
 
 const OPENAI_FIXTURES: &[Fixture] = &[
     // providers.rs `parses_openai_sse_chat_events`.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n",
         &[("hel", false), ("lo", false), ("", true)],
+        None,
     ),
     // Same body, CRLF line endings.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n",
         &[("hel", false), ("lo", false), ("", true)],
+        None,
     ),
     // Multi-byte content (2-, 3- and 4-byte sequences), CRLF, a role-only first
     // delta (its empty content is still an event), content after `data:` with
@@ -57,6 +80,7 @@ const OPENAI_FIXTURES: &[Fixture] = &[
             (" \u{4e16}\u{754c}", false),
             ("", true),
         ],
+        None,
     ),
     // A `message.content` chunk (the non-delta shape some servers send), then
     // lines after `[DONE]`: neither a late chunk nor a second `[DONE]` may
@@ -64,6 +88,7 @@ const OPENAI_FIXTURES: &[Fixture] = &[
     (
         "data: {\"choices\":[{\"message\":{\"content\":\"wh\u{f6}le\"}}]}\n\ndata: [DONE]\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n",
         &[("wh\u{f6}le", false), ("", true)],
+        None,
     ),
     // The stream closes in the middle of its last line: no terminator and no
     // `[DONE]`, so that line's content reaches the caller only through
@@ -71,11 +96,20 @@ const OPENAI_FIXTURES: &[Fixture] = &[
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo \u{1f680}\"}}]}",
         &[("hel", false), ("lo \u{1f680}", false), ("", true)],
+        None,
     ),
     // The same cut-off tail on a CRLF stream, after the `\r` of the last line.
     (
         "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\r",
         &[("hel", false), ("lo", false), ("", true)],
+        None,
+    ),
+    // A line that is not JSON fails the stream, after the text before it has
+    // reached the caller; nothing after it is read.
+    (
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[\n\ndata: [DONE]\n\n",
+        &[("ok", false)],
+        Some("failed to parse local provider SSE data"),
     ),
 ];
 
@@ -86,6 +120,7 @@ const ANTHROPIC_FIXTURES: &[Fixture] = &[
     (
         "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\r\n\r\nevent: content_block_start\r\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"h\u{e9}l\u{1f680}\"}}\r\n\r\nevent: content_block_delta\r\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
         &[("h\u{e9}l\u{1f680}", false), ("lo", false), ("", true)],
+        None,
     ),
     // A `content_block_start` that carries text, after `data:` with no space
     // (Anthropic sends it empty, but the parser reads it when it is not), then
@@ -94,55 +129,73 @@ const ANTHROPIC_FIXTURES: &[Fixture] = &[
     (
         "event: content_block_start\ndata:{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"H\u{e9}\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"y\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"late\"}}\n\n",
         &[("H\u{e9}", false), ("y", false), ("", true)],
+        None,
     ),
     // The stream closes in the middle of its last line, before `message_stop`.
     (
         "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" th\u{e9}re\"}}",
         &[("hi", false), (" th\u{e9}re", false), ("", true)],
+        None,
+    ),
+    // A non-text delta (tool input), which is no event, then a `[DONE]` line,
+    // which Anthropic does not send but the parser takes as the end of the
+    // stream: the late delta after it must not reach the caller.
+    (
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ok\"}}\n\ndata: [DONE]\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"late\"}}\n\n",
+        &[("ok", false), ("", true)],
+        None,
+    ),
+    // An `error` event fails the stream with the server's message, after the
+    // text before it has reached the caller. `sse_line_parsers_never_panic`
+    // reaches this branch but can only fail on a panic, not on a wrong result.
+    (
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"par\"}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Overloaded\"}}\n\n",
+        &[("par", false)],
+        Some("Anthropic provider stream failed: Overloaded"),
+    ),
+    // An `error` event with no message: a placeholder stands in for it.
+    (
+        "data: {\"type\":\"error\",\"error\":{}}\n\n",
+        &[],
+        Some("Anthropic provider stream failed: unknown Anthropic stream error"),
     ),
 ];
 
-fn openai_events_from_pieces(pieces: &[&[u8]]) -> Vec<ProviderStreamEvent> {
+/// What a stream produced: the events the caller saw, and the error it failed
+/// with, if it failed.
+type Outcome = (Vec<ProviderStreamEvent>, Option<String>);
+
+/// Run `stream` with a callback that records every event.
+fn outcome(
+    stream: impl FnOnce(&mut dyn FnMut(ProviderStreamEvent) -> Result<()>) -> Result<()>,
+) -> Outcome {
     let mut events = Vec::new();
     let mut on_event = |event: ProviderStreamEvent| {
         events.push(event);
         Ok(())
     };
-    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-    for piece in pieces {
-        emitter.push_bytes(piece).expect("fixture lines parse");
-    }
-    emitter.finish().expect("fixture stream finishes");
-    events
+    let error = stream(&mut on_event).err().map(|error| error.to_string());
+    (events, error)
 }
 
-fn anthropic_events_from_pieces(pieces: &[&[u8]]) -> Vec<ProviderStreamEvent> {
-    let mut events = Vec::new();
-    let mut on_event = |event: ProviderStreamEvent| {
-        events.push(event);
-        Ok(())
-    };
-    let mut emitter = AnthropicSseEmitter::new(&mut on_event);
-    for piece in pieces {
-        emitter.push_bytes(piece).expect("fixture lines parse");
-    }
-    emitter.finish().expect("fixture stream finishes");
-    events
+fn openai_outcome(pieces: &[&[u8]]) -> Outcome {
+    outcome(|on_event| {
+        let mut emitter = OpenAiSseEmitter::new(on_event);
+        for piece in pieces {
+            emitter.push_bytes(piece)?;
+        }
+        emitter.finish()
+    })
 }
 
-/// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
-fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
-    let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    for cut in cuts {
-        pieces.push(&bytes[start..cut]);
-        start = cut;
-    }
-    pieces.push(&bytes[start..]);
-    pieces
+fn anthropic_outcome(pieces: &[&[u8]]) -> Outcome {
+    outcome(|on_event| {
+        let mut emitter = AnthropicSseEmitter::new(on_event);
+        for piece in pieces {
+            emitter.push_bytes(piece)?;
+        }
+        emitter.finish()
+    })
 }
 
 /// How many single split points landed in each place a line emitter is most
@@ -171,34 +224,33 @@ impl SplitReach {
     }
 }
 
-/// Check the whole body of each fixture against its expected events, then
+/// Check the whole body of each fixture against its expected outcome, then
 /// every one- and two-point split of it against the whole body.
-fn sweep_splits(
-    fixtures: &[Fixture],
-    events_from_pieces: fn(&[&[u8]]) -> Vec<ProviderStreamEvent>,
-    reach: &mut SplitReach,
-) {
-    for (fixture, expected) in fixtures {
+fn sweep_splits(fixtures: &[Fixture], outcome_of: fn(&[&[u8]]) -> Outcome, reach: &mut SplitReach) {
+    for (fixture, events, error) in fixtures {
         let bytes = fixture.as_bytes();
-        let whole = events_from_pieces(&[bytes]);
-        let expected: Vec<ProviderStreamEvent> = expected
-            .iter()
-            .map(|&(content, done)| ProviderStreamEvent {
-                content: content.to_owned(),
-                done,
-            })
-            .collect();
-        assert_eq!(whole, expected, "events of {fixture:?}");
+        let whole = outcome_of(&[bytes]);
+        let expected: Outcome = (
+            events
+                .iter()
+                .map(|&(content, done)| ProviderStreamEvent {
+                    content: content.to_owned(),
+                    done,
+                })
+                .collect(),
+            error.map(str::to_owned),
+        );
+        assert_eq!(whole, expected, "outcome of {fixture:?}");
         for a in 0..=bytes.len() {
             reach.record(bytes, a);
             assert_eq!(
-                events_from_pieces(&split_at_offsets(bytes, &[a])),
+                outcome_of(&split_at_offsets(bytes, &[a])),
                 whole,
                 "split at {a} of {fixture:?}"
             );
             for b in a..=bytes.len() {
                 assert_eq!(
-                    events_from_pieces(&split_at_offsets(bytes, &[a, b])),
+                    outcome_of(&split_at_offsets(bytes, &[a, b])),
                     whole,
                     "split at {a},{b} of {fixture:?}"
                 );
@@ -213,13 +265,13 @@ fn sweep_splits(
 #[test]
 fn sse_emitters_are_invariant_under_every_one_and_two_point_split() {
     let mut reach = SplitReach::default();
-    sweep_splits(OPENAI_FIXTURES, openai_events_from_pieces, &mut reach);
-    sweep_splits(ANTHROPIC_FIXTURES, anthropic_events_from_pieces, &mut reach);
+    sweep_splits(OPENAI_FIXTURES, openai_outcome, &mut reach);
+    sweep_splits(ANTHROPIC_FIXTURES, anthropic_outcome, &mut reach);
     eprintln!("single-split reach: {reach:?}");
     assert!(reach.mid_utf8 > 0 && reach.mid_data_prefix > 0);
     // Each emitter has a fixture whose last line is left for `finish()`.
     for fixtures in [OPENAI_FIXTURES, ANTHROPIC_FIXTURES] {
-        assert!(fixtures.iter().any(|(body, _)| !body.ends_with('\n')));
+        assert!(fixtures.iter().any(|(body, ..)| !body.ends_with('\n')));
     }
 }
 
@@ -480,43 +532,63 @@ proptest! {
     }
 }
 
-/// An Anthropic `error` event fails the stream with the server's message (or a
-/// placeholder when it sends none), after the text that came before it has
-/// reached the caller. `sse_line_parsers_never_panic` reaches this branch but
-/// can only fail on a panic, not on a wrong result.
+/// Each parser accepts a line that still ends in `\r`, whatever the emitter in
+/// front of it does. For a `[DONE]` line this reaches the parser's own trims
+/// (`line.trim()` and `data.trim()`, either of which is enough); a JSON payload
+/// would not, because `serde_json` reads a trailing `\r` as whitespace.
 #[test]
-fn anthropic_error_event_fails_the_stream() {
-    for (error, reported) in [
-        (
-            "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
-            "Anthropic provider stream failed: Overloaded",
-        ),
-        (
-            "{\"type\":\"error\",\"error\":{}}",
-            "Anthropic provider stream failed: unknown Anthropic stream error",
-        ),
-    ] {
-        let body = format!(
-            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"par\"}}}}\n\nevent: error\ndata: {error}\n\n"
-        );
-        let mut events = Vec::new();
-        let mut on_event = |event: ProviderStreamEvent| {
-            events.push(event);
-            Ok(())
-        };
-        let mut emitter = AnthropicSseEmitter::new(&mut on_event);
-        let failure = emitter
-            .push_bytes(body.as_bytes())
-            .expect_err("an error event fails the stream");
-        assert_eq!(failure.to_string(), reported);
+fn sse_line_parsers_accept_a_cr_terminated_line() {
+    let done = Some(ProviderStreamEvent {
+        content: String::new(),
+        done: true,
+    });
+    for line in ["data: [DONE]\r", "data:[DONE]\r"] {
         assert_eq!(
-            events,
-            [ProviderStreamEvent {
-                content: "par".to_owned(),
-                done: false,
-            }]
+            parse_openai_sse_line(line).expect("parses"),
+            done,
+            "{line:?}"
+        );
+        assert_eq!(
+            parse_anthropic_sse_line(line).expect("parses"),
+            done,
+            "{line:?}"
         );
     }
+    assert_eq!(
+        parse_anthropic_sse_line("data: {\"type\":\"message_stop\"}\r").expect("parses"),
+        done
+    );
+}
+
+/// An error the caller's callback returns stops the stream and is the error
+/// the emitter returns: from a pushed line, and from the end-of-stream event
+/// `finish()` sends when the body had none.
+#[test]
+fn a_callback_error_stops_either_emitter() {
+    fn refuse(event: ProviderStreamEvent) -> Result<()> {
+        bail!("caller refused {:?}", event.content)
+    }
+    let mut on_event = refuse;
+
+    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
+    let error = emitter
+        .push_bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n")
+        .expect_err("a callback error on a line propagates");
+    assert_eq!(error.to_string(), "caller refused \"hi\"");
+    let mut emitter = AnthropicSseEmitter::new(&mut on_event);
+    let error = emitter
+        .push_bytes(b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n")
+        .expect_err("a callback error on a line propagates");
+    assert_eq!(error.to_string(), "caller refused \"hi\"");
+
+    let error = OpenAiSseEmitter::new(&mut on_event)
+        .finish()
+        .expect_err("a callback error on the end event propagates");
+    assert_eq!(error.to_string(), "caller refused \"\"");
+    let error = AnthropicSseEmitter::new(&mut on_event)
+        .finish()
+        .expect_err("a callback error on the end event propagates");
+    assert_eq!(error.to_string(), "caller refused \"\"");
 }
 
 /// An OpenAI-compatible server that fails mid-generation reports it in-band:
@@ -538,17 +610,9 @@ fn in_band_stream_errors_are_not_reported_as_a_clean_finish() {
         let body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"partial\"}}}}]}}\n\n{error_line}data: [DONE]\n\n"
         );
-        let mut events = Vec::new();
-        let mut on_event = |event: ProviderStreamEvent| {
-            events.push(event);
-            Ok(())
-        };
-        let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-        let result = emitter
-            .push_bytes(body.as_bytes())
-            .and_then(|()| emitter.finish());
+        let (events, error) = openai_outcome(&[body.as_bytes()]);
         assert!(
-            result.is_err(),
+            error.is_some(),
             "stream with an in-band error finished cleanly with {events:?}"
         );
         // The text produced before the failure still reaches the caller.
