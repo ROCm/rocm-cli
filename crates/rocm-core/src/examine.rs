@@ -4400,7 +4400,7 @@ mod tests {
     /// runtime.
     #[cfg(unix)]
     fn plant_fake_runtime_interpreter(label: &str) -> (std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
             "rocm-core-examine-{label}-{}",
@@ -4409,8 +4409,7 @@ mod tests {
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let python = root.join("python");
-        std::fs::write(
-            &python,
+        write_fake_executable(&python,
             format!(
                 "#!/bin/sh\n\
                  case \"${env}\" in\n\
@@ -4424,8 +4423,6 @@ mod tests {
             ),
         )
         .expect("plant the fake interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the fake interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,
@@ -4510,7 +4507,7 @@ mod tests {
     fn plant_loader_path_recording_interpreter(
         label: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
             "rocm-core-examine-{label}-{}",
@@ -4520,7 +4517,7 @@ mod tests {
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let recorded = root.join("loader-path");
         let python = root.join("python");
-        std::fs::write(
+        write_fake_executable(
             &python,
             format!(
                 "#!/bin/sh\n\
@@ -4532,8 +4529,6 @@ mod tests {
             ),
         )
         .expect("plant the recording interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the recording interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,

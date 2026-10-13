@@ -42,14 +42,11 @@ async fn plant_engine_env(world: &mut E2eWorld) {
     std::fs::create_dir_all(&bin).expect("failed to create the planted engine env");
 
     let python = bin.join("python");
-    std::fs::write(&python, "#!/bin/sh\necho planted-engine-python\n")
-        .expect("failed to write the planted interpreter");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to mark the planted interpreter executable");
-    }
+    rocm_core::fake_executable::write_fake_executable(
+        &python,
+        "#!/bin/sh\necho planted-engine-python\n",
+    )
+    .expect("failed to write the planted interpreter");
 
     let manifests = root
         .path()
