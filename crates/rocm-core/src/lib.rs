@@ -2691,6 +2691,38 @@ pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
         .map(|segment| format!("vllm: {segment}"))
 }
 
+/// The text to *show* the user for a segment [`vllm_oom_diagnose_symptom`]
+/// selected, with the `vllm: ` anchor already removed by the caller.
+///
+/// Not the same operation as stripping the segment's control bytes, and the
+/// difference is the whole point. [`strip_terminal_control_sequences`] deletes
+/// every break token — `\r`, `ESC[1A`, `NEL`, `VT`, `U+2028`… — *without a
+/// separator*, so a progress-bar repaint such as
+/// `Loading weights: 90%\x1b[1Atorch.OutOfMemoryError: HIP out of memory` comes
+/// back as the single run-together line
+/// `Loading weights: 90%torch.OutOfMemoryError: HIP out of memory`. That string
+/// is text vLLM never printed: two rows the terminal drew separately, welded
+/// into one. Displaying it beside "Detected an out-of-memory failure" presents a
+/// fabricated line as the user's own output, and — once rocm-cli writes its bail
+/// back into the shared log — a *later* read finds that welded line, scores it
+/// as an OOM, finds it quotable (the control bytes are gone) and quotes it into
+/// the `rocm diagnose --symptom` command the user is invited to paste.
+///
+/// So this returns the [`terminal::rendered_lines`] row that actually scored —
+/// the same per-row rule [`segment_shows_oom`] gates on — which is one row the
+/// terminal really drew. When no row scores (the caller passed a segment that is
+/// not an OOM at all) it falls back to stripping, which is lossless for the
+/// single-row case that is by far the common one.
+///
+/// Pinned by `the_displayed_oom_line_is_a_row_the_terminal_actually_drew`.
+#[must_use]
+pub fn vllm_oom_display_line(segment: &str) -> String {
+    terminal::rendered_lines(segment)
+        .into_iter()
+        .find(|row| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {row}")))
+        .unwrap_or_else(|| terminal::strip_terminal_control_sequences(segment))
+}
+
 /// Locate `amd-smi` inside the bin directories of the newest managed ROCm SDK
 /// runtime recorded in the registry. The binary ships with the TheRock wheel
 /// (under the SDK `bin_path` and/or the venv `install_root/bin`) and is not on
@@ -4194,14 +4226,19 @@ last_installed_runtime_id = "therock-release"
             }
 
             // Either way the user still sees their real error: the raw bytes
-            // survive selection, so stripping for display recovers the
+            // survive selection, so rendering for display recovers the
             // exception rather than the progress-bar text that preceded it.
-            let displayed = terminal::strip_terminal_control_sequences(
-                symptom.strip_prefix("vllm: ").unwrap_or(&symptom),
-            );
-            assert!(
-                displayed.contains("torch.OutOfMemoryError"),
-                "{label}: the displayed line must be the exception, got {displayed:?}"
+            //
+            // Asserted as exact equality, not `contains`. `contains` passed on
+            // the welded `Loading weights: 90%torch.OutOfMemoryError: ...` that
+            // plain stripping produced, so it could not fail on the very bug
+            // this line is here to catch.
+            let displayed =
+                vllm_oom_display_line(symptom.strip_prefix("vllm: ").unwrap_or(&symptom));
+            assert_eq!(
+                displayed, exception,
+                "{label}: the displayed line must be the exception row on its own, with no \
+                 progress-bar text welded onto its front"
             );
 
             // An escape-bearing segment must never pass the quoting guard, or it
@@ -4213,6 +4250,45 @@ last_installed_runtime_id = "therock-release"
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_displayed_oom_line_is_a_row_the_terminal_actually_drew() {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+
+        // The bug: `strip_terminal_control_sequences` deletes the break token
+        // with nothing in its place, welding the progress bar onto the front of
+        // the exception. The welded string is text vLLM never emitted, and it is
+        // quotable (no control bytes left), so it would reach the printed
+        // `rocm diagnose --symptom` command as a runnable lookalike.
+        let repaint = format!("Loading weights: 90%\u{1b}[1A{exception}");
+        let welded = terminal::strip_terminal_control_sequences(&repaint);
+        assert_eq!(
+            welded,
+            format!("Loading weights: 90%{exception}"),
+            "this pins the shape of the bug, so the assertion below cannot pass vacuously"
+        );
+        assert!(
+            terminal::quotable_in_single_quotes(&welded),
+            "the welded line is quotable, which is exactly why it must never be displayed \
+             or written back into the shared log"
+        );
+
+        assert_eq!(
+            vllm_oom_display_line(&repaint),
+            exception,
+            "the displayed line must be the rendered row that scored, not the whole segment \
+             with its break tokens deleted"
+        );
+
+        // A plain single-row line is unchanged, so the common case is lossless.
+        assert_eq!(vllm_oom_display_line(exception), exception);
+        // A line that is not an OOM at all has no scoring row to pick, so the
+        // helper still returns something printable rather than an empty string.
+        assert_eq!(
+            vllm_oom_display_line("\u{1b}[31mOSError: model weights not found\u{1b}[0m"),
+            "OSError: model weights not found"
+        );
     }
 
     #[test]

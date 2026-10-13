@@ -701,8 +701,10 @@ fine. It appears only when all of the following hold:
 - You are looking at the **interactive deployment summary** — the default
   background managed launch with a terminal on stdout. A piped, redirected, or
   otherwise scripted run prints the plain machine-readable form
-  (`readiness: <status>`), which carries no notes at all, and
-  `--verbose`/`--foreground` streams the engine log in your terminal instead,
+  (`readiness: <status>`), which carries no *post-launch* notes — it still
+  prints the pre-launch planning lines, including the low-VRAM `note:` when
+  amd-smi reports a tight card, so a `note:` in piped output is never this one —
+  and `--verbose`/`--foreground` streams the engine log in your terminal instead,
   where the traceback is already in front of you. Either way, the log is on
   disk: `rocm services logs <service-id>`.
 - The service **failed to become ready** (recorded status `starting`). A `ready`

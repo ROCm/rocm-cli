@@ -454,8 +454,9 @@ rocm model --verbose"
     /// --gpu-memory-utilization and --gpu, warning that lowering the reservation will not
     /// help if the model does not fit, and printing a `rocm diagnose --symptom` command
     /// for your own failing line. That note belongs to the interactive summary only: a
-    /// piped or redirected run prints the plain machine-readable form with no notes, and
-    /// --verbose streams the traceback itself. It is never shown for a healthy or
+    /// piped or redirected run prints the plain machine-readable form, which carries no
+    /// post-launch notes (it still prints the pre-launch planning ones), and --verbose
+    /// streams the traceback itself. It is never shown for a healthy or
     /// still-loading server, for a non-memory failure, or for a run that reused an
     /// already-running server rather than launching one — read that server's own log with
     /// `rocm services logs <service-id>`.

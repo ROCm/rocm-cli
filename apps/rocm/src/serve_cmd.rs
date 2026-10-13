@@ -1050,10 +1050,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // Note the asymmetry this sits inside: `summary_mode` is
             // `background && stdout().is_terminal()`, so the guidance reaches an
             // interactive user only. A scripted / CI / assistant-driven run takes
-            // `print_managed_launch_plain`, which prints `readiness: {status}` and
-            // no notes at all — that path is machine-readable by design and is not
-            // the place to grow prose, but it does mean the same failed launch is
-            // explained in one invocation and not the other.
+            // `print_managed_launch_plain`, which ends at `readiness: {status}`
+            // and carries no *post-launch* note. It is not noteless: the
+            // `!summary_mode` branch above still prints the pre-launch planning
+            // lines, low-VRAM `note:` included, so the asymmetry is precisely
+            // that the OOM confirmation and the `rocm diagnose --symptom`
+            // command are missing — not that the path prints nothing. That path
+            // is machine-readable by design and is not the place to grow prose,
+            // but it does mean the same failed launch is explained in one
+            // invocation and not the other.
             let notes = append_oom_serve_note(
                 notes,
                 engine_serves_vllm,

@@ -720,10 +720,27 @@ fn prepend_path_entries(entries: &[PathBuf], current: Option<OsString>) -> Resul
 /// output and this whole string is `bail!`-ed to the user's terminal, so
 /// stripping control bytes out of the one echoed line further down while
 /// printing the raw tail a few lines above would have left the escapes a clear
-/// path to the terminal inside the same message. Stripping is per line so the
-/// tail keeps its shape; `oom_utilization_hint` still reads the *raw* tail,
-/// because what it selects from it is quoted into a command and has its own,
-/// stricter admissibility test.
+/// path to the terminal inside the same message. `oom_utilization_hint` still
+/// reads the *raw* tail, because what it selects from it is quoted into a
+/// command and has its own, stricter admissibility test.
+///
+/// Sanitizing with [`rocm_core::terminal::rendered_lines`] rather than
+/// `strip_terminal_control_sequences` is load-bearing, not a stylistic
+/// preference. Stripping deletes every line-break token (`\r`, `ESC[1A`, `NEL`,
+/// `VT`, `U+2028`…) *with no separator in its place*, so a progress-bar repaint
+/// — `Loading weights: 90%\rtorch.OutOfMemoryError: HIP out of memory.`, which
+/// vLLM emits as one `\n` line — was echoed as the single welded line
+/// `Loading weights: 90%torch.OutOfMemoryError: HIP out of memory.`. That is
+/// text the engine never printed, and it is worse than cosmetic: a managed
+/// launch shares one log between the supervisor and the engine, so the CLI
+/// writes this whole bail back into the same file, and the next read finds the
+/// welded line, scores it as a genuine OOM, finds it quotable (the control bytes
+/// are gone) and prints it inside the `rocm diagnose --symptom '…'` command the
+/// serve summary invites the user to paste. Expanding each physical line into
+/// the rows a terminal would have drawn keeps the echo faithful, keeps the
+/// tail's shape, and leaves nothing weldable behind for the second read.
+///
+/// Pinned by `the_echoed_tail_never_welds_two_rendered_rows_into_one_line`.
 fn startup_log_context(log_path: Option<&Path>) -> String {
     let summary = log_path
         .and_then(|p| summarize_startup_log_tail(p, STARTUP_FAILURE_LOG_TAIL_LINES).ok())
@@ -734,7 +751,7 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
     let hint = oom_utilization_hint(&summary);
     let summary = summary
         .lines()
-        .map(rocm_core::strip_terminal_control_sequences)
+        .flat_map(rocm_core::terminal::rendered_lines)
         .collect::<Vec<_>>()
         .join("\n");
     format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}{hint}")
@@ -774,10 +791,15 @@ fn oom_utilization_hint(log_tail: &str) -> String {
         return String::new();
     };
     // The line is subprocess output, so it is echoed only after the terminal
-    // control bytes vLLM's colourised logger emits are removed.
-    let symptom_line = rocm_core::strip_terminal_control_sequences(
-        symptom.strip_prefix("vllm: ").unwrap_or(&symptom),
-    );
+    // control bytes vLLM's colourised logger emits are removed -- but removing
+    // them is not enough on its own. A break token deleted with nothing in its
+    // place welds the two rows either side of it into a line the engine never
+    // printed (`Loading weights: 90%torch.OutOfMemoryError: ...`), which would
+    // then be presented here as the user's own output. The shared helper returns
+    // the rendered row that actually scored, which is one row the terminal
+    // really drew.
+    let symptom_line =
+        rocm_core::vllm_oom_display_line(symptom.strip_prefix("vllm: ").unwrap_or(&symptom));
     let symptom = if rocm_core::quotable_in_single_quotes(&symptom) {
         symptom
     } else {
@@ -1390,6 +1412,69 @@ mod tests {
                 .and_then(|rest| rest.split("\n\nDetected").next()),
             Some("INFO starting\nRuntimeError: HIP out of memory"),
             "the tail must keep its text and its line structure, minus the escapes: {context:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_echoed_tail_never_welds_two_rendered_rows_into_one_line() -> Result<()> {
+        // vLLM draws its progress bar with bare carriage returns, so a real OOM
+        // arrives as ONE `\n` line carrying two rows the terminal drew. The echo
+        // used to sanitize with `strip_terminal_control_sequences`, which drops
+        // the break with nothing in its place and welds them together.
+        //
+        // That is not cosmetic. A managed launch shares one log between the
+        // supervisor and the engine: the CLI writes this whole bail back into
+        // the same file, so the *second* read sees the welded line, scores it as
+        // a genuine OOM, finds it quotable (the control bytes are gone) and
+        // quotes it into the `rocm diagnose --symptom '...'` command the serve
+        // summary invites the user to paste. The user would be told to paste a
+        // line vLLM never printed.
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let welded = format!("Loading weights: 90%{exception}");
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-weld-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("Loading weights: 90%\r{exception}\n"))?;
+        let context = startup_log_context(Some(path.as_path()));
+        fs::remove_file(&path).ok();
+
+        assert!(
+            !context.contains(&welded),
+            "the echoed tail must not weld the progress bar onto the exception: {context:?}"
+        );
+        assert!(
+            context.contains(&format!("Loading weights: 90%\n{exception}")),
+            "each row the terminal drew must be echoed on its own line: {context:?}"
+        );
+        // The displayed line beside the hint is the scoring row, not the segment
+        // with its breaks deleted.
+        assert!(
+            context.contains(&format!(
+                "{}{exception})",
+                rocm_core::VLLM_OOM_DETECTED_PREFIX
+            )),
+            "the hint must name the exception row alone: {context:?}"
+        );
+        assert!(
+            !context.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte may survive into the printed failure message: {context:?}"
+        );
+
+        // Now the second read: rebuild the shared log exactly as the supervisor
+        // leaves it (the raw engine output, then the CLI's `Error:` echo of this
+        // bail) and confirm the selector still picks the engine's real row.
+        let second_read = format!(
+            "Loading weights: 90%\r{exception}\n\
+             Error: vLLM server process exited before becoming ready (status: exit status: 1)\
+             {context}\n"
+        );
+        assert_eq!(
+            rocm_core::vllm_oom_diagnose_symptom(&second_read).as_deref(),
+            Some(format!("vllm: {exception}").as_str()),
+            "the welded echo must never become the symptom the user is told to paste"
         );
         Ok(())
     }

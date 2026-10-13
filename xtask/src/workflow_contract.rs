@@ -2512,7 +2512,18 @@ esac
         );
     }
 
-    /// Nothing shipped may be built with a test-only feature.
+    /// `release.yml` must build the shipped binaries with no feature flags, so a
+    /// test-only feature cannot reach a release artefact.
+    ///
+    /// Scoped to `release.yml` deliberately, and that scope is narrower than
+    /// "nothing shipped" — stated here rather than implied, so this guard is not
+    /// read as a guarantee it does not make. `nightly.yml` also builds
+    /// `-p rocm -p rocmd` and publishes the result (`gh release create
+    /// --prerelease`), and nothing here checks those builds. They carry no
+    /// features today. A wholesale scan of `nightly.yml` cannot be the fix:
+    /// that file legitimately builds `--features rocm/e2e-test-hooks` for its
+    /// E2E lanes, so covering it needs a check aimed at the publishing jobs
+    /// alone.
     ///
     /// Shape-based rather than a deny-list of feature names: a deny-list only
     /// catches the features that existed when it was written. The pre-existing

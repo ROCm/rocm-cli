@@ -1557,9 +1557,14 @@ const VLLM_ANCHOR_PATTERN: &str = r"vllm|gpu[-_]memory[-_]utilization";
 ///
 /// It carries two independent signals (the torch exception class *and* the HIP
 /// allocator message) on one anchored line, so it scores even after overlap
-/// de-duplication. The vLLM engine falls back to this when a user's actual
-/// failing line would not itself be diagnosable, so the `rocm diagnose` command
-/// it prints always reports a cause.
+/// de-duplication. Both OOM surfaces — the vLLM engine's startup-failure hint
+/// and the `rocm serve` summary note — fall back to this when the user's actual
+/// failing line cannot be rendered as one intact single-quoted shell argument
+/// (`quotable_in_single_quotes` rejects it), so the `rocm diagnose` command they
+/// print always reports a cause. Note the condition is *quotability*, not
+/// diagnosability: `vllm_oom_diagnose_symptom` returns the raw line with its
+/// control bytes intact, and an escape-bearing line scores on its rendered rows
+/// but is refused by the quoting guard, which is what sends it here.
 pub const VLLM_OOM_CANONICAL_SYMPTOM: &str = "vllm: torch.OutOfMemoryError: HIP out of memory";
 
 /// The lines of `symptom` that carry the vLLM OOM anchor (`vllm` or
@@ -1639,10 +1644,15 @@ fn vllm_anchored_lines(symptom: &str) -> String {
 /// Whether `symptom` clears [`MIN_SCORE_FOR_MATCH`] for the vLLM-OOM failure
 /// mode.
 ///
-/// The vLLM engine calls this to decide whether the user's actual failing line
-/// is worth routing into a `--symptom` example, or whether to fall back to
-/// [`VLLM_OOM_CANONICAL_SYMPTOM`] so the printed command is guaranteed to report
-/// a cause rather than reading as "the tool checked and found nothing".
+/// This is the OOM *classifier* the whole stack scores against. It is not what
+/// the engine calls directly any more: `rocm_core::vllm_oom_diagnose_symptom`
+/// owns line selection for both surfaces and reaches this per rendered row, and
+/// what those surfaces then branch on before printing is
+/// `quotable_in_single_quotes` — a line this function accepts is still replaced
+/// by [`VLLM_OOM_CANONICAL_SYMPTOM`] when it cannot be rendered as one intact
+/// single-quoted argument. Scoring here and admissibility there are deliberately
+/// separate questions; keeping them straight is what stops a colourised line
+/// being printed as a runnable lookalike of the user's error.
 #[must_use]
 pub fn vllm_oom_symptom_is_diagnosable(symptom: &str) -> bool {
     let e = Examination {

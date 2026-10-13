@@ -112,8 +112,11 @@ pub fn run(args: &[String]) -> Result<()> {
             // only — the release build never enables it, so shipped binaries
             // carry no fault-injection hook. It joins `rocm/e2e-test-hooks`
             // (the general e2e hook surface) in a single space-separated
-            // `--features` value; cargo takes one `--features` argument, so both
-            // must be listed together rather than in two overriding flags.
+            // `--features` value. Cargo does accept repeated `--features`/`-F`
+            // flags and unions them, so one value is a readability choice rather
+            // than a cargo constraint — but it is the shape
+            // `workflow_contract.rs` asserts the prebuilt lanes spell, so keep
+            // the two listed together.
             .args([
                 "build",
                 "--release",
@@ -169,6 +172,20 @@ mod tests {
             .get_envs()
             .find(|(name, _)| *name == OsStr::new(key))
             .and_then(|(_, value)| value.map(OsStr::to_os_string))
+    }
+
+    /// Whether `key` is explicitly *cleared* on `command` — an `env_remove`,
+    /// which `get_envs` reports as a present key carrying a `None` value.
+    ///
+    /// [`command_env`] cannot express this: it flattens "removed" and "never
+    /// mentioned" to the same `None`, so `assert_eq!(command_env(..), None)`
+    /// holds whether the `env_remove` branch exists or not. Deleting that branch
+    /// left every test in this module green, which is the whole reason this
+    /// second helper exists rather than reusing the first.
+    fn command_env_is_cleared(command: &Command, key: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == OsStr::new(key) && value.is_none())
     }
 
     #[test]
@@ -229,8 +246,16 @@ mod tests {
             binaries.rocmd.map(PathBuf::into_os_string)
         );
         // A prebuilt binary has the fault-injection hook compiled out, so the
-        // signal must be cleared, not inherited from the ambient environment.
-        assert_eq!(command_env(&command, "ROCM_E2E_OOM_FAULT_INJECTION"), None);
+        // signal must be *cleared*, not merely left unset: xtask inherits this
+        // process's environment, so an ambient `ROCM_E2E_OOM_FAULT_INJECTION=1`
+        // would otherwise reach the harness and let it run
+        // `@requires-oom-fault-injection` scenarios against a binary with the
+        // hook compiled out. Asserted with `command_env_is_cleared` rather than
+        // `command_env(..) == None`, which cannot tell the two apart.
+        assert!(
+            command_env_is_cleared(&command, "ROCM_E2E_OOM_FAULT_INJECTION"),
+            "the fault-injection signal must be explicitly removed for a prebuilt binary"
+        );
     }
 
     #[test]
@@ -245,6 +270,12 @@ mod tests {
 
         let mut command = Command::new("cargo");
         configure_harness_env(&mut command, &binaries);
-        assert_eq!(command_env(&command, "ROCM_CLI_ROCMD_BINARY"), None);
+        // Same distinction as above: `configure_harness_env` removes the key
+        // rather than leaving it alone, so an inherited `ROCM_CLI_ROCMD_BINARY`
+        // cannot point the harness at a daemon this invocation never resolved.
+        assert!(
+            command_env_is_cleared(&command, "ROCM_CLI_ROCMD_BINARY"),
+            "an unresolved rocmd path must be explicitly removed, not left to the environment"
+        );
     }
 }
