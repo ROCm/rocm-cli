@@ -329,6 +329,15 @@ fn extract_rust(path: &Path, rel: &str, out: &mut Vec<Advice>) {
 
 fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
     let text = std::fs::read_to_string(path).expect("read markdown");
+    extract_markdown_text(&text, rel, out);
+}
+
+fn extract_markdown_text(text: &str, rel: &str, out: &mut Vec<Advice>) {
+    let fenced = |start: usize, raw: String| Advice {
+        source: format!("{rel}:{start}"),
+        raw,
+        surface: Surface::CommandLine,
+    };
     let mut in_fence = false;
     // A fenced command continued with `\` (sh) or `` ` `` (PowerShell).
     let mut pending: Option<(usize, String)> = None;
@@ -338,6 +347,11 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
         let line_no = index + 1;
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
+            // A continuation the fence cut off is still a command; checking it
+            // as it stands beats gluing the next fence's first line onto it.
+            if let Some((start, joined)) = pending.take() {
+                out.push(fenced(start, joined));
+            }
             in_fence = !in_fence;
             continue;
         }
@@ -350,11 +364,7 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
                 if continued {
                     pending = Some((start, joined));
                 } else {
-                    out.push(Advice {
-                        source: format!("{rel}:{start}"),
-                        raw: joined,
-                        surface: Surface::CommandLine,
-                    });
+                    out.push(fenced(start, joined));
                 }
                 continue;
             }
@@ -366,11 +376,7 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
                 if continued {
                     pending = Some((line_no, command.to_owned()));
                 } else {
-                    out.push(Advice {
-                        source: format!("{rel}:{line_no}"),
-                        raw: command.to_owned(),
-                        surface: Surface::CommandLine,
-                    });
+                    out.push(fenced(line_no, command.to_owned()));
                 }
             }
             continue;
@@ -389,13 +395,24 @@ fn extract_markdown(path: &Path, rel: &str, out: &mut Vec<Advice>) {
             prose = Some((start, joined));
             continue;
         }
-        for raw in backtick_spans(&joined) {
-            out.push(Advice {
-                source: format!("{rel}:{start}"),
-                raw,
-                surface: Surface::InlineProse,
-            });
-        }
+        push_spans(start, &joined, rel, out);
+    }
+    // The file ended inside a continued command or a wrapped paragraph.
+    if let Some((start, joined)) = pending {
+        out.push(fenced(start, joined));
+    }
+    if let Some((start, joined)) = prose {
+        push_spans(start, &joined, rel, out);
+    }
+}
+
+fn push_spans(start: usize, prose: &str, rel: &str, out: &mut Vec<Advice>) {
+    for raw in backtick_spans(prose) {
+        out.push(Advice {
+            source: format!("{rel}:{start}"),
+            raw,
+            surface: Surface::InlineProse,
+        });
     }
 }
 
@@ -1043,23 +1060,16 @@ pub(crate) fn rocm_verdict(args: &[String]) -> Verdict {
     }
 }
 
-/// `rocmd`'s parser is private to its crate. Appending `--help` makes clap stop
-/// at the first word it cannot place (unknown subcommand or flag, invalid enum
-/// or number) and otherwise return `DisplayHelp` *before anything runs*, so
-/// every named word is checked against the real definition without executing
-/// it. Missing required values are not checked this way; for advice that is
-/// the `IncompleteReference` case anyway.
+/// `rocmd`'s parser, through [`rocmd::parse_args`]: the full clap validation
+/// (unknown words, invalid values, conflicting flags, missing required
+/// values), with nothing run.
 pub(crate) fn rocmd_verdict(args: &[String]) -> Verdict {
     let argv = std::iter::once("rocmd".into())
         .chain(args.iter().map(Into::into))
-        .chain(std::iter::once("--help".into()))
         .collect();
-    match rocmd::run_from_args(argv) {
+    match rocmd::parse_args(argv) {
         Ok(()) => Verdict::Parses,
-        Err(error) => match error.downcast_ref::<clap::Error>() {
-            Some(clap_error) => classify_clap_error(clap_error),
-            None => Verdict::Rejected(format!("{error:#}")),
-        },
+        Err(error) => classify_clap_error(&error),
     }
 }
 
@@ -1238,18 +1248,22 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
 /// the planner (`rocm doctor`) means the advised subcommand is not real — the
 /// user gets a request plan instead of the command they were told about.
 ///
-/// The words must be multi-word *in the advice*: a quoted request, or a
-/// placeholder that names one (`<natural language request>`). A value
-/// [`placeholder_value`] filled in does not count — `rocm frobnicate <TEXT>`
-/// fills `<TEXT>` with several words, but the advice names a subcommand.
+/// The *first* request word must be multi-word *in the advice*: a quoted
+/// request, or a placeholder that names one (`<natural language request>`).
+/// That is the word real routing judges ([`command_invocation_error`] treats a
+/// request as prose only when its first word has whitespace), so a quoted
+/// argument after a single word does not count — `rocm frobnicate "two
+/// words"` names a subcommand. Nor does a value [`placeholder_value`] filled
+/// in — `rocm frobnicate <TEXT>` fills `<TEXT>` with several words, but the
+/// advice names a subcommand.
 fn is_deliberate_natural_language(words: &[Word]) -> bool {
     let args = values(&words[1..]);
     let request = parse_freeform_invocation(&args).request_args;
     // The request is a suffix of the arguments (`--yes` is the only prefix).
     let request_words = &words[words.len() - request.len()..];
     request_words
-        .iter()
-        .any(|word| word.advised.contains(char::is_whitespace))
+        .first()
+        .is_some_and(|word| word.advised.contains(char::is_whitespace))
 }
 
 pub(crate) struct Finding {
@@ -1471,16 +1485,16 @@ fn checker_rejects_what_users_would_hit() {
     // The verdicts the contract rests on, each against the real parser.
     let argv = |text: &str| argv_variants(text).remove(0);
     assert!(matches!(
-        verdict(&argv("rocm update --check")),
+        verdict(&argv("rocm update --frobnicate")),
         Verdict::Rejected(_)
     ));
     assert!(matches!(
         verdict(&argv("rocm install --channel release")),
         Verdict::Rejected(_)
     ));
-    assert_eq!(verdict(&argv("rocm doctor")), Verdict::Freeform);
+    assert_eq!(verdict(&argv("rocm frobnicate")), Verdict::Freeform);
     let words = |text: &str| command_variants(text).remove(0);
-    assert!(!is_deliberate_natural_language(&words("rocm doctor")));
+    assert!(!is_deliberate_natural_language(&words("rocm frobnicate")));
     assert!(matches!(
         verdict(&argv("rocm instal sdk")),
         Verdict::Rejected(_)
@@ -1500,6 +1514,22 @@ fn checker_rejects_what_users_would_hit() {
     assert_eq!(
         verdict(&argv("rocmd run --automations-enabled")),
         Verdict::Parses
+    );
+    // `rocmd` gets the full validation too, not only unknown words: flags
+    // declared as conflicting, and a missing required value.
+    let supervise = "rocmd supervise svc --engine vllm --model-ref m \
+                     --canonical-model-id c --port 8000";
+    assert_eq!(
+        verdict(&argv(&format!("{supervise} --runtime-id a"))),
+        Verdict::Parses
+    );
+    assert!(matches!(
+        verdict(&argv(&format!("{supervise} --runtime-id a --env-id b"))),
+        Verdict::Rejected(error) if error.contains("cannot be used with")
+    ));
+    assert_eq!(
+        verdict(&argv("rocmd supervise svc --engine vllm")),
+        Verdict::IncompleteReference
     );
     assert!(is_deliberate_natural_language(&words(
         "rocm --yes \"start a local model\""
@@ -1857,7 +1887,85 @@ fn dump_advised_invocations() {
     println!("TOTAL\t{}", advice.len());
 }
 
-#[cfg(test)]
+/// Markdown advice in each shape the extractor handles. Every shape carries a
+/// removed subcommand that must be reported, so dropping the branch that
+/// reads the shape fails here rather than leaving that advice unchecked.
+#[test]
+fn every_markdown_shape_is_extracted_and_checked() {
+    let doc = "\
+Run `rocm frobnicate-inline` first.
+
+Wrapped prose: run `rocm
+frobnicate-wrapped --now` to check.
+
+```sh
+$ rocm frobnicate-dollar
+```
+
+```powershell
+PS> rocm frobnicate-ps
+```
+
+```sh
+rocm frobnicate-continued \\
+  --flag
+```
+";
+    let mut advice = Vec::new();
+    extract_markdown_text(doc, "fixture.md", &mut advice);
+    let reported: Vec<String> = findings(&advice)
+        .iter()
+        .map(|finding| format!("{} {}", finding.source, finding.argv[1]))
+        .collect();
+    assert_eq!(
+        reported,
+        [
+            "fixture.md:1 frobnicate-inline",
+            "fixture.md:3 frobnicate-wrapped",
+            "fixture.md:7 frobnicate-dollar",
+            "fixture.md:11 frobnicate-ps",
+            "fixture.md:15 frobnicate-continued",
+        ],
+        "{advice:?}"
+    );
+    let continued = advice
+        .iter()
+        .find(|item| item.raw.contains("frobnicate-continued"))
+        .expect("continued command extracted");
+    assert_eq!(continued.raw, "rocm frobnicate-continued --flag");
+}
+
+/// A `\` continuation the closing fence (or the end of the file) cuts off is
+/// checked as it stands, and does not swallow the next fence's first line.
+#[test]
+fn a_cut_off_continuation_stays_one_command() {
+    let doc = "\
+```sh
+rocm frobnicate-cut \\
+```
+
+```sh
+rocm examine
+```
+
+```sh
+rocm frobnicate-eof \\";
+    let mut advice = Vec::new();
+    extract_markdown_text(doc, "fixture.md", &mut advice);
+    let raws: Vec<(&str, &str)> = advice
+        .iter()
+        .map(|item| (item.source.as_str(), item.raw.as_str()))
+        .collect();
+    assert_eq!(
+        raws,
+        [
+            ("fixture.md:2", "rocm frobnicate-cut"),
+            ("fixture.md:6", "rocm examine"),
+            ("fixture.md:10", "rocm frobnicate-eof"),
+        ]
+    );
+}
+
 fn fixture(raw: &str, surface: Surface) -> Advice {
     Advice {
         source: "fixture.md:1".to_owned(),
@@ -1966,8 +2074,12 @@ fn an_options_placeholder_stands_for_no_arguments() {
 /// `rocm frobnicate <TEXT>` a request: `frobnicate` is a removed subcommand.
 #[test]
 fn only_advised_text_makes_a_request_deliberate() {
-    let found = findings(&[fixture("rocm frobnicate <TEXT>", Surface::CommandLine)]);
-    assert_eq!(found.len(), 1, "{}", render_findings(&found));
+    // A removed subcommand stays a finding whatever follows it: a filled-in
+    // placeholder, or a quoted argument after the single word routing judges.
+    for raw in ["rocm frobnicate <TEXT>", "rocm frobnicate \"two words\""] {
+        let found = findings(&[fixture(raw, Surface::CommandLine)]);
+        assert_eq!(found.len(), 1, "{raw}: {}", render_findings(&found));
+    }
     for raw in [
         "rocm \"start a local model\"",
         "rocm --yes \"start a local model\"",
