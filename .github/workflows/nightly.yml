@@ -1782,7 +1782,10 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
-          model: claude-sonnet-4.5
+          # Copilot CLI's --model slugs use dots, not the Anthropic API's
+          # hyphenated IDs. claude-sonnet-4.5 was retired when Claude Sonnet
+          # 5.5 went GA; claude-sonnet-5.5 is the current slug.
+          model: claude-sonnet-5.5
           system-prompt-file: .github/prompts/release-readiness-narrative.txt
           prompt: "{{facts}}"
           file_input: |
