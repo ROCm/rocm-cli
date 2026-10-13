@@ -4,38 +4,33 @@
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessW, DETACHED_PROCESS, GetExitCodeProcess, INFINITE, OpenProcess,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(test, unix))]
+mod archive_props;
 pub mod browser;
+pub mod crypto;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
+pub mod fake_executable;
 pub mod fix;
 pub mod hardware_root;
 pub mod host_gpu;
+pub mod log_tail;
 pub mod managed_runtime;
+pub mod model_catalog;
 pub mod model_readiness;
+pub mod net;
 pub mod openmpi;
+pub mod paths;
 pub mod proc_lifecycle;
+pub mod process;
 pub mod report;
 pub mod report_delivery;
 pub mod rocm_install;
@@ -47,6 +42,10 @@ mod test_env;
 #[cfg(test)]
 mod test_support;
 pub mod uv;
+pub use crypto::{
+    generate_rsa_signing_keypair, sign_rsa_pkcs1_sha256_signature,
+    verify_rsa_pkcs1_sha256_signature,
+};
 pub use diagnose::{
     DiagnoseReport, Diagnosis, Fix, Route, VLLM_OOM_CANONICAL_SYMPTOM, diagnose as run_diagnose,
     render_report_text as render_diagnose_text, vllm_oom_symptom_is_diagnosable,
@@ -80,6 +79,7 @@ use host_gpu::{
     detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, ldconfig_cache,
     ldconfig_lists_librocdxg, managed_therock_sdk_probe_candidates,
 };
+pub use log_tail::tail_lines;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
@@ -88,9 +88,43 @@ pub use managed_runtime::{
 use managed_runtime::{
     TheRockFamilyManifest, managed_sdk_tool_path, managed_therock_environment_records,
 };
+pub use model_catalog::{
+    ModelArtifactCacheStatus, ModelCatalogPlatform, ModelRecipeArtifactRecord,
+    ModelRecipeArtifactSourcePolicyRecord, ModelRecipeEndpointRecord, ModelRecipeEngineRecord,
+    ModelRecipeIndexDocument, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
+    ModelRecipeUnsupportedCombinationRecord, builtin_model_recipe_registry, builtin_model_recipes,
+    load_model_recipe_index, load_model_recipe_registry, load_signed_model_recipe_index,
+    model_artifact_cache_marker_path, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_index_signature_path, model_recipe_target_platform_label,
+    normalize_model_ref, platform_matches_gfx_family, resolve_builtin_model_recipe,
+    resolve_model_recipe, resolve_model_recipe_artifact, verify_model_recipe_index_signature,
+};
+pub use net::{
+    Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
+    DownloadRequest, EndpointIdentity, EndpointReadiness, EndpointReadinessOutcome,
+    HttpResponseParts, INFERENCE_PROBE_ATTEMPTED_STATE_KEY, INFERENCE_PROBE_RETRY_INTERVAL,
+    INFERENCE_PROBE_TIMEOUT, INFERENCE_VERIFIED_STATE_KEY, connect_tcp_stream,
+    download_file_streaming, download_file_streaming_with_progress, download_file_to_path,
+    download_file_to_path_with_progress, engine_state_inference_verified, format_host_for_url,
+    format_host_port, format_http_base_url, http_get_text, http_get_text_with_auth,
+    http_get_with_auth, http_post_json_with_auth, managed_service_endpoint_identity,
+    managed_service_endpoint_model_ready, managed_service_endpoint_readiness,
+    merge_json_state_file, openai_chat_completion_probe, openai_chat_completion_status,
+    openai_models_endpoint_has_model, openai_models_endpoint_identity, parse_http_endpoint,
+    read_http_response_bounded, write_all_tcp_stream,
+};
+pub use paths::{AppPaths, engine_plugin_dirs};
 pub use proc_lifecycle::{
     IdentityState, KillScope, ProcessIdentity, TerminationOutcome, identity_state,
     identity_state_with_observed, process_start_ticks, terminate_verified,
+};
+pub use process::{
+    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+};
+#[cfg(windows)]
+pub use process::{
+    spawn_detached_no_inherit, spawn_hidden_console_no_inherit, spawn_hidden_console_with_log,
+    wait_for_process_exit,
 };
 pub use report::{
     APPROVED_ARCHITECTURES, APPROVED_ARCHITECTURES_SOURCE, REPORT_SCHEMA_VERSION, ReadOutcome,
@@ -125,9 +159,6 @@ pub use uv::{
     uv_pip_freeze_args, uv_pip_install_base, uv_venv_args, violation_subject, violations_requiring,
 };
 
-pub const DEFAULT_LOCAL_PORT: u16 = 11_435;
-pub const DEFAULT_LOCAL_HOST: &str = "127.0.0.1";
-
 /// The variable that opts a machine out of rocm-cli choosing its runtime's torch.
 pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT";
 
@@ -148,1987 +179,6 @@ pub const TORCH_ALIGNMENT_DISABLED_ENV: &str = "ROCM_CLI_DISABLE_TORCH_ALIGNMENT
 /// device or cannot run a kernel on one is still reported as such.
 pub fn torch_alignment_disabled() -> bool {
     std::env::var_os(TORCH_ALIGNMENT_DISABLED_ENV).is_some()
-}
-
-pub fn format_host_for_url(host: &str) -> String {
-    let trimmed = host.trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        return trimmed.to_owned();
-    }
-    match trimmed.parse::<IpAddr>() {
-        Ok(IpAddr::V6(_)) => format!("[{trimmed}]"),
-        _ => trimmed.to_owned(),
-    }
-}
-
-pub fn format_host_port(host: &str, port: u16) -> String {
-    format!("{}:{port}", format_host_for_url(host))
-}
-
-pub fn format_http_base_url(host: &str, port: u16) -> String {
-    format!("http://{}", format_host_port(host, port))
-}
-
-pub fn parse_http_endpoint(endpoint_url: &str) -> Option<(String, u16)> {
-    let without_scheme = endpoint_url.trim().strip_prefix("http://")?;
-    let authority = without_scheme.split('/').next()?.trim();
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(rest) = authority.strip_prefix('[') {
-        let end = rest.find(']')?;
-        let host = rest[..end].to_owned();
-        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
-        return Some((host, port));
-    }
-    let (host, port) = authority.rsplit_once(':')?;
-    Some((host.to_owned(), port.parse().ok()?))
-}
-
-/// Attempts a download makes before giving up. The first attempt is not a
-/// retry, so this is one initial try plus two retries.
-pub const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
-
-/// Chunk size for the streaming copy. Fixed, so peak memory is independent of
-/// the artifact size — the whole point of streaming a multi-gigabyte tarball.
-const DOWNLOAD_CHUNK_BYTES: usize = 64 * 1024;
-
-/// Exponential backoff between download attempts.
-///
-/// A copy of the shape used by the dashboard's reconnect loop rather than a
-/// shared dependency: `rocm-core` sits below the dash crates, so it cannot
-/// import theirs.
-#[derive(Debug, Clone, Copy)]
-pub struct Backoff {
-    current: Duration,
-    max: Duration,
-    factor: u32,
-}
-
-impl Default for Backoff {
-    fn default() -> Self {
-        Self::new(Duration::from_millis(500), Duration::from_secs(8), 2)
-    }
-}
-
-impl Backoff {
-    pub const fn new(initial: Duration, max: Duration, factor: u32) -> Self {
-        Self {
-            current: initial,
-            max,
-            factor,
-        }
-    }
-
-    /// The delay to wait before the next attempt, then grow toward `max`.
-    pub fn next_delay(&mut self) -> Duration {
-        let delay = self.current;
-        self.current = self.current.saturating_mul(self.factor).min(self.max);
-        delay
-    }
-}
-
-/// A download of a single artifact to a single path.
-#[derive(Debug, Clone, Copy)]
-pub struct DownloadRequest<'a> {
-    pub url: &'a str,
-    pub destination: &'a Path,
-    pub timeout: Duration,
-    pub headers: &'a [(&'a str, &'a str)],
-    /// Refuse a body larger than this, so an unexpected response cannot fill
-    /// the disk. `None` accepts whatever the server sends.
-    pub max_bytes: Option<u64>,
-    /// Size the caller already knows from a manifest. Checked in addition to
-    /// the server's own `Content-Length`.
-    pub expected_len: Option<u64>,
-    pub expected_sha256: Option<&'a str>,
-}
-
-impl<'a> DownloadRequest<'a> {
-    pub const fn new(url: &'a str, destination: &'a Path, timeout: Duration) -> Self {
-        Self {
-            url,
-            destination,
-            timeout,
-            headers: &[],
-            max_bytes: None,
-            expected_len: None,
-            expected_sha256: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadOutcome {
-    pub bytes_written: u64,
-    pub sha256: String,
-}
-
-/// Stream `request.url` to `request.destination`, retrying transient failures
-/// and resuming where the server allows it.
-///
-/// Bytes go through a fixed [`DOWNLOAD_CHUNK_BYTES`] buffer into a sibling
-/// `.part` file and are hashed on the way past, so peak memory does not scale
-/// with the artifact — a multi-gigabyte SDK tarball costs the same as a small
-/// one. The `.part` file is a sibling of the destination so the final rename
-/// stays within one filesystem and is atomic: a caller that finds the
-/// destination present knows it holds a complete download, and an interrupted
-/// run never leaves a truncated file that a later run would treat as cached.
-///
-/// # Integrity
-///
-/// With `expected_sha256` the content is authenticated. Without it the only
-/// integrity signal is the byte count, cross-checked against `Content-Length`
-/// and `expected_len`. That catches truncation and interrupted transfers, which
-/// is what this guards against, but `Content-Length` is unauthenticated and a
-/// matching length proves nothing about the bytes — do not read a successful
-/// return as "the artifact is genuine" unless a digest was supplied.
-pub fn download_file_streaming(request: &DownloadRequest<'_>) -> Result<DownloadOutcome> {
-    download_file_streaming_with_progress(request, &mut |_written, _total| {})
-}
-
-/// As [`download_file_streaming`], but reports progress via `on_progress`.
-///
-/// `on_progress` is called with the cumulative bytes written and, when
-/// known, the total size — once before the transfer starts and once after
-/// every chunk is written to disk. The byte count is monotonically
-/// non-decreasing across the whole call, including across retries: an
-/// attempt that restarts from scratch (the server ignored `Range`, or
-/// resumed at the wrong offset and had its partial file discarded) counts
-/// its own bytes from 0 internally, but the byte count `on_progress` sees
-/// never drops below the highest value already reported by an earlier
-/// attempt. The total is not clamped the same way and is passed through as
-/// reported by the current attempt, so it can go from `None` to `Some` (or
-/// back) mid-transfer if a retry's response differs on `Content-Length`.
-/// Note also that for the whole duration of a from-scratch restart, the
-/// byte count holds flat at the prior high-water mark until the new attempt
-/// catches back up — a caller driving a static progress line should pair
-/// this with an animated indicator (as the `rocm` CLI's spinner does) so a
-/// long restart doesn't look hung. Callers that don't need progress should
-/// use [`download_file_streaming`] instead.
-pub fn download_file_streaming_with_progress(
-    request: &DownloadRequest<'_>,
-    on_progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<DownloadOutcome> {
-    if let Some(parent) = request.destination.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let partial_path = partial_download_path(request.destination);
-    // Resume is scoped to retries within this call. A `.part` file found at
-    // entry is debris from an earlier run — process ids get reused, so its
-    // contents cannot be attributed to this URL and appending to it would
-    // silently produce a corrupt artifact.
-    let _ = fs::remove_file(&partial_path);
-    let mut backoff = Backoff::default();
-    let mut attempt = 1;
-    // `download_attempt` reports whatever it has on disk for *this* attempt,
-    // which resets to 0 on a from-scratch restart even though earlier
-    // attempts already progressed further. Clamp to a high-water mark here
-    // so every caller — not just ones that happen to add their own UI-side
-    // clamp — sees a byte count that never goes backwards.
-    let mut high_water = 0_u64;
-    let mut monotonic_progress = move |written: u64, total: Option<u64>| {
-        high_water = high_water.max(written);
-        on_progress(high_water, total);
-    };
-    let outcome = loop {
-        match download_attempt(request, &partial_path, &mut monotonic_progress) {
-            Ok(outcome) => break outcome,
-            Err(error) => {
-                let retryable = error.retryable && attempt < DOWNLOAD_MAX_ATTEMPTS;
-                if !retryable {
-                    let _ = fs::remove_file(&partial_path);
-                    return Err(error.error);
-                }
-                thread::sleep(backoff.next_delay());
-                attempt += 1;
-            }
-        }
-    };
-    fs::rename(&partial_path, request.destination).map_err(|error| {
-        let _ = fs::remove_file(&partial_path);
-        anyhow::Error::new(error).context(format!(
-            "failed to move the completed download into {}",
-            request.destination.display()
-        ))
-    })?;
-    Ok(outcome)
-}
-
-/// Where the in-progress bytes live. Keyed by process id so two processes
-/// downloading the same destination cannot append into each other's file.
-fn partial_download_path(destination: &Path) -> PathBuf {
-    let mut name = destination.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".part-{}", std::process::id()));
-    destination.with_file_name(name)
-}
-
-/// A failed attempt, and whether trying again could plausibly help.
-struct DownloadAttemptError {
-    error: anyhow::Error,
-    retryable: bool,
-}
-
-const fn transient(error: anyhow::Error) -> DownloadAttemptError {
-    DownloadAttemptError {
-        error,
-        retryable: true,
-    }
-}
-
-const fn permanent(error: anyhow::Error) -> DownloadAttemptError {
-    DownloadAttemptError {
-        error,
-        retryable: false,
-    }
-}
-
-/// Whether a status is worth another attempt. Server-side and rate-limit
-/// responses can succeed later; the rest of `4xx` means the request itself is
-/// wrong, and repeating it just wastes the user's time.
-const fn status_is_retryable(status: u16) -> bool {
-    status == 408 || status == 429 || status >= 500
-}
-
-/// A single attempt at the transfer. `written` — and so what this reports
-/// through `on_progress` — reflects only what this attempt itself has put on
-/// disk: a confirmed `206` continuation starts counting from the resumed
-/// offset, but a restart (the server ignored `Range`, or resumed at the
-/// wrong offset and had its partial file discarded) truncates the file and
-/// starts counting from 0 again, even if a previous attempt already reported
-/// further along. That's fine — [`download_file_streaming_with_progress`]
-/// wraps `on_progress` with a high-water mark so callers never observe the
-/// drop; this function does not need to care.
-fn download_attempt(
-    request: &DownloadRequest<'_>,
-    partial_path: &Path,
-    on_progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<DownloadOutcome, DownloadAttemptError> {
-    // Resume from whatever a previous attempt already wrote. A missing file is
-    // simply a fresh start.
-    let resume_from = fs::metadata(partial_path).map_or(0, |meta| meta.len());
-    let mut call = ureq::get(request.url).timeout(request.timeout);
-    for (name, value) in request.headers {
-        call = call.set(name, value);
-    }
-    if resume_from > 0 {
-        call = call.set("Range", &format!("bytes={resume_from}-"));
-    }
-    let response = match call.call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, _)) => {
-            let error = anyhow::anyhow!("HTTP {status} while downloading {url}", url = request.url);
-            return Err(if status_is_retryable(status) {
-                transient(error)
-            } else {
-                permanent(error)
-            });
-        }
-        // Transport failures are exactly the interruptions worth retrying.
-        Err(error) => {
-            return Err(transient(
-                anyhow::Error::new(error).context(format!("failed to download {}", request.url)),
-            ));
-        }
-    };
-    let status = response.status();
-    if status != 200 && status != 206 {
-        return Err(permanent(anyhow::anyhow!(
-            "HTTP {status} while downloading {url}",
-            url = request.url
-        )));
-    }
-    // A `206` that does not confirm continuing from `resume_from` cannot be
-    // treated as a fresh full download either: its `Content-Length` is the
-    // length of whatever slice the server chose to send, not the whole
-    // artifact, so accepting it as complete would silently rename a truncated
-    // body into place. Discard the partial file and restart clean with a
-    // plain `GET` instead of reinterpreting the mismatched slice.
-    if status == 206 && resume_from > 0 && content_range_start(&response) != Some(resume_from) {
-        let _ = fs::remove_file(partial_path);
-        return Err(transient(anyhow::anyhow!(
-            "{url} resumed from an unexpected byte offset; restarting the download",
-            url = request.url
-        )));
-    }
-    // Only append when the server confirmed it is continuing from exactly where
-    // we stopped. A server that ignores `Range` answers 200 with the whole body,
-    // which restarts cleanly too.
-    let resuming = status == 206 && resume_from > 0;
-    let remaining_len = header_u64(&response, "Content-Length");
-    let total_len =
-        remaining_len.map(|len| len.saturating_add(if resuming { resume_from } else { 0 }));
-    // Fall back to the caller-supplied expected length when the server omits
-    // `Content-Length`, so progress reporting doesn't lose a total that's
-    // already known and already used for the preflight checks below.
-    let reported_total = total_len.or(request.expected_len);
-    if let Some(total) = reported_total {
-        if let Some(max_bytes) = request.max_bytes
-            && total > max_bytes
-        {
-            return Err(permanent(anyhow::anyhow!(
-                "{url} is {total} bytes, over the approved limit of {max_bytes}",
-                url = request.url
-            )));
-        }
-        // Free-space preflight, before a single byte is read: an exact size
-        // means we can refuse upfront instead of failing partway through. Only
-        // the bytes still to come need room; a resumed prefix already has it.
-        let still_needed = total.saturating_sub(if resuming { resume_from } else { 0 });
-        if let Err(error) = disk_space::ensure_space_for(
-            &format!("download {}", request.url),
-            request.destination,
-            disk_space::with_margin(still_needed),
-        ) {
-            return Err(permanent(error));
-        }
-    }
-
-    let mut hasher = Sha256::new();
-    let mut written = 0_u64;
-    let mut file = if resuming {
-        // Re-hash the prefix so the digest covers the whole artifact, not just
-        // the bytes this attempt happened to fetch.
-        let mut existing =
-            fs::File::open(partial_path).map_err(|error| permanent(anyhow::Error::new(error)))?;
-        written = std::io::copy(&mut existing, &mut hasher)
-            .map_err(|error| permanent(anyhow::Error::new(error)))?;
-        fs::OpenOptions::new()
-            .append(true)
-            .open(partial_path)
-            .map_err(|error| permanent(anyhow::Error::new(error)))?
-    } else {
-        fs::File::create(partial_path).map_err(|error| {
-            permanent(
-                anyhow::Error::new(error)
-                    .context(format!("failed to create {}", partial_path.display())),
-            )
-        })?
-    };
-
-    on_progress(written, reported_total);
-
-    let mut reader = response.into_reader();
-    let mut buffer = vec![0_u8; DOWNLOAD_CHUNK_BYTES];
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            // A mid-body failure keeps the partial file: the next attempt
-            // resumes from it. A server that drops the connection early and one
-            // that closes cleanly after a short body are the same problem to
-            // the user, so report the shortfall either way rather than a bare
-            // transport error.
-            Err(error) => {
-                let reason = reported_total.map_or_else(
-                    || format!("failed while downloading {}", request.url),
-                    |expected| {
-                        format!(
-                            "incomplete download of {}: expected {expected} bytes, got {written}",
-                            request.url
-                        )
-                    },
-                );
-                return Err(transient(anyhow::Error::new(error).context(reason)));
-            }
-        };
-        written = written.saturating_add(read as u64);
-        if let Some(max_bytes) = request.max_bytes
-            && written > max_bytes
-        {
-            return Err(permanent(anyhow::anyhow!(
-                "{url} exceeded the approved limit of {max_bytes} bytes",
-                url = request.url
-            )));
-        }
-        hasher.update(&buffer[..read]);
-        if let Err(error) = file.write_all(&buffer[..read]) {
-            return Err(permanent(disk_space::map_write_error(error, partial_path)));
-        }
-        on_progress(written, reported_total);
-    }
-    if let Err(error) = file.sync_all() {
-        return Err(permanent(disk_space::map_write_error(error, partial_path)));
-    }
-    drop(file);
-
-    // Two independent length contracts, checked separately because they fail
-    // for different reasons and deserve different handling.
-    //
-    // The server's own `Content-Length`: a shortfall means the transfer was cut
-    // short, so the bytes on disk are good as far as they go and the next
-    // attempt resumes from them.
-    if let Some(expected) = total_len
-        && written != expected
-    {
-        return Err(transient(anyhow::anyhow!(
-            "incomplete download of {url}: expected {expected} bytes, got {written}",
-            url = request.url
-        )));
-    }
-    // A size the caller knew in advance: the server delivered a complete body
-    // that is not the artifact the manifest describes. Refetching returns the
-    // same wrong thing, so do not spend the remaining attempts on it.
-    if let Some(expected) = request.expected_len
-        && written != expected
-    {
-        return Err(permanent(anyhow::anyhow!(
-            "{url} is {written} bytes, but {expected} were expected",
-            url = request.url
-        )));
-    }
-    let sha256 = format!("{:x}", hasher.finalize());
-    if let Some(expected) = request.expected_sha256
-        && !sha256.eq_ignore_ascii_case(expected)
-    {
-        // The bytes are wrong, not merely incomplete; resuming would append to
-        // a corrupt prefix, so discard it and fail.
-        let _ = fs::remove_file(partial_path);
-        return Err(permanent(anyhow::anyhow!(
-            "SHA-256 mismatch for {url}: expected {expected}, got {sha256}",
-            url = request.url
-        )));
-    }
-    Ok(DownloadOutcome {
-        bytes_written: written,
-        sha256,
-    })
-}
-
-fn header_u64(response: &ureq::Response, name: &str) -> Option<u64> {
-    response
-        .header(name)
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
-/// First byte offset from a `Content-Range: bytes <start>-<end>/<total>` header.
-fn content_range_start(response: &ureq::Response) -> Option<u64> {
-    let value = response.header("Content-Range")?;
-    let range = value.trim().strip_prefix("bytes")?.trim_start();
-    let start = range.split('-').next()?.trim();
-    start.parse::<u64>().ok()
-}
-
-pub fn download_file_to_path(url: &str, destination: &Path, timeout: Duration) -> Result<()> {
-    download_file_streaming(&DownloadRequest::new(url, destination, timeout))?;
-    Ok(())
-}
-
-/// As [`download_file_to_path`], but reports progress via `on_progress`. See
-/// [`download_file_streaming_with_progress`] for callback semantics.
-pub fn download_file_to_path_with_progress(
-    url: &str,
-    destination: &Path,
-    timeout: Duration,
-    on_progress: &mut dyn FnMut(u64, Option<u64>),
-) -> Result<()> {
-    download_file_streaming_with_progress(
-        &DownloadRequest::new(url, destination, timeout),
-        on_progress,
-    )?;
-    Ok(())
-}
-
-pub fn http_get_text(endpoint_url: &str, path: &str, timeout: Duration) -> Result<String> {
-    http_get_text_with_auth(endpoint_url, path, None, timeout)
-}
-
-/// As [`http_get_text`], but authenticated.
-///
-/// Sends `Authorization: Bearer <key>` when `endpoint_api_key` is `Some`. Used to
-/// probe endpoints that `rocm serve` has protected with an API key; `None`
-/// preserves the unauthenticated behavior for loopback endpoints.
-pub fn http_get_text_with_auth(
-    endpoint_url: &str,
-    path: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<String> {
-    let parts = http_get_with_auth(endpoint_url, path, endpoint_api_key, timeout)?;
-    if parts.status != 200 {
-        bail!("HTTP endpoint returned HTTP {}", parts.status);
-    }
-    Ok(parts.body)
-}
-
-/// GET `path` and return the response status alongside the body.
-///
-/// The GET sibling of [`http_post_json_with_auth`], and it exists for the same
-/// reason: a caller probing an endpoint has to tell "the server answered, with a
-/// refusal" apart from "the server never answered", and only the former proves
-/// something is alive on that port. [`http_get_text_with_auth`] collapses both
-/// into `Err` — correct for callers that only want a 200's body, wrong for
-/// anything deciding whether a port is still held.
-pub fn http_get_with_auth(
-    endpoint_url: &str,
-    path: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<HttpResponseParts> {
-    let deadline = Instant::now() + timeout;
-    let (host, port) = parse_http_endpoint(endpoint_url)
-        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    let mut stream = connect_tcp_stream(&host, port, timeout)?;
-    let host_header = format_host_port(&host, port);
-    let auth_header = match endpoint_api_key {
-        Some(key) => format!("Authorization: Bearer {key}\r\n"),
-        None => String::new(),
-    };
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\n{auth_header}Connection: close\r\n\r\n"
-    );
-    write_all_tcp_stream(&mut stream, request.as_bytes())
-        .with_context(|| format!("failed to write HTTP GET {path}"))?;
-    let response = read_http_response_bounded(&mut stream, deadline)
-        .with_context(|| format!("failed to read HTTP GET {path}"))?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .context("HTTP response was missing a body")?;
-    let status_line = headers.lines().next().unwrap_or_default();
-    let status = http_status_code(status_line)
-        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
-    Ok(HttpResponseParts {
-        status,
-        body: body.to_owned(),
-    })
-}
-
-/// POST a JSON body and return the response status line plus body.
-///
-/// The POST sibling of [`http_get_text_with_auth`]. Unlike the GET helper this
-/// does not treat a non-200 as an error: callers that probe an endpoint need to
-/// tell "the server answered, with a refusal" apart from "the server never
-/// answered", and only the former proves the request path is alive.
-pub fn http_post_json_with_auth(
-    endpoint_url: &str,
-    path: &str,
-    body: &serde_json::Value,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<HttpResponseParts> {
-    let deadline = Instant::now() + timeout;
-    let (host, port) = parse_http_endpoint(endpoint_url)
-        .with_context(|| format!("unsupported endpoint URL `{endpoint_url}`"))?;
-    let mut stream = connect_tcp_stream(&host, port, timeout)?;
-    let host_header = format_host_port(&host, port);
-    let auth_header = match endpoint_api_key {
-        Some(key) => format!("Authorization: Bearer {key}\r\n"),
-        None => String::new(),
-    };
-    let payload = serde_json::to_string(body).context("failed to serialize HTTP JSON body")?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_header}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{payload}",
-        payload.len()
-    );
-    write_all_tcp_stream(&mut stream, request.as_bytes())
-        .with_context(|| format!("failed to write HTTP POST {path}"))?;
-    let response = read_http_response_bounded(&mut stream, deadline)
-        .with_context(|| format!("failed to read HTTP POST {path}"))?;
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .context("HTTP response was missing a body")?;
-    let status_line = headers.lines().next().unwrap_or_default();
-    let status = http_status_code(status_line)
-        .with_context(|| format!("unparsable HTTP status line `{status_line}`"))?;
-    Ok(HttpResponseParts {
-        status,
-        body: body.to_owned(),
-    })
-}
-
-/// Budget for the single-token chat request that proves a service can serve.
-///
-/// Generously longer than a model-listing timeout: the probe is a real inference
-/// request, and a first request against a freshly loaded model pays for prompt
-/// processing before it answers.
-pub const INFERENCE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// Engine state-file key recording when inference was first confirmed.
-///
-/// Written by the engine healthchecks and adopted by
-/// [`ManagedServiceRecord::refresh_from_engine_state`], so the CLI side does not
-/// re-probe what an engine already verified.
-pub const INFERENCE_VERIFIED_STATE_KEY: &str = "inference_verified_at_unix_ms";
-
-/// Engine state-file key recording the last inference probe attempt.
-pub const INFERENCE_PROBE_ATTEMPTED_STATE_KEY: &str = "inference_probe_attempted_at_unix_ms";
-
-/// Minimum gap between inference probes against a service that is still loading.
-///
-/// Only a *successful* probe latches, so without this a warming model would be
-/// re-probed by every readiness poll — and each attempt costs up to
-/// [`INFERENCE_PROBE_TIMEOUT`], which is the whole poll's latency. The
-/// supervisor ticks every few seconds and `services list` sits in front of a
-/// user, so the unthrottled cost lands exactly where it is most visible. The
-/// price of throttling is that readiness can be noticed up to this late.
-pub const INFERENCE_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
-
-/// Merge `patch`'s top-level keys into the JSON object stored at `path`.
-///
-/// Creates the file (and its parent) when absent, and replaces a non-object
-/// document rather than failing — the caller is recording a fact about a live
-/// service, not validating an existing file.
-pub fn merge_json_state_file(path: &Path, patch: &serde_json::Value) -> Result<()> {
-    let mut value = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !value.is_object() {
-        value = serde_json::json!({});
-    }
-    let object = value.as_object_mut().expect("object checked above");
-    if let Some(patch) = patch.as_object() {
-        for (key, patch_value) in patch {
-            object.insert(key.clone(), patch_value.clone());
-        }
-    }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&value).context("failed to serialize service state")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
-}
-
-/// Whether inference has been confirmed for a service, from its engine state
-/// file — probing at most once, and at most once per
-/// [`INFERENCE_PROBE_RETRY_INTERVAL`] while it is still loading.
-///
-/// Shared by the engine adapters so the latch and backoff bookkeeping has one
-/// implementation: the engines differ in how they decide a model is *listed*,
-/// but not in what confirming inference means.
-///
-/// The attempt is recorded before the probe runs, so a caller killed mid-probe
-/// still leaves the throttle in place instead of freeing the next poll to spend
-/// another full timeout.
-pub fn engine_state_inference_verified(
-    state_path: &Path,
-    state: Option<&serde_json::Value>,
-    endpoint_url: &str,
-    model_ref: &str,
-    endpoint_api_key: Option<&str>,
-) -> bool {
-    let state_u64 = |key: &str| {
-        state
-            .and_then(|value| value.get(key))
-            .and_then(serde_json::Value::as_u64)
-    };
-    if state_u64(INFERENCE_VERIFIED_STATE_KEY).is_some() {
-        return true;
-    }
-    if model_ref.trim().is_empty() {
-        return false;
-    }
-    let now = unix_time_millis() as u64;
-    if let Some(attempted_at) = state_u64(INFERENCE_PROBE_ATTEMPTED_STATE_KEY)
-        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
-    {
-        return false;
-    }
-    let _ = merge_json_state_file(
-        state_path,
-        &serde_json::json!({ INFERENCE_PROBE_ATTEMPTED_STATE_KEY: now }),
-    );
-    if !openai_chat_completion_probe(
-        endpoint_url,
-        model_ref,
-        endpoint_api_key,
-        INFERENCE_PROBE_TIMEOUT,
-    )
-    .unwrap_or(false)
-    {
-        return false;
-    }
-    let _ = merge_json_state_file(
-        state_path,
-        &serde_json::json!({ INFERENCE_VERIFIED_STATE_KEY: unix_time_millis() as u64 }),
-    );
-    true
-}
-
-/// The parts of an HTTP response a probe needs: the status code and the body.
-#[derive(Debug, Clone)]
-pub struct HttpResponseParts {
-    pub status: u16,
-    pub body: String,
-}
-
-fn http_status_code(status_line: &str) -> Option<u16> {
-    status_line.split_whitespace().nth(1)?.parse().ok()
-}
-
-/// Ask the endpoint for a single token and report whether it answered.
-///
-/// This is the readiness signal that `/v1/models` cannot give: an engine lists a
-/// model as soon as it accepts the name, which can be minutes before the weights
-/// are resident and the first chat request stops hanging.
-///
-/// "Answered" means a complete HTTP response with a status below 500, not a
-/// successful generation. A `4xx` still proves the inference path is up and the
-/// model is loaded — the request was understood and refused on its merits — while
-/// the failure this guards against is a hang, a dropped connection, or the `5xx`
-/// an engine returns while it is still warming up. Insisting on `200` with
-/// non-empty content would also wrongly fail a reasoning model, which can spend
-/// its whole (tiny) token budget before emitting any content.
-///
-/// The rule does mean a `404` reads as serving. That is harmless for the engines
-/// shipped today — both implement `/v1/chat/completions`, and a wrong key fails
-/// the model listing that gates this call — but an engine that does not expose an
-/// OpenAI-shaped chat route would need a different signal rather than this one.
-pub fn openai_chat_completion_probe(
-    endpoint_url: &str,
-    model_ref: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<bool> {
-    let status = openai_chat_completion_status(endpoint_url, model_ref, endpoint_api_key, timeout)?;
-    Ok(status < 500)
-}
-
-/// Send the smallest possible chat request and return the HTTP status.
-///
-/// Callers pick their own bar. Readiness ([`openai_chat_completion_probe`]) only
-/// needs to know the inference path answers at all, while a post-load smoke test
-/// wants a real `200` — there, a `4xx` means the model that came up is not the
-/// one that was asked for, which is a failure worth surfacing rather than
-/// tolerating.
-pub fn openai_chat_completion_status(
-    endpoint_url: &str,
-    model_ref: &str,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<u16> {
-    let body = serde_json::json!({
-        "model": model_ref,
-        "messages": [{"role": "user", "content": "Say ok."}],
-        "max_tokens": 2,
-        "stream": false,
-    });
-    let response = http_post_json_with_auth(
-        endpoint_url,
-        "/v1/chat/completions",
-        &body,
-        endpoint_api_key,
-        timeout,
-    )?;
-    Ok(response.status)
-}
-
-pub fn openai_models_endpoint_has_model(
-    endpoint_url: &str,
-    expected_model: Option<&str>,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<bool> {
-    Ok(
-        openai_models_endpoint_identity(endpoint_url, expected_model, endpoint_api_key, timeout)?
-            == EndpointIdentity::ServesExpectedModel,
-    )
-}
-
-/// What a listener said when asked which models it serves.
-///
-/// The distinction [`openai_models_endpoint_has_model`] cannot draw: it answers
-/// `false` both for "this is someone else's service" and for "this endpoint
-/// answered, but listed nothing". For a readiness poll those are the same — not
-/// ready either way — but for a caller deciding whether something still holds a
-/// port they are opposites. An engine that is up but has not populated its model
-/// list yet, or is mid-unload, lists nothing while very much holding the GPU.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EndpointIdentity {
-    /// Listed a model matching the one asked about (or listed models when no
-    /// particular one was asked for).
-    ServesExpectedModel,
-    /// Listed models, none of which match — a different service on this port.
-    ServesOtherModels,
-    /// Answered `/v1/models` with an empty list. Says nothing either way about
-    /// whose service this is.
-    ListsNoModels,
-}
-
-/// Ask a listener which models it serves, keeping "listed nothing" distinct.
-pub fn openai_models_endpoint_identity(
-    endpoint_url: &str,
-    expected_model: Option<&str>,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<EndpointIdentity> {
-    let body = http_get_text_with_auth(endpoint_url, "/v1/models", endpoint_api_key, timeout)?;
-    let value = serde_json::from_str::<serde_json::Value>(body.trim())
-        .context("failed to parse /v1/models JSON")?;
-    let loaded_models = openai_loaded_model_ids(&value);
-    if loaded_models.is_empty() {
-        return Ok(EndpointIdentity::ListsNoModels);
-    }
-    let Some(expected_model) = expected_model.filter(|value| !value.trim().is_empty()) else {
-        return Ok(EndpointIdentity::ServesExpectedModel);
-    };
-    Ok(
-        if loaded_models
-            .iter()
-            .any(|loaded| model_refs_match(loaded, expected_model))
-        {
-            EndpointIdentity::ServesExpectedModel
-        } else {
-            EndpointIdentity::ServesOtherModels
-        },
-    )
-}
-
-pub fn managed_service_endpoint_model_ready(
-    record: &ManagedServiceRecord,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<bool> {
-    if record.endpoint_url.trim().is_empty() {
-        return Ok(false);
-    }
-    let expected = if !record.canonical_model_id.trim().is_empty() {
-        Some(record.canonical_model_id.as_str())
-    } else if !record.model_ref.trim().is_empty() {
-        Some(record.model_ref.as_str())
-    } else {
-        None
-    };
-    openai_models_endpoint_has_model(&record.endpoint_url, expected, endpoint_api_key, timeout)
-}
-
-/// [`managed_service_endpoint_model_ready`] without collapsing "listed nothing"
-/// into "not ours".
-///
-/// An empty `endpoint_url` is the one case with no listener to ask about at all,
-/// so it stays an error rather than being reported as an identity.
-pub fn managed_service_endpoint_identity(
-    record: &ManagedServiceRecord,
-    endpoint_api_key: Option<&str>,
-    timeout: Duration,
-) -> Result<EndpointIdentity> {
-    if record.endpoint_url.trim().is_empty() {
-        bail!("service record has no endpoint URL to identify");
-    }
-    let expected = if !record.canonical_model_id.trim().is_empty() {
-        Some(record.canonical_model_id.as_str())
-    } else if !record.model_ref.trim().is_empty() {
-        Some(record.model_ref.as_str())
-    } else {
-        None
-    };
-    openai_models_endpoint_identity(&record.endpoint_url, expected, endpoint_api_key, timeout)
-}
-
-/// How far along a managed service's endpoint is.
-///
-/// The middle state is the one that matters: an engine lists a model within
-/// seconds of accepting its name, while the weights can take minutes to become
-/// usable. Callers must not treat `Listing` as ready — nor as dead, since the
-/// service is coming up normally and restarting it would start the wait over.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum EndpointReadiness {
-    /// Not answering at all: wrong port, process gone, or nothing bound yet.
-    Unreachable,
-    /// Answering and advertising the model, but inference has not come back.
-    Listing,
-    /// A real inference request has succeeded.
-    Serving,
-}
-
-/// The result of a readiness check, plus whether it left the record dirty.
-#[derive(Debug, Clone, Copy)]
-pub struct EndpointReadinessOutcome {
-    pub readiness: EndpointReadiness,
-    /// The check updated the record's probe bookkeeping. Persist it with
-    /// [`ManagedServiceRecord::write`] — the throttle in
-    /// [`managed_service_endpoint_readiness`] only works if the attempt survives
-    /// the process, since each CLI invocation starts fresh.
-    pub record_changed: bool,
-}
-
-/// How far along the service's endpoint is, probing inference at most once.
-///
-/// Stronger than [`managed_service_endpoint_model_ready`], which only asks
-/// whether the endpoint lists the model. A service reaches [`Serving`] once a
-/// real inference request has come back, and that verdict is **latched** into
-/// `record.inference_verified_at_unix_ms`: readiness is polled repeatedly (by
-/// `services list`, the dash, and the supervisor), and re-probing on every poll
-/// would queue a generation request behind the user's own traffic. The trade-off
-/// is that a service which degrades after start still reports ready — the same
-/// as before this check existed.
-///
-/// A *failed* probe cannot latch, so those are throttled instead: a still-loading
-/// service is re-probed at most once per [`INFERENCE_PROBE_RETRY_INTERVAL`],
-/// which keeps a warming model from costing every caller a full
-/// `probe_timeout`.
-///
-/// Mutates `record` when it probes; persist it when `record_changed` is set.
-///
-/// [`Serving`]: EndpointReadiness::Serving
-pub fn managed_service_endpoint_readiness(
-    record: &mut ManagedServiceRecord,
-    endpoint_api_key: Option<&str>,
-    listing_timeout: Duration,
-    probe_timeout: Duration,
-) -> EndpointReadinessOutcome {
-    let outcome = |readiness, record_changed| EndpointReadinessOutcome {
-        readiness,
-        record_changed,
-    };
-    let listed = managed_service_endpoint_model_ready(record, endpoint_api_key, listing_timeout)
-        .unwrap_or(false);
-    if !listed {
-        return outcome(EndpointReadiness::Unreachable, false);
-    }
-    if record.inference_verified_at_unix_ms.is_some() {
-        return outcome(EndpointReadiness::Serving, false);
-    }
-    let now = unix_time_millis() as u64;
-    if let Some(attempted_at) = record.inference_probe_attempted_at_unix_ms
-        && now.saturating_sub(attempted_at) < INFERENCE_PROBE_RETRY_INTERVAL.as_millis() as u64
-    {
-        return outcome(EndpointReadiness::Listing, false);
-    }
-    let model_ref = if record.canonical_model_id.trim().is_empty() {
-        record.model_ref.as_str()
-    } else {
-        record.canonical_model_id.as_str()
-    };
-    record.inference_probe_attempted_at_unix_ms = Some(now);
-    if !openai_chat_completion_probe(
-        &record.endpoint_url,
-        model_ref,
-        endpoint_api_key,
-        probe_timeout,
-    )
-    .unwrap_or(false)
-    {
-        return outcome(EndpointReadiness::Listing, true);
-    }
-    record.inference_verified_at_unix_ms = Some(unix_time_millis() as u64);
-    outcome(EndpointReadiness::Serving, true)
-}
-
-fn openai_loaded_model_ids(value: &serde_json::Value) -> Vec<String> {
-    value
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            ["id", "model", "name"]
-                .into_iter()
-                .filter_map(|field| item.get(field).and_then(serde_json::Value::as_str))
-                .find(|value| !value.trim().is_empty())
-                .map(str::to_owned)
-        })
-        .collect()
-}
-
-fn model_refs_match(left: &str, right: &str) -> bool {
-    let left = left.trim();
-    let right = right.trim();
-    if left.eq_ignore_ascii_case(right) || model_ref_basename(left).eq_ignore_ascii_case(right) {
-        return true;
-    }
-    if model_ref_basename(right).eq_ignore_ascii_case(left)
-        || model_ref_basename(left).eq_ignore_ascii_case(model_ref_basename(right))
-    {
-        return true;
-    }
-    builtin_model_recipes().into_iter().any(|recipe| {
-        (recipe.matches_ref(left) || recipe.matches_ref(right))
-            && (recipe.matches_ref(left) && recipe.matches_ref(right))
-    }) || model_ref_family_matches(left, right)
-        || model_ref_family_matches(right, left)
-}
-
-fn model_ref_basename(value: &str) -> &str {
-    value
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or_else(|| value.trim())
-}
-
-fn model_ref_family_matches(reported: &str, expected_family: &str) -> bool {
-    let expected = normalize_model_ref_family(expected_family);
-    if expected.len() < 3 || expected.chars().any(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    model_ref_tokens(reported)
-        .into_iter()
-        .any(|token| token == expected || token.starts_with(&expected))
-}
-
-fn normalize_model_ref_family(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn model_ref_tokens(value: &str) -> Vec<String> {
-    value
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .filter_map(|token| {
-            let token = normalize_model_ref_family(token);
-            (!token.is_empty()).then_some(token)
-        })
-        .collect()
-}
-
-pub fn connect_tcp_stream(host: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    let addr = (host, port)
-        .to_socket_addrs()
-        .with_context(|| format!("failed to resolve {host}:{port}"))?
-        .next()
-        .with_context(|| format!("no socket addresses resolved for {host}:{port}"))?;
-    // Bound the connect as well as the reads: a probe against an engine that is
-    // pinned solid must fail within the caller's timeout, not sit in the OS
-    // default SYN retry window.
-    let stream = TcpStream::connect_timeout(&addr, timeout)
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
-    Ok(stream)
-}
-
-pub fn write_all_tcp_stream(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    stream
-        .write_all(bytes)
-        .context("failed to write to TCP stream")
-}
-
-/// Read one HTTP response, bounded by a wall-clock deadline.
-///
-/// Two problems with reading to end-of-stream instead. A response is only
-/// complete at EOF if the peer actually closes: `Connection: close` asks for
-/// that, but nothing obliges a server or an intervening proxy to honor it, so a
-/// service that writes a perfectly good response and holds the socket open would
-/// stall until the read timeout and have its answer thrown away. And a socket
-/// read timeout bounds each `read` call, not the sequence of them, so a
-/// slow-drip responder could stretch the total wait to an arbitrary multiple of
-/// what the caller asked for. This returns as soon as the response is complete by
-/// its own framing, and never runs past `deadline` in total.
-pub fn read_http_response_bounded(stream: &mut TcpStream, deadline: Instant) -> Result<String> {
-    let mut response = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    while !http_response_is_complete(&response) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("timed out reading HTTP response");
-        }
-        stream.set_read_timeout(Some(remaining)).ok();
-        match stream.read(&mut chunk) {
-            // Peer closed: whatever arrived is the whole response.
-            Ok(0) => break,
-            Ok(read) => response.extend_from_slice(&chunk[..read]),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                bail!("timed out reading HTTP response");
-            }
-            // A signal delivered to this thread aborts the read with `EINTR`.
-            // `SA_RESTART` does not save us: Linux never restarts a socket read
-            // that has a receive timeout set, and this loop sets one on every
-            // pass (see signal(7), "Interruption of system calls"). Any handler
-            // in the process is enough — `crossterm`'s `SIGWINCH` hook is linked
-            // into the CLI. Nothing is wrong with the connection, so read again;
-            // `deadline` still bounds the total wait.
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error).context("failed to read TCP stream"),
-        }
-    }
-    Ok(String::from_utf8_lossy(&response).into_owned())
-}
-
-/// Whether the bytes so far are a complete HTTP response by their own framing.
-///
-/// `false` for a response that declares neither a length nor chunked encoding —
-/// those are delimited by the connection closing, so the caller must keep reading
-/// until EOF.
-fn http_response_is_complete(response: &[u8]) -> bool {
-    // Headers are ASCII by the HTTP spec, so it is safe to lossy-decode just
-    // that slice to parse them. The body length check below stays on raw
-    // bytes: lossy-decoding a body that ends mid multi-byte UTF-8 sequence
-    // replaces the truncated tail with a 3-byte U+FFFD, which can inflate a
-    // partial body's *decoded* length past the declared Content-Length and
-    // report completeness one read early.
-    let Some(header_end) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return false;
-    };
-    let headers = String::from_utf8_lossy(&response[..header_end]);
-    let body = &response[header_end + 4..];
-    let header_value = |name: &str| {
-        headers.lines().find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.trim()
-                .eq_ignore_ascii_case(name)
-                .then(|| value.trim().to_owned())
-        })
-    };
-    if let Some(length) =
-        header_value("Content-Length").and_then(|value| value.parse::<usize>().ok())
-    {
-        return body.len() >= length;
-    }
-    if header_value("Transfer-Encoding")
-        .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
-    {
-        return body.ends_with(b"0\r\n\r\n");
-    }
-    false
-}
-
-#[cfg(windows)]
-pub fn spawn_detached_no_inherit(
-    program: &Path,
-    args: &[String],
-    env_overrides: &[(&str, &Path)],
-) -> Result<u32> {
-    spawn_windows_no_inherit(
-        program,
-        args,
-        env_overrides,
-        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
-        false,
-        None,
-    )
-}
-
-#[cfg(windows)]
-pub fn spawn_hidden_console_no_inherit(
-    program: &Path,
-    args: &[String],
-    env_overrides: &[(&str, &Path)],
-) -> Result<u32> {
-    spawn_windows_no_inherit(
-        program,
-        args,
-        env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
-        None,
-    )
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
-pub fn spawn_hidden_console_with_log(
-    program: &Path,
-    args: &[String],
-    env_overrides: &[(&str, &Path)],
-    log_path: &Path,
-) -> Result<u32> {
-    use std::os::windows::io::AsRawHandle;
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .with_context(|| format!("failed to open {}", log_path.display()))?;
-    let current_process = unsafe { GetCurrentProcess() };
-    let source = log_file.as_raw_handle() as HANDLE;
-    let mut stdout_handle: HANDLE = null_mut();
-    let mut stderr_handle: HANDLE = null_mut();
-    unsafe {
-        if DuplicateHandle(
-            current_process,
-            source,
-            current_process,
-            &raw mut stdout_handle,
-            0,
-            1,
-            DUPLICATE_SAME_ACCESS,
-        ) == 0
-        {
-            bail!(
-                "failed to duplicate stdout log handle for {}: {}",
-                log_path.display(),
-                std::io::Error::last_os_error()
-            );
-        }
-        if DuplicateHandle(
-            current_process,
-            source,
-            current_process,
-            &raw mut stderr_handle,
-            0,
-            1,
-            DUPLICATE_SAME_ACCESS,
-        ) == 0
-        {
-            CloseHandle(stdout_handle);
-            bail!(
-                "failed to duplicate stderr log handle for {}: {}",
-                log_path.display(),
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-    let result = spawn_windows_no_inherit(
-        program,
-        args,
-        env_overrides,
-        CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
-        true,
-        Some((stdout_handle, stderr_handle)),
-    );
-    unsafe {
-        CloseHandle(stdout_handle);
-        CloseHandle(stderr_handle);
-    }
-    result
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
-pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-            0,
-            pid,
-        )
-    };
-    if handle.is_null() {
-        bail!(
-            "failed to open process {pid} for wait: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    unsafe {
-        WaitForSingleObject(handle, INFINITE);
-        let mut exit_code = 0;
-        if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
-            CloseHandle(handle);
-            bail!(
-                "failed to read process {pid} exit code: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        CloseHandle(handle);
-        Ok(exit_code)
-    }
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
-pub fn terminate_process(pid: u32) -> Result<()> {
-    use windows_sys::Win32::Foundation::CloseHandle;
-
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        bail!(
-            "failed to open process {pid} for termination: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    let terminated = unsafe { TerminateProcess(handle, 1) };
-    unsafe {
-        CloseHandle(handle);
-    }
-    if terminated == 0 {
-        bail!(
-            "failed to terminate process {pid}: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-#[allow(unsafe_code)] // libc FFI
-pub fn terminate_process(pid: u32) -> Result<()> {
-    let status = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to terminate process {pid}"))
-    }
-}
-
-/// Terminate `pid` together with every transitive child process.
-///
-/// Long-running engines such as vLLM spawn helper subprocesses (for example the
-/// `EngineCore` worker that holds the GPU allocation). Signalling only the
-/// launcher PID leaves those workers reparented to init, where they keep the
-/// model resident and the device memory pinned. Walking the descendant tree and
-/// signalling each process avoids that leak.
-#[cfg(not(windows))]
-#[allow(unsafe_code)] // libc FFI
-pub fn terminate_process_tree(pid: u32) -> Result<()> {
-    let mut last_error: Option<(u32, std::io::Error)> = None;
-    for target in collect_process_tree(pid) {
-        let status = unsafe { libc::kill(target.cast_signed(), libc::SIGTERM) };
-        if status != 0 {
-            let error = std::io::Error::last_os_error();
-            // A process that already exited (ESRCH) is not a failure here.
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                last_error = Some((target, error));
-            }
-        }
-    }
-    if let Some((target, error)) = last_error {
-        return Err(error).with_context(|| format!("failed to terminate process {target}"));
-    }
-    Ok(())
-}
-
-/// Send `signal` to `pid`, optionally extending to its transitive children.
-///
-/// Delivery to a process that has already exited (`ESRCH`) counts as success:
-/// the goal — that process no longer running — is already met. Returns `false`
-/// only when a signal could not be delivered for another reason (for example
-/// `EPERM`). Used by the verified-termination logic in [`proc_lifecycle`].
-#[cfg(not(windows))]
-#[allow(unsafe_code)] // libc FFI
-pub(crate) fn signal_process_scope(pid: u32, signal: i32, include_tree: bool) -> bool {
-    let targets = if include_tree {
-        collect_process_tree(pid)
-    } else {
-        vec![pid]
-    };
-    let mut delivered = true;
-    for target in targets {
-        let status = unsafe { libc::kill(target.cast_signed(), signal) };
-        if status != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-            delivered = false;
-        }
-    }
-    delivered
-}
-
-/// Snapshot `root` plus its transitive descendants as a flat PID list.
-///
-/// Used by [`proc_lifecycle`] to bind a tree termination to the exact processes
-/// present when the stop began. On platforms without `/proc` only `root` is
-/// returned.
-#[cfg(not(windows))]
-pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
-    collect_process_tree(root)
-}
-
-#[cfg(windows)]
-pub(crate) fn process_tree_pids(root: u32) -> Vec<u32> {
-    vec![root]
-}
-
-/// Collect `root` plus all of its transitive descendants by reading `/proc`.
-///
-/// On platforms without `/proc` (for example macOS) only `root` is returned, so
-/// callers degrade to single-process termination rather than failing.
-#[cfg(not(windows))]
-fn collect_process_tree(root: u32) -> Vec<u32> {
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    if let Ok(entries) = fs::read_dir("/proc") {
-        for entry in entries.flatten() {
-            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            if let Some(ppid) = read_parent_pid(pid) {
-                children.entry(ppid).or_default().push(pid);
-            }
-        }
-    }
-
-    let mut order = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![root];
-    while let Some(pid) = stack.pop() {
-        if !seen.insert(pid) {
-            continue;
-        }
-        order.push(pid);
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids.iter().copied());
-        }
-    }
-    order
-}
-
-/// Read the parent PID of `pid` from `/proc/<pid>/stat`.
-///
-/// The `comm` field can contain spaces and parentheses, so the parent PID is
-/// parsed from the text after the final `)`.
-#[cfg(not(windows))]
-fn read_parent_pid(pid: u32) -> Option<u32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.get(stat.rfind(')')? + 1..)?;
-    let mut fields = after_comm.split_whitespace();
-    let _state = fields.next()?;
-    fields.next()?.parse::<u32>().ok()
-}
-
-/// Terminate `pid` together with every transitive child process.
-///
-/// The Windows implementation falls back to terminating the single process; the
-/// engines that rely on descendant cleanup are Unix-only.
-#[cfg(windows)]
-pub fn terminate_process_tree(pid: u32) -> Result<()> {
-    terminate_process(pid)
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
-pub fn process_is_running(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-
-    if pid == 0 {
-        return false;
-    }
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return false;
-    }
-    let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
-    unsafe {
-        CloseHandle(handle);
-    }
-    ok && exit_code == 259
-}
-
-#[cfg(not(windows))]
-#[allow(unsafe_code)] // libc FFI
-pub fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    let status = unsafe { libc::kill(pid, 0) };
-    if status == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-/// An advisory, cross-process exclusive lock backed by a lock file.
-///
-/// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
-/// holds between *separate `rocm` processes*, not just threads: each caller opens
-/// the same lock-file path and only one can hold the lock at a time. It exists to
-/// serialize check-then-act sequences over shared on-disk state — the daemon
-/// autostart decision and the managed-serve GPU select-then-claim — so two
-/// concurrent invocations cannot both pass the same TOCTOU check.
-///
-/// The lock is released when the guard is dropped, and by the OS if the process
-/// exits while holding it (so a crashed holder never wedges the next caller).
-#[derive(Debug)]
-pub struct FileLock {
-    file: fs::File,
-    path: PathBuf,
-}
-
-impl FileLock {
-    /// Acquire an exclusive lock on `path`, creating the lock file and any
-    /// missing parent directories first. Blocks until the lock is available.
-    ///
-    /// The lock file itself carries no data; it is a rendezvous point, so an
-    /// existing file is reused (never truncated) and its contents are ignored.
-    pub fn acquire(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("failed to open lock file {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("failed to acquire lock {}", path.display()))?;
-        Ok(Self { file, path })
-    }
-
-    /// The lock file backing this guard.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        // Best-effort: an unlock failure only means the OS releases it slightly
-        // later (at the latest when the file handle closes), never a lost lock.
-        let _ = self.file.unlock();
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)] // libc FFI (pre_exec/setsid)
-pub fn detach_command_session(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-}
-
-#[cfg(not(unix))]
-// Platform stub. The `cfg` sibling calls non-const code, so making only this
-// arm `const` would give the two platforms different signatures and push
-// `missing_const_for_fn` onto every caller in turn.
-#[allow(clippy::missing_const_for_fn)]
-pub fn detach_command_session(_command: &mut Command) {}
-
-#[cfg(windows)]
-#[allow(unsafe_code)] // Win32 FFI
-fn spawn_windows_no_inherit(
-    program: &Path,
-    args: &[String],
-    env_overrides: &[(&str, &Path)],
-    creation_flags: u32,
-    hide_window: bool,
-    std_handles: Option<(
-        windows_sys::Win32::Foundation::HANDLE,
-        windows_sys::Win32::Foundation::HANDLE,
-    )>,
-) -> Result<u32> {
-    use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::CloseHandle;
-
-    let mut command_line = windows_command_line(program.as_os_str(), args);
-    let application_name = nul_terminated_wide(program.as_os_str());
-    let mut environment = windows_environment_block(env_overrides);
-    let mut startup_info = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    if hide_window {
-        const SW_HIDE: u16 = 0;
-        startup_info.dwFlags |= STARTF_USESHOWWINDOW;
-        startup_info.wShowWindow = SW_HIDE;
-    }
-    if let Some((stdout_handle, stderr_handle)) = std_handles {
-        startup_info.dwFlags |= STARTF_USESTDHANDLES;
-        startup_info.hStdInput = null_mut();
-        startup_info.hStdOutput = stdout_handle;
-        startup_info.hStdError = stderr_handle;
-    }
-    let mut process_info = PROCESS_INFORMATION::default();
-    let created = unsafe {
-        CreateProcessW(
-            application_name.as_ptr(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            i32::from(std_handles.is_some()),
-            creation_flags,
-            environment.as_mut_ptr().cast(),
-            null(),
-            &raw const startup_info,
-            &raw mut process_info,
-        )
-    };
-    if created == 0 {
-        bail!(
-            "failed to launch detached process {}: {}",
-            program.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    unsafe {
-        CloseHandle(process_info.hThread);
-        CloseHandle(process_info.hProcess);
-    }
-    Ok(process_info.dwProcessId)
-}
-
-#[cfg(windows)]
-fn nul_terminated_wide(value: &OsStr) -> Vec<u16> {
-    value.encode_wide().chain(std::iter::once(0)).collect()
-}
-
-#[cfg(windows)]
-fn windows_command_line(program: &OsStr, args: &[String]) -> Vec<u16> {
-    let mut command = quote_windows_arg(&program.to_string_lossy());
-    for arg in args {
-        command.push(' ');
-        command.push_str(&quote_windows_arg(arg));
-    }
-    OsStr::new(&command)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-#[cfg(windows)]
-fn quote_windows_arg(arg: &str) -> String {
-    if !arg.is_empty()
-        && !arg
-            .chars()
-            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'))
-    {
-        return arg.to_owned();
-    }
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0usize;
-    for ch in arg.chars() {
-        match ch {
-            '\\' => backslashes += 1,
-            '"' => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
-                quoted.push('"');
-                backslashes = 0;
-            }
-            _ => {
-                quoted.extend(std::iter::repeat_n('\\', backslashes));
-                backslashes = 0;
-                quoted.push(ch);
-            }
-        }
-    }
-    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
-    quoted.push('"');
-    quoted
-}
-
-#[cfg(windows)]
-fn windows_environment_block(env_overrides: &[(&str, &Path)]) -> Vec<u16> {
-    let mut env = BTreeMap::<String, OsString>::new();
-    for (key, value) in std::env::vars_os() {
-        let key_string = key.to_string_lossy().to_string();
-        env.insert(
-            key_string.to_ascii_uppercase(),
-            OsString::from(format!("{}={}", key_string, value.to_string_lossy())),
-        );
-    }
-    for (key, value) in env_overrides {
-        env.insert(
-            key.to_ascii_uppercase(),
-            OsString::from(format!("{}={}", key, value.display())),
-        );
-    }
-    let mut block = Vec::new();
-    for entry in env.values() {
-        block.extend(entry.encode_wide());
-        block.push(0);
-    }
-    block.push(0);
-    block
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AppPaths {
-    pub config_dir: PathBuf,
-    pub data_dir: PathBuf,
-    pub cache_dir: PathBuf,
-}
-
-impl AppPaths {
-    pub fn discover() -> Result<Self> {
-        let data_dir_override = env_path_override("ROCM_CLI_DATA_DIR");
-        let cache_dir_override = env_path_override("ROCM_CLI_CACHE_DIR");
-        let paths = Self {
-            config_dir: env_path_override("ROCM_CLI_CONFIG_DIR")
-                .or_else(default_config_dir)
-                .context("unable to determine config directory for rocm-cli")?,
-            data_dir: data_dir_override
-                .clone()
-                .or_else(default_data_dir)
-                .context("unable to determine data directory for rocm-cli")?,
-            cache_dir: cache_dir_override
-                .clone()
-                .or_else(default_cache_dir)
-                .context("unable to determine cache directory for rocm-cli")?,
-        }
-        .normalize_for_host();
-        Ok(Self::discover_from_paths(
-            paths,
-            data_dir_override.is_some(),
-            cache_dir_override.is_some(),
-        ))
-    }
-
-    fn discover_from_paths(
-        mut paths: Self,
-        data_dir_overridden: bool,
-        cache_dir_overridden: bool,
-    ) -> Self {
-        if !data_dir_overridden
-            && let Some(managed_root) = configured_managed_root_from_config(&paths)
-        {
-            paths = paths.with_managed_root(managed_root, cache_dir_overridden);
-        }
-        paths.normalize_for_host()
-    }
-
-    fn normalize_for_host(mut self) -> Self {
-        self.config_dir = normalize_runtime_path_for_host(&self.config_dir);
-        self.data_dir = normalize_runtime_path_for_host(&self.data_dir);
-        self.cache_dir = normalize_runtime_path_for_host(&self.cache_dir);
-        self
-    }
-
-    #[must_use]
-    pub fn with_managed_root(mut self, root: impl Into<PathBuf>, keep_cache_dir: bool) -> Self {
-        self.data_dir = managed_runtime_data_root(&root.into());
-        if !keep_cache_dir {
-            self.cache_dir = managed_runtime_cache_dir(&self.data_dir);
-        }
-        self.normalize_for_host()
-    }
-
-    pub fn ensure(&self) -> Result<()> {
-        for dir in [
-            &self.config_dir,
-            &self.data_dir,
-            &self.cache_dir,
-            &self.audit_dir(),
-            &self.automations_dir(),
-            &self.data_dir.join("engines"),
-            &self.data_dir.join("envs"),
-            &self.data_dir.join("logs"),
-            &self.data_dir.join("services"),
-            &self.data_dir.join("models"),
-            &self.data_dir.join("runtimes"),
-            &self.telemetry_state_dir(),
-        ] {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create {}", dir.display()))?;
-        }
-        Ok(())
-    }
-
-    pub fn engine_dir(&self, engine: &str) -> PathBuf {
-        self.data_dir.join("engines").join(engine)
-    }
-
-    pub fn primary_engine_plugin_dir(&self) -> PathBuf {
-        self.data_dir.join("engines").join("plugins")
-    }
-
-    pub fn engine_logs_dir(&self, engine: &str) -> PathBuf {
-        self.engine_dir(engine).join("logs")
-    }
-
-    /// Where engine virtualenvs live, honouring `ROCM_CLI_ENGINE_ENVS_ROOT`.
-    ///
-    /// Read-side of a write-only contract at present: `apps/rocm` exports this
-    /// key into the children it spawns, and this is the only code that reads it
-    /// back, so no in-tree production path reaches here today. That predates
-    /// the seam below and is deliberate — the key exists for an engine process
-    /// to honour. Being `pub` says nothing either way: `unreachable_pub` is
-    /// switched off workspace-wide (see the root `Cargo.toml`), so nothing warns
-    /// about an unused one. Delete this and the key together if the contract is
-    /// dropped; `engine_envs_dir_reads_its_root_from_the_environment` is what
-    /// keeps the lookup honest meanwhile.
-    pub fn engine_envs_root(&self) -> PathBuf {
-        self.engine_envs_root_from(env_path_override("ROCM_CLI_ENGINE_ENVS_ROOT").as_deref())
-    }
-
-    /// [`Self::engine_envs_root`] against a caller-supplied override.
-    ///
-    /// Lets a test drive the override without `std::env::set_var`, which is
-    /// process-global and races other tests under a threaded runner. Same seam
-    /// as [`discover_rocm_installs_in_layout`].
-    fn engine_envs_root_from(&self, override_root: Option<&Path>) -> PathBuf {
-        override_root.map_or_else(
-            || self.data_dir.join("engines"),
-            normalize_runtime_path_for_host,
-        )
-    }
-
-    pub fn engine_envs_dir(&self, engine: &str) -> PathBuf {
-        self.engine_envs_root().join(engine).join("envs")
-    }
-
-    /// [`Self::engine_envs_dir`] against a caller-supplied override.
-    #[cfg(test)]
-    fn engine_envs_dir_from(&self, engine: &str, override_root: Option<&Path>) -> PathBuf {
-        self.engine_envs_root_from(override_root)
-            .join(engine)
-            .join("envs")
-    }
-
-    pub fn engine_locks_dir(&self, engine: &str) -> PathBuf {
-        self.engine_dir(engine).join("locks")
-    }
-
-    pub fn engine_manifests_dir(&self, engine: &str) -> PathBuf {
-        self.engine_dir(engine).join("manifests")
-    }
-
-    pub fn engine_state_dir(&self, engine: &str) -> PathBuf {
-        self.engine_dir(engine).join("state")
-    }
-
-    pub fn config_path(&self) -> PathBuf {
-        self.config_dir.join("config.json")
-    }
-
-    pub fn services_dir(&self) -> PathBuf {
-        self.data_dir.join("services")
-    }
-
-    /// Lock file serializing the managed-serve GPU select-then-claim sequence, so
-    /// two concurrent `rocm serve` invocations cannot read the same free GPU and
-    /// both launch on it. Held from auto-selection through the claiming service
-    /// record write (see [`FileLock`]).
-    pub fn managed_launch_lock_path(&self) -> PathBuf {
-        self.services_dir().join("launch.lock")
-    }
-
-    /// Where `rocm remote` records the sessions it started on other machines.
-    ///
-    /// Kept beside [`Self::services_dir`] and following the same file-per-record
-    /// shape, but deliberately separate: these describe work running on a
-    /// *different* machine, and anything walking the local service registry
-    /// (status rendering, the daemon's recovery supervisor) must not mistake a
-    /// remote session for a local server it can supervise.
-    pub fn remote_sessions_dir(&self) -> PathBuf {
-        self.data_dir.join("remote-sessions")
-    }
-
-    pub fn audit_dir(&self) -> PathBuf {
-        self.data_dir.join("audit")
-    }
-
-    pub fn audit_events_path(&self) -> PathBuf {
-        self.audit_dir().join("events.jsonl")
-    }
-
-    pub fn automations_dir(&self) -> PathBuf {
-        self.data_dir.join("automations")
-    }
-
-    pub fn automation_state_path(&self) -> PathBuf {
-        self.automations_dir().join("runtime-state.json")
-    }
-
-    /// Lock file serializing the daemon autostart check-then-spawn, so two
-    /// concurrent callers cannot both observe "not running" and each spawn a
-    /// background automation daemon (see [`FileLock`]).
-    pub fn automation_autostart_lock_path(&self) -> PathBuf {
-        self.automations_dir().join("autostart.lock")
-    }
-
-    /// Short-lived claim written by the autostart holder right after it spawns
-    /// the daemon, recording the child PID and spawn time. It bridges the gap
-    /// between `spawn()` and the child publishing its runtime state: a concurrent
-    /// caller that acquires the autostart lock in that window sees the claim and
-    /// defers instead of spawning a duplicate daemon.
-    pub fn automation_autostart_claim_path(&self) -> PathBuf {
-        self.automations_dir().join("autostart.claim")
-    }
-
-    pub fn automation_events_path(&self) -> PathBuf {
-        self.automations_dir().join("events.jsonl")
-    }
-
-    pub fn automation_proposals_path(&self) -> PathBuf {
-        self.automations_dir().join("proposals.jsonl")
-    }
-
-    pub fn service_manifest_path(&self, service_id: &str) -> PathBuf {
-        self.services_dir().join(format!("{service_id}.json"))
-    }
-
-    pub fn service_log_path(&self, service_id: &str) -> PathBuf {
-        self.services_dir().join(format!("{service_id}.log"))
-    }
-
-    pub fn service_engine_state_path(&self, engine: &str, service_id: &str) -> PathBuf {
-        self.engine_state_dir(engine)
-            .join(format!("{service_id}.json"))
-    }
-
-    /// Directory holding rocm-dash telemetry daemon state.
-    /// (G3 rocm-cli maintainer sign-off pending — engineering implementation only.)
-    pub fn telemetry_state_dir(&self) -> PathBuf {
-        self.data_dir.join("telemetry")
-    }
-
-    /// The directive file that moves `rocm dash`'s telemetry daemon off wall time
-    /// and onto a logical observation clock (see `docs/release-trust.md`).
-    ///
-    /// `rocm dash` reads it in every build, and nothing in rocm-cli creates it —
-    /// only the E2E harness plants one, in its isolated data root. Both resolve it
-    /// through this one method, so the path the harness plants and the path the
-    /// dashboard reads cannot drift apart. If they did, the dashboard would
-    /// silently stay on wall time, and the clock-driven scenarios would not fail
-    /// outright: they would keep passing, but only by timing.
-    pub fn dash_test_clock_file(&self) -> PathBuf {
-        self.telemetry_state_dir().join("test-clock-offset")
-    }
-
-    /// Log file for the rocm-dash telemetry daemon, under the shared logs dir.
-    ///
-    /// Deliberately under the canonical `AppPaths` data root
-    /// (`~/.rocm/logs/rocmdashd.log`), NOT the legacy standalone rocm-dash XDG
-    /// state path (`~/.local/state/rocm-dash/`). D6 unifies the dual-dir split
-    /// onto `~/.rocm`; do not "restore" the old XDG location.
-    pub fn daemon_log_path(&self) -> PathBuf {
-        self.data_dir.join("logs").join("rocmdashd.log")
-    }
-
-    /// Directory for client-side (CLI/TUI process) `tracing` log files.
-    ///
-    /// Siblings the daemon's `rocmdashd.log` under the same canonical
-    /// `~/.rocm/logs` root; the client writer rotates files inside this
-    /// directory itself (see `apps/rocm/src/logging.rs`), so only the
-    /// directory — not a single fixed file name — is exposed here.
-    pub fn client_log_dir(&self) -> PathBuf {
-        self.data_dir.join("logs")
-    }
-}
-
-fn configured_managed_root_from_config(paths: &AppPaths) -> Option<PathBuf> {
-    let bytes = fs::read(paths.config_path()).ok()?;
-    let value = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-    value
-        .get("setup")?
-        .get("therock_venv")?
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-pub fn engine_plugin_dirs(paths: &AppPaths) -> Vec<PathBuf> {
-    vec![
-        paths.primary_engine_plugin_dir(),
-        paths.data_dir.join("engines"),
-    ]
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
 }
 
 pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
@@ -2734,15 +784,66 @@ impl RocmCliConfig {
             .with_context(|| format!("failed to parse {}", path.display()))
     }
 
+    /// Persist the config by replacing it: write a sibling temp file, then
+    /// rename it over `config.json`.
+    ///
+    /// Guarantees: an interrupted save (full disk, crash, killed process) can
+    /// never leave a truncated or empty `config.json`, which `load` refuses to
+    /// parse, and a reader sees either the old file or the new one. The
+    /// destination is never removed first, because `load` reads a missing
+    /// `config.json` as "no config" and answers with defaults.
+    ///
+    /// The temp file is `config.json.tmp-<millis>-<pid>`; the pid keeps two
+    /// `rocm` processes saving in the same millisecond apart. It is removed if
+    /// the write or the rename fails.
+    ///
+    /// Not guaranteed:
+    /// - Durability. The bytes are not fsynced before the rename, so a power
+    ///   loss can still surface the new name with unflushed contents.
+    /// - Replacing a `config.json` that another process holds open without
+    ///   delete sharing. On Windows the rename then fails with a sharing
+    ///   violation, the save returns that error, and the old config stays in
+    ///   place.
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?,
-        )
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        let bytes =
+            serde_json::to_vec_pretty(self).context("failed to serialize rocm-cli config")?;
+        // Both halves of the suffix matter: the timestamp keeps successive saves
+        // apart, and the pid keeps two `rocm` processes saving in the same
+        // millisecond from writing each other's temp file and losing one of the
+        // two updates.
+        let tmp_path = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            unix_time_millis(),
+            std::process::id()
+        ));
+        // Cleaned up on failure, like the rename below: a full disk otherwise
+        // strands a partial `config.json.tmp-<ts>-<pid>` next to the real config
+        // on every attempt.
+        fs::write(&tmp_path, bytes)
+            .with_context(|| format!("failed to write {}", tmp_path.display()))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp_path);
+            })?;
+        // The destination is NOT removed first: `fs::rename` replaces an
+        // existing file on both supported platforms (it is `MoveFileEx` with
+        // `MOVEFILE_REPLACE_EXISTING` on Windows), and removing it would open a
+        // window with no `config.json` at all — which `load` reads as "no
+        // config" and silently answers with defaults, losing every setting
+        // without so much as an error.
+        fs::rename(&tmp_path, &path)
+            .with_context(|| {
+                format!(
+                    "failed to move rocm-cli config {} into {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })
+            .inspect_err(|_| {
+                let _ = fs::remove_file(&tmp_path);
+            })?;
         Ok(())
     }
 
@@ -3255,475 +1356,6 @@ pub fn load_recent_automation_events(
     Ok(events)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeArtifactSourcePolicyRecord {
-    pub policy: String,
-    #[serde(default)]
-    pub required_hosts: Vec<String>,
-    #[serde(default)]
-    pub notes: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeArtifactRecord {
-    pub artifact_id: String,
-    pub kind: String,
-    pub uri: String,
-    #[serde(default)]
-    pub revision: Option<String>,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub size_bytes: Option<u64>,
-    #[serde(default)]
-    pub license: Option<String>,
-    #[serde(default)]
-    pub gated: Option<bool>,
-    #[serde(default)]
-    pub quantization: Option<String>,
-    #[serde(default)]
-    pub engines: Vec<String>,
-    #[serde(default)]
-    pub source_policy: Option<ModelRecipeArtifactSourcePolicyRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeEndpointRecord {
-    pub endpoint_mode: String,
-    #[serde(default)]
-    pub settings: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeUnsupportedCombinationRecord {
-    pub combination: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeEngineRecord {
-    pub engine: String,
-    #[serde(default)]
-    pub required_flags: Vec<String>,
-    #[serde(default)]
-    pub parser_settings: BTreeMap<String, String>,
-    #[serde(default)]
-    pub preferred_endpoint: Option<ModelRecipeEndpointRecord>,
-    #[serde(default)]
-    pub unsupported_combinations: Vec<ModelRecipeUnsupportedCombinationRecord>,
-    #[serde(default)]
-    pub notes: Vec<String>,
-    /// Overrides the recipe `canonical_model_id` when this engine serves the model.
-    /// Lets a single alias resolve to engine-specific artifacts (for example a GGUF
-    /// id for Lemonade versus a Hugging Face repo id for vLLM).
-    #[serde(default)]
-    pub model_id_override: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelArtifactCacheStatus {
-    pub artifact_id: String,
-    pub status: String,
-    pub marker_path: PathBuf,
-    pub reason: String,
-}
-
-pub fn model_artifact_cache_marker_path(
-    paths: &AppPaths,
-    model_ref: &str,
-    artifact_id: &str,
-) -> PathBuf {
-    let model_component = cache_marker_component("model", model_ref);
-    let artifact_component = cache_marker_component("artifact", artifact_id);
-    paths
-        .data_dir
-        .join("models")
-        .join("artifacts")
-        .join(&model_component)
-        .join(format!("{artifact_component}.json"))
-}
-
-fn cache_marker_component(kind: &str, value: &str) -> String {
-    let slug = sanitize_component(value)
-        .trim_matches('-')
-        .chars()
-        .take(32)
-        .collect::<String>();
-    let slug = if slug.is_empty() {
-        kind.to_owned()
-    } else {
-        slug
-    };
-    format!("{slug}--x{}", hex_encode_lower(value.as_bytes()))
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-pub fn model_artifact_cache_status(
-    paths: &AppPaths,
-    model_ref: &str,
-    artifact: &ModelRecipeArtifactRecord,
-) -> ModelArtifactCacheStatus {
-    let marker_path = model_artifact_cache_marker_path(paths, model_ref, &artifact.artifact_id);
-    if marker_path.is_file() {
-        ModelArtifactCacheStatus {
-            artifact_id: artifact.artifact_id.clone(),
-            status: "metadata_present".to_owned(),
-            marker_path,
-            reason: "rocm-cli artifact cache marker exists; artifact bytes are still engine/source specific".to_owned(),
-        }
-    } else {
-        ModelArtifactCacheStatus {
-            artifact_id: artifact.artifact_id.clone(),
-            status: "missing".to_owned(),
-            marker_path,
-            reason:
-                "no rocm-cli artifact cache marker; prefetch requires an approved source policy"
-                    .to_owned(),
-        }
-    }
-}
-
-pub fn resolve_model_recipe_artifact(
-    artifact_ref: &str,
-) -> Result<Option<(ModelRecipeRecord, ModelRecipeArtifactRecord)>> {
-    require_nonempty(artifact_ref, "artifact_ref")?;
-    let registry = load_model_recipe_registry()?;
-    let artifact_ref = artifact_ref.trim();
-    if let Some((model_ref, artifact_id)) = artifact_ref.split_once('#') {
-        require_nonempty(model_ref, "artifact model_ref")?;
-        require_nonempty(artifact_id, "artifact_id")?;
-        let Some(recipe) = registry
-            .recipes
-            .into_iter()
-            .find(|recipe| recipe.matches_ref(model_ref))
-        else {
-            return Ok(None);
-        };
-        return Ok(recipe
-            .artifacts
-            .iter()
-            .position(|artifact| artifact.artifact_id == artifact_id)
-            .map(|index| {
-                let artifact = recipe.artifacts[index].clone();
-                (recipe, artifact)
-            }));
-    }
-
-    let mut matches = registry
-        .recipes
-        .into_iter()
-        .filter_map(|recipe| {
-            recipe
-                .artifacts
-                .iter()
-                .position(|artifact| artifact.artifact_id == artifact_ref)
-                .map(|index| {
-                    let artifact = recipe.artifacts[index].clone();
-                    (recipe, artifact)
-                })
-        })
-        .collect::<Vec<_>>();
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(matches.pop()),
-        _ => bail!("artifact_ref `{artifact_ref}` is ambiguous; use `<model-ref>#{artifact_ref}`"),
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeRecord {
-    pub canonical_model_id: String,
-    pub aliases: Vec<String>,
-    pub task: String,
-    pub source: String,
-    pub revision: String,
-    pub loader: String,
-    pub trust_remote_code: bool,
-    pub dtype: String,
-    pub device_policy: String,
-    #[serde(default)]
-    pub min_gpu_mem_gb: Option<u32>,
-    #[serde(default)]
-    pub recommended_system_ram_gb: Option<u32>,
-    #[serde(default)]
-    pub quantization: Option<String>,
-    #[serde(default)]
-    pub artifact_hint: Option<String>,
-    #[serde(default)]
-    pub artifacts: Vec<ModelRecipeArtifactRecord>,
-    #[serde(default)]
-    pub engine_recipes: Vec<ModelRecipeEngineRecord>,
-    #[serde(default)]
-    pub manual_alternatives: Vec<String>,
-    #[serde(default)]
-    pub featured: bool,
-    pub chat_template_mode: String,
-    pub preferred_engines: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
-impl ModelRecipeRecord {
-    pub fn matches_ref(&self, model_ref: &str) -> bool {
-        let normalized = normalize_model_ref(model_ref);
-        normalize_model_ref(&self.canonical_model_id) == normalized
-            || self
-                .aliases
-                .iter()
-                .any(|alias| normalize_model_ref(alias) == normalized)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelCatalogPlatform {
-    pub label: String,
-    pub engines: Vec<String>,
-    #[serde(default)]
-    pub gfx_families: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModelRecipeIndexDocument {
-    pub schema_version: u32,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub generated_at_unix_ms: Option<u128>,
-    #[serde(default)]
-    pub platforms: Vec<ModelCatalogPlatform>,
-
-    recipes: Vec<ModelRecipeRecord>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ModelRecipeRegistry {
-    pub recipes: Vec<ModelRecipeRecord>,
-    pub platforms: Vec<ModelCatalogPlatform>,
-    pub source: ModelRecipeRegistrySource,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum ModelRecipeRegistrySource {
-    BuiltIn,
-    SignedIndex {
-        index_path: PathBuf,
-        signature_path: PathBuf,
-        public_key_path: PathBuf,
-    },
-}
-
-impl ModelRecipeIndexDocument {
-    pub fn validate(&self) -> Result<()> {
-        if self.schema_version != 1 {
-            bail!(
-                "model recipe index schema_version {} is unsupported; expected 1",
-                self.schema_version
-            );
-        }
-        if self.recipes.is_empty() {
-            bail!("model recipe index must contain at least one recipe");
-        }
-
-        let mut refs = BTreeMap::<String, String>::new();
-        for recipe in &self.recipes {
-            require_nonempty(&recipe.canonical_model_id, "canonical_model_id")?;
-            require_nonempty(&recipe.task, "task")?;
-            require_nonempty(&recipe.source, "source")?;
-            require_nonempty(&recipe.revision, "revision")?;
-            require_nonempty(&recipe.loader, "loader")?;
-            require_nonempty(&recipe.dtype, "dtype")?;
-            require_nonempty(&recipe.device_policy, "device_policy")?;
-            require_nonempty(&recipe.chat_template_mode, "chat_template_mode")?;
-            validate_model_device_policy(&recipe.device_policy)?;
-            insert_unique_model_ref(
-                &mut refs,
-                &recipe.canonical_model_id,
-                &recipe.canonical_model_id,
-            )?;
-            for alias in &recipe.aliases {
-                require_nonempty(alias, "alias")?;
-                insert_unique_model_ref(&mut refs, alias, &recipe.canonical_model_id)?;
-            }
-            for artifact in &recipe.artifacts {
-                validate_model_recipe_artifact(artifact, &recipe.canonical_model_id)?;
-            }
-            let mut engines = BTreeMap::<String, String>::new();
-            for engine_recipe in &recipe.engine_recipes {
-                validate_model_recipe_engine_record(engine_recipe, &recipe.canonical_model_id)?;
-                let normalized = normalize_model_ref(&engine_recipe.engine);
-                if let Some(existing) = engines.insert(normalized, engine_recipe.engine.clone()) {
-                    bail!(
-                        "engine recipe for `{}` on `{}` is duplicated by `{existing}`",
-                        engine_recipe.engine,
-                        recipe.canonical_model_id
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-pub fn builtin_model_recipe_registry() -> ModelRecipeRegistry {
-    let doc = builtin_model_catalog_document();
-    ModelRecipeRegistry {
-        recipes: doc.recipes.clone(),
-        platforms: doc.platforms.clone(),
-        source: ModelRecipeRegistrySource::BuiltIn,
-    }
-}
-
-pub fn load_model_recipe_registry() -> Result<ModelRecipeRegistry> {
-    let configured_index = env_path_override("ROCM_CLI_MODEL_RECIPE_INDEX_PATH");
-    if configured_index.is_none() && env_flag("ROCM_CLI_REQUIRE_MODEL_RECIPE_SIGNATURE") {
-        bail!(
-            "signed model recipe index is required but ROCM_CLI_MODEL_RECIPE_INDEX_PATH is not configured"
-        );
-    }
-    let Some(index_path) = configured_index else {
-        return Ok(builtin_model_recipe_registry());
-    };
-
-    let signature_path = env_path_override("ROCM_CLI_MODEL_RECIPE_INDEX_SIGNATURE_PATH")
-        .unwrap_or_else(|| model_recipe_index_signature_path(&index_path));
-    let public_key_path = env_path_override("ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH")
-        .context(
-            "signed model recipe index requires ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH",
-        )?;
-    let document = load_signed_model_recipe_index(&index_path, &signature_path, &public_key_path)?;
-    let platforms = if document.platforms.is_empty() {
-        builtin_model_catalog_document().platforms.clone()
-    } else {
-        document.platforms
-    };
-    Ok(ModelRecipeRegistry {
-        recipes: document.recipes,
-        platforms,
-        source: ModelRecipeRegistrySource::SignedIndex {
-            index_path,
-            signature_path,
-            public_key_path,
-        },
-    })
-}
-
-pub fn resolve_model_recipe(model_ref: &str) -> Result<Option<ModelRecipeRecord>> {
-    Ok(load_model_recipe_registry()?
-        .recipes
-        .into_iter()
-        .find(|recipe| recipe.matches_ref(model_ref)))
-}
-
-pub fn load_signed_model_recipe_index(
-    index_path: &Path,
-    signature_path: &Path,
-    public_key_path: &Path,
-) -> Result<ModelRecipeIndexDocument> {
-    verify_model_recipe_index_signature(index_path, signature_path, public_key_path)?;
-    let document = load_model_recipe_index(index_path)?;
-    document.validate()?;
-    Ok(document)
-}
-
-pub fn load_model_recipe_index(index_path: &Path) -> Result<ModelRecipeIndexDocument> {
-    let bytes = fs::read(index_path)
-        .with_context(|| format!("failed to read model recipe index {}", index_path.display()))?;
-    let document =
-        serde_json::from_slice::<ModelRecipeIndexDocument>(&bytes).with_context(|| {
-            format!(
-                "failed to parse model recipe index {}",
-                index_path.display()
-            )
-        })?;
-    document.validate()?;
-    Ok(document)
-}
-
-pub fn model_recipe_index_signature_path(index_path: &Path) -> PathBuf {
-    let mut signature = index_path.as_os_str().to_os_string();
-    signature.push(".sig");
-    PathBuf::from(signature)
-}
-
-/// Normalize a PEM document the way the OpenSSL CLI tolerated input, so keys
-/// produced or copied through other tooling still parse with the strict RFC 7468
-/// reader. Strips a leading UTF-8 BOM, accepts any line-ending style (CRLF, lone
-/// CR, or LF), and drops trailing whitespace from each line — Windows tooling
-/// (e.g. PowerShell `Set-Content`) can introduce CRLF or a stray trailing space
-/// on the `-----BEGIN ...-----` boundary that the parser would otherwise reject.
-fn normalize_pem(pem: &str) -> String {
-    let without_bom = pem.strip_prefix('\u{feff}').unwrap_or(pem);
-    let unified = without_bom.replace("\r\n", "\n").replace('\r', "\n");
-    let mut normalized: String = unified
-        .split('\n')
-        .map(|line| line.trim_end_matches([' ', '\t']))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    normalized.push('\n');
-    normalized
-}
-
-/// Verify an RSASSA-PKCS#1 v1.5 signature over SHA-256 using a pure-Rust
-/// implementation, with no external `openssl` process.
-///
-/// `public_key_pem` is a SubjectPublicKeyInfo PEM (`-----BEGIN PUBLIC KEY-----`),
-/// exactly what `openssl rsa -pubout` emits and what `openssl dgst -sha256 -verify`
-/// consumes, so verification is byte-compatible with that command. `label` names the
-/// artifact being checked (e.g. `"metadata"`); on a bad signature the error reads
-/// `"<label> signature verification failed"` to preserve existing diagnostics.
-pub fn verify_rsa_pkcs1_sha256_signature(
-    public_key_pem: &str,
-    payload: &[u8],
-    signature: &[u8],
-    label: &str,
-) -> Result<()> {
-    use rsa::RsaPublicKey;
-    use rsa::pkcs1v15::{Signature, VerifyingKey};
-    use rsa::pkcs8::DecodePublicKey;
-    use rsa::signature::Verifier;
-    use sha2::Sha256;
-
-    let public_key = RsaPublicKey::from_public_key_pem(&normalize_pem(public_key_pem))
-        .with_context(|| format!("{label} public key is not a valid RSA public key"))?;
-    let signature = Signature::try_from(signature)
-        .with_context(|| format!("{label} signature is malformed"))?;
-    VerifyingKey::<Sha256>::new(public_key)
-        .verify(payload, &signature)
-        .map_err(|error| anyhow::anyhow!("{label} signature verification failed: {error}"))
-}
-
-/// Produce an RSASSA-PKCS#1 v1.5 signature over SHA-256 with a pure-Rust
-/// implementation, with no external `openssl` process.
-///
-/// `private_key_pem` is a PKCS#8 private-key PEM (`-----BEGIN PRIVATE KEY-----`),
-/// as emitted by `openssl genpkey`. The signature is deterministic and
-/// byte-identical to `openssl dgst -sha256 -sign`, so artifacts signed here verify
-/// with either implementation.
-pub fn sign_rsa_pkcs1_sha256_signature(private_key_pem: &str, payload: &[u8]) -> Result<Vec<u8>> {
-    use rsa::RsaPrivateKey;
-    use rsa::pkcs1v15::SigningKey;
-    use rsa::pkcs8::DecodePrivateKey;
-    use rsa::signature::{SignatureEncoding, Signer};
-    use sha2::Sha256;
-
-    let private_key = RsaPrivateKey::from_pkcs8_pem(&normalize_pem(private_key_pem))
-        .context("signing private key is not a valid PKCS#8 RSA private key")?;
-    let signature = SigningKey::<Sha256>::new(private_key)
-        .try_sign(payload)
-        .context("failed to produce RSA signature")?;
-    Ok(signature.to_bytes().into_vec())
-}
-
 /// Number of random alphanumeric characters in a generated endpoint API key.
 /// 48 chars from a 62-symbol alphabet is ~285 bits of entropy — far beyond what
 /// a bearer token guarding a network endpoint needs, with no padding characters
@@ -3761,371 +1393,6 @@ pub fn generate_endpoint_api_key() -> String {
 /// (rejecting a supplied key) and defensively when reading the key file.
 pub fn endpoint_api_key_has_forbidden_chars(key: &str) -> bool {
     key.chars().any(char::is_control)
-}
-
-/// Generate a fresh 2048-bit RSA signing keypair, returned as
-/// `(PKCS#8 private-key PEM, SubjectPublicKeyInfo public-key PEM)` — the same
-/// formats `openssl genpkey` / `openssl rsa -pubout` produce.
-pub fn generate_rsa_signing_keypair() -> Result<(String, String)> {
-    use rsa::RsaPrivateKey;
-    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-
-    // `rsa` 0.9 is built against `rand_core` 0.6, while the workspace `rand` is
-    // 0.9 (`rand_core` 0.9) — the two trait sets are not interchangeable, so an
-    // rng from `rand::rng()` does not satisfy `RsaPrivateKey::new`. Use the
-    // `rand_core` that `rsa` itself re-exports, which keeps the versions matched
-    // no matter which one `rand` moves to. `OsRng` draws straight from the
-    // operating system CSPRNG.
-    let mut rng = rsa::rand_core::OsRng;
-    let private_key =
-        RsaPrivateKey::new(&mut rng, 2048).context("failed to generate RSA signing key")?;
-    let private_pem = private_key
-        .to_pkcs8_pem(LineEnding::LF)
-        .context("failed to encode private key")?
-        .to_string();
-    let public_pem = rsa::RsaPublicKey::from(&private_key)
-        .to_public_key_pem(LineEnding::LF)
-        .context("failed to encode public key")?;
-    Ok((private_pem, public_pem))
-}
-
-pub fn verify_model_recipe_index_signature(
-    index_path: &Path,
-    signature_path: &Path,
-    public_key_path: &Path,
-) -> Result<()> {
-    if !signature_path.is_file() {
-        bail!(
-            "model recipe index signature is missing: {}",
-            signature_path.display()
-        );
-    }
-    if !public_key_path.is_file() {
-        bail!(
-            "model recipe index public key is missing: {}",
-            public_key_path.display()
-        );
-    }
-    let public_key_pem = fs::read_to_string(public_key_path).with_context(|| {
-        format!(
-            "failed to read model recipe index public key: {}",
-            public_key_path.display()
-        )
-    })?;
-    let signature = fs::read(signature_path).with_context(|| {
-        format!(
-            "failed to read model recipe index signature: {}",
-            signature_path.display()
-        )
-    })?;
-    let payload = fs::read(index_path).with_context(|| {
-        format!(
-            "failed to read model recipe index: {}",
-            index_path.display()
-        )
-    })?;
-    verify_rsa_pkcs1_sha256_signature(&public_key_pem, &payload, &signature, "model recipe index")
-}
-
-fn validate_model_device_policy(policy: &str) -> Result<()> {
-    match policy {
-        "gpu_required" | "gpu_preferred" | "cpu_only" => Ok(()),
-        other => bail!(
-            "model recipe device_policy `{other}` is unsupported; expected gpu_required, gpu_preferred, or cpu_only"
-        ),
-    }
-}
-
-fn insert_unique_model_ref(
-    refs: &mut BTreeMap<String, String>,
-    model_ref: &str,
-    canonical_model_id: &str,
-) -> Result<()> {
-    let normalized = normalize_model_ref(model_ref);
-    if let Some(existing) = refs.insert(normalized, canonical_model_id.to_owned()) {
-        bail!(
-            "model recipe ref `{model_ref}` is duplicated by `{existing}` and `{canonical_model_id}`"
-        );
-    }
-    Ok(())
-}
-
-fn validate_model_recipe_artifact(
-    artifact: &ModelRecipeArtifactRecord,
-    canonical_model_id: &str,
-) -> Result<()> {
-    require_nonempty(&artifact.artifact_id, "artifact_id")?;
-    require_nonempty(&artifact.kind, "artifact kind")?;
-    require_nonempty(&artifact.uri, "artifact uri")?;
-    if let Some(sha256) = artifact.sha256.as_deref()
-        && (sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()))
-    {
-        bail!(
-            "artifact `{}` for `{canonical_model_id}` has invalid sha256",
-            artifact.artifact_id
-        );
-    }
-    if let Some(source_policy) = &artifact.source_policy {
-        validate_model_recipe_artifact_source_policy(source_policy, artifact, canonical_model_id)?;
-    }
-    Ok(())
-}
-
-fn validate_model_recipe_artifact_source_policy(
-    source_policy: &ModelRecipeArtifactSourcePolicyRecord,
-    artifact: &ModelRecipeArtifactRecord,
-    canonical_model_id: &str,
-) -> Result<()> {
-    require_nonempty(&source_policy.policy, "artifact source_policy policy")?;
-    for host in &source_policy.required_hosts {
-        require_nonempty(host, "artifact source_policy required_host")?;
-        if host.contains('/') || host.contains('@') || host.contains(':') {
-            bail!(
-                "artifact `{}` for `{canonical_model_id}` has invalid source_policy required_host `{host}`",
-                artifact.artifact_id
-            );
-        }
-    }
-    for note in &source_policy.notes {
-        require_nonempty(note, "artifact source_policy note")?;
-    }
-
-    if !source_policy.required_hosts.is_empty() {
-        let Some(host) = recipe_artifact_url_host(&artifact.uri) else {
-            bail!(
-                "artifact `{}` for `{canonical_model_id}` declares required source hosts but its uri is not HTTP(S)",
-                artifact.artifact_id
-            );
-        };
-        if !source_policy
-            .required_hosts
-            .iter()
-            .any(|required| required.eq_ignore_ascii_case(&host))
-        {
-            bail!(
-                "artifact `{}` for `{canonical_model_id}` uri host `{host}` is not allowed by source_policy",
-                artifact.artifact_id
-            );
-        }
-    }
-
-    match source_policy.policy.as_str() {
-        "direct_https_sha256" => {
-            if !artifact.uri.starts_with("https://") {
-                bail!(
-                    "artifact `{}` for `{canonical_model_id}` source_policy direct_https_sha256 requires an HTTPS uri",
-                    artifact.artifact_id
-                );
-            }
-            validate_prefetch_integrity_metadata(artifact, canonical_model_id)?;
-        }
-        "huggingface_public" => {
-            if artifact.gated.unwrap_or(false) {
-                bail!(
-                    "artifact `{}` for `{canonical_model_id}` source_policy huggingface_public cannot be used for a gated artifact",
-                    artifact.artifact_id
-                );
-            }
-            validate_huggingface_source_policy_uri(source_policy, artifact, canonical_model_id)?;
-            validate_prefetch_integrity_metadata(artifact, canonical_model_id)?;
-        }
-        "huggingface_authenticated" => {
-            validate_huggingface_source_policy_uri(source_policy, artifact, canonical_model_id)?;
-            validate_prefetch_integrity_metadata(artifact, canonical_model_id)?;
-        }
-        "manual_only" => {}
-        other => bail!(
-            "artifact `{}` for `{canonical_model_id}` has unsupported source_policy `{other}`",
-            artifact.artifact_id
-        ),
-    }
-    Ok(())
-}
-
-fn validate_prefetch_integrity_metadata(
-    artifact: &ModelRecipeArtifactRecord,
-    canonical_model_id: &str,
-) -> Result<()> {
-    if artifact.sha256.is_none() {
-        bail!(
-            "artifact `{}` for `{canonical_model_id}` source_policy requires sha256 metadata",
-            artifact.artifact_id
-        );
-    }
-    if artifact.size_bytes.is_none() {
-        bail!(
-            "artifact `{}` for `{canonical_model_id}` source_policy requires size_bytes metadata",
-            artifact.artifact_id
-        );
-    }
-    Ok(())
-}
-
-fn validate_huggingface_source_policy_uri(
-    source_policy: &ModelRecipeArtifactSourcePolicyRecord,
-    artifact: &ModelRecipeArtifactRecord,
-    canonical_model_id: &str,
-) -> Result<()> {
-    if !artifact.uri.starts_with("https://") {
-        bail!(
-            "artifact `{}` for `{canonical_model_id}` source_policy {} requires an HTTPS Hugging Face uri",
-            artifact.artifact_id,
-            source_policy.policy
-        );
-    }
-    if !recipe_artifact_uri_is_huggingface(&artifact.uri) {
-        bail!(
-            "artifact `{}` for `{canonical_model_id}` source_policy {} requires a Hugging Face uri",
-            artifact.artifact_id,
-            source_policy.policy
-        );
-    }
-    Ok(())
-}
-
-fn recipe_artifact_uri_is_huggingface(uri: &str) -> bool {
-    recipe_artifact_url_host(uri).is_some_and(|host| {
-        host == "huggingface.co"
-            || host.ends_with(".huggingface.co")
-            || host == "hf.co"
-            || host.ends_with(".hf.co")
-    })
-}
-
-fn recipe_artifact_url_host(uri: &str) -> Option<String> {
-    let rest = uri
-        .strip_prefix("https://")
-        .or_else(|| uri.strip_prefix("http://"))?;
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    let host = authority
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']').map(|(host, _)| host))
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default())
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
-}
-
-fn validate_model_recipe_engine_record(
-    engine_recipe: &ModelRecipeEngineRecord,
-    canonical_model_id: &str,
-) -> Result<()> {
-    require_nonempty(&engine_recipe.engine, "engine recipe engine")?;
-    for flag in &engine_recipe.required_flags {
-        require_nonempty(flag, "engine required flag")?;
-    }
-    for (key, value) in &engine_recipe.parser_settings {
-        require_nonempty(key, "engine parser setting key")?;
-        require_nonempty(value, "engine parser setting value")?;
-    }
-    if let Some(endpoint) = engine_recipe.preferred_endpoint.as_ref() {
-        require_nonempty(&endpoint.endpoint_mode, "engine preferred endpoint mode")?;
-        for (key, value) in &endpoint.settings {
-            require_nonempty(key, "engine endpoint setting key")?;
-            require_nonempty(value, "engine endpoint setting value")?;
-        }
-    }
-    for item in &engine_recipe.unsupported_combinations {
-        require_nonempty(&item.combination, "engine unsupported combination")?;
-        require_nonempty(&item.reason, "engine unsupported combination reason")?;
-    }
-    for note in &engine_recipe.notes {
-        require_nonempty(note, "engine recipe note")?;
-    }
-    if let Some(model_id_override) = engine_recipe.model_id_override.as_deref() {
-        require_nonempty(model_id_override, "engine model id override")?;
-    }
-    if engine_recipe.required_flags.is_empty()
-        && engine_recipe.parser_settings.is_empty()
-        && engine_recipe.preferred_endpoint.is_none()
-        && engine_recipe.unsupported_combinations.is_empty()
-        && engine_recipe.notes.is_empty()
-        && engine_recipe.model_id_override.is_none()
-    {
-        bail!(
-            "engine recipe for `{}` on `{canonical_model_id}` must not be empty",
-            engine_recipe.engine
-        );
-    }
-    Ok(())
-}
-
-pub fn builtin_model_recipes() -> Vec<ModelRecipeRecord> {
-    builtin_model_catalog_document().recipes.clone()
-}
-
-/// The curated fallback catalog shipped inside the binary. It is authored as JSON
-/// (`model_catalog.json`) using the same schema as an external signed recipe
-/// index, so the offline default and hosted indexes share one format. Parsed once
-/// and cached; a malformed catalog is a test-time bug guarded by a unit test.
-fn builtin_model_catalog_document() -> &'static ModelRecipeIndexDocument {
-    static CATALOG: std::sync::OnceLock<ModelRecipeIndexDocument> = std::sync::OnceLock::new();
-    CATALOG.get_or_init(|| {
-        let document =
-            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
-                .expect("built-in model catalog JSON must parse");
-        document
-            .validate()
-            .expect("built-in model catalog must satisfy the recipe index schema");
-        document
-    })
-}
-
-pub fn resolve_builtin_model_recipe(model_ref: &str) -> Option<ModelRecipeRecord> {
-    builtin_model_recipes()
-        .into_iter()
-        .find(|recipe| recipe.matches_ref(model_ref))
-}
-
-/// Returns the ordered platform definitions from the registry.
-pub fn model_catalog_platforms(registry: &ModelRecipeRegistry) -> Vec<ModelCatalogPlatform> {
-    registry.platforms.clone()
-}
-
-/// The label of the hardware platform a recipe targets, derived from its first
-/// preferred engine matched against the catalog's platform definitions.
-pub fn model_recipe_target_platform_label(
-    recipe: &ModelRecipeRecord,
-    platforms: &[ModelCatalogPlatform],
-) -> String {
-    let engine = recipe
-        .preferred_engines
-        .first()
-        .map(|e| e.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    platforms
-        .iter()
-        .find(|p| p.engines.iter().any(|e| e.eq_ignore_ascii_case(&engine)))
-        .map_or_else(|| engine.clone(), |p| p.label.clone())
-}
-
-/// Whether the given normalized TheRock family matches a platform's gfx targets.
-pub fn platform_matches_gfx_family(platform: &ModelCatalogPlatform, gfx_family: &str) -> bool {
-    platform
-        .gfx_families
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(gfx_family))
-}
-
-/// Whether a recipe appears in the curated `rocm model` short list.
-///
-/// Driven by the `featured` field in the catalog JSON. Hidden recipes stay fully
-/// resolvable for `rocm serve` and the crate's smoke tests; only the user-facing
-/// `rocm model` list omits them.
-pub const fn model_recipe_featured(recipe: &ModelRecipeRecord) -> bool {
-    recipe.featured
-}
-
-pub fn normalize_model_ref(model_ref: &str) -> String {
-    model_ref.trim().to_ascii_lowercase()
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -4329,10 +1596,20 @@ impl ManagedServiceRecord {
         {
             endpoint_url.clone_into(&mut self.endpoint_url);
         }
-        if let Some(runtime_id) = state
-            .get("runtime_id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
+        // `requested_runtime_id` is the selector the launch asked for: an exact
+        // runtime key or a family id, whichever was requested. `runtime_id` is
+        // only what the engine resolved that to, which for a TheRock runtime is
+        // the manifest's family id (`therock-release:gfx120X-all`), shared by
+        // every installed version of that family. When the launch pinned an
+        // exact key, adopting the resolved form would throw away the version
+        // the service is really on, and the record is what a restart re-pins
+        // and what runtime activation compares against. Prefer the requested
+        // value, falling back to the resolved one for engines that record only
+        // that. A blank value in either field is ignored.
+        if let Some(runtime_id) = ["requested_runtime_id", "runtime_id"]
+            .into_iter()
+            .filter_map(|key| state.get(key).and_then(serde_json::Value::as_str))
+            .find(|value| !value.trim().is_empty())
         {
             self.runtime_id = Some(runtime_id.to_owned());
         }
@@ -4877,7 +2154,7 @@ pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{temp_app_paths, workspace_test_artifact_dir};
+    use crate::test_support::{probe_test_record, temp_app_paths};
 
     use std::fs;
     use std::path::Path;
@@ -5192,83 +2469,18 @@ mod tests {
     }
 
     #[test]
-    fn file_lock_creates_missing_parent_dirs_and_lock_file() {
-        let dir =
-            std::env::temp_dir().join(format!("rocm-core-filelock-create-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let lock_path = dir.join("nested").join("child").join("guard.lock");
-        assert!(!lock_path.exists(), "precondition: lock file absent");
-
-        let guard = FileLock::acquire(&lock_path).expect("acquire creates parents");
-        assert!(lock_path.is_file(), "lock file is created on acquire");
-        assert_eq!(guard.path(), lock_path.as_path());
-        drop(guard);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_lock_serializes_concurrent_holders() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let dir =
-            std::env::temp_dir().join(format!("rocm-core-filelock-excl-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let lock_path = dir.join("guard.lock");
-
-        // First holder takes the lock and keeps it until we explicitly release it.
-        let held = FileLock::acquire(&lock_path).expect("first acquire");
-
-        let (started_tx, started_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        let thread_path = lock_path;
-        let handle = std::thread::spawn(move || {
-            started_tx.send(()).expect("signal about-to-acquire");
-            // Blocks until the main thread drops `held`.
-            let _guard = FileLock::acquire(&thread_path).expect("second acquire");
-            acquired_tx.send(()).expect("signal acquired");
-        });
-
-        // Ensure the contender has reached its acquire call before we assert it
-        // is blocked, so the negative check below is about the lock, not
-        // scheduling latency.
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("contender started");
-        assert!(
-            acquired_rx
-                .recv_timeout(Duration::from_millis(300))
-                .is_err(),
-            "second acquire must block while the first lock is still held"
+    #[cfg(any(target_os = "linux", windows))]
+    fn set_supervisor_records_the_pid_with_its_own_start_time() {
+        let mut record = probe_test_record(1);
+        assert_eq!(record.supervisor_start_ticks, None);
+        record.set_supervisor(std::process::id());
+        assert_eq!(record.supervisor_pid, std::process::id());
+        assert_eq!(
+            record.supervisor_start_ticks,
+            process_start_ticks(std::process::id()),
+            "a supervisor pid without a start time makes uninstall refuse a live, ours service"
         );
-
-        // Releasing the first lock lets the contender proceed promptly.
-        drop(held);
-        acquired_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("second acquire proceeds once the first lock is released");
-        handle.join().expect("contender thread joins");
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_lock_distinct_paths_do_not_contend() {
-        let dir = std::env::temp_dir().join(format!(
-            "rocm-core-filelock-distinct-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-
-        // Two different lock files are independent; holding one must not block the
-        // other in the same process.
-        let a = FileLock::acquire(dir.join("a.lock")).expect("acquire a");
-        let b = FileLock::acquire(dir.join("b.lock")).expect("acquire b");
-        drop(a);
-        drop(b);
-
-        let _ = fs::remove_dir_all(&dir);
+        assert!(record.supervisor_start_ticks.is_some());
     }
 
     #[test]
@@ -5398,1429 +2610,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_models_endpoint_has_model_checks_loaded_model_ids() -> Result<()> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<String> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut request_bytes = Vec::new();
-            let mut buffer = [0_u8; 512];
-            loop {
-                let read = stream.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                request_bytes.extend_from_slice(&buffer[..read]);
-                if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request_bytes).into_owned();
-            let body = r#"{"data":[{"id":"Qwen3-0.6B-GGUF"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(request)
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        assert!(openai_models_endpoint_has_model(
-            &endpoint,
-            Some("qwen"),
-            None,
-            Duration::from_secs(2)
-        )?);
-
-        let request = server.join().expect("server thread should not panic")?;
-        assert!(request.starts_with("GET /v1/models HTTP/1.1"));
-        Ok(())
-    }
-
-    #[test]
-    fn openai_models_endpoint_sends_bearer_when_key_present() -> Result<()> {
-        // A protected endpoint: 200 with the model list only when the request
-        // carries `Authorization: Bearer test-key`, otherwise 401. Serves two
-        // connections — the no-key probe, then the with-key probe.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut request_bytes = Vec::new();
-                let mut buffer = [0_u8; 512];
-                loop {
-                    let read = stream.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    request_bytes.extend_from_slice(&buffer[..read]);
-                    if String::from_utf8_lossy(&request_bytes).contains("\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                if request.contains("Authorization: Bearer test-key") {
-                    let body = r#"{"data":[{"id":"qwen"}]}"#;
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    )?;
-                } else {
-                    write!(
-                        stream,
-                        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    )?;
-                }
-            }
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        // Without the key the protected endpoint 401s → treated as not ready.
-        assert!(
-            openai_models_endpoint_has_model(&endpoint, Some("qwen"), None, Duration::from_secs(2))
-                .is_err()
-        );
-        // With the key the bearer header is sent → the model reads as ready.
-        assert!(openai_models_endpoint_has_model(
-            &endpoint,
-            Some("qwen"),
-            Some("test-key"),
-            Duration::from_secs(2)
-        )?);
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    #[test]
-    fn an_empty_model_list_is_not_reported_as_somebody_elses_service() -> Result<()> {
-        // `openai_models_endpoint_has_model` answers `false` both for "these are
-        // someone else's models" and for "this endpoint listed nothing". For a
-        // readiness poll that is fine — not ready either way. For a caller
-        // deciding whether something still holds a port they are opposites: an
-        // engine that is up but has not populated its list yet, or is
-        // mid-unload, lists nothing while holding the port and the GPU, and
-        // reading that as "not ours" removes the tooling out from under it.
-        //
-        // Four connections: an empty list and a stranger's list, asked twice —
-        // once through the enum, once through the bool wrapper. The wrapper is
-        // where the three-way answer collapses back to the readiness contract
-        // every existing caller depends on, and that single comparison is not
-        // pinned by asserting on the enum alone.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            let empty = r#"{"data":[]}"#;
-            let stranger = r#"{"data":[{"id":"someone/else"}]}"#;
-            for body in [empty, stranger, empty, stranger] {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut buffer = [0_u8; 512];
-                let _ = stream.read(&mut buffer)?;
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )?;
-            }
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        assert_eq!(
-            openai_models_endpoint_identity(
-                &endpoint,
-                Some("amd/ours"),
-                None,
-                Duration::from_secs(2)
-            )?,
-            EndpointIdentity::ListsNoModels,
-            "an empty list says nothing about whose service this is"
-        );
-        assert_eq!(
-            openai_models_endpoint_identity(
-                &endpoint,
-                Some("amd/ours"),
-                None,
-                Duration::from_secs(2)
-            )?,
-            EndpointIdentity::ServesOtherModels,
-            "a list that names other models is the only real evidence of a stranger"
-        );
-
-        // Across the wrapper. Only `ServesExpectedModel` may read as ready:
-        // mapping either of the other two arms to `true` would tell every
-        // readiness caller that an endpoint listing nothing, or listing a
-        // stranger's model, is serving theirs.
-        assert!(
-            !openai_models_endpoint_has_model(
-                &endpoint,
-                Some("amd/ours"),
-                None,
-                Duration::from_secs(2)
-            )?,
-            "an endpoint listing nothing is not serving our model"
-        );
-        assert!(
-            !openai_models_endpoint_has_model(
-                &endpoint,
-                Some("amd/ours"),
-                None,
-                Duration::from_secs(2)
-            )?,
-            "an endpoint serving a stranger's model is not serving ours"
-        );
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    #[test]
-    fn a_get_reports_a_refusal_as_an_answer_not_as_a_failure() -> Result<()> {
-        // The distinction `http_get_text_with_auth` cannot make. Its `Err` means
-        // "no 200", which lumps a 401 from a live server together with a dead
-        // port — and a caller deciding whether something still holds a port has
-        // to tell those apart: only the refusal proves the port is held.
-        //
-        // Two connections: the same 401 read both ways.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            for _ in 0..2 {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut buffer = [0_u8; 512];
-                let _ = stream.read(&mut buffer)?;
-                write!(
-                    stream,
-                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )?;
-            }
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        let parts = http_get_with_auth(&endpoint, "/models", None, Duration::from_secs(2))?;
-        assert_eq!(
-            parts.status, 401,
-            "a refusal is an answer, and its status has to survive"
-        );
-        assert!(
-            http_get_text_with_auth(&endpoint, "/models", None, Duration::from_secs(2)).is_err(),
-            "the text helper still collapses every non-200 into an error"
-        );
-
-        server.join().expect("server thread should not panic")?;
-
-        // And an unreachable port is an error either way — the two must not
-        // collapse in the other direction.
-        let dead = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let dead_port = dead.local_addr()?.port();
-        drop(dead);
-        assert!(
-            http_get_with_auth(
-                &format!("http://127.0.0.1:{dead_port}/v1"),
-                "/models",
-                None,
-                Duration::from_millis(500),
-            )
-            .is_err(),
-            "nothing answered, so there is no status to report"
-        );
-        Ok(())
-    }
-
-    // Why readiness is gated on an inference probe (EAI-7333): a server that
-    // lists the model on `/v1/models` but cannot yet serve
-    // `/v1/chat/completions` still reports the model as present. This test pins
-    // that `openai_models_endpoint_has_model` alone is a false positive for
-    // inference-readiness, which is why callers must additionally probe
-    // inference — see `openai_chat_completion_probe` and
-    // `managed_service_endpoint_readiness`.
-    #[test]
-    fn models_endpoint_readiness_does_not_imply_inference_ready() -> Result<()> {
-        // A server that answers `/v1/models` with the model listed, but would
-        // hang/refuse an actual chat request (it only ever serves this one
-        // response, then closes) — mirroring an engine whose model is still
-        // loading while `/v1/models` already responds.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut buffer = [0_u8; 512];
-            let _ = stream.read(&mut buffer)?;
-            let body = r#"{"data":[{"id":"Qwen/Qwen2.5-1.5B-Instruct"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        // The `/v1/models` probe reports the model present — this is the exact
-        // signal the healthcheck uses to declare "ready".
-        let models_ready = openai_models_endpoint_has_model(
-            &endpoint,
-            Some("Qwen/Qwen2.5-1.5B-Instruct"),
-            None,
-            Duration::from_secs(2),
-        )?;
-        assert!(
-            models_ready,
-            "/v1/models lists the model, so the current healthcheck would report ready"
-        );
-
-        // But that says nothing about inference: the server served only the
-        // models response and closed, so a chat request would not succeed.
-        // Readiness based on this signal alone is a false positive (EAI-7333).
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    /// Serve `count` canned HTTP responses on a loopback port, returning the port
-    /// and a handle yielding the requests that were received. Each response is
-    /// `(status_line, body)`; a `None` response accepts the connection and never
-    /// answers, standing in for an engine that hangs.
-    fn spawn_canned_http_server(
-        responses: Vec<Option<(&'static str, &'static str)>>,
-    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
-            let mut requests = Vec::new();
-            for response in responses {
-                let (mut stream, _) = listener.accept()?;
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                let mut request_bytes = Vec::new();
-                let mut buffer = [0_u8; 512];
-                while let Ok(read) = stream.read(&mut buffer) {
-                    if read == 0 {
-                        break;
-                    }
-                    request_bytes.extend_from_slice(&buffer[..read]);
-                    let text = String::from_utf8_lossy(&request_bytes);
-                    // Requests with a body (POST) are complete once the declared
-                    // content length has arrived after the header terminator.
-                    if let Some((headers, body)) = text.split_once("\r\n\r\n") {
-                        let declared = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.strip_prefix("Content-Length: ")?.trim().parse().ok()
-                            })
-                            .unwrap_or(0_usize);
-                        if body.len() >= declared {
-                            break;
-                        }
-                    }
-                }
-                requests.push(String::from_utf8_lossy(&request_bytes).into_owned());
-                let Some((status_line, body)) = response else {
-                    // Hang: hold the connection open without answering until the
-                    // client's read timeout fires, then drop it.
-                    std::thread::sleep(Duration::from_millis(1500));
-                    continue;
-                };
-                write!(
-                    stream,
-                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                )?;
-            }
-            Ok(requests)
-        });
-        Ok((port, handle))
-    }
-
-    /// How a scripted download server answers one request.
-    #[derive(Clone, Copy)]
-    enum DownloadReply {
-        /// The whole body with a matching `Content-Length`.
-        Complete,
-        /// Declare the full length, send only `sent` bytes, then close —
-        /// an interrupted transfer.
-        Truncated {
-            sent: usize,
-        },
-        /// Honour `Range` and serve the remainder as `206`.
-        Resume,
-        /// Answer `206` but from `start` regardless of what `Range` asked for,
-        /// as a non-compliant server or a broken caching proxy might.
-        ResumeAtWrongOffset {
-            start: usize,
-        },
-        /// Ignore `Range` and answer `200` with the whole body, as a server
-        /// without range support does.
-        IgnoreRange,
-        Status(&'static str),
-    }
-
-    impl DownloadReply {
-        fn client_may_disconnect(self) -> bool {
-            matches!(
-                self,
-                Self::ResumeAtWrongOffset { .. } | Self::Truncated { sent: 0 }
-            )
-        }
-    }
-
-    fn allow_expected_peer_disconnect(result: std::io::Result<()>) -> std::io::Result<()> {
-        match result {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                Ok(())
-            }
-            result => result,
-        }
-    }
-
-    /// Serve `body` over loopback, answering each request per `replies`.
-    /// Returns the port and a handle yielding the raw requests received.
-    fn spawn_download_server(
-        body: Vec<u8>,
-        replies: Vec<DownloadReply>,
-    ) -> Result<(u16, std::thread::JoinHandle<Result<Vec<String>>>)> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let handle = std::thread::spawn(move || -> Result<Vec<String>> {
-            let mut requests = Vec::new();
-            for reply in replies {
-                let (mut stream, _) = listener.accept()?;
-                // An accepted socket inherits the listener's mode on Windows,
-                // where a non-blocking read fails with `WSAEWOULDBLOCK` instead
-                // of waiting. Be explicit rather than rely on the platform.
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                let mut request_bytes = Vec::new();
-                let mut buffer = [0_u8; 512];
-                while let Ok(read) = stream.read(&mut buffer) {
-                    if read == 0 {
-                        break;
-                    }
-                    request_bytes.extend_from_slice(&buffer[..read]);
-                    if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&request_bytes).into_owned();
-                let range_start = request
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Range: bytes="))
-                    .and_then(|value| value.trim().split('-').next()?.parse::<usize>().ok())
-                    .unwrap_or(0);
-                requests.push(request);
-                let total = body.len();
-                let client_may_disconnect = reply.client_may_disconnect();
-                match reply {
-                    DownloadReply::Complete | DownloadReply::IgnoreRange => {
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
-                        )?;
-                        stream.write_all(&body)?;
-                    }
-                    DownloadReply::Truncated { sent } => {
-                        write!(
-                            stream,
-                            "HTTP/1.1 200 OK\r\nAccept-Ranges: bytes\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
-                        )?;
-                        stream.write_all(&body[..sent.min(total)])?;
-                    }
-                    DownloadReply::Resume => {
-                        let start = range_start.min(total);
-                        write!(
-                            stream,
-                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            total.saturating_sub(1),
-                            total - start
-                        )?;
-                        stream.write_all(&body[start..])?;
-                    }
-                    DownloadReply::ResumeAtWrongOffset { start } => {
-                        let start = start.min(total);
-                        write!(
-                            stream,
-                            "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            total.saturating_sub(1),
-                            total - start
-                        )?;
-                        allow_expected_peer_disconnect(stream.write_all(&body[start..]))?;
-                    }
-                    DownloadReply::Status(status_line) => {
-                        write!(
-                            stream,
-                            "{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        )?;
-                    }
-                }
-                if client_may_disconnect {
-                    allow_expected_peer_disconnect(stream.flush())?;
-                } else {
-                    stream.flush()?;
-                }
-            }
-            Ok(requests)
-        });
-        Ok((port, handle))
-    }
-
-    /// A body large enough to span many `DOWNLOAD_CHUNK_BYTES` reads, so the
-    /// streaming loop is genuinely exercised rather than fitting in one chunk.
-    fn download_body() -> Vec<u8> {
-        (0..DOWNLOAD_CHUNK_BYTES * 3 + 1234)
-            .map(|index| (index % 251) as u8)
-            .collect()
-    }
-
-    fn download_scratch(tag: &str) -> PathBuf {
-        let dir = workspace_test_artifact_dir().join(format!(
-            "download-{tag}-{}",
-            crate::test_support::unique_suffix()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("failed to create scratch dir");
-        dir
-    }
-
-    #[test]
-    fn download_scratch_gives_each_call_its_own_root_even_for_one_label() {
-        crate::test_support::assert_each_call_gets_its_own_root(|| download_scratch("same-label"));
-    }
-
-    #[test]
-    fn download_fixture_tolerates_only_expected_peer_disconnects() {
-        assert!(DownloadReply::ResumeAtWrongOffset { start: 1 }.client_may_disconnect());
-        assert!(DownloadReply::Truncated { sent: 0 }.client_may_disconnect());
-        assert!(!DownloadReply::Truncated { sent: 1 }.client_may_disconnect());
-        assert!(!DownloadReply::Complete.client_may_disconnect());
-
-        for kind in [
-            std::io::ErrorKind::BrokenPipe,
-            std::io::ErrorKind::ConnectionReset,
-        ] {
-            allow_expected_peer_disconnect(Err(std::io::Error::from(kind)))
-                .expect("an intentionally rejected response may close its socket");
-        }
-
-        let error =
-            allow_expected_peer_disconnect(Err(std::io::Error::from(std::io::ErrorKind::TimedOut)))
-                .expect_err("unrelated fixture I/O failures must remain visible");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn download_streams_a_large_body_and_reports_its_digest() -> Result<()> {
-        let body = download_body();
-        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
-        let dir = download_scratch("complete");
-        let destination = dir.join("artifact.bin");
-
-        let outcome = download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(10),
-        ))?;
-
-        let written = fs::read(&destination)?;
-        let expected_digest = format!("{:x}", Sha256::digest(&body));
-        server.join().expect("server thread")?;
-        let leftovers: Vec<_> = fs::read_dir(&dir)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .filter(|name| name.to_string_lossy().contains(".part"))
-            .collect();
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(written, body, "the saved file must match the served bytes");
-        assert_eq!(outcome.bytes_written, body.len() as u64);
-        assert_eq!(outcome.sha256, expected_digest);
-        assert!(leftovers.is_empty(), "the .part file must not survive");
-        Ok(())
-    }
-
-    #[test]
-    fn download_with_progress_reports_cumulative_bytes_across_chunks() -> Result<()> {
-        let body = download_body();
-        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
-        let dir = download_scratch("progress");
-        let destination = dir.join("artifact.bin");
-
-        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
-        let outcome = download_file_streaming_with_progress(
-            &DownloadRequest::new(
-                &format!("http://127.0.0.1:{port}/artifact.bin"),
-                &destination,
-                Duration::from_secs(10),
-            ),
-            &mut |written, total| calls.push((written, total)),
-        )?;
-
-        server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        let total = Some(body.len() as u64);
-        assert_eq!(
-            calls.first(),
-            Some(&(0, total)),
-            "the first call must fire before any bytes are read, already knowing the total: {calls:?}"
-        );
-        assert_eq!(
-            calls.last(),
-            Some(&(body.len() as u64, total)),
-            "the last call must report the complete byte count: {calls:?}"
-        );
-        assert!(
-            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "cumulative bytes must never go backwards: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .all(|&(_, reported_total)| reported_total == total),
-            "the total must stay constant across an attempt: {calls:?}"
-        );
-        assert_eq!(outcome.bytes_written, body.len() as u64);
-        Ok(())
-    }
-
-    #[test]
-    // This guards the resume path re-seeding `written` from the partial file
-    // already on disk (see `written = std::io::copy(...)` above), not the
-    // high-water-mark clamp itself — it would pass unchanged with the clamp
-    // removed entirely. `download_with_progress_stays_monotonic_after_a_discarded_restart`
-    // below is the one that actually exercises the clamp.
-    fn download_with_progress_reports_the_resumed_offset_before_reading_more() -> Result<()> {
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body.clone(),
-            vec![
-                DownloadReply::Truncated { sent: 5000 },
-                DownloadReply::Resume,
-            ],
-        )?;
-        let dir = download_scratch("progress-resume");
-        let destination = dir.join("artifact.bin");
-
-        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
-        let outcome = download_file_streaming_with_progress(
-            &DownloadRequest::new(
-                &format!("http://127.0.0.1:{port}/artifact.bin"),
-                &destination,
-                Duration::from_secs(10),
-            ),
-            &mut |written, total| calls.push((written, total)),
-        )?;
-
-        server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        let total = Some(body.len() as u64);
-        assert!(
-            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "byte counts must never regress across a retried attempt, e.g. reset to 0: {calls:?}"
-        );
-        assert!(
-            calls.iter().any(|&(written, _)| written == 5000),
-            "the resumed attempt must report the byte count already on disk before reading more: {calls:?}"
-        );
-        assert!(
-            calls
-                .iter()
-                .all(|&(_, reported_total)| reported_total == total),
-            "the total size must stay stable across the retry: {calls:?}"
-        );
-        assert_eq!(
-            calls.last(),
-            Some(&(body.len() as u64, total)),
-            "the last call must report the complete byte count: {calls:?}"
-        );
-        assert_eq!(outcome.bytes_written, body.len() as u64);
-        Ok(())
-    }
-
-    #[test]
-    fn download_with_progress_stays_monotonic_after_a_discarded_restart() -> Result<()> {
-        // The second reply resumes at the wrong offset, so its partial file is
-        // discarded and the third attempt restarts from scratch — internally
-        // reporting 0 bytes written again even though the first attempt had
-        // already reached 5000. The caller must never see that drop.
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body.clone(),
-            vec![
-                DownloadReply::Truncated { sent: 5000 },
-                DownloadReply::ResumeAtWrongOffset { start: 8000 },
-                DownloadReply::Complete,
-            ],
-        )?;
-        let dir = download_scratch("progress-wrong-offset");
-        let destination = dir.join("artifact.bin");
-
-        let mut calls: Vec<(u64, Option<u64>)> = Vec::new();
-        let outcome = download_file_streaming_with_progress(
-            &DownloadRequest::new(
-                &format!("http://127.0.0.1:{port}/artifact.bin"),
-                &destination,
-                Duration::from_secs(10),
-            ),
-            &mut |written, total| calls.push((written, total)),
-        )?;
-
-        let requests = server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        let total = Some(body.len() as u64);
-        assert_eq!(
-            requests.len(),
-            3,
-            "the wrong-offset reply must be discarded and retried, not accepted"
-        );
-        assert!(
-            calls.windows(2).all(|pair| pair[0].0 <= pair[1].0),
-            "cumulative bytes must never go backwards, even across a discarded \
-             partial file and a from-scratch restart: {calls:?}"
-        );
-        assert!(
-            calls.iter().any(|&(written, _)| written == 5000),
-            "the truncated first attempt's progress must not be lost once the \
-             restart reports 0 internally: {calls:?}"
-        );
-        assert_eq!(
-            calls.last(),
-            Some(&(body.len() as u64, total)),
-            "the last call must report the complete byte count: {calls:?}"
-        );
-        assert_eq!(outcome.bytes_written, body.len() as u64);
-        Ok(())
-    }
-
-    #[test]
-    fn download_interrupted_beyond_recovery_leaves_no_destination_file() -> Result<()> {
-        // Every attempt ends early, so the download never completes and the
-        // user is left with the truncation as the reported reason.
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body,
-            vec![DownloadReply::Truncated { sent: 4096 }; DOWNLOAD_MAX_ATTEMPTS as usize],
-        )?;
-        let dir = download_scratch("interrupted");
-        let destination = dir.join("artifact.bin");
-
-        let error = download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(5),
-        ))
-        .expect_err("a download that never completes must fail");
-
-        let requests = server.join().expect("server thread")?;
-        let entries: Vec<_> = fs::read_dir(&dir)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .collect();
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(
-            requests.len(),
-            DOWNLOAD_MAX_ATTEMPTS as usize,
-            "a truncated transfer is transient, so every attempt should be spent"
-        );
-        assert!(
-            !destination.exists(),
-            "a partial download must never appear at the destination, where a \
-             later run would treat it as a complete cached artifact"
-        );
-        assert!(
-            entries.is_empty(),
-            "the .part file must be cleaned up, found {entries:?}"
-        );
-        assert!(
-            error.to_string().contains("incomplete download"),
-            "the user should be told the transfer was short: {error}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn download_resumes_from_where_the_transfer_stopped() -> Result<()> {
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body.clone(),
-            vec![
-                DownloadReply::Truncated { sent: 5000 },
-                DownloadReply::Resume,
-            ],
-        )?;
-        let dir = download_scratch("resume");
-        let destination = dir.join("artifact.bin");
-
-        let outcome = download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(10),
-        ))?;
-
-        let written = fs::read(&destination)?;
-        let requests = server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(
-            written, body,
-            "a resumed download must reconstruct the artifact exactly"
-        );
-        assert_eq!(
-            outcome.sha256,
-            format!("{:x}", Sha256::digest(&body)),
-            "the digest must cover the resumed prefix too, not just the second attempt"
-        );
-        assert_eq!(requests.len(), 2, "one retry, not a full restart");
-        assert!(
-            requests[1].contains("Range: bytes=5000-"),
-            "the retry must ask to continue from byte 5000: {}",
-            requests[1]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn download_restarts_cleanly_when_resume_lands_at_the_wrong_offset() -> Result<()> {
-        // The second reply answers `206` from byte 8000, not the byte 5000 we
-        // asked to resume from. Accepting that slice's own `Content-Length` as
-        // the whole artifact would silently rename a corrupt file into place;
-        // instead the third attempt must be a plain `GET` that refetches the
-        // whole thing.
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body.clone(),
-            vec![
-                DownloadReply::Truncated { sent: 5000 },
-                DownloadReply::ResumeAtWrongOffset { start: 8000 },
-                DownloadReply::Complete,
-            ],
-        )?;
-        let dir = download_scratch("wrong-offset");
-        let destination = dir.join("artifact.bin");
-
-        let outcome = download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(10),
-        ))?;
-
-        let written = fs::read(&destination)?;
-        let requests = server.join().expect("server thread")?;
-        let leftovers: Vec<_> = fs::read_dir(&dir)?
-            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-            .filter(|name| name.to_string_lossy().contains(".part"))
-            .collect();
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(
-            written, body,
-            "a mismatched-offset resume must not be accepted as a complete artifact"
-        );
-        assert_eq!(
-            outcome.sha256,
-            format!("{:x}", Sha256::digest(&body)),
-            "the digest must cover the whole artifact from the clean restart"
-        );
-        assert_eq!(
-            requests.len(),
-            3,
-            "the wrong-offset reply must be discarded and retried, not accepted"
-        );
-        assert!(
-            !requests[2].contains("Range:"),
-            "the restart after a wrong-offset resume must be a plain GET: {}",
-            requests[2]
-        );
-        assert!(leftovers.is_empty(), "the .part file must not survive");
-        Ok(())
-    }
-
-    #[test]
-    fn download_restarts_cleanly_when_the_server_ignores_range() -> Result<()> {
-        // A server without range support answers 200 with the whole body.
-        // Appending that onto the bytes already written would double the file.
-        let body = download_body();
-        let (port, server) = spawn_download_server(
-            body.clone(),
-            vec![
-                DownloadReply::Truncated { sent: 3000 },
-                DownloadReply::IgnoreRange,
-            ],
-        )?;
-        let dir = download_scratch("ignore-range");
-        let destination = dir.join("artifact.bin");
-
-        download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(10),
-        ))?;
-
-        let written = fs::read(&destination)?;
-        server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        assert_eq!(written, body, "the restart must not append onto the prefix");
-        Ok(())
-    }
-
-    #[test]
-    fn download_rejects_a_digest_mismatch_without_retrying() -> Result<()> {
-        let body = download_body();
-        let (port, server) = spawn_download_server(body, vec![DownloadReply::Complete])?;
-        let dir = download_scratch("digest");
-        let destination = dir.join("artifact.bin");
-        let url = format!("http://127.0.0.1:{port}/artifact.bin");
-        let wrong_digest = "a".repeat(64);
-        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(10));
-        request.expected_sha256 = Some(&wrong_digest);
-
-        let error = download_file_streaming(&request).expect_err("wrong digest must fail");
-
-        let requests = server.join().expect("server thread")?;
-        let leftovers = fs::read_dir(&dir)?.count();
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(error.to_string().contains("SHA-256 mismatch"), "{error}");
-        assert!(!destination.exists());
-        assert_eq!(
-            requests.len(),
-            1,
-            "corrupt bytes are not a transient failure; retrying would re-fetch the same thing"
-        );
-        assert_eq!(leftovers, 0, "the corrupt prefix must be discarded");
-        Ok(())
-    }
-
-    #[test]
-    fn download_does_not_retry_a_client_error() -> Result<()> {
-        let body = download_body();
-        let (port, server) =
-            spawn_download_server(body, vec![DownloadReply::Status("HTTP/1.1 404 Not Found")])?;
-        let dir = download_scratch("not-found");
-        let destination = dir.join("artifact.bin");
-
-        let error = download_file_streaming(&DownloadRequest::new(
-            &format!("http://127.0.0.1:{port}/artifact.bin"),
-            &destination,
-            Duration::from_secs(5),
-        ))
-        .expect_err("404 must fail");
-
-        let requests = server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(error.to_string().contains("404"), "{error}");
-        assert_eq!(requests.len(), 1, "a 404 will not become a 200 on retry");
-        Ok(())
-    }
-
-    #[test]
-    fn download_refuses_a_body_over_the_approved_limit() -> Result<()> {
-        let body = download_body();
-        let total = body.len() as u64;
-        let (port, server) =
-            spawn_download_server(body, vec![DownloadReply::Truncated { sent: 0 }])?;
-        let dir = download_scratch("max-bytes");
-        let destination = dir.join("artifact.bin");
-        let url = format!("http://127.0.0.1:{port}/artifact.bin");
-        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(5));
-        request.max_bytes = Some(total - 1);
-
-        let error = download_file_streaming(&request).expect_err("over-limit must fail");
-
-        server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(error.to_string().contains("approved limit"), "{error}");
-        assert!(!destination.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn download_enforces_a_caller_declared_size_the_server_agrees_with() -> Result<()> {
-        // The server sends a complete, self-consistent body — it just is not
-        // the artifact the manifest described. A digest would catch this too,
-        // but the size contract is independent and must hold on its own.
-        let body = download_body();
-        let (port, server) = spawn_download_server(body.clone(), vec![DownloadReply::Complete])?;
-        let dir = download_scratch("expected-len");
-        let destination = dir.join("artifact.bin");
-        let url = format!("http://127.0.0.1:{port}/artifact.bin");
-        let mut request = DownloadRequest::new(&url, &destination, Duration::from_secs(10));
-        request.expected_len = Some(body.len() as u64 + 1);
-
-        let error = download_file_streaming(&request).expect_err("wrong size must fail");
-
-        let requests = server.join().expect("server thread")?;
-        fs::remove_dir_all(&dir).ok();
-
-        assert!(error.to_string().contains("were expected"), "{error}");
-        assert!(!destination.exists());
-        assert_eq!(
-            requests.len(),
-            1,
-            "a manifest disagreement will not resolve itself on retry"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn download_backoff_grows_then_settles_at_its_ceiling() {
-        let mut backoff = Backoff::new(Duration::from_millis(100), Duration::from_millis(800), 2);
-        let delays: Vec<u128> = (0..5).map(|_| backoff.next_delay().as_millis()).collect();
-        assert_eq!(delays, vec![100, 200, 400, 800, 800]);
-    }
-
-    const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
-    const MODELS_OK_BODY: &str = r#"{"data":[{"id":"Qwen/Qwen3-0.6B"}]}"#;
-
-    #[test]
-    fn chat_completion_probe_passes_when_the_endpoint_answers() -> Result<()> {
-        let (port, server) =
-            spawn_canned_http_server(vec![Some(("HTTP/1.1 200 OK", CHAT_OK_BODY))])?;
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        assert!(openai_chat_completion_probe(
-            &endpoint,
-            "Qwen/Qwen3-0.6B",
-            None,
-            Duration::from_secs(2)
-        )?);
-
-        let requests = server.join().expect("server thread should not panic")?;
-        let request = requests.first().expect("the probe sends one request");
-        assert!(
-            request.starts_with("POST /v1/chat/completions HTTP/1.1"),
-            "probe must exercise the inference path, got: {request}"
-        );
-        assert!(
-            request.contains("\"model\":\"Qwen/Qwen3-0.6B\"") && request.contains("\"max_tokens\""),
-            "probe asks the served model for a token-capped completion, got: {request}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn chat_completion_probe_separates_a_refusal_from_a_warmup_failure() -> Result<()> {
-        // A refusal proves the inference path is up and the model is resident:
-        // the request was understood and rejected on its merits. A 5xx is what an
-        // engine returns while it is still warming up, which is not ready.
-        let (port, server) = spawn_canned_http_server(vec![
-            Some(("HTTP/1.1 400 Bad Request", r#"{"error":"unsupported"}"#)),
-            Some((
-                "HTTP/1.1 503 Service Unavailable",
-                r#"{"error":"loading model"}"#,
-            )),
-        ])?;
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        assert!(openai_chat_completion_probe(
-            &endpoint,
-            "qwen",
-            None,
-            Duration::from_secs(2)
-        )?);
-        assert!(!openai_chat_completion_probe(
-            &endpoint,
-            "qwen",
-            None,
-            Duration::from_secs(2)
-        )?);
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    #[test]
-    fn chat_completion_probe_accepts_a_response_from_a_server_that_holds_the_socket() -> Result<()>
-    {
-        // `Connection: close` is a request, not a guarantee — a server or an
-        // intervening proxy may answer in full and keep the socket open. Reading
-        // to EOF would stall until the timeout and throw the answer away, leaving
-        // a perfectly healthy service stuck reporting "not ready".
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            let body = CHAT_OK_BODY;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            stream.flush()?;
-            // Hold the connection open past the probe's timeout.
-            std::thread::sleep(Duration::from_secs(3));
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        let started = Instant::now();
-        assert!(
-            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_secs(2))?,
-            "a complete response counts even when the peer keeps the socket open"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the framed response is complete, so the probe must not wait for EOF"
-        );
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    #[test]
-    fn http_read_is_bounded_across_reads_not_just_per_read() -> Result<()> {
-        // A socket read timeout bounds each `read`, not the sequence of them. A
-        // server that dribbles bytes forever, each within the per-read timeout,
-        // must still hit the caller's overall budget.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            // Never declares a length and never finishes: one byte at a time,
-            // comfortably inside any per-read timeout.
-            for _ in 0..200 {
-                if stream.write_all(b"x").is_err() || stream.flush().is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Ok(())
-        });
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        let started = Instant::now();
-        assert!(
-            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(500))
-                .is_err(),
-            "a response that never completes is not a passing probe"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "the call must honor its own budget, not a multiple of it: took {:?}",
-            started.elapsed()
-        );
-
-        let _ = server.join();
-        Ok(())
-    }
-
-    #[test]
-    fn http_response_is_complete_does_not_miscount_a_split_multibyte_char() {
-        // A body ending in a multi-byte UTF-8 character can arrive one byte
-        // short of the declared Content-Length. Lossy-decoding the whole
-        // buffer to check completeness turns that dangling partial sequence
-        // into a 3-byte U+FFFD replacement, inflating the decoded length past
-        // the declared one and reporting completeness a read early.
-        let body = "hi \u{2603}"; // snowman is a 3-byte UTF-8 character
-        let full = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_bytes();
-        let truncated = &full[..full.len() - 1];
-
-        assert!(!http_response_is_complete(truncated));
-        assert!(http_response_is_complete(&full));
-    }
-
-    /// A signal arriving mid-response must not fail the request.
-    ///
-    /// A signal delivered while the client is parked in `read` aborts it with
-    /// `EINTR`. `SA_RESTART` does not save us: Linux never restarts a socket read
-    /// that has a receive timeout set, and this client sets one on every pass.
-    /// Any handler in the process is enough to trigger it — `crossterm`'s
-    /// `SIGWINCH` hook is linked into the CLI — so treating `EINTR` as a
-    /// transport error turned an unrelated signal into a spurious "endpoint
-    /// unreachable".
-    ///
-    /// Linux-only on purpose. The guarantee being exercised — a receive timeout
-    /// defeats `SA_RESTART` — is documented for Linux; BSD-derived kernels may
-    /// restart the read instead, which would leave this passing without ever
-    /// reaching the retry. CI has no macOS runner to tell the difference.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn http_read_survives_a_signal_arriving_mid_response() -> Result<()> {
-        extern "C" fn noop_handler(_signal: libc::c_int) {}
-
-        let body = r#"{"data":[{"id":"qwen"}]}"#;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let port = listener.local_addr()?.port();
-        let server = std::thread::spawn(move || -> Result<()> {
-            let (mut stream, _) = listener.accept()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-            let mut buffer = [0_u8; 1024];
-            let _ = stream.read(&mut buffer);
-            // Answer late, so the client is blocked in `read` while the signals
-            // land rather than racing them.
-            std::thread::sleep(Duration::from_millis(400));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            )?;
-            stream.flush()?;
-            Ok(())
-        });
-
-        // Install the handler with SA_RESTART set, to show that the flag is not
-        // what protects this read.
-        //
-        // The handler is left installed rather than restored: the default
-        // disposition for SIGUSR1 is to kill the process, so putting it back
-        // would let a signal still in flight take the whole test binary down.
-        // Leaving a no-op handler is inert — nothing else here raises SIGUSR1,
-        // and the signals below are aimed at this thread alone, so no other
-        // test sharing this process can observe either one.
-        #[allow(unsafe_code)] // libc FFI
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = noop_handler as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&raw mut action.sa_mask);
-            assert_eq!(
-                libc::sigaction(libc::SIGUSR1, &raw const action, std::ptr::null_mut()),
-                0,
-                "failed to install the SIGUSR1 handler"
-            );
-        }
-
-        // Target this thread specifically: a process-directed signal could land
-        // on any thread and disturb an unrelated test sharing this process.
-        #[allow(unsafe_code)] // libc FFI
-        let reader = unsafe { libc::pthread_self() };
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let signaller = {
-            let stop = std::sync::Arc::clone(&stop);
-            std::thread::spawn(move || {
-                // Let the connect and the request write finish first; only the
-                // response read is under test.
-                std::thread::sleep(Duration::from_millis(50));
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    #[allow(unsafe_code)] // libc FFI
-                    unsafe {
-                        libc::pthread_kill(reader, libc::SIGUSR1);
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            })
-        };
-
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-        let response =
-            http_get_text_with_auth(&endpoint, "/v1/models", None, Duration::from_secs(5));
-
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        signaller.join().expect("signaller thread should not panic");
-        server.join().expect("server thread should not panic")?;
-
-        assert_eq!(
-            response?, body,
-            "an interrupted read is retryable, not a failed request"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn chat_completion_probe_fails_on_a_hung_endpoint() -> Result<()> {
-        // The reported symptom: the endpoint accepts the connection and never
-        // answers. The probe must give up within its timeout, not wait forever.
-        let (port, server) = spawn_canned_http_server(vec![None])?;
-        let endpoint = format!("http://127.0.0.1:{port}/v1");
-
-        let started = Instant::now();
-        assert!(
-            openai_chat_completion_probe(&endpoint, "qwen", None, Duration::from_millis(300))
-                .is_err(),
-            "a hung endpoint is not inference-ready"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the probe must be bounded by its timeout"
-        );
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    fn probe_test_record(port: u16) -> ManagedServiceRecord {
-        let root = PathBuf::from("/tmp/rocm-inference-probe-test");
-        let paths = AppPaths {
-            config_dir: root.join("config"),
-            data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
-        };
-        ManagedServiceRecord::new(
-            &paths,
-            "svc-probe",
-            "vllm",
-            "Qwen/Qwen3-0.6B",
-            "Qwen/Qwen3-0.6B",
-            "127.0.0.1",
-            port,
-            "serve",
-            4242,
-            None,
-            None,
-            None,
-        )
-    }
-
-    #[test]
-    #[cfg(any(target_os = "linux", windows))]
-    fn set_supervisor_records_the_pid_with_its_own_start_time() {
-        let mut record = probe_test_record(1);
-        assert_eq!(record.supervisor_start_ticks, None);
-        record.set_supervisor(std::process::id());
-        assert_eq!(record.supervisor_pid, std::process::id());
-        assert_eq!(
-            record.supervisor_start_ticks,
-            process_start_ticks(std::process::id()),
-            "a supervisor pid without a start time makes uninstall refuse a live, ours service"
-        );
-        assert!(record.supervisor_start_ticks.is_some());
-    }
-
-    #[test]
-    fn inference_readiness_latches_after_the_first_successful_probe() -> Result<()> {
-        // First check: list the model, then probe inference. Second check: the
-        // verdict is latched, so only the cheap listing is re-issued — repeated
-        // `services list` polls must not queue generation work behind real
-        // traffic.
-        let (port, server) = spawn_canned_http_server(vec![
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-        ])?;
-        let mut record = probe_test_record(port);
-
-        assert_eq!(
-            managed_service_endpoint_readiness(
-                &mut record,
-                None,
-                Duration::from_secs(2),
-                Duration::from_secs(2)
-            )
-            .readiness,
-            EndpointReadiness::Serving
-        );
-        assert!(
-            record.inference_verified_at_unix_ms.is_some(),
-            "a passing probe is recorded so later checks can skip it"
-        );
-
-        assert_eq!(
-            managed_service_endpoint_readiness(
-                &mut record,
-                None,
-                Duration::from_secs(2),
-                Duration::from_secs(2)
-            )
-            .readiness,
-            EndpointReadiness::Serving
-        );
-
-        let requests = server.join().expect("server thread should not panic")?;
-        let paths: Vec<&str> = requests
-            .iter()
-            .filter_map(|request| request.lines().next())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "GET /v1/models HTTP/1.1",
-                "POST /v1/chat/completions HTTP/1.1",
-                "GET /v1/models HTTP/1.1",
-            ],
-            "the second readiness check must not re-probe inference"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_warming_service_is_not_re_probed_on_every_poll() -> Result<()> {
-        // Only a successful probe latches, so a model that is listed but still
-        // loading would otherwise be re-probed by every poll — and each attempt
-        // costs the full probe timeout, paid by `services list` and the dash in
-        // front of a user. The second check must cost a listing and nothing more.
-        let (port, server) = spawn_canned_http_server(vec![
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-            Some((
-                "HTTP/1.1 503 Service Unavailable",
-                r#"{"error":"loading model"}"#,
-            )),
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-        ])?;
-        let mut record = probe_test_record(port);
-
-        let first = managed_service_endpoint_readiness(
-            &mut record,
-            None,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        );
-        assert_eq!(first.readiness, EndpointReadiness::Listing);
-        assert!(
-            first.record_changed && record.inference_probe_attempted_at_unix_ms.is_some(),
-            "the attempt must be recorded, and persisted by the caller — each CLI \
-             run is a fresh process, so an unwritten attempt throttles nothing"
-        );
-
-        let second = managed_service_endpoint_readiness(
-            &mut record,
-            None,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        );
-        assert_eq!(second.readiness, EndpointReadiness::Listing);
-        assert!(!second.record_changed);
-
-        let requests = server.join().expect("server thread should not panic")?;
-        let paths: Vec<&str> = requests
-            .iter()
-            .filter_map(|request| request.lines().next())
-            .collect();
-        assert_eq!(
-            paths,
-            vec![
-                "GET /v1/models HTTP/1.1",
-                "POST /v1/chat/completions HTTP/1.1",
-                "GET /v1/models HTTP/1.1",
-            ],
-            "the second check must not re-probe inside the retry interval"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn restarting_drops_the_previous_runs_inference_verification() {
         // The restarted child is a different server with an unloaded model. If the
         // verification carried over, readiness would short-circuit to "ready" the
@@ -6841,68 +2630,6 @@ mod tests {
         );
         assert_eq!(record.restart_count, 3);
         assert!(record.last_restart_unix_ms.is_some());
-    }
-
-    #[test]
-    fn inference_readiness_is_withheld_while_the_model_only_lists() -> Result<()> {
-        // The bug: `/v1/models` answers within seconds while the model loads for
-        // minutes and inference returns nothing. That service is not ready.
-        let (port, server) = spawn_canned_http_server(vec![
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-            Some((
-                "HTTP/1.1 503 Service Unavailable",
-                r#"{"error":"loading model"}"#,
-            )),
-        ])?;
-        let mut record = probe_test_record(port);
-
-        assert_eq!(
-            managed_service_endpoint_readiness(
-                &mut record,
-                None,
-                Duration::from_secs(2),
-                Duration::from_secs(2)
-            )
-            .readiness,
-            EndpointReadiness::Listing,
-            "a listed-but-unservable model is coming up, not dead"
-        );
-        assert!(
-            record.inference_verified_at_unix_ms.is_none(),
-            "nothing is latched until inference actually succeeds"
-        );
-
-        server.join().expect("server thread should not panic")?;
-        Ok(())
-    }
-
-    #[test]
-    fn inference_probe_sends_the_service_key_to_a_protected_endpoint() -> Result<()> {
-        let (port, server) = spawn_canned_http_server(vec![
-            Some(("HTTP/1.1 200 OK", MODELS_OK_BODY)),
-            Some(("HTTP/1.1 200 OK", CHAT_OK_BODY)),
-        ])?;
-        let mut record = probe_test_record(port);
-
-        assert_eq!(
-            managed_service_endpoint_readiness(
-                &mut record,
-                Some("test-key"),
-                Duration::from_secs(2),
-                Duration::from_secs(2)
-            )
-            .readiness,
-            EndpointReadiness::Serving
-        );
-
-        let requests = server.join().expect("server thread should not panic")?;
-        assert!(
-            requests
-                .iter()
-                .all(|request| request.contains("Authorization: Bearer test-key")),
-            "a protected service must not read as unready for want of its own key"
-        );
-        Ok(())
     }
 
     #[test]
@@ -6966,19 +2693,6 @@ mod tests {
 
         assert_eq!(resolved, Some(new_amd_smi.into_os_string()));
         Ok(())
-    }
-
-    #[test]
-    fn audit_events_path_lives_under_data_audit() {
-        let (_root, paths) = temp_app_paths("audit-path");
-        assert_eq!(
-            paths.audit_events_path(),
-            paths.data_dir.join("audit").join("events.jsonl")
-        );
-        assert_eq!(
-            paths.automation_proposals_path(),
-            paths.data_dir.join("automations").join("proposals.jsonl")
-        );
     }
 
     #[test]
@@ -7124,717 +2838,6 @@ mod tests {
     }
 
     #[test]
-    fn builtin_model_catalog_json_parses_and_validates() {
-        // Guards the embedded catalog: malformed JSON, a bad device policy, or a
-        // duplicate alias/canonical id would fail the shared index schema here
-        // instead of panicking at runtime.
-        let document =
-            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
-                .expect("catalog JSON parses");
-        document
-            .validate()
-            .expect("catalog satisfies the index schema");
-        assert!(
-            document.recipes.len() >= 10,
-            "curated catalog is non-trivial"
-        );
-        // The default Lemonade assistant must remain resolvable from the catalog.
-        assert!(
-            document
-                .recipes
-                .iter()
-                .any(|recipe| recipe.canonical_model_id == "Qwen3-4B-Instruct-2507-GGUF"),
-            "built-in assistant recipe present"
-        );
-    }
-
-    #[test]
-    fn builtin_catalog_authors_vllm_tool_call_parsers() {
-        // vLLM does not auto-detect a tool-call parser; the correct value is sourced
-        // from explicit per-model recipe metadata (never guessed at runtime). This
-        // guards the authored parser for well-known chat families so a regression is
-        // caught here rather than as an HTTP 400 in the TUI chat tab.
-        let document =
-            serde_json::from_str::<ModelRecipeIndexDocument>(include_str!("model_catalog.json"))
-                .expect("catalog JSON parses");
-        let tool_call_parser = |model_id: &str| -> Option<String> {
-            document
-                .recipes
-                .iter()
-                .find(|recipe| recipe.canonical_model_id == model_id)?
-                .engine_recipes
-                .iter()
-                .find(|engine_recipe| engine_recipe.engine == "vllm")
-                .and_then(|engine_recipe| {
-                    let flags = &engine_recipe.required_flags;
-                    assert!(
-                        flags.iter().any(|flag| flag == "--enable-auto-tool-choice"),
-                        "{model_id}: --tool-call-parser must be paired with --enable-auto-tool-choice"
-                    );
-                    let index = flags.iter().position(|flag| flag == "--tool-call-parser")?;
-                    flags.get(index + 1).cloned()
-                })
-        };
-        // Reported repro: a lemonade-preferred Qwen forced onto vLLM must still
-        // carry the Qwen-family parser.
-        assert_eq!(
-            tool_call_parser("Qwen/Qwen2.5-1.5B-Instruct").as_deref(),
-            Some("hermes")
-        );
-        assert_eq!(
-            tool_call_parser("Qwen/Qwen3-32B-FP8").as_deref(),
-            Some("hermes")
-        );
-        assert_eq!(
-            tool_call_parser("meta-llama/Llama-3.2-3B-Instruct").as_deref(),
-            Some("llama3_json")
-        );
-    }
-
-    #[test]
-    fn model_recipe_target_platform_groups_by_engine() {
-        let registry = builtin_model_recipe_registry();
-        let platforms = model_catalog_platforms(&registry);
-        // The (hidden) built-in assistant is a Lemonade recipe → Ryzen AI (Strix Halo).
-        let strix = resolve_builtin_model_recipe("qwen").expect("qwen assistant");
-        assert_eq!(
-            model_recipe_target_platform_label(&strix, &platforms),
-            "AMD Ryzen AI — Strix Halo (Lemonade / llama.cpp)"
-        );
-        let mi300x = resolve_builtin_model_recipe("qwen3.6-27b").expect("qwen3.6-27b");
-        assert_eq!(
-            model_recipe_target_platform_label(&mi300x, &platforms),
-            "AMD Instinct — MI300X, MI350X, MI355X (vLLM)"
-        );
-        // vLLM recipes land on the Instinct platform.
-        let llama = resolve_builtin_model_recipe("llama-3.2-3b-instruct").expect("llama");
-        assert_eq!(
-            model_recipe_target_platform_label(&llama, &platforms),
-            "AMD Instinct — MI300X, MI350X, MI355X (vLLM)"
-        );
-    }
-
-    #[test]
-    fn featured_catalog_is_curated_but_hidden_stay_resolvable() {
-        // Current popular models are featured in the curated list — GGUF for
-        // Strix Halo (served by their owner/repo:variant id) and BF16 for MI300X.
-        for alias in ["qwen3.6", "gemma-4", "qwen3.6-27b", "gemma-4-31b"] {
-            let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
-            assert!(model_recipe_featured(&recipe), "{alias} should be featured");
-        }
-        // The Strix Halo entries carry an explicit GGUF quant variant so they are
-        // directly servable via Lemonade.
-        assert_eq!(
-            resolve_builtin_model_recipe("qwen3.6")
-                .unwrap()
-                .canonical_model_id,
-            "unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M"
-        );
-        // ...while the default assistant, smoke paths, and superseded models stay
-        // resolvable for `rocm serve` but are hidden from the curated list.
-        for alias in ["qwen", "tiny-gpt2", "qwen3.5", "glm-5"] {
-            let recipe = resolve_builtin_model_recipe(alias).unwrap_or_else(|| panic!("{alias}"));
-            assert!(!model_recipe_featured(&recipe), "{alias} should be hidden");
-        }
-    }
-
-    #[test]
-    fn builtin_recipe_resolves_alias_and_canonical_model() {
-        let qwen = resolve_builtin_model_recipe("qwen").expect("qwen alias should resolve");
-        assert_eq!(qwen.canonical_model_id, "Qwen3-4B-Instruct-2507-GGUF");
-        assert_eq!(qwen.dtype, "gguf");
-        assert_eq!(qwen.device_policy, "gpu_required");
-        assert_eq!(qwen.preferred_engines, vec!["lemonade"]);
-
-        let qwen35 = resolve_builtin_model_recipe("qwen3.5").expect("qwen3.5 alias should resolve");
-        assert_eq!(qwen35.canonical_model_id, "Qwen/Qwen3.5-4B");
-        assert_eq!(qwen35.preferred_engines, vec!["vllm"]);
-        let lemonade_qwen =
-            resolve_builtin_model_recipe("lemonade-qwen").expect("lemonade qwen alias");
-        assert_eq!(
-            lemonade_qwen.canonical_model_id,
-            "Qwen3-4B-Instruct-2507-GGUF"
-        );
-        assert_eq!(lemonade_qwen.preferred_engines, vec!["lemonade"]);
-        assert_eq!(lemonade_qwen.device_policy, "gpu_required");
-        assert!(
-            qwen35
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("qwen3_5"))
-        );
-
-        let tiny = resolve_builtin_model_recipe("sshleifer/tiny-gpt2")
-            .expect("canonical tiny model should resolve");
-        assert_eq!(tiny.canonical_model_id, "sshleifer/tiny-gpt2");
-        assert_eq!(tiny.device_policy, "gpu_required");
-        assert_eq!(tiny.min_gpu_mem_gb, Some(2));
-    }
-
-    #[test]
-    fn builtin_recipe_records_remote_code_policy() {
-        let glm = resolve_builtin_model_recipe("glm-5").expect("glm alias should resolve");
-        assert!(glm.trust_remote_code);
-        assert_eq!(glm.device_policy, "gpu_required");
-        assert!(
-            glm.warnings
-                .iter()
-                .any(|item| item.contains("trust_remote_code"))
-        );
-    }
-
-    #[test]
-    fn model_recipe_index_validates_artifact_metadata() -> Result<()> {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.artifacts[0].uri =
-            "https://huggingface.co/Qwen/Test-1B/resolve/main/model.safetensors".to_owned();
-        recipe.artifacts[0].source_policy = Some(ModelRecipeArtifactSourcePolicyRecord {
-            policy: "huggingface_public".to_owned(),
-            required_hosts: vec!["huggingface.co".to_owned()],
-            notes: vec!["test metadata only".to_owned()],
-        });
-        recipe.engine_recipes.push(ModelRecipeEngineRecord {
-            engine: "vllm".to_owned(),
-            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
-            parser_settings: BTreeMap::from([("reasoning_parser".to_owned(), "qwen3".to_owned())]),
-            preferred_endpoint: Some(ModelRecipeEndpointRecord {
-                endpoint_mode: "openai".to_owned(),
-                settings: BTreeMap::from([("streaming".to_owned(), "true".to_owned())]),
-            }),
-            unsupported_combinations: vec![ModelRecipeUnsupportedCombinationRecord {
-                combination: "native Windows GPU serving".to_owned(),
-                reason: "vLLM ROCm serving is Linux/WSL only".to_owned(),
-            }],
-            notes: vec!["metadata only; adapter protocol does not consume this yet".to_owned()],
-            model_id_override: None,
-        });
-        let index = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        };
-
-        index.validate()?;
-
-        let artifact = &index.recipes[0].artifacts[0];
-        assert_eq!(artifact.kind, "huggingface");
-        let expected_sha = "a".repeat(64);
-        assert_eq!(artifact.sha256.as_deref(), Some(expected_sha.as_str()));
-        assert_eq!(artifact.engines, vec!["vllm"]);
-        assert_eq!(
-            artifact
-                .source_policy
-                .as_ref()
-                .map(|policy| policy.policy.as_str()),
-            Some("huggingface_public")
-        );
-        let settings = index.recipes[0]
-            .engine_recipes
-            .first()
-            .expect("vllm settings should validate");
-        assert_eq!(
-            settings.parser_settings.get("reasoning_parser"),
-            Some(&"qwen3".to_owned())
-        );
-        assert_eq!(
-            settings
-                .preferred_endpoint
-                .as_ref()
-                .map(|endpoint| endpoint.endpoint_mode.as_str()),
-            Some("openai")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn model_recipe_index_rejects_invalid_artifact_source_policy() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.artifacts[0].uri =
-            "https://example.invalid/Qwen/Test-1B/model.safetensors".to_owned();
-        recipe.artifacts[0].source_policy = Some(ModelRecipeArtifactSourcePolicyRecord {
-            policy: "huggingface_authenticated".to_owned(),
-            required_hosts: vec!["huggingface.co".to_owned()],
-            notes: Vec::new(),
-        });
-
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        }
-        .validate()
-        .expect_err("source policy host mismatch should be rejected")
-        .to_string();
-
-        assert!(error.contains("source_policy"));
-        assert!(error.contains("not allowed"));
-    }
-
-    #[test]
-    fn model_recipe_index_source_policy_requires_integrity_metadata() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.artifacts[0].uri = "https://example.invalid/model.bin".to_owned();
-        recipe.artifacts[0].sha256 = None;
-        recipe.artifacts[0].source_policy = Some(ModelRecipeArtifactSourcePolicyRecord {
-            policy: "direct_https_sha256".to_owned(),
-            required_hosts: vec!["example.invalid".to_owned()],
-            notes: Vec::new(),
-        });
-
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        }
-        .validate()
-        .expect_err("source policy should require sha256")
-        .to_string();
-
-        assert!(error.contains("requires sha256"));
-    }
-
-    #[test]
-    fn model_recipe_index_rejects_empty_engine_recipe() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.engine_recipes.push(ModelRecipeEngineRecord {
-            engine: "vllm".to_owned(),
-            ..ModelRecipeEngineRecord::default()
-        });
-
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        }
-        .validate()
-        .expect_err("empty engine recipe should be rejected")
-        .to_string();
-
-        assert!(error.contains("engine recipe for `vllm`"));
-        assert!(error.contains("must not be empty"));
-    }
-
-    #[test]
-    fn model_recipe_index_rejects_duplicate_engine_recipes() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.engine_recipes = vec![
-            ModelRecipeEngineRecord {
-                engine: "vllm".to_owned(),
-                notes: vec!["first".to_owned()],
-                ..ModelRecipeEngineRecord::default()
-            },
-            ModelRecipeEngineRecord {
-                engine: "VLLM".to_owned(),
-                notes: vec!["second".to_owned()],
-                ..ModelRecipeEngineRecord::default()
-            },
-        ];
-
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        }
-        .validate()
-        .expect_err("duplicate engine recipes should be rejected")
-        .to_string();
-
-        assert!(error.contains("engine recipe for `VLLM`"));
-        assert!(error.contains("duplicated"));
-    }
-
-    #[test]
-    fn model_recipe_index_requires_unsupported_combination_reason() {
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        recipe.engine_recipes.push(ModelRecipeEngineRecord {
-            engine: "vllm".to_owned(),
-            unsupported_combinations: vec![ModelRecipeUnsupportedCombinationRecord {
-                combination: "native Windows GPU serving".to_owned(),
-                reason: String::new(),
-            }],
-            ..ModelRecipeEngineRecord::default()
-        });
-
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![recipe],
-        }
-        .validate()
-        .expect_err("unsupported combinations need reasons")
-        .to_string();
-
-        assert!(error.contains("engine unsupported combination reason"));
-    }
-
-    #[test]
-    fn model_artifact_cache_status_uses_deterministic_marker_without_creating_dirs() -> Result<()> {
-        let (root, paths) = temp_app_paths("artifact-cache-status");
-        let mut recipe = sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"]);
-        let artifact = recipe.artifacts.remove(0);
-
-        let missing = model_artifact_cache_status(&paths, "Qwen/Test-1B", &artifact);
-        assert_eq!(missing.status, "missing");
-        assert!(
-            missing
-                .marker_path
-                .to_string_lossy()
-                .contains("hf-main--x68662d6d61696e.json")
-        );
-        assert!(
-            missing
-                .marker_path
-                .to_string_lossy()
-                .contains("qwen-test-1b")
-        );
-        assert!(!paths.data_dir.exists());
-
-        let parent = missing.marker_path.parent().expect("marker has parent");
-        fs::create_dir_all(parent)?;
-        fs::write(&missing.marker_path, "{}")?;
-        let present = model_artifact_cache_status(&paths, "Qwen/Test-1B", &artifact);
-
-        fs::remove_dir_all(root).ok();
-        assert_eq!(present.status, "metadata_present");
-        Ok(())
-    }
-
-    #[test]
-    fn model_artifact_cache_marker_path_includes_model_identity() {
-        let (_root, paths) = temp_app_paths("artifact-cache-model-scope");
-
-        let first = model_artifact_cache_marker_path(&paths, "Qwen/Test-1B", "hf-main");
-        let second = model_artifact_cache_marker_path(&paths, "Qwen/Other-1B", "hf-main");
-
-        assert_ne!(first, second);
-        assert!(first.to_string_lossy().contains("qwen-test-1b"));
-        assert!(second.to_string_lossy().contains("qwen-other-1b"));
-    }
-
-    #[test]
-    fn model_artifact_cache_marker_path_is_collision_proof_for_similar_refs() {
-        let (_root, paths) = temp_app_paths("artifact-cache-collision-proof");
-
-        let dash = model_artifact_cache_marker_path(&paths, "Qwen/Test-1B", "hf-main");
-        let underscore = model_artifact_cache_marker_path(&paths, "Qwen/Test_1B", "hf-main");
-        let case_variant = model_artifact_cache_marker_path(&paths, "qwen/test-1b", "hf-main");
-
-        assert_ne!(dash, underscore);
-        assert_ne!(dash, case_variant);
-        assert!(
-            dash.to_string_lossy()
-                .contains("--x5177656e2f546573742d3142")
-        );
-        assert!(
-            underscore
-                .to_string_lossy()
-                .contains("--x5177656e2f546573745f3142")
-        );
-        assert!(
-            case_variant
-                .to_string_lossy()
-                .contains("--x7177656e2f746573742d3162")
-        );
-    }
-
-    #[test]
-    fn model_recipe_index_rejects_duplicate_aliases() {
-        let error = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: None,
-            generated_at_unix_ms: None,
-            platforms: Vec::new(),
-            recipes: vec![
-                sample_recipe_with_artifact("Qwen/Test-1B", &["shared-alias"]),
-                sample_recipe_with_artifact("Qwen/Other-1B", &["shared-alias"]),
-            ],
-        }
-        .validate()
-        .expect_err("duplicate aliases should be rejected")
-        .to_string();
-
-        assert!(error.contains("duplicated"));
-        assert!(error.contains("shared-alias"));
-    }
-
-    #[test]
-    fn load_model_recipe_index_reads_local_fixture() -> Result<()> {
-        let (root, _paths) = temp_app_paths("recipe-index-fixture");
-        let index_path = root.join("recipes.json");
-        let document = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"])],
-        };
-        fs::create_dir_all(&root)?;
-        fs::write(&index_path, serde_json::to_vec_pretty(&document)?)?;
-
-        let loaded = load_model_recipe_index(&index_path)?;
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(loaded.source.as_deref(), Some("fixture"));
-        assert_eq!(loaded.recipes[0].canonical_model_id, "Qwen/Test-1B");
-        assert_eq!(loaded.recipes[0].artifacts.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn model_recipe_index_signature_path_is_detached_sidecar() {
-        assert_eq!(
-            model_recipe_index_signature_path(Path::new("recipes/index.json")),
-            PathBuf::from("recipes/index.json.sig")
-        );
-    }
-
-    #[test]
-    fn model_recipe_index_signature_accepts_generated_key_and_rejects_tamper() -> Result<()> {
-        let (root, _paths) = temp_app_paths("recipe-index-generated-signature");
-        fs::create_dir_all(&root)?;
-        let private_key = root.join("recipe-private.pem");
-        let public_key = root.join("recipe-public.pem");
-        let index_path = root.join("recipes.json");
-        let signature_path = model_recipe_index_signature_path(&index_path);
-        let document = ModelRecipeIndexDocument {
-            schema_version: 1,
-            source: Some("fixture".to_owned()),
-            generated_at_unix_ms: Some(123),
-            platforms: Vec::new(),
-            recipes: vec![sample_recipe_with_artifact("Qwen/Test-1B", &["test-qwen"])],
-        };
-
-        generate_test_signing_key(&private_key, &public_key)?;
-        fs::write(&index_path, serde_json::to_vec_pretty(&document)?)?;
-        sign_test_payload(&private_key, &index_path, &signature_path)?;
-
-        load_signed_model_recipe_index(&index_path, &signature_path, &public_key)?;
-
-        let tampered = ModelRecipeIndexDocument {
-            source: Some("tampered".to_owned()),
-            ..document
-        };
-        fs::write(&index_path, serde_json::to_vec_pretty(&tampered)?)?;
-        let error = load_signed_model_recipe_index(&index_path, &signature_path, &public_key)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("model recipe index signature verification failed"));
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    /// Produce a `(private-key PEM, SPKI public-key PEM, payload, signature)`
-    /// tuple with the OpenSSL CLI, cross-checking the pure-Rust sign/verify path
-    /// against the same RSASSA-PKCS#1 v1.5 over SHA-256 scheme the installer
-    /// (`install.sh`) and release packaging (`cargo xtask package`) use. Returns
-    /// `None` when openssl is unavailable or its spawn fails, so this interop
-    /// guard never reintroduces the build-failing flake we removed: the pure-Rust
-    /// sign/verify path is fully covered by the round-trip test, and this only
-    /// adds cross-checking against real openssl output where openssl exists.
-    fn openssl_signed_vector(dir: &Path) -> Option<(String, String, Vec<u8>, Vec<u8>)> {
-        let private_key = dir.join("interop-private.pem");
-        let public_key = dir.join("interop-public.pem");
-        let payload_path = dir.join("interop-payload.bin");
-        let signature_path = dir.join("interop.sig");
-        fs::write(&payload_path, b"version = 1\n").ok()?;
-
-        let run = |args: &[&str]| -> Option<()> {
-            let output = Command::new("openssl").args(args).output().ok()?;
-            output.status.success().then_some(())
-        };
-        run(&[
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-            "-out",
-            private_key.to_string_lossy().as_ref(),
-        ])?;
-        run(&[
-            "rsa",
-            "-in",
-            private_key.to_string_lossy().as_ref(),
-            "-pubout",
-            "-out",
-            public_key.to_string_lossy().as_ref(),
-        ])?;
-        run(&[
-            "dgst",
-            "-sha256",
-            "-sign",
-            private_key.to_string_lossy().as_ref(),
-            "-out",
-            signature_path.to_string_lossy().as_ref(),
-            payload_path.to_string_lossy().as_ref(),
-        ])?;
-
-        Some((
-            fs::read_to_string(&private_key).ok()?,
-            fs::read_to_string(&public_key).ok()?,
-            fs::read(&payload_path).ok()?,
-            fs::read(&signature_path).ok()?,
-        ))
-    }
-
-    #[test]
-    fn signing_tolerates_crlf_and_trailing_whitespace_pems() -> Result<()> {
-        // Windows tooling (PowerShell Set-Content, editors) can rewrite a PEM with
-        // CRLF endings, a stray trailing space on the boundary line, or a UTF-8 BOM.
-        // The OpenSSL CLI accepted these, so the Rust path must too.
-        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
-        let payload = b"version = 1\n";
-
-        let crlf_private = private_pem.replace('\n', "\r\n");
-        let trailing_ws_private = private_pem
-            .lines()
-            .map(|line| format!("{line} "))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let bom_public = format!("\u{feff}{public_pem}");
-
-        for variant in [crlf_private, trailing_ws_private] {
-            let signature = sign_rsa_pkcs1_sha256_signature(&variant, payload)?;
-            verify_rsa_pkcs1_sha256_signature(&public_pem, payload, &signature, "metadata")?;
-        }
-        let signature = sign_rsa_pkcs1_sha256_signature(&private_pem, payload)?;
-        verify_rsa_pkcs1_sha256_signature(&bom_public, payload, &signature, "metadata")?;
-        Ok(())
-    }
-
-    #[test]
-    fn rsa_sign_verify_round_trips_in_pure_rust() -> Result<()> {
-        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
-        let payload = b"version = 1\n";
-
-        let signature = sign_rsa_pkcs1_sha256_signature(&private_pem, payload)?;
-        verify_rsa_pkcs1_sha256_signature(&public_pem, payload, &signature, "metadata")?;
-
-        let mut tampered = payload.to_vec();
-        tampered[0] ^= 0x01;
-        let error =
-            verify_rsa_pkcs1_sha256_signature(&public_pem, &tampered, &signature, "metadata")
-                .expect_err("a tampered payload must be rejected")
-                .to_string();
-        assert!(error.contains("metadata signature verification failed"));
-        Ok(())
-    }
-
-    #[test]
-    fn rsa_verifier_is_byte_compatible_with_openssl_output() -> Result<()> {
-        let (root, _paths) = temp_app_paths("openssl-interop-vector");
-        fs::create_dir_all(&root)?;
-        let Some((private_key_pem, public_key_pem, payload, openssl_signature)) =
-            openssl_signed_vector(&root)
-        else {
-            eprintln!(
-                "skipping openssl interop check: openssl CLI unavailable or failed to produce a signature"
-            );
-            fs::remove_dir_all(&root).ok();
-            return Ok(());
-        };
-
-        // Our verifier accepts a signature produced by the openssl CLI.
-        verify_rsa_pkcs1_sha256_signature(
-            &public_key_pem,
-            &payload,
-            &openssl_signature,
-            "metadata",
-        )
-        .expect("pure-Rust verifier must accept an openssl-produced signature");
-
-        // Our signer is byte-identical to `openssl dgst -sha256 -sign`, so artifacts
-        // signed by the Rust xtask verify with the openssl-based installers and vice-versa.
-        let rust_signature = sign_rsa_pkcs1_sha256_signature(&private_key_pem, &payload)?;
-        assert_eq!(
-            rust_signature, openssl_signature,
-            "Rust signature must match openssl byte-for-byte"
-        );
-
-        let mut tampered = payload;
-        tampered[0] ^= 0x01;
-        let error = verify_rsa_pkcs1_sha256_signature(
-            &public_key_pem,
-            &tampered,
-            &openssl_signature,
-            "metadata",
-        )
-        .expect_err("a tampered payload must be rejected")
-        .to_string();
-        assert!(error.contains("metadata signature verification failed"));
-        fs::remove_dir_all(&root).ok();
-        Ok(())
-    }
-
-    fn generate_test_signing_key(private_key: &Path, public_key: &Path) -> Result<()> {
-        let (private_pem, public_pem) = generate_rsa_signing_keypair()?;
-        fs::write(private_key, private_pem.as_bytes())?;
-        fs::write(public_key, public_pem.as_bytes())?;
-        Ok(())
-    }
-
-    fn sign_test_payload(private_key: &Path, payload: &Path, signature: &Path) -> Result<()> {
-        let private_pem = fs::read_to_string(private_key)?;
-        let payload_bytes = fs::read(payload)?;
-        let produced = sign_rsa_pkcs1_sha256_signature(&private_pem, &payload_bytes)?;
-        fs::write(signature, produced)?;
-        Ok(())
-    }
-
-    fn sample_recipe_with_artifact(
-        canonical_model_id: &str,
-        aliases: &[&str],
-    ) -> ModelRecipeRecord {
-        ModelRecipeRecord {
-            canonical_model_id: canonical_model_id.to_owned(),
-            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
-            task: "chat".to_owned(),
-            source: "signed_recipe_index".to_owned(),
-            revision: "main".to_owned(),
-            loader: "transformers".to_owned(),
-            trust_remote_code: false,
-            dtype: "bfloat16".to_owned(),
-            device_policy: "gpu_required".to_owned(),
-            min_gpu_mem_gb: Some(12),
-            recommended_system_ram_gb: Some(16),
-            quantization: Some("none".to_owned()),
-            artifact_hint: None,
-            artifacts: vec![ModelRecipeArtifactRecord {
-                artifact_id: "hf-main".to_owned(),
-                kind: "huggingface".to_owned(),
-                uri: canonical_model_id.to_owned(),
-                revision: Some("main".to_owned()),
-                sha256: Some("a".repeat(64)),
-                size_bytes: Some(1024),
-                license: Some("apache-2.0".to_owned()),
-                gated: Some(false),
-                quantization: Some("none".to_owned()),
-                engines: vec!["vllm".to_owned()],
-                source_policy: None,
-            }],
-            engine_recipes: Vec::new(),
-            manual_alternatives: Vec::new(),
-            featured: false,
-            chat_template_mode: "auto".to_owned(),
-            preferred_engines: vec!["vllm".to_owned()],
-            warnings: Vec::new(),
-        }
-    }
-
-    #[test]
     fn config_defaults_to_local_telemetry_policy() {
         let config = RocmCliConfig::default();
 
@@ -7890,164 +2893,6 @@ mod tests {
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
         Ok(())
-    }
-
-    #[test]
-    fn with_managed_root_keeps_reprovisioning_flat_from_runtime_leaf() {
-        let data_root = PathBuf::from("/tmp/rocm-cli-reprovision");
-        let paths = AppPaths {
-            config_dir: data_root.clone(),
-            data_dir: data_root.clone(),
-            cache_dir: data_root.join("cache"),
-        };
-        // A prior install persisted the runtime's own install_root as the managed
-        // root; rebasing onto it must recover the canonical data root, not append
-        // a second `runtimes/wheel` when the next runtime is provisioned.
-        let leaf = data_root
-            .join("runtimes")
-            .join("wheel")
-            .join("release-wheel-gfx942-7-0");
-        let rebased = paths.with_managed_root(leaf, false);
-
-        assert_eq!(rebased.data_dir, data_root);
-        let next_root = rebased
-            .data_dir
-            .join("runtimes")
-            .join("wheel")
-            .join("nightly-wheel-gfx942-7-1");
-        // Count path components, not a literal separator, so the assertion holds
-        // on Windows too.
-        let runtimes_segments = next_root
-            .components()
-            .filter(|component| component.as_os_str() == std::ffi::OsStr::new("runtimes"))
-            .count();
-        assert_eq!(runtimes_segments, 1);
-    }
-
-    #[test]
-    fn app_paths_apply_configured_managed_root_when_unoverridden() -> Result<()> {
-        let (root, paths) = temp_app_paths("configured-managed-root");
-        let managed_root = root.join("managed");
-        let persisted_runtime = managed_root
-            .join("runtimes")
-            .join("wheel")
-            .join("release-wheel-gfx942-7-0");
-        fs::create_dir_all(&paths.config_dir)?;
-        fs::write(
-            paths.config_path(),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "setup": { "therock_venv": persisted_runtime }
-            }))?,
-        )?;
-
-        let discovered = AppPaths::discover_from_paths(paths.clone(), false, false);
-        assert_eq!(discovered.config_dir, paths.config_dir);
-        assert_eq!(discovered.data_dir, managed_root);
-        assert_eq!(discovered.cache_dir, managed_root.join("cache"));
-
-        let data_overridden = AppPaths::discover_from_paths(paths.clone(), true, false);
-        assert_eq!(data_overridden.data_dir, paths.data_dir);
-        assert_eq!(data_overridden.cache_dir, paths.cache_dir);
-
-        let cache_overridden = AppPaths::discover_from_paths(paths.clone(), false, true);
-        assert_eq!(cache_overridden.data_dir, managed_root);
-        assert_eq!(cache_overridden.cache_dir, paths.cache_dir);
-
-        fs::remove_dir_all(root).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn engine_envs_dir_honors_dedicated_root_override() {
-        let (root, paths) = temp_app_paths("engine-envs-root-override");
-        let override_root = root.join("runtime").join("engines");
-
-        // Passed in rather than set via `std::env::set_var`: the environment is
-        // process-global, so mutating it here would race any concurrent test
-        // that reads the same key under a threaded runner.
-        //
-        // What this assertion covers is the override being consulted and the
-        // `<root>/<engine>/envs` shape built on it. It deliberately does NOT
-        // claim to cover the host-normalisation step, and routing the expected
-        // value through the same call the production code makes is why: on a
-        // non-Windows target `normalize_runtime_path_for_host` returns its
-        // input unchanged (see `normalize_runtime_path_text_for_platform`) for
-        // any path these tests can produce, so dropping normalisation from the
-        // override arm cannot fail this on a Linux lane — nor, with an
-        // already-normal temp path, on a Windows one. Not the identity in the
-        // strict sense: the helper round-trips through `Path::display()`, which
-        // is lossy for a non-UTF-8 path. Temp paths here are UTF-8, so the
-        // distinction does not reach this assertion, but it is not a no-op.
-        // Making it fail would need the platform threaded through the seam, and
-        // the normaliser itself is already covered on every host by
-        // `runtime_path_normalization_accepts_windows_drive_forms` and its
-        // neighbours, which pass the platform in explicitly.
-        assert_eq!(
-            paths.engine_envs_dir_from("vllm", Some(&override_root)),
-            normalize_runtime_path_for_host(&override_root)
-                .join("vllm")
-                .join("envs")
-        );
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    /// Serializes tests that replace a process-global env var while they run.
-    ///
-    /// Named `*_TEST_LOCK` so the env-mutation contract guard recognises the
-    /// discipline by suffix rather than by a hardcoded list of lock names.
-    static ENGINE_ENVS_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// The two tests around this one drive the seam, which deliberately does
-    /// not read the environment — so on their own the production lookup, and
-    /// the key it names, could both be deleted without failing anything. This
-    /// drives `engine_envs_dir` itself against a real variable.
-    #[test]
-    fn engine_envs_dir_reads_its_root_from_the_environment() {
-        let _guard = ENGINE_ENVS_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (root, paths) = temp_app_paths("engine-envs-root-env");
-        let override_root = root.join("runtime").join("engines");
-
-        // Restored on drop rather than on the next line, so a panic inside
-        // `engine_envs_dir` cannot leave this key pointing at the directory
-        // removed below. `RestoredEnvVar` only restores; the lock above is what
-        // serializes, and the contract guard requires it here because
-        // `RestoredEnvVar::set(` is in its mutation list.
-        let restore =
-            crate::test_env::RestoredEnvVar::set("ROCM_CLI_ENGINE_ENVS_ROOT", &override_root);
-        let resolved = paths.engine_envs_dir("vllm");
-        drop(restore);
-
-        // Same scope as the seam test above: this pins that `engine_envs_dir`
-        // reaches the variable, not that the value is host-normalised on the
-        // way through. See that test for why the normalisation step is not
-        // observable here.
-        assert_eq!(
-            resolved,
-            normalize_runtime_path_for_host(&override_root)
-                .join("vllm")
-                .join("envs"),
-            "engine_envs_dir must reach $ROCM_CLI_ENGINE_ENVS_ROOT"
-        );
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn engine_envs_dir_falls_back_to_the_data_dir_without_an_override() {
-        // The other half of the override contract: with nothing supplied the
-        // root is the data dir, which is what the unset-environment production
-        // path resolves to.
-        let (root, paths) = temp_app_paths("engine-envs-root-default");
-
-        assert_eq!(
-            paths.engine_envs_dir_from("vllm", None),
-            paths.data_dir.join("engines").join("vllm").join("envs")
-        );
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8111,31 +2956,6 @@ mod tests {
         assert!(watcher.trigger.contains("gpu.thermal_pressure"));
         assert!(watcher.trigger.contains("gpu.memory_pressure"));
         assert_eq!(watcher.actions, &["queue_stop_server_proposal"]);
-    }
-
-    #[test]
-    fn engine_plugin_dirs_are_data_owned_and_ordered() {
-        let (_root, paths) = temp_app_paths("engine-plugin-dirs");
-
-        assert_eq!(
-            engine_plugin_dirs(&paths),
-            vec![
-                paths.primary_engine_plugin_dir(),
-                paths.data_dir.join("engines")
-            ]
-        );
-    }
-
-    #[test]
-    fn http_host_formatting_brackets_ipv6_literals() {
-        assert_eq!(format_host_port("127.0.0.1", 11435), "127.0.0.1:11435");
-        assert_eq!(
-            format_http_base_url("localhost", 11435),
-            "http://localhost:11435"
-        );
-        assert_eq!(format_host_port("::1", 11435), "[::1]:11435");
-        assert_eq!(format_http_base_url("::1", 11435), "http://[::1]:11435");
-        assert_eq!(format_host_port("[::1]", 11435), "[::1]:11435");
     }
 
     // ===== Dashboard sub-config + migration =====
@@ -8263,25 +3083,6 @@ mod tests {
     }
 
     #[test]
-    fn app_paths_expose_telemetry_and_daemon_log_paths() -> Result<()> {
-        let (root, paths) = temp_app_paths("telemetry-paths");
-        assert_eq!(
-            paths.telemetry_state_dir(),
-            paths.data_dir.join("telemetry")
-        );
-        assert_eq!(
-            paths.daemon_log_path(),
-            paths.data_dir.join("logs").join("rocmdashd.log")
-        );
-        assert_eq!(paths.client_log_dir(), paths.data_dir.join("logs"));
-        // ensure() creates the telemetry state dir alongside the others.
-        paths.ensure()?;
-        assert!(paths.telemetry_state_dir().is_dir());
-        let _ = fs::remove_dir_all(&root);
-        Ok(())
-    }
-
-    #[test]
     #[allow(clippy::float_cmp)]
     fn migrate_legacy_dashboard_toml_maps_knobs_and_is_one_shot() -> Result<()> {
         let (root, paths) = temp_app_paths("migrate-dash");
@@ -8359,6 +3160,331 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(migrated, None);
         assert!(!paths.config_path().is_file());
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The `inspect_err` cleanup on the rename, which the happy-path test above
+    /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
+    /// behind, so deleting the cleanup would go unnoticed until a user with a
+    /// failing disk accumulated one `config.json.tmp-<ts>-<pid>` per attempt.
+    ///
+    /// A directory at the destination is what makes the rename fail on both
+    /// supported platforms without needing permissions a root CI lane ignores —
+    /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
+    /// uses in `apps/rocm`.
+    #[test]
+    fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-rename-fails");
+        fs::create_dir_all(&paths.config_dir)?;
+        let occupied = paths.config_path();
+        fs::create_dir_all(occupied.join("nested"))?;
+        fs::write(occupied.join("nested").join("keep"), b"x")?;
+
+        RocmCliConfig::default()
+            .save(&paths)
+            .expect_err("renaming onto a non-empty directory must fail");
+
+        let leftovers: Vec<String> = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            leftovers.is_empty(),
+            "a save that could not publish must not strand its temp file: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn saving_the_config_replaces_it_without_leaving_a_temp_file_behind() -> Result<()> {
+        let (root, paths) = temp_app_paths("config-save-atomic");
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        // Overwriting is the interesting case: the save goes through a temp file
+        // and a rename rather than truncating the live config, so an interrupted
+        // save can never leave a half-written file that `load` refuses to parse.
+        config.default_engine = Some("lemonade".to_owned());
+        config.save(&paths)?;
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let leftovers = fs::read_dir(&paths.config_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect::<Vec<_>>();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        assert!(
+            leftovers.is_empty(),
+            "a completed save must leave no temp file in the config folder: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // The inode is the observable difference between a rewrite in place and
+        // a replacement, and the reason the doc comment can promise what it
+        // promises. A `fs::write` over the live path truncates and refills the
+        // SAME file, so a reader holding it open — or one that opens it mid-save
+        // — can see an empty or half-written config, which `load` hard-errors
+        // on. A rename publishes a DIFFERENT file over the name, so a reader
+        // sees either the old config or the new one and never the gap between.
+        //
+        // The sibling test above only checks that no temp file is left behind,
+        // which holds just as well for an implementation with no temp file at
+        // all, so it cannot tell the two apart.
+        //
+        // The `#[cfg(windows)]` function of the same name below asserts the same
+        // guarantee through `GetFileInformationByHandle`.
+        let (root, paths) = temp_app_paths("config-save-replaces");
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        let before = fs::metadata(paths.config_path())?.ino();
+
+        config.default_engine = Some("lemonade".to_owned());
+        config.save(&paths)?;
+        let after = fs::metadata(paths.config_path())?.ino();
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_ne!(
+            before, after,
+            "an overwrite that keeps the same inode rewrote the live config in \
+             place, so an interrupted save can leave it truncated"
+        );
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        Ok(())
+    }
+
+    /// The volume serial number paired with the 64-bit file index: this
+    /// platform's file identity, the way an inode is on Unix.
+    ///
+    /// Read through `GetFileInformationByHandle` rather than
+    /// `std::os::windows::fs::MetadataExt`, whose `volume_serial_number` and
+    /// `file_index` accessors are unstable behind the `windows_by_handle`
+    /// feature gate and so cannot be called on the pinned stable toolchain.
+    #[cfg(windows)]
+    #[allow(unsafe_code)] // Win32 FFI
+    fn windows_file_identity(path: &Path) -> Result<(u32, u64)> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        // All-POD `repr(C)` record, fully overwritten by the call below on
+        // success and never read on failure.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let handle = file.as_raw_handle() as HANDLE;
+        if unsafe { GetFileInformationByHandle(handle, &raw mut info) } == 0 {
+            bail!(
+                "failed to read the file identity of {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        ))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        // The Windows counterpart of the Unix test above. The file index
+        // together with the volume serial number is this platform's file
+        // identity, the way an inode is on Unix: a `fs::write` over the live
+        // path refills the SAME file and keeps the pair, while a
+        // publish-by-rename puts a DIFFERENT file behind the name. This keeps a
+        // Windows-only regression to a plain `fs::write` from passing every
+        // gate.
+        //
+        // The identity is not optional: `GetFileInformationByHandle` either
+        // fills both fields or fails, and a failure is a test error rather than
+        // a silently skipped assertion.
+        let (root, paths) = temp_app_paths("config-save-replaces");
+        let mut config = RocmCliConfig {
+            default_engine: Some("vllm".to_owned()),
+            ..RocmCliConfig::default()
+        };
+        config.save(&paths)?;
+        let before = windows_file_identity(&paths.config_path())?;
+
+        config.default_engine = Some("lemonade".to_owned());
+        config.save(&paths)?;
+        let after = windows_file_identity(&paths.config_path())?;
+
+        let loaded = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_ne!(
+            before, after,
+            "an overwrite that keeps the same file identity rewrote the live \
+             config in place, so an interrupted save can leave it truncated"
+        );
+        assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_keeps_the_runtime_selector_the_launch_requested() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-pin");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-pin",
+            "vllm",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            Some("release-pip-gfx120x-all-7-13-0".to_owned()),
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // What a vLLM server writes: `runtime_id` is the manifest's family id,
+        // shared by every installed version of that family, while
+        // `requested_runtime_id` is the selector the launch asked for, here an
+        // exact runtime key.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "therock-release:gfx120X-all",
+                "requested_runtime_id": "release-pip-gfx120x-all-7-13-0",
+            }))?,
+        )?;
+
+        let refreshed = record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(refreshed);
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("release-pip-gfx120x-all-7-13-0"),
+            "adopting the resolved family id would throw away which installed \
+             version the service is actually on — the record is what a restart \
+             re-pins and what runtime activation compares against"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_falls_back_to_the_resolved_runtime_id() -> Result<()> {
+        let (root, paths) = temp_app_paths("record-runtime-fallback");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-runtime-fallback",
+            "lemonade",
+            "Qwen/Qwen3-0.6B",
+            "Qwen/Qwen3-0.6B",
+            "127.0.0.1",
+            9,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        fs::create_dir_all(
+            record
+                .engine_state_path
+                .parent()
+                .expect("engine state path has a parent"),
+        )?;
+        // An engine that records only the resolved runtime must still be read:
+        // preferring `requested_runtime_id` must not mean ignoring `runtime_id`.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "running",
+                "runtime_id": "lemonade-embeddable-8.1.11",
+                "requested_runtime_id": serde_json::Value::Null,
+            }))?,
+        )?;
+
+        record.refresh_from_engine_state()?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            record.runtime_id.as_deref(),
+            Some("lemonade-embeddable-8.1.11")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn engine_state_refresh_ignores_a_blank_requested_runtime_id() -> Result<()> {
+        // A blank selector names no runtime, so adopting it would leave the
+        // record with an empty runtime that matches nothing and that a restart
+        // would re-pin. Both an empty string and whitespace must fall through
+        // to the resolved `runtime_id`.
+        for (blank, name) in [("", "empty"), ("   ", "whitespace")] {
+            let (root, paths) = temp_app_paths(&format!("record-runtime-blank-{name}"));
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                "svc-runtime-blank",
+                "lemonade",
+                "Qwen/Qwen3-0.6B",
+                "Qwen/Qwen3-0.6B",
+                "127.0.0.1",
+                9,
+                "managed",
+                std::process::id(),
+                None,
+                None,
+                Some("gpu_required".to_owned()),
+            );
+            fs::create_dir_all(
+                record
+                    .engine_state_path
+                    .parent()
+                    .expect("engine state path has a parent"),
+            )?;
+            fs::write(
+                &record.engine_state_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "status": "running",
+                    "runtime_id": "lemonade-embeddable-8.1.11",
+                    "requested_runtime_id": blank,
+                }))?,
+            )?;
+
+            let refreshed = record.refresh_from_engine_state()?;
+            let _ = fs::remove_dir_all(&root);
+
+            assert!(refreshed, "{name}: the engine state must still be adopted");
+            assert_eq!(
+                record.runtime_id.as_deref(),
+                Some("lemonade-embeddable-8.1.11"),
+                "{name}: a blank requested_runtime_id must fall through to runtime_id"
+            );
+        }
         Ok(())
     }
 

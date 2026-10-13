@@ -2043,7 +2043,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn install_vllm_rocm10_discover_realigns_torch_after_the_config_file_install() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let root = tempfile::tempdir()?;
         let paths = AppPaths {
@@ -2054,14 +2054,13 @@ mod tests {
         let log = root.path().join("uv-calls.log");
 
         let python = root.path().join("python");
-        std::fs::write(&python, "#!/bin/sh\necho cp314\n")?;
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
 
         // Answers every `--dry-run` discovery call with a resolved pin for
         // whatever package the requirement names, and otherwise just records
         // the call (the real installs) for the assertions below.
         let uv = root.path().join("uv");
-        std::fs::write(
+        write_fake_executable(
             &uv,
             format!(
                 r#"#!/bin/sh
@@ -2082,7 +2081,6 @@ exit 0
                 log = log.display()
             ),
         )?;
-        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))?;
 
         let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
         let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
@@ -2162,7 +2160,7 @@ exit 0
     #[cfg(unix)]
     fn install_vllm_rocm10_discover_realigns_stale_device_packages_per_base_package() -> Result<()>
     {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let root = tempfile::tempdir()?;
         let paths = AppPaths {
@@ -2173,11 +2171,10 @@ exit 0
         let log = root.path().join("uv-calls.log");
 
         let python = root.path().join("python");
-        std::fs::write(&python, "#!/bin/sh\necho cp314\n")?;
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
 
         let uv = root.path().join("uv");
-        std::fs::write(
+        write_fake_executable(
             &uv,
             format!(
                 r#"#!/bin/sh
@@ -2202,7 +2199,6 @@ exit 0
                 log = log.display()
             ),
         )?;
-        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))?;
 
         let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
         let pins = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)?;
@@ -2266,7 +2262,7 @@ exit 0
     #[test]
     #[cfg(unix)]
     fn install_vllm_rocm10_discover_realigns_the_trio_even_if_pip_freeze_fails() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let root = tempfile::tempdir()?;
         let paths = AppPaths {
@@ -2277,11 +2273,10 @@ exit 0
         let log = root.path().join("uv-calls.log");
 
         let python = root.path().join("python");
-        std::fs::write(&python, "#!/bin/sh\necho cp314\n")?;
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&python, "#!/bin/sh\necho cp314\n")?;
 
         let uv = root.path().join("uv");
-        std::fs::write(
+        write_fake_executable(
             &uv,
             format!(
                 r#"#!/bin/sh
@@ -2303,7 +2298,6 @@ exit 0
                 log = log.display()
             ),
         )?;
-        std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755))?;
 
         let build = vllm_rocm_discover_build("10.1.0").expect("10.1.0 has a discover row");
         let err = install_vllm_rocm10_discover(&uv, &paths, &python, true, build)

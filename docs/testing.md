@@ -113,6 +113,20 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Tests that run a fake executable
+
+Plant a stand-in `python`, `uv`, `amd-smi`, ... with
+`rocm_core::fake_executable::write_fake_executable`, not `std::fs::write`
+followed by `set_permissions(0o755)`. On Linux the plain write makes the first
+run of the fake fail intermittently with `Text file busy (os error 26)`: while
+the write fd is open, a test on another thread can spawn a child, and that child
+keeps a copy of the fd until its own `exec` (`O_CLOEXEC` closes it only then).
+The kernel refuses to execute a file any process still has open for writing, so
+the fake's first run can land in that window. The helper has a short-lived
+child write the file instead, so this process never holds a write fd on it. The
+same applies to E2E steps: scenarios run concurrently in one process, and the
+`rocm` child that runs the shim can be the one refused.
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -480,6 +494,70 @@ python3 scripts/comfyui_therock_gpu_test.py \
   --generate-cat
 ```
 
+## ComfyUI Reinstall
+
+`rocm comfyui install --reinstall` deletes only the top-level entries the
+installed ComfyUI release shipped in its `source/` folder (as recorded when it
+was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
+`input/`, `custom_nodes/`, `datasets/`, `extra_model_paths.yaml`), renames an
+entry of the user's that the new release starts shipping (`set aside:`) and
+leaves anything else in place. An install from before that record replaces
+the entries named like the new release's code and lists them (`replaced:`).
+It leaves the install untouched when the new source cannot be obtained or is
+not a ComfyUI release, or when ComfyUI is found running just before the swap;
+`start` refuses a folder whose swap was interrupted or stopped part-way, and
+the command it names finishes it. The swap is unit-tested directly, without a
+fake Python. Most of those tests also run on Windows: stopping the swap before
+each filesystem change in turn and checking that a re-run converges (with and
+without an entry to set aside), unknown entries and `datasets/` left in place,
+an unreadable or malformed release record or swap marker, an entry that
+cannot be removed, the copy taken when the release cannot be renamed into
+place across filesystems, `main.py` removed first and moved in last, a
+release without `main.py` refused before an existing install changes, and the
+`replaced:` list of an install with no record staying complete when its swap
+is interrupted at any step. The symlink tests (symlinked model folders, links
+inside them, loops, dangling links, copying links without following them), the
+inode/ctime test and a copy that fails part-way are Unix-only; the retry while
+another program holds a file and names that differ only in case are
+Windows-only:
+
+```bash
+cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::tests
+```
+
+The second filter covers the install-level tests: `reinstall_*`,
+`install_after_an_interrupted_reinstall_finishes_it`,
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
+`a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
+`a_failure_after_the_swap_names_what_it_replaced`,
+`only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it`,
+`swap_changes_summary_names_what_was_replaced_and_set_aside`,
+`a_plain_install_is_not_refused_while_comfyui_runs`,
+`plain_install_dry_run_previews_no_reinstall`,
+`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`.
+The running guard is tested against a ComfyUI answering on its port
+(`running`) and one whose process is up but whose port is not answering yet
+(`starting`).
+
+The e2e scenarios `comfyui-05` to `comfyui-13`
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
+GPU) cover the same through the built binary: what is kept, replaced and left
+in place (also when the saved run state is unreadable), a failed download, the
+dry run, a reinstall refused while ComfyUI runs (which the dry run says
+first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
+run, the answer to a plain-words status question
+(`rocm "what is the comfyui status"`) while ComfyUI starts and while a
+reinstall is unfinished, a folder of the user's set aside when the new release
+ships one of the same name, a reinstall that fails after the swap naming
+what it replaced and the command that finishes it, a ComfyUI started while
+the reinstall downloads, which the check just before the swap refuses, and a
+download that is not a ComfyUI release, which is neither installed nor kept:
+
+```bash
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
@@ -492,9 +570,40 @@ Activate one validated runtime:
 
 ```bash
 rocm runtimes activate <runtime_key>
+rocm runtimes activate <runtime_key> --restart-services --yes
 ```
 
-Engine installs and managed serving inherit this active runtime by default.
+New engine installs and new serve launches use this active runtime by default.
+Already-running managed servers do not follow the activation: each one keeps
+the runtime recorded in its service record until it is restarted. The
+activation report says so from that recorded state rather than as a fixed
+note — it prints `services_on_previous_runtime: <n>` with one line per stale
+service (`- <service_id> engine=<engine> recorded_runtime=<key>`), and
+`services_on_previous_runtime: 0` when nothing is left behind. Live services
+whose record names no runtime are counted separately under
+`services_with_unrecorded_runtime:`. Only services on an engine that
+manages its own runtime (`lemonade`) are never counted as stale; an `env_id`
+recorded in a service record is not a pin and does not exempt the service.
+
+`--restart-services` moves those services: it rewrites each service record onto
+the newly active runtime and then restarts it. Moving a service also clears any
+`env_id` stored in its record; the engine writes its own back on the next
+launch. It requires `--yes` and never prompts, the same idiom as
+`rocm services restart <id> --yes` and `rocm runtimes uninstall --yes`. Restart
+is best effort per service — every failure is named, its record is put back on
+the runtime it actually ran on, and the command exits non-zero. After a failure
+the service is read back: one that is still live stays counted under
+`services_on_previous_runtime`, and one that is not is reported as stopped by
+the attempt. The error says which is which. `services_restarted` lists only
+servers that answered an inference request after the restart; one that was
+respawned but had not answered when the restart stopped waiting (45 seconds) is
+listed under `services_restarted_not_yet_serving` instead, and does not fail the
+command.
+
+Activating the runtime that is already active changes nothing: the report prints
+`changed_from_runtime_key: <unchanged>` and the existing rollback target is kept,
+so the activation command in the report's own note can be run safely.
+
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.
 
@@ -517,10 +626,12 @@ Developer-only previous-runtime regression check:
 
 ```bash
 rocm runtimes rollback
+rocm runtimes rollback --restart-services --yes
 ```
 
 This command validates the saved previous-runtime marker, but it is not the
-primary user-facing way to switch ROCm installs.
+primary user-facing way to switch ROCm installs. It reports and restarts
+running services exactly as `activate` does.
 
 Import an existing rocm-cli/TheRock runtime manifest in read-only mode:
 
@@ -698,8 +809,18 @@ happens before anything is stopped, so it cannot take down a running service. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
-that later observes the process dead. There is no e2e coverage of `services
-stop`/`restart` or endpoint auth; these paths are unit-tested only.
+that later observes the process dead. `service-stop-01`
+(`features/service_stop.feature`) covers `services stop` succeeding against a
+running record on the mock lane and the record being persisted as stopped;
+there is still no e2e coverage of the key being dropped or `services restart`,
+which remain unit-tested only. Reusing a running service for a
+`--require-api-key` request it never had is refused rather than silently
+upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
+Linux-only since the Windows managed Lemonade spawn can't enforce the key)
+covers the local refusal and that its printed stop hint actually clears it;
+`remote-15` (`features/remote.feature`, `@requires-docker`) covers the same
+refusal on `rocm remote serve`, reusing the fake remote's own deterministic
+service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being

@@ -12,10 +12,14 @@
 
 use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, AutomationRuntimeState, ManagedServiceRecord};
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::*;
+use crate::{
+    MANAGED_STOP_GRACE, endpoint_keys, host_port_resolves, load_managed_services,
+    loopback_tcp_port_is_reachable, managed_service_is_live, stop_internal_managed_service,
+};
 
 /// A managed service uninstall could not confirm stopped, and why.
 ///

@@ -201,13 +201,15 @@ jobs:
               - 'PSScriptAnalyzerSettings.psd1'
               - '.github/workflows/**'
             # Sphinx docs site: the doc sources themselves, plus README.md,
-            # CONTRIBUTING.md and docs/vllm.md, which pages single-source via
-            # MyST `{include}` directives, plus the build config/toolchain pins.
+            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
+            # single-source via MyST `{include}` directives, plus the build
+            # config/toolchain pins.
             docs:
               - 'docs/rocm-docs/**'
               - 'README.md'
               - 'CONTRIBUTING.md'
               - 'docs/vllm.md'
+              - 'docs/wsl.md'
               - '.readthedocs.yaml'
               - '.github/workflows/**'
 
@@ -722,13 +724,23 @@ jobs:
         shell: pwsh
         run: python .\scripts\smoke_local.py --skip-build
 
-      - name: Acceptance harness self-tests
+      # One command per step: pwsh carries on past a failing native command and
+      # the step reports only the last command's exit code, so a multi-line
+      # block would let an early self-test fail unseen.
+      - name: Acceptance harness self-test (ComfyUI)
         if: needs.changes.outputs.heavy == 'true'
         shell: pwsh
-        run: |
-          python .\scripts\comfyui_therock_gpu_test.py --self-test
-          python .\scripts\local_assistant_therock_gpu_test.py --self-test
-          python .\scripts\vllm_therock_gpu_test.py --self-test
+        run: python .\scripts\comfyui_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (local assistant)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\local_assistant_therock_gpu_test.py --self-test
+
+      - name: Acceptance harness self-test (vLLM)
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: python .\scripts\vllm_therock_gpu_test.py --self-test
 
       - name: Release readiness self-test
         if: needs.changes.outputs.heavy == 'true'

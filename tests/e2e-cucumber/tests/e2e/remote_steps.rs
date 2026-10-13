@@ -577,6 +577,24 @@ async fn given_serving_machine(world: &mut E2eWorld) {
     assert_eq!(world.cli_rc, Some(0), "serve failed:\n{}", said(world));
 }
 
+/// Plants a service directly on the machine, bypassing `rocm remote serve`
+/// entirely, so no local session is recorded for it.
+///
+/// `serve_with_transport`'s `session::exists` guard is purely local — keyed on
+/// the machine and port, with nothing to do with what is actually running
+/// remotely — so a `Given`/`When` pair that both call `rocm remote serve`
+/// trips that guard on the second call and never reaches
+/// `discover_started_service`'s "reused instead of started" refusal this
+/// scenario means to exercise. Calling the stand-in CLI straight on the
+/// container, the way an operator's own `rocm serve` or an earlier *unmanaged*
+/// `remote serve` run would leave it, reproduces the actual precondition: a
+/// service already live on the port with no session of ours beside it.
+#[given("the machine is already serving a model, started outside any session")]
+async fn given_pre_existing_service_on_machine(world: &mut E2eWorld) {
+    given_reachable_machine(world).await;
+    machine(world).exec(&["rocm", "serve", "test-model", "--port", "11434"]);
+}
+
 #[when("the user serves a model on that machine")]
 async fn when_serve_on_machine(world: &mut E2eWorld) {
     let env = world.remote_env.clone();
@@ -698,5 +716,62 @@ async fn then_report_names_machine(world: &mut E2eWorld) {
         said.contains("Health of gpu-box"),
         "a remote report indistinguishable from a local one gets acted on against the \
          wrong computer:\n{said}"
+    );
+}
+
+/// Pulls the directly-runnable `rocm services stop <id> --yes` command out of a
+/// refusal message, the same copy-pasteable form `discover_started_service`
+/// prints. Panics with the full message on either boundary missing, so a
+/// malformed or missing hint fails loudly rather than silently matching
+/// nothing.
+fn extract_remote_stop_hint(output: &str) -> String {
+    const START: &str = "rocm services stop ";
+    const END: &str = " --yes";
+    let start = output
+        .find(START)
+        .unwrap_or_else(|| panic!("refusal did not contain a `{START}` hint:\n{output}"));
+    let after_start = &output[start..];
+    let end = after_start
+        .find(END)
+        .unwrap_or_else(|| panic!("refusal's stop hint did not end in `{END}`:\n{output}"));
+    after_start[..end + END.len()].to_owned()
+}
+
+#[then("the user is told it is already serving and given the exact command to stop it")]
+async fn then_already_serving_with_stop_hint(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no remote serve rc recorded");
+    let said = said(world);
+    assert!(
+        rc != 0,
+        "serving again on an already-serving machine must be refused, but it exited 0:\n{said}"
+    );
+    assert!(
+        said.contains("already serving"),
+        "the refusal must say what it found: {said}"
+    );
+    // Only asserts the hint is well-formed and present here; the next step
+    // proves it is also correct by actually running it.
+    extract_remote_stop_hint(&said);
+}
+
+#[then("running that command on the machine stops it")]
+async fn then_stop_hint_clears_the_service(world: &mut E2eWorld) {
+    let hint = extract_remote_stop_hint(&said(world));
+    let args: Vec<&str> = hint.split_whitespace().collect();
+    let stop_output = machine(world).exec(&args);
+    assert!(
+        stop_output.contains("stopped"),
+        "running the printed hint `{hint}` must report success:\n{stop_output}"
+    );
+    let listing = machine(world).exec(&["rocm", "services", "list", "--json"]);
+    assert_eq!(
+        args.len(),
+        5,
+        "hint must be `rocm services stop <id> --yes`, got `{hint}`"
+    );
+    let service_id = args[3];
+    assert!(
+        !listing.contains(service_id),
+        "the service must be gone from the remote's own listing after running the hint:\n{listing}"
     );
 }

@@ -18,7 +18,7 @@
 
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
-    detect_managed_therock_family, discover_rocm_installs, env_flag, examine, host_path,
+    detect_managed_therock_family, discover_rocm_installs, examine, host_path,
     managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
 use anyhow::Result;
@@ -263,7 +263,7 @@ fn capture_optional_command_candidate_with_timeout(
 }
 
 fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
-    if !env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
+    if !crate::runtime::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
         return;
     }
     eprintln!(
@@ -3165,12 +3165,10 @@ mod tests {
             fs::write(path, format!("@echo off\r\necho {target}\r\n"))?;
         } else {
             let path = bin_dir.join("rocm_agent_enumerator");
-            fs::write(&path, format!("#!/bin/sh\necho {target}\n"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-            }
+            crate::fake_executable::write_fake_executable(
+                &path,
+                format!("#!/bin/sh\necho {target}\n"),
+            )?;
         }
         Ok(())
     }

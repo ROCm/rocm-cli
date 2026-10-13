@@ -25,7 +25,7 @@ use rocm_core::{AppPaths, ExamineSummary, shell_command_for_host};
 use serde::{Deserialize, Serialize};
 
 use crate::cli_report;
-use crate::{empty_as_unknown, parse_os_release_field, read_os_release};
+use crate::runtime_install_finalize::{empty_as_unknown, parse_os_release_field, read_os_release};
 
 pub(crate) fn install_driver(
     paths: &AppPaths,

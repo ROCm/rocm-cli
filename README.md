@@ -32,9 +32,11 @@ for Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
+
+For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
@@ -282,8 +284,10 @@ fix` takes the id, not the position.
   this machine (nothing needs to be installed inside the distribution — name
   it only when more than one is installed). Inspecting remotely this way
   skips checks that need to read the distribution's own environment
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
-  `rocm diagnose` inside the distribution for those.
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) and the
+  library and shared-memory checks (`fix-18-comgr-conflict`,
+  `fix-19-shm-too-small`) — run `rocm diagnose` inside the distribution for
+  those.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing — there is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action. The
@@ -452,8 +456,8 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key>
-rocm runtimes rollback
+rocm runtimes activate <runtime-key> [--restart-services] [--yes]
+rocm runtimes rollback [--restart-services] [--yes]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
@@ -466,6 +470,69 @@ by the packages they were installed from, not by version alone, so one version
 can appear more than once: a `--devel` install and a plain one of the same
 version are two separate runtimes, as are two installs that resolved different
 GPU device payloads.
+
+`activate` and `rollback` change which runtime the next install or server
+picks up. A server that is already running is not moved: it keeps serving on
+the runtime it started with until it is restarted. Both commands count the
+servers they leave behind and name each one, from what those servers themselves
+recorded:
+
+```
+  services_on_previous_runtime: 2
+    - svc-a engine=vllm recorded_runtime=<old-runtime-key>
+    - svc-b engine=vllm recorded_runtime=<old-runtime-key>
+  note: those keep serving on their recorded runtime until they are restarted; run `rocm runtimes activate <runtime-key> --restart-services --yes` to move them
+```
+
+When nothing is left behind the count is `services_on_previous_runtime: 0`. A
+running server whose record names no runtime is counted separately under
+`services_with_unrecorded_runtime:`, because what it loaded cannot be read back
+from the record. Only servers on an engine that brings its own runtime
+(`lemonade`) are never counted; an `env_id` recorded in a service record is not
+a pin and does not exempt the server. The same summary appears in the
+`rocm install sdk` and `rocm update --apply --activate` reports, which activate
+a runtime without taking `--restart-services` themselves — which is why the note
+names the `rocm runtimes activate` invocation that does, rather than a flag to
+add to whatever was just run.
+
+The note's command re-activates the runtime that is already active, which moves
+the servers without moving the runtime. Re-activating the active runtime prints
+`changed_from_runtime_key: <unchanged>` and keeps the existing rollback target.
+
+Add `--restart-services` to move those servers onto the newly active runtime
+rather than leave them behind; each one is put on the new runtime and then
+restarted. Moving a server also clears any `env_id` stored in its record; the
+engine writes its own back on the next launch. That restarts running servers,
+so it requires `--yes` and never prompts, the same as
+`rocm services restart <service-id> --yes`.
+
+After each restart the command waits up to 45 seconds for the server to answer
+an inference request, and the summary lists the outcomes separately:
+
+```
+  services_restarted: 1
+    - svc-a
+  services_restarted_not_yet_serving: 1
+    - svc-b status=starting (check `rocm services logs svc-b` if it does not come up)
+  services_restart_failed: 1
+    - svc-c: <error>
+```
+
+- `services_restarted` lists servers that answered an inference request.
+- `services_restarted_not_yet_serving` lists servers that were respawned but had
+  not answered when the wait ended. The command still exits 0 for these; if one
+  does not come up, check `rocm services logs <service-id>`.
+- `services_restart_failed` lists servers that could not be restarted, and the
+  command exits with an error.
+
+Servers are handled one at a time and a failure does not stop the rest: every
+failure is named in the summary and its record is put back on the runtime it
+last ran on. After a failure the server is read back: one that is still live
+stays counted under `services_on_previous_runtime`, and one that is not is
+reported as stopped by the attempt. The error says which is which. Read
+`rocm services logs <service-id>` first — a restart that just failed is likely
+to fail the same way again — then start a stopped server with
+`rocm services restart <service-id> --yes` once the cause is fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
@@ -571,7 +638,7 @@ requested this time; otherwise it errors out instead of silently serving with
 different settings. If you previously started a service with `--temperature`
 (or another sampling flag) and now run `rocm serve` for the same model without
 flags — or with different ones — stop the existing service first (`rocm
-services stop`) or match the original flags.
+services stop <service-id> --yes`) or match the original flags.
 
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
@@ -616,8 +683,8 @@ Manage background servers started with `--managed`:
 ```
 rocm services list [--all] [--json]
 rocm services logs <service-id>
-rocm services stop <service-id> [--yes]
-rocm services restart <service-id> [--yes]
+rocm services stop <service-id> --yes
+rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
@@ -760,6 +827,53 @@ rocm comfyui models-path
 None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
 accepted on each for consistency with other mutating commands but currently
 has no effect.
+
+`install --reinstall` replaces ComfyUI's code in its `source/` folder (the
+folder that contains the `models path:` it prints):
+
+- **Deleted and replaced:** the top-level files and folders the installed
+  ComfyUI release shipped, which rocm-cli records when it installs one, plus
+  `__pycache__/`.
+- **Kept:** `models/` (the folder `models-path` prints), `user/` (saved
+  workflows and settings), `output/`, `input/`, `custom_nodes/`, `datasets/`
+  and `extra_model_paths.yaml`. They are never moved, copied or deleted. Files
+  a new release adds inside them are added alongside yours; where both have a
+  file of the same name, yours is kept, and a folder you replaced with a
+  symlink is not written into.
+- **Set aside:** an entry of yours whose name the new release starts shipping
+  (an `app/` of yours when a release adds `app/`, say) is renamed to
+  `<name>.rocm-cli-kept-<time>` rather than deleted. The reinstall lists it
+  under `set aside:` with its new name.
+- **Left in place:** anything else, such as `.git/`, a `venv/`, `styles.csv`,
+  logs or `temp/`. The reinstall lists these.
+
+An install made before rocm-cli recorded what its release shipped has nothing
+to tell release code from your entries. There, the entries with the names the
+new release ships are deleted and replaced instead, including one of yours of
+the same name, and the reinstall lists them under `replaced:`; everything else
+is left in place. On Windows, names that differ only in case (`readme.md`,
+`README.md`) count as the same entry, as they do on its file systems.
+
+The new copy is unpacked before the existing one is touched, so a failed
+download, or a download that is not a ComfyUI release (no `main.py` at its
+top), leaves the install as it was; such a download is not kept, so the next
+attempt downloads again. `--reinstall --dry-run` names the folder
+whose code would be replaced, which of the kept folders it holds, and whether
+an entry of yours named like the new release's code would be set aside or
+replaced; which entries those are is only known once the new release is
+downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
+launched is running or still starting, and its dry run says so; stop it with
+`rocm comfyui stop` first. This is checked before the download and again just
+before the code is replaced, so a ComfyUI started during the download is
+caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
+reinstall says so and is not refused, since `stop` cannot read it either. If a
+reinstall is interrupted part-way, or stops part-way (because a file it must
+delete or move is in use, say), `start` refuses to launch the half-replaced
+folder, and `start`, `status`, the answer to
+`rocm "what is the comfyui status"` and the failed reinstall name the
+`rocm comfyui install --runtime-id <key>` command that finishes it. If the
+install fails after the new code is in place (in the GPU check, say), the
+error names that command too, and what was replaced or set aside.
 
 ### Automations
 
