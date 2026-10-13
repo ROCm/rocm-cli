@@ -1209,6 +1209,7 @@ async fn plant_unrelated_live_lemonade_serve(world: &mut E2eWorld) {
             startup_phase: Some("initializing"),
             supervisor_pid: std::process::id(),
             engine_pid: Some(std::process::id()),
+            ..ServiceRecordOptions::default()
         },
     );
 }
