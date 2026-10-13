@@ -1597,8 +1597,9 @@ const TORCH_STACK_PROBE: &str = "import json,sys\n\
 /// `LD_LIBRARY_PATH`/`ROCM_PATH`, while this runs the interpreter bare.
 ///
 /// Exact versions of the whole torch stack (`torch`, `torchvision`, `torchaudio`),
-/// formatted `name=version` (or `name=absent`), one per line. The product pins all
-/// three, so the scenario compares all three.
+/// formatted `name=version` (or `name=absent`), one per line. The product pins whichever
+/// of the three are installed, so the scenario compares all three: a member that
+/// appears later changes the string.
 fn torch_stack_versions(python: &Path) -> String {
     let output = std::process::Command::new(python)
         .args(["-c", TORCH_STACK_PROBE])
