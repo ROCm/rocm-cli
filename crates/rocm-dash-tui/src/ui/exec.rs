@@ -38,14 +38,12 @@ pub fn exe_label(cmd: &str) -> &str {
 /// ordinary preview stays readable — `rocm serve qwen2.5-7b --managed`, not
 /// `rocm 'serve' 'qwen2.5-7b' '--managed'`.
 ///
-/// Mirrors the CLI-side quoter in `apps/rocm/src/shell_quote.rs`. Deliberately
-/// a second copy: `xtask`'s crate-edge contract forbids
-/// `rocm-dash-tui -> rocm-core` (`xtask/src/crate_edges.rs`), and `apps/rocm`
-/// is the crate that owns `rocm-core`, so there is nowhere both can reach
-/// without breaking that. Nothing ties the two copies to each other: each is
-/// held to the same contract by its own tests, including a real `sh` reading
-/// the rendered line back, so either one *breaking* fails its own suite. They
-/// may still differ harmlessly in which values they leave bare.
+/// The one quoter in the workspace. `apps/rocm`'s `shell_quote` delegates
+/// here rather than keeping a copy: `apps/rocm` already depends on this crate,
+/// so this is the place both can reach without a new crate edge (the reverse,
+/// `rocm-dash-tui -> rocm-core`, is the one `xtask/src/crate_edges.rs`
+/// forbids). The remote `ssh` command line, the CLI's printed `run:` hints and
+/// these approval previews therefore cannot drift apart.
 pub fn quote_display_arg(value: &str) -> String {
     // `=` is left bare because POSIX gives it meaning only in a word ahead of
     // the command name, where `A=b` is an assignment rather than an argument.
@@ -152,9 +150,19 @@ mod tests {
     /// empty argument — are the ones nobody writes an example for, and uniform
     /// random text produces them too rarely to find anything. Reach is measured
     /// by `the_generator_reaches_the_shapes_that_break_quoting`.
+    ///
+    /// `[ ] { } % , @ +` are here although most shells give them little or no
+    /// meaning in an argument: `[`/`]` glob, `{`/`}` brace-expand in bash, and
+    /// a quoter that marked any of them inert would otherwise be caught only
+    /// by a single example. `\t` is the one control character, and it is here
+    /// as whitespace, not as a control character.
+    ///
+    /// `apps/rocm/src/shell_quote.rs` has a second generator for the CLI's own
+    /// renderers. It cannot share this one: a `#[cfg(test)]` item is not
+    /// visible to another crate's tests.
     const HOSTILE_ALPHABET: &[char] = &[
         ' ', '\t', '"', '\'', '\\', '$', '`', ';', '|', '&', '*', '?', '(', ')', '<', '>', '#',
-        '=', '-', '~', '!', 'a', '1', '/', 'é',
+        '=', '-', '~', '!', '[', ']', '{', '}', '%', ',', '@', '+', 'a', '1', '/', 'é',
     ];
 
     fn hostile_arg() -> impl Strategy<Value = String> {
@@ -164,6 +172,7 @@ mod tests {
             1 => proptest::sample::select(&[
                 "install", "sdk", "--prefix", "/mnt/my folder",
                 "C:\\Program Files\\ROCm", "qwen2.5-7b-instruct", "",
+                "package[extra]",
             ][..]).prop_map(str::to_owned),
         ]
     }
@@ -178,6 +187,11 @@ mod tests {
         /// rendered line the way a shell would and demanding that argv back —
         /// `shlex` is a POSIX word-splitter, which is exactly the reader this
         /// line is written for.
+        ///
+        /// That a preview has exactly one word per argument follows from this.
+        /// What does not follow is that `;`, `|` or `>` stay data: `shlex`
+        /// treats none of them as operators, so only the real-`sh` property
+        /// below checks that — and it runs on unix only.
         #[test]
         fn a_preview_splits_back_to_the_argv_the_job_will_run(argv in hostile_argv()) {
             let preview = format!("{} {}", exe_label("/usr/local/bin/rocm"), display_args(&argv));
@@ -186,15 +200,6 @@ mod tests {
                 .collect();
             let split = shlex::split(&preview);
             prop_assert_eq!(split, Some(expected), "preview = {:?}", preview);
-        }
-
-        /// No argument can add a word to the preview, so a `;`, `|` or `>`
-        /// inside a value reads as data rather than as a second command.
-        #[test]
-        fn an_argument_can_never_add_a_word(argv in hostile_argv()) {
-            let preview = display_args(&argv);
-            let split = shlex::split(&preview).expect("preview must parse");
-            prop_assert_eq!(split.len(), argv.len(), "preview = {:?}", preview);
         }
 
         /// Quoting an already-quoted token does not corrupt it.
@@ -308,13 +313,20 @@ mod tests {
         }
     }
 
+    /// A Windows install folder keeps its backslashes in the preview.
+    ///
+    /// Deliberately a folder with no space in it: a space makes any quoter
+    /// wrap the value, so `C:\Program Files\ROCm` round-tripped under the old
+    /// double-quoted form too and could not tell the two apart. A bare
+    /// backslash is what has to be quoted on its own merits — left bare, a
+    /// POSIX reader treats it as an escape and hands back `C:ROCm`.
     #[test]
     fn a_windows_install_folder_keeps_its_separators() {
         let argv = [
             "install".to_owned(),
             "sdk".to_owned(),
             "--prefix".to_owned(),
-            "C:\\Program Files\\ROCm".to_owned(),
+            "C:\\ROCm".to_owned(),
         ];
         let preview = format!(
             "{} {}",
@@ -328,8 +340,46 @@ mod tests {
                 "install".to_owned(),
                 "sdk".to_owned(),
                 "--prefix".to_owned(),
-                "C:\\Program Files\\ROCm".to_owned(),
-            ])
+                "C:\\ROCm".to_owned(),
+            ]),
+            "preview = {preview:?}"
         );
+    }
+
+    /// Glob brackets are quoted, so a pip-style extra is one literal word.
+    ///
+    /// The generator draws `[` and `]` too; this pins the shape users actually
+    /// type, so marking either inert fails here by name and not only on
+    /// whichever generated case happens to hit it.
+    #[test]
+    fn a_package_extra_is_quoted_as_one_literal_word() {
+        assert_eq!(quote_display_arg("package[extra]"), "'package[extra]'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hostile_values_survive_a_real_shell_as_one_literal_argument() {
+        // The property that matters is not the shape of the quoting but what a
+        // shell does with it. Ask one: each value must come back byte-identical,
+        // proving it was neither expanded nor split nor able to start a second
+        // command.
+        for value in [
+            "x'; rm -rf ~; echo '",
+            "$(id)",
+            "`id`",
+            "a b",
+            "it's",
+            "*",
+            "package[extra]",
+            "--not-a-flag",
+            "qwen2.5-7b-instruct",
+            "/mnt/my folder",
+        ] {
+            assert_eq!(
+                words_a_real_shell_reads(&quote_display_arg(value)),
+                vec![value.to_owned()],
+                "shell mangled {value:?}"
+            );
+        }
     }
 }
