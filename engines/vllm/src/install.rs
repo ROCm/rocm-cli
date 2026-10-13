@@ -127,6 +127,7 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // rejects. Left as-is rather than pinned blind -- which torchaudio
         // rebuild pairs with 10.0's torch 2.12 needs a live 10.0 box to
         // establish, and this row has no coverage on the self-hosted lanes.
+        // `rocm install sdk` reads this field too: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Series("2.11"),
     },
     VllmRocmDiscoverBuild {
@@ -160,7 +161,8 @@ const VLLM_ROCM_DISCOVER_BUILD_TABLE: &[VllmRocmDiscoverBuild] = &[
         // box: torch 2.13.0+rocm10.1.0 exports both symbols as `T`, and
         // torchaudio 2.11.0.2 imports them as `U`); a series match would
         // resolve the newest, `2.11.0.3`, so pin the lower of the two
-        // confirmed-working builds instead.
+        // confirmed-working builds instead. `rocm install sdk` pins this same
+        // build for the 10.1 line: see `torchaudio_version`.
         torchaudio_version: DiscoverVersion::Exact("2.11.0.2"),
     },
 ];

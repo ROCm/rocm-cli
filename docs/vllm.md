@@ -84,7 +84,8 @@ own `+rocmX.Y` torch from, but vLLM's discovery is independent of that: it
 resolves its own torch/torchvision/torchaudio pins fresh from the row's own
 static version prefixes, rather than reusing whatever the SDK install
 resolved, which may be a different torch version than this row pins. One
-value flows the other way: a row's exact torchaudio pin (10.1's `2.11.0.2`) is
+value flows the other way: a row's exact torchaudio pin, where it has one rather
+than a series, is
 also the hardware-verified build `rocm install sdk` pins for that ROCm line,
 read from this table rather than copied, so set an exact torchaudio only for a
 build confirmed on hardware. Patch
