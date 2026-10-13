@@ -49,8 +49,9 @@ index currently serves (see the pre-warm section below for the exact,
 unpinned invocation). Pinning it to hold at `n-1`/`n-2` instead of
 always-latest, and wiring an actual `sdk_version: [current, n-1, n-2]` matrix
 axis into the release-branch trigger, is pending work (ROCMAI-430): nothing
-in this repo today maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
-index-version parsers are private).
+in this repo today maps "n-1"/"n-2" to a concrete SDK version
+([`therock.rs`](../apps/rocm/src/therock.rs)'s `parse_simple_index_versions`
+is private).
 
 ## Platforms
 
