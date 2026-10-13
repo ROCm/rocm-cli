@@ -91,10 +91,10 @@ pub use model_catalog::{
     ModelRecipeIndexDocument, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     ModelRecipeUnsupportedCombinationRecord, builtin_model_recipe_registry, builtin_model_recipes,
     load_model_recipe_index, load_model_recipe_registry, load_signed_model_recipe_index,
-    model_artifact_cache_status, model_catalog_platforms, model_recipe_featured,
-    model_recipe_index_signature_path, model_recipe_target_platform_label, normalize_model_ref,
-    platform_matches_gfx_family, resolve_builtin_model_recipe, resolve_model_recipe,
-    resolve_model_recipe_artifact, verify_model_recipe_index_signature,
+    model_artifact_cache_marker_path, model_artifact_cache_status, model_catalog_platforms,
+    model_recipe_featured, model_recipe_index_signature_path, model_recipe_target_platform_label,
+    normalize_model_ref, platform_matches_gfx_family, resolve_builtin_model_recipe,
+    resolve_model_recipe, resolve_model_recipe_artifact, verify_model_recipe_index_signature,
 };
 pub use net::{
     Backoff, DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, DOWNLOAD_MAX_ATTEMPTS, DownloadOutcome,
