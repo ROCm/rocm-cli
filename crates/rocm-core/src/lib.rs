@@ -21,6 +21,7 @@ pub mod fake_executable;
 pub mod fix;
 pub mod hardware_root;
 pub mod host_gpu;
+pub mod log_tail;
 pub mod managed_runtime;
 pub mod model_catalog;
 pub mod model_readiness;
@@ -77,6 +78,7 @@ use host_gpu::{
     detect_wsl_host_driver, detect_wsl_summary, is_wsl1_kernel, ldconfig_cache,
     ldconfig_lists_librocdxg, managed_therock_sdk_probe_candidates,
 };
+pub use log_tail::tail_lines;
 pub use managed_runtime::{
     FrameworkInterpreter, ManagedRuntimeEnvironment, active_managed_framework_interpreter,
     active_managed_therock_channel, active_managed_therock_environment,
