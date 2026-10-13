@@ -916,9 +916,10 @@ pub(crate) const fn stopped_record_verdict(
     }
 }
 
-/// Whether a record carrying no start-time predates the field. Both supported
-/// platforms (Linux, Windows) can record one, so an absent value means the record
-/// was written by a pre-upgrade `rocmd`.
+/// Whether a record carrying no start-time cannot be proven ours. Both supported
+/// platforms (Linux, Windows) can record one, so an absent value means the
+/// record predates the field or its writer never stamped it; either way the pid
+/// is unproven.
 pub(crate) const fn record_predates_start_ticks(recorded_start_ticks: Option<u64>) -> bool {
     recorded_start_ticks.is_none()
 }

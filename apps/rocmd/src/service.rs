@@ -557,6 +557,7 @@ pub(crate) fn supervise_service(
         env_id.clone(),
         Some(device_policy.clone()),
     );
+    record.set_supervisor(std::process::id());
     record.gpu_indices = gpu_indices;
     record.engine_recipe_json = engine_recipe_json.clone();
     // Carried over from whatever is on disk. `ManagedServiceRecord::new` starts

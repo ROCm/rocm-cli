@@ -1449,7 +1449,7 @@ pub(crate) fn restart_managed_service(
     // that write can land after the child's. Clearing here keeps the invariant
     // true at the one site that reuses a record across restarts.
     record.reset_for_restart();
-    record.supervisor_pid = std::process::id();
+    record.set_supervisor(std::process::id());
     record.write()?;
 
     let mut child = detached_rocmd_command(&rocmd_binary)
@@ -1460,7 +1460,7 @@ pub(crate) fn restart_managed_service(
         .spawn()
         .context("failed to spawn recovery supervisor")?;
 
-    record.supervisor_pid = child.id();
+    record.set_supervisor(child.id());
     record.write()?;
 
     thread::sleep(Duration::from_millis(200));

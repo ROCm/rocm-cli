@@ -4266,6 +4266,14 @@ impl ManagedServiceRecord {
         }
     }
 
+    /// Record `pid` as the supervisor together with its start-time token. The
+    /// two are one fact: uninstall refuses a live supervisor pid that has no
+    /// start time, so writing the pid alone makes every such record block it.
+    pub fn set_supervisor(&mut self, pid: u32) {
+        self.supervisor_pid = pid;
+        self.supervisor_start_ticks = process_start_ticks(pid);
+    }
+
     /// Drop the per-run state that a restart invalidates, and count the restart.
     ///
     /// A restart reuses this manifest but spawns a different server with an
@@ -6684,6 +6692,21 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn set_supervisor_records_the_pid_with_its_own_start_time() {
+        let mut record = probe_test_record(1);
+        assert_eq!(record.supervisor_start_ticks, None);
+        record.set_supervisor(std::process::id());
+        assert_eq!(record.supervisor_pid, std::process::id());
+        assert_eq!(
+            record.supervisor_start_ticks,
+            process_start_ticks(std::process::id()),
+            "a supervisor pid without a start time makes uninstall refuse a live, ours service"
+        );
+        assert!(record.supervisor_start_ticks.is_some());
     }
 
     #[test]
