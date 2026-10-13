@@ -531,6 +531,7 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
             startup_phase: None,
             supervisor_pid: server.id(),
             engine_pid: Some(server.id()),
+            ..ServiceRecordOptions::default()
         },
     );
     // A record written by a current `rocmd` carries the supervisor's start time;
