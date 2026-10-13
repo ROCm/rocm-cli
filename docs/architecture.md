@@ -43,8 +43,10 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 - [`logging.rs`](../apps/rocm/src/logging.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`provider_keys.rs`](../apps/rocm/src/provider_keys.rs) — full domain extraction.
 - [`providers.rs`](../apps/rocm/src/providers.rs) — full domain extraction (no dedicated command enum; invoked from the existing chat/config command flows).
+- [`runtime_services.rs`](../apps/rocm/src/runtime_services.rs) — full domain extraction; reads the live local servers at activation time, classifies each against the runtime being activated, renders the report, and moves stale ones with `--restart-services`.
 - [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs) — mechanical relocation, owns private types (Phase 6a): `serve()`, plus engine-recipe overrides.
 - [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) — full domain extraction.
+- [`service_hints.rs`](../apps/rocm/src/service_hints.rs) — shared CLI-output component: the `rocm services <action> <id> --yes` hint text, shared by [`main.rs`](../apps/rocm/src/main.rs), [`remote/mod.rs`](../apps/rocm/src/remote/mod.rs), and [`serve_summary.rs`](../apps/rocm/src/serve_summary.rs) so the three cannot go out of sync with each other, as `serve_summary.rs`'s stop row did from the day it was added — #417.
 - [`storage.rs`](../apps/rocm/src/storage.rs) — full domain extraction.
 - [`therock.rs`](../apps/rocm/src/therock.rs) — full domain extraction; owns TheRock SDK install/update and the runtime-manifest model/loaders. The `runtimes` subcommand's own command enum, dispatch fn, and most of its domain logic — rendering, activation, and manifest import — stay in [`main.rs`](../apps/rocm/src/main.rs).
 - [`uninstall.rs`](../apps/rocm/src/uninstall.rs) — mechanical relocation, dispatch-adjacent, no owned types.

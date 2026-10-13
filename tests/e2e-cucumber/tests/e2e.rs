@@ -37,6 +37,7 @@ mod e2e {
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
+    pub mod service_stop_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;

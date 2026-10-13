@@ -492,9 +492,40 @@ Activate one validated runtime:
 
 ```bash
 rocm runtimes activate <runtime_key>
+rocm runtimes activate <runtime_key> --restart-services --yes
 ```
 
-Engine installs and managed serving inherit this active runtime by default.
+New engine installs and new serve launches use this active runtime by default.
+Already-running managed servers do not follow the activation: each one keeps
+the runtime recorded in its service record until it is restarted. The
+activation report says so from that recorded state rather than as a fixed
+note — it prints `services_on_previous_runtime: <n>` with one line per stale
+service (`- <service_id> engine=<engine> recorded_runtime=<key>`), and
+`services_on_previous_runtime: 0` when nothing is left behind. Live services
+whose record names no runtime are counted separately under
+`services_with_unrecorded_runtime:`. Only services on an engine that
+manages its own runtime (`lemonade`) are never counted as stale; an `env_id`
+recorded in a service record is not a pin and does not exempt the service.
+
+`--restart-services` moves those services: it rewrites each service record onto
+the newly active runtime and then restarts it. Moving a service also clears any
+`env_id` stored in its record; the engine writes its own back on the next
+launch. It requires `--yes` and never prompts, the same idiom as
+`rocm services restart <id> --yes` and `rocm runtimes uninstall --yes`. Restart
+is best effort per service — every failure is named, its record is put back on
+the runtime it actually ran on, and the command exits non-zero. After a failure
+the service is read back: one that is still live stays counted under
+`services_on_previous_runtime`, and one that is not is reported as stopped by
+the attempt. The error says which is which. `services_restarted` lists only
+servers that answered an inference request after the restart; one that was
+respawned but had not answered when the restart stopped waiting (45 seconds) is
+listed under `services_restarted_not_yet_serving` instead, and does not fail the
+command.
+
+Activating the runtime that is already active changes nothing: the report prints
+`changed_from_runtime_key: <unchanged>` and the existing rollback target is kept,
+so the activation command in the report's own note can be run safely.
+
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.
 
@@ -517,10 +548,12 @@ Developer-only previous-runtime regression check:
 
 ```bash
 rocm runtimes rollback
+rocm runtimes rollback --restart-services --yes
 ```
 
 This command validates the saved previous-runtime marker, but it is not the
-primary user-facing way to switch ROCm installs.
+primary user-facing way to switch ROCm installs. It reports and restarts
+running services exactly as `activate` does.
 
 Import an existing rocm-cli/TheRock runtime manifest in read-only mode:
 
@@ -715,8 +748,18 @@ happens before anything is stopped, so it cannot take down a running service. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
-that later observes the process dead. There is no e2e coverage of `services
-stop`/`restart` or endpoint auth; these paths are unit-tested only.
+that later observes the process dead. `service-stop-01`
+(`features/service_stop.feature`) covers `services stop` succeeding against a
+running record on the mock lane and the record being persisted as stopped;
+there is still no e2e coverage of the key being dropped or `services restart`,
+which remain unit-tested only. Reusing a running service for a
+`--require-api-key` request it never had is refused rather than silently
+upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
+Linux-only since the Windows managed Lemonade spawn can't enforce the key)
+covers the local refusal and that its printed stop hint actually clears it;
+`remote-15` (`features/remote.feature`, `@requires-docker`) covers the same
+refusal on `rocm remote serve`, reusing the fake remote's own deterministic
+service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being

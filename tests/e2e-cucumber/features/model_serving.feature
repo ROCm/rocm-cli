@@ -296,12 +296,38 @@ Feature: Model serving
     Then the serve plan warns the GPU is low on VRAM
     And the serve plan explains how to lower vLLM's memory reservation
 
+  # `--require-api-key` reuse refusal (#604). A running server's key is read once
+  # at launch; reuse cannot retroactively satisfy a demand for auth the server
+  # never got, so the idempotency guard refuses instead of upgrading the record
+  # in place (see `spawn_managed_engine_child` in `main.rs`). This is the
+  # local-side proof that the printed stop hint is not just present but correct
+  # and directly runnable: the scenario stops the service with it and checks the
+  # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
+  # running-service` gives the summary's own hint. The idempotency match is keyed
+  # on (engine, canonical model id) only — not a real listening port or process —
+  # so a planted record is enough; no actual Lemonade load is needed. Runs on the
+  # Lemonade GPU lane because `--managed` serve still refuses before reaching
+  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
+  # bind, and the serve path's `ensure_public_bind_engine_supported` guard
+  # (defined in `main.rs`, called from `serve_cmd.rs`) refuses that combination
+  # for Lemonade on Windows (its server can't receive the key through the
+  # Windows detached-spawn primitive), so this scenario cannot reach the
+  # refusal it exercises there.
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again with --require-api-key
+    Then the CLI refuses and names the exact command to stop the existing service
+    And running that command actually stops the service
+
   # Real CLI coverage for automatic port allocation. A loopback listener holds
   # the legacy default while one real managed GPU serve starts; the reported
   # endpoint must advance to the next candidate rather than failing late in the
   # engine. Runs in the merge queue because it launches a real model server.
   @id:serve-auto-port-skips-occupied @requires-gpu @merge-queue
-  Scenario: serve-24 - Automatic serving skips an occupied default port
+  Scenario: serve-25 - Automatic serving skips an occupied default port
     Given a managed runtime is active
     And the default serve port is occupied
     When the user serves a model with automatic port selection
@@ -312,7 +338,7 @@ Feature: Model serving
   # before any engine or GPU work, so it needs no GPU and gates every PR
   # (ungated), like its sibling serve-14.
   @id:serve-invalid-port-rejected
-  Scenario: serve-25 - Serving with an out-of-range port is refused with a clear reason
+  Scenario: serve-26 - Serving with an out-of-range port is refused with a clear reason
     When the user serves a model with an out-of-range port
     Then serving is refused before any engine starts
     And the user is told the port must be between 1 and 65535
@@ -323,9 +349,9 @@ Feature: Model serving
   # another port. Reaching this check needs a real GPU: `resolve_serve_port`
   # only runs once `spawn_managed_engine_child` has a completed model/engine
   # resolution in hand, and `serve` has no CPU fallback that gets there.
-  # Runs in the merge queue, like its automatic-port sibling serve-24.
+  # Runs in the merge queue, like its automatic-port sibling serve-25.
   @id:serve-explicit-port-reserved @requires-gpu @merge-queue
-  Scenario: serve-26 - Serving on a port another managed service already holds is refused
+  Scenario: serve-27 - Serving on a port another managed service already holds is refused
     Given a managed runtime is active
     And another managed service already reserves the default serve port
     When the user serves a model explicitly on the reserved port

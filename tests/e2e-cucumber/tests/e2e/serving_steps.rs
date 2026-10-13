@@ -34,7 +34,7 @@ fn serve_timeout_secs() -> u64 {
 /// scenario (lengthen a genuinely slow serve, e.g. a large model), else an
 /// `expectations.toml` xfail `serve_timeout_secs` (shorten a known-bug serve so
 /// it fails fast).
-fn serve_timeout_for(world: &E2eWorld) -> u64 {
+pub(crate) fn serve_timeout_for(world: &E2eWorld) -> u64 {
     world
         .serve_timeout_override
         .unwrap_or_else(serve_timeout_secs)
@@ -47,7 +47,11 @@ fn serve_timeout_for(world: &E2eWorld) -> u64 {
 /// scenario A's `rocm` has no record of scenario B's managed service and can't
 /// stop it; a plain 200 check would then proceed against the WRONG model. Wait
 /// for the expected model so the readiness signal reflects this scenario's serve.
-async fn model_is_ready(models_url: &str, expect_model: Option<&str>, timeout_secs: u64) -> bool {
+pub(crate) async fn model_is_ready(
+    models_url: &str,
+    expect_model: Option<&str>,
+    timeout_secs: u64,
+) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     while Instant::now() < deadline {
         if let Ok(resp) = reqwest::get(models_url).await
@@ -1555,7 +1559,7 @@ fn resolved_model(output: &str) -> Option<&str> {
 /// (`Qwen3-4B-Instruct-2507-GGUF`) matches the concrete artifact the endpoint
 /// reports (`Qwen3-4B-Instruct-2507-Q4_K_M.gguf`) — both share the base
 /// `Qwen3-4B-Instruct-2507`.
-fn ready_substr_for(model_id: &str) -> &str {
+pub(crate) fn ready_substr_for(model_id: &str) -> &str {
     let base = model_id.rsplit('/').next().unwrap_or(model_id);
     base.strip_suffix("-GGUF")
         .or_else(|| base.strip_suffix("-gguf"))
@@ -1678,4 +1682,142 @@ async fn assert_response_model_correct(world: &mut E2eWorld) {
 /// match in either direction.
 fn model_ids_match(resp_model: &str, expected: &str) -> bool {
     e2e_cucumber::model_id::model_ids_match(resp_model, expected)
+}
+
+// ── `--require-api-key` reuse refusal (#604) ──────────────────────────
+
+/// Catalog id of the built-in Lemonade smoke-test recipe (`model_catalog.json`).
+/// Its `engine_recipes` list is empty, so a plain serve of this model on
+/// `lemonade` with no extra flags resolves `engine_recipe: None` — the planted
+/// record below omits `engine_recipe_json` (defaults to `null`) to match, so
+/// the idempotency guard's recipe-mismatch check never fires and the scenario
+/// reaches the `--require-api-key` check it exists to exercise.
+const REUSE_REFUSAL_MODEL: &str = "Qwen3-0.6B-GGUF";
+const REUSE_REFUSAL_ENGINE: &str = "lemonade";
+const REUSE_REFUSAL_SERVICE_ID: &str = "lemonade-e2e-reuse";
+
+/// Plants a live, unauthenticated managed-service record for
+/// [`REUSE_REFUSAL_MODEL`]/[`REUSE_REFUSAL_ENGINE`] — matching the idempotency
+/// guard's key of `(engine, canonical_model_id)` only, not a real listening
+/// port or process, so no actual Lemonade load is needed. `supervisor_pid: 0`
+/// is the documented placeholder for "no process recorded yet", so the
+/// liveness overlay reads `status` at face value instead of checking a PID —
+/// the same trick `service_stop_steps.rs` uses, and for the same reason: a
+/// *real* PID here would be actively harmful, since the World's teardown runs
+/// `rocm services stop <id> --yes` for every record left in the isolated tree.
+#[given("an unauthenticated Lemonade service is already running for that model")]
+async fn plant_unauthenticated_lemonade_service(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let services_dir = root.join("data").join("services");
+    let states_dir = root
+        .join("data")
+        .join("engines")
+        .join(REUSE_REFUSAL_ENGINE)
+        .join("state");
+    std::fs::create_dir_all(&services_dir).expect("failed to create services dir");
+    std::fs::create_dir_all(&states_dir).expect("failed to create engine state dir");
+
+    let manifest = services_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json"));
+    let record = serde_json::json!({
+        "service_id": REUSE_REFUSAL_SERVICE_ID,
+        "engine": REUSE_REFUSAL_ENGINE,
+        "model_ref": REUSE_REFUSAL_MODEL,
+        "canonical_model_id": REUSE_REFUSAL_MODEL,
+        "host": "127.0.0.1",
+        // Discard port: nothing here depends on a real server answering on it —
+        // the idempotency guard matches on engine + canonical model id only.
+        "port": 9,
+        "endpoint_url": "http://127.0.0.1:9/v1",
+        "mode": "managed",
+        "status": "starting",
+        "supervisor_pid": 0,
+        "engine_pid": null,
+        "requires_api_key": false,
+        "engine_recipe_json": null,
+        "manifest_path": manifest,
+        "log_path": services_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.log")),
+        "engine_state_path": states_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json")),
+        "created_at_unix_ms": 1_700_000_000_000_u64,
+    });
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec_pretty(&record).expect("failed to serialize record"),
+    )
+    .expect("failed to write service record");
+    std::fs::write(
+        states_dir.join(format!("{REUSE_REFUSAL_SERVICE_ID}.json")),
+        serde_json::json!({ "status": "starting" }).to_string(),
+    )
+    .expect("failed to write engine state");
+}
+
+#[when("the user serves that same model again with --require-api-key")]
+async fn user_serves_requiring_api_key(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            REUSE_REFUSAL_MODEL,
+            "--engine",
+            REUSE_REFUSAL_ENGINE,
+            "--managed",
+            "--require-api-key",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("the CLI refuses and names the exact command to stop the existing service")]
+async fn assert_refused_with_stop_hint(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert!(
+        rc != 0,
+        "reusing an unauthenticated service must not satisfy --require-api-key, but serve exited 0:\n{output}"
+    );
+    assert!(
+        output.contains("without authentication"),
+        "the refusal must say why it refused: {output}"
+    );
+    assert!(
+        output.contains(&format!(
+            "rocm services stop {REUSE_REFUSAL_SERVICE_ID} --yes"
+        )),
+        "the refusal must name the way out, directly runnable with --yes: {output}"
+    );
+}
+
+#[then("running that command actually stops the service")]
+async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
+    let stdout = crate::run_rocm_ok(
+        world,
+        &["services", "stop", REUSE_REFUSAL_SERVICE_ID, "--yes"],
+    );
+    assert!(
+        stdout.contains("stopped"),
+        "stopping the planted service must report success:\n{stdout}"
+    );
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path();
+    let manifest = root
+        .join("data")
+        .join("services")
+        .join(format!("{REUSE_REFUSAL_SERVICE_ID}.json"));
+    let bytes = std::fs::read(&manifest).expect("failed to read service record");
+    let record: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("failed to parse service record");
+    assert_eq!(
+        record.get("status").and_then(serde_json::Value::as_str),
+        Some("stopped"),
+        "the on-disk record must persist the stop, got:\n{record}"
+    );
 }
