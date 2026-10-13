@@ -38,14 +38,19 @@ use rocm_engine_protocol::{
 use serde::Deserialize;
 
 use crate::EnginesCommand;
+use crate::runtime_install_finalize::{
+    ensure_libatomic_for_torch, ensure_libnuma_for_torch, ensure_openmpi_for_vllm,
+    settle_engine_install,
+};
+use crate::runtimes_cmd::{
+    normalize_path_for_compare, recover_setup_runtime_registration, select_runtime_manifest,
+    validate_runtime_manifest_for_activation,
+};
 use crate::therock;
 use crate::{
-    apply_app_path_env, engine_request, engine_request_with_env_root, ensure_libatomic_for_torch,
-    ensure_libnuma_for_torch, ensure_openmpi_for_vllm, normalize_path_for_compare,
-    record_cli_audit_event, recover_setup_runtime_registration,
+    apply_app_path_env, engine_request, engine_request_with_env_root, record_cli_audit_event,
     render_engine_inventory_text_with_paths, resolve_engine_selection,
-    resolve_runtime_selector_to_exact_key, select_runtime_manifest, settle_engine_install,
-    validate_engine_selection_runtime, validate_runtime_manifest_for_activation,
+    resolve_runtime_selector_to_exact_key, validate_engine_selection_runtime,
 };
 
 pub(crate) fn render_engine_inventory_text() -> String {
@@ -715,7 +720,8 @@ fn load_engine_env_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{test_paths, test_runtime_manifest_for_update, write_test_pip_runtime};
+    use crate::test_support::write_test_pip_runtime;
+    use crate::tests::{test_paths, test_runtime_manifest_for_update};
 
     /// Two runtimes installed side by side, as a pre-warmed CI tree holds them.
     ///
