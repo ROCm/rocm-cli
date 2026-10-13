@@ -7,13 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+// `Read`/`Command`/`Stdio`/`thread`/`Instant` are this branch's, not survivors
+// of the `process.rs` extraction (#599): `run_command_with_timeout` and its
+// drain and reaper threads still live in this module, so the `Read` bound that
+// `drain_on_thread` needs has to come back even though the extraction took the
+// import with it. The `windows_sys` block that used to sit here left with that
+// extraction and is deliberately not kept — nothing in this file uses it any
+// more, and an unused import is a hard error on the Windows lane's
+// `-D warnings` build.
+use std::io::Read;
 use std::path::{Path, PathBuf};
-// `Command`/`Stdio`/`thread`/`Instant` are this branch's, not survivors of the
-// `process.rs` extraction (#599): `run_command_with_timeout` and its drain and
-// reaper threads still live in this module. The `windows_sys` block that used
-// to sit here left with that extraction and is deliberately not kept — nothing
-// in this file uses it any more, and an unused import is a hard error on the
-// Windows lane's `-D warnings` build.
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
