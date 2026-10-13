@@ -19,7 +19,7 @@ newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
 that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`. `xtask/src/workflow_contract.rs`'s
+`EAI-7548`. [`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
 `self_hosted_workflow_owns_the_gpu_lanes` test requires `e2e-gpu`,
 `e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` to appear as job keys in
 `e2e-selfhosted.yml`, so a PR that moves one of these lanes back into
@@ -44,16 +44,13 @@ rung instead of being removed outright.
 The release-candidate rung's `release/**` trigger merged in PR #415, so
 `e2e-selfhosted.yml` on `main` already triggers on `push: branches: [main,
 "release/**"]`. `cargo xtask e2e-prewarm` has no `--version`/`--build-date`
-pin at HEAD (ROCMAI-430 adds mutually exclusive flags for that, so a
-release-branch run can hold at `n-1`/`n-2` instead of always tracking the
-latest channel index — see the pre-warm section below for its current,
-unpinned invocation). Wiring an actual `sdk_version: [current, n-1, n-2]`
-matrix axis into the release-branch trigger is a separate, not-yet-started
-step: nothing in this
-repo maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
-index-version parsers are private), so the release gate's SDK version is
-whatever `--version`/`--build-date` its caller passes, not an automatic
-3-way matrix.
+pin today — every lane, including this one, tracks whatever build the channel
+index currently serves (see the pre-warm section below for the exact,
+unpinned invocation). Pinning it to hold at `n-1`/`n-2` instead of
+always-latest, and wiring an actual `sdk_version: [current, n-1, n-2]` matrix
+axis into the release-branch trigger, is pending work (ROCMAI-430): nothing
+in this repo today maps "n-1"/"n-2" to a concrete SDK version (`therock.rs`'s
+index-version parsers are private).
 
 ## Platforms
 
@@ -220,11 +217,14 @@ against it.
 None of the tables above vary the serve engine as a matrix dimension, because
 no workflow passes an explicit `--engine` or configures a `default_engine`,
 so hardware/OS is what drives the engine the E2E harness expects by default
-(`select_serve_engine` in `apps/rocm/src/main.rs` checks explicit/configured
-overrides first; only when neither is set does it fall back to the GPU-family
-preference). `tests/e2e-cucumber/src/capability.rs`'s `effective_serve_engine()`
-predicts what `rocm serve` would pick with no `--engine` on a given host,
-re-implementing the product's `preferred_serve_engine_for_host_gpu_summary`:
+(`select_serve_engine` in [`serve_cmd.rs`](../apps/rocm/src/serve_cmd.rs)
+checks explicit/configured overrides first, then the GPU-family preference
+— but only if the model's recipe actually supports that engine — then the
+recipe's own first preferred engine, and finally the platform default).
+[`capability.rs`](../tests/e2e-cucumber/src/capability.rs)'s
+`effective_serve_engine()` predicts what `rocm serve` would pick with no
+`--engine` on a given host, re-implementing the product's
+`preferred_serve_engine_for_host_gpu_summary`:
 
 ```rust
 pub fn effective_serve_engine(gfx_target: Option<&str>, os_family: &str) -> String {
@@ -239,8 +239,9 @@ pub fn effective_serve_engine(gfx_target: Option<&str>, os_family: &str) -> Stri
 }
 ```
 
-Any Windows host resolves to `lemonade` (the vLLM adapter does not run
-there); otherwise `vllm` is only preferred for the `*-dcgpu` families and
+Any native Windows host resolves to `lemonade` (the vLLM adapter does not
+run there; WSL reports `os_family` `"linux"` and stays vLLM-eligible);
+otherwise `vllm` is only preferred for the `*-dcgpu` families and
 `gfx906`/`gfx908`/`gfx90a`. Consequences for the lanes above:
 
 - Strix Halo is `gfx1151` on every OS, so all three per-PR Strix lanes
@@ -364,10 +365,9 @@ Pre-warm then:
   repair, so the multi-version cache stays bounded.
 
 `e2e-prewarm` has no `--version`/`--build-date` pin at HEAD — the unpinned
-invocation above is what every lane in this tree runs today. ROCMAI-430 adds
-mutually exclusive flags for that pin, letting a caller hold the SDK build
-the pre-warm resolves to instead of always tracking whatever the channel
-index currently serves (see "The three-stage validation ladder" above).
+invocation above is what every lane in this tree runs today. See "The
+three-stage validation ladder" above for the pending SDK-version-pin work
+(ROCMAI-430).
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
