@@ -220,7 +220,7 @@ Feature: TheRock "next" ROCm 10 install layout
   # the install stops and says so instead of taking another build's torchaudio.
   @id:therock-next-12-missing-torchaudio-build-refused
   Scenario: therock-next-12 - A ROCm 10 wheel install refuses when the pinned build publishes no torchaudio
-    Given a ROCm 10 pip index fixture that publishes torchaudio only for a newer ROCm 10 build
+    Given a ROCm 10 pip index fixture whose ROCm 10.0.0 torchaudio is only a wheel this host cannot install
     When the user tries to preview a wheel SDK install for arch gfx1200 pinned to ROCm 10.0.0
     Then the install fails
     And the failure says no torchaudio for ROCm 10.0.0 is published for this platform, without falling back to another
@@ -234,6 +234,20 @@ Feature: TheRock "next" ROCm 10 install layout
   # newer `2.11.0.3`.
   @id:therock-next-13-verified-torchaudio-over-newer-rebuild
   Scenario: therock-next-13 - A ROCm 10 wheel install takes the hardware-verified torchaudio over a newer rebuild
-    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    Given a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label
     When the user previews a wheel SDK install for arch gfx1200 pinned to ROCm 10.1.0
     Then the preview installs the hardware-verified torchaudio for ROCm 10.1.0, not the newer rebuild
+
+  # The real-install half of therock-next-11: past the preview, an unverified
+  # torchaudio is also announced in the install log, since it is the one stack
+  # choice ROCm CLI makes on its own judgement. No GPU or download is needed to
+  # see it: with an active default runtime and no consent flag, the install is
+  # refused right after the note, before `uv` runs or anything changes on disk.
+  @id:therock-next-14-real-install-notes-unverified-torchaudio
+  Scenario: therock-next-14 - A real ROCm 10 wheel install notes an unverified torchaudio in its install log
+    Given a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build
+    And a registered ROCm 10 wheel runtime with a grouped family
+    And that runtime is the active default
+    When the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming
+    Then the install is refused without replacing the active default runtime
+    And the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified
