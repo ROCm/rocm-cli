@@ -476,8 +476,9 @@ pub(crate) fn install(
     }
 
     // Checked before the download, so a refusal costs nothing, and again
-    // just before the code is replaced: a `rocm comfyui start` during a long
-    // download would otherwise be running the code the swap replaces.
+    // just before the code is replaced, so a `rocm comfyui start` during a
+    // long download is caught. `start` takes no lock, so one that begins
+    // during the swap itself is not; it refuses once the swap's marker exists.
     if replaces_existing {
         let mut warnings = Vec::new();
         let running = running_from(paths, &source_path, &mut warnings);
@@ -1798,8 +1799,9 @@ fn download_and_extract_source(
 }
 
 /// Unpacks `archive_path` under `extract_root` and returns the archive's
-/// top-level folder. A cached archive that cannot be unpacked is dropped, so
-/// the next attempt downloads a fresh copy instead of failing the same way.
+/// top-level folder. A cached archive that cannot be unpacked, or that is not
+/// a ComfyUI release (no `main.py` in that folder), is dropped, so the next
+/// attempt downloads a fresh copy instead of failing the same way.
 fn unpack_source_archive(archive_path: &Path, extract_root: &Path) -> Result<PathBuf> {
     fs::create_dir_all(extract_root)
         .with_context(|| format!("failed to create {}", extract_root.display()))?;
@@ -1809,7 +1811,18 @@ fn unpack_source_archive(archive_path: &Path, extract_root: &Path) -> Result<Pat
     let unpacked = tar
         .unpack(extract_root)
         .with_context(|| format!("failed to extract {}", archive_path.display()))
-        .and_then(|()| first_child_dir(extract_root));
+        .and_then(|()| first_child_dir(extract_root))
+        .and_then(|release| {
+            if release.join("main.py").is_file() {
+                Ok(release)
+            } else {
+                bail!(
+                    "{} is not a ComfyUI release: it has no main.py in {}",
+                    archive_path.display(),
+                    release.display()
+                )
+            }
+        });
     if unpacked.is_err() {
         fs::remove_file(archive_path).ok();
     }
@@ -3579,6 +3592,43 @@ mod tests {
         Ok(())
     }
 
+    /// A downloaded archive that unpacks but is not a ComfyUI release (no
+    /// `main.py` in its top folder) leaves the existing install as it was, and
+    /// is dropped so the next attempt downloads again instead of failing the
+    /// same way.
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_from_an_archive_without_main_py_changes_nothing() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-not-comfyui")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_cached_source_archive(
+            &app_root,
+            &[("README.md", "not comfyui"), ("comfy/x.py", "code")],
+        )?;
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("an archive without main.py must not be installed");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("is not a ComfyUI release"), "{message}");
+        assert!(
+            !message.contains("rocm comfyui install"),
+            "nothing was changed, so there is nothing to finish: {message}"
+        );
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+        assert!(source.join("comfy/removed_upstream.py").is_file());
+        assert!(!source_swap::swap_interrupted(&source));
+        assert_user_files_intact(&source);
+        assert!(
+            !archive_path.exists(),
+            "an archive that is not a ComfyUI release must not be reused"
+        );
+        assert_staging_folder_empty(&app_root)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
     /// Nothing is left behind in the staging folder a release is unpacked to.
     fn assert_staging_folder_empty(app_root: &Path) -> Result<()> {
         let extract = app_root.join("extract");
@@ -4222,9 +4272,13 @@ mod tests {
         assert!(!status.contains("comfyui start"), "{status}");
         // The summary the assistant answers with after a status tool call
         // passes the note on too.
-        let summary =
-            crate::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+        // Another tool's output ahead of it in the same text keeps its notes.
+        let summary = crate::deterministic_comfyui_tool_summary(&format!(
+            "Engines\n  note: another tool's note\n\n{status}"
+        ))
+        .context("a status summary")?;
         assert!(summary.contains(&format!("  Note: {advice}.")), "{summary}");
+        assert!(!summary.contains("another tool"), "{summary}");
         // What the note claims: start refuses until that install runs.
         let manifest = load_manifest(&paths)?.context("manifest")?;
         assert!(ensure_source_is_startable(&manifest).is_err());

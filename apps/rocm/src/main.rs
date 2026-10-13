@@ -956,7 +956,9 @@ enum ComfyuiCommand {
         /// renamed to `<name>.rocm-cli-kept-<time>`. An install made before rocm-cli recorded
         /// what its release shipped instead replaces whatever has the names the new release
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
-        /// running, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// running or still starting, checked before the download and again just before the code
+        /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
+        /// A download that is not a ComfyUI release (no main.py) changes nothing.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.
@@ -11401,10 +11403,11 @@ fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<String> {
         lines.push(format!("  Models folder: {models_path}."));
     }
     // A note about the install itself (an interrupted reinstall, which names
-    // the command that finishes it) comes before the `Running` section, whose
-    // own notes the line above already sums up.
+    // the command that finishes it) sits between `status`'s `ComfyUI` heading
+    // and its `Running` section, whose own notes the `Running:` line sums up.
     for line in tool_text
         .lines()
+        .skip_while(|line| line.trim() != "ComfyUI")
         .take_while(|line| line.trim() != "Running")
     {
         if let Some(note) = line.trim().strip_prefix("note:").map(str::trim)

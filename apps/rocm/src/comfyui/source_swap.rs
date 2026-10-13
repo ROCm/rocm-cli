@@ -1625,6 +1625,31 @@ mod tests {
         Ok(())
     }
 
+    /// Windows, with a record that does not name it: the user's `readme.md`
+    /// is the same file as the `README.md` the new release adds, so it is set
+    /// aside with its contents, not overwritten or left to be renamed over.
+    #[cfg(windows)]
+    #[test]
+    fn a_user_entry_differing_only_in_case_is_set_aside_on_windows() -> Result<()> {
+        let dir = TestDir::new("case-record");
+        let source = used_source(&dir.0);
+        write(&source, &[("readme.md", "user readme")]);
+        let tree = new_release(&dir.0);
+        write(&tree, &[("README.md", "release readme")]);
+
+        let report = install_release_tree(&tree, &source)?;
+
+        assert_eq!(report.set_aside.len(), 1, "{report:?}");
+        let (name, new_name) = &report.set_aside[0];
+        assert!(name.eq_ignore_ascii_case("readme.md"), "{report:?}");
+        assert_eq!(read(&source.join(new_name)).as_deref(), Some("user readme"));
+        assert_eq!(
+            read(&source.join("README.md")).as_deref(),
+            Some("release readme")
+        );
+        Ok(())
+    }
+
     /// An unreadable record does not stop the swap: it falls back to the new
     /// release's names, lists what that replaced, and says why.
     #[test]
