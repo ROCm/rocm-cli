@@ -889,6 +889,10 @@ trait Waitable {
     fn wait(&mut self) -> std::io::Result<ExitStatus>;
 }
 
+// `Child::` rather than `Self::` on purpose: inside this impl `Self` is
+// `Child`, so `Self::try_wait` reads as the trait method being defined
+// here rather than the inherent one being forwarded to.
+#[allow(clippy::use_self)]
 impl Waitable for Child {
     fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         Child::try_wait(self)
