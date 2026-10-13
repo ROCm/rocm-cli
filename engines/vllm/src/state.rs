@@ -458,11 +458,13 @@ mod tests {
     }
     #[test]
     fn write_running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
-        // Uses the test's own live PID rather than a fixed placeholder so the
-        // `start_ticks` assertion below exercises the real
+        // Uses the test's own live PID rather than a fixed placeholder so that,
+        // on Linux, the `start_ticks` assertion below exercises the real
         // `rocm_core::process_start_ticks` lookup instead of a value `json!`
         // would write regardless (a prior version of this test asserted only
-        // `is_some()`, which `Some(Value::Null)` also satisfies).
+        // `is_some()`, which `Some(Value::Null)` also satisfies). On other
+        // platforms `process_start_ticks` is a stub that always returns
+        // `None`, so there the assertion only checks `None == None`.
         let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
         // `sdk_root` must be a real, scratch directory on Linux: this payload can
