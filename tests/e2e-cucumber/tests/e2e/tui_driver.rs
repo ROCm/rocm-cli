@@ -186,14 +186,17 @@ impl TuiSession {
 
     /// Like [`spawn`](Self::spawn), but spawned with `dir` as the child's
     /// working directory. Without this, portable-pty's `CommandBuilder`
-    /// doesn't inherit the harness's own cwd at all — it falls back to
-    /// `$HOME` (Unix) or `%USERPROFILE%` (Windows), which on Unix is already
-    /// this scenario's isolated `HOME` (see [`pty_env`]) but on Windows is
-    /// the real host profile directory. `spawn_in` makes the cwd an
-    /// arbitrary, explicit choice — independent of `HOME` overrides, and the
-    /// only control at all on Windows — for driving UI flows (onboarding's
-    /// adopt/install-folder browsers, install-manager, runtime-manager,
-    /// serve-wizard) that resolve an initial path via
+    /// never inherits the harness's own cwd on Unix — it falls back to
+    /// `$HOME`, which is already this scenario's isolated `HOME` (see
+    /// [`pty_env`]). On Windows it falls back to `%USERPROFILE%` when that
+    /// names a real directory — the real host profile, not this scenario's
+    /// isolation — and only inherits the harness's own cwd (via a null
+    /// `lpCurrentDirectory` to `CreateProcessW`) when `%USERPROFILE%` is
+    /// unset or not a directory. `spawn_in` makes the cwd an arbitrary,
+    /// explicit choice — independent of `HOME`/`USERPROFILE` overrides, and
+    /// the only reliable control on Windows — for driving UI flows
+    /// (onboarding's adopt/install-folder browsers, install-manager,
+    /// runtime-manager, serve-wizard) that resolve an initial path via
     /// `std::env::current_dir()` when nothing is already staged.
     pub fn spawn_in(world: &E2eWorld, args: &[&str], dir: &Path) -> Result<Self, String> {
         Self::spawn_binary_with_env(world, crate::rocm_binary(), args, &[], Some(dir))
