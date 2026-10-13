@@ -369,16 +369,19 @@ impl ServeWizardState {
                 format!("host is required; type an address or restore {DEFAULT_HOST}"),
             ));
         }
+        // Dash has no `--allow-public-bind` confirmation and no endpoint-key
+        // UI, so it must never stage a public bind — even with an explicit
+        // port. That deliberate step belongs to the CLI. Checked before the
+        // auto-port rule below: a public host is refused outright regardless
+        // of port mode, so its error must name that, not dead-end the user
+        // into switching to a custom port that would be refused anyway.
+        if !is_loopback_host(host) {
+            return Err((Field::Host, PUBLIC_HOST_NEEDS_CLI.to_string()));
+        }
         // Automatic port selection is only supported on the canonical loopback
         // host — anything else must name its own port. Never invent one.
         if host != DEFAULT_HOST && self.port_mode == PortMode::Auto {
             return Err((Field::Port, CUSTOM_HOST_NEEDS_PORT.to_string()));
-        }
-        // Dash has no `--allow-public-bind` confirmation and no endpoint-key
-        // UI, so it must never stage a public bind — even with an explicit
-        // port. That deliberate step belongs to the CLI.
-        if !is_loopback_host(host) {
-            return Err((Field::Host, PUBLIC_HOST_NEEDS_CLI.to_string()));
         }
         if self.port_mode == PortMode::Custom {
             let Some(port) = parse_port(&self.port) else {
@@ -1140,7 +1143,9 @@ mod tests {
 
     #[test]
     fn noncanonical_host_with_auto_port_is_blocked_with_the_contract_message() {
-        for host in ["localhost", "::1", "0.0.0.0", "192.168.1.5"] {
+        // Loopback but not the canonical default: auto-port is refused with the
+        // "set Port to Custom" guidance, which actually resolves the problem.
+        for host in ["localhost", "::1"] {
             let w = ServeWizardState {
                 model: "m".into(),
                 host: host.into(),
@@ -1150,6 +1155,20 @@ mod tests {
             let (field, msg) = w.build_args().unwrap_err();
             assert_eq!(field, Field::Port, "{host}");
             assert_eq!(msg, CUSTOM_HOST_NEEDS_PORT, "{host}");
+        }
+        // Not loopback at all: refused outright regardless of port mode, so the
+        // error must point at the real blocker instead of dead-ending the user
+        // into a custom port that would be refused anyway.
+        for host in ["0.0.0.0", "192.168.1.5"] {
+            let w = ServeWizardState {
+                model: "m".into(),
+                host: host.into(),
+                port_mode: PortMode::Auto,
+                ..Default::default()
+            };
+            let (field, msg) = w.build_args().unwrap_err();
+            assert_eq!(field, Field::Host, "{host}");
+            assert_eq!(msg, PUBLIC_HOST_NEEDS_CLI, "{host}");
         }
     }
 
