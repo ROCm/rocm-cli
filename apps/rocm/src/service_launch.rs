@@ -10,9 +10,11 @@
 //! the Phase 6a (ROCMAI-82) split: `start_managed_service`,
 //! `run_attached_service`, `spawn_managed_engine_child`, `stream_attached_logs`,
 //! and the rest of this file. It was entangled with crate-root launch helpers
-//! — `record_cli_audit_event`, `existing_live_managed_service`, and the
-//! service-record-management cluster (stop/restart/remove/prune) — and
-//! separating them out is this later pass (ROCMAI-91, Phase 6b).
+//! — `record_cli_audit_event`, `existing_live_managed_service`, and the stop
+//! action of the service-record-management cluster (this module reaches only
+//! stop, via `AttachOutcome::Stop`; restart/remove/prune are not called here)
+//! — and this later pass (ROCMAI-91, Phase 6b) separates the spawning tail out
+//! from them; they stay at the crate root (see below).
 //!
 //! `dispatch()`'s call sites are unaffected: `Command::Services { command } =>
 //! services(command)` doesn't call anything in this cluster directly, and
