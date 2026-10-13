@@ -385,16 +385,17 @@ const MANAGED_LAUNCH_CLEANUP_GRACE: Duration = Duration::from_secs(2);
 /// so no failed transaction leaves a live reservation or a stray endpoint key.
 ///
 /// Order matters: a spawned child is terminated and confirmed dead *first*, so
-/// nothing is still holding the port or writing to the log when the artifacts —
-/// including the record that reserves the port for other launches — are removed.
+/// nothing is still holding the port or writing to the log by the time cleanup
+/// runs. If no child was ever spawned (`record.engine_pid` is still `None`),
+/// every artifact this attempt created is removed: there is nothing for
+/// `rocm services`/`rocm logs` to show. If a child did run, its record and log
+/// are kept instead (marked `status = "failed"`), since the error that led here
+/// already told the user to go inspect that log; only the endpoint key, which a
+/// failed attempt has no use for, is cleared.
 /// Every step is best-effort and idempotent; cleanup must never mask the
 /// original failure with a second one.
-fn abandon_failed_managed_launch(
-    paths: &AppPaths,
-    record: &ManagedServiceRecord,
-    child_pid: Option<u32>,
-) {
-    if let Some(pid) = child_pid.filter(|pid| *pid != 0) {
+fn abandon_failed_managed_launch(paths: &AppPaths, record: &ManagedServiceRecord) {
+    if let Some(pid) = record.engine_pid.filter(|pid| *pid != 0) {
         let outcome = rocm_core::terminate_verified(
             &rocm_core::ProcessIdentity::capture(pid),
             rocm_core::KillScope::Tree,
@@ -412,6 +413,11 @@ fn abandon_failed_managed_launch(
             ),
             Some(&record.service_id),
         );
+        let mut failed = record.clone();
+        failed.status = "failed".to_owned();
+        let _ = failed.write();
+        endpoint_keys::clear_endpoint_api_key(paths, &record.service_id);
+        return;
     }
     for path in [
         record.manifest_path.as_path(),
@@ -588,10 +594,11 @@ fn spawn_managed_engine_child(
             child_pid,
         }),
         Err(error) => {
-            // Pre-spawn failures reach here with nothing running; a post-spawn
-            // publication failure already terminated its child, and the removals
-            // are idempotent.
-            abandon_failed_managed_launch(paths, &record, None);
+            // The single cleanup choke point for every failure path below the
+            // record's first write: `record.engine_pid` tells it whether a child
+            // ever ran, so a pre-spawn failure deletes everything and a post-spawn
+            // one keeps the record and log (marked `status = "failed"`) instead.
+            abandon_failed_managed_launch(paths, &record);
             Err(error)
         }
     }
@@ -704,6 +711,9 @@ fn launch_managed_engine_child_locked(
             .spawn()
             .context("failed to launch managed engine process")?;
         let child_pid = child.id();
+        // Set before the immediate-exit check below, so a bail! here still leaves
+        // `record.engine_pid` telling cleanup that a child was spawned.
+        record.engine_pid = Some(child_pid);
         thread::sleep(Duration::from_millis(200));
         if let Some(status) = child
             .try_wait()
@@ -730,7 +740,10 @@ fn launch_managed_engine_child_locked(
     record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     if let Err(error) = record.write() {
-        abandon_failed_managed_launch(paths, record, Some(child_pid));
+        // Cleanup is the caller's job now: `record.engine_pid` (set above) is
+        // already enough for `abandon_failed_managed_launch` to terminate this
+        // child, so there is nothing left for this inner path to do beyond
+        // surfacing the error.
         return Err(error.context("failed to publish the managed service record"));
     }
 
@@ -2366,7 +2379,7 @@ mod tests {
     fn abandoned_launch_leaves_no_record_log_or_endpoint_key() -> Result<()> {
         let (root, paths) = test_paths("abandon-launch-cleanup");
         paths.ensure()?;
-        let record = write_live_service_record(&paths, "lemonade-abandon", "abandon-model", 11_490, "running")?;
+        let mut record = write_live_service_record(&paths, "lemonade-abandon", "abandon-model", 11_490, "running")?;
         fs::create_dir_all(
             record
                 .engine_state_path
@@ -2375,8 +2388,10 @@ mod tests {
         )?;
         fs::write(&record.engine_state_path, "{}")?;
         endpoint_keys::store_endpoint_api_key(&paths, &record.service_id, "secret-key")?;
+        // Simulate a pre-spawn failure: nothing ever ran.
+        record.engine_pid = None;
 
-        abandon_failed_managed_launch(&paths, &record, None);
+        abandon_failed_managed_launch(&paths, &record);
 
         assert!(!record.manifest_path.exists());
         assert!(!record.log_path.exists());
@@ -2399,7 +2414,7 @@ mod tests {
     fn abandoned_launch_terminates_the_spawned_child() -> Result<()> {
         let (root, paths) = test_paths("abandon-launch-terminates-child");
         paths.ensure()?;
-        let record =
+        let mut record =
             write_live_service_record(&paths, "lemonade-abandon-child", "abandon-child-model", 11_491, "running")?;
 
         let current_exe = std::env::current_exe().expect("current test exe");
@@ -2412,11 +2427,11 @@ mod tests {
             .spawn()
             .expect("spawn sleeper child");
         let child_pid = child.id();
+        record.engine_pid = Some(child_pid);
 
-        abandon_failed_managed_launch(&paths, &record, Some(child_pid));
+        abandon_failed_managed_launch(&paths, &record);
 
         let wait_result = child.wait();
-        let _ = fs::remove_dir_all(root);
 
         match wait_result {
             Ok(status) => assert!(
@@ -2425,7 +2440,18 @@ mod tests {
             ),
             Err(error) => panic!("failed to wait for sleeper child: {error}"),
         }
-        assert!(!record.manifest_path.exists());
+        let persisted = load_managed_services(&paths)
+            .expect("re-read manifests")
+            .into_iter()
+            .find(|candidate| candidate.service_id == record.service_id);
+        let _ = fs::remove_dir_all(root);
+        let persisted = persisted.expect(
+            "a launch that spawned a child must keep its record so `rocm services`/`rocm logs` can show the attempt",
+        );
+        assert_eq!(
+            persisted.status, "failed",
+            "a spawned child's record must be marked failed, not deleted"
+        );
         Ok(())
     }
 }

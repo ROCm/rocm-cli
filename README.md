@@ -768,6 +768,18 @@ rocm serve <model> [--engine lemonade|vllm]
                    [--gpu-memory-utilization FRACTION] [--tool-call-parser NAME]
 ```
 
+`--port` is optional on the default loopback host (`127.0.0.1`): omit it and
+`rocm serve` picks the first free port in `11435`-`11535`, checking both
+rocm-cli's own records and the OS so two servers never collide. The deployment
+summary shows `Port: automatic; endpoint shown after launch` while the launch
+is in flight and prints the concrete endpoint once the port is actually leased.
+Pass `--port` explicitly to pin one; an explicit loopback port already
+reserved or in use is rejected up front, naming the server holding it and how
+to free it (`rocm services stop <service-id> --yes`). `--host` to anything
+other than the default loopback address (`localhost`, `::1`, `0.0.0.0`, or any
+other address) requires an explicit `--port`: automatic selection only probes
+`127.0.0.1` and cannot promise a free port anywhere else.
+
 `--gpu-memory-utilization` (a fraction above 0.0 and up to 1.0 of each GPU's
 total VRAM) and `--tool-call-parser` (for example `hermes`, `llama3_json`, or
 `mistral`, which also turns on automatic tool choice) apply to vLLM only. Lower
