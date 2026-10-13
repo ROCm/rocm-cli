@@ -207,11 +207,16 @@ fn select_active_managed_therock_record(
 /// installed runtime" would be chosen by the filesystem. Ties are ordinary: a
 /// `--devel` install and its plain sibling land in the same millisecond, and a
 /// record written before the field existed reads as `0`. `rocm`'s own registry
-/// load breaks the same tie on the runtime key, ascending; using the same rule
-/// here keeps the runtime this crate falls back to the same one the CLI's
-/// startup update check reports on. Shared by all three registry fallbacks:
-/// the active-runtime fallback, the `amd-smi` binary resolver, and the SDK
-/// probe candidate list.
+/// load breaks the same tie on the runtime key, ascending, so this uses the
+/// same tiebreak among the records this crate considers. The two sides do not
+/// consider the same records, though: these fallbacks only see records
+/// [`managed_therock_environment_records`] accepts (a TheRock runtime whose
+/// `rocm_sdk` probe imported), while the CLI's startup update check takes the
+/// first of every parsed manifest. So the rule is shared, not the pick: with
+/// no active key, a tarball runtime installed after a wheel one is what the
+/// CLI reports on, while this falls back to the wheel. Shared by all three
+/// registry fallbacks: the active-runtime fallback, the `amd-smi` binary
+/// resolver, and the SDK probe candidate list.
 pub(crate) fn sort_records_newest_install_first(records: &mut [(PathBuf, TheRockFamilyManifest)]) {
     records.sort_by(|(left_path, left), (right_path, right)| {
         right
@@ -585,6 +590,82 @@ mod tests {
         let mut records = vec![record("aaa", 1_000), record("zzz", 2_000)];
         sort_records_newest_install_first(&mut records);
         assert_eq!(keys(&records), ["zzz", "aaa"]);
+    }
+
+    #[test]
+    fn registry_records_without_a_key_or_a_time_still_sort_deterministically() {
+        let record = |path: &str, fields: serde_json::Value| {
+            (
+                PathBuf::from(path),
+                serde_json::from_value::<TheRockFamilyManifest>(fields).expect("record"),
+            )
+        };
+        let paths = |records: &[(PathBuf, TheRockFamilyManifest)]| {
+            records
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        // Two keyless records in the same millisecond differ only in their
+        // path, so the path is the last tiebreak and decides in both input
+        // orders.
+        for mut records in [
+            vec![
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+            vec![
+                record(
+                    "a.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+                record(
+                    "b.json",
+                    serde_json::json!({ "installed_at_unix_ms": 2_000 }),
+                ),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["a.json", "b.json"]);
+        }
+
+        // A record written before `installed_at_unix_ms` existed reads as
+        // installed at 0: it ties with an explicit 0 (so the key decides) and
+        // sorts below any real install time.
+        for mut records in [
+            vec![
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+            ],
+            vec![
+                record(
+                    "timed.json",
+                    serde_json::json!({ "runtime_key": "zzz", "installed_at_unix_ms": 1 }),
+                ),
+                record(
+                    "zero.json",
+                    serde_json::json!({ "runtime_key": "bbb", "installed_at_unix_ms": 0 }),
+                ),
+                record("untimed.json", serde_json::json!({ "runtime_key": "aaa" })),
+            ],
+        ] {
+            sort_records_newest_install_first(&mut records);
+            assert_eq!(paths(&records), ["timed.json", "untimed.json", "zero.json"]);
+        }
     }
 
     #[test]
