@@ -5,8 +5,11 @@
 //! Spawn, attach to, and stream logs from a managed background service
 //! process, plus the endpoint-key/auth checks that gate it.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change. This module
-//! is the managed-service-spawning tail that was deliberately deferred out of
+//! Relocated from `main.rs`, mechanically and with no behavior change at the
+//! time; it has since gained behavior of its own — the engine spawn seam the
+//! launch and restart share, the startup-death check on both platforms, and
+//! the retirement of a failed launch's record. This module is the
+//! managed-service-spawning tail that was deliberately deferred out of
 //! the Phase 6a (ROCMAI-82) split: `start_managed_service`,
 //! `run_attached_service`, `spawn_managed_engine_child`, `stream_attached_logs`,
 //! and the rest of this file. It was entangled with crate-root launch helpers
