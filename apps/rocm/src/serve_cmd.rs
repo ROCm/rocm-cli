@@ -23,7 +23,7 @@
 
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use rocm_core::{
     AppPaths, ModelRecipeRecord, RocmCliConfig, default_engine_for_platform,
     detect_host_gpu_summary, generate_service_id, preferred_serve_engine_for_host_gpu_summary,
@@ -42,8 +42,8 @@ use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
     ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
-    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
-    validate_bind_host,
+    managed_service_reuse_refusal, print_managed_launch_plain, resolve_endpoint_auth,
+    run_attached_service, start_managed_service, validate_bind_host,
 };
 use crate::{
     EngineSelection, any_live_managed_service_for_model, append_oom_serve_note, cli_progress,
@@ -731,9 +731,34 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                     engine_recipe: engine_recipe.clone(),
                 },
             )?;
+            // Liveness + engine + canonical id says a service *matches*; it does
+            // not say this invocation can reuse it. `spawn_managed_engine_child`
+            // still refuses on a recipe mismatch or an unmet `--require-api-key`,
+            // so deciding the bypass on the weaker test sent the user to a dead
+            // end: on a GPU-less host the refusal was skipped, the spawn told
+            // them to stop the running server and re-run, and the re-run — with
+            // nothing left to reuse — hit the no-GPU refusal. The advice named a
+            // command that could not clear the condition.
+            //
+            // The device policy is passed here and not at the spawn because this
+            // is the caller gating the GPU bail on the answer: a `cpu_only`
+            // service must not buy a `gpu_required` serve a bypass of it.
+            let requested_recipe_json = engine_recipe
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("failed to encode engine recipe hint")?;
             reuse_existing =
                 existing_live_managed_service(&paths, &selected_engine, &probe.canonical_model_id)
-                    .is_some();
+                    .is_some_and(|existing| {
+                        managed_service_reuse_refusal(
+                            &existing,
+                            requested_recipe_json.as_deref(),
+                            require_api_key,
+                            Some(&device_policy),
+                        )
+                        .is_none()
+                    });
             resolved_model = Some(probe);
         }
         resolved_selection = Some(selection);
