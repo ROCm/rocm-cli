@@ -5614,9 +5614,12 @@ mod tests {
 
     /// Both `/etc/os-release` reads `rocm examine` makes — the distro fields
     /// and the distro name — answer from a simulated host root, and through the
-    /// shared parser: a planted single-quoted file naming a distro no runner
-    /// has reads as that distro. A read that bypassed the root would report the
-    /// runner's distro; one that bypassed the parser would keep the quotes.
+    /// shared parser: a planted file naming a distro no runner has reads as
+    /// that distro, as `sh` reads it. A read that bypassed the root would
+    /// report the runner's distro. One that bypassed the parser would read the
+    /// file as the old per-reader parsers did: the distro fields with their
+    /// single quotes kept, and the name from the first of two `PRETTY_NAME`s
+    /// rather than the last, which is the one `sh` assigns.
     #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
     #[test]
     fn os_release_reads_follow_the_simulated_host_root() {
@@ -5630,7 +5633,7 @@ mod tests {
         std::fs::create_dir_all(root.join("etc")).expect("create planted /etc");
         std::fs::write(
             root.join("etc/os-release"),
-            "ID='planted'\nVERSION_ID='0.1'\nPRETTY_NAME='Planted 0.1'\n",
+            "ID='planted'\nVERSION_ID='0.1'\nPRETTY_NAME='Stale 0.0'\nPRETTY_NAME='Planted 0.1'\n",
         )
         .expect("write planted os-release");
 
