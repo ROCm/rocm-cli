@@ -6,13 +6,13 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, ManagedToolConfig, RUNTIME_LIBRARY_PATH_ENV, RocmCliConfig, detect_host_gfx_target,
     detect_host_gpu_diagnostics, detect_legacy_rocm_summary, detect_managed_therock_family,
-    disk_space, ensure_uv_binary, extract_first_gfx_token, interactive_terminal,
-    known_therock_families, managed_tools_dir, normalize_runtime_path_for_host,
-    normalize_runtime_path_for_storage, normalize_runtime_path_text_for_host,
-    normalize_runtime_path_text_for_storage, normalize_therock_family, runtime_is_windows,
-    runtime_os_name, runtime_path_for_windows_child, runtime_path_list_split,
-    runtime_python_executable_in_env, unix_time_millis, uv_command_env, uv_pip_install_base,
-    uv_venv_args, verify_rsa_pkcs1_sha256_signature,
+    disk_space, ensure_uv_binary, extract_first_gfx_token, gfx_target_has_no_rocm_build,
+    interactive_terminal, known_therock_families, managed_tools_dir,
+    normalize_runtime_path_for_host, normalize_runtime_path_for_storage,
+    normalize_runtime_path_text_for_host, normalize_runtime_path_text_for_storage,
+    normalize_therock_family, runtime_is_windows, runtime_os_name, runtime_path_for_windows_child,
+    runtime_path_list_split, runtime_python_executable_in_env, unix_time_millis, uv_command_env,
+    uv_pip_install_base, uv_venv_args, verify_rsa_pkcs1_sha256_signature,
 };
 #[cfg(test)]
 use rocm_core::{
@@ -3402,11 +3402,14 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    // A GPU was detected but belongs to no package family (for example the
-    // gfx90c Vega iGPU in Renoir/Cezanne APUs). Listing the recognized families
-    // would invite installing a build for different silicon, so say plainly
-    // that there is nothing to install for this GPU.
-    if let Some(raw_arch) = host_arch.as_deref() {
+    // A GPU was detected that is known to have no package family: the gfx90c
+    // Vega iGPU in Renoir/Cezanne APUs. Listing the recognized families would
+    // invite installing a build for different silicon, so say plainly that
+    // there is nothing to install for this GPU. Other unmapped targets keep the
+    // generic error below, which points at `--family`.
+    if let Some(raw_arch) = host_arch.as_deref()
+        && gfx_target_has_no_rocm_build(raw_arch)
+    {
         let diagnostics = detect_host_gpu_diagnostics();
         bail!("{}\n\n{diagnostics}", unsupported_host_gpu_message(raw_arch));
     }

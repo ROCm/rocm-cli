@@ -104,6 +104,17 @@ pub fn extract_first_gfx_token(text: &str) -> Option<String> {
         })
 }
 
+/// Whether `gfx` names a GPU target the CLI recognizes but that no TheRock
+/// package family covers, so `normalize_therock_family` returns `None` for it
+/// on purpose rather than because the target is unknown.
+///
+/// Today that is gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
+/// APUs. Callers use it to say "detected, but not supported by ROCm" instead of
+/// treating the GPU as undetected or suggesting a package family for it.
+pub fn gfx_target_has_no_rocm_build(gfx: &str) -> bool {
+    extract_first_gfx_token(gfx).is_some_and(|target| target.starts_with("gfx90c"))
+}
+
 pub fn normalize_therock_family(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -585,18 +596,26 @@ const fn detect_linux_primary_gpu_name() -> Option<String> {
 
 fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     let mut name_fallback = None;
+    let mut unsupported_match = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let (name, pnp_id) = line.split_once('\t').unwrap_or((line, ""));
         if let Some(device_id) = amd_pci_device_id_from_pnp_id(pnp_id)
             && let Some(target) = gfx_target_from_amd_pci_device_id(&device_id)
         {
+            if gfx_target_has_no_rocm_build(target) {
+                // A Vega iGPU listed ahead of a discrete card must not hide it:
+                // keep looking, and fall back to this target only if nothing
+                // else on the host is recognized.
+                unsupported_match = unsupported_match.or(Some(target));
+                continue;
+            }
             return Some(target.to_owned());
         }
         if name_fallback.is_none() {
             name_fallback = gfx_target_from_amd_marketing_name(name).map(str::to_owned);
         }
     }
-    name_fallback
+    name_fallback.or_else(|| unsupported_match.map(str::to_owned))
 }
 
 fn parse_windows_display_name(text: &str) -> Option<String> {
@@ -1638,20 +1657,27 @@ impl WindowsExamineInventory {
     }
 
     fn preferred_amd_display(&self) -> Option<&WindowsDisplayAdapter> {
+        let pci_target = |display: &WindowsDisplayAdapter| {
+            display
+                .pnp_device_id
+                .as_deref()
+                .and_then(amd_pci_device_id_from_pnp_id)
+                .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id))
+        };
         self.displays
             .iter()
-            .find(|display| {
-                display
-                    .pnp_device_id
-                    .as_deref()
-                    .and_then(amd_pci_device_id_from_pnp_id)
-                    .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id))
-                    .is_some()
-            })
+            .find(|display| pci_target(display).is_some_and(|t| !gfx_target_has_no_rocm_build(t)))
             .or_else(|| {
                 self.displays
                     .iter()
                     .find(|display| gfx_target_from_amd_marketing_name(&display.name).is_some())
+            })
+            // A recognized-but-unsupported iGPU (gfx90c) ranks below every
+            // other recognized adapter, so it cannot hide a discrete card.
+            .or_else(|| {
+                self.displays
+                    .iter()
+                    .find(|display| pci_target(display).is_some())
             })
             .or_else(|| {
                 self.displays
@@ -1739,7 +1765,7 @@ impl ExamineSummary {
     /// the GPU was in fact recognized and simply has no ROCm build.
     fn rocm_support_line(&self) -> String {
         match (self.detected_gfx_target.as_deref(), self.compatible_therock_family.as_deref()) {
-            (Some(gfx), None) => format!(
+            (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => format!(
                 "  rocm_support: GPU detected ({gfx}) but not supported by ROCm; \
                  the Vulkan backend can still be used\n"
             ),
@@ -3379,6 +3405,33 @@ mod tests {
     }
 
     #[test]
+    fn gfx_target_has_no_rocm_build_names_only_gfx90c() {
+        assert!(gfx_target_has_no_rocm_build("gfx90c"));
+        assert!(gfx_target_has_no_rocm_build("GFX90C"));
+        assert!(gfx_target_has_no_rocm_build("gfx90c:xnack-"));
+        assert!(!gfx_target_has_no_rocm_build("gfx90a"));
+        assert!(!gfx_target_has_no_rocm_build("gfx906"));
+        assert!(!gfx_target_has_no_rocm_build("gfx1103"));
+        assert!(!gfx_target_has_no_rocm_build(""));
+    }
+
+    #[test]
+    fn windows_display_parser_prefers_a_supported_gpu_over_a_vega_igpu() {
+        // Ryzen 4000/5000 laptop with a discrete card: the iGPU is listed first
+        // and has a mapped PCI ID, but it must not hide the discrete GPU.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
+                    AMD Radeon RX 6600\tPCI\\VEN_1002&DEV_73E0";
+        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx1032".to_owned()));
+        // The name fallback also outranks the unsupported iGPU.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
+                    AMD Radeon RX 6800M\tPCI\\VEN_1002&DEV_9999";
+        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx1031".to_owned()));
+        // Alone, the iGPU is still reported as gfx90c.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636";
+        assert_eq!(parse_windows_display_gfx_target(text), Some("gfx90c".to_owned()));
+    }
+
+    #[test]
     fn known_therock_families_all_round_trip() {
         for family in known_therock_families() {
             assert_eq!(
@@ -4495,6 +4548,12 @@ Class Name:                Display
 
         let missing = examine_summary_with_gpu(None, None);
         let rendered = missing.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
+
+        // An unmapped target the CLI knows nothing about is not claimed to be
+        // unsupported; only targets known to have no ROCm build are.
+        let unknown = examine_summary_with_gpu(Some("gfx803"), None);
+        let rendered = unknown.render_text();
         assert!(!rendered.contains("rocm_support"), "{rendered}");
     }
 
