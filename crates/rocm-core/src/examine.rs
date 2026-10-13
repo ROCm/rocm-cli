@@ -2762,7 +2762,10 @@ fn managed_runtime_roots() -> Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>
 /// Truncate `value` to at most `max_chars` characters, appending a marker when
 /// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
 /// slice would panic when the cut lands inside a multibyte character.
-fn truncate_to_chars(value: String, max_chars: usize) -> String {
+///
+/// `pub(crate)` for the `amd-smi` failure quote in `lib.rs`, which bounds raw
+/// child output for the same reason the examination bounds captured text.
+pub(crate) fn truncate_to_chars(value: String, max_chars: usize) -> String {
     if value.chars().count() > max_chars {
         let truncated: String = value.chars().take(max_chars).collect();
         format!("{truncated}...[truncated]")

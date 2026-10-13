@@ -4487,48 +4487,70 @@ fn resolve_amd_smi_binary_in_home(home_dir: Option<&Path>) -> OsString {
 /// [`crate::examine::WslFacts`]).
 const KFD_DEVICE: &str = "/dev/kfd";
 
-/// Whether it is safe to launch `amd-smi` on this host.
+/// Whether `/dev/kfd` can be opened for reading — the pre-flight every
+/// `amd-smi` launch goes through, and it is **mandatory** before every launch.
 ///
-/// On Linux this is a readability check on `/dev/kfd`, and it is **mandatory**
-/// before every launch. Against a kernel fusion driver in a bad state —
-/// partially installed, version-mismatched, wedged after a GPU fault, or passed
-/// into a container from an unhealthy host — `amd-smi` blocks in uninterruptible
-/// kernel sleep. No signal escapes that state, so the process survives both
-/// Ctrl-C and `SIGKILL`, and a timeout cannot rescue it either: killing a
-/// D-state child is a no-op and the `wait` that follows blocks alongside it.
-/// Declining to launch is the only mitigation.
+/// What it actually detects is **inaccessible**, not **unhealthy**. `kfd_open`
+/// refuses when the node is absent, when permission is denied, when the driver
+/// exposes no KFD GPU node, and while a reset is in progress; a driver that is
+/// merely version-mismatched or wedged after a fault still opens. Those are the
+/// states in which `amd-smi` blocks in uninterruptible kernel sleep — no signal
+/// escapes, so the process survives both Ctrl-C and `SIGKILL`, and no timeout
+/// rescues it, because killing a D-state child is a no-op. This gate removes
+/// the reachable half of that hazard; it does not claim to see the rest.
 ///
-/// Off Linux there is no such device and no such kernel state, so this returns
-/// `true` without probing anything. That gate is load-bearing rather than
-/// pedantic: `amd-smi.exe` is a supported Windows binary (see
+/// Off Linux there is no such device and no such kernel state, so the check is
+/// `true` without probing anything. That wave-through is load-bearing rather
+/// than pedantic: `amd-smi.exe` is a supported Windows binary (see
 /// [`managed_sdk_tool_path`]), so a check that simply failed to find `/dev/kfd`
 /// there would silently disable GPU detection on every Windows host.
 ///
-/// WSL needs the same wave-through for the same reason, and cannot get it from
-/// `cfg`: it compiles as Linux yet has no `/dev/kfd` (see [`KFD_DEVICE`]), so
-/// the real open would fail on every WSL host and decline every launch. WSL is
-/// supported here — it has its own diagnosis catalog and its own GPU E2E lane —
-/// and both `serve` probes discard the error with `.ok()?`, so that would be a
-/// silent loss of GPU detection rather than a visible failure. The D-state hazard
-/// this gate exists for is an `amdgpu`/KFD one, which is precisely the stack WSL
-/// does not load.
-#[must_use]
-pub fn amd_smi_preflight_ok() -> bool {
-    kfd_readable(Path::new(KFD_DEVICE))
-}
-
+/// WSL needs a wave-through for the same reason and cannot get it from `cfg`:
+/// it compiles as Linux yet has no `/dev/kfd` (see [`KFD_DEVICE`]), so the real
+/// open fails on every WSL host. But WSL identity alone is not the condition.
+/// `b4f98bc2` replaced exactly such a bare identity check in the dashboard
+/// pre-flight with [`has_usable_amd_gpu`], because `/dev/dxg` is vendor-agnostic
+/// and a WSL host whose ROCDXG plumbing is not ready is one where `amd-smi`
+/// still hangs — a different hazard from the KFD one, which an "is this WSL"
+/// test cannot tell apart from a healthy host. So the substitution is
+/// `is_wsl_host() && has_usable_amd_gpu()`, the same conjunction
+/// `apps/rocm/src/dash.rs::gpu_reachable_for_preflight` feeds the dashboard, and
+/// `serve`/`rocmd`/the dashboard keep the single cross-surface verdict that
+/// commit established. On bare metal `is_wsl_host()` short-circuits, so
+/// [`has_usable_amd_gpu`] is never consulted and behaviour is a plain
+/// `/dev/kfd` open.
+///
+/// Hardware-probe routing (see [`crate::hardware_root`]): like the dashboard
+/// pre-flight, this reads `host_path("/dev/kfd")` *and* keeps the real node's
+/// veto. A simulated E2E root can therefore make the gate decline on a machine
+/// that has a GPU, but can never make it allow a launch on a machine that does
+/// not.
 #[cfg(target_os = "linux")]
 fn kfd_readable(device: &Path) -> bool {
-    kfd_readable_with(is_wsl_host(), device)
+    kfd_readable_with(
+        // `&&` short-circuits: `has_usable_amd_gpu` runs on WSL only.
+        is_wsl_host() && has_usable_amd_gpu(),
+        device,
+        &host_path(device),
+    )
 }
 
-/// [`kfd_readable`] with the WSL determination injected, so the wave-through can
-/// be pinned from a test on an ordinary Linux host rather than only on WSL.
+/// [`kfd_readable`] with its two non-syscall inputs injected, so the
+/// wave-through and the simulated-root routing can both be pinned from a test
+/// on an ordinary Linux host rather than only on WSL or under an E2E root.
+///
+/// `wsl_gpu_reachable` may only ever be the WSL conjunction described on
+/// [`kfd_readable`]; it substitutes for the device open entirely, so widening it
+/// to any fail-open verdict would disable the gate on bare metal.
 #[cfg(target_os = "linux")]
-fn kfd_readable_with(is_wsl: bool, device: &Path) -> bool {
-    if is_wsl {
-        return true;
-    }
+fn kfd_readable_with(wsl_gpu_reachable: bool, real_device: &Path, host_device: &Path) -> bool {
+    wsl_gpu_reachable
+        || (device_readable(real_device)
+            && (host_device == real_device || device_readable(host_device)))
+}
+
+#[cfg(target_os = "linux")]
+fn device_readable(device: &Path) -> bool {
     fs::OpenOptions::new().read(true).open(device).is_ok()
 }
 
@@ -4537,8 +4559,27 @@ fn kfd_readable(_device: &Path) -> bool {
     true
 }
 
+/// How much of a failed `amd-smi`'s own output the error message quotes.
+///
+/// The bound is not cosmetic. `rocmd` renders this whole error chain into
+/// `CodexBridgeGpuSnapshot.note` and the GPU-metrics watcher copies that note
+/// into the automation-event and audit JSONL files on every poll — files whose
+/// append helpers rewrite the whole file each time. Unbounded, one `amd-smi`
+/// that prints a payload and then fails grows both logs by that much per tick,
+/// and every subsequent append costs more than the last. A 151K-character JSONL
+/// line was reproduced from exactly that poller.
+///
+/// Deliberately the same name and value as the `MAX_QUOTED_OUTPUT_CHARS` in
+/// `fix/rocmai-448-drain-child-pipes` (PR #526), which bounds the same quote for
+/// the same reason one layer down, in its `run_with_timeout`. The two branches
+/// are building overlapping subprocess-timeout helpers; keeping the bound
+/// identical means converging on one of them is a deletion rather than a
+/// behaviour change. Sized to still hold a real stderr backtrace: the point is
+/// to stop a payload-sized quote, not to shorten diagnostics.
+const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
+
 /// Run `amd-smi <args>` and parse its stdout as JSON, declining to launch at all
-/// unless [`amd_smi_preflight_ok`] passes.
+/// unless the `/dev/kfd` pre-flight in [`kfd_readable`] passes.
 ///
 /// This is the supported way to launch `amd-smi` from a synchronous caller. The
 /// pre-flight has to happen at every launch site or it protects nothing, and
@@ -4546,10 +4587,10 @@ fn kfd_readable(_device: &Path) -> bool {
 /// added.
 ///
 /// `timeout` is defence in depth, not the mitigation: see
-/// [`run_command_with_timeout`], which kills the child and then waits for it,
-/// neither of which dislodges a process in uninterruptible sleep. It bounds the
-/// ordinary failures — a slow or wedged-but-signalable `amd-smi` — and nothing
-/// more.
+/// [`run_command_with_timeout`], which kills the child and hands the `wait` to a
+/// detached reaper — neither of which dislodges a process in uninterruptible
+/// sleep. It bounds the ordinary failures — a slow or wedged-but-signalable
+/// `amd-smi` — and it bounds this call's own return, not the child's lifetime.
 pub fn amd_smi_json(args: &[&str], timeout: Duration) -> Result<serde_json::Value> {
     amd_smi_json_with(
         &resolve_amd_smi_binary(),
@@ -4567,8 +4608,9 @@ fn amd_smi_json_with(
 ) -> Result<serde_json::Value> {
     if !kfd_readable(kfd_device) {
         bail!(
-            "declined to launch `amd-smi {}`: {} is not readable, and amd-smi can block \
-             unkillably in uninterruptible sleep against a kernel driver in that state",
+            "declined to launch `amd-smi {}`: {} could not be opened for reading (absent, \
+             permission denied, no KFD GPU node, or a reset in progress), and amd-smi can \
+             block unkillably in uninterruptible sleep against a device in that state",
             args.join(" "),
             kfd_device.display()
         );
@@ -4586,18 +4628,26 @@ fn amd_smi_json_with(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        // Truncated, not dropped. This message reaches `rocmd`'s snapshot note
+        // and from there the JSONL logs, so the quote has to be bounded at the
+        // point that knows these characters are raw child output — see
+        // [`MAX_QUOTED_OUTPUT_CHARS`]. The head is where a failing `amd-smi`
+        // says what went wrong, and the command is named before it either way.
         bail!(
             "amd-smi {} failed: {}",
             args.join(" "),
-            if stderr.is_empty() {
-                if stdout.is_empty() {
-                    format!("exit status {}", output.status)
+            crate::examine::truncate_to_chars(
+                if stderr.is_empty() {
+                    if stdout.is_empty() {
+                        format!("exit status {}", output.status)
+                    } else {
+                        stdout
+                    }
                 } else {
-                    stdout
-                }
-            } else {
-                stderr
-            }
+                    stderr
+                },
+                MAX_QUOTED_OUTPUT_CHARS,
+            )
         );
     }
 
@@ -4610,8 +4660,8 @@ fn amd_smi_json_with(
 ///
 /// Bounds signalable children only. A child in uninterruptible sleep ignores
 /// the `kill`, so callers that can reach one must decline to spawn it in the
-/// first place — see [`amd_smi_preflight_ok`]. This function at least returns
-/// to its caller in that case rather than joining the child in its wait.
+/// first place — see the pre-flight on [`amd_smi_json`]. This function at least
+/// returns to its caller in that case rather than joining the child in its wait.
 ///
 /// On timeout the calling thread returns without waiting on the child; the
 /// `wait` is handed to a detached reaper thread instead, because
@@ -4630,8 +4680,8 @@ pub fn run_command_with_timeout(
     // (64 KiB on Linux) blocks mid-write and never exits, so a merely verbose
     // command would be reported as having hung. `amd-smi metric --json` on a
     // multi-GPU host clears 64 KiB comfortably.
-    let stdout = child.stdout.take().map(drain_on_thread);
-    let stderr = child.stderr.take().map(drain_on_thread);
+    let stdout = child.stdout.take().and_then(drain_on_thread);
+    let stderr = child.stderr.take().and_then(drain_on_thread);
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait().context("failed to poll child process")? {
@@ -4683,15 +4733,19 @@ pub fn run_command_with_timeout(
 /// Does not guarantee:
 ///
 /// - That the child dies. A process in uninterruptible sleep ignores `SIGKILL`,
-///   so its reaper parks until the kernel lets it go, possibly forever. The
-///   resource leaked in that case is a blocked thread rather than a zombie PID
-///   — no worse than what it replaces, and better than blocking the caller, but
-///   still a leak. The only real mitigation is declining to spawn against a
-///   suspect device: see [`amd_smi_preflight_ok`].
+///   so its reaper parks until the kernel lets it go, possibly forever — and so
+///   do both reader threads, which only end at EOF on their pipes. The resources
+///   leaked in that case are three parked threads rather than a zombie PID:
+///   better than blocking the caller, but still a leak, and a larger one than
+///   the single blocked caller thread the pre-rewrite code would have had. The
+///   only real mitigation is declining to spawn against a suspect device: see
+///   the pre-flight on [`amd_smi_json`].
 /// - That a reaper always exists. If the thread cannot be spawned, the child is
-///   dropped and left as a zombie, which is the pre-existing failure mode and
-///   strictly better than propagating an error from a path that is already
-///   reporting one.
+///   dropped and left as a zombie. That is strictly better than propagating an
+///   error from a path that is already reporting one — but it is *not* what the
+///   pre-rewrite code did: that waited synchronously after the `kill` and so
+///   left no zombie, at the cost of blocking the caller in the D-state case
+///   this function exists to return from.
 ///
 /// Reaper threads do not accumulate under normal operation: one is created per
 /// timeout, and each one exits as soon as its child does. Accumulation needs a
@@ -4705,12 +4759,23 @@ fn reap_in_background(mut child: std::process::Child) {
         });
 }
 
-fn drain_on_thread<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = pipe.read_to_end(&mut buffer);
-        buffer
-    })
+/// Start draining `pipe` on its own thread, or return `None` if no thread can be
+/// started.
+///
+/// `thread::Builder` rather than `thread::spawn` for the same reason
+/// [`reap_in_background`] uses it: a panic here would unwind out of a daemon
+/// with the child already spawned and nobody left to kill or reap it. Failing to
+/// start a reader instead costs that stream's output and leaves the timeout to
+/// bound the call, which is survivable.
+fn drain_on_thread<R: Read + Send + 'static>(mut pipe: R) -> Option<thread::JoinHandle<Vec<u8>>> {
+    thread::Builder::new()
+        .name("rocm-drain-child-pipe".to_owned())
+        .spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+        .ok()
 }
 
 fn join_drained(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
@@ -6580,7 +6645,6 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn the_kfd_preflight_waves_through_hosts_that_have_no_kfd() {
         assert!(kfd_readable(Path::new("/definitely/not/a/device/node")));
-        assert!(amd_smi_preflight_ok());
     }
 
     /// WSL has no `/dev/kfd` either, but unlike Windows it cannot be waved
@@ -6590,20 +6654,152 @@ mod tests {
     /// `.ok()?`. Same wave-through as the off-Linux case above, decided at
     /// runtime instead.
     ///
-    /// The bare-metal assertion is the control: without it this would still
-    /// pass with the wave-through deleted.
+    /// The *conjunction* is what is pinned, not WSL identity: a WSL host whose
+    /// ROCDXG plumbing is not ready is one where `amd-smi` still hangs, which is
+    /// why `b4f98bc2` replaced a bare identity check with `has_usable_amd_gpu()`
+    /// in the dashboard pre-flight. The unready-WSL case below is the one that
+    /// distinguishes this from that mistake; the bare-metal case is the control
+    /// that stops the whole test passing with the gate deleted.
     #[test]
     #[cfg(target_os = "linux")]
-    fn the_kfd_preflight_waves_through_wsl_hosts() {
+    fn the_kfd_preflight_waves_through_wsl_hosts_only_when_the_gpu_is_reachable() {
         let absent = Path::new("/definitely/not/a/device/node");
         assert!(
-            kfd_readable_with(true, absent),
-            "WSL has no /dev/kfd, so its absence must not decline the launch"
+            kfd_readable_with(true, absent, absent),
+            "a ready WSL host has no /dev/kfd, so its absence must not decline the launch"
         );
         assert!(
-            !kfd_readable_with(false, absent),
-            "a bare-metal host with no readable KFD must still be declined"
+            !kfd_readable_with(false, absent, absent),
+            "an unready WSL host — or a bare-metal one with no readable KFD — must be declined"
         );
+    }
+
+    /// The simulated-root routing, which `kfd_readable` applies to the real
+    /// `/dev/kfd` on the production path.
+    ///
+    /// Both halves are load-bearing and they fail in opposite directions. A
+    /// simulated root that hides the device must decline (so an E2E lane can
+    /// manufacture the declined branch on a machine that does have a GPU), and
+    /// a simulated root that *invents* a device must not allow (so no test hook
+    /// can ever start a real `amd-smi` on a machine that has no GPU — the veto
+    /// `hardware_root`'s module contract requires of this probe).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-kfd-root-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let present = temp_root.join("present-kfd");
+        fs::write(&present, b"")?;
+        let absent = temp_root.join("absent-kfd");
+
+        let real_present_root_absent = kfd_readable_with(false, &present, &absent);
+        let real_absent_root_present = kfd_readable_with(false, &absent, &present);
+        let both_present = kfd_readable_with(false, &present, &present);
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert!(
+            !real_present_root_absent,
+            "a simulated root that hides the device must decline the launch"
+        );
+        assert!(
+            !real_absent_root_present,
+            "a simulated root must never be able to start amd-smi on a host with no real device"
+        );
+        assert!(
+            both_present,
+            "the ordinary case must still pass, or the two above prove nothing"
+        );
+        Ok(())
+    }
+
+    /// Pins the production wiring the injected helpers cannot: that
+    /// [`amd_smi_json`] gates on [`KFD_DEVICE`] itself.
+    ///
+    /// Every other gate test reaches `amd_smi_json_with` with a device of its
+    /// own choosing, so swapping the constant out of the public wrapper — which
+    /// disables the gate for every production caller — leaves them all green.
+    /// This compares the wrapper's observable verdict against the gate read
+    /// directly, so the two can only agree while the wrapper passes the real
+    /// device through.
+    ///
+    /// Non-vacuous on any host with no readable `/dev/kfd` (every non-GPU CI
+    /// runner): there the gate says "decline" and a wrapper that no longer
+    /// consults it does not. On a GPU host both sides say "allow" and this
+    /// asserts only that no spurious decline appeared.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_public_amd_smi_entry_point_gates_on_the_real_kfd_device() {
+        let gate_allows = kfd_readable(Path::new(KFD_DEVICE));
+
+        // A deliberately bogus subcommand: if the gate allows the launch this
+        // still fails, but with a *launch* error rather than a decline, and it
+        // is the decline that is under test. The timeout is short because the
+        // pre-flight has already passed by the time anything is spawned.
+        let error = amd_smi_json(&["--rocm-cli-gate-probe"], Duration::from_secs(5)).err();
+        let declined = error.is_some_and(|error| {
+            let message = format!("{error:#}");
+            message.contains("declined to launch") && message.contains(KFD_DEVICE)
+        });
+
+        assert_eq!(
+            declined, !gate_allows,
+            "amd_smi_json must decline exactly when the gate on {KFD_DEVICE} does; a wrapper \
+             that passes some other path declines on neither host"
+        );
+    }
+
+    /// A failing `amd-smi` that prints a payload must not paste the payload into
+    /// the error. `rocmd` puts this message in its snapshot note and the
+    /// GPU-metrics watcher copies that note into rewrite-the-whole-file JSONL
+    /// logs on every poll, which is how a 151K-character log line was produced.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_failing_amd_smi_cannot_paste_its_whole_output_into_the_error() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if is_wsl_host() {
+            return Ok(());
+        }
+
+        const PAYLOAD_CHARS: usize = 200_000;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-amd-smi-quote-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let fake_amd_smi = temp_root.join("amd-smi");
+        fs::write(
+            &fake_amd_smi,
+            format!("#!/bin/sh\nyes x | head -c {PAYLOAD_CHARS} | tr -d '\\n' >&2\nexit 1\n"),
+        )?;
+        fs::set_permissions(&fake_amd_smi, fs::Permissions::from_mode(0o755))?;
+        let readable_device = temp_root.join("stand-in-kfd");
+        fs::write(&readable_device, b"")?;
+
+        let error = amd_smi_json_with(
+            fake_amd_smi.as_os_str(),
+            &readable_device,
+            &["list", "--json"],
+            Duration::from_secs(30),
+        )
+        .expect_err("a child that exits 1 must fail the call");
+        let message = format!("{error:#}");
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert!(
+            message.chars().count() < PAYLOAD_CHARS / 10,
+            "the failure message quoted {} characters of child output unbounded",
+            message.chars().count()
+        );
+        assert!(
+            message.contains("amd-smi list --json failed"),
+            "the bound must not cost the message its subject: {message}"
+        );
+        assert!(
+            message.contains("[truncated]"),
+            "an over-long quote must say it was cut, not look like the whole story: {message}"
+        );
+        Ok(())
     }
 
     #[test]

@@ -5,9 +5,8 @@
 use anyhow::{Context, Result, bail};
 use rocm_core::{
     AppPaths, AutomationRuntimeState, CodexBridgeEngine, CodexBridgeGpuSnapshot,
-    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, amd_smi_json, command_failure_detail,
-    daemon_binary_path, default_engine_for_platform, format_host_port,
-    load_recent_automation_events, unix_time_millis,
+    CodexBridgeSnapshot, ExamineSummary, RocmCliConfig, amd_smi_json, daemon_binary_path,
+    default_engine_for_platform, format_host_port, load_recent_automation_events, unix_time_millis,
 };
 #[cfg(test)]
 use rocm_engine_protocol::EnginePluginDescriptor;
@@ -163,37 +162,6 @@ pub(crate) struct CommandCapture {
     pub(crate) stderr: String,
 }
 
-pub(crate) fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
 pub(crate) fn run_rocm_capture(args: &[&str]) -> Result<CommandCapture> {
     let paths = AppPaths::discover()?;
     run_rocm_capture_for_paths(&paths, args, Duration::from_mins(2))
@@ -214,7 +182,14 @@ pub(crate) fn run_rocm_capture_for_paths(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = run_command_with_timeout(command, timeout)
+    // The shared helper, not a local poll-and-`wait_with_output` loop: this path
+    // is reached from the MCP bridge's examine/update/sandbox-check handlers,
+    // where `rocm` can easily print more than the 64 KiB pipe buffer, and the
+    // local copy reported that as a timeout it had itself caused. It also quoted
+    // the whole of the child's output into that timeout error, which is the
+    // unbounded-note defect `fix/rocmai-448-drain-child-pipes` reproduced from
+    // the daemon's JSONL logs; the shared helper quotes none of it.
+    let output = rocm_core::run_command_with_timeout(command, timeout)
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())

@@ -39,14 +39,20 @@
 //! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
 //! about this process's environment, not the hardware.
 //!
-//! Routed, but with the real device keeping a veto: the `rocm dash` `amd-smi`
-//! pre-flight. It decides whether a real `amd-smi` process may start, so
-//! `apps/rocm/src/dash.rs` passes `host_path("/dev/kfd")` to the dash daemon
-//! and the collector requires both that path and the real `/dev/kfd` to be
-//! readable. A simulated root can hide the GPU from the dashboard but cannot
-//! start `amd-smi` on a machine without one. The WSL reachability verdict
-//! still substitutes for the whole device check, as it always has, so the veto
-//! does not cover it.
+//! Routed, but with the real device keeping a veto: the two `amd-smi`
+//! pre-flights. Each decides whether a real `amd-smi` process may start, so
+//! each requires `host_path("/dev/kfd")` *and* the real `/dev/kfd` to be
+//! readable. A simulated root can hide the GPU from them, but cannot start
+//! `amd-smi` on a machine without one. They are:
+//!
+//! - the `rocm dash` collector's, where `apps/rocm/src/dash.rs` passes the
+//!   re-rooted path down to the dash daemon — those crates deliberately do not
+//!   depend on this one, so the caller resolves it;
+//! - the synchronous one behind `crate::amd_smi_json`, which `rocm serve` and
+//!   `rocmd` reach and which calls [`host_path`] itself.
+//!
+//! The WSL reachability verdict still substitutes for the whole device check in
+//! both, as it always has, so the veto does not cover it.
 //!
 //! In a normal build [`host_path`] is the identity: the path is returned as
 //! written and the probes read the real host. Only a build compiled with the
