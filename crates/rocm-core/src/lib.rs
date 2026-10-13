@@ -3162,8 +3162,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_kfd_gate_stops_amd_smi_before_it_is_spawned() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         // WSL compiles as Linux but is waved through deliberately (see
         // `the_kfd_preflight_waves_through_wsl_hosts`), so there is no gate to
         // exercise on such a host and the blocked case could never hold.
@@ -3177,11 +3175,13 @@ mod tests {
         fs::create_dir_all(&temp_root)?;
         let marker = temp_root.join("amd-smi-ran");
         let fake_amd_smi = temp_root.join("amd-smi");
-        fs::write(
+        // Not `fs::write` + `set_permissions`: this process is about to execute
+        // the file, and a write fd leaked into a parallel test's fork would make
+        // the first run fail with `ETXTBSY`. See `fake_executable`.
+        crate::fake_executable::write_fake_executable(
             &fake_amd_smi,
             format!("#!/bin/sh\ntouch '{}'\necho '{{}}'\n", marker.display()),
         )?;
-        fs::set_permissions(&fake_amd_smi, fs::Permissions::from_mode(0o755))?;
         let readable_device = temp_root.join("stand-in-kfd");
         fs::write(&readable_device, b"")?;
 
@@ -3485,8 +3485,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn a_failing_amd_smi_cannot_paste_its_whole_output_into_the_error() -> Result<()> {
-        use std::os::unix::fs::PermissionsExt;
-
         const PAYLOAD_CHARS: usize = 200_000;
 
         if is_wsl_host() {
@@ -3499,11 +3497,12 @@ mod tests {
             std::env::temp_dir().join(format!("rocm-cli-amd-smi-quote-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
         let fake_amd_smi = temp_root.join("amd-smi");
-        fs::write(
+        // See the sibling gate test: planting an executable this process then
+        // runs has to go through `fake_executable` or it races `ETXTBSY`.
+        crate::fake_executable::write_fake_executable(
             &fake_amd_smi,
             format!("#!/bin/sh\nyes x | head -c {PAYLOAD_CHARS} | tr -d '\\n' >&2\nexit 1\n"),
         )?;
-        fs::set_permissions(&fake_amd_smi, fs::Permissions::from_mode(0o755))?;
         let readable_device = temp_root.join("stand-in-kfd");
         fs::write(&readable_device, b"")?;
 
