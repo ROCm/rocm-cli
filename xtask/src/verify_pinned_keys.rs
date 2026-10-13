@@ -506,12 +506,15 @@ mod tests {
     /// a variable nothing ever sets, and the cross-check silently skips.
     ///
     /// Matching the gate's assignment lines, not merely the name somewhere in the
-    /// file, is what makes this bite. Both literals also appear in
-    /// `PRODUCTION_TRUST_ENV_NAMES` and `validate_production_trust`, so a
-    /// name-anywhere search passed three real regressions: swapping the two
-    /// constants (release CI would read the PEM text as a file path), and pointing
-    /// either at `ROCM_CLI_METADATA_*` (the cross-check would quietly skip).
-    /// Pinning `BINDING = "NAME"` ties each name to the role the gate gives it.
+    /// file, is what makes this bite. The literals also appear in the gate's
+    /// self-test environments, so a name-anywhere search passed three real
+    /// regressions: swapping the two constants (release CI would read the PEM text
+    /// as a file path), and pointing either at `ROCM_CLI_METADATA_*` (the
+    /// cross-check would quietly skip). Pinning `BINDING = "NAME"` ties each name
+    /// to the role the gate gives it.
+    ///
+    /// This pins the names only. [`key_resolution_order_matches_the_release_gate`]
+    /// pins the order they are consulted in, which is a separate rule.
     #[test]
     fn ci_public_key_env_names_match_the_release_gate() {
         let gate = std::fs::read_to_string(repo_root().join("scripts/release_readiness.py"))
@@ -528,6 +531,92 @@ mod tests {
                  with. Expected the line {assignment:?}"
             );
         }
+    }
+
+    /// The source of one top-level `def`, up to the next top-level `def`.
+    ///
+    /// Slicing to the function matters: both constants appear a dozen other
+    /// places in the gate (`PRODUCTION_TRUST_ENV_NAMES`, `validate_production_trust`,
+    /// the self-test cases), so a file-wide search would order unrelated lines and
+    /// pass whatever the resolver actually did.
+    fn python_function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let header = format!("\ndef {name}(");
+        let start = source
+            .find(&header)
+            .unwrap_or_else(|| panic!("scripts/release_readiness.py has no `def {name}(`"))
+            + 1;
+        let rest = &source[start..];
+        let end = rest[1..]
+            .find("\ndef ")
+            .map_or(rest.len(), |index| index + 2);
+        &rest[..end]
+    }
+
+    /// The path-before-PEM precedence must stay in lockstep across both
+    /// implementations, not merely the variable names.
+    ///
+    /// [`ci_public_key_env_names_match_the_release_gate`] pins *which* variable
+    /// each side reads for each role, but nothing pinned the *order* they are
+    /// consulted in. Reversing either side alone left both suites green: the
+    /// lookup tests below only observe the Rust resolver, and the gate's
+    /// `--self-test` only observes the Python one. A release would then be
+    /// verified against the inline PEM while this cross-check compared the key
+    /// named by path (or the reverse) — two different trust roots, with the run
+    /// still reporting success and naming only one of them.
+    ///
+    /// So the order is established twice, independently: observed by *running*
+    /// the Rust resolver with both sources set, and read out of the gate's own
+    /// `resolve_signing_key` body. Both must say path-before-PEM.
+    #[test]
+    fn key_resolution_order_matches_the_release_gate() {
+        // The Rust order, observed rather than read off the source: with both
+        // sources set to different keys, whichever comes back is the winner.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_file = dir.path().join("by-path.pem");
+        std::fs::write(&key_file, SAMPLE).expect("write key");
+        let inline = SAMPLE.replace("test", "diff");
+
+        let both_set = |name: &str| match name {
+            CI_PUBLIC_KEY_PATH_ENV => Some(OsString::from(key_file.as_os_str())),
+            CI_PUBLIC_KEY_PEM_ENV => Some(OsString::from(inline.as_str())),
+            other => panic!("unexpected variable queried: {other}"),
+        };
+        let resolved = resolve_ci_public_key(both_set)
+            .expect("both sources set resolves a key")
+            .expect("a key");
+        assert_eq!(
+            pem_body(&resolved).unwrap(),
+            pem_body(SAMPLE).unwrap(),
+            "resolve_ci_public_key stopped preferring {CI_PUBLIC_KEY_PATH_ENV} over \
+             {CI_PUBLIC_KEY_PEM_ENV}. The release gate still resolves the path first, so \
+             this cross-check would compare a different key than releases are verified \
+             against, and report a match for a key nobody verified with"
+        );
+
+        // The Python order, read out of the gate's own resolver.
+        let gate = std::fs::read_to_string(repo_root().join("scripts/release_readiness.py"))
+            .expect("read scripts/release_readiness.py");
+        let body = python_function_body(&gate, "resolve_signing_key");
+        let locate = |needle: &str| {
+            body.find(needle).unwrap_or_else(|| {
+                panic!(
+                    "resolve_signing_key no longer resolves its key via `{needle}`, so the \
+                     two implementations' precedence can no longer be compared. Re-establish \
+                     the comparison rather than deleting it: the order is the security rule. \
+                     The body read was:\n{body}"
+                )
+            })
+        };
+        let path_branch = locate("env_path(SIGNING_PUBLIC_KEY_PATH_ENV)");
+        let pem_branch = locate("env_text(SIGNING_PUBLIC_KEY_ENV)");
+        assert!(
+            path_branch < pem_branch,
+            "release_readiness.py's resolve_signing_key now consults \
+             {CI_PUBLIC_KEY_PEM_ENV} before {CI_PUBLIC_KEY_PATH_ENV}, while \
+             resolve_ci_public_key above still resolves the path first. The gate would \
+             verify a release against one key and this cross-check would compare another. \
+             Change both or neither"
+        );
     }
 
     /// The cross-check must see a key supplied by path, not just the inline PEM.
