@@ -4,8 +4,15 @@
 
 //! Shared test-only fixtures for `rocm`'s module test suites.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::Result;
+use rocm_core::AppPaths;
+
+use crate::runtimes_cmd::{runtime_manifest_path, runtime_registry_dir};
+use crate::therock;
 
 /// A name suffix no other call in this test process returns.
 ///
@@ -58,6 +65,100 @@ pub(crate) fn assert_each_call_gets_its_own_root(make_root: impl Fn() -> PathBuf
         CALLERS,
         "two calls with one label must not share a root"
     );
+}
+
+/// Write a fake `release-pip` runtime install (manifest, registry entry, and
+/// the on-disk layout `InstalledRuntimeManifest` expects) under `paths`, for
+/// tests across the runtime/SDK-install test suites that need a usable
+/// runtime fixture without a real ROCm SDK install.
+pub(crate) fn write_test_pip_runtime(
+    paths: &AppPaths,
+    runtime_key: &str,
+    runtime_id: &str,
+    version: &str,
+    installed_at_unix_ms: u128,
+) -> Result<therock::InstalledRuntimeManifest> {
+    let install_root = paths
+        .data_dir
+        .join("runtimes")
+        .join("wheel")
+        .join(runtime_key);
+    let scripts_dir = install_root.join(if cfg!(windows) { "Scripts" } else { "bin" });
+    let python_executable = scripts_dir.join(if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python"
+    });
+    let sdk_root = install_root.join("_rocm_sdk_devel");
+    let sdk_bin = sdk_root.join("bin");
+    fs::create_dir_all(&scripts_dir)?;
+    fs::create_dir_all(&sdk_bin)?;
+    let amdhip = sdk_bin.join(if cfg!(windows) {
+        "amdhip64_7.dll"
+    } else {
+        "libamdhip64.so"
+    });
+    let hipblas = sdk_bin.join(if cfg!(windows) {
+        "hipblas.dll"
+    } else {
+        "libhipblas.so"
+    });
+    fs::write(&python_executable, "python")?;
+    fs::write(&amdhip, "amdhip")?;
+    fs::write(&hipblas, "hipblas")?;
+
+    let manifest = therock::InstalledRuntimeManifest {
+        runtime_key: runtime_key.to_owned(),
+        runtime_id: runtime_id.to_owned(),
+        channel: "release".to_owned(),
+        format: "wheel".to_owned(),
+        family: "gfx120X-all".to_owned(),
+        family_source: "test".to_owned(),
+        version: version.to_owned(),
+        install_root: install_root.clone(),
+        selected_artifact_url: "https://example.invalid/therock".to_owned(),
+        source_layout_generation: None,
+        index_url: Some("https://example.invalid/therock".to_owned()),
+        tarball_file_name: None,
+        python_launcher: Some("python".to_owned()),
+        python_executable: Some(python_executable.display().to_string()),
+        pip_cache_dir: Some(paths.cache_dir.join("uv").join("therock")),
+        rocm_sdk: Some(therock::RocmSdkPythonProbe {
+            import_ok: true,
+            root_path: Some(sdk_root.clone()),
+            bin_path: Some(sdk_bin.clone()),
+            runtime_roots: vec![sdk_root],
+            bin_paths: vec![sdk_bin.clone()],
+            library_paths: vec![sdk_bin],
+            resolved_libraries: vec![
+                therock::RocmSdkLibraryProbe {
+                    shortname: "amdhip64".to_owned(),
+                    paths: vec![amdhip],
+                },
+                therock::RocmSdkLibraryProbe {
+                    shortname: "hipblas".to_owned(),
+                    paths: vec![hipblas],
+                },
+            ],
+            ..therock::RocmSdkPythonProbe::default()
+        }),
+        sdk_torch: None,
+        wheel_composition: None,
+        read_only: false,
+        imported_from: None,
+        devel: true,
+        installed_at_unix_ms,
+    };
+    fs::create_dir_all(runtime_registry_dir(paths))?;
+    fs::write(
+        runtime_manifest_path(paths, runtime_key),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(manifest)
 }
 
 mod tests {

@@ -201,13 +201,15 @@ jobs:
               - 'PSScriptAnalyzerSettings.psd1'
               - '.github/workflows/**'
             # Sphinx docs site: the doc sources themselves, plus README.md,
-            # CONTRIBUTING.md and docs/vllm.md, which pages single-source via
-            # MyST `{include}` directives, plus the build config/toolchain pins.
+            # CONTRIBUTING.md, docs/vllm.md and docs/wsl.md, which pages
+            # single-source via MyST `{include}` directives, plus the build
+            # config/toolchain pins.
             docs:
               - 'docs/rocm-docs/**'
               - 'README.md'
               - 'CONTRIBUTING.md'
               - 'docs/vllm.md'
+              - 'docs/wsl.md'
               - '.readthedocs.yaml'
               - '.github/workflows/**'
 
