@@ -852,9 +852,11 @@ mod tests {
     /// `load` rejects. A hard link taken before the save still names the old
     /// file's contents only if the save published a new file over the path.
     ///
-    /// Unix-only because it observes replacement through a hard link; the
-    /// Windows publish step (`ReplaceFileW`) is covered by the atomic writer's
-    /// own tests in `apps/rocm/src/therock.rs`.
+    /// Unix-only because it observes replacement through a hard link. On
+    /// Windows the same guarantee is asserted by the `#[cfg(windows)]`
+    /// `saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place`,
+    /// through the file identity: `ReplaceFileW` leaves the published file with
+    /// the replacement's file ID, not the replaced one's.
     #[cfg(unix)]
     #[test]
     fn config_save_replaces_the_file_instead_of_rewriting_it_in_place() -> Result<()> {
@@ -1239,15 +1241,16 @@ last_installed_runtime_id = "therock-release"
         Ok(())
     }
 
-    /// The `inspect_err` cleanup on the rename, which the happy-path test above
-    /// cannot reach: it only ever asserts that a SUCCESSFUL save leaves nothing
-    /// behind, so deleting the cleanup would go unnoticed until a user with a
-    /// failing disk accumulated one `config.json.tmp-<ts>-<pid>` per attempt.
+    /// The atomic writer's cleanup of a temp file it could not publish, seen
+    /// through `save`, which the happy-path test above cannot reach: it only
+    /// ever asserts that a SUCCESSFUL save leaves nothing behind, so a save that
+    /// bypassed the writer's cleanup would go unnoticed until a user with a
+    /// failing disk accumulated one `config.json.tmp-*` per attempt.
     ///
-    /// A directory at the destination is what makes the rename fail on both
+    /// A directory at the destination is what makes the publish fail on both
     /// supported platforms without needing permissions a root CI lane ignores —
     /// the same device `write_file_atomically_cleans_up_temp_when_the_rename_fails`
-    /// uses in `apps/rocm`.
+    /// uses in `atomic_write.rs`.
     #[test]
     fn a_config_save_that_cannot_publish_cleans_up_its_temp_file() -> Result<()> {
         let (root, paths) = temp_app_paths("config-save-rename-fails");
