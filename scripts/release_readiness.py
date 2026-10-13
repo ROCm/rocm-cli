@@ -560,18 +560,29 @@ def require_existing_env_path(name: str) -> Path:
 
 
 def validate_production_trust() -> list[str]:
-    """Validate only explicit owner-provided production trust inputs."""
+    """Validate only explicit owner-provided production trust inputs.
+
+    The signing-key checks below are defence in depth rather than the live gate.
+    ``--require-production-trust`` now makes ``verification_is_required`` true, so
+    ``main`` runs ``resolve_signing_key`` first and already fails closed when no
+    key resolves; by the time this function runs, a signing key is known to exist.
+    They are kept because this function is also reachable directly (``--self-test``
+    drives it, and ``validate_release`` can be called as a library function), and
+    because a check that fails closed costs nothing when it never fires. Deleting
+    them would make the "production trust" report depend entirely on a guarantee
+    established somewhere else.
+    """
 
     messages: list[str] = []
     require_any(
         "the release signing public key",
-        ["ROCM_CLI_SIGNING_PUBLIC_KEY_PATH", "ROCM_CLI_SIGNING_PUBLIC_KEY_PEM"],
+        [SIGNING_PUBLIC_KEY_PATH_ENV, SIGNING_PUBLIC_KEY_ENV],
     )
     if (
-        path := env_path("ROCM_CLI_SIGNING_PUBLIC_KEY_PATH")
+        path := env_path(SIGNING_PUBLIC_KEY_PATH_ENV)
     ) is not None and not path.is_file():
         raise ReadinessError(
-            f"ROCM_CLI_SIGNING_PUBLIC_KEY_PATH does not point to a file: {path}"
+            f"{SIGNING_PUBLIC_KEY_PATH_ENV} does not point to a file: {path}"
         )
     messages.append("release signing public key configured")
 
