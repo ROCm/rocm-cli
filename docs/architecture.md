@@ -75,9 +75,12 @@ Already-extracted subsystem modules, following the same full-domain-extraction p
 - [`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs) — (ROCMAI-85, Phase 7a of EAI-7768's sequencing) GPU/host hardware detection — see the module's own doc comment for what it owns.
 - [`managed_runtime.rs`](../crates/rocm-core/src/managed_runtime.rs) — (ROCMAI-85, Phase 7a) the TheRock managed-runtime-environment surface — see the module's own doc comment for what it owns.
 - [`model_readiness.rs`](../crates/rocm-core/src/model_readiness.rs) — the `rocm diagnose --model`/`rocm model --verbose` fit assessment: curated-recipe lookup against a host's measured GPU/RAM, shared between the two commands so they cannot disagree about whether a model fits.
+- [`net.rs`](../crates/rocm-core/src/net.rs) — (ROCMAI-154, Phase 7b) networking/download/endpoint-readiness primitives.
+- [`paths.rs`](../crates/rocm-core/src/paths.rs) — (ROCMAI-154, Phase 7b) `AppPaths` and its filesystem-location primitives.
+- [`process.rs`](../crates/rocm-core/src/process.rs) — (ROCMAI-154, Phase 7b) process-spawn/terminate primitives, including `FileLock`.
 - [`rocm_install.rs`](../crates/rocm-core/src/rocm_install.rs) — (ROCMAI-85, Phase 7a) unmanaged ("legacy") ROCm install discovery — see the module's own doc comment for what it owns.
 
-Still in [`lib.rs`](../crates/rocm-core/src/lib.rs): amd-smi binary resolution (`resolve_amd_smi_binary*`), which consumes [`managed_runtime.rs`](../crates/rocm-core/src/managed_runtime.rs)'s registry records but is a distinct, not-yet-scoped concern.
+Still in [`lib.rs`](../crates/rocm-core/src/lib.rs): amd-smi binary resolution (`resolve_amd_smi_binary*`), which consumes [`managed_runtime.rs`](../crates/rocm-core/src/managed_runtime.rs)'s registry records but is a distinct, not-yet-scoped concern; the crypto and model-catalog clusters (ROCMAI-152, Phase 7c); and the config/automation/service-record/binary-paths clusters (ROCMAI-151, Phase 7d).
 
 [`lib.rs`](../crates/rocm-core/src/lib.rs) itself is **not yet fully modularized** — see EAI-7768, planned last in the modularization effort: highest fan-in (every app and engine crate depends on it), but lowest novelty since the existing sibling modules already prove the pattern works.
 
