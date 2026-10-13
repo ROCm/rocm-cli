@@ -6789,13 +6789,13 @@ mod tests {
     fn a_failing_amd_smi_cannot_paste_its_whole_output_into_the_error() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
+        const PAYLOAD_CHARS: usize = 200_000;
+
         if is_wsl_host() {
             return Ok(());
         }
 
         let _host_root = host_root_guard();
-
-        const PAYLOAD_CHARS: usize = 200_000;
 
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-amd-smi-quote-{}", unix_time_millis()));
