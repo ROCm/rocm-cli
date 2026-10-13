@@ -1439,17 +1439,18 @@ jobs:
           }
           exit 0
 
-      # The copy-out step above is deliberately best-effort (it must not report
-      # red just because an earlier step already failed the job), so a copy
-      # that failed for its own reason leaves results/ empty. `error` makes
-      # that a failed step here, in the lane that owns the copy, where default
-      # `warn` would upload nothing without a word. The consolidated report
-      # job's missing-report check flags the absent artifact too, and is the
-      # only signal on a `continue-on-error` lane: a failed step there does
-      # not turn the lane's check red. Only the WSL lanes need this guard:
-      # every other lane writes report.json directly in-job, with no
-      # guest-to-host copy step that can fail on its own. Each of the three
-      # legs below needs its own `if-no-files-found: error`, not just `current`.
+      # Three literal-named conditional steps rather than one templated `name:`
+      # — see e2e-gpu's upload-step comment for why. `if-no-files-found: error`
+      # on all three: the copy-out step above is deliberately best-effort (it
+      # must not report red just because an earlier step already failed the
+      # job), so this is the only place left to catch a copy that failed for
+      # its own reason: default `warn` would upload nothing, and the
+      # consolidated report's `discover()` (xtask/src/e2e_report.rs) simply
+      # omits any platform with no report.json rather than flagging it, so the
+      # lane would silently vanish from the report instead of showing as a
+      # failure. Only the WSL lanes need this: every other lane writes
+      # report.json directly in-job, with no extra guest-to-host copy step
+      # that can fail on its own.
       - name: Upload E2E report (current)
         if: always() && matrix.sdk_version == 'current'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
