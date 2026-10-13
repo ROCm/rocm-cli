@@ -369,4 +369,4 @@ Feature: Model serving
     When the user serves a model with Lemonade
     Then serving fails and names the engine's own log
     When the user serves the same model again
-    Then that serve reaches the engine launch again rather than being refused as already running
+    Then that serve reaches the engine launch again and fails the same way
