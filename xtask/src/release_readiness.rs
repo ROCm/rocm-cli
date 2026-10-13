@@ -145,9 +145,36 @@ fn collect_commit_subjects(since_tag: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Conventional Commit scopes that denote internal CI/dev tooling rather than
+/// CLI behavior an end user would notice. A multi-scope commit (e.g.
+/// `fix(core,ci): ...`) is kept if *any* of its scopes falls outside this
+/// set — only commits scoped *entirely* to internal tooling are dropped.
+const INTERNAL_SCOPES: &[&str] = &[
+    "ci",
+    "nightly",
+    "github",
+    "hooks",
+    "xtask",
+    "build",
+    "deps",
+    "e2e",
+    "e2e-report",
+    "e2e-cucumber",
+    "e2e-prewarm",
+];
+
+fn is_internal_only_scope(scope: &str) -> bool {
+    scope
+        .split(',')
+        .all(|s| INTERNAL_SCOPES.contains(&s.trim()))
+}
+
 /// Classify commit subjects by their Conventional Commit type prefix
 /// (`feat`/`fix`), splitting out `!`-marked breaking changes into their own
-/// bucket rather than double-counting them under feature/fix.
+/// bucket rather than double-counting them under feature/fix. Commits scoped
+/// entirely to internal CI/dev tooling (see [`INTERNAL_SCOPES`]) are dropped:
+/// this summary is for end-user-facing functionality and fixes, not the
+/// workflow that generates it.
 pub fn categorize(subjects: &[String]) -> CommitBuckets {
     let mut buckets = CommitBuckets::default();
     for subject in subjects {
@@ -157,7 +184,14 @@ pub fn categorize(subjects: &[String]) -> CommitBuckets {
         let head = &subject[..colon];
         let mut rest = subject[colon + 1..].trim().to_string();
         let breaking = head.ends_with('!');
-        let kind = head.trim_end_matches('!').split('(').next().unwrap_or("");
+        let head_no_bang = head.trim_end_matches('!');
+        let kind = head_no_bang.split('(').next().unwrap_or("");
+        let scope = head_no_bang
+            .find('(')
+            .and_then(|i| head_no_bang[i + 1..].strip_suffix(')'));
+        if scope.is_some_and(is_internal_only_scope) {
+            continue;
+        }
         let pr = extract_pr_number(subject);
         // `rest` still carries the trailing `(#NNN)` GitHub appends on
         // squash-merge, since it's after the colon too; strip it here so
@@ -399,6 +433,34 @@ mod tests {
                 pr: Some(125),
                 subject: "drop deprecated --legacy-flag".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn categorize_drops_commits_scoped_entirely_to_internal_tooling() {
+        let subjects = vec![
+            "fix(nightly): ensure a newline before the GITHUB_OUTPUT delimiter".to_string(),
+            "fix(ci): poll the GPU at least once before the preflight deadline (#608)".to_string(),
+            "fix(core,ci): bound local-service HTTP reads; raise strix-ubuntu E2E job timeout (#348)"
+                .to_string(),
+            "fix: report the ComfyUI source folder consistently in status and install (#600)"
+                .to_string(),
+        ];
+        let got = categorize(&subjects);
+        assert_eq!(
+            got.fixes,
+            vec![
+                CommitEntry {
+                    pr: Some(348),
+                    subject: "bound local-service HTTP reads; raise strix-ubuntu E2E job timeout"
+                        .to_string(),
+                },
+                CommitEntry {
+                    pr: Some(600),
+                    subject: "report the ComfyUI source folder consistently in status and install"
+                        .to_string(),
+                },
+            ]
         );
     }
 
