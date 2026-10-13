@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! One POSIX shell quoter for this binary's three command lines.
+//! One POSIX shell quoter for every command line this binary prints or runs.
 //!
 //! They look unrelated and are not:
 //!
@@ -16,13 +16,18 @@
 //! * [`crate::therock::quote_display_arg`] builds the `command: uv … && uv …`
 //!   line the install dry-run prints. Its install root comes from a `--prefix`
 //!   the local assistant can choose, and the line is offered to be run.
+//! * [`crate::service_hints`] and the runtime-activation report in
+//!   [`crate::runtime_services`] build the `rocm services … <id> --yes`,
+//!   `rocm services logs <id>` and `rocm runtimes activate <key> …` lines a
+//!   user is told to run next. A service id is not limited to inert
+//!   characters, so a bare one could split into several words on paste.
 //!
-//! All three want the same guarantee — *this value is one word and nothing
+//! All of them want the same guarantee — *this value is one word and nothing
 //! else* — so they share one implementation and one set of tests. Keeping them
 //! apart is how two of them ended up with quoters that did not escape `$`,
 //! backticks or `;`, and left a lone `"` unquoted entirely.
 //!
-//! The fourth is in another crate and stays there: `rocm-dash-tui`'s
+//! One more copy is in another crate and stays there: `rocm-dash-tui`'s
 //! `ui::exec::quote_display_arg`. `crates/rocm-dash-tui` must not depend on
 //! `rocm-core` — an invariant the workspace enforces, not a preference — and
 //! `apps/rocm` is the crate that owns `rocm-core`, so nothing here can be

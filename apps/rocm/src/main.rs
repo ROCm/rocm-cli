@@ -4204,7 +4204,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        "After this, `rocm services logs {}` and `{}` no longer work.",
+        shell_quote(service_id),
         service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
@@ -15533,6 +15534,44 @@ pub(crate) mod tests {
         assert!(
             rendered.contains(&format!("  log: {}", record.log_path.display())),
             "the log path must be printed before the delete:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    // The two commands the removal says stop working name the service, so
+    // each must split back to exactly that argv for an id that is not one
+    // inert word. Mutation: interpolating the id bare in either fails this.
+    #[test]
+    fn services_remove_names_the_commands_it_disables_as_their_argv() -> Result<()> {
+        let service_id = "svc 'a b'";
+        let (root, paths) = test_paths("services-remove-awkward-id");
+        paths.ensure()?;
+        plant_service_record(&paths, service_id, "failed", 999_999_999)?;
+
+        let rendered = remove_managed_service_record(&paths, service_id, true);
+        let _ = fs::remove_dir_all(&root);
+        let rendered = rendered?;
+
+        let line = rendered
+            .lines()
+            .find(|line| line.starts_with("After this,"))
+            .expect("the removal names the commands it disables");
+        let commands: Vec<Vec<String>> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(|command| shlex::split(command).expect("a named command must parse"))
+            .collect();
+        let argv = |words: &[&str]| -> Vec<String> {
+            words.iter().map(|word| (*word).to_owned()).collect()
+        };
+        assert_eq!(
+            commands,
+            vec![
+                argv(&["rocm", "services", "logs", service_id]),
+                argv(&["rocm", "services", "restart", service_id, "--yes"]),
+            ],
+            "{rendered}"
         );
         Ok(())
     }
