@@ -150,6 +150,9 @@ pub struct E2eWorld {
     /// skill scenarios. That document is the EXPECTED-value fixture for the
     /// skill↔CLI contract checks — see `e2e::skill_steps`.
     pub skill_reference: Option<String>,
+    /// Raw text of `skills/rocm-doctor/SKILL.md`, loaded together with
+    /// `skill_reference`. Only `skill-07` reads it.
+    pub skill_md: Option<String>,
     /// The symptom text a rocm-doctor scenario hands to `rocm diagnose`. Its own
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
@@ -316,6 +319,7 @@ impl Default for E2eWorld {
             chat_use_mock: false,
             lifecycle: None,
             skill_reference: None,
+            skill_md: None,
             skill_symptom: None,
             recorded_process: None,
         }

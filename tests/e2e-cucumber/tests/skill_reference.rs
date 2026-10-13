@@ -110,8 +110,9 @@ fn catalog_not_print_only_count(md: &str) -> usize {
 /// Two free-standing counts restate the table in prose rather than in cells a
 /// parser already checks: `reference.md`'s "(N failure modes)" heading, and
 /// `SKILL.md`'s "the other M are print-only" line. `rocm_doctor_skill.feature`
-/// says plainly that these are not parsed and can go stale even while the
-/// table itself stays correct -- which is exactly what happened here (the
+/// does not parse them, so they can go stale even while the table itself
+/// stays correct, and says that this file checks both counts instead. That is
+/// exactly what happened here (the
 /// catalog grew by one row and both numbers were left behind). This does not
 /// reopen that scope decision; it only adds a floor cheap enough that the next
 /// drift fails a `cargo test` instead of waiting for someone to count rows by
