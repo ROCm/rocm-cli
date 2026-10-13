@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `comfyui` and `therock`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
@@ -20,8 +25,11 @@ mod logging;
 mod provider_keys;
 mod providers;
 mod remote;
+mod runtime_services;
 mod serve_cmd;
 mod serve_summary;
+mod service_hints;
+mod service_launch;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -33,10 +41,15 @@ mod uninstall;
 // Dispatch call sites stay byte-identical via these re-imports (upstream-sync
 // mergeability); several helpers are re-imported for reasons other than
 // dispatch: `select_serve_engine` because `assess_model_for_host` calls it
-// directly, and `env_root_for_service`, `env_root_for_engine_install`,
+// directly, `env_root_for_service`, `env_root_for_engine_install`,
 // `runtime_manifest_for_selector`, `engine_manages_own_runtime`, and
 // `runtime_key_for_python` because other root-level commands outside
-// `dispatch()` call them directly.
+// `dispatch()` call them directly, `attach_background_stdio`,
+// `detach_background_command`, `managed_engine_startup_failure_detail`, and
+// `managed_service_process_command` because `restart_internal_managed_service`
+// (also outside `dispatch()`) calls them, and
+// `ensure_public_service_has_endpoint_key`/`is_loopback_host` because the
+// loopback/endpoint-key checks below call them directly.
 use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
 use crate::engines_cmd::{
@@ -44,6 +57,12 @@ use crate::engines_cmd::{
     runtime_key_for_python, runtime_manifest_for_selector,
 };
 use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};
+#[cfg(not(windows))]
+use crate::service_launch::{
+    attach_background_stdio, detach_background_command, managed_engine_startup_failure_detail,
+    managed_service_process_command,
+};
+use crate::service_launch::{ensure_public_service_has_endpoint_key, is_loopback_host};
 use crate::uninstall::uninstall;
 
 use anyhow::{Context, Result, bail};
@@ -74,7 +93,7 @@ use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
     ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod, EnginePluginDescriptor, EngineRecipeHint,
     EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, InstallRequest, InstallResponse,
-    ResolveModelResponse, StopRequest, StopResponse,
+    StopRequest, StopResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -86,7 +105,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-#[cfg(not(windows))]
+#[cfg(all(test, not(windows)))]
 use std::process::ExitStatus;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -824,13 +843,31 @@ enum RuntimesCommand {
     Activate {
         /// Runtime key or friendly runtime selector.
         runtime: String,
+        /// Restart running local servers so they use the newly active runtime.
+        #[arg(long)]
+        restart_services: bool,
+        /// Approve restarting running local servers. Requires --restart-services.
+        //
+        // `requires` rather than a silent no-op: unlike `runtimes uninstall`,
+        // where `--yes` skips a real prompt, activation has nothing to confirm
+        // on its own, so a bare `--yes` here means the user believes they asked
+        // for something they did not.
+        #[arg(long, requires = "restart_services")]
+        yes: bool,
     },
     /// Switch back to the previously selected ROCm runtime.
     #[command(
         after_help = "NOTE: rollback has no history — it remembers only the runtime you just \
 left, so it cannot undo more than one activation."
     )]
-    Rollback,
+    Rollback {
+        /// Restart running local servers so they use the restored runtime.
+        #[arg(long)]
+        restart_services: bool,
+        /// Approve restarting running local servers. Requires --restart-services.
+        #[arg(long, requires = "restart_services")]
+        yes: bool,
+    },
     /// Remove a ROCm runtime from ROCm CLI.
     #[command(alias = "remove")]
     Uninstall {
@@ -997,7 +1034,7 @@ enum ServicesCommand {
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; stop refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1005,7 +1042,7 @@ enum ServicesCommand {
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; restart refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1018,7 +1055,7 @@ enum ServicesCommand {
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1050,7 +1087,7 @@ enum ServicesCommand {
         /// Show what would be removed, without removing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not ask for confirmation.
+        /// Required unless --dry-run; prune refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -3687,107 +3724,6 @@ fn collect_serve_notes(
     notes
 }
 
-/// Test-only fault-injection switch, off (`const false`) in shipped binaries:
-/// the `e2e-oom-fault-injection` feature is enabled only by the `xtask e2e`
-/// mock-lane build, never by the release build. When enabled and
-/// `ROCM_E2E_SIMULATE_OOM_LAUNCH=1` is set on the process, `rocm serve` fabricates
-/// the on-disk state of a managed vLLM launch that spawned, wrote an
-/// out-of-memory traceback to the log it owns, and never became ready — so the
-/// positive OOM-guidance summary path can be verified on a GPU-less CI host,
-/// where a real launch cannot run. See [`simulate_oom_managed_launch`].
-#[cfg(feature = "e2e-oom-fault-injection")]
-fn e2e_simulate_oom_launch() -> bool {
-    std::env::var_os("ROCM_E2E_SIMULATE_OOM_LAUNCH").is_some_and(|value| value == "1")
-}
-
-/// Release builds carry no fault-injection switch: the seam compiles out
-/// entirely, so `rocm serve` behaves identically to a build without the feature.
-#[cfg(not(feature = "e2e-oom-fault-injection"))]
-const fn e2e_simulate_oom_launch() -> bool {
-    false
-}
-
-/// Test-only (see [`e2e_simulate_oom_launch`]): fabricate the on-disk state of a
-/// managed vLLM launch that spawned, OOM'd, and never became ready, then return
-/// the launch report the summary path would see for it — `already_running: false`
-/// (this invocation launched it), `status: "starting"` (it failed to become
-/// ready), and a `log_path` whose contents carry a real allocator OOM signature.
-/// [`append_oom_serve_note`] then renders the memory-knob guidance. No process is
-/// spawned. Compiled out of shipped binaries.
-#[cfg(feature = "e2e-oom-fault-injection")]
-#[allow(clippy::too_many_arguments)]
-fn simulate_oom_managed_launch(
-    paths: &AppPaths,
-    engine: &str,
-    service_id: &str,
-    requested_model: &str,
-    resolve: &ResolveModelResponse,
-    host: &str,
-    port: u16,
-    device_policy: &DevicePolicy,
-    gpu_indices: &[u32],
-    runtime_id: Option<&str>,
-    env_id: Option<&str>,
-) -> Result<ManagedLaunchReport> {
-    paths.ensure()?;
-    fs::create_dir_all(paths.services_dir())?;
-    let mut record = ManagedServiceRecord::new(
-        paths,
-        service_id,
-        engine,
-        requested_model,
-        resolve.canonical_model_id.clone(),
-        host,
-        port,
-        "managed",
-        std::process::id(),
-        runtime_id.map(str::to_owned),
-        env_id.map(str::to_owned),
-        Some(device_policy_name(device_policy).to_owned()),
-    );
-    record.gpu_indices = gpu_indices.to_vec();
-    record.status = "starting".to_owned();
-    record.write()?;
-    // A real allocator OOM signature in the log this invocation owns, so the
-    // summary renders memory guidance for a launch that actually OOM'd.
-    //
-    // The engine's own error block is reproduced below it, because that is what
-    // a real managed launch leaves on disk, and leaving it out hid a bug this
-    // scenario should have caught: the supervisor and the engine share one log,
-    // so when vLLM OOMs the engine bails with its startup-log context — which
-    // embeds rocm-cli's own OOM hint — and `exit_code_for` writes that whole
-    // error back into the same file, *after* the real line. A fixture carrying
-    // only the raw OOM line can never see the newest-first scan land on
-    // rocm-cli's own sentence instead of the user's error.
-    let real_line = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
-    fs::write(
-        &record.log_path,
-        format!(
-            "{real_line}\n\
-             Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
-             \n\
-             Last 50 lines of startup log:\n\
-             {real_line}\n\
-             \n\
-             {}{real_line}). {}\n\
-             For conditional remediation, run `{} 'vllm: {real_line}'`.\n",
-            rocm_core::VLLM_OOM_DETECTED_PREFIX,
-            rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT,
-            rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
-        ),
-    )
-    .with_context(|| format!("failed to write {}", record.log_path.display()))?;
-    Ok(ManagedLaunchReport {
-        service_id: service_id.to_owned(),
-        endpoint_url: format!("{}/v1", format_http_base_url(host, port)),
-        status: "starting".to_owned(),
-        already_running: false,
-        child_pid: None,
-        log_path: Some(record.log_path),
-        manifest_path: Some(record.manifest_path),
-    })
-}
-
 /// Appends the actionable memory-knob note when a managed serve failed to become
 /// ready and its engine log carries an out-of-memory signature.
 ///
@@ -3859,1124 +3795,6 @@ fn append_oom_serve_note(
         notes.push(note);
     }
     notes
-}
-
-fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
-    if !is_loopback_host(host) && !allow_public_bind {
-        bail!(
-            "`rocm serve --host {host}` is not loopback; pass `--allow-public-bind` before binding a non-local interface"
-        );
-    }
-    Ok(())
-}
-
-/// Inverse of [`rocm_engine_protocol::is_public_bind_host`], which owns the
-/// policy so `rocmd` classifies a recorded `host` identically when it respawns
-/// the service.
-fn is_loopback_host(host: &str) -> bool {
-    !rocm_engine_protocol::is_public_bind_host(host)
-}
-
-/// Resolve the API key that will guard this endpoint, applying the
-/// loopback-vs-public policy for `rocm serve`.
-///
-/// - **Loopback host** → `None`: local serving stays credential-free (the
-///   unchanged default). Any key supplied for a loopback bind is ignored and
-///   nothing is persisted — loopback needs no auth.
-/// - **Public host** → `Some(key)`: use the user-supplied key when present,
-///   otherwise generate a strong random one so a public endpoint can never come
-///   up anonymous. An empty/whitespace supplied key is rejected rather than
-///   silently treated as "no auth".
-/// - **`required`** → treat a loopback bind as public for this purpose.
-///
-/// That last case exists because "loopback" is a statement about the bind
-/// address, not about who can reach the port. Publishing the port onto a
-/// tailnet, proxying it, or mapping it out of a container all leave the bind
-/// loopback while widening the audience — and the policy above would then hand
-/// out an unauthenticated endpoint. Whoever widens the reach is responsible for
-/// asking for the credential, so this is an explicit flag rather than a guess.
-fn resolve_endpoint_auth(
-    host: &str,
-    supplied: Option<&str>,
-    required: bool,
-) -> Result<Option<String>> {
-    if is_loopback_host(host) && !required {
-        return Ok(None);
-    }
-    match supplied {
-        Some(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                bail!(
-                    "`rocm serve --api-key` (or ROCM_SERVE_API_KEY) was empty; a public \
-                     endpoint must be protected by a non-empty API key"
-                );
-            }
-            // The key is later interpolated verbatim into raw `Authorization:
-            // Bearer {key}\r\n` header lines; reject a control character (e.g. an
-            // embedded CR/LF) here so a crafted key cannot inject extra headers.
-            if rocm_core::endpoint_api_key_has_forbidden_chars(trimmed) {
-                bail!(
-                    "`rocm serve --api-key` (or ROCM_SERVE_API_KEY) contained a control \
-                     character such as a carriage return or newline; an endpoint API key \
-                     must be a single line of printable characters"
-                );
-            }
-            Ok(Some(trimmed.to_owned()))
-        }
-        None => Ok(Some(rocm_core::generate_endpoint_api_key())),
-    }
-}
-
-/// When an equivalent managed service is already running, the endpoint key
-/// serve() freshly stored for this attempt is unused — drop it so it is not
-/// orphaned in storage. The already-running service keeps its own key.
-/// Best-effort and idempotent; a loopback attempt (`freshly_stored == None`)
-/// is a no-op.
-fn drop_orphaned_endpoint_key_on_already_running(
-    paths: &AppPaths,
-    service_id: &str,
-    freshly_stored: Option<&str>,
-) {
-    if freshly_stored.is_some() {
-        endpoint_keys::clear_endpoint_api_key(paths, service_id);
-    }
-}
-
-/// Reject engine/platform combinations that cannot enforce a public endpoint's
-/// API key, so a public bind fails closed instead of coming up unauthenticated.
-///
-/// The one such case today: Windows managed Lemonade. Its server reads the
-/// value-typed `LEMONADE_API_KEY` env var, but the Windows detached-spawn
-/// primitive only carries path-valued env overrides, so the key never reaches it.
-/// vLLM enforces auth on every platform (`VLLM_API_KEY`), and loopback binds
-/// (`public_bind == false`) need no key — both pass. `is_windows` is a parameter
-/// so both branches are unit-testable off-Windows.
-fn ensure_public_bind_engine_supported(
-    engine: &str,
-    public_bind: bool,
-    is_windows: bool,
-) -> Result<()> {
-    if public_bind && is_windows && engine == "lemonade" {
-        bail!(
-            "public binding with the lemonade engine is not supported on Windows: the endpoint \
-             API key cannot be enforced there. Use `--engine vllm`, or bind a loopback host \
-             (the default 127.0.0.1)."
-        );
-    }
-    Ok(())
-}
-
-/// Refuse to (re)spawn a managed service recorded on a public host when its
-/// endpoint API key is gone, so a respawn cannot reopen the endpoint anonymously.
-///
-/// `serve()` applies the loopback-vs-public policy once, via
-/// [`resolve_endpoint_auth`], and persists the resulting key. Every later spawn
-/// — `rocm services restart`, and `rocmd`'s recovery supervisor — reads that key
-/// file back and would otherwise treat "no key file" as "no auth wanted",
-/// silently downgrading a protected public endpoint to an open one. The real
-/// invariant is a property of the *host*, not of the file: a non-loopback bind
-/// must always be authenticated.
-///
-/// The gap is reachable through ordinary commands, because a stop deletes the
-/// key file and `rocm services restart` accepts a stopped service id (its help
-/// points at `rocm services list --all`).
-///
-/// `key_present` is a plain `bool` rather than a path so both branches are
-/// unit-testable without touching the filesystem, mirroring `is_windows` in
-/// [`ensure_public_bind_engine_supported`].
-fn ensure_public_service_has_endpoint_key(
-    host: &str,
-    key_present: bool,
-    requires_api_key: bool,
-) -> Result<()> {
-    // Two ways a service can need a key. A public bind is the obvious one. The
-    // other is a service that asked for auth on a loopback bind, because
-    // something outside this process republishes the port — a tailnet publish
-    // survives a reboot, let alone a restart, so "loopback" stops meaning
-    // "only this machine" and the bind address can no longer be trusted to
-    // answer the question on its own.
-    if requires_api_key && !key_present {
-        bail!(
-            "managed service was launched with `--require-api-key` but has no endpoint API key, \
-             so restarting it would reopen it without authentication. Something outside this \
-             machine may still be publishing its port. The key is dropped when a service stops \
-             and cannot be recovered. Launch it again with \
-             `rocm serve --require-api-key` (add `--api-key <key>`, or set ROCM_SERVE_API_KEY, \
-             to choose the key instead of generating one)."
-        );
-    }
-    if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
-        bail!(
-            "managed service is bound to the public host `{host}` but has no endpoint API key, \
-             so restarting it would reopen it without authentication. The key is dropped when a \
-             service stops and cannot be recovered. Launch it again with \
-             `rocm serve --host {host} --allow-public-bind` (add `--api-key <key>`, or set \
-             ROCM_SERVE_API_KEY, to choose the key instead of generating one)."
-        );
-    }
-    Ok(())
-}
-
-/// Write `contents` to `path` with owner-only (0600) permissions on Unix so a
-/// secret is not world-readable. On non-Unix, default permissions apply.
-pub(crate) fn write_private_file_0600(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        std::io::Write::write_all(&mut file, contents)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, contents)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn detach_background_command(command: &mut ProcessCommand) {
-    rocm_core::detach_command_session(command);
-}
-
-#[cfg(not(windows))]
-fn attach_background_stdio(command: &mut ProcessCommand, log_path: Option<&Path>) -> Result<()> {
-    if let Some(log_path) = log_path {
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-            .with_context(|| format!("failed to open {}", log_path.display()))?;
-        command
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log));
-    } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn managed_engine_startup_failure_detail(status: ExitStatus, log_path: &Path) -> String {
-    let mut recent_lines = read_optional_tail_lines(log_path, 80, "service log");
-    if recent_lines.is_empty() {
-        for _ in 0..5 {
-            thread::sleep(Duration::from_millis(120));
-            recent_lines = read_optional_tail_lines(log_path, 80, "service log");
-            if !recent_lines.is_empty() {
-                break;
-            }
-        }
-    }
-    if recent_lines.is_empty() {
-        return format!(
-            "managed engine exited immediately with status {status}; inspect {}",
-            log_path.display()
-        );
-    }
-    format!(
-        "managed engine exited immediately with status {status}; inspect {}\n\nrecent startup log output:\n{}",
-        log_path.display(),
-        recent_lines.join("\n")
-    )
-}
-#[cfg(not(windows))]
-fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
-    let mut command = ProcessCommand::new(program);
-    command.args(args);
-    command
-}
-
-/// Engine-neutral result of a managed launch. Returned rather than printed so the
-/// caller can render it either as the rich deployment summary (interactive TTY) or
-/// as the plain line-by-line form (piped output, chat assistant), from one code path.
-struct ManagedLaunchReport {
-    service_id: String,
-    /// `http://host:port/v1`.
-    endpoint_url: String,
-    /// `"ready"` (inference confirmed), `"running"` (model listed but not serving
-    /// yet), `"starting"` (endpoint not answering), or the existing service's
-    /// status when nothing was spawned.
-    status: String,
-    /// True when an equivalent service was already live and nothing was spawned.
-    already_running: bool,
-    child_pid: Option<u32>,
-    log_path: Option<PathBuf>,
-    manifest_path: Option<PathBuf>,
-}
-
-/// Either an already-live service (nothing spawned) or a freshly spawned engine
-/// child that is `running` but not yet HTTP-ready.
-///
-/// Split out of [`start_managed_service`] so the attached (`--verbose` /
-/// `--foreground`) serve path can spawn the very same detached child and stream
-/// its log live from the first line — including startup — instead of blocking on
-/// the readiness wait before any output appears.
-enum ManagedSpawn {
-    AlreadyRunning(ManagedLaunchReport),
-    // `ManagedServiceRecord` is large; box it so the two variants stay a similar
-    // size (clippy::large_enum_variant).
-    Spawned {
-        record: Box<ManagedServiceRecord>,
-        child_pid: u32,
-    },
-}
-
-/// Spawn the detached engine child shared by the managed (background) and
-/// attached (`--verbose`/`--foreground`) serve paths. Returns before the HTTP
-/// readiness wait; callers decide whether to block on readiness
-/// ([`start_managed_service`]) or start tailing the log immediately
-/// ([`run_attached_service`]).
-#[allow(clippy::too_many_arguments)]
-fn spawn_managed_engine_child(
-    paths: &AppPaths,
-    engine: &str,
-    service_id: &str,
-    requested_model: &str,
-    resolve: &ResolveModelResponse,
-    host: &str,
-    port: u16,
-    device_policy: &DevicePolicy,
-    gpu_indices: &[u32],
-    runtime_id: Option<&str>,
-    env_id: Option<&str>,
-    engine_recipe: Option<&EngineRecipeHint>,
-    require_api_key: bool,
-) -> Result<ManagedSpawn> {
-    paths.ensure()?;
-    fs::create_dir_all(paths.services_dir())?;
-
-    // Idempotency guard: if a managed service for this engine+model is already
-    // alive, surface it and spawn nothing. A second `serve --managed` (e.g. the
-    // chat assistant re-issuing the same request) is treated as satisfied, not
-    // an error. Keyed on engine+canonical model — the freshly generated
-    // `service_id` is timestamp-unique and would never match an existing one.
-    // Stale/dead services fall through and relaunch normally.
-    let requested_recipe_json = engine_recipe
-        .map(serde_json::to_string)
-        .transpose()
-        .context("failed to encode engine recipe hint")?;
-    if let Some(existing) =
-        existing_live_managed_service(paths, engine, &resolve.canonical_model_id)
-    {
-        if existing.engine_recipe_json != requested_recipe_json {
-            bail!(
-                "managed service `{}` is already running for engine `{engine}` and model `{}` with different serve options (recipe hint, tool-call parser, or generation defaults); stop it and run `rocm serve` again to apply the requested options",
-                existing.service_id,
-                resolve.canonical_model_id
-            );
-        }
-        // Reuse cannot satisfy a demand for auth the running server never got.
-        // The engine reads its key once, at launch, from the environment this
-        // function builds below — so a server started without one keeps serving
-        // anonymously no matter what is written afterwards. Upgrading the record
-        // here would be worse than doing nothing: the record would claim auth
-        // that the live process does not enforce, and
-        // `ensure_public_service_has_endpoint_key` would pass on the strength of
-        // a key file nothing reads.
-        //
-        // This is what `rocm remote serve` relies on. It publishes a loopback
-        // port onto the tailnet and prints "the API key above is what stops
-        // anyone else calling it". Reusing an unauthenticated service silently
-        // would make that sentence false about an endpoint the whole tailnet can
-        // reach. Refusing is the only answer that fails closed, and it is the
-        // same shape as the recipe mismatch above.
-        if require_api_key && !existing.requires_api_key {
-            bail!(
-                "managed service `{}` is already running for engine `{engine}` and model `{}` \
-                 without authentication, and a running server cannot be given a key it did not \
-                 start with; stop it with `rocm services stop {}` and run the command again to \
-                 serve it with `--require-api-key`",
-                existing.service_id,
-                resolve.canonical_model_id,
-                existing.service_id
-            );
-        }
-        record_cli_audit_event(
-            paths,
-            "service",
-            "managed_service_launch_skipped",
-            "info",
-            format!(
-                "skipped duplicate managed launch engine={engine} model={} existing_service_id={} status={}",
-                resolve.canonical_model_id, existing.service_id, existing.status
-            ),
-            Some(&existing.service_id),
-        );
-        return Ok(ManagedSpawn::AlreadyRunning(ManagedLaunchReport {
-            service_id: existing.service_id,
-            endpoint_url: existing.endpoint_url,
-            status: existing.status,
-            already_running: true,
-            child_pid: None,
-            log_path: None,
-            manifest_path: None,
-        }));
-    }
-
-    let mut record = ManagedServiceRecord::new(
-        paths,
-        service_id,
-        engine,
-        requested_model,
-        resolve.canonical_model_id.clone(),
-        host,
-        port,
-        "managed",
-        0,
-        runtime_id.map(str::to_owned),
-        env_id.map(str::to_owned),
-        Some(device_policy_name(device_policy).to_owned()),
-    );
-    record.gpu_indices = gpu_indices.to_vec();
-    record.engine_recipe_json = requested_recipe_json;
-    // The flag the user actually passed, carried through rather than re-derived.
-    //
-    // Deriving it from key-file presence looked equivalent and was not:
-    // `resolve_endpoint_auth` mints a key for *every* non-loopback bind whether or
-    // not auth was demanded, so a plain `--host 0.0.0.0 --allow-public-bind`
-    // recorded `true` here. The guard below tests this field before the bind
-    // address, so that service was then refused with a message naming a flag it
-    // never used and a relaunch command that drops `--allow-public-bind` — the
-    // public-bind branch, which carries the right command, became unreachable.
-    //
-    // This field means "the user demanded auth on a bind that would not otherwise
-    // require it". A public bind needs no such record; its address still says so.
-    record.requires_api_key = require_api_key;
-    record.write()?;
-
-    if let Some(parent) = record.engine_state_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::File::create(&record.log_path)
-        .with_context(|| format!("failed to create {}", record.log_path.display()))?;
-    let current_exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let serve_args = builtin_engine_serve_http_args(
-        engine,
-        service_id,
-        &resolve.canonical_model_id,
-        host,
-        port,
-        device_policy,
-        gpu_indices,
-        runtime_id,
-        env_id,
-        engine_recipe,
-        &record.engine_state_path,
-        Some(&record.log_path),
-    )?;
-    let engine_envs_root = env_root_for_service(paths, engine, runtime_id, env_id)?;
-    // Hand the child the *path* to the endpoint key file (public bind only) via the
-    // environment. A path — not the secret value — is what the detached-spawn
-    // primitives accept as an env override, and it keeps the key off both the argv
-    // and the environment block. `serve()` wrote the file before spawning.
-    // Validity, not mere existence: the engine adapters resolve the key with
-    // `endpoint_api_key_from_file` and enforce nothing when it yields `None`, so
-    // an empty or malformed key file would otherwise satisfy the guard below and
-    // still produce an unauthenticated public listener.
-    let endpoint_key_file = endpoint_keys::endpoint_key_file_if_present(paths, service_id)
-        .filter(|path| rocm_engine_protocol::endpoint_api_key_from_file(path).is_some());
-    // `serve()` already resolved and stored the key for a public bind, so the
-    // public-bind branch cannot fire on the fresh-launch path today. It is the
-    // shared choke point for managed spawns, so enforce the invariant here too
-    // rather than relying on every future caller having done so.
-    //
-    // `record.requires_api_key` is passed, not a literal, and the two arguments
-    // are deliberately different things: that field is the `--require-api-key`
-    // flag the caller passed, `endpoint_key_file` is whether a *usable* key is on
-    // disk. A present but empty or malformed key file is where they disagree, and
-    // is exactly what the `requires_api_key` branch exists to refuse.
-    //
-    // The field is threaded, never derived from the key file. Deriving it marked
-    // every public bind as having demanded auth — see the assignment above.
-    ensure_public_service_has_endpoint_key(
-        host,
-        endpoint_key_file.is_some(),
-        record.requires_api_key,
-    )?;
-    #[cfg(windows)]
-    let child_pid = {
-        let env_values = app_path_env_var_values(paths, engine_envs_root.as_deref());
-        let mut env_refs = app_path_env_var_refs(&env_values);
-        if let Some(key_file) = endpoint_key_file.as_deref() {
-            env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
-        }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
-    };
-    #[cfg(not(windows))]
-    let child_pid = {
-        let mut command = managed_service_process_command(&current_exe, &serve_args);
-        command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, Some(&record.log_path))?;
-        detach_background_command(&mut command);
-        apply_app_path_env(&mut command, paths);
-        if let Some(engine_envs_root) = engine_envs_root.as_deref() {
-            command.env("ROCM_CLI_ENGINE_ENVS_ROOT", engine_envs_root);
-        }
-        if let Some(key_file) = endpoint_key_file.as_deref() {
-            command.env(rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file);
-        }
-        let mut child = command
-            .spawn()
-            .context("failed to launch managed engine process")?;
-        let child_pid = child.id();
-        thread::sleep(Duration::from_millis(200));
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to check managed engine startup state")?
-        {
-            bail!(
-                "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
-            );
-        }
-        child_pid
-    };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
-    record.status = "running".to_owned();
-    record.write()?;
-
-    Ok(ManagedSpawn::Spawned {
-        record: Box::new(record),
-        child_pid,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_managed_service(
-    engine: &str,
-    service_id: &str,
-    requested_model: &str,
-    resolve: &ResolveModelResponse,
-    host: &str,
-    port: u16,
-    device_policy: &DevicePolicy,
-    gpu_indices: &[u32],
-    runtime_id: Option<&str>,
-    env_id: Option<&str>,
-    engine_recipe: Option<&EngineRecipeHint>,
-    endpoint_api_key: Option<&str>,
-    launch_lock: rocm_core::FileLock,
-    require_api_key: bool,
-    on_wait_tick: &mut dyn FnMut(Duration),
-) -> Result<ManagedLaunchReport> {
-    let paths = AppPaths::discover()?;
-    #[cfg(feature = "e2e-oom-fault-injection")]
-    if e2e_simulate_oom_launch() {
-        return simulate_oom_managed_launch(
-            &paths,
-            engine,
-            service_id,
-            requested_model,
-            resolve,
-            host,
-            port,
-            device_policy,
-            gpu_indices,
-            runtime_id,
-            env_id,
-        );
-    }
-    let (mut record, child_pid) = match spawn_managed_engine_child(
-        &paths,
-        engine,
-        service_id,
-        requested_model,
-        resolve,
-        host,
-        port,
-        device_policy,
-        gpu_indices,
-        runtime_id,
-        env_id,
-        engine_recipe,
-        require_api_key,
-    )? {
-        ManagedSpawn::AlreadyRunning(report) => return Ok(report),
-        ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
-    };
-    // The claiming service record is now persisted, so the selected GPU is
-    // visible to any concurrent auto-selection. Release the launch lock before
-    // the readiness wait below, which can block for many seconds — holding it
-    // that long would needlessly serialize unrelated serves.
-    drop(launch_lock);
-
-    #[cfg(windows)]
-    thread::sleep(Duration::from_millis(200));
-
-    let readiness = wait_for_service_http_ready_with_progress(
-        engine,
-        host,
-        port,
-        &resolve.canonical_model_id,
-        endpoint_api_key,
-        Duration::from_secs(45),
-        on_wait_tick,
-    );
-    let launch_status = status_for_readiness(readiness);
-    record.status = launch_status.to_owned();
-    if readiness == EndpointReadiness::Serving {
-        // Latch the verification the wait just performed, so the readiness checks
-        // behind `services list` and chat read it instead of re-probing.
-        record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
-    }
-    record.write()?;
-    let endpoint_url = format!("{}/v1", format_http_base_url(host, port));
-    record_cli_audit_event(
-        &paths,
-        "service",
-        "managed_service_launch",
-        "info",
-        format!(
-            "launched managed service engine={} model={} endpoint={} readiness={}",
-            engine, resolve.canonical_model_id, endpoint_url, launch_status
-        ),
-        Some(service_id),
-    );
-    Ok(ManagedLaunchReport {
-        service_id: service_id.to_owned(),
-        endpoint_url,
-        status: launch_status.to_owned(),
-        already_running: false,
-        child_pid: Some(child_pid),
-        log_path: Some(record.log_path),
-        manifest_path: Some(record.manifest_path),
-    })
-}
-
-/// Reproduce the original plain, line-by-line managed-launch output. Used for
-/// non-interactive output (piped, CI, the chat assistant's `serve --managed`),
-/// where the animated summary is inappropriate. The interactive path renders the
-/// summary table via [`serve_summary`] instead.
-fn print_managed_launch_plain(report: &ManagedLaunchReport, endpoint_api_key: Option<&str>) {
-    if report.already_running {
-        println!("managed service already running");
-        println!("  service_id: {}", report.service_id);
-        println!("  endpoint: {}", report.endpoint_url);
-        println!("  status: {}", report.status);
-        println!("  note: existing service detected; no second process spawned");
-        return;
-    }
-    println!("managed service launched");
-    println!("  service_id: {}", report.service_id);
-    if let Some(child_pid) = report.child_pid {
-        println!("  process_pid: {child_pid}");
-    }
-    println!("  endpoint: {}", report.endpoint_url);
-    if let Some(key) = endpoint_api_key {
-        // Intentional one-time display of a freshly generated API key to the
-        // terminal so the user can copy it — the designed delivery channel
-        // documented on `render_endpoint_client_config`, not a log. The tag below
-        // is currently inert (Rust's CodeQL pack has no AlertSuppression.ql yet —
-        // github/codeql#21637) but will start working once that lands, since the
-        // tag must be the single line immediately before the flagged code.
-        print!(
-            // codeql[rust/cleartext-logging]
-            "{}",
-            render_endpoint_client_config(&report.endpoint_url, key)
-        );
-    }
-    if let Some(log_path) = report.log_path.as_deref() {
-        println!("  log_path: {}", log_path.display());
-    }
-    if let Some(manifest_path) = report.manifest_path.as_deref() {
-        println!("  manifest_path: {}", manifest_path.display());
-    }
-    println!("  readiness: {}", report.status);
-}
-
-/// Render the one-time secure client configuration for a public, authenticated
-/// endpoint. This is the *intended* channel for delivering the key to the user
-/// (unlike logs/status, which must never contain it) — it prints the key once at
-/// launch alongside a ready-to-use example. Callers only invoke this for a
-/// non-loopback bind that generated/received a key.
-fn render_endpoint_client_config(endpoint_url: &str, api_key: &str) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "  api key: {api_key}");
-    let _ = writeln!(
-        out,
-        "  note: this key is shown only now — clients must send `Authorization: Bearer <key>`"
-    );
-    let _ = writeln!(
-        out,
-        "  example: curl -H \"Authorization: Bearer {api_key}\" {endpoint_url}/models"
-    );
-    out
-}
-
-/// The "should we spawn?" decision for [`ensure_background_helper_running`],
-/// factored out so it is testable hermetically (no spawn side effect). Returns
-/// `true` when the file-based runtime state says the daemon is `running` AND its
-/// recorded `daemon_pid` is a live process — i.e. a second spawn must be guarded.
-/// A missing state file, `running=false`, or a dead/zero pid returns `false`.
-pub(crate) fn background_helper_already_running(paths: &AppPaths) -> Result<bool> {
-    Ok(AutomationRuntimeState::load(paths)?
-        .is_some_and(|state| state.running && rocm_core::process_is_running(state.daemon_pid)))
-}
-
-/// Shared daemon-lifecycle entrypoint: ensures the background automation helper
-/// (`rocm daemon`) is running, spawning it detached if not. Liveness is read from
-/// the file-based automation runtime state. Intentionally `pub(crate)` — reused by
-/// both the `serve --managed` path and `automations enable`. Only the spawn result
-/// itself (`command.spawn()` / `spawn_detached_no_inherit`) is logged rather than
-/// propagated; setup errors (path discovery, stdio attach) still return `Err`.
-pub(crate) fn ensure_background_helper_running() -> Result<()> {
-    ensure_background_helper_running_quiet(false)
-}
-
-/// As [`ensure_background_helper_running`], but suppresses the stdout status line
-/// when `quiet` is set. The interactive `rocm serve` summary path uses `quiet` so
-/// the daemon-spawn note does not appear above the deployment summary table.
-pub(crate) fn ensure_background_helper_running_quiet(quiet: bool) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    if background_helper_already_running(&paths)? {
-        return Ok(());
-    }
-
-    // The check above and the spawn below are a TOCTOU window: two concurrent
-    // callers (e.g. two `rocm serve`) can both read "not running" and each spawn
-    // a daemon. Serialize the decision on a lock file and re-check under it — the
-    // first holder spawns, later holders observe the now-running daemon and
-    // return without spawning. The unlocked pre-check above keeps the common
-    // already-running case lock-free.
-    let _autostart_lock = rocm_core::FileLock::acquire(paths.automation_autostart_lock_path())?;
-    if background_helper_already_running(&paths)? {
-        return Ok(());
-    }
-
-    // The lock alone does not close the window: the spawned daemon does not
-    // publish its `running` runtime state until well after `spawn()` (clap parse,
-    // runtime build, config load, banner flush). A second caller that acquires
-    // this lock during that gap still sees "not running" and would spawn a
-    // duplicate. Bridge the gap with a short-lived claim recording the child PID
-    // and spawn time: a holder that finds a live, recent claim defers instead.
-    let claim_path = paths.automation_autostart_claim_path();
-    if autostart_spawn_in_flight(
-        read_autostart_claim(&claim_path),
-        now_unix_millis(),
-        AUTOSTART_CLAIM_TTL_MS,
-        rocm_core::process_is_running,
-    ) {
-        return Ok(());
-    }
-
-    let exe = managed_service_launcher_path()
-        .context("failed to resolve current rocm executable path")?;
-    let args = vec!["daemon".to_owned()];
-    #[cfg(windows)]
-    let spawn_result = {
-        let env_values = app_path_env_var_values(&paths, None);
-        let env_refs = app_path_env_var_refs(&env_values);
-        rocm_core::spawn_detached_no_inherit(&exe, &args, &env_refs)
-    };
-    #[cfg(not(windows))]
-    let spawn_result = {
-        let mut command = managed_service_process_command(&exe, &args);
-        command.stdin(Stdio::null());
-        attach_background_stdio(&mut command, None)?;
-        detach_background_command(&mut command);
-        apply_app_path_env(&mut command, &paths);
-        command.spawn().map(|child| child.id())
-    };
-    match spawn_result {
-        Ok(daemon_pid) => {
-            // Record the claim before returning (and thus releasing the lock) so a
-            // concurrent holder in the spawn→publish window defers. Best-effort: a
-            // failed write only reopens the original, already-tolerated race.
-            let _ = write_autostart_claim(
-                &claim_path,
-                AutostartClaim {
-                    daemon_pid,
-                    spawned_at_ms: now_unix_millis(),
-                },
-            );
-            if !quiet {
-                println!("  helper: started background automation daemon");
-            }
-        }
-        Err(error) if !quiet => {
-            println!("  helper: could not start background automation daemon: {error}");
-        }
-        Err(_) => {}
-    }
-    Ok(())
-}
-
-/// How long an autostart claim is honoured before it is treated as stale even if
-/// its recorded PID is still alive. Comfortably longer than a cold daemon boot
-/// (clap parse → runtime build → config load → state publish) yet short enough
-/// that a crashed spawn cannot suppress autostart for long.
-const AUTOSTART_CLAIM_TTL_MS: u128 = 30_000;
-
-/// A just-spawned daemon's autostart claim: the child PID and the wall-clock time
-/// (milliseconds since the Unix epoch) the spawn was recorded. It lets a
-/// concurrent autostart holder distinguish a live, in-flight spawn from a stale
-/// leftover. Serialized as a single `"<pid> <ms>"` line — no dependency and
-/// trivially forward-compatible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AutostartClaim {
-    daemon_pid: u32,
-    spawned_at_ms: u128,
-}
-
-/// Milliseconds since the Unix epoch, or `0` if the clock is before the epoch
-/// (which only makes a fresh claim look old — safe, it just permits a respawn).
-fn now_unix_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis())
-}
-
-/// Read an autostart claim, returning `None` when the file is absent or
-/// unparseable (either is treated as "no claim", so a respawn is permitted).
-fn read_autostart_claim(path: &Path) -> Option<AutostartClaim> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut parts = text.split_whitespace();
-    let daemon_pid = parts.next()?.parse().ok()?;
-    let spawned_at_ms = parts.next()?.parse().ok()?;
-    Some(AutostartClaim {
-        daemon_pid,
-        spawned_at_ms,
-    })
-}
-
-/// Write an autostart claim as `"<pid> <ms>"`. Best-effort at the call site.
-fn write_autostart_claim(path: &Path, claim: AutostartClaim) -> std::io::Result<()> {
-    std::fs::write(
-        path,
-        format!("{} {}", claim.daemon_pid, claim.spawned_at_ms),
-    )
-}
-
-/// Whether an existing autostart `claim` means a daemon spawn is still in flight,
-/// so the current lock holder should defer rather than spawn a duplicate. A claim
-/// counts as in-flight only while its child PID is alive *and* it is younger than
-/// `ttl_ms` — the TTL bounds how long a crashed spawn (or a PID later reused by an
-/// unrelated process) can suppress autostart. `pid_alive` is injected so the
-/// decision is unit-testable without a live process.
-fn autostart_spawn_in_flight(
-    claim: Option<AutostartClaim>,
-    now_ms: u128,
-    ttl_ms: u128,
-    pid_alive: impl Fn(u32) -> bool,
-) -> bool {
-    claim.is_some_and(|claim| {
-        now_ms.saturating_sub(claim.spawned_at_ms) < ttl_ms && pid_alive(claim.daemon_pid)
-    })
-}
-
-/// What ended an attached (`--verbose`/`--foreground`) streaming session. Kept
-/// as a plain enum, separate from any terminal I/O, so the follow-up action
-/// (detach note vs. stop the server) is unit-testable without a TTY.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachOutcome {
-    /// Ctrl-D: leave the server running and hand the terminal back.
-    Detach,
-    /// Ctrl-C: stop the server, then hand the terminal back.
-    Stop,
-    /// The engine process exited on its own while we were streaming its log.
-    ServerExited,
-}
-
-/// Attached serve path for `--verbose`/`--foreground`: spawn the engine as a
-/// detached managed child (the same child the background path spawns) and stream
-/// its log in this terminal. Unlike the old in-process foreground, the server
-/// survives the session — Ctrl-D detaches and leaves it running, Ctrl-C stops it.
-#[allow(clippy::too_many_arguments)]
-fn run_attached_service(
-    engine: &str,
-    service_id: &str,
-    requested_model: &str,
-    resolve: &ResolveModelResponse,
-    host: &str,
-    port: u16,
-    gpu_indices: &[u32],
-    runtime_id: Option<&str>,
-    env_id: Option<&str>,
-    endpoint_api_key: Option<&str>,
-    launch_lock: rocm_core::FileLock,
-    require_api_key: bool,
-) -> Result<()> {
-    let paths = AppPaths::discover()?;
-
-    let spawn = spawn_managed_engine_child(
-        &paths,
-        engine,
-        service_id,
-        requested_model,
-        resolve,
-        host,
-        port,
-        &resolve.device_policy,
-        gpu_indices,
-        runtime_id,
-        env_id,
-        resolve.engine_recipe.as_ref(),
-        require_api_key,
-    )?;
-    // The claiming record is persisted (or an existing service was found), so the
-    // selected GPU is now visible to concurrent auto-selection. Release the launch
-    // lock before streaming logs, which blocks for the whole attached session.
-    drop(launch_lock);
-
-    let (service_id, log_path, child_pid) = match spawn {
-        // A server for this engine+model is already live. Don't fight it for the
-        // port — point the user at the existing one instead of tailing a log we
-        // did not start.
-        ManagedSpawn::AlreadyRunning(report) => {
-            println!("model already being served");
-            println!("  service_id: {}", report.service_id);
-            println!("  endpoint: {}", report.endpoint_url);
-            println!("  status: {}", report.status);
-            println!("  logs: rocm logs {}", report.service_id);
-            println!("  stop: rocm services stop {} --yes", report.service_id);
-            drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
-            return Ok(());
-        }
-        ManagedSpawn::Spawned { record, child_pid } => {
-            (service_id.to_owned(), record.log_path.clone(), child_pid)
-        }
-    };
-
-    // The child is a managed service that outlives this session once detached, so
-    // it needs the same supervision the background path gives it: the daemon
-    // health-checks and auto-recovers managed servers, reconciles a self-exited
-    // server's record, and feeds the dashboard. Match the background ordering
-    // (spawn, then ensure the helper) and keep it quiet so no status line breaks
-    // into the log stream.
-    ensure_background_helper_running_quiet(true)?;
-
-    // The resolution detail (model, engine, runtime, GPU, warnings) was already
-    // printed as the "serve plan" block in `serve()`; extend it with the launch
-    // coordinates and the streaming hint rather than repeating it.
-    let endpoint = format!("{}/v1", format_http_base_url(host, port));
-    println!("  service_id: {service_id}");
-    println!("  endpoint: {endpoint}");
-    if let Some(key) = endpoint_api_key {
-        // Same intentional one-time key display as `print_managed_launch_plain`
-        // above; see its rationale for why the tag below is currently inert.
-        // codeql[rust/cleartext-logging]
-        print!("{}", render_endpoint_client_config(&endpoint, key));
-    }
-    println!("  streaming engine logs — Ctrl-D detaches (leaves it running), Ctrl-C stops it");
-    println!();
-
-    let outcome = stream_attached_logs(&log_path, child_pid)?;
-    println!();
-
-    match outcome {
-        AttachOutcome::Detach => {
-            println!("detached — server still running");
-            println!("  service_id: {service_id}");
-            println!("  endpoint: {endpoint}");
-            println!("  list: rocm services");
-            println!("  logs: rocm logs {service_id}");
-            println!("  stop: rocm services stop {service_id} --yes");
-            record_cli_audit_event(
-                &paths,
-                "service",
-                "serve_detach",
-                "info",
-                format!("detached from attached serve service_id={service_id} endpoint={endpoint}"),
-                Some(&service_id),
-            );
-            Ok(())
-        }
-        AttachOutcome::Stop => {
-            println!("stopping server…");
-            match run_internal_sandbox_tool(
-                &paths,
-                SandboxToolArg::StopServer,
-                Some(service_id.clone()),
-                true,
-            ) {
-                Ok(result) => print!("{}", render_service_action_result("stop_server", &result)),
-                Err(error) => {
-                    // Best-effort direct signal so Ctrl-C never leaves the model
-                    // orphaned when the sandbox stop path fails.
-                    let _ = rocm_core::terminate_process_tree(child_pid);
-                    println!("  note: {error}");
-                }
-            }
-            record_cli_audit_event(
-                &paths,
-                "service",
-                "serve_stop",
-                "info",
-                format!("stopped attached serve service_id={service_id}"),
-                Some(&service_id),
-            );
-            Ok(())
-        }
-        AttachOutcome::ServerExited => {
-            println!("server process exited");
-            println!("  service_id: {service_id}");
-            println!("  recent logs: rocm logs {service_id}");
-            Ok(())
-        }
-    }
-}
-
-/// Restores cooked terminal mode when dropped, so [`stream_attached_logs`] leaves
-/// the terminal usable on every exit path (normal return, `?` error, or panic).
-struct RawModeGuard;
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-/// Map a key press (control modifier + lowercased character) to the attach
-/// action it triggers, if any. Factored out of the raw-mode reader loop so the
-/// Ctrl-D/Ctrl-C mapping is unit-testable without a terminal.
-const fn detach_key_outcome(ctrl: bool, ch: char) -> Option<AttachOutcome> {
-    if !ctrl {
-        return None;
-    }
-    match ch {
-        'c' => Some(AttachOutcome::Stop),
-        'd' => Some(AttachOutcome::Detach),
-        _ => None,
-    }
-}
-
-/// Follow `log_path` in the terminal until the user presses Ctrl-D (detach) or
-/// Ctrl-C (stop), or the engine process exits. Uses crossterm raw mode to
-/// capture the keys directly (in raw mode Ctrl-C does not raise SIGINT, so we see
-/// it as a key event). When stdin is not a TTY (piped/CI), keystroke capture is
-/// impossible, so we follow the log until the process exits instead.
-fn stream_attached_logs(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
-    use std::io::IsTerminal as _;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-
-    if !std::io::stdin().is_terminal() {
-        return stream_attached_logs_no_tty(log_path, child_pid);
-    }
-
-    // Enter raw mode *before* spawning the key reader. In raw mode Ctrl-C arrives
-    // as a key event instead of SIGINT; if the reader started first, a Ctrl-C in
-    // that window would kill the CLI outright (leaving the detached child alive
-    // but printing no detach/stop message). The guard restores cooked mode on
-    // every exit path (normal return, `?` error, panic).
-    crossterm::terminal::enable_raw_mode().context("failed to enter raw terminal mode")?;
-    let _raw_guard = RawModeGuard;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = mpsc::channel::<AttachOutcome>();
-
-    let reader_stop = Arc::clone(&stop);
-    let reader = thread::spawn(move || {
-        use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-        while !reader_stop.load(Ordering::Relaxed) {
-            match event::poll(Duration::from_millis(100)) {
-                Ok(true) => match event::read() {
-                    Ok(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                        let outcome = match key.code {
-                            KeyCode::Char(ch) => detach_key_outcome(
-                                key.modifiers.contains(KeyModifiers::CONTROL),
-                                ch.to_ascii_lowercase(),
-                            ),
-                            _ => None,
-                        };
-                        if let Some(outcome) = outcome {
-                            let _ = tx.send(outcome);
-                            break;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(_) => break,
-                },
-                Ok(false) => {}
-                Err(_) => break,
-            }
-        }
-    });
-
-    let mut stdout = io::stdout();
-    let mut log_reader: Option<io::BufReader<fs::File>> = None;
-    let mut line = String::new();
-    let outcome = loop {
-        if log_reader.is_none() {
-            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
-        }
-        if let Some(reader) = log_reader.as_mut() {
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        // Raw mode disables the terminal's own \n -> \r\n
-                        // translation, so emit an explicit carriage return to
-                        // keep the log left-aligned instead of stair-stepping.
-                        let _ = write!(stdout, "{}\r\n", line.trim_end_matches('\n'));
-                        let _ = stdout.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if let Ok(signal) = rx.try_recv() {
-            break signal;
-        }
-        if !process_is_running(child_pid) {
-            break AttachOutcome::ServerExited;
-        }
-        thread::sleep(Duration::from_millis(150));
-    };
-
-    stop.store(true, Ordering::Relaxed);
-    let _ = reader.join();
-    Ok(outcome)
-}
-
-/// Non-interactive fallback for [`stream_attached_logs`]: no keystroke capture,
-/// so just follow the log until the (detached) engine process exits. A Ctrl-C
-/// here delivers SIGINT to this process and leaves the managed server running.
-fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<AttachOutcome> {
-    let mut stdout = io::stdout();
-    let mut log_reader: Option<io::BufReader<fs::File>> = None;
-    let mut line = String::new();
-    loop {
-        if log_reader.is_none() {
-            log_reader = fs::File::open(log_path).ok().map(io::BufReader::new);
-        }
-        if let Some(reader) = log_reader.as_mut() {
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let _ = write!(stdout, "{line}");
-                        let _ = stdout.flush();
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-        if !process_is_running(child_pid) {
-            return Ok(AttachOutcome::ServerExited);
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
 }
 
 fn services(command: Option<ServicesCommand>) -> Result<()> {
@@ -5229,9 +4047,9 @@ fn run_approved_service_action(
     validate_service_id(service_id)?;
     if !yes {
         bail!(
-            "{} local server `{service_id}` requires --yes.\n\nTry: rocm services {} {service_id} --yes",
+            "{} local server `{service_id}` requires --yes.\n\nTry: {}",
             service_action_verb(tool),
-            service_action_command(tool)
+            service_hints::service_action_hint(service_action_command(tool), service_id)
         );
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
@@ -5432,13 +4250,15 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     // advice a user takes away from it.
     if managed_service_record_is_in_use(&record) {
         bail!(
-            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
-            record.status
+            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
+            record.status,
+            service_hints::service_stop_hint(service_id)
         );
     }
     if !yes {
         bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+            service_hints::service_action_hint("remove", service_id)
         );
     }
 
@@ -5454,7 +4274,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
 
@@ -5586,7 +4407,8 @@ fn describe_hours(hours: u64) -> String {
 ///
 /// "No `<id>.json` beside it" is also exactly what a *launch in progress* looks
 /// like: `serve` writes the 0600 `<id>.endpoint-key` before
-/// [`spawn_managed_engine_child`] writes the first `<id>.json`. Nothing about
+/// `spawn_managed_engine_child` (in `service_launch.rs`) writes the first
+/// `<id>.json`. Nothing about
 /// the file distinguishes the two cases — under `--any-age` there is no age gate
 /// left to ask — so this function does not try. It is only ever reached with the
 /// managed-launch lock held, which excludes that window outright; see
@@ -5665,8 +4487,10 @@ fn build_service_prune_plan(
         if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
-                "{} is {} — stop it first with `rocm services stop {} --yes`",
-                record.service_id, record.status, record.service_id
+                "{} is {} — stop it first with `{}`",
+                record.service_id,
+                record.status,
+                service_hints::service_stop_hint(&record.service_id)
             ));
             continue;
         }
@@ -5866,7 +4690,7 @@ fn apply_service_prune_plan(
 /// leftover, and that is also what a launch looks like mid-flight: `serve`
 /// writes the 0600 `<id>.endpoint-key` at the top of the managed path, and the
 /// first `<id>.json` only lands at `record.write()` inside
-/// [`spawn_managed_engine_child`]. Between those two writes a live server's
+/// `spawn_managed_engine_child` (in `service_launch.rs`). Between those two writes a live server's
 /// secret is indistinguishable from a leftover, and `--any-age` removes the age
 /// gate that used to hide the window, so a concurrent
 /// `rocm services prune --any-age --yes` deleted it.
@@ -6028,37 +4852,79 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
         RuntimesCommand::List => {
             print!("{}", render_runtimes_text(&paths, &config)?);
         }
-        RuntimesCommand::Activate { runtime } => {
-            let result = activate_runtime(&paths, &mut config, &runtime)?;
+        RuntimesCommand::Activate {
+            runtime,
+            restart_services,
+            yes,
+        } => {
+            // Checked before anything is written: a refused restart must leave
+            // the previously active runtime in place, not switch the runtime and
+            // then decline the half of the job the user actually asked for.
+            runtime_services::ensure_service_restart_approved(
+                restart_services,
+                yes,
+                &format!("activate {runtime}"),
+            )?;
+            let mut result = activate_runtime(&paths, &mut config, &runtime)?;
+            if restart_services {
+                runtime_services::restart_stale_runtime_services(
+                    &paths,
+                    &result.runtime_key,
+                    &mut result.services,
+                );
+            }
             println!("runtime activated");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
             println!(
                 "  changed_from_runtime_key: {}",
-                result.previous_runtime_key.as_deref().unwrap_or("<unset>")
+                changed_from_runtime_key_text(&result)
             );
-            println!(
-                "  note: running services keep their recorded runtime until they are restarted"
+            print!(
+                "{}",
+                runtime_services::render_runtime_service_reconciliation(
+                    &result.services,
+                    &result.runtime_key
+                )
             );
             if result.previous_runtime_key.is_some() {
                 println!("{ROLLBACK_RECOVERY_HINT}");
             }
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
+            // Severity and detail come from the restart outcome, not from the
+            // switch alone. The switch did succeed, so "activated" is true — but
+            // the command is about to exit non-zero, and an audit line reading
+            // `info: activated` is where someone reconstructing the incident
+            // would stop looking.
+            let (severity, detail) =
+                runtime_services::service_restart_audit_outcome(&result.services);
             record_cli_audit_event(
                 &paths,
                 "runtime",
                 "runtime_activate",
-                "info",
+                severity,
                 format!(
-                    "activated runtime_key={} runtime_id={}",
+                    "activated runtime_key={} runtime_id={}{detail}",
                     result.runtime_key, result.runtime_id
                 ),
                 None,
             );
+            runtime_services::bail_on_failed_service_restarts(&result.services)?;
         }
-        RuntimesCommand::Rollback => {
-            let result = rollback_runtime(&paths, &mut config)?;
+        RuntimesCommand::Rollback {
+            restart_services,
+            yes,
+        } => {
+            runtime_services::ensure_service_restart_approved(restart_services, yes, "rollback")?;
+            let mut result = rollback_runtime(&paths, &mut config)?;
+            if restart_services {
+                runtime_services::restart_stale_runtime_services(
+                    &paths,
+                    &result.runtime_key,
+                    &mut result.services,
+                );
+            }
             println!("runtime rolled back");
             println!("  runtime_id: {}", result.runtime_id);
             println!("  runtime_key: {}", result.runtime_key);
@@ -6066,22 +4932,29 @@ fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
                 "  changed_from_runtime_key: {}",
                 result.previous_runtime_key.as_deref().unwrap_or("<unset>")
             );
-            println!(
-                "  note: running services keep their recorded runtime until they are restarted"
+            print!(
+                "{}",
+                runtime_services::render_runtime_service_reconciliation(
+                    &result.services,
+                    &result.runtime_key
+                )
             );
             println!("  marker: {}", active_runtime_marker_path(&paths).display());
             println!("  config: {}", paths.config_path().display());
+            let (severity, detail) =
+                runtime_services::service_restart_audit_outcome(&result.services);
             record_cli_audit_event(
                 &paths,
                 "runtime",
                 "runtime_rollback",
-                "info",
+                severity,
                 format!(
-                    "rolled back to runtime_key={} runtime_id={}",
+                    "rolled back to runtime_key={} runtime_id={}{detail}",
                     result.runtime_key, result.runtime_id
                 ),
                 None,
             );
+            runtime_services::bail_on_failed_service_restarts(&result.services)?;
         }
         RuntimesCommand::Uninstall {
             runtime,
@@ -6270,6 +5143,171 @@ pub(crate) struct RuntimeActivationResult {
     runtime_id: String,
     runtime_key: String,
     previous_runtime_key: Option<String>,
+    /// The runtime asked for was already the active one, so nothing was
+    /// switched and `previous_runtime_key` is the rollback target the earlier
+    /// activation recorded, not a runtime this call left.
+    reactivated: bool,
+    /// What the live local servers were running on when this activation
+    /// happened. Read from disk, never assumed: a fixed "running services keep
+    /// their recorded runtime" note would be printed whether or not a single
+    /// service existed.
+    services: runtime_services::RuntimeServiceReconciliation,
+}
+
+/// What `changed_from_runtime_key:` says in the activation report.
+///
+/// A re-activation left nothing, so naming the rollback target it retained
+/// would claim the user just came from it.
+fn changed_from_runtime_key_text(result: &RuntimeActivationResult) -> &str {
+    if result.reactivated {
+        "<unchanged>"
+    } else {
+        result.previous_runtime_key.as_deref().unwrap_or("<unset>")
+    }
+}
+
+/// The persisted state an activation replaces, captured before the first
+/// write so a half-applied activation can be undone.
+///
+/// Activation writes two independent files — the config and the active-runtime
+/// marker. Without this, a marker write that fails leaves the config naming the
+/// new runtime while the marker still names the old one, and the marker feeds
+/// both runtime resolution and the storage retention holds.
+struct ActivationSnapshot {
+    default_runtime_id: Option<String>,
+    active_runtime_key: Option<String>,
+    previous_runtime_key: Option<String>,
+    marker: MarkerSnapshot,
+}
+
+/// What stood at the active-runtime marker path before an activation wrote it.
+///
+/// "No marker" and "a marker this process could not read" are deliberately
+/// distinct. Collapsing them — which `fs::read(..).ok()` does — makes the
+/// restore treat an unreadable marker as one it is entitled to delete, so a
+/// permissions or IO fault on a marker whose bytes were never captured would
+/// be destroyed by the very path that exists to put state back.
+enum MarkerSnapshot {
+    /// The marker's bytes, to be written back verbatim.
+    Contents(Vec<u8>),
+    /// There was no marker, so restoring means removing the one that was
+    /// written over it.
+    Absent,
+    /// A marker was there but could not be read. Its bytes are not held, so
+    /// the only honest restore is to leave whatever is there alone.
+    Unreadable,
+}
+
+impl ActivationSnapshot {
+    fn capture(paths: &AppPaths, config: &RocmCliConfig) -> Self {
+        Self {
+            default_runtime_id: config.default_runtime_id.clone(),
+            active_runtime_key: config.active_runtime_key.clone(),
+            previous_runtime_key: config.previous_runtime_key.clone(),
+            marker: match fs::read(active_runtime_marker_path(paths)) {
+                Ok(bytes) => MarkerSnapshot::Contents(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    MarkerSnapshot::Absent
+                }
+                Err(_) => MarkerSnapshot::Unreadable,
+            },
+        }
+    }
+
+    /// Put the caller's in-memory config back, without touching disk.
+    ///
+    /// Split out because the first write an activation makes is
+    /// `config.save`: when that is what failed, nothing reached disk and
+    /// saving again would only produce a second failure to explain, but the
+    /// caller still holds a config describing a runtime that was never
+    /// activated.
+    fn restore_in_memory(&self, config: &mut RocmCliConfig) {
+        config
+            .default_runtime_id
+            .clone_from(&self.default_runtime_id);
+        config
+            .active_runtime_key
+            .clone_from(&self.active_runtime_key);
+        config
+            .previous_runtime_key
+            .clone_from(&self.previous_runtime_key);
+    }
+
+    fn restore(self, paths: &AppPaths, config: &mut RocmCliConfig) -> Result<()> {
+        self.restore_in_memory(config);
+        config.save(paths)?;
+        let path = active_runtime_marker_path(paths);
+        match self.marker {
+            // Written through the same atomic helper the forward path uses, not
+            // a bare `fs::write`. This runs only when something has already
+            // failed, so it is the write least able to afford leaving a
+            // truncated marker behind — which runtime resolution and the
+            // storage retention holds would both read as "nothing is active".
+            MarkerSnapshot::Contents(bytes) => {
+                let parent = path
+                    .parent()
+                    .context("active runtime marker path has no parent directory")?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+                therock::write_file_atomically(&path, &bytes)
+                    .with_context(|| format!("failed to restore {}", path.display()))?;
+            }
+            // Only a regular file is removed: whatever else may sit at that
+            // path was there before this activation, so leaving it is what
+            // "restore the previous state" means.
+            MarkerSnapshot::Absent if path.is_file() => fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?,
+            MarkerSnapshot::Absent | MarkerSnapshot::Unreadable => {}
+        }
+        Ok(())
+    }
+}
+
+/// Persist the config an activation just mutated, putting the caller's
+/// in-memory copy back if that write fails.
+///
+/// `config.save` is the FIRST of an activation's two writes, so a failure here
+/// leaves disk untouched — but not the caller's struct, which already names the
+/// runtime that was not activated. Callers keep using it: `rocm update --apply
+/// --activate` saves the same config again straight after, so an unrestored
+/// struct is a route to persisting an activation that was refused.
+fn save_activated_config(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    snapshot: &ActivationSnapshot,
+) -> Result<()> {
+    config.save(paths).map_err(|error| {
+        snapshot.restore_in_memory(config);
+        error.context(
+            "failed to record the active ROCm runtime; the previously active runtime is still \
+             the active one",
+        )
+    })
+}
+
+/// Undo a half-applied activation and describe what the user is left with.
+///
+/// Mirrors the shape of `revalidate_runtime_uninstall_plan`: refuse the
+/// operation with a message that says exactly which state is on disk and which
+/// command puts it right.
+fn restore_after_failed_activation(
+    paths: &AppPaths,
+    config: &mut RocmCliConfig,
+    snapshot: ActivationSnapshot,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match snapshot.restore(paths, config) {
+        Ok(()) => error.context(
+            "failed to record the active ROCm runtime; the previously active runtime is still \
+             the active one",
+        ),
+        Err(restore_error) => error.context(format!(
+            "failed to record the active ROCm runtime, and restoring the previous state failed \
+             too ({restore_error:#}); the ROCm CLI config and the active runtime marker may now \
+             disagree. Run `rocm runtimes list` to see both, then re-run `rocm runtimes activate \
+             <runtime_key>` for the runtime you want to write them again"
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6437,12 +5475,12 @@ pub(crate) fn activate_runtime(
     // Re-selecting the runtime already in use is a no-op to the user: they have
     // not left anything, so there is no new rollback target — and no reason to
     // forget the one the activation that put them here recorded. Deriving the
-    // target from `current` unconditionally used to clear it, silently removing
+    // target from `current` unconditionally would clear it, silently removing
     // the recovery path that activation had just offered.
-    let (previous_runtime_key, previous_runtime_id) = if current
+    let reactivating_active_runtime = current
         .as_ref()
-        .is_some_and(|current| current.runtime_key == manifest.runtime_key)
-    {
+        .is_some_and(|current| current.runtime_key == manifest.runtime_key);
+    let (previous_runtime_key, previous_runtime_id) = if reactivating_active_runtime {
         let runtime_key = config.previous_runtime_key.clone();
         let runtime_id = runtime_key
             .as_deref()
@@ -6464,11 +5502,24 @@ pub(crate) fn activate_runtime(
         )
     };
 
+    // Read the live services before anything is written, so an unreadable
+    // services folder refuses the activation instead of half-applying it.
+    let services =
+        runtime_services::reconcile_services_for_runtime(paths, &manifests, &manifest.runtime_key)
+            .with_context(|| {
+                format!(
+                    "the local server records could not be read, so the switch to `{}` was not \
+                     made and the previously active runtime is unchanged",
+                    manifest.runtime_key
+                )
+            })?;
+    let snapshot = ActivationSnapshot::capture(paths, config);
+
     config.default_runtime_id = Some(manifest.runtime_id.clone());
     config.active_runtime_key = Some(manifest.runtime_key.clone());
     config.previous_runtime_key = previous_runtime_key.clone();
-    config.save(paths)?;
-    write_active_runtime_marker(
+    save_activated_config(paths, config, &snapshot)?;
+    if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
             runtime_id: manifest.runtime_id.clone(),
@@ -6479,12 +5530,18 @@ pub(crate) fn activate_runtime(
             previous_runtime_key: previous_runtime_key.clone(),
             activated_at_unix_ms: rocm_core::unix_time_millis(),
         },
-    )?;
+    ) {
+        return Err(restore_after_failed_activation(
+            paths, config, snapshot, error,
+        ));
+    }
 
     Ok(RuntimeActivationResult {
         runtime_id: manifest.runtime_id.clone(),
         runtime_key: manifest.runtime_key.clone(),
         previous_runtime_key,
+        reactivated: reactivating_active_runtime,
+        services,
     })
 }
 
@@ -6509,11 +5566,22 @@ fn rollback_runtime(
         .map(|manifest| manifest.runtime_id.clone())
         .filter(|_| new_previous_key.is_some());
 
+    let services =
+        runtime_services::reconcile_services_for_runtime(paths, &manifests, &previous.runtime_key)
+            .with_context(|| {
+                format!(
+                    "the local server records could not be read, so the rollback to `{}` was not \
+                     made and the previously active runtime is unchanged",
+                    previous.runtime_key
+                )
+            })?;
+    let snapshot = ActivationSnapshot::capture(paths, config);
+
     config.default_runtime_id = Some(previous.runtime_id.clone());
     config.active_runtime_key = Some(previous.runtime_key.clone());
     config.previous_runtime_key = new_previous_key.clone();
-    config.save(paths)?;
-    write_active_runtime_marker(
+    save_activated_config(paths, config, &snapshot)?;
+    if let Err(error) = write_active_runtime_marker(
         paths,
         ActiveRuntimeMarker {
             runtime_id: previous.runtime_id.clone(),
@@ -6524,12 +5592,18 @@ fn rollback_runtime(
             previous_runtime_key: new_previous_key.clone(),
             activated_at_unix_ms: rocm_core::unix_time_millis(),
         },
-    )?;
+    ) {
+        return Err(restore_after_failed_activation(
+            paths, config, snapshot, error,
+        ));
+    }
 
     Ok(RuntimeActivationResult {
         runtime_id: previous.runtime_id.clone(),
         runtime_key: previous.runtime_key.clone(),
         previous_runtime_key: new_previous_key,
+        reactivated: false,
+        services,
     })
 }
 
@@ -6913,6 +5987,7 @@ struct SdkInstallFinalization {
     install_root: PathBuf,
     family: String,
     previous_runtime_key: Option<String>,
+    services: runtime_services::RuntimeServiceReconciliation,
 }
 
 fn print_sdk_install_success(finalized: &SdkInstallFinalization) {
@@ -8792,6 +7867,14 @@ fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> String {
         finalized.install_root.display(),
         finalized.runtime_key
     );
+    let _ = write!(
+        output,
+        "{}",
+        runtime_services::render_runtime_service_reconciliation(
+            &finalized.services,
+            &finalized.runtime_key
+        )
+    );
     if finalized.previous_runtime_key.is_some() {
         let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
     }
@@ -8817,6 +7900,9 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
         let mut current_config = RocmCliConfig::load(paths)?;
         current_config.setup.completed = true;
         current_config.setup.therock_venv = Some(manifest.install_root.clone());
+        // This activation re-activates in the caller's original root. The
+        // user-facing reconciliation report comes from the activation against
+        // `activation_paths` below, so the result here is intentionally discarded.
         let _ = activate_runtime(paths, &mut current_config, &manifest.runtime_key)?;
     }
 
@@ -8832,6 +7918,7 @@ fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstall
         install_root: manifest.install_root,
         family: manifest.family,
         previous_runtime_key: activation.previous_runtime_key,
+        services: activation.services,
     }))
 }
 
@@ -9441,22 +8528,21 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
         path.parent()
             .context("active runtime marker path has no parent directory")?,
     )?;
-    let tmp_path = path.with_extension(format!("json.tmp-{}", rocm_core::unix_time_millis()));
-    fs::write(
-        &tmp_path,
-        serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
+    // The shared helper rather than a local temp-file-and-rename: it is the same
+    // write the failed-activation restore uses, and it is strictly stronger than
+    // a bare `fs::rename`, which on Windows is `MoveFileExW` and fails with a
+    // sharing violation when another process holds the marker open. The helper
+    // uses `ReplaceFileW` there whenever the destination exists. The
+    // destination is never removed first, on any platform — that would leave a
+    // window with no marker at all, which runtime resolution and the storage
+    // retention holds both read as "nothing is active" — and a failed publish
+    // takes its temp file with it, so a retried activation cannot strand one in
+    // the folder `rocm runtimes` reads.
+    therock::write_file_atomically(
+        &path,
+        &serde_json::to_vec_pretty(&marker).context("failed to serialize active runtime marker")?,
     )
-    .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
-    fs::rename(&tmp_path, &path).with_context(|| {
-        format!(
-            "failed to move active runtime marker {} into {}",
-            tmp_path.display(),
-            path.display()
-        )
-    })?;
+    .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -15405,14 +14491,14 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         ) {
             let _ = writeln!(
                 output,
-                "  stop: rocm services stop {} --yes",
-                record.service_id
+                "  stop: {}",
+                service_hints::service_stop_hint(&record.service_id)
             );
         } else {
             let _ = writeln!(
                 output,
-                "  restart: rocm services restart {} --yes",
-                record.service_id
+                "  restart: {}",
+                service_hints::service_action_hint("restart", &record.service_id)
             );
         }
     }
@@ -15636,7 +14722,7 @@ fn run_internal_sandbox_tool(
         }
         SandboxToolArg::RestartServer => {
             let service_id = service_id.context("restart_server requires --service-id")?;
-            let service = restart_internal_managed_service(paths, &service_id)?;
+            let service = restart_internal_managed_service(paths, &service_id, None)?;
             serde_json::json!({
                 "tool": tool.as_cli_value(),
                 "status": "restarted",
@@ -15805,11 +14891,84 @@ fn unload_lemonade_service_model(record: &ManagedServiceRecord) -> Result<()> {
     }
 }
 
+/// Re-apply a caller's runtime pin to a record that was just loaded for a
+/// restart, in the same shape `pin_service_record_to_runtime` writes it: the
+/// exact runtime key, and no env pin.
+///
+/// Split out from [`restart_internal_managed_service`] so the pin can be
+/// asserted without launching an engine — see
+/// `pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv`.
+fn apply_restart_runtime_pin(record: &mut ManagedServiceRecord, runtime_pin: Option<&str>) {
+    if let Some(runtime_key) = runtime_pin {
+        record.runtime_id = Some(runtime_key.to_owned());
+        record.env_id = None;
+    }
+}
+
+/// Load the record a restart relaunches from, with the caller's runtime pin
+/// applied after the load's own refresh.
+///
+/// Everything a restart can say about WHICH runtime the child comes back on is
+/// decided here and in [`restart_child_argv`], and neither spawns anything, so
+/// `restart_internal_managed_service` is only the stop, the spawn and the
+/// readiness wait around them. That split is what lets a test reach the part of
+/// a restart that matters for a move without an engine: dropping the pin from
+/// this function, or from the caller that supplies it, changes the argv a test
+/// reads off [`restart_child_argv`].
+fn load_service_for_restart(
+    paths: &AppPaths,
+    service_id: &str,
+    runtime_pin: Option<&str>,
+) -> Result<ManagedServiceRecord> {
+    let mut record = load_managed_service(paths, service_id)?;
+    apply_restart_runtime_pin(&mut record, runtime_pin);
+    Ok(record)
+}
+
+/// The argv a restarted child is launched with, read entirely off the record.
+///
+/// Every field comes from the record rather than from a parameter on purpose: a
+/// restart's runtime is whatever the record says after
+/// [`load_service_for_restart`], and an input here that bypassed it would let a
+/// test assert a runtime the restart never uses.
+fn restart_child_argv(record: &ManagedServiceRecord) -> Result<Vec<String>> {
+    let policy = parse_device_policy(record.device_policy.as_deref())?;
+    let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
+    builtin_engine_serve_http_args(
+        &record.engine,
+        &record.service_id,
+        &record.canonical_model_id,
+        &record.host,
+        record.port,
+        &policy,
+        &record.gpu_indices,
+        record.runtime_id.as_deref(),
+        record.env_id.as_deref(),
+        recipe.as_ref(),
+        &record.engine_state_path,
+        Some(&record.log_path),
+    )
+}
+
+/// Stop a managed service and bring it back up.
+///
+/// `runtime_pin` is for callers whose whole reason for restarting is to MOVE the
+/// service — `runtime_services::restart_service_onto_runtime`. Passing the key
+/// here is not a convenience over writing the record first: `load_managed_service`
+/// below refreshes the record from the engine state file written by the process
+/// being replaced, which re-adopts THAT process's `runtime_id` and `env_id`. For
+/// a plain restart that is correct, since the record should describe what is
+/// actually running. For a move it silently undoes the re-pin — the previous
+/// `env_id` comes back, and `builtin_engine_serve_http_args` omits `--runtime-id`
+/// whenever `env_id` is set, so the child would resolve a runtime for itself and
+/// come back up on the one it was already using while the record claimed the new
+/// key. `None` leaves the refreshed record exactly as it was.
 fn restart_internal_managed_service(
     paths: &AppPaths,
     service_id: &str,
+    runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
-    let mut record = load_managed_service(paths, service_id)?;
+    let mut record = load_service_for_restart(paths, service_id, runtime_pin)?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
     // deletes the key file (correct on a real stop), but a restart must bring the
     // service back on the same public host with the same auth. Capture it first and
@@ -15832,7 +14991,10 @@ fn restart_internal_managed_service(
     // the record writes below; if the restart bails before one of those, the
     // marker stays set on disk — correct, since then the stop is what stands.
     record.stop_requested_unix_ms = None;
-    let policy = parse_device_policy(record.device_policy.as_deref())?;
+    // Still after the stop, like the device-policy refusal inside it always was:
+    // the callers' "stopped by the attempt" report and pin restore both cover a
+    // restart that gets this far and fails.
+    let serve_args = restart_child_argv(&record)?;
     fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -15844,21 +15006,6 @@ fn restart_internal_managed_service(
     }
     let current_exe = managed_service_launcher_path()
         .context("failed to resolve current rocm executable path")?;
-    let recipe = parse_engine_recipe_json_arg(record.engine_recipe_json.clone())?;
-    let serve_args = builtin_engine_serve_http_args(
-        &record.engine,
-        &record.service_id,
-        &record.canonical_model_id,
-        &record.host,
-        record.port,
-        &policy,
-        &record.gpu_indices,
-        record.runtime_id.as_deref(),
-        record.env_id.as_deref(),
-        recipe.as_ref(),
-        &record.engine_state_path,
-        Some(&record.log_path),
-    )?;
     let engine_envs_root = env_root_for_service(
         paths,
         &record.engine,
@@ -16221,8 +15368,11 @@ fn apply_runtime_update(
         installed.install_root.display()
     );
     if activate {
+        // No `config.save` after this: `activate_runtime` already persisted the
+        // same struct and nothing mutates it in between, so a second write can
+        // only fail after an activation that fully succeeded — sending the user
+        // to re-run a command that already worked.
         let activation = activate_runtime(paths, config, &installed.runtime_key)?;
-        config.save(paths)?;
         append_update_activate_summary(&mut output, &activation);
     } else {
         let _ = writeln!(
@@ -16266,9 +15416,13 @@ fn append_update_activate_summary(output: &mut String, activation: &RuntimeActiv
             .as_deref()
             .unwrap_or("<unset>")
     );
-    let _ = writeln!(
+    let _ = write!(
         output,
-        "  note: running services keep their recorded runtime until they are restarted"
+        "{}",
+        runtime_services::render_runtime_service_reconciliation(
+            &activation.services,
+            &activation.runtime_key
+        )
     );
     if activation.previous_runtime_key.is_some() {
         let _ = writeln!(output, "{ROLLBACK_RECOVERY_HINT}");
@@ -21215,6 +20369,87 @@ pub(crate) mod tests {
         );
     }
 
+    fn parse_runtimes(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["rocm", "runtimes"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    }
+
+    /// The two restart flags as `activate` and `rollback` parsed them.
+    fn runtimes_restart_flags(args: &[&str]) -> (bool, bool) {
+        match parse_runtimes(args).expect("flags parse").command {
+            Some(Command::Runtimes {
+                command:
+                    Some(
+                        RuntimesCommand::Activate {
+                            restart_services,
+                            yes,
+                            ..
+                        }
+                        | RuntimesCommand::Rollback {
+                            restart_services,
+                            yes,
+                        },
+                    ),
+            }) => (restart_services, yes),
+            other => panic!("expected runtimes activate or rollback, got {other:?}"),
+        }
+    }
+
+    // `--yes` approves a restart, so on its own it asks for something that was
+    // never requested. Mutation: removing `requires = "restart_services"` from
+    // either subcommand's `yes` makes that subcommand's argv parse and fails
+    // the loop on it.
+    #[test]
+    fn runtimes_activate_and_rollback_refuse_yes_without_restart_services() {
+        for args in [&["activate", "x", "--yes"][..], &["rollback", "--yes"][..]] {
+            let error = parse_runtimes(args)
+                .expect_err("a bare --yes has nothing to approve and must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "expected a missing-argument refusal for {args:?}"
+            );
+            assert!(
+                error.to_string().contains("restart-services"),
+                "the refusal must name the flag that is missing for {args:?}:\n{error}"
+            );
+        }
+    }
+
+    // Mutation: making `--restart-services` conflict with `--yes`, or dropping
+    // the `yes` field from either variant, fails the pair assertions.
+    #[test]
+    fn runtimes_restart_flags_parse_together_and_alone() {
+        for prefix in [&["activate", "x"][..], &["rollback"][..]] {
+            let mut together = prefix.to_vec();
+            together.extend(["--restart-services", "--yes"]);
+            assert_eq!(
+                runtimes_restart_flags(&together),
+                (true, true),
+                "{together:?}"
+            );
+
+            let mut alone = prefix.to_vec();
+            alone.push("--restart-services");
+            assert_eq!(runtimes_restart_flags(&alone), (true, false), "{alone:?}");
+
+            assert_eq!(runtimes_restart_flags(prefix), (false, false), "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn runtimes_activate_parses_the_runtime_it_was_given() {
+        let cli = parse_runtimes(&["activate", "release-pip-x", "--restart-services", "--yes"])
+            .expect("activate parses");
+        match cli.command {
+            Some(Command::Runtimes {
+                command: Some(RuntimesCommand::Activate { runtime, .. }),
+            }) => assert_eq!(runtime, "release-pip-x"),
+            other => panic!("expected runtimes activate, got {other:?}"),
+        }
+    }
+
     fn parse_serve(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec!["rocm", "serve", "qwen"];
         argv.extend_from_slice(args);
@@ -21248,22 +20483,6 @@ pub(crate) mod tests {
         // exclusive (point users at `rocm logs` for a managed server instead).
         let error = parse_serve(&["--verbose", "--managed"]).expect_err("conflict rejected");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn detach_key_ctrl_d_detaches_ctrl_c_stops() {
-        assert_eq!(detach_key_outcome(true, 'd'), Some(AttachOutcome::Detach));
-        assert_eq!(detach_key_outcome(true, 'c'), Some(AttachOutcome::Stop));
-    }
-
-    #[test]
-    fn detach_key_ignores_plain_and_unrelated_keys() {
-        // Without the control modifier, `d`/`c` are ordinary log-scroll input.
-        assert_eq!(detach_key_outcome(false, 'd'), None);
-        assert_eq!(detach_key_outcome(false, 'c'), None);
-        // Other control combos are not detach/stop triggers.
-        assert_eq!(detach_key_outcome(true, 'q'), None);
-        assert_eq!(detach_key_outcome(true, 'z'), None);
     }
 
     #[test]
@@ -26491,18 +25710,41 @@ install therock";
         status: &str,
         supervisor_pid: u32,
     ) -> Result<ManagedServiceRecord> {
-        let mut record = ManagedServiceRecord::new(
+        plant_service_record_on_runtime(
             paths,
             service_id,
             "vllm",
+            status,
+            supervisor_pid,
+            None,
+            None,
+        )
+    }
+
+    /// [`plant_service_record_without_its_key`] with the three fields the runtime-activation
+    /// tests need to vary: the engine (self-managed engines are never stale),
+    /// the recorded runtime key, and the environment pin.
+    fn plant_service_record_on_runtime(
+        paths: &AppPaths,
+        service_id: &str,
+        engine: &str,
+        status: &str,
+        supervisor_pid: u32,
+        runtime_id: Option<&str>,
+        env_id: Option<&str>,
+    ) -> Result<ManagedServiceRecord> {
+        let mut record = ManagedServiceRecord::new(
+            paths,
+            service_id,
+            engine,
             "qwen",
             "Qwen/Qwen3.5",
             "127.0.0.1",
             9,
             "managed",
             supervisor_pid,
-            None,
-            None,
+            runtime_id.map(ToOwned::to_owned),
+            env_id.map(ToOwned::to_owned),
             Some("gpu_required".to_owned()),
         );
         status.clone_into(&mut record.status);
@@ -27927,250 +27169,6 @@ install therock";
     }
 
     #[test]
-    fn spawn_managed_engine_child_blocks_reuse_with_mismatched_recipe() -> Result<()> {
-        // A live service recorded with one recipe (e.g. a tool-call parser flag)
-        // must reject a relaunch requesting a different recipe rather than
-        // silently reusing the old server, and the error must not claim the
-        // mismatch is specifically about generation defaults when it could stem
-        // from any recipe field.
-        let (root, paths) = test_paths("dup-managed-recipe-mismatch");
-        paths.ensure()?;
-        let mut existing = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-1000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11510,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        existing.status = "ready".to_owned();
-        existing.engine_pid = Some(std::process::id());
-        existing.engine_recipe_json = Some(serde_json::to_string(&EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "lemonade".to_owned(),
-            required_flags: vec!["--tool-call-parser".to_owned(), "hermes".to_owned()],
-            ..EngineRecipeHint::default()
-        })?);
-        existing.write()?;
-
-        let resolve = ResolveModelResponse {
-            canonical_model_id: "qwen-canonical".to_owned(),
-            task: "chat".to_owned(),
-            source: "hf".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llama.cpp".to_owned(),
-            trust_remote_code: false,
-            chat_template_mode: "auto".to_owned(),
-            dtype: "auto".to_owned(),
-            device_policy: DevicePolicy::GpuPreferred,
-            estimated_memory: "unknown".to_owned(),
-            launch_defaults: serde_json::json!({}),
-            engine_recipe: None,
-            warnings: Vec::new(),
-        };
-        let requested_recipe = EngineRecipeHint {
-            contract_version: ENGINE_RECIPE_CONTRACT_VERSION.to_owned(),
-            engine: "lemonade".to_owned(),
-            required_flags: vec!["--temperature".to_owned(), "0.5".to_owned()],
-            ..EngineRecipeHint::default()
-        };
-
-        let result = spawn_managed_engine_child(
-            &paths,
-            "lemonade",
-            "lemonade-qwen-2000",
-            "qwen",
-            &resolve,
-            "127.0.0.1",
-            11511,
-            &resolve.device_policy,
-            &[],
-            None,
-            None,
-            Some(&requested_recipe),
-            false,
-        );
-        let _ = fs::remove_dir_all(root);
-
-        let Err(error) = result else {
-            panic!("mismatched recipe on a live service must be rejected")
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("different serve options"),
-            "message should describe the mismatch generically: {message}"
-        );
-        assert!(
-            message.contains("recipe hint, tool-call parser, or generation defaults"),
-            "message should not single out generation defaults as the sole cause: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn spawn_managed_engine_child_refuses_to_reuse_an_unauthenticated_service() -> Result<()> {
-        // `--require-api-key` used to be accepted and dropped on this path. The
-        // reuse branch returns before the flag is recorded and before the
-        // endpoint key is checked, so a caller demanding auth got a server that
-        // never had it, with no error. `rocm remote serve` then published that
-        // endpoint onto the tailnet and printed a freshly minted key under "the
-        // API key above is what stops anyone else calling it" — a false
-        // assurance about an endpoint the whole tailnet can reach.
-        //
-        // Asserted through `spawn_managed_engine_child` rather than against the
-        // guard's own arguments: the defect was the early return, so only the
-        // real call site can fail for it.
-        let (root, paths) = test_paths("dup-managed-unauthenticated-reuse");
-        paths.ensure()?;
-        let mut existing = ManagedServiceRecord::new(
-            &paths,
-            "lemonade-qwen-3000",
-            "lemonade",
-            "qwen",
-            "qwen-canonical",
-            "127.0.0.1",
-            11520,
-            "managed",
-            std::process::id(),
-            None,
-            None,
-            None,
-        );
-        existing.status = "ready".to_owned();
-        existing.engine_pid = Some(std::process::id());
-        // The state that matters: live, matching, and serving without auth.
-        existing.requires_api_key = false;
-        existing.write()?;
-
-        let resolve = ResolveModelResponse {
-            canonical_model_id: "qwen-canonical".to_owned(),
-            task: "chat".to_owned(),
-            source: "hf".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llama.cpp".to_owned(),
-            trust_remote_code: false,
-            chat_template_mode: "auto".to_owned(),
-            dtype: "auto".to_owned(),
-            device_policy: DevicePolicy::GpuPreferred,
-            estimated_memory: "unknown".to_owned(),
-            launch_defaults: serde_json::json!({}),
-            engine_recipe: None,
-            warnings: Vec::new(),
-        };
-
-        let result = spawn_managed_engine_child(
-            &paths,
-            "lemonade",
-            "lemonade-qwen-3001",
-            "qwen",
-            &resolve,
-            "127.0.0.1",
-            11520,
-            &resolve.device_policy,
-            &[],
-            None,
-            None,
-            None,
-            // The demand that used to be silently discarded.
-            true,
-        );
-        let _ = fs::remove_dir_all(root);
-
-        let Err(error) = result else {
-            panic!(
-                "reusing an unauthenticated service must not satisfy `--require-api-key`; a \
-                 satisfied reuse leaves the endpoint open while the caller is told it is not"
-            )
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("without authentication"),
-            "the refusal must say why it refused: {message}"
-        );
-        assert!(
-            message.contains("rocm services stop lemonade-qwen-3000"),
-            "the refusal must name the way out, with the service to stop: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_managed_spawn_refuses_an_invalid_key_file_on_a_service_that_requires_one() -> Result<()> {
-        // Drives the real call site, not the guard's own arguments. The service
-        // was launched with `--require-api-key`, and its key file is present but
-        // empty — so `requires_api_key` is true while `key_present` is false,
-        // which is the only way to reach the first branch. A test calling
-        // `ensure_public_service_has_endpoint_key` directly cannot catch a
-        // mis-wired call site, which is the defect that has occurred here twice.
-        //
-        // The flag is passed explicitly rather than inferred from the key file.
-        // Inferring it marked every public bind as having demanded auth, because
-        // a public bind always has a key file whether or not it asked for one.
-        let (root, paths) = test_paths("managed-spawn-invalid-key");
-        paths.ensure()?;
-        fs::create_dir_all(paths.services_dir())?;
-
-        // Empty, so the file exists (requires_api_key = true) but yields no
-        // usable key (key_present = false).
-        endpoint_keys::store_endpoint_api_key(&paths, "lemonade-qwen-3000", "")?;
-
-        let resolve = ResolveModelResponse {
-            canonical_model_id: "qwen-canonical".to_owned(),
-            task: "chat".to_owned(),
-            source: "hf".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llama.cpp".to_owned(),
-            trust_remote_code: false,
-            chat_template_mode: "auto".to_owned(),
-            dtype: "auto".to_owned(),
-            device_policy: DevicePolicy::GpuPreferred,
-            estimated_memory: "unknown".to_owned(),
-            launch_defaults: serde_json::json!({}),
-            engine_recipe: None,
-            warnings: Vec::new(),
-        };
-
-        let result = spawn_managed_engine_child(
-            &paths,
-            "lemonade",
-            "lemonade-qwen-3000",
-            "qwen",
-            &resolve,
-            // Loopback on purpose: the public-bind branch must not be what
-            // refuses this, or the test would pass with the guard disabled.
-            "127.0.0.1",
-            11512,
-            &resolve.device_policy,
-            &[],
-            None,
-            None,
-            None,
-            true,
-        );
-        let _ = fs::remove_dir_all(root);
-
-        let Err(error) = result else {
-            panic!("a service requiring a key must not spawn with an unusable key file")
-        };
-        let message = error.to_string();
-        assert!(
-            message.contains("--require-api-key"),
-            "the refusal must name the flag the service was launched with: {message}"
-        );
-        assert!(
-            message.contains("without authentication"),
-            "the refusal must say what the risk is: {message}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn services_tool_result_text_includes_running_interpretation() {
         let (_root, paths) = test_paths("services-tool-text");
         let mut record = ManagedServiceRecord::new(
@@ -28592,164 +27590,6 @@ install therock";
     }
 
     #[test]
-    fn serve_bind_validation_requires_public_ack() {
-        validate_bind_host("127.0.0.1", false).unwrap();
-        validate_bind_host("localhost", false).unwrap();
-        validate_bind_host("::1", false).unwrap();
-        let error = validate_bind_host("0.0.0.0", false).unwrap_err();
-        assert!(
-            error.to_string().contains("--allow-public-bind"),
-            "{error:#}"
-        );
-        validate_bind_host("0.0.0.0", true).unwrap();
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_loopback_stays_credential_free() {
-        // Loopback binds never require auth, even if a key is supplied.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            assert_eq!(resolve_endpoint_auth(host, None, false).unwrap(), None);
-            assert_eq!(
-                resolve_endpoint_auth(host, Some("ignored"), false).unwrap(),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_loopback_can_be_required_when_something_republishes_it() {
-        // "Loopback" describes the bind address, not who can reach the port. A
-        // tailnet publish, a proxy, or a container port map all leave the bind
-        // loopback while widening the audience, and the default policy would
-        // hand out an unauthenticated endpoint. Whoever widens the reach asks
-        // for the credential explicitly.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            let generated = resolve_endpoint_auth(host, None, true)
-                .unwrap()
-                .expect("a required key must be generated, not skipped");
-            assert!(!generated.trim().is_empty());
-
-            assert_eq!(
-                resolve_endpoint_auth(host, Some("supplied-key"), true).unwrap(),
-                Some("supplied-key".to_owned()),
-                "a supplied key must be honoured rather than ignored as it is by default"
-            );
-        }
-
-        // The same validation a public bind gets: an empty key is a refusal, not
-        // a silent downgrade to no auth.
-        assert!(resolve_endpoint_auth("127.0.0.1", Some("  "), true).is_err());
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_public_uses_supplied_key_trimmed() {
-        let key = resolve_endpoint_auth("0.0.0.0", Some("  my-key  "), false)
-            .unwrap()
-            .expect("public bind must have a key");
-        assert_eq!(key, "my-key");
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_public_generates_key_when_absent() {
-        let key = resolve_endpoint_auth("0.0.0.0", None, false)
-            .unwrap()
-            .expect("public bind must generate a key");
-        assert_eq!(key.len(), 48);
-        assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_public_rejects_empty_supplied_key() {
-        let error = resolve_endpoint_auth("0.0.0.0", Some("   "), false).unwrap_err();
-        assert!(error.to_string().contains("non-empty"), "{error:#}");
-    }
-
-    #[test]
-    fn resolve_endpoint_auth_public_rejects_embedded_crlf() {
-        // A supplied key survives `trim()` with embedded CR/LF intact and would
-        // otherwise be interpolated into a raw `Authorization: Bearer` header,
-        // injecting an extra header line. It must be rejected at input validation.
-        for supplied in [
-            "good-key\r\nX-Injected: value",
-            "good-key\nmore",
-            "line\rreturn",
-        ] {
-            let error = resolve_endpoint_auth("0.0.0.0", Some(supplied), false).unwrap_err();
-            assert!(error.to_string().contains("control character"), "{error:#}");
-        }
-    }
-
-    #[test]
-    fn drop_orphaned_endpoint_key_on_already_running_clears_stored_key() {
-        let (root, paths) = test_paths("drop-orphaned-key-stored");
-        let service_id = "svc-orphaned";
-        endpoint_keys::store_endpoint_api_key(&paths, service_id, "secret-key").unwrap();
-
-        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, Some("secret-key"));
-
-        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
-        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn drop_orphaned_endpoint_key_on_already_running_is_noop_for_loopback() {
-        // A loopback attempt never stores a key (`freshly_stored == None`), so the
-        // helper must not panic or error, and no file must appear.
-        let (root, paths) = test_paths("drop-orphaned-key-loopback");
-        let service_id = "svc-loopback";
-
-        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, None);
-
-        assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
-        assert!(!endpoint_keys::endpoint_key_file_path(&paths, service_id).exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn public_bind_fails_closed_for_windows_lemonade_only() {
-        // Windows + Lemonade + public bind: refuse (cannot enforce the key).
-        let error = ensure_public_bind_engine_supported("lemonade", true, true).unwrap_err();
-        assert!(error.to_string().contains("lemonade"), "{error:#}");
-        // Every other combination is allowed:
-        ensure_public_bind_engine_supported("vllm", true, true).unwrap(); // vLLM enforces auth on Windows
-        ensure_public_bind_engine_supported("lemonade", true, false).unwrap(); // non-Windows
-        ensure_public_bind_engine_supported("lemonade", false, true).unwrap(); // loopback needs no key
-    }
-
-    #[test]
-    fn a_public_bind_is_refused_with_the_command_that_restores_it() {
-        // `resolve_endpoint_auth` mints a key for every non-loopback bind whether
-        // or not auth was demanded, so deriving `requires_api_key` from key-file
-        // presence marked ordinary public binds as having asked for it. The guard
-        // tests that field first, so those services were refused with a message
-        // naming a flag they never passed and a relaunch command that drops
-        // `--allow-public-bind` — coming back on loopback instead.
-        //
-        // A plain `--host 0.0.0.0 --allow-public-bind` launch: key file present,
-        // `--require-api-key` never passed.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false)
-            .expect_err("a public bind with no key must be refused");
-        let rendered = format!("{error:#}");
-        assert!(
-            rendered.contains("--allow-public-bind"),
-            "the refusal must name the command that restores the public bind: {rendered}"
-        );
-        assert!(
-            !rendered.contains("--require-api-key"),
-            "a service that never passed the flag must not be told it did: {rendered}"
-        );
-
-        // And the loopback-with-forced-auth case still reports its own reason.
-        let error = ensure_public_service_has_endpoint_key("127.0.0.1", false, true)
-            .expect_err("a service that demanded auth must not come back without it");
-        assert!(
-            format!("{error:#}").contains("--require-api-key"),
-            "{error:#}"
-        );
-    }
-
-    #[test]
     fn restarting_a_keyless_public_service_names_the_public_bind_not_the_key_flag() -> Result<()> {
         // The same defect at a real call site rather than through the guard's own
         // arguments. `restart` reads `requires_api_key` off the record on disk, so
@@ -28778,7 +27618,7 @@ install therock";
         record.write()?;
 
         // No key file: the situation after a stop, which drops it.
-        let error = restart_internal_managed_service(&paths, "vllm-public-2000")
+        let error = restart_internal_managed_service(&paths, "vllm-public-2000", None)
             .expect_err("a keyless public service must not be restarted");
         let rendered = format!("{error:#}");
         assert!(
@@ -28797,50 +27637,6 @@ install therock";
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
-    }
-
-    #[test]
-    fn respawn_fails_closed_for_a_public_service_whose_key_is_gone() {
-        // A stop deletes the key file, so a later restart of a public service
-        // would otherwise respawn it with no auth at all.
-        let error = ensure_public_service_has_endpoint_key("0.0.0.0", false, false).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("0.0.0.0"), "{error:#}");
-        assert!(message.contains("without authentication"), "{error:#}");
-        // Actionable: name the command that mints a fresh key.
-        assert!(message.contains("--allow-public-bind"), "{error:#}");
-
-        // A public service that still has its key restarts normally.
-        ensure_public_service_has_endpoint_key("0.0.0.0", true, false).unwrap();
-    }
-
-    #[test]
-    fn respawn_allows_loopback_services_without_an_endpoint_key() {
-        // Loopback stays credential-free, so every accepted spelling must pass
-        // the guard with no key present — when nothing asked for auth.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            ensure_public_service_has_endpoint_key(host, false, false)
-                .unwrap_or_else(|error| panic!("{host} must not require a key: {error:#}"));
-        }
-    }
-
-    #[test]
-    fn respawn_refuses_a_loopback_service_that_was_launched_with_a_key() {
-        // The hole this closes: a loopback bind that something else republishes
-        // — a tailnet publish, a proxy, a container port map. The publish
-        // outlives the process, so a restart after the key was dropped would
-        // reopen a reachable endpoint with no authentication, and the bind
-        // address gives the guard no way to notice.
-        for host in ["127.0.0.1", "localhost", "::1"] {
-            let error = ensure_public_service_has_endpoint_key(host, false, true)
-                .expect_err("a service launched with a key must not restart without one");
-            let message = format!("{error:#}");
-            assert!(message.contains("without authentication"), "{message}");
-            assert!(message.contains("--require-api-key"), "{message}");
-        }
-
-        // With its key still present it restarts normally.
-        ensure_public_service_has_endpoint_key("127.0.0.1", true, true).unwrap();
     }
 
     #[test]
@@ -28866,7 +27662,7 @@ install therock";
         record.status = "running".to_owned();
         record.write().unwrap();
 
-        let error = restart_internal_managed_service(&paths, service_id).unwrap_err();
+        let error = restart_internal_managed_service(&paths, service_id, None).unwrap_err();
         assert!(
             error.to_string().contains("without authentication"),
             "{error:#}"
@@ -28989,19 +27785,6 @@ install therock";
         assert_eq!(endpoint_keys::endpoint_api_key(&paths, service_id), None);
         assert_eq!(record.stop_requested_unix_ms, None);
         let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn endpoint_client_config_shows_key_once_with_bearer_guidance() {
-        let rendered = render_endpoint_client_config("http://0.0.0.0:11435/v1", "secret-123");
-        // Dummy literal exercising the intentional one-time key display documented
-        // on `render_endpoint_client_config`; not a real credential or a log write.
-        // codeql[rust/cleartext-logging]
-        assert!(rendered.contains("secret-123"), "{rendered}");
-        // codeql[rust/cleartext-logging]: see rationale above.
-        assert!(rendered.contains("Authorization: Bearer"), "{rendered}");
-        // codeql[rust/cleartext-logging]: see rationale above.
-        assert!(rendered.contains("shown only now"), "{rendered}");
     }
 
     #[test]
@@ -30310,6 +29093,70 @@ install therock";
         Ok(())
     }
 
+    // The install report is only as honest as the reconciliation that reaches
+    // it: a server still on the runtime the install just replaced has to survive
+    // `finalize_successful_sdk_install` into the finalization the report renders.
+    // The service is planted under the same rebased paths the production
+    // activation reads its service records from.
+    // Mutation: replacing `services: activation.services` with a default
+    // reconciliation in `finalize_successful_sdk_install` fails the `stale`
+    // assertion and the rendered-count assertion.
+    #[test]
+    fn sdk_install_finalization_carries_the_servers_left_on_the_replaced_runtime() -> Result<()> {
+        let (root, paths) = test_paths("sdk-install-finalization-services");
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let newest = write_test_pip_runtime(
+            &paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let activation_paths = paths.clone().with_managed_root(newest.install_root, false);
+        activation_paths.ensure()?;
+        plant_service_record_on_runtime(
+            &activation_paths,
+            "svc-sdk-stale",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let finalized = finalize_successful_sdk_install(&paths)?
+            .context("sdk install finalization should select the newest runtime")?;
+        let rendered = render_sdk_install_success(&finalized);
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(finalized.runtime_key, NEW_RUNTIME_KEY);
+        assert_eq!(
+            finalized.services.stale,
+            vec![runtime_services::RuntimeServiceEntry {
+                service_id: "svc-sdk-stale".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+            }],
+            "the server still on the replaced runtime must be carried into the \
+             finalization: {:?}",
+            finalized.services
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1")
+                && rendered.contains(&format!(
+                    "- svc-sdk-stale engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+                )),
+            "the install report names the server the install left behind:\n{rendered}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn render_runtimes_text_reports_missing_configured_active_runtime() -> Result<()> {
         let (root, paths) = test_paths("runtime-active-missing");
@@ -30521,6 +29368,1468 @@ install therock";
 
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    /// The two runtimes every activation/reconciliation test switches between.
+    const OLD_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-12-0";
+    const NEW_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-13-0";
+
+    /// Register both runtimes and make `OLD_RUNTIME_KEY` the active one, which
+    /// is the state every "switch away from it" test starts from.
+    fn activate_old_runtime(paths: &AppPaths) -> Result<RocmCliConfig> {
+        write_test_pip_runtime(
+            paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        activate_runtime(paths, &mut config, OLD_RUNTIME_KEY)?;
+        Ok(config)
+    }
+
+    /// Replace the active-runtime marker with a NON-EMPTY directory, so the
+    /// next `write_active_runtime_marker` fails at a predictable point: its
+    /// `create_dir_all` of the parent succeeds, and the final `fs::rename` of
+    /// the temp file onto a non-empty directory fails on both supported
+    /// platforms without needing privileges or a real full disk.
+    fn break_active_runtime_marker(paths: &AppPaths) -> Result<PathBuf> {
+        let marker = active_runtime_marker_path(paths);
+        let _ = fs::remove_file(&marker);
+        fs::create_dir_all(&marker)?;
+        let sentinel = marker.join("occupied.txt");
+        fs::write(&sentinel, "not a marker")?;
+        Ok(sentinel)
+    }
+
+    /// Names of any `active.json.tmp-*` files left beside the marker.
+    fn marker_temp_file_names(paths: &AppPaths) -> Result<Vec<String>> {
+        let marker = active_runtime_marker_path(paths);
+        let dir = marker
+            .parent()
+            .context("active runtime marker path has no parent directory")?;
+        Ok(fs::read_dir(dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect())
+    }
+
+    #[test]
+    fn a_failed_activation_leaves_an_unreadable_marker_alone() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-unreadable-marker");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let marker_path = active_runtime_marker_path(&paths);
+        // A marker the snapshot cannot read. A directory is the portable way to
+        // make `fs::read` fail with something other than NotFound on both
+        // supported platforms; a permission-denied file would do the same, and
+        // is what this stands in for.
+        fs::remove_file(&marker_path)?;
+        fs::create_dir_all(&marker_path)?;
+
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        assert!(
+            matches!(snapshot.marker, MarkerSnapshot::Unreadable),
+            "a marker that is there but unreadable is not an absent marker"
+        );
+        // Whatever the failed activation is being rolled back from, the restore
+        // must not act on bytes it never captured.
+        fs::remove_dir_all(&marker_path)?;
+        fs::write(
+            &marker_path,
+            b"{\"runtime_key\":\"written-by-someone-else\"}",
+        )?;
+
+        snapshot.restore(&paths, &mut config)?;
+
+        let survived = fs::read(&marker_path)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            survived,
+            b"{\"runtime_key\":\"written-by-someone-else\"}".to_vec(),
+            "the snapshot holds no bytes for this marker, so deleting it would \
+             destroy state on the very path that exists to put state back"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_config_save_leaves_the_caller_holding_the_old_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-config-save-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // Two activations before the failure, not one: with a single activation
+        // `previous_runtime_key` is already `None`, so the assertion below would
+        // hold even if `restore_in_memory` never put the field back. Switching
+        // once gives it a value that a missed restore would visibly change.
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        assert_eq!(
+            config.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        // Same trick as `break_active_runtime_marker`, aimed at the config: the
+        // save's final rename onto a non-empty directory fails, which is the
+        // FIRST of an activation's two writes and so never reaches the
+        // marker-failure recovery path.
+        let config_path = paths.config_path();
+        fs::remove_file(&config_path)?;
+        fs::create_dir_all(&config_path)?;
+        fs::write(config_path.join("occupied.txt"), "not a config")?;
+
+        let error = activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)
+            .expect_err("a failed config save must fail the activation");
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the previously active runtime is still the active one"),
+            "nothing reached disk, so the error must say which runtime is \
+             active:\n{error}"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(NEW_RUNTIME_KEY),
+            "the caller goes on using this struct — `rocm update --apply \
+             --activate` saves it again right after — so a config left naming \
+             the runtime that was NOT activated is a route to persisting it"
+        );
+        assert_eq!(
+            config.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the rollback target belongs to the activation that succeeded, not \
+             to the one that failed before it wrote anything"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_reports_live_service_on_previous_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-live-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // The current process is a guaranteed-live pid, and "starting" keeps the
+        // liveness refresh from probing an endpoint nothing is serving — the
+        // record stays live without a server behind it.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-on-old-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        assert_eq!(
+            result.services.stale,
+            vec![runtime_services::RuntimeServiceEntry {
+                service_id: "svc-on-old-runtime".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+            }],
+            "a live service still recording the previous runtime is exactly what \
+             the activation report exists to name"
+        );
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1"),
+            "the report must count what it found:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- svc-on-old-runtime engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+            )),
+            "the report must name the service and the runtime it is still on:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "run `rocm runtimes activate {NEW_RUNTIME_KEY} --restart-services --yes` to move \
+                 them"
+            )),
+            "having found something to move, the report must name the exact \
+             invocation that moves it — the reports printed by `rocm install \
+             sdk` and `rocm update` reach commands that have no such flag at \
+             all:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("running services keep their recorded runtime"),
+            "the fixed note this replaced was printed whether or not any service \
+             existed; it must not survive alongside the derived report:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_ignores_stopped_services() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-stopped-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // A stopped service holds no runtime: it will pick up whatever is active
+        // when it is next launched, so reporting it would send the user chasing
+        // a restart that changes nothing.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-stopped",
+            "vllm",
+            "stopped",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.services.stale.is_empty(), "{:?}", result.services);
+        assert!(result.services.unknown.is_empty(), "{:?}", result.services);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "a clean switch must still print the count, so it reads differently \
+             from a report that never looked:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_ignores_self_managed_engine_services() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-self-managed");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // lemonade pins its own embeddable runtime, which is never a ROCm
+        // runtime key — comparing it against one would report every lemonade
+        // server as permanently stale, on every activation, forever.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-lemonade",
+            "lemonade",
+            "starting",
+            std::process::id(),
+            Some("lemonade-embeddable-8.1.11"),
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(result.services.stale.is_empty(), "{:?}", result.services);
+        assert!(result.services.unknown.is_empty(), "{:?}", result.services);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "a self-managed engine service is not moved by a ROCm runtime switch:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A vLLM record whose engine state file carries a `runtime_id` — the way a
+    /// real engine always writes it — and also has an `env_id` is classified by
+    /// that runtime like any other record, so it is reported when it differs
+    /// from the one being activated. Treating `env_id` as a pin would classify
+    /// it `Matches` and never report it, which makes this test fail.
+    #[test]
+    fn runtime_activation_reports_env_pinned_service_the_engine_recorded_a_runtime_for()
+    -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-env-pinned-with-runtime-id");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // Plant a vLLM record with an env_id (as `--env-id custom-env` would
+        // produce) but WITHOUT a runtime_id in the in-memory record, mirroring
+        // what `plant_service_record_on_runtime` gives us when runtime_id is
+        // None. Then overwrite the engine state file with a realistic payload
+        // that includes a non-empty `runtime_id`, exactly as `write_running_state`
+        // in the engine emits it — this is what `refresh_from_engine_state` reads
+        // and adopts into `record.runtime_id`.
+        let record = plant_service_record_on_runtime(
+            &paths,
+            "svc-env-pinned-with-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            None,
+            Some("custom-env"),
+        )?;
+        // Overwrite the engine state file with a realistic payload that carries
+        // a non-empty `runtime_id`. `refresh_from_engine_state` reads this and
+        // sets `record.runtime_id`, which is then what `classify_service_runtime_state`
+        // sees — so the record is judged by its runtime, and the `env_id` it
+        // also carries does not hide it.
+        fs::write(
+            &record.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "starting",
+                "runtime_id": OLD_RUNTIME_KEY,
+            }))?,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            result
+                .services
+                .stale
+                .iter()
+                .any(|e| e.service_id == "svc-env-pinned-with-runtime"),
+            "a vLLM service whose engine state file records a runtime must appear \
+             in stale, not be silently excluded because it also has an env_id:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1"),
+            "the report must count the env-pinned service that the engine \
+             recorded a runtime for:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// A live service whose engine state file is absent or unreadable has no
+    /// recorded runtime, so it cannot be classified as stale. It must appear
+    /// under `services_with_unrecorded_runtime` (Unknown), must NOT be counted
+    /// in `services_on_previous_runtime`, and must NOT be touched by
+    /// `restart_stale_runtime_services`, which iterates `services.stale` only.
+    #[test]
+    fn runtime_activation_reports_service_with_no_recorded_runtime_as_unknown() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-unknown-runtime");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        // Plant a record with no runtime_id; the engine state file written by
+        // `plant_service_record_on_runtime` contains only `{"status": "starting"}`,
+        // so `refresh_from_engine_state` finds no `runtime_id` to adopt.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-no-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            None,
+            None,
+        )?;
+
+        let result = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            result.services.stale.is_empty(),
+            "a service with no recorded runtime must not appear in stale:\n{:?}",
+            result.services
+        );
+        assert!(
+            result
+                .services
+                .unknown
+                .iter()
+                .any(|e| e.service_id == "svc-no-runtime"),
+            "a service with no recorded runtime must appear in unknown:\n{:?}",
+            result.services
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "unknown services are not counted in services_on_previous_runtime:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_with_unrecorded_runtime: 1"),
+            "the report must surface the service with no recorded runtime:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_rolls_back_when_marker_write_fails() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-marker-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let sentinel = break_active_runtime_marker(&paths)?;
+
+        let error = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)
+            .expect_err("a failed marker write must fail the activation");
+
+        let persisted = RocmCliConfig::load(&paths)?;
+        let sentinel_survived = sentinel.is_file();
+        let stranded_temp_files = marker_temp_file_names(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the previously active runtime is still the active one"),
+            "the error must say the activation did not take effect:\n{error}"
+        );
+        assert!(
+            stranded_temp_files.is_empty(),
+            "the activation is recoverable and the user retries it, so a marker \
+             write that failed must not strand its temp file in the folder \
+             `rocm runtimes` reads: {stranded_temp_files:?}"
+        );
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the config on disk must still name the runtime the marker names; \
+             a torn write here also changes storage GC hold decisions"
+        );
+        assert_eq!(
+            persisted.default_runtime_id.as_deref(),
+            Some("therock-release:gfx120X-all")
+        );
+        assert_eq!(persisted.previous_runtime_key, None);
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the caller's in-memory config must be restored too, or the next \
+             `config.save` on this path writes the state the restore just undid"
+        );
+        assert!(
+            sentinel_survived,
+            "whatever occupied the marker path predates this activation, so \
+             restoring must leave it exactly as it was"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_restart_services_requires_yes() {
+        // The caller passes the runtime the user actually typed, so the hint is
+        // copy-pasteable. A literal `<runtime_key>` here would assert a string
+        // the CLI never prints.
+        let error = runtime_services::ensure_service_restart_approved(
+            true,
+            false,
+            &format!("activate {NEW_RUNTIME_KEY}"),
+        )
+        .expect_err("restarting local servers must not happen without --yes")
+        .to_string();
+
+        assert!(
+            error.contains("requires --yes"),
+            "the refusal must name the missing approval:\n{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "rocm runtimes activate {NEW_RUNTIME_KEY} --restart-services --yes"
+            )),
+            "this path never prompts, so the refusal must spell out the command \
+             that does work, with the runtime the user asked for:\n{error}"
+        );
+
+        assert!(
+            runtime_services::ensure_service_restart_approved(
+                true,
+                true,
+                &format!("activate {NEW_RUNTIME_KEY}")
+            )
+            .is_ok(),
+            "--yes is the approval this path accepts"
+        );
+        assert!(
+            runtime_services::ensure_service_restart_approved(false, false, "rollback").is_ok(),
+            "a rollback that restarts nothing needs no approval"
+        );
+        // The hint is built per command, so the one error it can make is naming
+        // the other one — and `rocm runtimes activate ... --restart-services
+        // --yes` told to a user who just ran `rollback` would switch the runtime
+        // rather than restore it.
+        let rollback_error =
+            runtime_services::ensure_service_restart_approved(true, false, "rollback")
+                .expect_err("rollback restarts local servers too, so it needs --yes as well")
+                .to_string();
+        assert!(
+            rollback_error.contains("Try: rocm runtimes rollback --restart-services --yes"),
+            "the rollback refusal must name rollback, not activate:\n{rollback_error}"
+        );
+    }
+
+    #[test]
+    fn runtime_rollback_reports_live_service_on_previous_runtime() -> Result<()> {
+        let (root, paths) = test_paths("runtime-rollback-live-service");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        // Serving started on the newer runtime; rolling back leaves this server
+        // behind exactly the way activating forward does.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-on-new-runtime",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(NEW_RUNTIME_KEY),
+            None,
+        )?;
+
+        let result = rollback_runtime(&paths, &mut config)?;
+        let rendered = runtime_services::render_runtime_service_reconciliation(
+            &result.services,
+            &result.runtime_key,
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(result.runtime_key, OLD_RUNTIME_KEY);
+        assert_eq!(
+            result.services.stale,
+            vec![runtime_services::RuntimeServiceEntry {
+                service_id: "svc-on-new-runtime".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some(NEW_RUNTIME_KEY.to_owned()),
+            }]
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1"),
+            "rollback counts what it found, not only the line beneath the \
+             count — without this the count could be dropped and the test \
+             would stay green:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "- svc-on-new-runtime engine=vllm recorded_runtime={NEW_RUNTIME_KEY}"
+            )),
+            "rollback reports live services the same way activate does:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_rollback_rolls_back_when_marker_write_fails() -> Result<()> {
+        let (root, paths) = test_paths("runtime-rollback-marker-failure");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        let sentinel = break_active_runtime_marker(&paths)?;
+
+        let error = rollback_runtime(&paths, &mut config)
+            .expect_err("a failed marker write must fail the rollback");
+
+        let persisted = RocmCliConfig::load(&paths)?;
+        let sentinel_survived = sentinel.is_file();
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("the previously active runtime is still the active one"),
+            "the error must say the rollback did not take effect:\n{error}"
+        );
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(NEW_RUNTIME_KEY),
+            "a failed rollback must leave the runtime it failed to leave active"
+        );
+        assert_eq!(
+            persisted.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the rollback target must survive a failed rollback, or the user \
+             loses the only state that makes a retry possible"
+        );
+        assert_eq!(config.active_runtime_key.as_deref(), Some(NEW_RUNTIME_KEY));
+        assert!(sentinel_survived);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_activation_resolves_a_recorded_family_runtime_id() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-family-id");
+        paths.ensure()?;
+        // Distinct runtime_ids, so each family id names exactly one installed
+        // runtime and resolves without ambiguity.
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        write_test_pip_runtime(
+            &paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx1100",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)?;
+        // `refresh_from_engine_state` adopts what the engine reports, which for
+        // a TheRock runtime can be the manifest's family runtime_id rather than
+        // the versioned key. A verbatim string compare against the key would
+        // call this server stale while it is running on the very runtime being
+        // activated — and `--restart-services` would then stop and respawn it
+        // for nothing.
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-family-id",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some("therock-release:gfx1100"),
+            None,
+        )?;
+
+        let matched = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?.services;
+
+        // The same record is genuinely stale once the OTHER runtime is
+        // activated, so the resolution must not simply excuse every family id.
+        let stale = rollback_runtime(&paths, &mut config)?.services;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            matched.stale.is_empty() && matched.unknown.is_empty(),
+            "the recorded family id resolves to the runtime being activated: {matched:?}"
+        );
+        assert_eq!(
+            stale.stale,
+            vec![runtime_services::RuntimeServiceEntry {
+                service_id: "svc-family-id".to_owned(),
+                engine: "vllm".to_owned(),
+                recorded_runtime: Some("therock-release:gfx1100".to_owned()),
+            }],
+            "activating a different runtime does leave this server behind"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pinning_a_service_record_to_a_runtime_drops_its_env_pin() -> Result<()> {
+        let (root, paths) = test_paths("service-runtime-pin");
+        paths.ensure()?;
+        plant_service_record_on_runtime(
+            &paths,
+            "svc-pinned",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            Some("custom-env"),
+        )?;
+
+        let previous =
+            runtime_services::pin_service_record_to_runtime(&paths, "svc-pinned", NEW_RUNTIME_KEY)?;
+        let repinned = load_managed_service(&paths, "svc-pinned")?;
+        assert_eq!(
+            previous,
+            runtime_services::ServiceRuntimePin {
+                runtime_id: Some(OLD_RUNTIME_KEY.to_owned()),
+                env_id: Some("custom-env".to_owned()),
+            }
+        );
+
+        runtime_services::restore_service_record_pin(&paths, "svc-pinned", previous)?;
+        let restored = load_managed_service(&paths, "svc-pinned")?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(repinned.runtime_id.as_deref(), Some(NEW_RUNTIME_KEY));
+        assert_eq!(
+            repinned.env_id, None,
+            "`builtin_engine_serve_http_args` leaves `--runtime-id` out of the \
+             child's argv whenever `env_id` is set, so a record that kept its \
+             env pin would be restarted onto a runtime nobody chose while \
+             claiming the new key"
+        );
+        assert_eq!(restored.runtime_id.as_deref(), Some(OLD_RUNTIME_KEY));
+        assert_eq!(restored.env_id.as_deref(), Some("custom-env"));
+        Ok(())
+    }
+
+    /// The value following `flag` in an argv, or `None` when the flag is absent.
+    fn argv_flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    /// The runtime pin a `--restart-services` restart moves a server with, at
+    /// the only place it is observable without launching an engine: the argv the
+    /// restarted child is given.
+    ///
+    /// The sibling test above asserts the record's fields; that is not the same
+    /// claim. `builtin_engine_serve_http_args` omits `--runtime-id` whenever
+    /// `env_id` is set, so what the record says and what the child is told can
+    /// differ — and it is the child's argv that decides which runtime comes back
+    /// up.
+    ///
+    /// The setup is what makes this non-vacuous, and it is the state a live
+    /// restart really sees rather than an invented one. The service being moved is
+    /// still running when the restart loads its record, so its engine state file
+    /// still describes it, and `refresh_from_engine_state` re-adopts that
+    /// process's `runtime_id` and `env_id` over the pin
+    /// `pin_service_record_to_runtime` had just written. The `None` load at the
+    /// end is that load: the argv carries no `--runtime-id` at all because the
+    /// revived `env_id` suppresses it.
+    ///
+    /// The restart is the production `restart_service_onto_runtime_with`, handed
+    /// a stand-in that does what `restart_internal_managed_service` does up to
+    /// the spawn — `load_service_for_restart`, then `restart_child_argv` — and
+    /// then fails. Two things are guarded:
+    ///
+    /// - that `load_service_for_restart` applies the pin it is given: removing
+    ///   the `apply_restart_runtime_pin` call inside it leaves the revived
+    ///   `env_id` in place, and the `--runtime-id` and `--env-id` assertions
+    ///   fail;
+    /// - that `restart_service_onto_runtime_with` hands the key to the restart:
+    ///   passing `None` instead of `Some(runtime_key)` fails the assertion on the
+    ///   pin the stand-in was given, and with it the `--runtime-id` assertion.
+    ///
+    /// The failing stand-in also drives the restore path, so the record on disk
+    /// is read back to be on the runtime it ran on.
+    ///
+    /// What it does not reach is that a real child launched with this argv loads
+    /// the runtime, which needs a GPU: `runtime-lifecycle-12` observes that.
+    #[test]
+    fn pinning_the_record_is_what_puts_the_new_runtime_in_the_restart_argv() -> Result<()> {
+        let (root, paths) = test_paths("service-runtime-pin-argv");
+        paths.ensure()?;
+        let planted = plant_service_record_on_runtime(
+            &paths,
+            "svc-argv",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            Some("custom-env"),
+        )?;
+        // The outgoing process's own state, in the shape vLLM writes it: the
+        // exact key it was launched with, the family form it resolved that to,
+        // and an `env_id` it records on every launch whether or not the user
+        // asked for one.
+        fs::write(
+            &planted.engine_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "starting",
+                "requested_runtime_id": OLD_RUNTIME_KEY,
+                "runtime_id": "therock-release:gfx120X-all",
+                "env_id": "custom-env",
+            }))?,
+        )?;
+        let handed_pin = RefCell::new(None::<String>);
+        let observed_argv = RefCell::new(None::<Vec<String>>);
+
+        let error = runtime_services::restart_service_onto_runtime_with(
+            &paths,
+            "svc-argv",
+            NEW_RUNTIME_KEY,
+            |restart_paths, service_id, pin| -> Result<ManagedServiceRecord> {
+                *handed_pin.borrow_mut() = pin.map(ToOwned::to_owned);
+                let record = load_service_for_restart(restart_paths, service_id, pin)?;
+                *observed_argv.borrow_mut() = Some(restart_child_argv(&record)?);
+                bail!("stop here: the argv is what is under test");
+            },
+        )
+        .expect_err("the stand-in restart always fails");
+        let handed_pin = handed_pin.into_inner();
+        let observed_argv = observed_argv.into_inner();
+        // Read the file itself: a load would refresh the record from the engine
+        // state again and hide what the restore wrote.
+        let on_disk: ManagedServiceRecord =
+            serde_json::from_slice(&fs::read(paths.service_manifest_path("svc-argv"))?)?;
+        let unpinned = load_service_for_restart(&paths, "svc-argv", None)?;
+        let unpinned_argv = restart_child_argv(&unpinned)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            format!("{error:#}").contains("stop here"),
+            "the stand-in's own failure must reach the caller:\n{error:#}"
+        );
+        assert_eq!(
+            handed_pin.as_deref(),
+            Some(NEW_RUNTIME_KEY),
+            "the key has to be passed to the restart as well as written to the \
+             record: the restart's own load refreshes the record from the \
+             outgoing process's state and undoes the write"
+        );
+        let argv = observed_argv.context("the stand-in restart never built an argv")?;
+        assert_eq!(
+            argv_flag_value(&argv, "--runtime-id"),
+            Some(NEW_RUNTIME_KEY),
+            "re-applying the pin after the refresh is what makes the restarted \
+             child load the runtime that was just activated: {argv:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&argv, "--env-id"),
+            None,
+            "clearing `env_id` is half the pin, not tidying: leaving it set \
+             would suppress the `--runtime-id` asserted above: {argv:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&unpinned_argv, "--runtime-id"),
+            None,
+            "without the pin the same record is restarted with no `--runtime-id`, \
+             because the outgoing process's `env_id` is restored over it; this is \
+             what makes the assertions above mean something: {unpinned_argv:?}"
+        );
+        assert_eq!(
+            argv_flag_value(&unpinned_argv, "--env-id"),
+            Some("custom-env"),
+            "which is the engine's own env coming back, not the user's: {unpinned_argv:?}"
+        );
+        assert_eq!(
+            on_disk.runtime_id.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the failed restart must put the record back on the runtime it ran on"
+        );
+        assert_eq!(on_disk.env_id.as_deref(), Some("custom-env"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_refused_service_restart_leaves_the_record_on_the_runtime_it_ran_on() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-refused");
+        paths.ensure()?;
+        let mut record = plant_service_record_on_runtime(
+            &paths,
+            "svc-public",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            Some("custom-env"),
+        )?;
+        // A public bind with no endpoint key is refused by
+        // `restart_internal_managed_service` before it stops anything, which
+        // makes the failure branch reachable without spawning a process — and,
+        // just as importantly, without signalling the pid the planted record
+        // carries, which is this test process.
+        record.host = "0.0.0.0".to_owned();
+        record.write()?;
+        endpoint_keys::clear_endpoint_api_key(&paths, "svc-public");
+
+        let error =
+            runtime_services::restart_service_onto_runtime(&paths, "svc-public", NEW_RUNTIME_KEY)
+                .expect_err("a refused restart must fail the move");
+        let after = load_managed_service(&paths, "svc-public")?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            format!("{error:#}").contains("endpoint API key"),
+            "the restart's own refusal must survive to the caller:\n{error:#}"
+        );
+        assert_eq!(
+            after.runtime_id.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "a service that did not move must not be described by a runtime it \
+             never loaded"
+        );
+        assert_eq!(after.env_id.as_deref(), Some("custom-env"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_restart_that_fails_after_the_stop_leaves_the_server_stopped_and_repinned() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-fails-after-stop");
+        paths.ensure()?;
+        let mut record = plant_service_record_on_runtime(
+            &paths,
+            "svc-cpu-policy",
+            "vllm",
+            "starting",
+            // Skipped by `terminate_recorded_service_pids`, which never
+            // signals this process — so the stop runs for real without the
+            // test killing itself.
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        // A device policy the managed serve path refuses. It is parsed AFTER
+        // `restart_internal_managed_service` has already stopped the service,
+        // which is the failure the report's "stopped by the attempt" claim and
+        // the pin restore are both written for — and which the pre-stop
+        // refusal test deliberately does not reach.
+        record.device_policy = Some("cpu_only".to_owned());
+        record.write()?;
+
+        let error = runtime_services::restart_service_onto_runtime(
+            &paths,
+            "svc-cpu-policy",
+            NEW_RUNTIME_KEY,
+        )
+        .expect_err("a refused device policy must fail the move");
+        let after = load_managed_service(&paths, "svc-cpu-policy")?;
+        let _ = fs::remove_dir_all(&root);
+
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("CPU mode is not a fallback path"),
+            "moving a server onto a new runtime goes through the same managed \
+             serve path as a fresh launch, so it must refuse CPU execution \
+             exactly as that path does:\n{error}"
+        );
+        assert_eq!(
+            after.runtime_id.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the restart got past the stop but never came back up, so the \
+             record must not describe a runtime the server never loaded"
+        );
+        assert_eq!(
+            after.status, "stopped",
+            "the report and the docs both tell the user a failed restart left \
+             the server down; if the stop had not happened that sends them \
+             away from a server that is still serving"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_restart_is_counted_by_whether_the_server_is_still_up() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-failure-counting");
+        paths.ensure()?;
+        // Refused BEFORE the stop, so this server is still serving from the
+        // runtime the activation switched away from when the attempt returns.
+        let mut still_up = plant_service_record_on_runtime(
+            &paths,
+            "svc-public",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        still_up.host = "0.0.0.0".to_owned();
+        still_up.write()?;
+        endpoint_keys::clear_endpoint_api_key(&paths, "svc-public");
+        // Refused AFTER the stop, so this one really is down.
+        let mut taken_down = plant_service_record_on_runtime(
+            &paths,
+            "svc-cpu-policy",
+            "vllm",
+            "starting",
+            std::process::id(),
+            Some(OLD_RUNTIME_KEY),
+            None,
+        )?;
+        taken_down.device_policy = Some("cpu_only".to_owned());
+        taken_down.write()?;
+        let stale_entry = |service_id: &str| runtime_services::RuntimeServiceEntry {
+            service_id: service_id.to_owned(),
+            engine: "vllm".to_owned(),
+            recorded_runtime: Some(OLD_RUNTIME_KEY.to_owned()),
+        };
+        let mut services = runtime_services::RuntimeServiceReconciliation {
+            stale: vec![stale_entry("svc-public"), stale_entry("svc-cpu-policy")],
+            ..runtime_services::RuntimeServiceReconciliation::default()
+        };
+
+        runtime_services::restart_stale_runtime_services(&paths, NEW_RUNTIME_KEY, &mut services);
+        let rendered =
+            runtime_services::render_runtime_service_reconciliation(&services, NEW_RUNTIME_KEY);
+        let exit_error = format!(
+            "{:#}",
+            runtime_services::bail_on_failed_service_restarts(&services)
+                .expect_err("a failed restart must make the command exit non-zero")
+        );
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(services.failed.len(), 2, "{services:?}");
+        assert!(
+            services.restarted.is_empty(),
+            "a server that never came back up on the new runtime must not be \
+             counted as restarted; `services_restarted` is what the report \
+             offers as the good news: {services:?}"
+        );
+        assert_eq!(
+            services.stale,
+            vec![stale_entry("svc-public")],
+            "a restart refused before the stop leaves the server serving from \
+             the runtime it recorded, so dropping it under-reports a live \
+             server on the previous runtime exactly the way counting a moved \
+             one over-reported it; the server the attempt took down is not \
+             serving from anything and must not be listed: {services:?}"
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 1")
+                && rendered.contains(&format!(
+                    "- svc-public engine=vllm recorded_runtime={OLD_RUNTIME_KEY}"
+                )),
+            "the count and the line beneath it both describe what is actually \
+             still serving:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_restart_failed: 2"),
+            "every failure is reported, whichever side of the stop it fell \
+             on:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("--restart-services --yes` to move them"),
+            "advising a flag the user just passed is advice that cannot help:\n{rendered}"
+        );
+        assert!(
+            exit_error.contains("stopped by the attempt and are no longer serving: svc-cpu-policy"),
+            "the server the attempt took down has to be named as down:\n{exit_error}"
+        );
+        assert!(
+            exit_error.contains("still serving from the runtime they recorded")
+                && exit_error.contains("svc-public"),
+            "telling this user the server is down sends them away from a live \
+             server on the runtime they just switched off:\n{exit_error}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_restart_with_nothing_left_serving_is_reported_as_stopped() {
+        // No entry survives in `stale`, i.e. the failure left no server read
+        // back as live. That input — not a failed restart in general — is what
+        // makes "stopped by the attempt" the right thing to say here.
+        let services = runtime_services::RuntimeServiceReconciliation {
+            failed: vec![runtime_services::FailedServiceRestart {
+                service_id: "svc-a".to_owned(),
+                error: "boom".to_owned(),
+            }],
+            ..runtime_services::RuntimeServiceReconciliation::default()
+        };
+
+        let error = runtime_services::bail_on_failed_service_restarts(&services)
+            .expect_err("a failed restart must make the command exit non-zero")
+            .to_string();
+
+        assert!(error.contains("svc-a"), "{error}");
+        assert!(
+            error.contains("stopped by the attempt"),
+            "nothing was read back as still serving, so this failure is one the \
+             attempt left down — a report that says it keeps serving sends the \
+             user away from an outage:\n{error}"
+        );
+        assert!(
+            !error.contains("still serving"),
+            "the still-serving clause describes servers read back as live; \
+             naming one when none was read back would count the same failure \
+             twice and point the user at a server that is not there:\n{error}"
+        );
+        assert!(
+            error.contains("rocm services restart svc-a --yes")
+                || error.contains("rocm services restart <id> --yes"),
+            "the error must name the command that brings it back:\n{error}"
+        );
+    }
+
+    // A respawn is "serving" only when the restart saw an inference request
+    // succeed, which is the one way it leaves the record at `ready`. The other
+    // statuses it can return — the endpoint lists the model, or nothing answered
+    // within the wait — are a server that was moved and not yet confirmed, and
+    // neither is rolled back: the record keeps naming the runtime it was moved to.
+    // Mutation: matching `running` or `starting` as well as `ready` in
+    // `restart_service_onto_runtime_with` makes the outcomes list differ.
+    #[test]
+    fn a_restart_counts_as_serving_only_when_the_respawned_server_is_ready() -> Result<()> {
+        let (root, paths) = test_paths("service-restart-outcome");
+        paths.ensure()?;
+        let mut outcomes = Vec::new();
+        let mut recorded_runtimes = Vec::new();
+        for (service_id, status) in [
+            ("svc-ready", "ready"),
+            ("svc-running", "running"),
+            ("svc-starting", "starting"),
+        ] {
+            plant_service_record_on_runtime(
+                &paths,
+                service_id,
+                "vllm",
+                "starting",
+                std::process::id(),
+                Some(OLD_RUNTIME_KEY),
+                None,
+            )?;
+            outcomes.push(runtime_services::restart_service_onto_runtime_with(
+                &paths,
+                service_id,
+                NEW_RUNTIME_KEY,
+                |restart_paths, id, _pin| {
+                    let mut record = load_managed_service(restart_paths, id)?;
+                    status.clone_into(&mut record.status);
+                    Ok(record)
+                },
+            )?);
+            recorded_runtimes.push(load_managed_service(&paths, service_id)?.runtime_id);
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            outcomes,
+            vec![
+                runtime_services::ServiceRestartOutcome::Serving,
+                runtime_services::ServiceRestartOutcome::NotConfirmed {
+                    status: "running".to_owned()
+                },
+                runtime_services::ServiceRestartOutcome::NotConfirmed {
+                    status: "starting".to_owned()
+                },
+            ]
+        );
+        assert!(
+            recorded_runtimes
+                .iter()
+                .all(|runtime| runtime.as_deref() == Some(NEW_RUNTIME_KEY)),
+            "a respawned server stays recorded on the runtime it was moved to, \
+             confirmed or not: {recorded_runtimes:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_activation_restores_the_marker_it_replaced() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-restore");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let marker_path = active_runtime_marker_path(&paths);
+        let before = fs::read(&marker_path)?;
+
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        // Stand in for a half-applied activation: both halves moved on.
+        config.default_runtime_id = Some("therock-release:gfx1100".to_owned());
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        fs::write(&marker_path, b"{\"runtime_key\":\"half-applied\"}")?;
+
+        snapshot.restore(&paths, &mut config)?;
+
+        let persisted = RocmCliConfig::load(&paths)?;
+        let after = fs::read(&marker_path)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            after, before,
+            "restoring has to put the marker back byte for byte; the marker \
+             feeds runtime resolution and the storage retention holds, so a \
+             config-only restore still leaves the two disagreeing"
+        );
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        assert_eq!(persisted.previous_runtime_key, None);
+        assert_eq!(config.active_runtime_key.as_deref(), Some(OLD_RUNTIME_KEY));
+        Ok(())
+    }
+
+    /// The restore's own write has to be atomic, not merely correct. Its sibling
+    /// above asserts the bytes come back; swapping `write_file_atomically` for a
+    /// bare `fs::write` satisfies that and leaves the arm that runs *after
+    /// something already failed* able to strand a truncated marker. The inode is
+    /// the observable difference, so this test reads it on Unix only; the
+    /// equivalent `rocm-core` config-save test also has a Windows variant that
+    /// reads the file identity instead.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_a_marker_replaces_the_file_rather_than_rewriting_it_in_place() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let (root, paths) = test_paths("activation-snapshot-restore-atomic");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let marker_path = active_runtime_marker_path(&paths);
+
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        fs::write(&marker_path, b"{\"runtime_key\":\"half-applied\"}")?;
+        // Read AFTER the half-applied write, so the comparison is against the
+        // file the restore actually replaces.
+        let before_ino = fs::metadata(&marker_path)?.ino();
+
+        snapshot.restore(&paths, &mut config)?;
+
+        let after_ino = fs::metadata(&marker_path)?.ino();
+        let leftovers: Vec<String> = fs::read_dir(
+            marker_path
+                .parent()
+                .context("marker path has no parent directory")?,
+        )?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".tmp-"))
+        .collect();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_ne!(
+            before_ino, after_ino,
+            "the restore must publish a new file over the marker rather than \
+             rewrite it in place; an in-place write can be interrupted and this \
+             runs when something has already gone wrong"
+        );
+        assert!(
+            leftovers.is_empty(),
+            "a successful restore must not strand a staging file: {leftovers:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_activation_removes_a_marker_that_was_not_there_before() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-restore-absent");
+        paths.ensure()?;
+        // Captured with no marker on disk at all, which is the state a first
+        // activation starts from. Restoring then means removing the marker the
+        // activation wrote, not putting bytes back — the one `MarkerSnapshot`
+        // arm whose `fs::remove_file` could be replaced with a no-op and go
+        // unnoticed.
+        let mut config = RocmCliConfig::default();
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "7.12.0",
+            10,
+        )?;
+        let marker_path = active_runtime_marker_path(&paths);
+        assert!(!marker_path.exists());
+
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        assert!(matches!(snapshot.marker, MarkerSnapshot::Absent));
+        activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)?;
+        assert!(marker_path.is_file(), "the activation wrote a marker");
+
+        snapshot.restore(&paths, &mut config)?;
+
+        let marker_still_there = marker_path.exists();
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !marker_still_there,
+            "there was no marker to put back, so restoring means removing the \
+             one written over nothing — leaving it names a runtime the config \
+             no longer claims"
+        );
+        assert_eq!(persisted.active_runtime_key, None);
+        assert_eq!(persisted.default_runtime_id, None);
+        Ok(())
+    }
+
+    // A restore that fails too must say so and name the way out, rather than
+    // claim the previous runtime is still the active one. The marker's parent is
+    // made a regular file, so writing the captured bytes back fails at
+    // `create_dir_all` on every platform without needing privileges.
+    // Mutation: returning the single-fault message from the `Err(restore_error)`
+    // arm of `restore_after_failed_activation` makes the second assertion fail.
+    #[test]
+    fn a_restore_that_fails_too_names_both_failures_and_how_to_recover() -> Result<()> {
+        let (root, paths) = test_paths("activation-snapshot-double-fault");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let snapshot = ActivationSnapshot::capture(&paths, &config);
+        assert!(
+            matches!(snapshot.marker, MarkerSnapshot::Contents(_)),
+            "only a captured marker is written back, which is the restore that can fail"
+        );
+        // Stand in for a half-applied activation: the config moved on, in memory
+        // and on disk.
+        config.default_runtime_id = Some("therock-release:gfx1100".to_owned());
+        config.active_runtime_key = Some(NEW_RUNTIME_KEY.to_owned());
+        config.previous_runtime_key = Some(OLD_RUNTIME_KEY.to_owned());
+        config.save(&paths)?;
+        let marker_parent = active_runtime_marker_path(&paths)
+            .parent()
+            .context("active runtime marker path has no parent directory")?
+            .to_path_buf();
+        fs::remove_dir_all(&marker_parent)?;
+        fs::write(&marker_parent, b"not a directory")?;
+
+        let error = restore_after_failed_activation(
+            &paths,
+            &mut config,
+            snapshot,
+            anyhow::anyhow!("marker write failed"),
+        );
+        let rendered = format!("{error:#}");
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            rendered.contains("marker write failed"),
+            "the failure that started the rollback must survive:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("restoring the previous state failed too"),
+            "a restore that failed must not be reported as one that worked:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("rocm runtimes list"),
+            "the user needs the command that shows the disagreeing state:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("the previously active runtime is still the active one"),
+            "that sentence is only true when the restore worked:\n{rendered}"
+        );
+        assert_eq!(
+            config.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the in-memory config is put back before anything that can fail"
+        );
+        assert_eq!(config.previous_runtime_key, None);
+        assert_eq!(
+            persisted.active_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the config half of the restore still happened"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reactivating_the_active_runtime_keeps_the_rollback_target() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-reactivate");
+        paths.ensure()?;
+        let mut config = activate_old_runtime(&paths)?;
+        let switched = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        assert_eq!(
+            switched.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+
+        // The report's own advice: re-activate the runtime that is already
+        // active, with `--restart-services --yes`, to move the servers left
+        // behind without moving the runtime. That note prints one line above
+        // `ROLLBACK_RECOVERY_HINT`, so a no-op activation that discarded the
+        // rollback target would break the very next thing the user is told.
+        let reactivated = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        let marker: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        // Proves the retained target is usable, not merely recorded.
+        let rolled_back = rollback_runtime(&paths, &mut config)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(reactivated.runtime_key, NEW_RUNTIME_KEY);
+        assert_eq!(
+            reactivated.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "a switch that does not switch has no history to record and none \
+             to discard"
+        );
+        assert_eq!(
+            persisted.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        assert_eq!(
+            marker.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the marker carries the rollback target too, and is what the \
+             storage retention holds read"
+        );
+        assert!(
+            marker.previous_runtime_id.is_some(),
+            "the retained key resolves to a runtime that is still installed, \
+             so its runtime_id belongs in the marker beside it"
+        );
+        assert_eq!(
+            rolled_back.runtime_key, OLD_RUNTIME_KEY,
+            "rollback after a no-op activation must still reach the runtime \
+             the user last switched away from"
+        );
+        Ok(())
+    }
+
+    // The rollback target's runtime can be uninstalled while it is still the
+    // recorded target. Re-activating the active runtime then keeps the recorded
+    // key but cannot name an id for a runtime that is no longer registered. The
+    // two runtimes have different ids so that an id taken from the active
+    // runtime instead of the target is visible.
+    // Mutation: resolving `previous_runtime_id` from `current` rather than from
+    // `manifests` makes the marker carry the active runtime's id and fails the
+    // `previous_runtime_id` assertion; reporting `reactivated: false` for a
+    // re-activation fails the `reactivated.reactivated` assertion.
+    #[test]
+    fn reactivating_after_the_rollback_target_was_uninstalled_records_no_id_for_it() -> Result<()> {
+        let (root, paths) = test_paths("runtime-activation-reactivate-uninstalled-target");
+        paths.ensure()?;
+        write_test_pip_runtime(
+            &paths,
+            OLD_RUNTIME_KEY,
+            "therock-release:gfx120X-all-old",
+            "7.12.0",
+            10,
+        )?;
+        let new_manifest = write_test_pip_runtime(
+            &paths,
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all-new",
+            "7.13.0",
+            20,
+        )?;
+        let mut config = RocmCliConfig::default();
+        activate_runtime(&paths, &mut config, OLD_RUNTIME_KEY)?;
+        let switched = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+        fs::remove_file(runtime_manifest_path(&paths, OLD_RUNTIME_KEY))?;
+
+        let reactivated = activate_runtime(&paths, &mut config, NEW_RUNTIME_KEY)?;
+
+        let marker: ActiveRuntimeMarker =
+            serde_json::from_slice(&fs::read(active_runtime_marker_path(&paths))?)?;
+        let persisted = RocmCliConfig::load(&paths)?;
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            !switched.reactivated,
+            "moving between two runtimes is a switch"
+        );
+        assert!(
+            reactivated.reactivated,
+            "asking for the runtime that is already active switches nothing"
+        );
+        assert_eq!(marker.runtime_key, NEW_RUNTIME_KEY);
+        assert_eq!(
+            marker.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY),
+            "the recorded rollback target is kept as the key it was recorded under"
+        );
+        assert_eq!(
+            marker.previous_runtime_id, None,
+            "no registered runtime has that key any more, so there is no id to \
+             record for it; the active runtime's id `{}` is not the target's",
+            new_manifest.runtime_id
+        );
+        assert_eq!(
+            persisted.previous_runtime_key.as_deref(),
+            Some(OLD_RUNTIME_KEY)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_activation_report_says_unchanged_only_when_nothing_was_switched() {
+        let result = |reactivated: bool, previous: Option<&str>| RuntimeActivationResult {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            runtime_key: NEW_RUNTIME_KEY.to_owned(),
+            previous_runtime_key: previous.map(ToOwned::to_owned),
+            reactivated,
+            services: runtime_services::RuntimeServiceReconciliation::default(),
+        };
+        let reactivated_with_target = result(true, Some(OLD_RUNTIME_KEY));
+        let switched = result(false, Some(OLD_RUNTIME_KEY));
+        let first_activation = result(false, None);
+
+        // Mutation: dropping the `reactivated` branch of
+        // `changed_from_runtime_key_text` fails this first assertion.
+        assert_eq!(
+            changed_from_runtime_key_text(&reactivated_with_target),
+            "<unchanged>",
+            "naming the retained rollback target would claim the user just came from it"
+        );
+        assert_eq!(changed_from_runtime_key_text(&switched), OLD_RUNTIME_KEY);
+        assert_eq!(changed_from_runtime_key_text(&first_activation), "<unset>");
     }
 
     #[test]
@@ -32239,6 +32548,7 @@ install therock";
             install_root: PathBuf::from("/tmp/does-not-need-to-exist"),
             family: "gfx94X-dcgpu".to_owned(),
             previous_runtime_key: None,
+            services: runtime_services::RuntimeServiceReconciliation::default(),
         }
     }
 
@@ -32256,6 +32566,43 @@ install therock";
             |_, _| outcome,
         );
         (result, finalized)
+    }
+
+    #[test]
+    fn render_sdk_install_success_includes_service_reconciliation_section() {
+        // Verify that the reconciliation section is printed even when no services
+        // are stale, so callers can distinguish "looked and found nothing" from
+        // "never looked" — the same guarantee `runtimes activate` provides.
+        // A previous runtime is recorded, so the rollback hint is printed too and
+        // the ordering below has two things to order.
+        let finalized = SdkInstallFinalization {
+            previous_runtime_key: Some("wheel-gfx942-7.12.0".to_owned()),
+            ..sdk_install_finalization()
+        };
+        let rendered = render_sdk_install_success(&finalized);
+        assert!(
+            rendered.contains("services_on_previous_runtime:"),
+            "`render_sdk_install_success` must include the reconciliation section \
+             so the install report is consistent with `runtimes activate`:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "with no live services the count must be 0:\n{rendered}"
+        );
+        // The reconciliation must appear before any rollback hint, matching the
+        // ordering the `runtimes activate` handler uses.
+        // Mutation: printing the hint before the reconciliation section fails the
+        // position comparison; dropping the hint fails the `expect`.
+        let recon_pos = rendered
+            .find("services_on_previous_runtime:")
+            .expect("the reconciliation section is printed");
+        let rollback_pos = rendered
+            .find("rocm runtimes rollback")
+            .expect("a recorded previous runtime prints the rollback hint");
+        assert!(
+            recon_pos < rollback_pos,
+            "reconciliation section must precede the rollback hint:\n{rendered}"
+        );
     }
 
     #[test]
@@ -33963,9 +34310,19 @@ install therock";
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: Some("release-wheel-gfx942-old".to_owned()),
+            reactivated: false,
+            // No live services: this test is about the rollback hint, and an
+            // empty reconciliation is what an update on a machine with nothing
+            // serving produces.
+            services: runtime_services::RuntimeServiceReconciliation::default(),
         };
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &with_previous);
+        assert!(
+            rendered.contains("services_on_previous_runtime: 0"),
+            "the update summary reports service state the same way `runtimes \
+             activate` does, including when there is none:\n{rendered}"
+        );
         assert!(
             rendered.contains("next step: if this causes problems, run `rocm runtimes rollback`"),
             "a previous runtime is recorded, so rollback is a valid recovery path:\n{rendered}"
@@ -33979,6 +34336,8 @@ install therock";
             runtime_id: "therock-release:gfx942".to_owned(),
             runtime_key: "release-wheel-gfx942".to_owned(),
             previous_runtime_key: None,
+            reactivated: false,
+            services: runtime_services::RuntimeServiceReconciliation::default(),
         };
         let mut rendered = String::new();
         append_update_activate_summary(&mut rendered, &without_previous);
@@ -34109,6 +34468,160 @@ install therock";
             devel: true,
             installed_at_unix_ms: 1,
         }
+    }
+
+    /// How `classify_service_runtime_state` sorts a record against the runtime
+    /// being activated when the manifest list is complete: a server already on
+    /// that runtime matches, the same record is stale once a different runtime
+    /// is activated, a family id shared by two installs is reported rather than
+    /// guessed, one that resolves to a single install matches that install, and
+    /// a record naming no runtime is unknown.
+    ///
+    /// It does not isolate the exact-key fast path: `runtime_manifest_for_selector`
+    /// resolves an exact key too, so every exact-key assertion here still holds
+    /// without that arm. `a_record_naming_the_active_runtime_matches_without_any_manifest_to_resolve_it`
+    /// covers it.
+    #[test]
+    fn classifying_a_service_against_the_runtime_it_already_runs_on() {
+        let (root, paths) = test_paths("classify-service-runtime-state");
+        paths.ensure().unwrap();
+        let manifests = vec![
+            test_runtime_manifest_for_update(
+                OLD_RUNTIME_KEY,
+                "therock-release:gfx120X-all",
+                "gfx120X-all",
+                "7.12.0",
+            ),
+            test_runtime_manifest_for_update(
+                NEW_RUNTIME_KEY,
+                "therock-release:gfx120X-all",
+                "gfx120X-all",
+                "7.13.0",
+            ),
+        ];
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-classify",
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            9,
+            "managed",
+            1,
+            None,
+            None,
+            None,
+        );
+
+        record.runtime_id = Some(OLD_RUNTIME_KEY.to_owned());
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &manifests, OLD_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Matches,
+            "a server already on the runtime being activated is not left behind"
+        );
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &manifests, NEW_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: OLD_RUNTIME_KEY.to_owned()
+            },
+            "activating past it makes the same record stale"
+        );
+
+        // A family id both installed versions share resolves to neither, so it
+        // stays Stale rather than silently matching one of them.
+        record.runtime_id = Some("therock-release:gfx120X-all".to_owned());
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &manifests, OLD_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: "therock-release:gfx120X-all".to_owned()
+            },
+            "an ambiguous family id is reported rather than assumed correct"
+        );
+
+        // The family-resolution arm itself, which the ambiguous case above does
+        // not reach: one install carrying the family id resolves to it, and a
+        // server already on the runtime being activated must not be reported as
+        // left behind — `--restart-services` would otherwise stop and respawn it
+        // for nothing.
+        let one_install_of_the_family = vec![test_runtime_manifest_for_update(
+            NEW_RUNTIME_KEY,
+            "therock-release:gfx120X-all",
+            "gfx120X-all",
+            "7.13.0",
+        )];
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(
+                &record,
+                &one_install_of_the_family,
+                NEW_RUNTIME_KEY
+            ),
+            runtime_services::ServiceRuntimeState::Matches,
+            "an unambiguous family id resolves to the install that carries it"
+        );
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(
+                &record,
+                &one_install_of_the_family,
+                OLD_RUNTIME_KEY
+            ),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: "therock-release:gfx120X-all".to_owned()
+            },
+            "resolving is not excusing: the same family id is stale against a \
+             runtime it does not resolve to"
+        );
+
+        record.runtime_id = None;
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &manifests, OLD_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Unknown,
+            "a record naming no runtime says nothing about which one it loaded"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // The exact-key arm of `classify_service_runtime_state` answers from the
+    // record alone, so it still holds for a caller whose manifest list does not
+    // contain the key. With the full list the arm cannot be told apart from the
+    // resolution below it, because that resolves an exact key too; an empty list
+    // is where it is the only thing that can say `Matches`.
+    // Mutation: deleting the `Some(recorded) if recorded == runtime_key` arm
+    // makes the `Matches` assertion fail, since nothing is left to resolve the
+    // key.
+    #[test]
+    fn a_record_naming_the_active_runtime_matches_without_any_manifest_to_resolve_it() {
+        let (_root, paths) = test_paths("classify-service-runtime-state-no-manifests");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-classify-empty",
+            "vllm",
+            "model-ref",
+            "canonical/model",
+            "127.0.0.1",
+            9,
+            "managed",
+            1,
+            Some(NEW_RUNTIME_KEY.to_owned()),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &[], NEW_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Matches,
+            "a record that names the runtime being activated needs no manifest to say so"
+        );
+
+        record.runtime_id = Some(OLD_RUNTIME_KEY.to_owned());
+        assert_eq!(
+            runtime_services::classify_service_runtime_state(&record, &[], NEW_RUNTIME_KEY),
+            runtime_services::ServiceRuntimeState::Stale {
+                recorded: OLD_RUNTIME_KEY.to_owned()
+            },
+            "a different recorded runtime is stale however short the manifest list is"
+        );
     }
 
     #[cfg(unix)]
@@ -34253,120 +34766,6 @@ install therock";
     #[test]
     fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
         crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
-    }
-
-    /// Build an `AutomationRuntimeState` for the no-double-spawn guard tests.
-    fn runtime_state(running: bool, daemon_pid: u32) -> AutomationRuntimeState {
-        AutomationRuntimeState {
-            running,
-            automations_enabled: true,
-            daemon_pid,
-            started_at_unix_ms: 1,
-            last_tick_unix_ms: 1,
-            local_webhook_endpoint: None,
-            active_watchers: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn background_helper_already_running_true_for_live_pid() {
-        // Phase-10 daemon no-double-spawn: a runtime-state.json with running=true
-        // and a LIVE daemon_pid (this very test process) means the helper is
-        // already up — the "should spawn?" decision must say NO (true ⇒ skip).
-        // Hermetic + offline: no spawn, just the file-based liveness check.
-        let (root, paths) = test_paths("helper-live-pid");
-        runtime_state(true, std::process::id())
-            .write(&paths)
-            .expect("write runtime state");
-        assert!(
-            background_helper_already_running(&paths).expect("liveness check ok"),
-            "live recorded pid + running=true ⇒ do not spawn a second daemon"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn background_helper_already_running_false_for_dead_or_missing() {
-        // The inverse guard cases — each must report NOT running (false ⇒ spawn):
-        // (1) no state file at all, (2) running=true but a dead/zero pid,
-        // (3) a live pid but running=false. None must spawn from this decision.
-        let (root, paths) = test_paths("helper-dead-or-missing");
-        // (1) No state file yet.
-        assert!(
-            !background_helper_already_running(&paths).expect("missing state ⇒ ok"),
-            "no runtime state ⇒ not running"
-        );
-        // (2) running=true but pid 0 is never a live process.
-        runtime_state(true, 0).write(&paths).expect("write state");
-        assert!(
-            !background_helper_already_running(&paths).expect("dead pid ⇒ ok"),
-            "running=true + dead pid ⇒ not running (spawn)"
-        );
-        // (3) live pid but running flag is false.
-        runtime_state(false, std::process::id())
-            .write(&paths)
-            .expect("write state");
-        assert!(
-            !background_helper_already_running(&paths).expect("not-running flag ⇒ ok"),
-            "running=false ⇒ not running even with a live pid"
-        );
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn autostart_spawn_in_flight_defers_only_for_a_live_recent_claim() {
-        let claim = AutostartClaim {
-            daemon_pid: 4242,
-            spawned_at_ms: 1_000,
-        };
-        // A recent claim whose PID is still alive ⇒ a spawn is in flight, defer.
-        assert!(autostart_spawn_in_flight(
-            Some(claim),
-            1_000 + 5_000,
-            AUTOSTART_CLAIM_TTL_MS,
-            |_| true,
-        ));
-        // Same claim but the child PID is gone (crashed spawn) ⇒ respawn.
-        assert!(!autostart_spawn_in_flight(
-            Some(claim),
-            1_000 + 5_000,
-            AUTOSTART_CLAIM_TTL_MS,
-            |_| false,
-        ));
-        // Older than the TTL, even with a live PID (possible PID reuse) ⇒ respawn.
-        assert!(!autostart_spawn_in_flight(
-            Some(claim),
-            1_000 + AUTOSTART_CLAIM_TTL_MS,
-            AUTOSTART_CLAIM_TTL_MS,
-            |_| true,
-        ));
-        // No claim at all ⇒ nothing in flight, spawn.
-        assert!(!autostart_spawn_in_flight(
-            None,
-            1_000,
-            AUTOSTART_CLAIM_TTL_MS,
-            |_| true,
-        ));
-    }
-
-    #[test]
-    fn autostart_claim_round_trips_and_absent_or_garbage_reads_as_none() {
-        let (root, paths) = test_paths("autostart-claim-roundtrip");
-        let path = paths.automation_autostart_claim_path();
-        fs::create_dir_all(path.parent().expect("claim parent")).expect("mkdir claim dir");
-        // Absent file ⇒ no claim.
-        assert_eq!(read_autostart_claim(&path), None);
-        // Round-trip a written claim.
-        let claim = AutostartClaim {
-            daemon_pid: 9987,
-            spawned_at_ms: 1_726_000_000_123,
-        };
-        write_autostart_claim(&path, claim).expect("write claim");
-        assert_eq!(read_autostart_claim(&path), Some(claim));
-        // Garbage / partial content ⇒ no claim (permits a respawn, never panics).
-        fs::write(&path, "not-a-pid").expect("write garbage");
-        assert_eq!(read_autostart_claim(&path), None);
-        let _ = fs::remove_dir_all(&root);
     }
 
     // ---- Phase 9: reroute dispatch (bare `rocm` + interactive `rocm chat`) ----

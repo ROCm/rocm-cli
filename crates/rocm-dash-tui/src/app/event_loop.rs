@@ -36,11 +36,11 @@ use super::chat::{
     self, StartupChatOutcome, build_chat_agent, build_local_agent, detect_local_chat,
     discover_configured_chat_model, persist_chat_endpoint, startup_chat_outcome,
 };
-use super::scrollbar::{PaneFocus, resolve_mouse};
+use super::scrollbar::resolve_mouse;
 use super::summary::{parse_plan_result, summarize_slash_tool};
 use super::types::{
-    ChatKeyCtx, ChatProvider, ChatTurn, ConnState, Focus, NO_CHAT_BACKEND_MSG, ReplayState,
-    ResolvedArgs, UpdateStatus,
+    ChatKeyCtx, ChatProvider, ChatTurn, ConnState, Focus, NO_CHAT_BACKEND_MSG, PaneFocus,
+    ReplayState, ResolvedArgs, UpdateStatus,
 };
 use super::{AppState, ProviderSwitch};
 
@@ -1587,11 +1587,7 @@ async fn event_loop(terminal: &mut Tui, args: &ResolvedArgs) -> color_eyre::Resu
 mod tests {
     use super::*;
 
-    use super::super::test_support::press;
-
-    fn st() -> AppState {
-        AppState::new("t".into(), "default-dark".into())
-    }
+    use super::super::test_support::{press, st};
 
     /// Serialises every test that touches the process-global signal machinery.
     ///

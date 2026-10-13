@@ -11,19 +11,15 @@
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
 //!
-//! Several `serve()`-only helpers stay in `main.rs`, for two different
-//! reasons. The managed-service-spawning tail (`start_managed_service` and
-//! `run_attached_service`, re-imported here; `spawn_managed_engine_child`,
-//! called only from `main.rs` itself) is entangled with other still-
-//! crate-root launch helpers (`stream_attached_logs`, `record_cli_audit_event`,
-//! and friends) that have not been relocated yet, so moving it alone would
-//! just relocate the `use` statements, not reduce the coupling. `collect_serve_notes`,
-//! `validate_bind_host`, `resolve_endpoint_auth`,
-//! `ensure_public_bind_engine_supported`, `validate_pinned_gpu_index`, and
-//! `print_managed_launch_plain` have no such entanglement and no non-test
-//! caller left in `main.rs` — they stayed to keep this extraction a minimal,
-//! easy-to-review diff rather than a mixed move-and-reshuffle pass; a later
-//! pass can relocate them along with their test module.
+//! `collect_serve_notes` and `validate_pinned_gpu_index` stay in `main.rs`
+//! (no entanglement; a later pass can relocate them). The
+//! managed-service-spawning tail this file calls into — `start_managed_service`,
+//! `run_attached_service`, `resolve_endpoint_auth`,
+//! `ensure_public_bind_engine_supported`,
+//! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
+//! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
+//! to `service_launch.rs` in ROCMAI-91 (Phase 6b), along with its test module;
+//! this file's `use` list below points there now instead of at the crate root.
 
 use std::fmt::Write as _;
 
@@ -43,16 +39,18 @@ use crate::DevicePolicyArg;
 use crate::endpoint_keys;
 use crate::engines_cmd::{engine_manages_own_runtime, ensure_self_managed_engine_ready};
 use crate::serve_summary;
+use crate::service_launch::{
+    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch,
+    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    print_managed_launch_plain, resolve_endpoint_auth, run_attached_service, start_managed_service,
+    validate_bind_host,
+};
 use crate::{
     EngineSelection, any_live_managed_service_for_model, append_oom_serve_note, cli_progress,
-    collect_serve_notes, detect_gpu_count, device_policy_name,
-    drop_orphaned_endpoint_key_on_already_running, e2e_simulate_oom_launch, engine_request,
-    ensure_background_helper_running_quiet, ensure_public_bind_engine_supported,
+    collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
     existing_live_managed_service, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
-    print_managed_launch_plain, resolve_endpoint_auth, resolve_engine_selection,
-    run_attached_service, select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
-    start_managed_service, validate_bind_host, validate_engine_selection_runtime,
-    validate_pinned_gpu_index,
+    resolve_engine_selection, select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
+    validate_engine_selection_runtime, validate_pinned_gpu_index,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1076,7 +1074,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 notes,
             };
             // Same intentional one-time key display as `print_managed_launch_plain`
-            // in main.rs; see its rationale for why the tag below is currently inert.
+            // in service_launch.rs; see its rationale for why the tag below is currently inert.
             // codeql[rust/cleartext-logging]
             print!("{}", serve_summary::render_summary(&summary));
         } else {

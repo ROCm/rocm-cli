@@ -85,8 +85,14 @@ pub struct Gpu {
 }
 
 /// Stat of a device node such as `/dev/kfd` or `/dev/dri/renderD*`.
+///
+/// `path` is always the logical host path (`/dev/kfd`), as `rocm examine
+/// --json` reports it. When a test build re-roots hardware probes (see
+/// [`crate::host_path`]), the node is read under that root, but the root never
+/// appears here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
+    /// The logical host path of the node, never the re-rooted one.
     pub path: String,
     pub exists: bool,
     pub mode: String,
@@ -2813,7 +2819,7 @@ fn probe_shared_memory_at(e: &mut Examination, path: &str) {
 /// keep distinct from zero: a machine that could not be measured is not a
 /// machine with no space.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in process.rs
 fn filesystem_size(path: &str) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
@@ -4394,7 +4400,7 @@ mod tests {
     /// runtime.
     #[cfg(unix)]
     fn plant_fake_runtime_interpreter(label: &str) -> (std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
             "rocm-core-examine-{label}-{}",
@@ -4403,8 +4409,7 @@ mod tests {
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let python = root.join("python");
-        std::fs::write(
-            &python,
+        write_fake_executable(&python,
             format!(
                 "#!/bin/sh\n\
                  case \"${env}\" in\n\
@@ -4418,8 +4423,6 @@ mod tests {
             ),
         )
         .expect("plant the fake interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the fake interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,
@@ -4504,7 +4507,7 @@ mod tests {
     fn plant_loader_path_recording_interpreter(
         label: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
             "rocm-core-examine-{label}-{}",
@@ -4514,7 +4517,7 @@ mod tests {
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let recorded = root.join("loader-path");
         let python = root.join("python");
-        std::fs::write(
+        write_fake_executable(
             &python,
             format!(
                 "#!/bin/sh\n\
@@ -4526,8 +4529,6 @@ mod tests {
             ),
         )
         .expect("plant the recording interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the recording interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,

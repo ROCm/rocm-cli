@@ -207,7 +207,7 @@ pub fn terminate_verified(
     // For a tree this binds each descendant PID to its own start-time, so a PID
     // recycled during the wait is never mistaken for a survivor.
     let members: Vec<ProcessIdentity> = if tree {
-        crate::process_tree_pids(id.pid)
+        crate::process::process_tree_pids(id.pid)
             .into_iter()
             .map(ProcessIdentity::capture)
             .collect()
@@ -289,7 +289,7 @@ fn send_signal(pid: u32, signal: Signal, tree: bool) -> bool {
         Signal::Term => libc::SIGTERM,
         Signal::Kill => libc::SIGKILL,
     };
-    crate::signal_process_scope(pid, raw, tree)
+    crate::process::signal_process_scope(pid, raw, tree)
 }
 
 #[cfg(windows)]

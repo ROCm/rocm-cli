@@ -319,7 +319,7 @@ Feature: Model serving
     Then the summary reflects the reused already-running service
     And the deployment summary does not blame this invocation for GPU memory
 
-  # Positive counterpart of Scenario 23 (EAI-8059 review asked for both): when
+  # Positive counterpart of serve-24 (EAI-8059 review asked for both): when
   # THIS invocation launches a managed vLLM serve that OOMs and never becomes
   # ready, the summary MUST name the memory knobs. A real launch cannot run on a
   # GPU-less host, so the mock lane build compiles in a test-only fault-injection
@@ -350,7 +350,7 @@ Feature: Model serving
   # and therefore the one whose preparation is user-visible; the planted record
   # names lemonade too, so the engine matches and the MODEL is the only thing
   # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
-  # no service planted at all, and scenario 23 plants the SAME model, so neither
+  # no service planted at all, and serve-24 plants the SAME model, so neither
   # discriminates the model keying — this one does.
   @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
   Scenario: serve-26 - A live service for another model does not soften the no-GPU refusal
@@ -359,3 +359,29 @@ Feature: Model serving
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
     And no engine was prepared for GPU serving
+
+  # `--require-api-key` reuse refusal (#604). A running server's key is read once
+  # at launch; reuse cannot retroactively satisfy a demand for auth the server
+  # never got, so the idempotency guard refuses instead of upgrading the record
+  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
+  # local-side proof that the printed stop hint is not just present but correct
+  # and directly runnable: the scenario stops the service with it and checks the
+  # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
+  # running-service` gives the summary's own hint. The idempotency match is keyed
+  # on (engine, canonical model id) only — not a real listening port or process —
+  # so a planted record is enough; no actual Lemonade load is needed. Runs on the
+  # Lemonade GPU lane because `--managed` serve still refuses before reaching
+  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
+  # bind, and the serve path's `ensure_public_bind_engine_supported` guard
+  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
+  # for Lemonade on Windows (its server can't receive the key through the
+  # Windows detached-spawn primitive), so this scenario cannot reach the
+  # refusal it exercises there.
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-27 - Reusing a running server without a key refuses a --require-api-key request
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again with --require-api-key
+    Then the CLI refuses and names the exact command to stop the existing service
+    And running that command actually stops the service

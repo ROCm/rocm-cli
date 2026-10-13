@@ -1401,7 +1401,7 @@ esac
         fixture: &str,
         env: &[(&str, &str)],
     ) -> (i32, String) {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let fixture_path = dir.path().join("smi.txt");
@@ -1409,9 +1409,7 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_fake_executable(&stub, SMI_STUB).expect("write rocm-smi stub");
         // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
         // run from a directory that has one.
         std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
@@ -1497,7 +1495,7 @@ esac
     /// GitHub's Ubuntu images, so this normally runs rather than skips.
     #[cfg(unix)]
     fn run_preflight_pwsh(script: &str, fixture: &str, env: &[(&str, &str)]) -> (i32, String) {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
         let fixture_path = dir.path().join("smi.txt");
@@ -1505,9 +1503,7 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        std::fs::write(&stub, SMI_STUB).expect("write rocm-smi stub");
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("make the stub executable");
+        write_fake_executable(&stub, SMI_STUB).expect("write rocm-smi stub");
 
         let path = format!(
             "{}:{}",

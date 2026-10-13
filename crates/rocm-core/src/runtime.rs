@@ -204,6 +204,15 @@ pub(crate) fn env_path_override(name: &str) -> Option<PathBuf> {
         .filter(|path| !path.as_os_str().is_empty())
 }
 
+pub(crate) fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 pub(crate) fn home_rocm_dir() -> Option<PathBuf> {
     runtime_home_dir().map(|dir| dir.join(".rocm"))
 }
