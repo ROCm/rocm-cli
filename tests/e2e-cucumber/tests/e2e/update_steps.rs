@@ -2,12 +2,18 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm update` (report only). Run with NO managed runtimes so the
-//! report needs no network (with a runtime present, `update` reaches the TheRock
-//! index to resolve the latest version). The report's update-feed status block is
+//! Steps for `rocm update` (report only). Mock lane.
+//!
+//! update-01 to update-06 run with NO managed runtimes so the report needs no
+//! network (with a runtime present, `update` reaches the TheRock index to
+//! resolve the latest version). The report's update-feed status block is
 //! host-invariant and is what pins the "distinguishes configured from
 //! not-configured feeds" behaviour. Contracts verified against the running Linux
-//! binary (EAI-8072). Mock lane.
+//! binary (EAI-8072).
+//!
+//! update-07 and update-08 do plant managed runtimes, and serve the TheRock
+//! catalog they resolve against from a loopback server, so they stay off the
+//! network too.
 
 use cucumber::{given, then, when};
 use e2e_cucumber::loopback_http::LoopbackServer;

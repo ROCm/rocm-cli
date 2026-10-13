@@ -1251,15 +1251,24 @@ cargo test -p rocm --bin rocm version_proptests
 cargo xtask e2e -- -n 'update-0[78]'
 ```
 
-Which runtime build `rocm install sdk` resolves to, and whether `rocm update`
-offers one, both follow one PEP 440 order over published version strings
-(`7.9` < `7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`,
-`7.2.4.70204` above `7.2.4`). The property tests check that it is a total
-order, that picks do not depend on the order the index lists versions in, and
-that the update verdict points the same way as the order. Two spellings of one
-version (`7.0.0-rc1` and `7.0.0rc1`) are never an update. `generator_reach_report`
-prints how often each hard case is generated (run it with `-- --nocapture`), and
-fails if the generator stops reaching them.
+Where `rocm install sdk` and `rocm update` compare runtime versions, they
+compare them in one PEP 440 order over published version strings (`7.9` <
+`7.10.0`, `7.0.0b1` < `7.0.0rc1` < `7.0.0` < `7.0.0.post1`, `7.2.4.70204` above
+`7.2.4`). That covers picking the newest ROCm version from a wheel index,
+breaking ties between tarball builds uploaded at the same time, and the
+update-or-not verdict. It does not decide everything on its own: tarball builds
+are picked by upload time first, and on the release channel only a stable
+version in the strict `X.Y.Z` shape is a candidate at all, so a four-component
+release such as `7.2.4.70204` is never picked there. The property tests check
+that the order is total, that picks do not depend on the order the index lists
+versions in, and that the update verdict points the same way as the order. Two
+spellings of one version (`7.0.0-rc1` and `7.0.0rc1`) are not offered as an
+update for a tarball runtime; a wheel runtime for an exact device target,
+installed under one spelling, can still report `repair_available` against an
+index that publishes the other,
+because its runtime key and package specs carry the index's spelling.
+`generator_reach_report` prints how often each hard case is generated (run it
+with `-- --nocapture`), and fails if the generator stops reaching them.
 
 Model recipe engine metadata checks:
 
