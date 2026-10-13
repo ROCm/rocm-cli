@@ -1453,12 +1453,19 @@ and the distro name it prints
 `sh` source the file and reports what it assigned.
 
 A line that is not a plain assignment makes the whole file unreadable, and
-each reader names that line instead of reporting an unknown distro:
+each reader names that line instead of reporting an unknown distro. Where the
+message asks for a fix, it also says what to change on the line: LF line
+endings, single quotes around the value, or a `NAME=value` line in place of
+anything else.
 
 - `rocm install driver`: policy `unreadable_os_release`, no commands, and a
   reason naming the line.
-- The OpenMPI, libatomic and libnuma installs and hints: no commands, and the
-  line ahead of the manual-install advice.
+- The OpenMPI, libatomic and libnuma installs: no commands, and the line ahead
+  of the manual-install advice in the plan's reason.
+- The hints naming those installs in vLLM's warnings and errors: the line
+  after the manual-install advice, and no offer of `rocm engines install vllm
+  --yes`, which would plan nothing. That command is offered only when its plan
+  has commands, so it is not offered for an unknown distribution either.
 - `rocm examine`: `distro: Linux (/etc/os-release line N is not a plain
   assignment: "…")`; with `--json`, also an empty `distro_id` and
   `distro_version`, the same line in `probe_failures`, and `status: degraded`
@@ -1471,9 +1478,13 @@ cargo test -p rocm-core --lib os_release
 cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
 cargo test -p rocm-core --lib openmpi::tests
 cargo test -p rocm --bin rocm os_release
+cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root
 ```
 
-The parser tests that compare against `/bin/sh` itself are Linux-only.
+The parser tests that compare against `/bin/sh` itself are Linux-only. The last
+command plants a file under the simulated host root and checks that both
+`rocm examine` reads answer from it through the shared parser; the feature it
+needs is enabled only by its own CI step.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios

@@ -851,7 +851,8 @@ fn build_driver_install_plan(
                 repo_version,
                 reason: format!(
                     "/etc/os-release {unreadable}; no driver commands were planned \
-                     because the distro cannot be read."
+                     because the distro cannot be read. To fix it, {}.",
+                    unreadable.fix()
                 ),
                 preflight_checks: Vec::new(),
                 commands: Vec::new(),
@@ -1833,7 +1834,8 @@ mod tests {
         assert_eq!(
             plan.reason,
             "/etc/os-release line 4 is not a plain assignment: \"unset ID\"; no driver \
-             commands were planned because the distro cannot be read."
+             commands were planned because the distro cannot be read. To fix it, remove \
+             that line or rewrite it as NAME=value."
         );
         assert!(!plan.supported);
         assert!(plan.commands.is_empty(), "{:?}", plan.commands);

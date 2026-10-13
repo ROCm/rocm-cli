@@ -58,10 +58,10 @@
 //! an ordinary character, as it is to `sh`.
 //!
 //! What `None` means downstream: never a plan for a distro the file does not
-//! declare. A caller that reports on the file reads it through [`parse`] or
+//! declare. Every caller reads the file through [`parse`] or
 //! [`id_and_id_like`], so an unreadable file is reported by the line that made
-//! it so rather than as an unsupported distro; [`field`] is for a caller that
-//! only needs the value.
+//! it so rather than as an unsupported distro, and [`UnreadableLine::fix`]
+//! says what to change on that line.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -74,12 +74,61 @@ pub struct UnreadableLine {
     pub number: usize,
     /// The line as written, cut to [`UnreadableLine::SHOWN_CHARS`] characters.
     pub text: String,
+    /// What to change, judged from the whole line rather than the cut `text`.
+    fix: Fix,
 }
 
 impl UnreadableLine {
     /// How much of the offending line is kept: enough to recognise it, not so
     /// much that one bad line floods a report.
     pub const SHOWN_CHARS: usize = 120;
+
+    /// What to change on the line so the file reads, for a message that asks
+    /// the user to fix it.
+    #[must_use]
+    pub const fn fix(&self) -> Fix {
+        self.fix
+    }
+}
+
+/// What makes an unreadable line readable, by what is wrong with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fix {
+    /// A control character, which is what a CRLF file trips: `sh` would keep
+    /// the `\r` as part of the value.
+    LineEndings,
+    /// A valid name and `=`, but a value `sh` would not assign as written.
+    /// Single quotes take everything up to the next `'` literally.
+    QuoteValue,
+    /// Not an assignment at all: a command, or a name `sh` does not accept.
+    Rewrite,
+}
+
+impl Fix {
+    fn of(line: &str) -> Self {
+        if line.chars().any(|ch| ch.is_control() && ch != '\t') {
+            Self::LineEndings
+        } else if line
+            .trim_start_matches([' ', '\t'])
+            .split_once('=')
+            .is_some_and(|(name, _)| is_shell_name(name))
+        {
+            Self::QuoteValue
+        } else {
+            Self::Rewrite
+        }
+    }
+}
+
+/// An imperative clause, to follow "to fix it, ".
+impl fmt::Display for Fix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LineEndings => "save the file with LF line endings and no control characters",
+            Self::QuoteValue => "put that line's value in single quotes",
+            Self::Rewrite => "remove that line or rewrite it as NAME=value",
+        })
+    }
 }
 
 /// `line N is not a plain assignment: "<text>"` — the text `Debug`-quoted, so
@@ -114,15 +163,6 @@ pub fn id_and_id_like(text: &str) -> Result<(String, String), UnreadableLine> {
     ))
 }
 
-/// The value of `key` in os-release `text`, as `sh` would assign it, or `None`.
-///
-/// `None` when the key is absent, or when the file is unreadable — see
-/// [`parse`] for which line made it so.
-#[must_use]
-pub fn field(text: &str, key: &str) -> Option<String> {
-    parse(text).ok()?.remove(key)
-}
-
 /// Every assignment in `text`, the last of each name winning — or the first
 /// line that is not a blank, a comment or a plain assignment.
 ///
@@ -141,6 +181,7 @@ pub fn parse(text: &str) -> Result<HashMap<String, String>, UnreadableLine> {
         let unreadable = || UnreadableLine {
             number: index + 1,
             text: raw_line.chars().take(UnreadableLine::SHOWN_CHARS).collect(),
+            fix: Fix::of(raw_line),
         };
         let line = raw_line.trim_start_matches([' ', '\t']);
         if line.is_empty() || line.starts_with('#') {
@@ -241,6 +282,14 @@ fn decode(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The value of `key` in os-release `text`, as `sh` would assign it, or
+    /// `None` — when the key is absent, or when the file is unreadable. Only
+    /// the tests ask for one key at a time; production callers go through
+    /// [`parse`] or [`id_and_id_like`] so they can report the line.
+    fn field(text: &str, key: &str) -> Option<String> {
+        parse(text).ok()?.remove(key)
+    }
 
     #[test]
     fn reads_both_quote_styles_and_bare_values_alike() {
@@ -436,7 +485,8 @@ mod tests {
             unreadable,
             UnreadableLine {
                 number: 4,
-                text: "export ID=debian".to_owned()
+                text: "export ID=debian".to_owned(),
+                fix: Fix::Rewrite,
             }
         );
         assert_eq!(
@@ -454,6 +504,69 @@ mod tests {
         let long = format!("X={}", "a b".repeat(100));
         let cut = parse(&long).unwrap_err();
         assert_eq!(cut.text.chars().count(), UnreadableLine::SHOWN_CHARS);
+    }
+
+    /// `ID_LIKE` is a space-separated list, and the two values come back in
+    /// the order the name says: a package plan matches `ID` exactly and each
+    /// `ID_LIKE` word separately, so swapping them plans nothing for a
+    /// derivative whose `ID_LIKE` has more than one word.
+    #[test]
+    fn id_and_id_like_come_back_in_that_order() {
+        assert_eq!(
+            id_and_id_like("ID=rocky\nID_LIKE=\"rhel fedora\"\n"),
+            Ok(("rocky".to_owned(), "rhel fedora".to_owned()))
+        );
+        assert_eq!(
+            id_and_id_like("NAME=x\n"),
+            Ok((String::new(), String::new()))
+        );
+    }
+
+    /// Spaces and tabs may come before a comment as well as before a name;
+    /// `sh` skips them either way.
+    #[test]
+    fn an_indented_comment_is_a_comment() {
+        assert_eq!(
+            field(" \t# comment\nID=ubuntu\n", "ID").as_deref(),
+            Some("ubuntu")
+        );
+    }
+
+    /// The reported line is the line as written, indentation included, so it
+    /// matches what an editor shows on that line.
+    #[test]
+    fn an_indented_unreadable_line_keeps_its_indentation() {
+        let unreadable = parse("ID=ubuntu\n \tunset ID\n").unwrap_err();
+        assert_eq!(unreadable.number, 2);
+        assert_eq!(unreadable.text, " \tunset ID");
+    }
+
+    /// The fix offered matches what is wrong with the line, judged from the
+    /// whole line: a control character past the cut still asks for LF
+    /// endings, not for quotes that would not help.
+    #[test]
+    fn the_fix_offered_matches_what_is_wrong_with_the_line() {
+        for (text, fix) in [
+            ("ID=ubuntu\r\n", Fix::LineEndings),
+            ("ID='ub\u{1b}untu'\n", Fix::LineEndings),
+            ("ANSI_COLOR=0;31\n", Fix::QuoteValue),
+            ("NAME=Ubuntu Linux\n", Fix::QuoteValue),
+            ("  ID=$X\n", Fix::QuoteValue),
+            ("export ID=debian\n", Fix::Rewrite),
+            ("unset ID\n", Fix::Rewrite),
+            ("ID =x\n", Fix::Rewrite),
+            ("VERSION-ID=x\n", Fix::Rewrite),
+        ] {
+            assert_eq!(parse(text).unwrap_err().fix(), fix, "{text:?}");
+        }
+        let long = format!("X={}\r", "a".repeat(UnreadableLine::SHOWN_CHARS * 2));
+        let cut = parse(&long).unwrap_err();
+        assert!(!cut.text.contains('\r'), "the cut drops the \\r");
+        assert_eq!(cut.fix(), Fix::LineEndings);
+        assert_eq!(
+            Fix::QuoteValue.to_string(),
+            "put that line's value in single quotes"
+        );
     }
 
     /// Characters drawn from to build values: mostly the ones the encodings
