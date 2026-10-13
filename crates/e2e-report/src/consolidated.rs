@@ -1708,13 +1708,18 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_entry_points_delegate_through_from_reports() {
+    fn wrapper_and_from_reports_outputs_agree() {
         // ROCMAI-484: generate_consolidated/consolidated_summary_markdown now
         // delegate to the *_from_reports entry points via load_platform_reports.
-        // This is a delegation check only: it shows the two call shapes compose
-        // without diverging, not that `_from_reports` actually uses `reports`
-        // rather than re-deriving it from `inputs` — that behavior is covered by
-        // from_reports_entry_points_follow_reports_not_inputs instead.
+        // This shows the two call shapes give the same output; it cannot tell
+        // whether the wrappers actually delegate, since both sides call the
+        // same load_platform_reports and the same *_from_reports body — a
+        // wrapper that copied the old code inline would stay green here too.
+        // That `_from_reports` actually uses `reports` rather than re-deriving
+        // it from `inputs` is covered by
+        // from_reports_entry_points_follow_reports_not_inputs and
+        // from_reports_entry_points_render_reports_not_inputs_when_both_nonempty
+        // instead.
         let a = write_report(&feature_json(&[(&[], &["passed"]), (&[], &["passed"])]));
         let b = write_report(&feature_json(&[(&["expected-failure"], &["failed"])]));
         let inputs = vec![
@@ -1783,6 +1788,70 @@ mod tests {
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(html.contains("No per-platform report.json files were found to consolidate."));
         assert!(!html.contains("Per-platform Details"));
+    }
+
+    #[test]
+    fn from_reports_entry_points_render_reports_not_inputs_when_both_nonempty() {
+        // `inputs` and `reports` are both non-empty here, and built from two
+        // different fixtures: `inputs` is "e2e-report" (Mock, one passing
+        // scenario, no commands.jsonl); `reports` is "e2e-gpu-report" (MI300X,
+        // one failing scenario, with a `rocm serve` command recorded). If
+        // `*_from_reports` silently ignored `reports` and re-derived its own
+        // set from `inputs` (e.g. by calling load_platform_reports(inputs)
+        // itself), every assertion below would read "Mock"/pass/no-coverage
+        // instead of "MI300X"/fail/the recorded command.
+        let inputs_report = write_report(&feature_json(&[(&[], &["passed"])]));
+        let inputs = vec![("e2e-report".to_string(), inputs_report.path().to_path_buf())];
+
+        let reports_dir = tempfile::tempdir().expect("tempdir");
+        let reports_report = reports_dir.path().join("report.json");
+        std::fs::write(&reports_report, feature_json(&[(&[], &["failed"])])).expect("write report");
+        std::fs::write(
+            reports_dir.path().join("commands.jsonl"),
+            concat!(
+                r#"{"scenario":"s0","subcommand":"rocm serve Qwen --engine","command":"rocm serve Qwen --engine vllm","engine":"vllm","engine_is_default":false}"#,
+                "\n",
+            ),
+        )
+        .expect("write commands");
+        let reports = load_platform_reports(&[("e2e-gpu-report".to_string(), reports_report)]);
+
+        let md = consolidated_summary_markdown_from_reports(&reports, &inputs);
+        assert!(
+            md.contains("MI300X"),
+            "matrix row must follow reports:\n{md}"
+        );
+        assert!(
+            !md.contains("| Mock"),
+            "must not render inputs' platform:\n{md}"
+        );
+        assert!(
+            md.contains("rocm serve Qwen --engine vllm"),
+            "command coverage must follow reports' commands.jsonl:\n{md}"
+        );
+
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated_from_reports(&reports, &inputs, out.path(), &RunMeta::default())
+            .expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        assert!(
+            html.contains("<td>MI300X</td>"),
+            "matrix row must follow reports:\n{html}"
+        );
+        assert!(
+            !html.contains("<td>Mock</td>"),
+            "matrix must not render inputs' platform:\n{html}"
+        );
+        assert!(
+            html.contains("platform-name\">MI300X Linux</span>"),
+            "per-platform details must follow reports:\n{html}"
+        );
+        // Not a bare `!html.contains("Mock")`: the static legend text always
+        // says "Mock" regardless of which platform actually rendered.
+        assert!(
+            !html.contains("platform-name\">Mock Linux</span>"),
+            "per-platform details must not render inputs' platform:\n{html}"
+        );
     }
 
     #[test]
