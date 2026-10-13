@@ -657,22 +657,40 @@ impl AppState {
     /// on a host where the daemon does connect, `instances` is authoritative
     /// and the registry read is no longer consulted for THIS question (a
     /// model that legitimately stops later in the session is still reflected
-    /// correctly) — but `has_stoppable_managed_instance` below still reads it
-    /// live for a different question (which ids are reachable), unconditionally.
+    /// correctly) — but `has_stoppable_managed_instance_with` below still
+    /// reads the registry live for a different question (which ids are
+    /// reachable), unconditionally.
     pub(crate) fn has_live_instance(&self) -> bool {
+        self.has_live_instance_with(&self.live_registry_snapshot())
+    }
+
+    /// Same question as [`has_live_instance`](Self::has_live_instance), against
+    /// an already-fetched snapshot — for a caller that must ask this alongside
+    /// another registry-backed question (e.g.
+    /// [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with))
+    /// and needs both answered from the same on-disk read, not two independent
+    /// ones that a registry write in between could answer differently.
+    pub(crate) fn has_live_instance_with(
+        &self,
+        snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+    ) -> bool {
         if self.simulated {
             return false;
         }
         self.instances.values().any(|i| i.status.is_serving())
-            || (!self.has_received_snapshot && self.live_registry_snapshot().has_live_service)
+            || (!self.has_received_snapshot && snapshot.has_live_service)
     }
 
     /// Read the bin-injected live registry probe now, or a default (empty,
-    /// nothing live) snapshot when none was injected (demo/replay/mock).
-    /// Single call site for the registry-read seam so `has_live_instance`,
-    /// `has_stoppable_managed_instance`, `quit_confirm_open_services_key`, and
-    /// `ui::quit_confirm_body` all read the exact same live classification
-    /// rather than each unwrapping `managed_registry_probe` by hand.
+    /// nothing live) snapshot in the one path that has no probe to read: a
+    /// test building `AppState` directly rather than through `resolved_args`,
+    /// which injects `Some` on every real entry point, including
+    /// demo/replay/mock. Single call site for the registry-read seam so
+    /// `has_live_instance`,
+    /// `has_stoppable_managed_instance_with`, `quit_confirm_open_services_key`,
+    /// and `ui::quit_confirm_body_with` all read the exact same live
+    /// classification rather than each unwrapping `managed_registry_probe` by
+    /// hand.
     pub(crate) fn live_registry_snapshot(&self) -> crate::registry_probe::ManagedRegistrySnapshot {
         self.managed_registry_probe
             .as_ref()
@@ -682,14 +700,21 @@ impl AppState {
     /// Whether at least one currently-serving instance is one this host's own
     /// registry manages (a live read — see `live_registry_snapshot`) — i.e.
     /// one `rocm services stop` can actually reach. Shared by
-    /// `ui::quit_confirm_body` (whether to show the "press s" hint) and
+    /// `ui::quit_confirm_body_with` (whether to show the "press s" hint) and
     /// `quit_confirm_open_services_key` (whether `s` does anything), so the
-    /// two can't drift on when stopping is actually offered.
-    pub(crate) fn has_stoppable_managed_instance(&self) -> bool {
-        let managed_ids = self.live_registry_snapshot().managed_ids;
+    /// two can't drift on when stopping is actually offered. Takes an
+    /// already-fetched `snapshot` — see
+    /// [`has_live_instance_with`](Self::has_live_instance_with) for why: both
+    /// call sites also ask a sibling registry-backed question in the same
+    /// decision and need the two answered from one read, not two independent
+    /// ones a registry write in between could answer differently.
+    pub(crate) fn has_stoppable_managed_instance_with(
+        &self,
+        snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+    ) -> bool {
         self.instances
             .values()
-            .any(|i| i.status.is_serving() && managed_ids.contains(&i.container_id))
+            .any(|i| i.status.is_serving() && snapshot.managed_ids.contains(&i.container_id))
     }
 
     /// Whether the confirm-before-quit prompt is open. Mirrors
@@ -786,10 +811,15 @@ impl AppState {
         if !self.quit_confirm_pending() || code != crossterm::event::KeyCode::Char('s') {
             return false;
         }
-        if !self.has_stoppable_managed_instance() {
+        // One read for both questions below: a registry write landing between
+        // two separate reads could let the short-circuit see a stoppable
+        // instance that the row lookup's own read no longer does, silently
+        // swallowing the keypress (the prompt stays open with no feedback).
+        let snapshot = self.live_registry_snapshot();
+        if !self.has_stoppable_managed_instance_with(&snapshot) {
             return false;
         }
-        let managed_ids = self.live_registry_snapshot().managed_ids;
+        let managed_ids = snapshot.managed_ids;
         let rows = crate::ui::services_manager::service_rows(&self.instances);
         let Some(selected) = rows.iter().position(|r| {
             managed_ids.contains(&r.id)
@@ -3469,10 +3499,51 @@ mod tests {
             );
             with_registry_probe(&mut s, true, &["svc-managed"]);
             assert!(
-                !s.has_stoppable_managed_instance(),
+                !s.has_stoppable_managed_instance_with(&s.live_registry_snapshot()),
                 "status {status:?} must not count as stoppable"
             );
         }
+    }
+
+    #[test]
+    fn quit_confirm_open_services_key_skips_a_non_serving_row_that_sorts_first() {
+        // Regression guard: the row-finding `position` closure in
+        // `quit_confirm_open_services_key` re-checks `is_serving()` per row
+        // (see its doc comment). The sibling test above only ever seeds a
+        // single non-serving instance, so `has_stoppable_managed_instance_with`'s
+        // own short-circuit already returns `false` before `position` ever
+        // runs — weakening the closure's `is_serving()` check to `.is_some()`
+        // would still pass it. Seed a non-serving row ("svc-a", sorts first by
+        // id, same key `services_manager::service_rows` sorts by) alongside a
+        // serving one ("svc-b"), so `position` must actually skip row 0 to
+        // land on row 1.
+        use crossterm::event::KeyCode;
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut s = st();
+        s.instances.insert(
+            "svc-a".to_string(),
+            Instance {
+                container_id: "svc-a".to_string(),
+                status: InstanceStatus::Stopped,
+                ..Default::default()
+            },
+        );
+        s.instances.insert(
+            "svc-b".to_string(),
+            Instance {
+                container_id: "svc-b".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        with_registry_probe(&mut s, true, &["svc-a", "svc-b"]);
+        s.open_quit_confirm();
+        assert!(s.quit_confirm_open_services_key(KeyCode::Char('s')));
+        let selected = s.services.expect("s must open Services").selected;
+        assert_eq!(
+            selected, 1,
+            "row 0 (svc-a, stopped) must be skipped; row 1 (svc-b, running) must be selected"
+        );
     }
 
     #[test]

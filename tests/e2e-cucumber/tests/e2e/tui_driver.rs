@@ -697,10 +697,13 @@ impl TuiSession {
     /// the app has finished acting on whatever came just before it (e.g. right
     /// after an unsynchronized `send` like the Escape key), it can be consumed
     /// by that transient state and never reach the quit handler — the process
-    /// then never exits and this hangs until `timeout`. Re-sending the gesture
-    /// on a short cadence closes that gap the same way [`send_until`] does for
-    /// screen markers: if the first attempt landed (the common case), the
-    /// process has already exited by the first check and nothing is resent.
+    /// then never exits and this hangs until `timeout`. Re-sending on a short
+    /// cadence closes that gap the same way [`send_until`] does for screen
+    /// markers: if the first attempt landed (the common case), the process
+    /// has already exited by the first check and the loop below never reaches
+    /// a second send. What's resent each pass isn't always the same literal
+    /// `gesture` either — see the quit-confirm handling below, which switches
+    /// to `"y"` once the prompt is on screen.
     pub async fn quit_and_wait(&mut self, timeout: Duration) -> Result<(), String> {
         // Several fixtures leave a model serving (`simulated`/demo sessions
         // never do — `AppState::has_live_instance` always returns `false`

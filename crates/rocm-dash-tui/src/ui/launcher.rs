@@ -789,9 +789,10 @@ mod tests {
 
     #[test]
     fn launcher_state_does_not_warn_on_a_starting_only_registry() {
-        // Regression: `launcher_serving_instances` returns every managed
-        // record regardless of status, including one still `Starting`. The
-        // quit-confirm gate (`AppState::has_live_instance`) must apply the
+        // Regression: `launcher_serving_instances` (`discover_managed_services`)
+        // already drops a failed/stopped/unbound-port record, but still keeps
+        // one still `Starting` — that status alone isn't enough to exclude
+        // it. The quit-confirm gate (`AppState::has_live_instance`) must apply the
         // same `is_serving()` filter here that the dashboard's live probe
         // (`LiveManagedRegistryProbe::snapshot`) applies, or a
         // starting-only registry would trip "Still serving — quit anyway?"
@@ -983,5 +984,67 @@ mod tests {
             handle_launcher_key(&mut s, &mut sel, KeyCode::Char('y')),
             LauncherKeyOutcome::Exit(None)
         ));
+    }
+
+    #[test]
+    fn launcher_quit_confirm_esc_and_q_also_cancel() {
+        // Regression guard: `launcher_quit_confirm_approve_exits_deny_and_cancel_stay`
+        // (above) sends only `y` and `n` despite its name claiming to cover
+        // Cancel too — Esc and `q` (`approval::approval_key`'s own Cancel
+        // keys) were never actually sent while the prompt was open. Both must
+        // behave like Deny here: close the prompt, keep the loop going.
+        for cancel_key in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut s = launcher_state(
+                "default-dark",
+                vec![Instance {
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                }],
+            );
+            let mut sel = 0usize;
+            s.open_quit_confirm();
+            assert!(
+                matches!(
+                    handle_launcher_key(&mut s, &mut sel, cancel_key),
+                    LauncherKeyOutcome::Continue
+                ),
+                "key {cancel_key:?} must cancel, not exit the loop"
+            );
+            assert!(
+                s.quit_confirm.is_none(),
+                "key {cancel_key:?} must close the prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn launcher_quit_confirm_swallows_a_non_verdict_key_while_open() {
+        // Regression guard: `handle_launcher_key`'s early-return guard
+        // (`state.quit_confirm_pending()`) must own every key while the
+        // prompt is open — including `d`, which normally jumps straight to
+        // the dashboard (see the match arm below this fn). A future
+        // refactor of that guard could let `d` fall through and navigate
+        // away while the confirm prompt is still on screen with no test
+        // catching it.
+        let mut s = launcher_state(
+            "default-dark",
+            vec![Instance {
+                status: InstanceStatus::Running,
+                ..Default::default()
+            }],
+        );
+        let mut sel = 0usize;
+        s.open_quit_confirm();
+        assert!(
+            matches!(
+                handle_launcher_key(&mut s, &mut sel, KeyCode::Char('d')),
+                LauncherKeyOutcome::Continue
+            ),
+            "`d` must not exit (or navigate) while the prompt is open"
+        );
+        assert!(
+            s.quit_confirm.is_some(),
+            "`d` is not a verdict key — the prompt must still be open"
+        );
     }
 }

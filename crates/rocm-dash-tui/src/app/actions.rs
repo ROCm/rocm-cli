@@ -69,8 +69,9 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 /// are the one exception: this session was opened FROM the pre-dashboard
 /// launcher, which outlives it and redraws its own menu once it returns, and
 /// the launcher's own `q`/Esc already shares this exact gate — so IT is what
-/// actually governs process exit, with a live registry read backing its
-/// decision (issue #145's launcher/Windows fix). Asking here too would open a
+/// actually governs process exit, backed by a registry read taken fresh at
+/// the top of that menu pass rather than this session's launch-time state
+/// (issue #145's launcher/Windows fix). Asking here too would open a
 /// "Still serving — quit anyway?" whose "yes" doesn't exit the process at all
 /// — it only returns to the launcher loop, which then immediately asks the
 /// identical question again on its own next `q`. So a launcher-hosted session
@@ -930,6 +931,20 @@ mod tests {
             "choosing Quit must close the Esc menu like every other row, \
              not strand it open behind the confirm prompt"
         );
+    }
+
+    #[test]
+    fn quitting_from_the_esc_menu_exits_immediately_when_nothing_is_serving() {
+        // Regression guard: every existing Esc-menu quit test seeds a Running
+        // instance, so none of them exercise the overwhelmingly common case —
+        // the Esc-menu's own "Quit" row, with nothing serving, must still be a
+        // one-keystroke quit (no prompt), the same as the plain `q` key
+        // (`quit_exits_immediately_when_nothing_is_serving` above).
+        let mut s = AppState::new("t".into(), "default-dark".into());
+        s.modal = Modal::Menu;
+        s.menu_sel = 2; // the "Quit" row
+        assert!(apply_action(&mut s, KeyAction::MenuActivate));
+        assert!(s.quit_confirm.is_none());
     }
 
     #[test]

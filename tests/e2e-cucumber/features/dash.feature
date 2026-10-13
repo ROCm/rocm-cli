@@ -413,6 +413,7 @@ Feature: Interactive dashboard
     When the user declines the quit prompt
     And the user runs the quit prompt's stop command
     Then the managed model is no longer listed as running
+    And the disposable process has exited
     When the user quits the dashboard
     Then the dashboard exits successfully
 

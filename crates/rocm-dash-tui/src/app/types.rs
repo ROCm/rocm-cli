@@ -41,10 +41,12 @@ pub struct ResolvedArgs {
     /// (`apps/rocm::dash::run_launcher`'s own loop — `LauncherRoute::Dashboard`
     /// / `LauncherRoute::Chat`), which outlives this session and redraws its
     /// own menu once it returns. The launcher's own `q`/Esc already shares
-    /// this session's quit-confirm gate (`request_quit`) and re-reads the
-    /// managed-service registry live before it asks (now that gate consults
-    /// `managed_registry_probe` rather than a frozen snapshot — issue #145),
-    /// so it is the one that actually governs process exit when `true`. This
+    /// this session's quit-confirm gate (`request_quit`), backed by a fresh
+    /// registry read taken at the top of that menu pass (not a frozen,
+    /// launch-time snapshot — issue #145; see `ui::launcher::launcher_state`'s
+    /// doc comment for why that one read is a `StaticManagedRegistrySnapshot`
+    /// rather than the dashboard's own continuously-live probe), so it is the
+    /// one that actually governs process exit when `true`. This
     /// session's own `q`/Esc/`/quit`/`/exit`/Esc-menu Quit row must then skip
     /// its own confirm and exit immediately — otherwise it asks "Still
     /// serving — quit anyway?", the user says yes, control returns to the

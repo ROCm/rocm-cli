@@ -904,6 +904,35 @@ async fn managed_model_no_longer_listed_as_running(world: &mut E2eWorld) {
     );
 }
 
+/// Proves the stop command signalled the real process, not only the
+/// registry record (AGENTS.md §3: "actually clear the condition"). Without
+/// this, a `rocm services stop` that merely rewrote the record's status to
+/// `stopped` without signalling anything would still leave
+/// `managed_model_no_longer_listed_as_running` above green — it only reads
+/// the registry, never the process `dash-27`'s own
+/// "the managed model's record points at a disposable process" step pointed
+/// the record's `supervisor_pid`/`engine_pid` at.
+#[then("the disposable process has exited")]
+async fn disposable_process_has_exited(world: &mut E2eWorld) {
+    let child = world
+        .disposable_service_process
+        .as_mut()
+        .expect("no disposable process recorded for this scenario");
+    let mut exited = false;
+    for _ in 0..20 {
+        if child.try_wait().ok().flatten().is_some() {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        exited,
+        "the stop command must actually terminate the process it names, not \
+         just rewrite the registry record to stopped"
+    );
+}
+
 #[when("the user quits interactive chat")]
 async fn quit_interactive_chat(world: &mut E2eWorld) {
     quit_tui(world, "interactive chat").await;

@@ -203,13 +203,21 @@ pub(crate) fn quit_confirm_request(
     state: &AppState,
     offer_stop_action: bool,
 ) -> approval::ApprovalRequest {
-    let title = if nothing_is_currently_being_served(state) {
+    // One snapshot for the whole decision: the title, the body, and the
+    // stop-hint below all read it instead of each doing their own
+    // `live_registry_snapshot()` call, so a registry write mid-render can no
+    // longer make them disagree the way "Still serving" over a body that says
+    // "Nothing is being served anymore." used to be possible (the doc comment
+    // on `nothing_is_currently_being_served_with` below is only true because
+    // of this single read).
+    let snapshot = state.live_registry_snapshot();
+    let title = if nothing_is_currently_being_served_with(state, &snapshot) {
         "Nothing to confirm — quit?"
     } else {
         "Still serving — quit anyway?"
     };
-    let mut body = quit_confirm_body(state);
-    if offer_stop_action && state.has_stoppable_managed_instance() {
+    let mut body = quit_confirm_body_with(state, &snapshot, offer_stop_action);
+    if offer_stop_action && state.has_stoppable_managed_instance_with(&snapshot) {
         body.push(String::new());
         body.push("Press s to open Services and stop it.".to_string());
     }
@@ -218,39 +226,72 @@ pub(crate) fn quit_confirm_request(
 
 /// Whether the authoritative view — a real snapshot if one has landed,
 /// otherwise a live registry read — says nothing is currently serving.
-/// Shared by `quit_confirm_request` (title) and `quit_confirm_body` (its own
-/// early-return branch) so the two can't independently decide this and drift
-/// apart. Expressed directly via `AppState::has_live_instance` — the exact
-/// same question, already answered there — rather than re-deriving the same
-/// `instances`/registry-fallback OR by hand a second time (the `simulated`
-/// short-circuit that function also applies is a no-op here in practice: the
-/// prompt can only be open at all once `has_live_instance` was already `true`
-/// when it was opened, and `simulated` never changes mid-session).
-fn nothing_is_currently_being_served(state: &AppState) -> bool {
-    !state.has_live_instance()
+/// Shared by `quit_confirm_request` (title) and `quit_confirm_body_with` (its
+/// own early-return branch) so the two can't independently decide this and
+/// drift apart. Expressed directly via `AppState::has_live_instance_with` —
+/// the exact same question, already answered there, against the caller's own
+/// already-fetched `snapshot` rather than a fresh read — not re-deriving the
+/// same `instances`/registry-fallback OR by hand a second time (the
+/// `simulated` short-circuit that function also applies is a no-op here in
+/// practice: the prompt can only be open at all once `has_live_instance` was
+/// already `true` when it was opened, and `simulated` never changes
+/// mid-session).
+fn nothing_is_currently_being_served_with(
+    state: &AppState,
+    snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+) -> bool {
+    !state.has_live_instance_with(snapshot)
+}
+
+/// Fetch-once convenience wrapper over
+/// [`quit_confirm_body_with`] for a caller that only needs the body in
+/// isolation (every unit test below) — `quit_confirm_request` calls the
+/// `_with` form directly so it shares one snapshot across the title, body,
+/// and stop-hint instead of each fetching its own.
+#[cfg(test)]
+fn quit_confirm_body(state: &AppState) -> Vec<String> {
+    let snapshot = state.live_registry_snapshot();
+    quit_confirm_body_with(state, &snapshot, true)
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
 /// (mirroring the Serving tab's "Running now" listing in
 /// `tabs::pane::live_lines`'s `OpenServices` arm, as plain lines instead of
 /// styled spans), and how to stop each one that this host's own registry
-/// manages (a live read — `AppState::live_registry_snapshot`) — not a blanket
-/// command, since a Docker- or Lemonade-discovered instance from an external
-/// daemon cannot be stopped that way.
+/// manages (a live read, passed in as `snapshot` so the caller controls how
+/// many times the registry is actually read — see `quit_confirm_request`) —
+/// not a blanket command, since a Docker- or Lemonade-discovered instance
+/// from an external daemon cannot be stopped that way.
+///
+/// `offer_stop_action` also picks which trailer the `total > 0` branch below
+/// uses: `true` only from the dashboard's own render arm, where `instances`
+/// is either still empty (handled by the `total == 0` branch instead) or
+/// populated from a real, daemon-verified snapshot once one has landed —
+/// trustworthy enough to claim present-tense that a model "keeps running".
+/// `false` only from the pre-dashboard launcher, whose `instances` come from
+/// a raw on-disk registry read with no liveness check at all (see
+/// `ui::launcher::launcher_state`) — the same kind of unverified read the
+/// `total == 0` branch below already hedges for, so a crashed-but-still-
+/// `ready` launcher record gets the same hedge instead of an unhedged claim
+/// the underlying data can't actually back up.
 ///
 /// Iterates `state.instances.values()` more than once (via the `running`
-/// closure below, and again inside `nothing_is_currently_being_served`)
+/// closure below, and again inside `nothing_is_currently_being_served_with`)
 /// rather than collecting into a `Vec` first: nothing here needs random
 /// access, and a `HashMap`'s `values()` is cheap to re-create — this still
 /// allocates a fresh `Vec<String>` for the returned body every render while
 /// the prompt is open (an unavoidable allocation, not one this avoids); the
 /// point of the double iteration is only to skip building an intermediate
 /// `Vec<&Instance>` neither closure needs.
-fn quit_confirm_body(state: &AppState) -> Vec<String> {
+fn quit_confirm_body_with(
+    state: &AppState,
+    snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
+    offer_stop_action: bool,
+) -> Vec<String> {
     let running = || state.instances.values().filter(|i| i.status.is_serving());
     let total = running().count();
-    let managed_ids = state.live_registry_snapshot().managed_ids;
-    if nothing_is_currently_being_served(state) {
+    let managed_ids = &snapshot.managed_ids;
+    if nothing_is_currently_being_served_with(state, snapshot) {
         // A real snapshot is authoritative here (or there was never a
         // startup fallback to begin with) and it says nothing is serving.
         // Can change between opening the prompt and this render (e.g. the
@@ -293,7 +334,14 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
         }
         "It may still be running in the background after you quit."
     } else {
-        for i in running().take(5) {
+        // Sorted by `container_id` — the same key `services_manager::service_rows`
+        // sorts by for `AppState::quit_confirm_open_services_key`'s own row
+        // lookup — so the Nth instance named here is provably the one `s`
+        // focuses in the Services overlay, not merely whichever order this
+        // `HashMap`'s `values()` happened to yield.
+        let mut sorted: Vec<_> = running().collect();
+        sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
+        for i in sorted.into_iter().take(5) {
             // The stop command is only ever printed next to a service this
             // host's own registry can actually reach: `instances` can also
             // hold a Docker- or Lemonade-discovered entry from an external
@@ -326,7 +374,16 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
         if let Some(line) = format::overflow_line(total, 5) {
             body.push(line);
         }
-        "It keeps running in the background after you quit."
+        if offer_stop_action {
+            "It keeps running in the background after you quit."
+        } else {
+            // The launcher's `instances` (see this fn's own doc comment) carry
+            // no liveness check, the same gap the `total == 0` branch above
+            // already hedges for — so a crashed-but-still-`ready` launcher
+            // record gets the identical hedge instead of a present-tense claim
+            // the underlying read can't actually back up.
+            "It may still be running in the background after you quit."
+        }
     };
     body.push(String::new());
     body.push(trailer.to_string());
@@ -1079,6 +1136,12 @@ mod tests {
         // but also no stop command and no id, even though the live registry
         // read already has one. The registry read needs no daemon snapshot,
         // so the stop command should be available here regardless.
+        //
+        // This only pins the printed string (AGENTS.md §3) — it does not run
+        // the command. `dash-27`
+        // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
+        // that proves a real `rocm services stop <id> --yes` actually clears
+        // the condition.
         let mut state = AppState::new("t".into(), "default-dark".into());
         with_registry_probe(&mut state, true, &["svc-managed"]);
         assert!(state.instances.is_empty());
@@ -1122,7 +1185,7 @@ mod tests {
         // early return in `quit_confirm_body` fires before the registry is
         // ever consulted, so a "stop it first" assertion here would be
         // vacuously true regardless of what's seeded (see the sibling tests
-        // for actual stop-line coverage: `quit_confirm_body_prints_a_working_stop_command_for_a_managed_instance`
+        // for actual stop-line coverage: `quit_confirm_body_names_the_real_stop_command_for_a_managed_instance`
         // and `quit_confirm_body_omits_the_stop_command_for_an_unmanaged_instance`).
         let mut state = AppState::new("t".into(), "default-dark".into());
         with_registry_probe(&mut state, true, &["svc-managed"]);
@@ -1308,10 +1371,15 @@ mod tests {
     }
 
     #[test]
-    fn quit_confirm_body_prints_a_working_stop_command_for_a_managed_instance() {
+    fn quit_confirm_body_names_the_real_stop_command_for_a_managed_instance() {
         // The prompt's remediation must name the id `rocm services stop`
         // actually needs, not a literal `<id>` placeholder, and must only
         // offer it for a service this host's own registry manages.
+        //
+        // This only pins the printed string (AGENTS.md §3) — a string match
+        // cannot show the command "works". `dash-27`
+        // (`@id:dash-quit-prompt-stop-command-actually-works`) is the test
+        // that runs it for real and proves it does.
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
         let mut state = AppState::new("t".into(), "default-dark".into());
         state.instances.insert(
@@ -1436,32 +1504,45 @@ mod tests {
     #[test]
     fn quit_confirm_popup_with_realistic_ids_does_not_panic_at_a_narrow_width() {
         // `generate_service_id` (`rocm_core::generate_service_id`) produces
-        // roughly 23-47 character ids, not the short `e2e-mock`/`svc-managed`
-        // fixtures used elsewhere
-        // in this file — a doc comment on the stop-command split used to
-        // claim the split "keeps the command short enough to never need to
-        // wrap", which is false for a real id at a narrow popup width. This
-        // doesn't assert a specific layout (ratatui wraps however it wraps;
-        // asserting exact column breaks here would just pin that behavior
-        // without proving anything about it) — it pins that several
-        // realistic-length managed ids at the popup's narrowest supported
+        // `<engine>-<model-slug>-<unix-millis>` ids, roughly 23-47 characters,
+        // not the short `e2e-mock`/`svc-managed` fixtures used elsewhere in
+        // this file — a doc comment on the stop-command split used to claim
+        // the split "keeps the command short enough to never need to wrap",
+        // which is false for a real id at a narrow popup width. This doesn't
+        // assert a specific layout (ratatui wraps however it wraps; asserting
+        // exact column breaks here would just pin that behavior without
+        // proving anything about it, and the clipping this can produce at 3+
+        // services is a known, separately-tracked non-blocking gap, not what
+        // this test is for) — it pins that several realistic-length,
+        // realistic-*format* managed ids at the popup's narrowest supported
         // width render without panicking and still contain every id's text
         // somewhere in the frame.
+        //
+        // The fixture's `model_name` deliberately does NOT embed the id
+        // (unlike an earlier version of this test): with a model name like
+        // "model-<id>", `painted.contains(id)` could pass off that line
+        // alone even if the "stop it first" bullet and its
+        // `rocm services stop <id> --yes` line — the only other place the raw
+        // id appears — were dropped entirely. With a plain name instead, the
+        // id can only appear via the stop-command line, so this is no longer
+        // vacuous.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
 
         let realistic_ids = [
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890-vllm",
-            "f0e1d2c3-b4a5-6978-dcba-fe0987654321-lemonade",
+            "vllm-llama-3-1-8b-instruct-1760345671001",
+            "lemonade-qwen2-5-7b-instruct-1760345672002",
+            "vllm-mixtral-8x7b-instruct-1760345673003",
         ];
+        let model_names = ["Model A", "Model B", "Model C"];
         let mut state = AppState::new("t".into(), "default-dark".into());
-        for id in realistic_ids {
+        for (id, name) in realistic_ids.into_iter().zip(model_names) {
             state.instances.insert(
                 id.to_string(),
                 Instance {
                     container_id: id.to_string(),
-                    model_name: format!("model-{id}"),
+                    model_name: name.to_string(),
                     status: InstanceStatus::Running,
                     ..Default::default()
                 },
@@ -1479,11 +1560,16 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect();
+        assert!(
+            painted.contains("rocm services stop"),
+            "at least one stop command must render: {painted:?}"
+        );
         for id in realistic_ids {
             assert!(
                 painted.contains(id),
                 "realistic id {id:?} must still appear somewhere in the \
-                 rendered frame even if its line wraps: {painted:?}"
+                 rendered frame even if its line wraps — not vacuously \
+                 satisfied by a model name that happens to embed it: {painted:?}"
             );
         }
     }

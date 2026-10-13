@@ -270,11 +270,12 @@ pub fn resolved_args(
 ) -> ResolvedArgs {
     let t = &config.dashboard.tui;
     let service_records = rocm_dash_daemon::registry::load_service_records(&paths.services_dir());
-    // One read of the managed-service registry AND one classification pass over
-    // it (`discover_managed_services`), shared by the three derived fields below
-    // rather than each re-reading/re-classifying it (all three are launch-cheap
-    // by design; collapsing three walks of `service_records` into one pays that
-    // cost once instead of three times).
+    // One read of the managed-service registry AND one classification pass
+    // over it (`discover_managed_services`), feeding `services_past_attempts`
+    // below. `managed_registry_probe` does NOT reuse this: it needs its own
+    // fresh read on every `snapshot()` call for the life of the session (see
+    // `LiveManagedRegistryProbe`'s own doc comment), not the one-shot read
+    // taken here at launch.
     let discovery = rocm_dash_daemon::registry::discover_managed_services(&service_records);
     ResolvedArgs {
         connect: t.connect.clone(),
@@ -605,6 +606,19 @@ const fn launcher_route(choice: LauncherChoice) -> LauncherRoute {
     }
 }
 
+/// Whether a route escalates into a session the launcher itself hosts —
+/// `run`/`run_chat`'s own `q`/Esc must then exit straight back to this loop
+/// rather than open a second, redundant quit-confirm prompt (issue #145's
+/// double-prompt fix; see `ResolvedArgs::launcher_hosted`'s doc comment). Only
+/// `Chat` and `Dashboard` escalate at all — `Focused` runs in place via
+/// `run_focused`, which never touches `launcher_hosted`. Named and tested on
+/// its own rather than left as two independent `true` literals at the two
+/// call sites below, so a future route added by copying the nearest example
+/// can't silently pass the wrong one.
+const fn launcher_route_hosts_session(route: &LauncherRoute) -> bool {
+    matches!(route, LauncherRoute::Chat | LauncherRoute::Dashboard)
+}
+
 /// Entry point for bare `rocm`: the launcher as a persistent hub.
 ///
 /// Draws the minimal front door; runs the chosen flow; then redraws the menu so
@@ -658,17 +672,23 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
         let serving = launcher_serving_instances(&paths);
         match rocm_dash_tui::ui::launcher::run_launcher(&theme, serving)? {
             None => return Ok(()),
-            Some(choice) => match launcher_route(choice) {
-                LauncherRoute::Focused(focus) => run_focused(focus)?,
-                // `launcher_hosted = true`: this session's own `q`/Esc must
-                // not re-ask "Still serving — quit anyway?" (issue #145's
-                // double-prompt fix) — the launcher's own gate, re-entered at
-                // the top of this loop, is what actually governs process exit.
-                LauncherRoute::Chat => {
-                    run_chat(chat_mock, ChatInferenceParams::default(), true)?;
+            Some(choice) => {
+                let route = launcher_route(choice);
+                // This session's own `q`/Esc must not re-ask "Still serving —
+                // quit anyway?" (issue #145's double-prompt fix) — the
+                // launcher's own gate, re-entered at the top of this loop, is
+                // what actually governs process exit. Derived from `route`
+                // itself (`launcher_route_hosts_session`) rather than a bare
+                // `true` literal at each arm below, so the two can't drift.
+                let launcher_hosted = launcher_route_hosts_session(&route);
+                match route {
+                    LauncherRoute::Focused(focus) => run_focused(focus)?,
+                    LauncherRoute::Chat => {
+                        run_chat(chat_mock, ChatInferenceParams::default(), launcher_hosted)?;
+                    }
+                    LauncherRoute::Dashboard => run(None, false, chat_mock, launcher_hosted)?,
                 }
-                LauncherRoute::Dashboard => run(None, false, chat_mock, true)?,
-            },
+            }
         }
     }
 }
@@ -1219,6 +1239,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Proves the injected probe re-reads the registry on every `snapshot()`
+    /// call rather than caching the state it saw when `resolved_args` built
+    /// it. Every other `resolved_args_*` registry test writes its record(s)
+    /// *before* calling `resolved_args` and never mutates afterward, so a
+    /// probe that cached its first read would also pass every one of them —
+    /// this is the one that would actually catch that regression.
+    #[test]
+    fn live_registry_probe_reflects_a_record_written_after_resolved_args_was_built() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(".rocm-work")
+            .join("tests")
+            .join("dash")
+            .join(format!(
+                "reread-{}-{}",
+                std::process::id(),
+                rocm_core::unix_time_millis()
+            ));
+        let p = AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        };
+        std::fs::create_dir_all(p.services_dir()).unwrap();
+
+        // Built against an empty services dir: nothing live yet.
+        let args = resolved_args(&cfg(), &p, ActiveTab::Home);
+        assert!(!probe_snapshot(&args).has_live_service);
+
+        // Write a running record *after* `args` was built, with no call back
+        // into `resolved_args`. A cached probe would still report `false` here.
+        let record_path = p.services_dir().join("live.json");
+        std::fs::write(
+            &record_path,
+            br#"{"service_id":"svc-live","engine":"vllm","port":8001,"status":"running","created_at_unix_ms":2}"#,
+        )
+        .unwrap();
+        assert!(
+            probe_snapshot(&args).has_live_service,
+            "the probe must re-read the registry, not cache the state it saw at build time"
+        );
+
+        // Remove it again: the probe must flip back, not latch on the first
+        // `true` it ever saw.
+        std::fs::remove_file(&record_path).unwrap();
+        assert!(
+            !probe_snapshot(&args).has_live_service,
+            "the probe must reflect the current registry state, not a one-shot snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Paired with `resolved_args_reports_no_live_managed_service_when_none_are_ready_or_running`:
     /// `managed_ids` and `has_live_service` (`ManagedRegistrySnapshot`) are two
     /// different questions over the same live read (liveness vs. reachability), so a record
@@ -1716,6 +1790,23 @@ mod tests {
             launcher_route(LauncherChoice::OpenDashboard),
             LauncherRoute::Dashboard
         );
+    }
+
+    #[test]
+    fn launcher_route_hosts_session_is_true_only_for_the_two_escalations() {
+        // Regression guard: `run_launcher`'s hub loop used to pass a bare
+        // `true` literal to `run_chat`/`run` at each escalation arm by hand.
+        // A worker confirmed flipping either literal to `false` left every
+        // unit test green — this test ties `launcher_hosted` to the route
+        // itself instead, so a future route added by copying the nearest
+        // example can't silently carry the wrong value.
+        assert!(launcher_route_hosts_session(&LauncherRoute::Chat));
+        assert!(launcher_route_hosts_session(&LauncherRoute::Dashboard));
+        for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {
+            assert!(!launcher_route_hosts_session(&LauncherRoute::Focused(
+                focus
+            )));
+        }
     }
 
     #[test]
