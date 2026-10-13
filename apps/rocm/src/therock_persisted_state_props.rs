@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MIT
 
 //! Property tests for state `rocm` persists under the config/data/cache dirs:
-//! the runtime registry, the startup update-check cache, the active-runtime
-//! marker, and how a config writer in this module treats a `config.json` it
-//! cannot parse.
+//! the runtime registry, the startup update-check cache, and how a config
+//! writer in this module treats a `config.json` it cannot parse. The
+//! active-runtime marker's checks live in `runtimes_cmd`'s
+//! `tests::persisted_state_props`, next to the private marker writer and reader
+//! they drive.
 //!
 //! A child of `therock` so it can drive the real private load/save functions.
 //! No test here reads or writes the process environment: every `AppPaths` is
@@ -758,62 +760,4 @@ fn startup_update_check_record_round_trips() {
         Ok(())
     });
     report("startup update check round-trip", result);
-}
-
-// ---------------------------------------------------------------------------
-// Active-runtime marker: which real-output mutations the strict reader rejects.
-// ---------------------------------------------------------------------------
-
-/// `active_runtime_marker_matches` (uninstall path) fails loudly on a marker it
-/// cannot parse; `storage::read_active_runtime_marker` turns the same file into
-/// "no marker". This enumerates which single-key drops from REAL output put a
-/// marker into that disagreement, so the reach of the known asymmetry is
-/// measured rather than assumed.
-#[test]
-fn marker_key_drops_that_split_the_two_readers() {
-    let (root, paths) = fresh_paths("marker");
-    crate::write_active_runtime_marker(
-        &paths,
-        crate::ActiveRuntimeMarker {
-            runtime_id: "therock-release:gfx1151".to_owned(),
-            runtime_key: "therock-release-gfx1151-7.13.0".to_owned(),
-            manifest_path: PathBuf::from("/x/registry/k.json"),
-            install_root: PathBuf::from("/x/r"),
-            previous_runtime_id: None,
-            previous_runtime_key: Some("old".to_owned()),
-            // Realistic, and below u64::MAX on purpose: the mutation below
-            // goes through `serde_json::Value`, which holds an integer above
-            // u64::MAX as an f64, and the strict `u128` field then rejects it.
-            // That would make every mutation look rejected.
-            activated_at_unix_ms: 1_700_000_000_000,
-        },
-    )
-    .unwrap();
-    let marker_path = crate::active_runtime_marker_path(&paths);
-    let real: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
-    assert!(
-        crate::active_runtime_marker_matches(&paths, "therock-release-gfx1151-7.13.0").unwrap()
-    );
-    let mut rejected = Vec::new();
-    for key in real.as_object().unwrap().keys() {
-        let mut mutated = real.clone();
-        mutated.as_object_mut().unwrap().remove(key);
-        std::fs::write(&marker_path, serde_json::to_vec(&mutated).unwrap()).unwrap();
-        if crate::active_runtime_marker_matches(&paths, "therock-release-gfx1151-7.13.0").is_err() {
-            rejected.push(key.clone());
-        }
-    }
-    let _ = std::fs::remove_dir_all(&root);
-    eprintln!("marker keys whose absence the strict reader rejects: {rejected:?}");
-    assert_eq!(
-        rejected,
-        [
-            "activated_at_unix_ms",
-            "install_root",
-            "manifest_path",
-            "runtime_id",
-            "runtime_key",
-        ]
-    );
 }
