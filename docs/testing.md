@@ -404,6 +404,38 @@ selection:
 python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
 ```
 
+### GPU targets with no ROCm build
+
+Some recognized targets have no TheRock package family at all. Today that is
+`gfx90c`, the Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs. For these
+`rocm install sdk` refuses instead of resolving a family, and `rocm examine`
+adds a `rocm_support` line saying the GPU is detected but unsupported.
+
+Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
+when changing it:
+
+- `gfx_target_has_no_rocm_build` in
+  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  with `normalize_therock_family` returning `None`. Do not simplify it to a bare
+  target-name check. Every test that drives the refusal does so by naming the
+  target explicitly, and would otherwise keep passing after the `gfx90c` arm in
+  `normalize_therock_family` was deleted, because the refusal short-circuits
+  before the mapping is read. `no_rocm_build_implies_no_therock_family` pins
+  this.
+- detection itself has no override — `detect_host_gfx_target` reads real sysfs
+  or WMI — so no lane can fake the host half. The end-to-end coverage is
+  `@id:runtime-install-sdk-refuses-unsupported-gpu-target` (`runtime-19` in
+  [runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature)),
+  which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
+  no GPU tag. The detected-GPU wording itself is covered at unit level by
+  `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
+  [therock.rs](../apps/rocm/src/therock.rs).
+
+To check the mapping is still load-bearing, delete the `gfx90c` arm from
+`normalize_therock_family` and confirm the cucumber scenario goes red along with
+the unit tests. A mutant that only renames the arm will not do: confirm the
+edited file actually differs before concluding anything from a green run.
+
 ## ComfyUI TheRock GPU Acceptance
 
 This opt-in test verifies that rocm-cli can install or reuse its managed

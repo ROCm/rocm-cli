@@ -1436,11 +1436,17 @@ async fn assert_unsupported_family_refused(world: &mut E2eWorld) {
 
 /// The refusal must not name a package family.
 ///
-/// This is the half that fails on the old mapping. `gfx90c` used to normalize
-/// to `gfx90X-dcgpu`, so the command succeeded and printed a plan naming that
-/// family; and the generic "unable to resolve a supported family" error lists
-/// every recognized family as a `--family` suggestion. Either way a family name
-/// reaches the user. Only the dedicated refusal names none.
+/// The weaker of the two halves, and worth keeping for the case the stronger
+/// one misses: the generic "unable to resolve a supported family" error lists
+/// every recognized family as a `--family` suggestion, and the old mapping
+/// printed a plan naming `gfx90X-dcgpu`. Either way a family name reaches the
+/// user and invites installing a build for different silicon. Only the
+/// dedicated refusal names none.
+///
+/// A regression in the gfx90c mapping itself is caught by the step above, whose
+/// "no ROCm SDK build" cannot appear once `normalize_therock_family` maps the
+/// target again — see `gfx_target_has_no_rocm_build`, which is conjoined with
+/// that mapping precisely so this scenario cannot pass without it.
 #[then("the refusal offers no package family to install instead")]
 async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
     let output = unsupported_family_attempt(world);

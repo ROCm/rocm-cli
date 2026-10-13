@@ -379,18 +379,28 @@ Feature: Runtime configuration
   # The honest scenario would run on such a laptop, and there is no lane with
   # one: no CI runner has a Vega APU, and detection reads real sysfs/WMI with no
   # override to fake a target with (see `detect_host_gfx_target`). What is
-  # reachable from any lane is the same refusal through the other door the user
-  # can open -- naming the target explicitly. That exercises the same
-  # `normalize_therock_family` answer and the same error text the detected case
-  # prints, without needing the silicon.
+  # reachable from any lane is the refusal through the other door the user can
+  # open -- naming the target explicitly. The two doors do not print the same
+  # sentence (`unsupported_host_gpu_message` says "detected"; this one names
+  # where the target was asked from), but they share the wording the Thens pin
+  # and both are gated on the same `gfx_target_has_no_rocm_build`.
+  #
+  # That predicate is what makes this scenario evidence about the mapping rather
+  # than about itself: it answers `true` only when `normalize_therock_family`
+  # also answers `None`, so deleting the gfx90c arm there turns the refusal off
+  # at both doors at once. Were the predicate to name gfx90c on its own, the
+  # explicit door would keep refusing from its own copy of the target name and
+  # this scenario would stay green through exactly the regression it exists to
+  # catch.
   #
   # Asserting only that the command fails would pass on the old code too: an
   # unrecognized `--family` already fell through to host detection and failed on
   # the no-GPU lane for an unrelated reason. So the Thens pin which refusal it
-  # is -- it names gfx90c, and it offers no package family. On the old mapping
-  # the command does not fail at all; it resolves `gfx90X-dcgpu` and prints a
-  # plan. The second Then is the one that would catch a regression that reopens
-  # the catch-all, because a resolved family would have to appear in the output.
+  # is. The first catches a reopened catch-all: with the gfx90c arm gone the
+  # target resolves to `gfx90X-dcgpu` and no refusal is printed, so "no ROCm SDK
+  # build" is absent however the run then ends. The second guards the weaker
+  # failure where a refusal is printed but still dangles a family name in front
+  # of the user.
   @id:runtime-install-sdk-refuses-unsupported-gpu-target
   Scenario: runtime-19 - Asking for a GPU target ROCm does not build is refused outright
     When the user dry-runs an SDK install for the gfx90c Vega iGPU

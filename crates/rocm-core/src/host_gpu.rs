@@ -113,8 +113,19 @@ pub fn extract_first_gfx_token(text: &str) -> Option<String> {
 /// Today that is gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
 /// APUs. Callers use it to say "detected, but not supported by ROCm" instead of
 /// treating the GPU as undetected or suggesting a package family for it.
+///
+/// The `normalize_therock_family` half of that sentence is a real conjunct, not
+/// a restatement: if the gfx90c arm there were ever removed and the target fell
+/// back into the loose `gfx90` catch-all, this would answer `false` and every
+/// caller would go back to the old data-center behaviour together. Naming the
+/// target on its own would instead leave the two halves free to disagree — the
+/// install path would keep refusing gfx90c through this predicate while
+/// `normalize_therock_family` quietly resolved `gfx90X-dcgpu` for it, and the
+/// refusal would be certifying a mapping that no longer existed. Tests that
+/// drive the refusal are only evidence about the mapping because of this.
 pub fn gfx_target_has_no_rocm_build(gfx: &str) -> bool {
     extract_first_gfx_token(gfx).is_some_and(|target| target.starts_with("gfx90c"))
+        && normalize_therock_family(gfx).is_none()
 }
 
 pub fn normalize_therock_family(value: &str) -> Option<String> {
@@ -3427,6 +3438,41 @@ mod tests {
         assert!(!gfx_target_has_no_rocm_build("gfx906"));
         assert!(!gfx_target_has_no_rocm_build("gfx1103"));
         assert!(!gfx_target_has_no_rocm_build(""));
+    }
+
+    /// The predicate must agree with `normalize_therock_family`, not merely
+    /// happen to.
+    ///
+    /// "Has no ROCm build" and "normalizes to no family" are two statements
+    /// about the same fact, written in two places. If they are allowed to drift
+    /// the install path refuses a target that the resolver would happily map,
+    /// and — worse for the test suite — every test that drives the refusal
+    /// through `--family gfx90c` keeps passing after the gfx90c arm in
+    /// `normalize_therock_family` is deleted, because the refusal short-circuits
+    /// before the mapping is ever consulted. This is the assertion that makes
+    /// those tests evidence about the mapping.
+    #[test]
+    fn no_rocm_build_implies_no_therock_family() {
+        for target in [
+            "gfx90c",
+            "gfx90c:xnack-",
+            "gfx900",
+            "gfx906",
+            "gfx908",
+            "gfx90a",
+            "gfx1030",
+            "gfx1103",
+            "gfx1201",
+        ] {
+            if gfx_target_has_no_rocm_build(target) {
+                assert_eq!(
+                    normalize_therock_family(target),
+                    None,
+                    "`{target}` is reported as having no ROCm build, so it must \
+                     not normalize to a package family"
+                );
+            }
+        }
     }
 
     #[test]

@@ -193,6 +193,44 @@ Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup. The script checks the default install; add `--devel` to check
 the opt-in compiler toolchain path instead.
 
+### 2a. A GPU target with no ROCm build
+
+Any machine can run this one; it needs no particular GPU. `gfx90c` is the Vega
+iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs, and ROCm publishes no build
+for it:
+
+```powershell
+rocm install sdk --family gfx90c --dry-run
+```
+
+Expected result:
+
+- The command fails. It says no ROCm SDK build exists for `gfx90c`, names
+  `--family` as where the target came from, and states that nothing was
+  installed and no other family was substituted.
+- It offers **no** package family to try instead. A message listing
+  `gfx110X-all`, `gfx90X-dcgpu` or any other family here is a regression: it
+  invites installing a build for different silicon. In particular
+  `gfx90X-dcgpu` appearing means the data-center catch-all has been reopened.
+- It does not fall back to this machine's own GPU. On a host with a supported
+  card, a run that succeeds and installs for that card is a regression — the
+  named target must not be silently replaced.
+
+On a Ryzen 4000 or 5000 machine whose Vega iGPU is the only GPU, two further
+checks, which cannot be made anywhere else:
+
+- `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
+  `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
+  detected but not supported by ROCm and that the Vulkan backend can still be
+  used. A `<unknown>` target, or a missing `rocm_support` line, means detection
+  regressed.
+- A plain `rocm install sdk`, with no `--family`, gives the same refusal with
+  the wording for a *detected* GPU rather than a requested one.
+
+On Windows, a hybrid laptop with both the Vega iGPU and a discrete card must
+still report the discrete card from `rocm examine`; the iGPU is listed first by
+WMI and must not hide it.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
