@@ -137,9 +137,11 @@ places, and checks only what it finds:
 - the `--help` of every visible command: lines that start with a command
   (EXAMPLES rows) and inline backtick spans
 - production Rust string literals: backtick spans, literals that start with a
-  command, and labelled lines such as `next step: rocm …`. Comments, items
-  gated on `cfg(test)` or `cfg(all(test, …))`, and whole files declared only
-  as test modules (following `#[path]`) are skipped.
+  command, and labelled lines such as `next step: rocm …`. Whole-line `//`
+  comments, items gated on `cfg(test)` or `cfg(all(test, …))`, and whole
+  files declared only as test modules (following `#[path]`) are skipped; a
+  trailing `// …` comment or a `/* … */` block on a line of code is still
+  scanned.
 - `README.md`, `docs/` and `skills/`: inline backtick spans and fenced
   code-block lines
 - the VHS tapes under `docs/tapes/`
@@ -154,16 +156,20 @@ follows one.
 
 It fills in placeholders such as `<model>` and `{}`, drops one that stands for
 options described elsewhere (`<case-appropriate options above>`), tries each
-`[--flag]` group and `a|b` alternative, then routes each command the way `rocm`
-itself does.
+`[--flag]` group and `a|b` alternative (a nested group such as
+`[--restart-services [--yes]]` is tried with and without its inner part), then
+routes each command the way `rocm` itself does. `rocmd` commands go through
+`rocmd`'s own parser, with nothing run.
 These fail the test:
 
 - a command that clap rejects
 - a command that ends up at the natural-language planner, unless the advice
-  itself is a multi-word request: a quoted one (`rocm "start a local model"`)
-  or a placeholder that names one (`rocm --yes <natural language request>`). A
-  placeholder filled in with several words does not count, so a removed
-  subcommand that took a text argument (`frobnicate <TEXT>`) still fails.
+  itself is a multi-word request: its first request word is a quoted request
+  (`rocm "start a local model"`) or a placeholder that names one
+  (`rocm --yes <natural language request>`). Only the first word counts, as in
+  real routing, and a placeholder filled in with several words does not count,
+  so a removed subcommand that took a text argument (`frobnicate <TEXT>`,
+  `frobnicate "two words"`) still fails.
 - a command that leaves out a required argument or subcommand, when it is a
   line meant to be run as written: a fenced code line, a string literal that
   starts with a command, a labelled `next step:`/`Try:` line, or a help
@@ -184,12 +190,16 @@ not checked as written:
 - a Rust raw string (`r#"…"#`) or a string literal that spans lines without a
   trailing `\` is not read as one literal
 - a backtick span that wraps across lines in a Rust string is not seen
-  (Markdown joins wrapped spans; Rust does not)
+  (Markdown and `--help` text join wrapped spans; Rust source does not)
+- an EXAMPLES row in `--help` that wraps onto a second line is checked only up
+  to the wrap (clap is built without `wrap_help`, so this happens only where an
+  author breaks the line)
 - a `{` or `}` inside a string in a `#[cfg(test)]` item can end the skipped
   item early or late
-- templated advice whose verb is a format argument (the `services` retry line
-  in `main.rs`) is excluded and checked through the function that builds it
-  instead
+- templated advice whose verb is a format argument (the `services` hint in
+  `service_hints.rs`, whose verb is `{action}`, and the `runtimes` retry line
+  in `runtime_services.rs`, whose subcommand is `{command}`) is excluded and
+  checked through the functions that build it instead
 
 When it fails, fix the advice (or the CLI). Add text to `NOT_INVOCATIONS`, with
 a reason, only when the text starts with `rocm` but is not advice to run

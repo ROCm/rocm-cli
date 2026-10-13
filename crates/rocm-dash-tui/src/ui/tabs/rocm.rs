@@ -196,8 +196,10 @@ mod tests {
     }
 
     /// The detail pane prints `Runs: <cmd>`. A label that parses is not a
-    /// label that is true: each must name what its manager actually spawns,
-    /// so a user who copies it to a shell gets the same command.
+    /// label that is true: each must name the subcommand its manager
+    /// actually spawns, and its value flags. Values the user picks in a form
+    /// show as `…`, and mode switches such as `--dry-run` are left out, so
+    /// the Install label is not a command to copy as written.
     #[test]
     fn rocm_runs_labels_name_what_each_manager_spawns() {
         use crate::ui::examine_manager::EXAMINE_ARGS;

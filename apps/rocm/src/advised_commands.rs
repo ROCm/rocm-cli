@@ -20,9 +20,10 @@
 //! - production Rust string literals under `apps/`, `crates/` and `engines/`:
 //!   backtick spans naming `rocm …`, and literals that *start* with a command
 //!   (the `rocm_core::fix` RECIPES `commands`/`verify` fields, dashboard
-//!   "Runs:" lines). Comments, items gated on `cfg(test)` or
-//!   `cfg(all(test, …))`, and whole files declared only as test modules are
-//!   skipped — they are never printed;
+//!   "Runs:" lines). Whole-line `//` comments, items gated on `cfg(test)`
+//!   or `cfg(all(test, …))`, and whole files declared only as test modules
+//!   are skipped — they are never printed. A trailing comment or `/* … */`
+//!   block on a line of code is still scanned;
 //! - `README.md`, `docs/**/*.md` and `skills/**/*.md` (inline backtick spans
 //!   and fenced code-block lines), and the VHS tapes under `docs/tapes/`.
 //!
@@ -255,8 +256,10 @@ fn test_only_module_files(files: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Production lines of a Rust file, with string continuations (`\` at end of
-/// line) joined the way the compiler joins them. Comments and `#[cfg(test)]`
-/// items are dropped: they are never printed to a user.
+/// line) joined the way the compiler joins them. Whole-line `//` comments
+/// (doc comments included) and `#[cfg(test)]` items are dropped: they are
+/// never printed to a user. A trailing `// …` comment or a `/* … */` block on
+/// a line of code is kept, and its backtick spans are scanned.
 fn rust_production_lines(text: &str) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut kept: Vec<(usize, String)> = Vec::new();
@@ -471,7 +474,7 @@ pub(crate) fn source_advice() -> Vec<Advice> {
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         // This module's own fixtures are not advice.
-        if name.ends_with("tests.rs") || name == "build.rs" || name == "advised_commands.rs" {
+        if name.ends_with("tests.rs") || name == "build.rs" {
             continue;
         }
         extract_rust(&path, &rel(&path), &mut advice);
@@ -528,24 +531,51 @@ fn examples_row(line: &str) -> Option<String> {
 
 /// Every invocation named in the long `--help` of every visible command.
 pub(crate) fn help_text_advice() -> Vec<Advice> {
+    help_advice_of(cli_command())
+}
+
+/// [`help_text_advice`] for any command tree, so a fixture tree can test it.
+fn help_advice_of(mut root: clap::Command) -> Vec<Advice> {
     fn visit(command: &mut clap::Command, path: &str, out: &mut Vec<Advice>) {
         let help = command.render_long_help().to_string();
-        for (index, line) in help.lines().enumerate() {
-            let source = format!("`{path} --help` line {}", index + 1);
-            if let Some(raw) = examples_row(line) {
+        let push_spans = |start: usize, prose: &str, out: &mut Vec<Advice>| {
+            for raw in backtick_spans(prose) {
                 out.push(Advice {
-                    source: source.clone(),
-                    raw,
-                    surface: Surface::CommandLine,
-                });
-            }
-            for raw in backtick_spans(line) {
-                out.push(Advice {
-                    source: source.clone(),
+                    source: format!("`{path} --help` line {start}"),
                     raw,
                     surface: Surface::InlineProse,
                 });
             }
+        };
+        // Help text with an inline span broken across lines (an authored
+        // `\n` inside one), joined as Markdown prose is.
+        let mut prose: Option<(usize, String)> = None;
+        for (index, line) in help.lines().enumerate() {
+            let line_no = index + 1;
+            if let Some(raw) = examples_row(line) {
+                out.push(Advice {
+                    source: format!("`{path} --help` line {line_no}"),
+                    raw,
+                    surface: Surface::CommandLine,
+                });
+            }
+            let trimmed = line.trim();
+            let (start, joined) = match prose.take() {
+                Some((start, mut joined)) => {
+                    joined.push(' ');
+                    joined.push_str(trimmed);
+                    (start, joined)
+                }
+                None => (line_no, line.to_owned()),
+            };
+            if joined.matches('`').count() % 2 == 1 && !trimmed.is_empty() {
+                prose = Some((start, joined));
+                continue;
+            }
+            push_spans(start, &joined, out);
+        }
+        if let Some((start, joined)) = prose {
+            push_spans(start, &joined, out);
         }
         // clap's generated `help` subcommand renders the same help again; one
         // bad line would be reported once per nesting level.
@@ -561,10 +591,10 @@ pub(crate) fn help_text_advice() -> Vec<Advice> {
             visit(sub, &format!("{path} {name}"), out);
         }
     }
-    let mut root = cli_command();
     root.build();
     let mut out = Vec::new();
-    visit(&mut root, "rocm", &mut out);
+    let path = root.get_name().to_owned();
+    visit(&mut root, &path, &mut out);
     out
 }
 
@@ -850,41 +880,49 @@ fn synopsis_items(words: &[String]) -> Vec<Item> {
     // Bracket depth inside `group`: a nested `[...]` (`[--restart-services
     // [--yes]]`, `[--distro [NAME]]`) is optional *within* the outer group.
     let mut depth = 0_usize;
+    // Where the alternative being written starts in the group's forms: a
+    // value list or a nested group turns it into several forms.
+    let mut branch = 0_usize;
     for (index, raw_word) in words.iter().enumerate() {
         let opening = raw_word.chars().take_while(|c| *c == '[').count();
         let closing = raw_word.chars().rev().take_while(|c| *c == ']').count();
         let word = raw_word.trim_matches(['[', ']']);
         if opening > 0 && group.is_none() {
             group = Some(vec![Vec::new()]);
+            branch = 0;
         }
         if let Some(alternatives) = group.as_mut() {
             if opening > 0 && depth > 0 {
                 // The words before a nested group are a form of their own:
                 // `[--restart-services [--yes]]` allows `--restart-services`
                 // alone as well as with `--yes`.
-                let current = alternatives.last().cloned().unwrap_or_default();
-                if !current.is_empty() {
-                    alternatives.insert(alternatives.len() - 1, current);
-                }
+                let forms: Vec<Vec<String>> = alternatives[branch..]
+                    .iter()
+                    .filter(|form| !form.is_empty())
+                    .cloned()
+                    .collect();
+                let count = forms.len();
+                alternatives.splice(branch..branch, forms);
+                branch += count;
             }
             depth += opening;
             if word == "|" {
                 alternatives.push(Vec::new());
+                branch = alternatives.len() - 1;
             } else if !word.is_empty() && !is_ellipsis(word) {
-                // `[--provider anthropic|openai|...]`: a value list inside a
-                // group becomes one alternative per value.
+                // A value list (`[--provider anthropic|openai|...]`, `[stop|restart
+                // <id>]`) branches every form of the current alternative, and
+                // the words after it extend each branch.
                 let values = word_alternatives(word, false);
-                let current = alternatives.pop().unwrap_or_default();
-                if values.len() > 1 && !current.is_empty() {
-                    for value in values {
-                        let mut alternative = current.clone();
-                        alternative.push(value);
-                        alternatives.push(alternative);
+                if !values.is_empty() {
+                    let forms: Vec<Vec<String>> = alternatives.drain(branch..).collect();
+                    for form in forms {
+                        for value in &values {
+                            let mut extended = form.clone();
+                            extended.push(value.clone());
+                            alternatives.push(extended);
+                        }
                     }
-                } else {
-                    let mut current = current;
-                    current.extend(values);
-                    alternatives.push(current);
                 }
             }
             depth = depth.saturating_sub(closing);
@@ -1594,6 +1632,27 @@ fn synopsis_notation_expands_to_each_documented_form() {
             ],
         ]
     );
+    // A value list first in a group branches, and later words extend each
+    // branch.
+    assert_eq!(
+        argv_variants("rocm services [stop|restart <id>] list"),
+        vec![
+            vec!["rocm", "services", "list"],
+            vec!["rocm", "services", "stop", "svc-1", "list"],
+            vec!["rocm", "services", "restart", "svc-1", "list"],
+        ]
+    );
+    assert_eq!(
+        argv_variants("rocm x [--a|--b [--c] | --d]"),
+        vec![
+            vec!["rocm", "x"],
+            vec!["rocm", "x", "--a"],
+            vec!["rocm", "x", "--b"],
+            vec!["rocm", "x", "--a", "--c"],
+            vec!["rocm", "x", "--b", "--c"],
+            vec!["rocm", "x", "--d"],
+        ]
+    );
     assert_eq!(
         argv_variants("rocm storage [report [--json]] [--top N]"),
         vec![
@@ -1885,6 +1944,23 @@ fn dump_advised_invocations() {
         }
     }
     println!("TOTAL\t{}", advice.len());
+}
+
+/// A span an author broke across help lines is joined and checked, like a
+/// wrapped span in Markdown prose.
+#[test]
+fn a_span_wrapped_in_help_text_is_checked() {
+    let tree = clap::Command::new("rocm")
+        .after_long_help("Then run `rocm\nfrobnicate --now` to finish.\nAlso `rocm examine`.");
+    let advice = help_advice_of(tree);
+    let raws: Vec<&str> = advice.iter().map(|item| item.raw.as_str()).collect();
+    assert!(
+        raws.contains(&"rocm frobnicate --now") && raws.contains(&"rocm examine"),
+        "{advice:?}"
+    );
+    let found = findings(&advice);
+    assert_eq!(found.len(), 1, "{}", render_findings(&found));
+    assert_eq!(found[0].argv[1], "frobnicate");
 }
 
 /// Markdown advice in each shape the extractor handles. Every shape carries a
