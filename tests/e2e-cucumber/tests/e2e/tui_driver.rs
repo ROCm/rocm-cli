@@ -236,11 +236,12 @@ impl TuiSession {
             cmd.arg(arg);
         }
         if let Some(dir) = cwd {
+            // portable-pty 0.9.0 silently filters a non-directory cwd and
+            // falls back to `$HOME`/`%USERPROFILE%` with no error, so check
+            // it ourselves rather than let a typo'd or not-yet-created
+            // target spawn somewhere else without saying so.
             if !dir.is_dir() {
-                return Err(format!(
-                    "spawn_in target {} is not a directory",
-                    dir.display()
-                ));
+                return Err(format!("cwd {} is not a directory", dir.display()));
             }
             cmd.cwd(dir);
         }
