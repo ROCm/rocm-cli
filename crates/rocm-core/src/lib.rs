@@ -25,11 +25,14 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 
+#[cfg(all(test, unix))]
+mod archive_props;
 pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
 pub mod fix;
+pub mod hardware_root;
 pub mod host_gpu;
 pub mod managed_runtime;
 pub mod model_readiness;
@@ -63,6 +66,7 @@ pub use fix::{
     apply as apply_fix, catalog_manifest, catalog_manifest_json, exit as fix_exit,
     list_recipes as list_fix_recipes,
 };
+pub use hardware_root::host_path;
 pub use host_gpu::{
     DriverSummary, ExamineSummary, HostGpuSummary, WslHostDriverProbe, WslSummary,
     default_engine_for_host, default_engine_for_platform, detect_gpu_driver_version,
@@ -1262,7 +1266,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stdout_handle,
+            &raw mut stdout_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1278,7 +1282,7 @@ pub fn spawn_hidden_console_with_log(
             current_process,
             source,
             current_process,
-            &mut stderr_handle,
+            &raw mut stderr_handle,
             0,
             1,
             DUPLICATE_SAME_ACCESS,
@@ -1328,7 +1332,7 @@ pub fn wait_for_process_exit(pid: u32) -> Result<u32> {
     unsafe {
         WaitForSingleObject(handle, INFINITE);
         let mut exit_code = 0;
-        if GetExitCodeProcess(handle, &mut exit_code) == 0 {
+        if GetExitCodeProcess(handle, &raw mut exit_code) == 0 {
             CloseHandle(handle);
             bail!(
                 "failed to read process {pid} exit code: {}",
@@ -1511,7 +1515,7 @@ pub fn process_is_running(pid: u32) -> bool {
         return false;
     }
     let mut exit_code = 0;
-    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 };
+    let ok = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) != 0 };
     unsafe {
         CloseHandle(handle);
     }
@@ -1607,6 +1611,10 @@ pub fn detach_command_session(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 pub fn detach_command_session(_command: &mut Command) {}
 
 #[cfg(windows)]
@@ -1650,12 +1658,12 @@ fn spawn_windows_no_inherit(
             command_line.as_mut_ptr(),
             null(),
             null(),
-            if std_handles.is_some() { 1 } else { 0 },
+            i32::from(std_handles.is_some()),
             creation_flags,
             environment.as_mut_ptr().cast(),
             null(),
-            &startup_info,
-            &mut process_info,
+            &raw const startup_info,
+            &raw mut process_info,
         )
     };
     if created == 0 {

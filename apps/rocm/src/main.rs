@@ -2,6 +2,11 @@
 //
 // SPDX-License-Identifier: MIT
 
+/// Shared archive generator and filesystem oracle for the extraction property
+/// tests in `comfyui` and `therock`.
+#[cfg(all(test, unix))]
+#[path = "../../../crates/rocm-core/src/archive_props.rs"]
+mod archive_props;
 mod automations;
 mod bootstrap;
 mod chat_host_facts;
@@ -22,6 +27,7 @@ mod providers;
 mod remote;
 mod serve_cmd;
 mod serve_summary;
+mod service_hints;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -976,7 +982,7 @@ enum ServicesCommand {
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; stop refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -984,7 +990,7 @@ enum ServicesCommand {
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; restart refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -997,7 +1003,7 @@ enum ServicesCommand {
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1029,7 +1035,7 @@ enum ServicesCommand {
         /// Show what would be removed, without removing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not ask for confirmation.
+        /// Required unless --dry-run; prune refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1309,6 +1315,10 @@ fn reset_sigpipe() {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn reset_sigpipe() {}
 
 /// Run `f` with SIGPIPE temporarily ignored, restoring the previous
@@ -3994,11 +4004,11 @@ fn spawn_managed_engine_child(
             bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` \
                  without authentication, and a running server cannot be given a key it did not \
-                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 start with; stop it with `{}` and run the command again to \
                  serve it with `--require-api-key`",
                 existing.service_id,
                 resolve.canonical_model_id,
-                existing.service_id
+                service_hints::service_stop_hint(&existing.service_id)
             );
         }
         record_cli_audit_event(
@@ -4529,7 +4539,10 @@ fn run_attached_service(
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
-            println!("  stop: rocm services stop {} --yes", report.service_id);
+            println!(
+                "  stop: {}",
+                service_hints::service_stop_hint(&report.service_id)
+            );
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
@@ -4571,7 +4584,7 @@ fn run_attached_service(
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
             println!("  logs: rocm logs {service_id}");
-            println!("  stop: rocm services stop {service_id} --yes");
+            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             record_cli_audit_event(
                 &paths,
                 "service",
@@ -5014,9 +5027,9 @@ fn run_approved_service_action(
     validate_service_id(service_id)?;
     if !yes {
         bail!(
-            "{} local server `{service_id}` requires --yes.\n\nTry: rocm services {} {service_id} --yes",
+            "{} local server `{service_id}` requires --yes.\n\nTry: {}",
             service_action_verb(tool),
-            service_action_command(tool)
+            service_hints::service_action_hint(service_action_command(tool), service_id)
         );
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
@@ -5217,13 +5230,15 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     // advice a user takes away from it.
     if managed_service_record_is_in_use(&record) {
         bail!(
-            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
-            record.status
+            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
+            record.status,
+            service_hints::service_stop_hint(service_id)
         );
     }
     if !yes {
         bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+            service_hints::service_action_hint("remove", service_id)
         );
     }
 
@@ -5239,7 +5254,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
 
@@ -5450,8 +5466,10 @@ fn build_service_prune_plan(
         if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
-                "{} is {} — stop it first with `rocm services stop {} --yes`",
-                record.service_id, record.status, record.service_id
+                "{} is {} — stop it first with `{}`",
+                record.service_id,
+                record.status,
+                service_hints::service_stop_hint(&record.service_id)
             ));
             continue;
         }
@@ -6816,6 +6834,13 @@ pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The real host's `/etc/os-release`.
+///
+/// Deliberately not routed through `rocm_core::host_path`: every caller builds
+/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
+/// against the real machine, so a simulated host root must not choose its
+/// distro. The descriptive distro name `examine` reports comes from
+/// `rocm_core::detect_distro_name`, which does follow a simulated root.
 pub(crate) fn read_os_release() -> Result<String> {
     fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
 }
@@ -15152,14 +15177,14 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         ) {
             let _ = writeln!(
                 output,
-                "  stop: rocm services stop {} --yes",
-                record.service_id
+                "  stop: {}",
+                service_hints::service_stop_hint(&record.service_id)
             );
         } else {
             let _ = writeln!(
                 output,
-                "  restart: rocm services restart {} --yes",
-                record.service_id
+                "  restart: {}",
+                service_hints::service_action_hint("restart", &record.service_id)
             );
         }
     }
@@ -19058,6 +19083,10 @@ fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn gpu_vram_usage_sysfs() -> Option<Vec<GpuVramUsage>> {
     None
 }
@@ -27571,9 +27600,21 @@ install therock";
             message.contains("without authentication"),
             "the refusal must say why it refused: {message}"
         );
+        // The printed hint must be the exact, directly-runnable command: this
+        // same file's `service_actions_require_yes_and_render_sandbox_result`
+        // proves this exact form (`rocm services stop <id> --yes`) is the one
+        // the approval gate itself recommends. That running this form actually
+        // clears *this* refusal — a service reused without the key it is now
+        // being asked to require — is proven by
+        // `@id:serve-require-api-key-refuses-unauthenticated-reuse`
+        // (`tests/e2e-cucumber/features/model_serving.feature`, serve-24),
+        // which reproduces this exact condition, runs the printed hint, and
+        // asserts the record is left `stopped` — not by `stop_managed_services`
+        // in `tests/e2e-cucumber/tests/e2e.rs`, which runs this same
+        // invocation as best-effort teardown and never asserts success.
         assert!(
-            message.contains("rocm services stop lemonade-qwen-3000"),
-            "the refusal must name the way out, with the service to stop: {message}"
+            message.contains("rocm services stop lemonade-qwen-3000 --yes"),
+            "the refusal must name the way out, with the service to stop, directly runnable with --yes: {message}"
         );
         Ok(())
     }
@@ -29215,6 +29256,47 @@ install therock";
         assert!(vram_capacity_is_meaningful(Some("gfx1151"), 2));
         // An unknown target is never treated as unified memory.
         assert!(vram_capacity_is_meaningful(None, 1));
+    }
+
+    /// The package-manager plans run against the real machine, so a simulated
+    /// host root must not change the distro they are built for: under a root
+    /// whose `/etc/os-release` names a different distro, `read_os_release`
+    /// still returns the real file.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn read_os_release_ignores_a_simulated_host_root() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-os-release-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        fs::write(
+            root.join("etc/os-release"),
+            "ID=planted-distro\nVERSION_ID=\"99.9\"\n",
+        )
+        .expect("write planted os-release");
+
+        let read = {
+            let mut env = ScopedTestEnv::new();
+            env.set(
+                rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
+                &root.to_string_lossy(),
+            );
+            read_os_release().unwrap_or_default()
+        };
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !read.contains("planted-distro"),
+            "read the simulated root's os-release: {read:?}"
+        );
+        assert_eq!(
+            read,
+            fs::read_to_string("/etc/os-release").unwrap_or_default()
+        );
     }
 
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
