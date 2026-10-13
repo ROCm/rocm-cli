@@ -3165,12 +3165,10 @@ mod tests {
             fs::write(path, format!("@echo off\r\necho {target}\r\n"))?;
         } else {
             let path = bin_dir.join("rocm_agent_enumerator");
-            fs::write(&path, format!("#!/bin/sh\necho {target}\n"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-            }
+            crate::fake_executable::write_fake_executable(
+                &path,
+                format!("#!/bin/sh\necho {target}\n"),
+            )?;
         }
         Ok(())
     }

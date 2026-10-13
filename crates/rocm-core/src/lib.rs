@@ -33,6 +33,7 @@ pub mod browser;
 pub mod diagnose;
 pub mod disk_space;
 pub mod examine;
+pub mod fake_executable;
 pub mod fix;
 pub mod hardware_root;
 pub mod host_gpu;

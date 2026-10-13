@@ -113,6 +113,20 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Tests that run a fake executable
+
+Plant a stand-in `python`, `uv`, `amd-smi`, ... with
+`rocm_core::fake_executable::write_fake_executable`, not `std::fs::write`
+followed by `set_permissions(0o755)`. On Linux the plain write makes the first
+run of the fake fail intermittently with `Text file busy (os error 26)`: while
+the write fd is open, a test on another thread can spawn a child, and that child
+keeps a copy of the fd until its own `exec` (`O_CLOEXEC` closes it only then).
+The kernel refuses to execute a file any process still has open for writing, so
+the fake's first run can land in that window. The helper has a short-lived
+child write the file instead, so this process never holds a write fd on it. The
+same applies to E2E steps: scenarios run concurrently in one process, and the
+`rocm` child that runs the shim can be the one refused.
+
 Run the cross-platform smoke test:
 
 ```bash
