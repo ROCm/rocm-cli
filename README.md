@@ -430,8 +430,9 @@ hardware, not something an install or a setting can put right.
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
-- `--json` prints the catalog as JSON for tooling. It's valid only without a fix
-  id.
+- `--json`, used without a fix id, prints the catalog manifest as JSON. It
+  applies no fix and exits 0. Together with a fix id it is refused, with exit
+  code 1.
 
 ### ROCm installation
 
