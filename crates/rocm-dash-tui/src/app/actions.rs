@@ -11,9 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use crate::ui;
 
 use super::AppState;
-use super::scrollbar::{PaneFocus, ScrollTarget};
 use super::summary::summarize_json_value;
-use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal};
+use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal, PaneFocus, ScrollTarget};
 #[cfg(test)]
 use super::types::{ChatProvider, ChatRole};
 

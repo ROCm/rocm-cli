@@ -4647,7 +4647,7 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
         path,
@@ -11184,5 +11184,58 @@ exit 1
             !kernel_section.contains(r#"out["device_count"] ="#),
             "a kernel failure must preserve the enumerated device count"
         );
+    }
+}
+
+/// Property tests for the SDK tarball unpack, judged on the filesystem by
+/// `crate::archive_props`. Extraction is the system `tar` resolved from
+/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
+/// guarantees through `extract_tarball_and_discard_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use super::extract_tarball_and_discard_archive;
+    use crate::archive_props::{
+        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
+        tar_gz_bytes,
+    };
+
+    /// No escape, and no setuid/setgid or world-writable entry. The modes are
+    /// what the system `tar` gives an unprivileged user, so they are not
+    /// judged when this runs as root (see `Modes`).
+    #[test]
+    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let expect = Expect {
+            modes: Modes::SafeUnlessRoot,
+            no_outward_links: false,
+        };
+        note_mode_scope("therock", expect.modes);
+        run_property("therock", 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "sdk.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| {
+                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
+                },
+            )
+            .judge(expect)
+        })
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed tarball is extracted in full, into
+    /// the install root it was given. An unpack that wrote somewhere else
+    /// entirely escapes the oracle above; this catches it.
+    #[test]
+    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        run_round_trip("therock-benign", |layout, entries| {
+            let archive = layout.base.join("sdk.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
     }
 }
