@@ -1242,14 +1242,6 @@ fn render_stopped(
     output
 }
 
-// `shell_quote` used to be defined here. It now lives in `crate::shell_quote`,
-// because the command *previews* a user approves need the same guarantee —
-// this value is one word and nothing else — and giving them a quoter of their
-// own is how they ended up with one that left `$`, a backtick and a lone `"`
-// unescaped. Model names and engine flags still reach a shell on another
-// machine through it; see that module for the tests, including the one that
-// asks a real `sh`.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1431,10 +1423,9 @@ mod tests {
         assert!(command.contains("--gpu 1"), "{command}");
     }
 
-    // The quoter's own tests — including the one that asks a real `sh` whether
-    // a hostile value survives as a single literal argument — moved with it to
-    // `crate::shell_quote`. What stays here is what is specific to this module:
-    // that the remote command actually uses it.
+    // The quoter's own tests, including a real `sh` reading a hostile value
+    // back, are with the quoter in `rocm-dash-tui`'s `ui::exec`. This one
+    // pins what is specific to this module: that the remote command uses it.
 
     #[test]
     fn a_hostile_model_name_is_quoted_into_the_remote_command() {
