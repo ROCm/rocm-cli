@@ -489,7 +489,8 @@ was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
 entry of the user's that the new release starts shipping (`set aside:`) and
 leaves anything else in place. An install from before that record replaces
 the entries named like the new release's code and lists them (`replaced:`).
-It leaves the install untouched when the new source cannot be obtained,
+It leaves the install untouched when the new source cannot be obtained or is
+not a ComfyUI release, or when ComfyUI is found running just before the swap;
 `start` refuses a folder whose swap was interrupted or stopped part-way, and
 the command it names finishes it. The swap is unit-tested directly, without a
 fake Python. Most of those tests also run on Windows: stopping the swap before
@@ -500,11 +501,11 @@ cannot be removed, the copy taken when the release cannot be renamed into
 place across filesystems, `main.py` removed first and moved in last, a
 release without `main.py` refused before anything changes, and the
 `replaced:` list of an install with no record staying complete when its swap
-is interrupted at any step. The
-symlink tests (symlinked model folders, links inside them, loops, dangling
-links, copying links without following them), the inode/ctime test and a copy
-that fails part-way are Unix-only; the retry while another program holds a
-file and names that differ only in case are Windows-only:
+is interrupted at any step. The symlink tests (symlinked model folders, links
+inside them, loops, dangling links, copying links without following them), the
+inode/ctime test and a copy that fails part-way are Unix-only; the retry while
+another program holds a file and names that differ only in case are
+Windows-only:
 
 ```bash
 cargo test -p rocm --bin rocm comfyui::source_swap

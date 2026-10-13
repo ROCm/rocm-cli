@@ -543,6 +543,8 @@ async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     let build_dir = root(world).join("comfyui-fixture").join("archive-build");
     let source_dir = build_dir.join("ComfyUI-master");
     std::fs::create_dir_all(&source_dir).expect("failed to create ComfyUI source directory");
+    // Every ComfyUI release has it; an archive without one is refused.
+    write_fixture(&source_dir.join("main.py"), "");
     write_fixture(
         &source_dir.join("requirements.txt"),
         "torch==2.4.0\ntorchvision==0.19.0\ntorchaudio==2.4.0\n",
@@ -1020,6 +1022,17 @@ async fn preview_command_includes_reinstall(world: &mut E2eWorld) {
 async fn comfyui_running_from_install(world: &mut E2eWorld) {
     let port = hold_answering_port(world);
     plant_running_state(world, spawn_stand_in(), port);
+    // What the rest of the scenario rests on: rocm-cli reads it as running,
+    // not as starting.
+    let (stdout, stderr, rc) = run_keeping_scenario_env(world, &["comfyui", "status"]);
+    assert_eq!(
+        rc, 0,
+        "`rocm comfyui status` failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("  status: running\n"),
+        "the planted ComfyUI must read as running, got:\n{stdout}"
+    );
 }
 
 /// A ComfyUI started with `rocm comfyui start` that is still loading: its
@@ -1038,8 +1051,9 @@ async fn comfyui_loading_from_install(world: &mut E2eWorld) {
 /// `rocm comfyui start` is run while a reinstall downloads the newer release:
 /// the server records the started ComfyUI, answering on its port, when the
 /// download begins, which is after the reinstall's first check that nothing
-/// runs from the folder. Only the first request does, so a later reinstall
-/// that downloads again finds nothing new started.
+/// runs from the folder. Only on the first request: the reinstall after
+/// `stop` reuses the downloaded archive, and should it download again it
+/// still must not find ComfyUI started a second time.
 #[given(
     "a newer ComfyUI release is available, and ComfyUI is started from that install while it downloads"
 )]
@@ -1112,6 +1126,25 @@ fn plant_running_state(world: &E2eWorld, pid: u32, port: u16) {
     write_fixture(
         &running_state_path(world),
         &running_state_json(world, pid, port),
+    );
+}
+
+#[then("the reinstall was refused before it downloaded anything")]
+async fn refused_before_download(world: &mut E2eWorld) {
+    let downloads = comfyui_source_dir(world)
+        .parent()
+        .expect("source has a parent")
+        .join("downloads");
+    let downloaded: Vec<_> = match std::fs::read_dir(&downloads) {
+        Ok(entries) => entries
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("failed to read {}: {error}", downloads.display()),
+    };
+    assert!(
+        downloaded.is_empty(),
+        "a reinstall refused up front must not download first: {downloaded:?}"
     );
 }
 

@@ -163,6 +163,7 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the existing ComfyUI code and the user's files are untouched
     When the user reinstalls ComfyUI
     Then the reinstall is refused and names rocm comfyui stop
+    And the reinstall was refused before it downloaded anything
     And the existing ComfyUI code and the user's files are untouched
     When the user stops ComfyUI
     And the user reinstalls ComfyUI
