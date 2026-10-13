@@ -1731,6 +1731,22 @@ impl ExamineSummary {
         })
     }
 
+    /// The `rocm_support` line of the examine text, or an empty string.
+    ///
+    /// Present only when a GPU was detected but no ROCm package family covers
+    /// it (for example the gfx90c Vega iGPU in Renoir / Cezanne APUs). Without
+    /// it `compatible_therock_family: <unknown>` reads like a probe failure, when
+    /// the GPU was in fact recognized and simply has no ROCm build.
+    fn rocm_support_line(&self) -> String {
+        match (self.detected_gfx_target.as_deref(), self.compatible_therock_family.as_deref()) {
+            (Some(gfx), None) => format!(
+                "  rocm_support: GPU detected ({gfx}) but not supported by ROCm; \
+                 the Vulkan backend can still be used\n"
+            ),
+            _ => String::new(),
+        }
+    }
+
     pub fn render_text(&self) -> String {
         let legacy_paths = if self.legacy_rocm.paths.is_empty() {
             "<none>".to_owned()
@@ -1753,7 +1769,7 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1767,6 +1783,7 @@ impl ExamineSummary {
             self.compatible_therock_family
                 .as_deref()
                 .unwrap_or("<unknown>"),
+            self.rocm_support_line(),
             self.detected_therock_family
                 .as_deref()
                 .unwrap_or("<not detected>"),
@@ -4416,6 +4433,69 @@ Class Name:                Display
         assert!(rendered.contains("managed_runtimes: 2"));
         assert!(rendered.contains("managed_services: 1"));
         assert!(rendered.contains("model_cache_entries: 3"));
+    }
+
+    fn examine_summary_with_gpu(
+        detected_gfx_target: Option<&str>,
+        compatible_therock_family: Option<&str>,
+    ) -> ExamineSummary {
+        ExamineSummary {
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "lemonade".to_owned(),
+            detected_gfx_target: detected_gfx_target.map(str::to_owned),
+            compatible_therock_family: compatible_therock_family.map(str::to_owned),
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "windows_validate_only".to_owned(),
+                status: "amd_display_driver_detected".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        }
+    }
+
+    #[test]
+    fn examine_render_says_a_gpu_without_a_rocm_family_is_unsupported() {
+        // gfx90c is detected from its PCI ID but has no ROCm package family.
+        let family = normalize_therock_family("gfx90c");
+        let summary = examine_summary_with_gpu(Some("gfx90c"), family.as_deref());
+        let rendered = summary.render_text();
+        assert!(rendered.contains("detected_gfx_target: gfx90c"), "{rendered}");
+        assert!(
+            rendered.contains("rocm_support: GPU detected (gfx90c) but not supported by ROCm"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("the Vulkan backend can still be used"), "{rendered}");
+    }
+
+    #[test]
+    fn examine_render_omits_the_support_note_for_supported_or_missing_gpus() {
+        let family = normalize_therock_family("gfx1103");
+        let supported = examine_summary_with_gpu(Some("gfx1103"), family.as_deref());
+        let rendered = supported.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
+
+        let missing = examine_summary_with_gpu(None, None);
+        let rendered = missing.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
     }
 
     #[test]
