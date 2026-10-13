@@ -32,9 +32,11 @@ for Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
+
+For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
@@ -282,8 +284,10 @@ fix` takes the id, not the position.
   this machine (nothing needs to be installed inside the distribution — name
   it only when more than one is installed). Inspecting remotely this way
   skips checks that need to read the distribution's own environment
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
-  `rocm diagnose` inside the distribution for those.
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) and the
+  library and shared-memory checks (`fix-18-comgr-conflict`,
+  `fix-19-shm-too-small`) — run `rocm diagnose` inside the distribution for
+  those.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing — there is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action. The
