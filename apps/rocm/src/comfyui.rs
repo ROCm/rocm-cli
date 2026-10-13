@@ -3259,13 +3259,13 @@ mod archive_properties {
     /// of the app root, and the very next install step creates `models/`
     /// through it. Minimal shrunk counterexample: one entry, `l -> ..`.
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn source_unpack_never_writes_outside_the_app_root() {
         property("comfyui", entries(), ESCAPES_ONLY, false).unwrap();
     }
 
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn installed_source_path_is_a_real_directory() {
         property("comfyui-source-dir", entries(), ESCAPES_ONLY, true).unwrap();
     }
@@ -3295,7 +3295,7 @@ mod archive_properties {
     /// first install write, nothing may exist under `outside/` and `source`
     /// must be a real directory.
     #[test]
-    #[ignore = "known defect: a top-level symlink in the source archive becomes the install's source dir (#522)"]
+    #[ignore = "known gap: a top-level symlink in the source archive becomes the install's source dir (#522)"]
     fn top_level_symlink_in_source_archive_does_not_redirect_the_install() {
         use crate::archive_props::{OUTSIDE_TOKEN, concretize};
         let layout = Layout::new();
