@@ -1488,11 +1488,14 @@ needs is enabled only by its own CI step.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios
-`examine-20` to `examine-22` in
-[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one:
+`examine-20` to `examine-23` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
+`examine-23` also plants a GPU in the kernel topology and puts an `lspci`
+listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
+lane, with or without a GPU:
 
 ```bash
-RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[012] '
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
 ```
 
 The install plans deliberately read the real file, so no scenario plants one

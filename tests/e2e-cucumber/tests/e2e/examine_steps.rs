@@ -1319,10 +1319,42 @@ async fn os_release_reassigned(world: &mut E2eWorld) {
 async fn os_release_with_a_command(world: &mut E2eWorld) {
     // To `sh`, line 3 is a command that changes `ID`, so no value after it can
     // be trusted: the file is unreadable rather than "Ubuntu".
-    plant_os_release(
-        world,
-        "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
-    );
+    plant_os_release(world, RUNS_A_COMMAND_ON_LINE_3);
+}
+
+/// A release file whose line 3 is a command that changes `ID`.
+const RUNS_A_COMMAND_ON_LINE_3: &str =
+    "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
+
+#[given("a GPU machine whose release file runs a command on line 3")]
+async fn gpu_machine_with_unreadable_os_release(world: &mut E2eWorld) {
+    plant_os_release(world, RUNS_A_COMMAND_ON_LINE_3);
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
+    // matches no `lspci` entry and is listed from the topology alone.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards.
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
 }
 
 #[when("the user inspects that machine in machine-readable form")]
@@ -1374,6 +1406,40 @@ async fn assert_reported_distribution(
 async fn assert_os_release_read_cleanly(world: &mut E2eWorld) {
     let json = parsed_json(world);
     assert_eq!(os_release_failures(&json), Vec::<String>::new(), "{json:#}");
+}
+
+#[then(
+    expr = "the inspection's verdict is degraded, and its only failure is line {int} of the release file"
+)]
+async fn assert_degraded_by_os_release_alone(world: &mut E2eWorld, line: u32) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    // The GPU is what lets the verdict be `degraded` rather than `no-amd-gpu`.
+    assert_eq!(
+        json.get("has_amd_gpu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the planted GPU was not found:\n{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, &format!("/{VERDICT_FIELD}")),
+        "degraded",
+        "{json:#}"
+    );
+    let failures: Vec<&str> = json
+        .get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        failures,
+        vec![format!(
+            "/etc/os-release line {line} is not a plain assignment: \"export ID=debian\"; \
+             the distro is not reported."
+        )],
+        "{json:#}"
+    );
 }
 
 #[then("the inspection reports no distribution")]

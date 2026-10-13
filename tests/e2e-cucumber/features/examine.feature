@@ -311,3 +311,17 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then the inspection reports no distribution
     And the inspection says line 3 of the release file is not a plain assignment, in its failures and in the distribution name
+
+  # The verdict needs a GPU to degrade from: without one it is `no-amd-gpu`
+  # whatever the release file says. The planted root supplies one through the
+  # kernel topology (a KFD node, which the topology probe reads under the
+  # simulated root), and a stand-in `lspci` on PATH reports an empty PCI bus so a
+  # runner without `lspci` does not add a failure of its own. A real GPU's
+  # `lspci` entry would not match the planted node's address either way. So this
+  # runs on every Linux lane, GPU or not, and the release file is the only thing
+  # that can degrade the verdict.
+  @id:examine-degrades-on-unreadable-os-release @requires-os:linux
+  Scenario: examine-23 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file runs a command on line 3
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure is line 3 of the release file
