@@ -299,7 +299,7 @@ Feature: Model serving
   # `--require-api-key` reuse refusal (#604). A running server's key is read once
   # at launch; reuse cannot retroactively satisfy a demand for auth the server
   # never got, so the idempotency guard refuses instead of upgrading the record
-  # in place (see `spawn_managed_engine_child` in `main.rs`). This is the
+  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
   # local-side proof that the printed stop hint is not just present but correct
   # and directly runnable: the scenario stops the service with it and checks the
   # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
@@ -310,7 +310,7 @@ Feature: Model serving
   # this guard without a live GPU, same as every other `@requires-gpu` scenario
   # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
   # bind, and the serve path's `ensure_public_bind_engine_supported` guard
-  # (defined in `main.rs`, called from `serve_cmd.rs`) refuses that combination
+  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
   # for Lemonade on Windows (its server can't receive the key through the
   # Windows detached-spawn primitive), so this scenario cannot reach the
   # refusal it exercises there.

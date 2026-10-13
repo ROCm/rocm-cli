@@ -85,8 +85,14 @@ pub struct Gpu {
 }
 
 /// Stat of a device node such as `/dev/kfd` or `/dev/dri/renderD*`.
+///
+/// `path` is always the logical host path (`/dev/kfd`), as `rocm examine
+/// --json` reports it. When a test build re-roots hardware probes (see
+/// [`crate::host_path`]), the node is read under that root, but the root never
+/// appears here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
+    /// The logical host path of the node, never the re-rooted one.
     pub path: String,
     pub exists: bool,
     pub mode: String,
@@ -2819,7 +2825,7 @@ fn probe_shared_memory_at(e: &mut Examination, path: &str) {
 /// keep distinct from zero: a machine that could not be measured is not a
 /// machine with no space.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in process.rs
 fn filesystem_size(path: &str) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
