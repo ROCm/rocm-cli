@@ -1788,6 +1788,7 @@ jobs:
           {
             echo "json<<${delimiter}"
             cat release-readiness/facts.json
+            echo
             echo "${delimiter}"
           } >> "$GITHUB_OUTPUT"
 
