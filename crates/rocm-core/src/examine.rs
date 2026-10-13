@@ -85,8 +85,14 @@ pub struct Gpu {
 }
 
 /// Stat of a device node such as `/dev/kfd` or `/dev/dri/renderD*`.
+///
+/// `path` is always the logical host path (`/dev/kfd`), as `rocm examine
+/// --json` reports it. When a test build re-roots hardware probes (see
+/// [`crate::host_path`]), the node is read under that root, but the root never
+/// appears here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
+    /// The logical host path of the node, never the re-rooted one.
     pub path: String,
     pub exists: bool,
     pub mode: String,
