@@ -148,7 +148,16 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
         {
             Some(pinned) => Decision::Reuse {
                 reason: format!("runtime already matches the pinned version {pin}"),
-                activate: Some(pinned.runtime_key.clone()),
+                // Same rule as the unpinned up-to-date branch below: only an
+                // `up_to_date` line's `target=` names a composition-migrated
+                // replacement for the SAME version. Any other status (e.g.
+                // `update_available`) means `target=` names the channel's
+                // newer latest instead, which a pin must not follow.
+                activate: Some(if pinned.status.as_deref() == Some("up_to_date") {
+                    pinned.serving_runtime_key().to_owned()
+                } else {
+                    pinned.runtime_key.clone()
+                }),
             },
             // `update`/`repair` only ever apply the report's `target=` key, which
             // is the index's latest — never this pin — so a miss means a fresh
@@ -1599,6 +1608,28 @@ runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release st
             None,
         ) else {
             panic!("a migrated tree must be reused");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-multi-arch-7-13-0-0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn pin_matching_a_superseded_line_activates_the_replacement_not_the_legacy_key() {
+        // Same migrated-tree shape as the unpinned case above, but reached via
+        // the pin branch: the pin matches the line's own (legacy) key, so the
+        // activated key must still come from `serving_runtime_key()`.
+        let Decision::Reuse { activate, .. } = decide(
+            &report_with_target(
+                "up_to_date",
+                "release",
+                "release-wheel-multi-arch-7-13-0-0123456789abcdef",
+            ),
+            "release",
+            Some("7.13.0"),
+        ) else {
+            panic!("a pin matching a migrated tree must be reused");
         };
         assert_eq!(
             activate.as_deref(),
