@@ -336,6 +336,7 @@ Feature: Model serving
     When the user opens the interactive serve summary for that launch
     Then the deployment summary blames this launch for GPU memory
     And the deployment summary names the GPU memory knobs
+    And the deployment summary quotes the engine's own failing line
 
   # Regression test for the GPU fail-fast contract (EAI-8059 review). The reuse
   # pre-gate that lets an already-running service skip the no-usable-GPU bail used
