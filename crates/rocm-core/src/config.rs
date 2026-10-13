@@ -563,6 +563,17 @@ impl RocmCliConfig {
     ///   non-finite `f64` (JSON has no NaN, so it is written as `null`). The
     ///   bytes are parsed back before anything is written, and the save fails
     ///   with the existing file left as it was.
+    ///
+    /// Not guaranteed, on Windows:
+    /// - Replacing a `config.json` that another process holds open without
+    ///   delete sharing. The replace then fails with a sharing violation, the
+    ///   save returns that error, and the old config stays in place.
+    /// - A replace that fails part-way. `ReplaceFileW` can move the old file
+    ///   off the `config.json` name and then fail to move the new one on; the
+    ///   writer retries once with a plain rename, and if that fails too the new
+    ///   contents stay in the `config.json.tmp-*` file the error names. Until
+    ///   it is renamed back there is no `config.json`, which `load` reads as
+    ///   "no settings".
     pub fn save(&self, paths: &AppPaths) -> Result<()> {
         let path = paths.config_path();
         let bytes =
@@ -844,56 +855,6 @@ mod tests {
         let tool = loaded.tools.get("python").expect("python tool should load");
         assert!(tool.managed);
         assert_eq!(tool.path.as_deref(), Some(python.as_path()));
-        Ok(())
-    }
-
-    /// `save` must replace `config.json`, not rewrite it in place: an in-place
-    /// write truncates first, so a full disk part-way through leaves a file
-    /// `load` rejects. A hard link taken before the save still names the old
-    /// file's contents only if the save published a new file over the path.
-    ///
-    /// Unix-only because it observes replacement through a hard link. On
-    /// Windows the same guarantee is asserted by the `#[cfg(windows)]`
-    /// `saving_the_config_replaces_the_file_rather_than_rewriting_it_in_place`,
-    /// through the file identity: `ReplaceFileW` leaves the published file with
-    /// the replacement's file ID, not the replaced one's.
-    #[cfg(unix)]
-    #[test]
-    fn config_save_replaces_the_file_instead_of_rewriting_it_in_place() -> Result<()> {
-        let (root, paths) = temp_app_paths("config-save-replaces");
-        let previous = RocmCliConfig {
-            active_runtime_key: Some("previous-runtime".to_owned()),
-            ..RocmCliConfig::default()
-        };
-        previous.save(&paths)?;
-        let before = fs::read(paths.config_path())?;
-        let witness = root.join("config-before-save.json");
-        fs::hard_link(paths.config_path(), &witness)?;
-
-        let next = RocmCliConfig {
-            active_runtime_key: Some("next-runtime".to_owned()),
-            ..RocmCliConfig::default()
-        };
-        next.save(&paths)?;
-
-        let witnessed = fs::read(&witness)?;
-        let loaded = RocmCliConfig::load(&paths)?;
-        let leftovers: Vec<_> = fs::read_dir(&paths.config_dir)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.file_name())
-            .filter(|name| name != "config.json")
-            .collect();
-        fs::remove_dir_all(root).ok();
-
-        assert_eq!(
-            witnessed, before,
-            "save rewrote the existing config.json in place"
-        );
-        assert_eq!(loaded.active_runtime_key.as_deref(), Some("next-runtime"));
-        assert!(
-            leftovers.is_empty(),
-            "save left files behind: {leftovers:?}"
-        );
         Ok(())
     }
 
@@ -1333,11 +1294,17 @@ last_installed_runtime_id = "therock-release"
         };
         config.save(&paths)?;
         let before = fs::metadata(paths.config_path())?.ino();
+        let before_bytes = fs::read(paths.config_path())?;
+        // A second name for the old file: if the save rewrote it in place, the
+        // new contents would show through this link too.
+        let witness = root.join("config-before-save.json");
+        fs::hard_link(paths.config_path(), &witness)?;
 
         config.default_engine = Some("lemonade".to_owned());
         config.save(&paths)?;
         let after = fs::metadata(paths.config_path())?.ino();
 
+        let witnessed = fs::read(&witness)?;
         let loaded = RocmCliConfig::load(&paths)?;
         let _ = fs::remove_dir_all(&root);
 
@@ -1345,6 +1312,10 @@ last_installed_runtime_id = "therock-release"
             before, after,
             "an overwrite that keeps the same inode rewrote the live config in \
              place, so an interrupted save can leave it truncated"
+        );
+        assert_eq!(
+            witnessed, before_bytes,
+            "save rewrote the existing config.json in place"
         );
         assert_eq!(loaded.default_engine.as_deref(), Some("lemonade"));
         Ok(())
