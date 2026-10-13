@@ -95,22 +95,24 @@ async fn assert_prompt_marked(world: &mut E2eWorld) {
     let marker = format!("(rocm:{ENGINE})");
     // The marker must be on the rendered prompt line, which is what the user
     // actually sees — not merely somewhere in the informational block above it.
-    session
-        .wait_for_screen(&marker, SCREEN_TIMEOUT)
-        .await
-        .unwrap_or_else(|e| panic!("engine shell prompt was not marked: {e}"));
-
-    let screen = session.screen_text();
+    // That block names the marker too ("your prompt is now prefixed
+    // (rocm:vllm)") and is printed before bash starts, so waiting for the bare
+    // marker returns before any prompt exists; wait for the prompt line itself.
     // `$` for a normal user's prompt, `#` for root's -- this suite runs as root
     // on the WSL2 hardware lane, so both are genuine prompt lines.
-    let on_a_prompt_line = screen
-        .lines()
-        .filter(|line| line.contains(&marker))
-        .any(|line| line.contains('$') || line.contains('#'));
-    assert!(
-        on_a_prompt_line,
-        "the marker never reached a prompt line:\n{screen}"
-    );
+    session
+        .wait_for_screen_where(
+            "the marker is on a prompt line",
+            |screen| {
+                screen
+                    .lines()
+                    .filter(|line| line.contains(&marker))
+                    .any(|line| line.contains('$') || line.contains('#'))
+            },
+            SCREEN_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the marker never reached a prompt line: {e}"));
 }
 
 #[then("the engine environment's interpreter is the one that runs")]
