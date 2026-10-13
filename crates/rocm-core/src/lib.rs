@@ -6750,7 +6750,14 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_public_amd_smi_entry_point_gates_on_the_real_kfd_device() {
-        let _host_root = host_root_guard();
+        // Acquired by name rather than through `host_root_guard()`: this is the
+        // one test here that also calls `RestoredEnvVar::set`, and the
+        // env-mutation contract guard matches TEXT -- it recognises a
+        // serializer by the `_TEST_LOCK` suffix, which the helper's name hides.
+        // Same lock, spelled so the guard can see it.
+        let _host_root = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         #[cfg(feature = "e2e-test-hooks")]
         let _simulated_host = {
             let root = tempfile::tempdir().expect("a simulated host root");
