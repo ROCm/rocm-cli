@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Crash- and race-safe file replacement.
+//! Atomic file replacement, shared by `rocm` and `rocmd`.
 //!
 //! [`write_file_atomically`] stages the bytes in a fresh sibling temp file and
 //! then publishes it over the destination in one step, so a reader sees either
@@ -13,9 +13,20 @@
 //! reserved with `create_new`, so two writers — threads of one process or
 //! separate processes — can never write through the same temp file, even when
 //! their pid and millisecond collide; a collision just moves on to the next
-//! attempt. A failed write or publish removes its temp file. On Windows the
-//! publish uses `ReplaceFileW` when the destination already exists, because
-//! `rename` onto an existing file is not a replace there.
+//! attempt. A failed write or publish removes its temp file.
+//!
+//! On Windows, when the destination already exists, the publish uses
+//! `ReplaceFileW` rather than `rename`. `std::fs::rename` does replace an
+//! existing file there, but as `MoveFileExW` it fails with a sharing violation
+//! while another process holds the destination open, which is the case
+//! `ReplaceFileW` is used for. Two publishes of one file in flight at once
+//! through `ReplaceFileW` are not exercised by any test; the concurrency tests
+//! below run on Unix only.
+//!
+//! Atomic, not durable: neither the temp file nor its directory is fsynced
+//! before the publish. That survives a crashed process and a concurrent
+//! writer, but after a power loss a filesystem that does not order data before
+//! the rename can still show an empty or stale destination.
 //!
 //! This makes each file individually atomic. It does not serialize a
 //! read-modify-write across processes: two writers that each read, change and
@@ -67,7 +78,7 @@ pub fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 /// published. Both exist so tests can force a temp-name collision and hold
 /// writers at the publish point; production code calls
 /// [`write_file_atomically`].
-pub fn write_file_atomically_with<S, P>(
+fn write_file_atomically_with<S, P>(
     path: &Path,
     bytes: &[u8],
     suffix_for_attempt: S,
@@ -86,11 +97,17 @@ where
     )
 }
 
-/// [`write_file_atomically_with`] with the publish step injected as well.
+/// Test seam: [`write_file_atomically`] with the temp name, a hook before the
+/// publish, and the publish step itself injected.
 ///
-/// Tests use it to observe the staged file and the destination at the moment
-/// of publication, or to make the publication fail. Pass
-/// [`publish_temp_file`] for the real one.
+/// Tests use it to force a temp-name collision, to hold writers at the publish
+/// point, to observe the staged file and the destination at the moment of
+/// publication, or to make the publication fail. Pass [`publish_temp_file`]
+/// for the real publish. Production code calls [`write_file_atomically`].
+///
+/// `pub` only because `apps/rocm`'s metadata-cache tests drive it across the
+/// crate boundary; hidden from the docs because it is not an API to build on.
+#[doc(hidden)]
 pub fn write_file_atomically_with_publish<S, P, F>(
     path: &Path,
     bytes: &[u8],
@@ -109,8 +126,12 @@ where
 }
 
 /// Write `bytes` to a fresh, uniquely named sibling of `path` and return the
-/// staged file's path without publishing it. The caller owns the staged file:
-/// it either publishes it or removes it.
+/// staged file's path without publishing it.
+///
+/// The caller owns the staged file and must remove it once done with it; on a
+/// staging failure nothing is left behind. To *replace* `path` with the bytes,
+/// call [`write_file_atomically`] instead, which also removes the staged file
+/// when the publish fails.
 pub fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let temp_id = process_temp_id();
     stage_file_for_atomic_publish_with(path, bytes, |attempt| {
@@ -121,10 +142,28 @@ pub fn stage_file_for_atomic_publish(path: &Path, bytes: &[u8]) -> Result<PathBu
 fn stage_file_for_atomic_publish_with<S>(
     path: &Path,
     bytes: &[u8],
-    mut suffix_for_attempt: S,
+    suffix_for_attempt: S,
 ) -> Result<PathBuf>
 where
     S: FnMut(u32) -> OsString,
+{
+    stage_file_for_atomic_publish_with_writer(path, bytes, suffix_for_attempt, |file, bytes| {
+        file.write_all(bytes)
+    })
+}
+
+/// [`stage_file_for_atomic_publish_with`] with the write into the reserved
+/// temp file injected, so a test can make it fail the way a full disk does
+/// without filling one.
+fn stage_file_for_atomic_publish_with_writer<S, W>(
+    path: &Path,
+    bytes: &[u8],
+    mut suffix_for_attempt: S,
+    write: W,
+) -> Result<PathBuf>
+where
+    S: FnMut(u32) -> OsString,
+    W: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
 {
     let parent = path.parent().context("file path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
@@ -156,7 +195,7 @@ where
         );
     };
 
-    if let Err(error) = file.write_all(bytes) {
+    if let Err(error) = write(&mut file, bytes) {
         drop(file);
         let _ = fs::remove_file(&tmp);
         return Err(disk_space::map_write_error(error, &tmp));
@@ -181,16 +220,26 @@ where
         .with_context(|| format!("failed to publish {}", path.display()))
 }
 
-/// Move the staged file `tmp` over `path` in one step, replacing any existing
-/// file without first removing it.
+/// Test seam: move the staged file `tmp` over `path` in one step, replacing
+/// any existing file without first removing it.
+///
+/// The real publish step to pass to [`write_file_atomically_with_publish`].
+/// `pub` only for that cross-crate test use; it does not remove `tmp` on
+/// failure, so production code calls [`write_file_atomically`] instead.
 #[cfg(not(windows))]
+#[doc(hidden)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
-/// Move the staged file `tmp` over `path` in one step, replacing any existing
-/// file without first removing it.
+/// Test seam: move the staged file `tmp` over `path` in one step, replacing
+/// any existing file without first removing it.
+///
+/// The real publish step to pass to [`write_file_atomically_with_publish`].
+/// `pub` only for that cross-crate test use; it does not remove `tmp` on
+/// failure, so production code calls [`write_file_atomically`] instead.
 #[cfg(windows)]
+#[doc(hidden)]
 pub fn publish_temp_file(tmp: &Path, path: &Path) -> io::Result<()> {
     if path.try_exists()? {
         return replace_file_windows(path, tmp);
@@ -253,15 +302,37 @@ mod tests {
         ))
     }
 
+    /// A write that runs out of space while staging says so in words, and
+    /// leaves no temp file behind to keep the disk full. Drives the real
+    /// staging path — the one both [`write_file_atomically`] and
+    /// [`stage_file_for_atomic_publish`] go through — with only the byte write
+    /// into the reserved temp file swapped for one that fails like a full
+    /// disk, so the mapping is checked where it is applied rather than on its
+    /// own.
     #[test]
-    fn write_file_atomically_reports_a_full_disk_clearly() {
-        // Exercise the mapping the write path uses, without filling a disk.
-        let error = disk_space::map_write_error(
-            std::io::Error::from(std::io::ErrorKind::StorageFull),
-            Path::new("/cache/rocm.tar.gz.tmp"),
-        );
+    fn staging_into_a_full_disk_reports_it_clearly_and_removes_the_temp_file() {
+        let root = scratch_dir("atomic-full-disk");
+        let destination = root.join("rocm.tar.gz");
+
+        let error = stage_file_for_atomic_publish_with_writer(
+            &destination,
+            b"payload",
+            |attempt| OsString::from(format!("full-disk-{attempt}")),
+            |_, _| Err(io::Error::from(io::ErrorKind::StorageFull)),
+        )
+        .expect_err("a write that hits a full disk must fail");
+
+        let leftovers: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let _ = fs::remove_dir_all(&root);
         let text = format!("{error:#}");
         assert!(text.contains("ran out of disk space"), "{text}");
+        assert!(
+            leftovers.is_empty(),
+            "the failed staging left files behind: {leftovers:?}"
+        );
     }
 
     /// The temp name keeps every extension, so a cleanup sweep over a cache
