@@ -1975,14 +1975,12 @@ fn install_wheel_runtime(
     if let Some(warning) = no_wheel_warning.as_deref() {
         progress_line(format!("Warning: {warning}"));
     }
-    // An unverified torchaudio is the one stack choice ROCm CLI made on its own
-    // judgement; say so in the install log, not only in the summary block.
-    if let Some(pin) = resolution
+    if let Some(note) = resolution
         .torchaudio_pin
         .as_ref()
-        .filter(|pin| !pin.is_verified())
+        .and_then(unverified_torchaudio_note)
     {
-        progress_line(format!("Note: {}", pin.describe()));
+        progress_line(note);
     }
 
     // Explain, in the visible install log, why an older TheRock ROCm is chosen
@@ -3835,10 +3833,19 @@ struct TorchaudioPin {
 enum TorchaudioPinBasis {
     /// `version` is the hardware-verified release for this ROCm line.
     Verified,
-    /// A verified release (held here) is recorded for this ROCm line, but the
-    /// index publishes no build of it for this Python and platform, so
-    /// `version` is the newest build instead.
-    VerifiedNotPublished(&'static str),
+    /// A verified release is recorded for this ROCm line, but the index
+    /// publishes no build of it labelled for this exact ROCm build (`+rocm`
+    /// label) for this Python and platform, so `version` is the newest build
+    /// instead.
+    VerifiedNotPublished {
+        release: &'static str,
+        /// A build of `release` this Python and platform can install, labelled
+        /// for another ROCm build, when one is published. The verified release
+        /// is matched by ROCm line, so a `10.1.1` request can find it published
+        /// only as `+rocm10.1.0`; the reason must then name the ROCm build, not
+        /// the Python or platform.
+        other_build: Option<String>,
+    },
     /// No verified release is recorded for this ROCm line, so `version` is the
     /// newest build.
     NoVerifiedRelease,
@@ -3859,14 +3866,34 @@ impl TorchaudioPin {
             TorchaudioPinBasis::Verified => format!(
                 "torchaudio {version}, the build verified on hardware for ROCm {rocm_version}"
             ),
-            TorchaudioPinBasis::VerifiedNotPublished(release) => format!(
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: None,
+            } => format!(
                 "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is not published for this Python and platform"
+            ),
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: Some(other_build),
+            } => format!(
+                "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because the verified release, {release}, is published for this Python and platform only for another ROCm build ({other_build}), not for ROCm {rocm_version}"
             ),
             TorchaudioPinBasis::NoVerifiedRelease => format!(
                 "torchaudio {version}, the newest build published for ROCm {rocm_version}; it is not hardware-verified, because no torchaudio release is recorded as verified for this ROCm line"
             ),
         }
     }
+}
+
+/// The install-log line for a torchaudio pin that is not hardware-verified, or
+/// `None` for one that is.
+///
+/// An unverified torchaudio is the one stack choice ROCm CLI makes on its own
+/// judgement, so a real install says so in the install log, not only in the
+/// plan's `torchaudio_selection:` line. A verified pin needs no such warning.
+/// The text is [`TorchaudioPin::describe`], so it cannot disagree with the pin.
+fn unverified_torchaudio_note(pin: &TorchaudioPin) -> Option<String> {
+    (!pin.is_verified()).then(|| format!("Note: {}", pin.describe()))
 }
 
 /// The torchaudio build to pin for `rocm_version`, from `published` (this
@@ -3905,7 +3932,19 @@ fn torchaudio_pin(
     let basis = match verified_release {
         Some(release) => match published_build_of(&built_for_rocm, release) {
             Some(version) => return Ok(pin(version, TorchaudioPinBasis::Verified)),
-            None => TorchaudioPinBasis::VerifiedNotPublished(release),
+            // Not among `built_for_rocm`, so a labelled build of it in the
+            // whole listing is one for another ROCm build.
+            None => TorchaudioPinBasis::VerifiedNotPublished {
+                release,
+                other_build: published_build_of(
+                    &published
+                        .iter()
+                        .filter(|version| package_rocm_suffix(version).is_some())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    release,
+                ),
+            },
         },
         None => TorchaudioPinBasis::NoVerifiedRelease,
     };
@@ -8685,29 +8724,69 @@ mod tests {
         let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0"), "https://index.test")?;
         assert_eq!(
             pin.basis,
-            TorchaudioPinBasis::VerifiedNotPublished("2.11.0")
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0",
+                other_build: None,
+            }
         );
         assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
         Ok(())
     }
 
-    /// A verified release published only for another ROCm build, or not at
-    /// all, falls back to the newest build — and the printed line names that
-    /// build, says it is not hardware-verified, and names the missing release.
+    /// A verified release published only for another ROCm build falls back to
+    /// the newest build for the requested one, and the printed reason names the
+    /// ROCm build as the cause, not the Python or platform: the verified release
+    /// is matched by ROCm line, so it can be published here under another label
+    /// of the same line.
+    #[test]
+    fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_published_for_another_rocm_build()
+    -> Result<()> {
+        let published = [
+            "2.11.0+rocm10.1.1",
+            "2.11.0.3+rocm10.1.1",
+            "2.11.0.2+rocm10.1.0",
+        ]
+        .map(str::to_owned);
+        let pin = torchaudio_pin(&published, "10.1.1", Some("2.11.0.2"), "https://index.test")?;
+        assert_eq!(pin.version, "2.11.0.3+rocm10.1.1");
+        assert_eq!(
+            pin.basis,
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: Some("2.11.0.2+rocm10.1.0".to_owned()),
+            }
+        );
+        assert!(!pin.is_verified());
+        let line = pin.describe();
+        assert!(
+            line.contains(
+                "torchaudio 2.11.0.3+rocm10.1.1, the newest build published for ROCm 10.1.1"
+            ) && line.contains("not hardware-verified")
+                && line.contains(
+                    "the verified release, 2.11.0.2, is published for this Python and platform only for another ROCm build (2.11.0.2+rocm10.1.0), not for ROCm 10.1.1"
+                )
+                && !line.contains("is not published for this Python and platform"),
+            "{line}"
+        );
+        Ok(())
+    }
+
+    /// A verified release with no build at all for this Python and platform
+    /// falls back to the newest build, and the printed line says the release is
+    /// not published here. An unlabelled build is not a ROCm build, so it does
+    /// not count as one "for another ROCm build".
     #[test]
     fn torchaudio_pin_falls_back_to_newest_when_the_verified_release_is_unpublished() -> Result<()>
     {
-        let published = [
-            "2.11.0+rocm10.1.0",
-            "2.11.0.3+rocm10.1.0",
-            "2.11.0.2+rocm10.0.0",
-        ]
-        .map(str::to_owned);
+        let published = ["2.11.0+rocm10.1.0", "2.11.0.3+rocm10.1.0", "2.11.0.2"].map(str::to_owned);
         let pin = torchaudio_pin(&published, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
         assert_eq!(pin.version, "2.11.0.3+rocm10.1.0");
         assert_eq!(
             pin.basis,
-            TorchaudioPinBasis::VerifiedNotPublished("2.11.0.2")
+            TorchaudioPinBasis::VerifiedNotPublished {
+                release: "2.11.0.2",
+                other_build: None,
+            }
         );
         assert!(!pin.is_verified());
         let line = pin.describe();
@@ -8715,9 +8794,46 @@ mod tests {
             line.contains(
                 "torchaudio 2.11.0.3+rocm10.1.0, the newest build published for ROCm 10.1.0"
             ) && line.contains("not hardware-verified")
-                && line.contains("the verified release, 2.11.0.2, is not published"),
+                && line.contains(
+                    "the verified release, 2.11.0.2, is not published for this Python and platform"
+                ),
             "{line}"
         );
+        Ok(())
+    }
+
+    /// A real install notes an unverified torchaudio in its install log, for
+    /// both reasons a pin can be unverified, and stays quiet for a verified
+    /// one. The note is the pin's own `describe()` line, so it states the
+    /// decision that was actually taken.
+    #[test]
+    fn unverified_torchaudio_note_is_logged_only_for_an_unverified_pin() -> Result<()> {
+        let builds = rocm10_1_torchaudio_builds();
+        let verified = torchaudio_pin(&builds, "10.1.0", Some("2.11.0.2"), "https://index.test")?;
+        let not_published =
+            torchaudio_pin(&builds, "10.1.0", Some("2.11.0.9"), "https://index.test")?;
+        let no_verified_release = torchaudio_pin(&builds, "10.1.0", None, "https://index.test")?;
+        assert_eq!(verified.basis, TorchaudioPinBasis::Verified);
+        assert!(matches!(
+            not_published.basis,
+            TorchaudioPinBasis::VerifiedNotPublished { .. }
+        ));
+        assert_eq!(
+            no_verified_release.basis,
+            TorchaudioPinBasis::NoVerifiedRelease
+        );
+
+        assert_eq!(unverified_torchaudio_note(&verified), None);
+        for pin in [&not_published, &no_verified_release] {
+            let note = unverified_torchaudio_note(pin);
+            assert_eq!(note, Some(format!("Note: {}", pin.describe())));
+            assert!(
+                note.as_deref()
+                    .is_some_and(|note| note.contains("torchaudio 2.11.0.3+rocm10.1.0")
+                        && note.contains("not hardware-verified")),
+                "{note:?}"
+            );
+        }
         Ok(())
     }
 
