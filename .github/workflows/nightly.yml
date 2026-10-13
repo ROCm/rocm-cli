@@ -1776,6 +1776,21 @@ jobs:
       - name: Install GitHub Copilot CLI
         run: npm install -g @github/copilot
 
+      # `{{var}}`/`file_input` templating only applies to a structured
+      # `.prompt.yml` loaded via `prompt-file` — it is silently ignored for
+      # an inline `prompt:` string, which is what this job uses. Inline the
+      # facts JSON into a step output instead (random delimiter since
+      # facts.json embeds untrusted GitHub issue titles).
+      - name: Read facts for prompt
+        id: facts
+        run: |
+          delimiter="$(openssl rand -hex 8)"
+          {
+            echo "json<<${delimiter}"
+            cat release-readiness/facts.json
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Draft narrative
         id: draft
         uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
@@ -1787,9 +1802,7 @@ jobs:
           # 5.5 went GA; claude-sonnet-5.5 is the current slug.
           model: claude-sonnet-5.5
           system-prompt-file: .github/prompts/release-readiness-narrative.txt
-          prompt: "{{facts}}"
-          file_input: |
-            facts: release-readiness/facts.json
+          prompt: ${{ steps.facts.outputs.json }}
 
       # `response-file` is an *output* of ai-inference (a path it already
       # wrote the response to), not an input — write it to the path the next
