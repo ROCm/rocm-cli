@@ -573,8 +573,10 @@ GPU host:
 E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e
 ```
 
-Do not select it with `-n`: that bypasses every gate above, so on WSL2,
-Windows or a machine with no GPU it would still run the real install.
+Do not select it with `-n`/`--name`, or with the `name_filter` input of the
+self-hosted CI dispatch (which forwards `--name`): each bypasses every gate
+above, so on WSL2, Windows or a machine with no GPU it would still run the real
+install.
 
 ## Runtime Selection And Activation
 
