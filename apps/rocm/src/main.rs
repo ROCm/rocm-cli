@@ -9037,9 +9037,9 @@ fn build_freeform_plan_with_context(
     match resolve_freeform_plan_with_provider(request, paths, config, provider, &deterministic) {
         Ok(plan) => plan,
         Err(error) => {
-            deterministic.notes.push(format!(
-                "Provider-assisted planner `{provider}` could not resolve this request: {error}"
-            ));
+            deterministic
+                .notes
+                .push(planner_failure_note(provider, &error));
             deterministic.notes.push(
                 "No provider-produced tool call was used. Fill the placeholder values or run /chat for help."
                     .to_owned(),
@@ -9047,6 +9047,17 @@ fn build_freeform_plan_with_context(
             deterministic
         }
     }
+}
+
+/// The plan-block note for a provider-assisted planning failure.
+///
+/// The plan block prints notes verbatim, and this error can carry text that
+/// came from the provider — an HTTP failure body, or a value its response
+/// named. The planner's own refusals do not echo a hostile value, but this is
+/// the one place every failure passes through, so it is stripped here too.
+fn planner_failure_note(provider: &str, error: &anyhow::Error) -> String {
+    let error = rocm_core::terminal::strip_terminal_control_sequences(&format!("{error}"));
+    format!("Provider-assisted planner `{provider}` could not resolve this request: {error}")
 }
 
 fn configured_planner_provider(config: &RocmCliConfig) -> Option<&str> {
@@ -9163,15 +9174,28 @@ fn provider_planner_response_to_plan(
         "The provider output was reduced to a validated rocm tool call; no shell command is executed."
             .to_owned(),
     ];
-    notes.extend(
-        response
-            .notes
-            .into_iter()
-            // Same reason as the argv above: a note is printed verbatim into the
-            // plan block, so a control character in one lets the planner redraw
-            // the lines around it.
-            .filter(|note| !note.trim().is_empty() && !has_terminal_control_character(note)),
-    );
+    // Same reason as the argv above: a note is printed verbatim into the plan
+    // block, so a control character in one lets the planner redraw the lines
+    // around it. Such a note is dropped rather than refused — it is commentary,
+    // and the plan stands without it — but not silently: the count of dropped
+    // notes is reported in a note this code writes.
+    let mut omitted = 0_usize;
+    for note in response.notes {
+        let note = note.trim();
+        if note.is_empty() {
+            continue;
+        }
+        if has_terminal_control_character(note) {
+            omitted += 1;
+            continue;
+        }
+        notes.push(note.to_owned());
+    }
+    if omitted > 0 {
+        notes.push(format!(
+            "{omitted} planner note(s) omitted: they contained terminal control characters."
+        ));
+    }
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
         planner: format!("hybrid-parser-v1 + provider:{provider}"),
@@ -9212,6 +9236,13 @@ fn strip_json_fence(content: &str) -> &str {
 
 fn validate_provider_planner_tool_call(call: &ProviderPlannerToolCall) -> Result<Vec<String>> {
     if call.tool != "rocm" {
+        // Not echoed when it carries a control character: this error ends up
+        // in the plan block's notes, which reach the terminal as bytes.
+        if has_terminal_control_character(&call.tool) {
+            bail!(
+                "provider planner returned an unsupported tool whose name contains a control character"
+            );
+        }
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
     if call.args.is_empty() {
@@ -9282,6 +9313,11 @@ fn planner_intent_from_provider_response(intent: &str, args: &[String]) -> Resul
         "update" => PlannerIntent::Update,
         "uninstall" => PlannerIntent::Uninstall,
         "inspect" | "examine" => PlannerIntent::Inspect,
+        // Not echoed when it carries a control character, for the same reason
+        // as an unsupported tool name in `validate_provider_planner_tool_call`.
+        _ if has_terminal_control_character(intent) => {
+            bail!("provider planner returned an unsupported intent containing a control character")
+        }
         _ => bail!("provider planner returned unsupported intent `{intent}`"),
     };
     if declared != args_intent {

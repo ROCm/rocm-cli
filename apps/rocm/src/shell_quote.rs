@@ -72,9 +72,17 @@ pub(crate) fn shell_quote(value: &str) -> String {
 /// whoever supplied the argument. A value in this shape is refused upstream
 /// rather than rendered.
 ///
-/// `char::is_control` covers C0, DEL and C1 (so ESC and the 8-bit CSI alike).
+/// The predicate is [`rocm_core::terminal::is_control_or_format`] — C0, DEL
+/// and C1 (so ESC and the 8-bit CSI alike), plus the Unicode format characters:
+/// a bidi override such as U+202E reorders how the rest of the line is drawn,
+/// and a zero-width character hides a difference between what is shown and
+/// what runs. U+2028/U+2029 are added because a terminal may start a new row
+/// at either, which would let a value forge a line of its own.
 pub(crate) fn has_terminal_control_character(value: &str) -> bool {
-    value.chars().any(char::is_control)
+    value.chars().any(|character| {
+        rocm_core::terminal::is_control_or_format(character)
+            || matches!(character, '\u{2028}' | '\u{2029}')
+    })
 }
 
 /// The argument generator the CLI's preview property tests share.
@@ -229,6 +237,16 @@ mod tests {
             "a\u{8}b",
             "a\u{7f}b",
             "a\u{9b}b",
+            // Format and line-separator characters: no cursor movement, but a
+            // right-to-left override reorders everything drawn after it, a
+            // zero-width space hides a difference, and a line separator may
+            // start a new row.
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{200b}b",
+            "a\u{feff}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
         ] {
             assert!(
                 has_terminal_control_character(value),
