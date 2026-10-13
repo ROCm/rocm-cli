@@ -96,14 +96,17 @@ fn write_fixture(path: &Path, contents: &str) {
 
 /// Writes an executable POSIX shell script, standing in for a real binary the
 /// CLI shells out to (`uv`, the runtime's Python).
+///
+/// Written via [`rocm_core::fake_executable::write_fake_executable`], not
+/// `std::fs::write`: scenarios run concurrently, and a write fd another
+/// scenario's spawn inherits makes the CLI's first run of the shim fail with
+/// `Text file busy`.
 fn write_shim(path: &Path, body: &str) {
-    write_fixture(path, body);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("failed to chmod fake {}: {e}", path.display()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create fixture directory");
     }
+    rocm_core::fake_executable::write_fake_executable(path, body)
+        .unwrap_or_else(|e| panic!("failed to write fake {}: {e}", path.display()));
 }
 
 /// Writes a fake runtime Python that answers both forms `probe_comfyui`'s

@@ -4,8 +4,9 @@
 
 //! Shared type and enum definitions for the dashboard reducer: `Focus`,
 //! `ResolvedArgs`, connection/tab/chat/replay state, `Modal`, `UpdateStatus`,
-//! and the slash/plan/approval payload types. No `AppState` access — split
-//! out of `app/mod.rs` to keep the core reducer focused.
+//! `PaneFocus`, `ScrollTarget`, and the slash/plan/approval payload types. No
+//! `AppState` access — split out of `app/mod.rs` to keep the core reducer
+//! focused.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -432,6 +433,50 @@ pub enum UpdateStatus {
         latest_version: String,
     },
     Error,
+}
+
+/// Where a domain tab's (ROCm/Serving) keyboard focus currently sits. Shared by
+/// both tabs; each keeps its own selection cursor (`rocm_sel`/`serving_sel`).
+///
+/// Lives here, not in `scrollbar.rs`: `scrollbar.rs` defined this type but
+/// never used it. Moving it out, together with [`ScrollTarget`], removes
+/// `actions.rs`'s only import from `scrollbar.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaneFocus {
+    /// Browsing the Actions list (left column).
+    #[default]
+    Actions,
+    /// Inside the Details pane (right column), ready to start the operation.
+    Detail,
+}
+
+/// Which scrollable surface a drawn scrollbar controls. Lets a mouse click on a
+/// scrollbar track write the right offset field.
+///
+/// Lives here, not in `scrollbar.rs`: `actions.rs`'s `KeyAction::ScrollGrab`
+/// variant carries one, so the type has to be visible to `actions.rs` without
+/// `actions.rs` importing it from `scrollbar.rs`. The reverse `use` edge
+/// stays — `scrollbar.rs` still imports `KeyAction`/`handle_mouse`/
+/// `tab_bar_hit` from `actions.rs` (plus `apply_action`, under `cfg(test)`)
+/// — that's the one direct `use`-level edge this module boundary keeps.
+/// `actions.rs` still reaches `ScrollDrag` indirectly, through the
+/// `scroll_drag` field it types on `AppState` (defined in `mod.rs`, e.g.
+/// `state.scroll_drag = None`; `actions.rs` never touches the
+/// `ScrollbarHandle`/`FooterChip`-typed fields) — reading or writing a
+/// field never requires importing its type, so this
+/// move doesn't touch that coupling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// Job console vertical (`console_scroll`).
+    Console,
+    /// Job console horizontal (`console_hscroll`).
+    ConsoleH,
+    /// Wide-layout LOGS dock (`dock_logs_scroll`, tail-anchored / inverted).
+    DockLogs,
+    /// Chat transcript (`chat_scroll`).
+    Chat,
+    /// Instance detail modal's launch_args/env_vars panes (`instance_detail_scroll`).
+    InstanceDetail,
 }
 
 #[cfg(test)]

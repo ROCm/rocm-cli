@@ -50,10 +50,10 @@ pub use event_loop::{run, spawn_termination_watcher};
 // if that caller ever disappears.
 #[cfg(test)]
 pub(crate) use event_loop::restore_after_session;
-pub use scrollbar::{FooterChip, PaneFocus, ScrollDrag, ScrollTarget, ScrollbarHandle};
+pub use scrollbar::{FooterChip, ScrollDrag, ScrollbarHandle};
 pub use types::{
-    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PlannedAction,
-    ReplayState, ResolvedArgs, UpdateStatus, format_mmss,
+    ActiveTab, ChatConsent, ChatKeyCtx, ChatRole, ChatTurn, ConnState, Focus, Modal, PaneFocus,
+    PlannedAction, ReplayState, ResolvedArgs, ScrollTarget, UpdateStatus, format_mmss,
 };
 pub(crate) use types::{ChatProvider, PendingApproval, SlashOutcome, SlashToolRequest};
 
@@ -1245,6 +1245,85 @@ mod tests {
     use super::summary::summarize_slash_tool;
     use super::test_support::st;
     use super::types::NO_CHAT_BACKEND_MSG;
+
+    #[test]
+    fn actions_does_not_import_from_scrollbar() {
+        // scrollbar.rs depends on actions.rs (KeyAction/handle_mouse/tab_bar_hit,
+        // plus apply_action under cfg(test)); actions.rs must never depend
+        // back on scrollbar.rs -- directly, through `crate::app::scrollbar`,
+        // or through one of the names app/mod.rs re-exports from it
+        // (ScrollbarHandle, ScrollDrag, FooterChip) -- or the direct
+        // `use`-level cycle that moving PaneFocus/ScrollTarget into types.rs
+        // removed would come back. The compiler accepts such a cycle, so
+        // nothing else catches it.
+        //
+        // Parsing `use` items can't guard that on its own: a glob import
+        // (`use super::*;`) brings a name in without ever writing a `use`
+        // that names it, and a fully-qualified path used inline needs no
+        // `use` statement at all. actions.rs has no legitimate reason to
+        // write any of these identifiers anywhere, by any means, so this
+        // scans its whole non-comment source for a whole-word match
+        // instead of parsing `use` syntax specifically -- a stronger check
+        // that is also simpler. Matching whole identifier tokens (not a
+        // bare substring) means `vertical_scrollbar` doesn't false-positive
+        // on `scrollbar`.
+        //
+        // Known gaps: a name written only inside a `/* */` block comment
+        // (unlike `//`, not stripped below) would false-positive; a
+        // reference whose type is fully inferred, with the identifier
+        // never written out as text anywhere, can't be caught by scanning
+        // text rather than parsing it. Unlike those two, which only
+        // over-fire or miss safely, the line-stripping below has no
+        // string-literal awareness: a name placed after a `//` that's
+        // actually inside a string literal (e.g. on a line with a
+        // `"http://..."` value) would be silently dropped from the scan
+        // and let a real violation pass. Currently harmless -- no line
+        // here combines the two -- but worth knowing this guard doesn't
+        // cover.
+        const SCROLLBAR_NAMES: [&str; 4] =
+            ["scrollbar", "ScrollbarHandle", "ScrollDrag", "FooterChip"];
+
+        fn tokens(s: &str) -> impl Iterator<Item = &str> {
+            s.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|t| !t.is_empty())
+        }
+
+        fn offenders_in(src: &str) -> Vec<&str> {
+            tokens(src)
+                .filter(|t| SCROLLBAR_NAMES.contains(t))
+                .collect()
+        }
+
+        // Positive controls: prove the detector actually flags every name
+        // it claims to guard -- including the re-export names, not just the
+        // module name -- and specifically a glob import that brings a name
+        // in without any `use` naming it directly, which a `use`-parsing
+        // check would miss.
+        for name in SCROLLBAR_NAMES {
+            let known_bad = format!("use super::*;\nfn f() -> {name} {{ todo!() }}");
+            assert!(
+                !offenders_in(&known_bad).is_empty(),
+                "sanity check failed: the detector doesn't flag {name}"
+            );
+        }
+        assert!(
+            offenders_in("let vertical_scrollbar = 1;").is_empty(),
+            "sanity check failed: the detector false-positives on a substring match"
+        );
+
+        let without_comments: String = include_str!("actions.rs")
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let offenders = offenders_in(&without_comments);
+        assert!(
+            offenders.is_empty(),
+            "actions.rs must not reference scrollbar.rs or its re-exported types \
+             (ScrollbarHandle, ScrollDrag, FooterChip), by any means: {offenders:#?}"
+        );
+    }
 
     #[test]
     fn back_out_requires_an_open_manager_on_any_tab() {
