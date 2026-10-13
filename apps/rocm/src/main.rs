@@ -47,10 +47,11 @@ mod uninstall;
 // directly, `env_root_for_service`, `env_root_for_engine_install`,
 // `runtime_manifest_for_selector`, `engine_manages_own_runtime`, and
 // `runtime_key_for_python` because other root-level commands outside
-// `dispatch()` call them directly, `attach_background_stdio`,
-// `detach_background_command`, `managed_engine_startup_failure_detail`, and
-// `managed_service_process_command` because `restart_internal_managed_service`
-// (also outside `dispatch()`) calls them, and
+// `dispatch()` call them directly, the engine spawn seam
+// (`ManagedEngineSpawnRequest`, `SpawnManagedEngine`,
+// `spawn_managed_engine_process`, `watch_managed_engine_startup`) because
+// `restart_internal_managed_service` (also outside `dispatch()`) starts its
+// child through the same spawner as the launch path, and
 // `ensure_public_service_has_endpoint_key`/`is_loopback_host` because the
 // loopback/endpoint-key checks below call them directly. `install()`'s SDK
 // path calls into `runtime_install_finalize` directly (not via `dispatch()`),
