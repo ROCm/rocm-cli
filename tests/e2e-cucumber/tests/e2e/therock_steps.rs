@@ -304,8 +304,7 @@ fn serve_two_next_builds(world: &mut E2eWorld, torchaudio: &[(&str, &str)]) {
 /// The older build also carries a torchaudio rebuild, as the live index does,
 /// and a newer rebuild still that this host cannot install. The newer build
 /// carries a hardware-verified torchaudio with a newer rebuild beside it.
-#[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
-async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
+fn serve_two_next_builds_with_torchaudio_rebuilds(world: &mut E2eWorld) {
     let mut torchaudio = vec![
         (NEXT_TORCHAUDIO_VERSION, ANY_WHEEL_TAG),
         (NEXT_TORCHAUDIO_REBUILD_VERSION, ANY_WHEEL_TAG),
@@ -315,9 +314,26 @@ async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
     serve_two_next_builds(world, &torchaudio);
 }
 
+#[given("a ROCm 10 pip index fixture that also publishes a newer ROCm 10 build")]
+async fn pip_index_fixture_with_newer_next_build(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
+/// The same index as the newer-build fixture, named for what the
+/// verified-torchaudio scenario needs from it: ROCm 10.1.0's original
+/// torchaudio release, its hardware-verified rebuild and a newer rebuild all
+/// share the `+rocm10.1.0` label.
+#[given("a ROCm 10 pip index fixture where several torchaudio rebuilds share one ROCm label")]
+async fn pip_index_fixture_with_torchaudio_rebuilds_sharing_a_label(world: &mut E2eWorld) {
+    serve_two_next_builds_with_torchaudio_rebuilds(world);
+}
+
 /// The pinned build's only torchaudio is a wheel this host cannot install, so
-/// for this Python and platform it publishes none.
-#[given("a ROCm 10 pip index fixture that publishes torchaudio only for a newer ROCm 10 build")]
+/// for this Python and platform it publishes none; the newer build publishes
+/// installable ones.
+#[given(
+    "a ROCm 10 pip index fixture whose ROCm 10.0.0 torchaudio is only a wheel this host cannot install"
+)]
 async fn pip_index_fixture_without_pinned_torchaudio(world: &mut E2eWorld) {
     let mut torchaudio = vec![(NEXT_TORCHAUDIO_FOREIGN_WHEEL_VERSION, FOREIGN_WHEEL_TAG)];
     torchaudio.extend(NEWER_NEXT_TORCHAUDIO_VERSIONS.map(|version| (version, ANY_WHEEL_TAG)));
@@ -376,6 +392,92 @@ async fn registered_next_wheel_runtime_with_grouped_family(world: &mut E2eWorld)
         manifest,
     )
     .expect("failed to write runtime manifest");
+}
+
+/// Makes the planted ROCm 10 runtime the active default, so a real install
+/// without consent reaches the non-interactive refusal: past every point where
+/// the plan is chosen and announced, but before `uv`, any download or any
+/// change on disk.
+#[given("that runtime is the active default")]
+async fn planted_runtime_is_the_active_default(world: &mut E2eWorld) {
+    // Black-box: plain JSON matching the CLI's on-disk config schema, as
+    // `examine_steps.rs` plants it. Every field defaults.
+    let config_dir = root(world).join("config");
+    std::fs::create_dir_all(&config_dir).expect("failed to create config dir");
+    let config = serde_json::json!({ "active_runtime_key": NEXT_GROUPED_FAMILY_RUNTIME_KEY });
+    std::fs::write(
+        config_dir.join("config.json"),
+        serde_json::to_string_pretty(&config).expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+}
+
+#[when("the user installs a wheel SDK for arch gfx1200 pinned to ROCm 10.0.0 without confirming")]
+async fn install_pinned_wheel_without_confirming(world: &mut E2eWorld) {
+    // No `--dry-run`: the install-log note is printed only past the preview.
+    preview(
+        world,
+        &[
+            "install",
+            "sdk",
+            "--channel",
+            "release",
+            "--format",
+            "wheel",
+            "--family",
+            RAW_ARCH,
+            "--version",
+            NEXT_ROCM_VERSION,
+        ],
+    );
+}
+
+#[then("the install is refused without replacing the active default runtime")]
+async fn install_refused_before_replacing_active_default(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no recorded exit code");
+    let reported = format!(
+        "{}\n{}",
+        stdout(world),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    );
+    assert!(
+        rc != 0 && reported.contains("--approve-replacing-active-default"),
+        "expected the non-interactive refusal (rc {rc}):\n{reported}"
+    );
+    // The refusal comes before `uv` creates an environment: nothing installed.
+    assert!(
+        !reported.contains("Creating Python environment"),
+        "the install went past the refusal:\n{reported}"
+    );
+    let registry = root(world).join("data").join("runtimes").join("registry");
+    let registered = std::fs::read_dir(&registry)
+        .expect("failed to read the runtime registry")
+        .map(|entry| entry.expect("bad registry entry").file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        registered,
+        [std::ffi::OsString::from(format!(
+            "{NEXT_GROUPED_FAMILY_RUNTIME_KEY}.json"
+        ))],
+        "the refused install registered a runtime"
+    );
+}
+
+#[then(
+    "the install log notes that its torchaudio is the newest build for ROCm 10.0.0 and not hardware-verified"
+)]
+async fn install_log_notes_unverified_torchaudio(world: &mut E2eWorld) {
+    // The same build therock-next-11's preview pins on this fixture, so the
+    // note names the build the install would have taken, not another one.
+    assert_contains(
+        world,
+        &format!(
+            "Note: torchaudio {NEXT_TORCHAUDIO_REBUILD_VERSION}, the newest build published for \
+             ROCm {NEXT_ROCM_VERSION}; it is not hardware-verified, because no torchaudio release \
+             is recorded as verified for this ROCm line"
+        ),
+        "unverified torchaudio install-log note",
+    );
 }
 
 #[when("the user previews applying the pending update to that runtime")]
