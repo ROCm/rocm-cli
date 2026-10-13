@@ -282,7 +282,11 @@ fn toml_float(value: f64) -> String {
 /// The migration writes `config.json` once and never again, so it has to write
 /// something the unified loader accepts, carrying the user's values. Generated
 /// as TOML *text* so the real `toml` 1.x parser is in the loop.
-fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str) {
+///
+/// With `must_migrate`, every case must migrate, and carry its ticks over
+/// unchanged: the strategy then generates only ticks rocm-dash accepts, so a
+/// refusal is a defect rather than the safe outcome it is for any tick.
+fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str, must_migrate: bool) {
     use std::fmt::Write as _;
     let total = AtomicUsize::new(0);
     let non_finite = AtomicUsize::new(0);
@@ -323,7 +327,14 @@ fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str) {
         let loaded = RocmCliConfig::load(&paths);
         let _ = std::fs::remove_dir_all(root);
         match migrated {
-            // Refusing to migrate is fine: the legacy file is left untouched.
+            Err(error) if must_migrate => Err(TestCaseError::fail(format!(
+                "refused to migrate ticks rocm-dash accepts: {error:#}\nlegacy toml:\n{toml_text}"
+            ))),
+            Ok(None) if must_migrate => Err(TestCaseError::fail(format!(
+                "did not migrate\nlegacy toml:\n{toml_text}"
+            ))),
+            // Refusing to migrate is fine otherwise: the legacy file is left
+            // untouched.
             Err(_) | Ok(None) => Ok(()),
             Ok(Some(_)) => {
                 let loaded = loaded.map_err(|e| {
@@ -332,6 +343,27 @@ fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str) {
                     ))
                 })?;
                 prop_assert_eq!(loaded.default_engine, engine);
+                let daemon = &loaded.dashboard.daemon;
+                // Within one unit in the last place, and with the same sign, so
+                // `-0.0` stays `-0.0`. Not bit-exact: serde_json is built
+                // without its `float_roundtrip` feature, so reading
+                // `config.json` back can land one ULP off (`97.95315202189215`
+                // does), whatever the migration wrote.
+                let migrated = [
+                    daemon.gpu_tick_secs,
+                    daemon.discovery_tick_secs,
+                    daemon.instance_tick_secs,
+                ];
+                prop_assert!(
+                    migrated.iter().zip([g, d, i]).all(|(got, want)| {
+                        got.is_sign_negative() == want.is_sign_negative()
+                            && got.to_bits().abs_diff(want.to_bits()) <= 1
+                    }),
+                    "migrated ticks {:?} differ from {:?}\nlegacy toml:\n{}",
+                    migrated,
+                    [g, d, i],
+                    toml_text
+                );
                 Ok(())
             }
         }
@@ -345,23 +377,27 @@ fn legacy_migration_property(ticks: &BoxedStrategy<f64>, label: &str) {
     report(label, result);
 }
 
-/// The half that holds: finite ticks and arbitrary strings migrate and load
-/// back. Kept enabled; it is also the `toml` 0.8 -> 1.x string guard.
+/// Ticks rocm-dash accepts and arbitrary strings migrate, and load back with
+/// the same values. Every generated tick passes `Duration::try_from_secs_f64`,
+/// which is the rule the migration applies, so each case must migrate: a
+/// refusal fails it. Also the `toml` 0.8 -> 1.x string guard.
 #[test]
-fn legacy_toml_migration_round_trips_finite_values() {
-    let finite = prop_oneof![
+fn legacy_toml_migration_round_trips_accepted_ticks() {
+    let accepted = prop_oneof![
         3 => 0.001_f64..120.0,
-        1 => Just(-1.0),
+        1 => Just(0.0),
         1 => Just(-0.0),
-        1 => Just(f64::MAX),
     ]
+    .prop_filter("a tick rocm-dash accepts", |secs| {
+        std::time::Duration::try_from_secs_f64(*secs).is_ok()
+    })
     .boxed();
-    legacy_migration_property(&finite, "legacy migration (finite)");
+    legacy_migration_property(&accepted, "legacy migration (accepted ticks)", true);
 }
 
 #[test]
 fn legacy_toml_migration_always_produces_a_loadable_config() {
-    legacy_migration_property(&tick(), "legacy migration (any)");
+    legacy_migration_property(&tick(), "legacy migration (any)", false);
 }
 
 fn toml_string_literal(value: &str) -> String {

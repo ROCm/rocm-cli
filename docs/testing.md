@@ -148,15 +148,16 @@ directory is found — has `proptest` properties. They run in the ordinary
 `cargo test`; to run only them:
 
 ```bash
-cargo test -p rocm-core --test persisted_config_props
-cargo test -p rocm-core --lib persisted_paths_props
-cargo test -p rocm --bin rocm persisted_state_props
+cargo test -p rocm-core --test persisted_config_props -- --nocapture
+cargo test -p rocm-core --lib persisted_paths_props -- --nocapture
+cargo test -p rocm --bin rocm persisted_state_props -- --nocapture
 ```
 
-A property that fails prints its shrunk counterexample. Each run also prints a
-`reach:` line counting how many generated cases hit the interesting input
-(non-finite ticks, unreadable files, and so on); a property whose reach is zero
-passed without testing anything.
+A property that fails prints its shrunk counterexample. With `--nocapture`,
+each property also prints a `reach:` line counting how many generated cases hit
+the interesting input (non-finite ticks, unreadable files, and so on); without
+it the test harness swallows that line. Nothing asserts on these counts, so
+read them: a property whose reach is zero passed without testing anything.
 
 Known gaps are kept as `#[ignore]`d reproducers, each with the defect in its
 ignore reason, so they stay runnable until fixed:

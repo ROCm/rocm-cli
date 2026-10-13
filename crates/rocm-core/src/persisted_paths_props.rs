@@ -61,7 +61,8 @@ fn data_dir_never_silently_relocates_when_config_is_unreadable() {
         let healthy = AppPaths::discover_from_paths(paths.clone(), false, false).unwrap();
         prop_assert_eq!(&healthy.data_dir, &managed_root);
 
-        // An interrupted `RocmCliConfig::save` (a plain `fs::write`).
+        // A truncated file: a hand edit cut short, or one damaged before saves
+        // became atomic.
         let bytes = std::fs::read(paths.config_path()).unwrap();
         std::fs::write(paths.config_path(), &bytes[..cut.min(bytes.len() - 1)]).unwrap();
         let strict = RocmCliConfig::load(&paths);
