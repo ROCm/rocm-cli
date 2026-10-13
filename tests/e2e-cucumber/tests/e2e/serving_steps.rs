@@ -397,6 +397,11 @@ async fn setup_mock_custom_port(world: &mut E2eWorld) {
 #[given("the default serve port is occupied")]
 async fn occupy_default_serve_port(world: &mut E2eWorld) {
     let _ = ensure_serve_port_free().await;
+    // A stale listener from a prior scenario (not just an unrelated process)
+    // is the realistic way this probe finds the next port taken; clear it the
+    // same way `ensure_serve_port_free` clears the default port instead of
+    // panicking the whole run over leftover state.
+    kill_listeners_on_port(SERVE_PORT + 1);
     let next = std::net::TcpListener::bind(("127.0.0.1", SERVE_PORT + 1))
         .expect("the next automatic port must be free before this scenario starts");
     drop(next);

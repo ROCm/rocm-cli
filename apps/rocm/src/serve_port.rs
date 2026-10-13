@@ -37,9 +37,9 @@ pub(crate) const AUTO_PORT_SPAN: u16 = 100;
 pub(crate) const AUTO_PORT_LAST: u16 = AUTO_PORT_FIRST + AUTO_PORT_SPAN;
 
 /// The one phrase used wherever a port must be described *before* it is
-/// resolved. The CLI plan output and the Dash approval card share it verbatim so
-/// neither promises a concrete port it has not yet acquired.
-pub(crate) const AUTOMATIC_PORT_DISCLOSURE: &str = "Port: automatic; endpoint shown after launch";
+/// resolved. Re-exported from the Dash approval card's own constant so the CLI
+/// plan output and the wizard can never drift apart in wording.
+pub(crate) use rocm_dash_tui::ui::serve_wizard::AUTO_PORT_NOTE as AUTOMATIC_PORT_DISCLOSURE;
 
 /// What the user asked for on the command line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
