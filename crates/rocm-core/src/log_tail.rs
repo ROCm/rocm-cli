@@ -193,6 +193,33 @@ mod tests {
     }
 
     #[test]
+    fn tail_lines_strips_crlf_and_lossily_decodes_invalid_utf8_in_a_kept_line() -> Result<()> {
+        // A small budget so the window starts exactly at this file's start
+        // (no seek, no partial-fragment classification) and exercises only
+        // the per-line finishing steps: CRLF stripping and lossy decoding of
+        // a kept (not dropped) line. "\xff" is never valid UTF-8 on its own,
+        // so it must come back as the replacement character rather than
+        // erroring the whole read.
+        let mut content = b"first\r\n".to_vec();
+        content.extend_from_slice(b"bad\xffbyte\r\n");
+        let max_tail_read = content.len() as u64;
+
+        let path =
+            std::env::temp_dir().join(format!("rocm-core-tail-crlf-{}.log", unique_suffix()));
+        fs::write(&path, &content)?;
+        let lines = tail_lines(&path, usize::MAX, max_tail_read)?;
+        fs::remove_file(&path).ok();
+
+        assert_eq!(
+            lines,
+            vec!["first".to_owned(), "bad\u{FFFD}byte".to_owned()],
+            "CRLF must be stripped and an invalid byte in a kept line must decode \
+             lossily instead of failing the read"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tail_lines_limit_zero_returns_empty_without_opening_file() -> Result<()> {
         let path = Path::new("/does/not/exist/rocm-core-tail-limit-zero.log");
         let lines = tail_lines(path, 0, TEST_MAX_TAIL_READ)?;
