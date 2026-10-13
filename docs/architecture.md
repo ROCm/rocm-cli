@@ -71,6 +71,7 @@ Modularized (ROCMAI-83, Phase 5 of EAI-7768's sequencing):
 
 Already-extracted subsystem modules, following the same full-domain-extraction pattern (and several further siblings beyond these):
 
+- [`crypto.rs`](../crates/rocm-core/src/crypto.rs) — (ROCMAI-152, Phase 7c) RSASSA-PKCS#1 v1.5/SHA-256 sign/verify, generic — not model-catalog-specific.
 - [`diagnose.rs`](../crates/rocm-core/src/diagnose.rs)
 - [`examine.rs`](../crates/rocm-core/src/examine.rs)
 - [`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs) — (ROCMAI-85, Phase 7a of EAI-7768's sequencing) GPU/host hardware detection — see the module's own doc comment for what it owns.
@@ -81,7 +82,7 @@ Already-extracted subsystem modules, following the same full-domain-extraction p
 - [`process.rs`](../crates/rocm-core/src/process.rs) — (ROCMAI-154, Phase 7b) process-spawn/terminate primitives, including `FileLock`, plus `run_with_timeout`: it drains both pipes on their own threads from the moment the child starts, so output size cannot stall a command into its own timeout, and it bounds how much of a timed-out child's output the error quotes, because that text reaches persisted automation logs. It is not yet the *only* such helper — [`therock.rs`](../apps/rocm/src/therock.rs)'s `wait_with_output_bounded`, [`examine.rs`](../crates/rocm-core/src/examine.rs)'s `run_raw`, and [`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)'s `capture_optional_command_candidate_with_timeout` (plus its Windows-only `capture_diagnostic_command`) still join their reader threads with no time limit, so a grandchild holding the pipe can outlast their timeout; converging them onto `run_with_timeout` is follow-up work to ROCMAI-448 tracked in [#623](https://github.com/ROCm/rocm-cli/issues/623).
 - [`rocm_install.rs`](../crates/rocm-core/src/rocm_install.rs) — (ROCMAI-85, Phase 7a) unmanaged ("legacy") ROCm install discovery — see the module's own doc comment for what it owns.
 
-Still in [`lib.rs`](../crates/rocm-core/src/lib.rs): amd-smi binary resolution (`resolve_amd_smi_binary*`), which consumes [`managed_runtime.rs`](../crates/rocm-core/src/managed_runtime.rs)'s registry records but is a distinct, not-yet-scoped concern; the crypto and model-catalog clusters (ROCMAI-152, Phase 7c); and the config/automation/service-record/binary-paths clusters (ROCMAI-151, Phase 7d).
+Still in [`lib.rs`](../crates/rocm-core/src/lib.rs): amd-smi binary resolution (`resolve_amd_smi_binary*`), which consumes [`managed_runtime.rs`](../crates/rocm-core/src/managed_runtime.rs)'s registry records but is a distinct, not-yet-scoped concern; the generated endpoint-API-key helpers (`generate_endpoint_api_key`/`endpoint_api_key_has_forbidden_chars`), unrelated to crypto or model-catalog despite sitting in the same stretch of the file pre-split — see ROCMAI-200; the model-catalog cluster (ROCMAI-152, Phase 7c); and the config/automation/service-record/binary-paths clusters (ROCMAI-151, Phase 7d).
 
 [`lib.rs`](../crates/rocm-core/src/lib.rs) itself is **not yet fully modularized** — see EAI-7768, planned last in the modularization effort: highest fan-in (every app and engine crate depends on it), but lowest novelty since the existing sibling modules already prove the pattern works.
 

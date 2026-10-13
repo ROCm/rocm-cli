@@ -9181,7 +9181,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -9199,8 +9199,7 @@ PY
 fi
 echo Python 3.12.10
 "#;
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9211,13 +9210,12 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9228,7 +9226,7 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             r#"#!/bin/sh
@@ -9248,8 +9246,7 @@ fi
 exit 1
 "#
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 

@@ -2025,13 +2025,12 @@ mod tests {
         // `rocm comfyui logs` can still find this run's log via a directory
         // scan even without a saved manifest, but naming the path directly
         // in the error is more precise and needs no second command.
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let paths = test_paths("comfyui-uv-failure");
         fs::create_dir_all(&paths.cache_dir)?;
         let uv_path = paths.cache_dir.join("fake-uv");
-        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
-        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&uv_path, "#!/bin/sh\nexit 1\n")?;
 
         let log_path = paths.cache_dir.join("install.log");
         let mut log = fs::File::create(&log_path)?;
