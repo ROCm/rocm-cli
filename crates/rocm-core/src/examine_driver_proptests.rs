@@ -21,13 +21,15 @@ use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
-/// Case count: `default`, unless `PROPTEST_CASES` (proptest's own knob, which
-/// an explicit count would otherwise override) asks for a longer run.
+/// Case count: `PROPTEST_CASES` (proptest's own knob, which an explicit count
+/// would otherwise override) when it is set and above `default`, otherwise
+/// `default`. Never below it, so a short run cannot pass a property its default
+/// count would fail, and `0` cannot pass vacuously.
 fn cases(default: u32) -> u32 {
     std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+        .map_or(default, |requested: u32| requested.max(default))
 }
 
 /// gfx targets a real host reports, as `examine` and the install probes see

@@ -141,8 +141,10 @@ reads the variable back itself: in `rocm` through `proptest_cases` in
 the `cases` helper in
 [examine_driver_proptests.rs](../crates/rocm-core/src/examine_driver_proptests.rs)
 and through `run_property` in
-[archive_props.rs](../crates/rocm-core/src/archive_props.rs), which only
-ever raises its count. The uninstall properties read their own knob instead,
+[archive_props.rs](../crates/rocm-core/src/archive_props.rs). All three only
+ever raise the module's count: a `PROPTEST_CASES` below it is ignored, because
+some of these properties catch their target defect in a small share of cases
+and would pass with it present on a short run. The uninstall properties read their own knob instead,
 `ROCM_DELETION_PROP_CASES`, described under Uninstall And Download Removal
 below.
 

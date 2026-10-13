@@ -10,7 +10,7 @@
 //! interrupts its reads. None of them generates SSE text from scratch.
 
 use super::*;
-use crate::test_support::proptest_cases;
+use crate::test_support::{proptest_cases, split_at_offsets};
 use proptest::prelude::*;
 use std::io::{BufReader, Cursor, ErrorKind, Read};
 
@@ -35,21 +35,6 @@ fn events_for_whole_body(body: &[u8]) -> Vec<ProviderStreamEvent> {
     emitter.push_bytes(body).expect("fixture lines parse");
     emitter.finish().expect("fixture stream finishes");
     events
-}
-
-/// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
-fn split_at_offsets<'a>(bytes: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
-    let mut cuts: Vec<usize> = offsets.iter().map(|o| o % (bytes.len() + 1)).collect();
-    cuts.sort_unstable();
-    cuts.dedup();
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    for cut in cuts {
-        pieces.push(&bytes[start..cut]);
-        start = cut;
-    }
-    pieces.push(&bytes[start..]);
-    pieces
 }
 
 /// Encode `body` with HTTP/1.1 chunked transfer coding, cutting chunks at
