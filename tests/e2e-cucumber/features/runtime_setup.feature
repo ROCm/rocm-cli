@@ -370,3 +370,29 @@ Feature: Runtime configuration
     And the user sends a chat completion request
     Then the response contains a model reply
     And the response identifies the correct model
+
+  # gfx90c -- the Vega iGPU in Renoir/Lucienne/Cezanne/Barcelo APUs -- has no
+  # TheRock build. It used to normalize through the loose `gfx90` arm to the
+  # data-center family `gfx90X-dcgpu`, so on a Ryzen 4000/5000 laptop a plain
+  # `rocm install sdk` resolved a data-center SDK for a mobile iGPU.
+  #
+  # The honest scenario would run on such a laptop, and there is no lane with
+  # one: no CI runner has a Vega APU, and detection reads real sysfs/WMI with no
+  # override to fake a target with (see `detect_host_gfx_target`). What is
+  # reachable from any lane is the same refusal through the other door the user
+  # can open -- naming the target explicitly. That exercises the same
+  # `normalize_therock_family` answer and the same error text the detected case
+  # prints, without needing the silicon.
+  #
+  # Asserting only that the command fails would pass on the old code too: an
+  # unrecognized `--family` already fell through to host detection and failed on
+  # the no-GPU lane for an unrelated reason. So the Thens pin which refusal it
+  # is -- it names gfx90c, and it offers no package family. On the old mapping
+  # the command does not fail at all; it resolves `gfx90X-dcgpu` and prints a
+  # plan. The second Then is the one that would catch a regression that reopens
+  # the catch-all, because a resolved family would have to appear in the output.
+  @id:runtime-install-sdk-refuses-unsupported-gpu-target
+  Scenario: runtime-19 - Asking for a GPU target ROCm does not build is refused outright
+    When the user dry-runs an SDK install for the gfx90c Vega iGPU
+    Then the install is refused as having no ROCm build for that GPU
+    And the refusal offers no package family to install instead

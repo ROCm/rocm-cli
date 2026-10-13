@@ -3362,6 +3362,26 @@ fn raw_arch_agreeing_with_family(raw_arch: Option<String>, family: &str) -> Opti
 }
 
 fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<FamilyResolution> {
+    let env_override = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok();
+
+    // An explicitly asked-for target that ROCm publishes no build for is
+    // refused here rather than normalized. `normalize_therock_family` answers
+    // `None` for gfx90c, and `None` from these two branches means "fall
+    // through", so without this the user's `--family gfx90c` would be dropped
+    // and whatever GPU this host happens to have would be installed for
+    // instead. Unrecognized spellings keep falling through to detection, which
+    // is the long-standing behavior for a typo.
+    for (value, source) in [
+        (family_override, "--family"),
+        (env_override.as_deref(), "ROCM_CLI_THEROCK_FAMILY"),
+    ] {
+        if let Some(value) = value
+            && gfx_target_has_no_rocm_build(value)
+        {
+            bail!(unsupported_requested_target_message(value.trim(), source));
+        }
+    }
+
     if let Some(value) = family_override
         && let Some(family) = normalize_therock_family(value)
     {
@@ -3372,13 +3392,13 @@ fn resolve_family(paths: &AppPaths, family_override: Option<&str>) -> Result<Fam
         });
     }
 
-    if let Some(value) = std::env::var("ROCM_CLI_THEROCK_FAMILY").ok()
-        && let Some(family) = normalize_therock_family(&value)
+    if let Some(value) = env_override.as_deref()
+        && let Some(family) = normalize_therock_family(value)
     {
         return Ok(FamilyResolution {
             family,
             source: "env".to_owned(),
-            raw_arch: family_override_raw_arch(&value),
+            raw_arch: family_override_raw_arch(value),
         });
     }
 
@@ -3433,6 +3453,22 @@ fn unsupported_host_gpu_message(raw_arch: &str) -> String {
          `rocm install sdk` has nothing to install for it.\n\
          The GPU is detected but is not supported by ROCm; \
          the Vulkan backend can still be used."
+    )
+}
+
+/// The install error for a target the user asked for by name that no TheRock
+/// package family covers.
+///
+/// Separate from [`unsupported_host_gpu_message`] because nothing was detected
+/// here: the user named the target, so the error names where it came from and
+/// does not claim a GPU is present. Like that message it offers no `--family`
+/// values, since none of them was built for this GPU.
+fn unsupported_requested_target_message(value: &str, source: &str) -> String {
+    format!(
+        "no ROCm SDK build exists for the GPU target `{value}` requested by \
+         {source}, so `rocm install sdk` has nothing to install for it.\n\
+         That GPU is not supported by ROCm; the Vulkan backend can still be \
+         used. Nothing was installed and no other family was substituted."
     )
 }
 
@@ -7629,6 +7665,52 @@ mod tests {
                 "the error must not offer `{family}` for an unsupported GPU: {message}"
             );
         }
+    }
+
+    /// Asking for gfx90c by name must fail, not quietly install for some other
+    /// GPU.
+    ///
+    /// `normalize_therock_family("gfx90c")` is `None`, and in `resolve_family`
+    /// `None` from the override branch means "keep looking" — so before the
+    /// explicit-target guard, `--family gfx90c` was dropped on the floor and
+    /// the host's own family was installed instead. That is worse than the
+    /// data-center mapping this change removed: the user named a target and
+    /// got a different one with no warning.
+    ///
+    /// Reaching detection at all would make this test depend on the machine it
+    /// runs on, so a failure here is also the signal that the guard moved below
+    /// the branches it has to precede.
+    #[test]
+    fn requesting_gfx90c_by_name_fails_instead_of_installing_another_family() {
+        let (_root, paths) = test_paths("resolve-family-gfx90c-override");
+        let error = resolve_family(&paths, Some("gfx90c"))
+            .expect_err("--family gfx90c must not resolve to any package family");
+        let message = error.to_string();
+        assert!(message.contains("no ROCm SDK build"), "{message}");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        assert!(
+            message.contains("no other family was substituted"),
+            "{message}"
+        );
+        for family in known_therock_families() {
+            assert!(
+                !message.contains(family),
+                "asking for gfx90c must not resolve or offer `{family}`: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_target_error_names_where_the_target_came_from() {
+        let message = unsupported_requested_target_message("gfx90c", "--family");
+        assert!(message.contains("`gfx90c`"), "{message}");
+        assert!(message.contains("--family"), "{message}");
+        // The user named it; nothing was detected, so the error must not say so.
+        assert!(!message.contains("detected"), "{message}");
+
+        let message = unsupported_requested_target_message("gfx90c", "ROCM_CLI_THEROCK_FAMILY");
+        assert!(message.contains("ROCM_CLI_THEROCK_FAMILY"), "{message}");
     }
 
     #[test]
