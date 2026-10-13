@@ -403,6 +403,7 @@ Feature: Interactive dashboard
   @id:dash-quit-prompt-stop-command-actually-works @requires-os:linux
   Scenario: dash-28 - Running the quit prompt's printed stop command actually stops the model
     Given a running managed model is available locally
+    And the managed model's record points at a disposable process
     When the user opens the dashboard
     And the user opens the Observe view
     Then the managed model is displayed

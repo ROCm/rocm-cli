@@ -264,15 +264,33 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
     let mut body = Vec::new();
     let trailer = if total == 0 {
         // `total == 0` here only because `nothing_is_currently_being_served`
-        // returned `false` above: the startup-race fallback (issue #145) is
-        // active — a model was recorded live on disk at launch, but
-        // `instances` is still empty because the daemon's first snapshot
-        // hasn't landed yet (or never will, if the connection never
-        // succeeds). So this stays honest about not knowing whether it still
-        // is serving, instead of claiming to know either way — the trailer
-        // below is hedged to match, rather than asserting present-tense that
-        // it does keep running.
-        body.push("A model was serving when this started.".to_string());
+        // returned `false` above: either the startup-race fallback (issue
+        // #145) is active — the daemon's first snapshot hasn't landed yet —
+        // or the connection never will succeed at all (Windows: the
+        // dashboard-embedded daemon client's connect path is unix-only, so
+        // `instances` stays empty for the whole session). `instances` can't
+        // name anything in either case, but the live registry read
+        // (`managed_ids`) needs no daemon snapshot — it is this host's own
+        // `rocm serve` registry, read straight off disk — so it can still
+        // list each id this host can actually stop and the real command for
+        // it; only the pretty model *name* `instances` would otherwise
+        // supply is unavailable here. So this stays honest about not knowing
+        // whether the listed ids are *still* serving, instead of claiming to
+        // know either way — the trailer below is hedged to match, rather
+        // than asserting present-tense that it does keep running.
+        if managed_ids.is_empty() {
+            body.push("A model was serving when this started.".to_string());
+        } else {
+            let mut ids: Vec<&String> = managed_ids.iter().collect();
+            ids.sort();
+            for id in ids.iter().take(5) {
+                body.push(format!("• {id} — stop it first:"));
+                body.push(format!("  rocm services stop {id} --yes"));
+            }
+            if let Some(line) = format::overflow_line(managed_ids.len(), 5) {
+                body.push(line);
+            }
+        }
         "It may still be running in the background after you quit."
     } else {
         for i in running().take(5) {
@@ -1051,6 +1069,41 @@ mod tests {
     }
 
     #[test]
+    fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
+     {
+        // On a host whose dashboard-embedded daemon client never connects at
+        // all (Windows — `has_received_snapshot` never flips for the whole
+        // session), `instances` never fills, so without this the quit prompt
+        // could only ever print the generic "a model was serving" sentence —
+        // no model name (expected: `instances` is the only source for that),
+        // but also no stop command and no id, even though the live registry
+        // read already has one. The registry read needs no daemon snapshot,
+        // so the stop command should be available here regardless.
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+        assert!(state.instances.is_empty());
+        assert!(!state.has_received_snapshot);
+
+        let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line.contains("rocm services stop svc-managed --yes")),
+            "must print the real stop command from the live registry read even with no \
+             daemon snapshot: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|line| line.contains("It keeps running")),
+            "must still hedge — the registry read can't confirm current liveness, only that \
+             the record hasn't been reconciled as stopped: {body:?}"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.contains("may still be running")),
+            "must hedge the trailer the same way the no-id fallback does: {body:?}"
+        );
+    }
+
+    #[test]
     fn quit_confirm_body_says_nothing_is_being_served_once_a_snapshot_confirms_it() {
         // Once a real (even empty) snapshot has landed, the startup fallback
         // is retired (`AppState::has_live_instance`'s own doc comment) and
@@ -1273,6 +1326,11 @@ mod tests {
         with_registry_probe(&mut state, true, &["svc-managed"]);
 
         let body = quit_confirm_body(&state);
+        assert!(
+            body.iter()
+                .any(|line| line == "• Qwen2.5-7B — stop it first:"),
+            "expected the managed-instance bullet to name the serving model: {body:?}"
+        );
         assert!(
             body.iter()
                 .any(|line| line.contains("rocm services stop svc-managed --yes")),

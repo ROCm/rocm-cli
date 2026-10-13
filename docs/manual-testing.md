@@ -527,12 +527,18 @@ Expected result:
 - A prompt appears naming the serving model and warning that it keeps
   running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
-  placeholder) to stop it first.
+  placeholder) to stop it first. On a host where the dashboard's own daemon
+  client never connects (Windows, for the whole session), the prompt still
+  shows that same stop command and the service id, but not the model's name —
+  the dashboard's own live view is where the name comes from, and it never
+  fills there.
 - From the dashboard (not the launcher), the prompt also offers `s`: pressing
   it closes the prompt and opens the Services overlay, pre-focused on the
   serving model, so you can stop it there through the overlay's own
   approval+job flow. The launcher's copy of the prompt does not show this
-  hint or respond to `s` — it has no live Services overlay to jump to.
+  hint or respond to `s` — it has no live Services overlay to jump to — and
+  neither does the dashboard on Windows, for the same reason the model's name
+  is missing there.
 - Declining (`n`/Esc) returns to where you were — the dashboard, or the
   launcher's own front door, whichever you pressed `q` from. Any plain modal
   that was open when you pressed `q` (the Esc menu, Options, Detail, Theme

@@ -103,6 +103,38 @@ async fn running_managed_model(world: &mut E2eWorld) {
     setup_managed_model(world, ServiceRecordOptions::default(), false).await;
 }
 
+/// Re-point "e2e-mock"'s `supervisor_pid`/`engine_pid` at a disposable `sleep`
+/// child instead of this harness's own PID. `register_mock_service_with`
+/// always points those fields at the harness process, which is fine for a
+/// scenario that only ever reads the record — but `dash-27` goes on to run the
+/// literal `rocm services stop e2e-mock --yes` the prompt prints, and that
+/// command signals whatever PID the record names. Without this step it
+/// signals the cucumber harness itself (SIGTERM, `KillScope::Tree`).
+#[given("the managed model's record points at a disposable process")]
+async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld) {
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("failed to spawn disposable process for dash-27's stop-command step");
+    let pid = child.id();
+    world.disposable_service_process = Some(child);
+
+    let root = world.isolated_root.as_ref().expect("no isolated root");
+    let services_dir = root.path().join("data").join("services");
+    let model = world.model_name.as_deref().expect("no model name set");
+    let port = world.mock.as_ref().expect("no mock server running").port();
+    e2e_cucumber::mock_server::write_service_record_with(
+        &services_dir,
+        model,
+        port,
+        ServiceRecordOptions {
+            supervisor_pid: pid,
+            engine_pid: Some(pid),
+            ..ServiceRecordOptions::default()
+        },
+    );
+}
+
 // ── When ───────────────────────────────────────────────────────────
 
 #[when("the user replays a recording that does not exist")]
@@ -673,9 +705,9 @@ async fn quit_confirm_is_displayed(world: &mut E2eWorld) {
 /// remediation command must be asserted, not just its wording.
 ///
 /// The command sits on its own screen row (`ui::quit_confirm_body` pushes it
-/// as a separate line from the model-name row above it, since commit
-/// c30f00d4) rather than trailing the model name on one combined line, so at
-/// this PTY's width it is not expected to word-wrap. Whitespace is still
+/// as a separate line from the model-name row above it) rather than trailing
+/// the model name on one combined line, so at this PTY's width it is not
+/// expected to word-wrap. Whitespace is still
 /// collapsed to single spaces before matching — this also merges the row
 /// boundary between the model-name line and the command line into one
 /// contiguous string — so the match is robust to that line break (and to any

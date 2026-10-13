@@ -341,6 +341,13 @@ pub fn resolved_args(
 /// `rocm_dash_tui::client`'s connect path and `maybe_spawn_embedded_daemon`
 /// are unix-only, so `AppState::instances` never gets a first snapshot
 /// there).
+///
+/// **Known divergence, same shape as [`services_past_attempts`]'s:** this
+/// reads the record's raw on-disk `status`, not process liveness. A service
+/// whose engine crashed moments ago still reads `ready`/`running` here until
+/// some `rocm services` invocation reconciles the record
+/// (`refresh_managed_service_runtime_liveness`) — see [`ManagedRegistryProbe`]'s
+/// own doc comment for why a local pid check was not added to close that gap.
 #[derive(Debug, Clone)]
 struct LiveManagedRegistryProbe {
     services_dir: PathBuf,

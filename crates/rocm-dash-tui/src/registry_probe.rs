@@ -59,8 +59,23 @@ pub struct ManagedRegistrySnapshot {
 /// Windows; see `AppState::has_live_instance`'s doc comment) — for the entire
 /// life of the session.
 pub trait ManagedRegistryProbe: std::fmt::Debug + Send + Sync {
-    /// Read the registry now and classify it the same way `rocm services`
-    /// does.
+    /// Read the registry now and classify it from the record's own `status`
+    /// field, the same statuses `Instance::status.is_serving()` treats as
+    /// live.
+    ///
+    /// This is **not** the same verdict `rocm services list` can give: that
+    /// command also probes process liveness and the endpoint itself
+    /// (`refresh_managed_service_runtime_liveness`), so it can demote a
+    /// crashed service's stale on-disk `ready`/`running` status to `stopped`
+    /// before this trait ever sees it. A local-only PID check was
+    /// deliberately not added here, for the same reason
+    /// `apps/rocm::dash::services_past_attempts` does not add one: it would
+    /// duplicate the CLI's liveness classification in a second place that
+    /// could drift from it, trading a crashed-but-not-yet-reaped service for
+    /// whatever the duplicated check gets wrong instead. A caller using this
+    /// for a blocking claim (e.g. the quit-confirm prompt) should treat it as
+    /// "the registry has not been told this stopped" rather than "this is
+    /// confirmed still running".
     fn snapshot(&self) -> ManagedRegistrySnapshot;
 }
 

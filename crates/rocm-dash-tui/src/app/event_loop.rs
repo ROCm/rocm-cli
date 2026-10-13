@@ -227,13 +227,17 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
 }
 
 /// Hand off `ResolvedArgs`'s live registry-read seam and launcher-hosted flag
-/// onto `AppState` (issue #145). `event_loop` calls this directly (rather
-/// than inlining the two assignments) so a regression test can exercise the
-/// actual call site instead of constructing an `AppState` and setting the
-/// fields by hand — the same reasoning as `apply_startup_focus` below: `run`/
-/// `event_loop` are only reachable through the full async terminal loop, so
-/// a silently dropped hand-off here would otherwise go uncaught by anything
-/// but the `@requires-os:linux` e2e lane.
+/// onto `AppState` (issue #145). `run_async` calls this directly (rather than
+/// inlining the two assignments) so the field-assignment logic itself has a
+/// synchronous unit test (`seed_registry_probe_and_hosting_wires_both_fields_onto_state`)
+/// instead of needing to spin up the full async terminal loop to reach it.
+///
+/// That unit test calls this function directly, so it does **not** cover the
+/// call site at `run_async` dropping the hand-off entirely, or passing the
+/// wrong field — `run`/`event_loop` are only reachable through the full async
+/// terminal loop, which only the `@requires-os:linux` e2e lane
+/// (`tests/e2e-cucumber/features/dash.feature`, any scenario that opens a real
+/// dashboard or chat session with a managed model present) actually drives.
 fn seed_registry_probe_and_hosting(
     state: &mut AppState,
     managed_registry_probe: Option<crate::registry_probe::SharedManagedRegistryProbe>,
@@ -2177,12 +2181,17 @@ mod tests {
 
     #[test]
     fn seed_registry_probe_and_hosting_wires_both_fields_onto_state() {
-        // Regression guard: this hand-off is otherwise only reachable through
-        // a full async `event_loop` run, so a silent no-op here (the call
-        // site deleted, or the fields swapped) would not fail any other
-        // test. Each half (the bin producing the probe, `AppState::
-        // has_live_instance`/`ui::quit_confirm_body` consuming it) is tested
-        // elsewhere; this is the wiring between them.
+        // Covers only `seed_registry_probe_and_hosting` itself — that it
+        // assigns `managed_registry_probe` and `launcher_hosted` onto the
+        // right fields, not swapped or dropped. It does NOT cover whether
+        // `run_async` actually calls this at its own call site with the
+        // right arguments: that would need the full async `event_loop` run,
+        // which only the `@requires-os:linux` e2e lane drives (any
+        // `dash.feature` scenario that opens a real dashboard/chat session
+        // with a managed model present exercises it for real). Each half
+        // (the bin producing the probe, `AppState::has_live_instance`/
+        // `ui::quit_confirm_body` consuming it) is tested elsewhere; this is
+        // only the field-assignment logic in between.
         use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
 
         let mut s = st();
