@@ -6723,13 +6723,29 @@ mod tests {
     /// directly, so the two can only agree while the wrapper passes the real
     /// device through.
     ///
-    /// Non-vacuous on any host with no readable `/dev/kfd` (every non-GPU CI
-    /// runner): there the gate says "decline" and a wrapper that no longer
-    /// consults it does not. On a GPU host both sides say "allow" and this
-    /// asserts only that no spurious decline appeared.
+    /// Non-vacuous on *every* host in an `e2e-test-hooks` build: the empty
+    /// simulated root below has no `dev/kfd`, so the gate declines whatever the
+    /// machine has, while a wrapper passing any other path — `/` being the
+    /// obvious mutant — re-roots to the root directory itself, which opens.
+    /// Without the feature it is non-vacuous on any host with no readable
+    /// `/dev/kfd` (every non-GPU CI runner) and asserts only the absence of a
+    /// spurious decline on a GPU host.
     #[test]
     #[cfg(target_os = "linux")]
     fn the_public_amd_smi_entry_point_gates_on_the_real_kfd_device() {
+        #[cfg(feature = "e2e-test-hooks")]
+        let _simulated_host = {
+            let guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let root = tempfile::tempdir().expect("a simulated host root");
+            let variable = crate::test_env::RestoredEnvVar::set(
+                crate::hardware_root::TEST_HOST_ROOT_ENV,
+                root.path(),
+            );
+            (guard, variable, root)
+        };
+
         let gate_allows = kfd_readable(Path::new(KFD_DEVICE));
 
         // A deliberately bogus subcommand: if the gate allows the launch this
