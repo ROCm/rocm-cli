@@ -866,7 +866,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         let mut spinner =
             cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
-        let report = start_managed_service(
+        let launched = start_managed_service(
             &selected_engine,
             &service_id,
             &model,
@@ -882,7 +882,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             &mut |_elapsed| spinner.tick(),
-        )?;
+        );
+        // `Spinner` has no `Drop`, so a launch that fails here would otherwise
+        // leave its line painted and the error would print on top of it.
+        let report = match launched {
+            Ok(report) => report,
+            Err(error) => {
+                spinner.clear();
+                return Err(error);
+            }
+        };
         ensure_background_helper_running_quiet(summary_mode)?;
 
         // An equivalent service was already running, so nothing was spawned and the
