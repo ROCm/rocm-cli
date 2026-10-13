@@ -558,6 +558,16 @@ download that is not a ComfyUI release, which is neither installed nor kept:
 cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 ```
 
+`comfyui-14` is different: it installs ComfyUI into a real, isolated managed
+runtime and checks the ROCm torch stack survives with no `nvidia-*` packages
+added. It runs only with `E2E_INCLUDE_NIGHTLY=1` on a bare-metal Linux GPU host
+(`@requires-gpu @nightly @requires-os:linux @requires-bare-metal`) and does a
+real `install sdk --yes` first:
+
+```bash
+E2E_INCLUDE_NIGHTLY=1 cargo xtask e2e -- -n comfyui-14
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:

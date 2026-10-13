@@ -292,11 +292,15 @@ Feature: ComfyUI install reports progress, makes failures actionable and preserv
   # host-level work: system-package consent, the torch system libraries, and the
   # preferred-engine auto install (for vLLM families a sudo OpenMPI package install when
   # missing, then a full vLLM engine install into the runtime), which adds nightly time;
-  # otherwise it touches only its own isolated runtime prefix. Native Linux only (@requires-os:linux @requires-bare-metal; WSL2 reports
-  # linux, so the first tag alone would not exclude it). WSL2 is excluded because no
-  # run of `comfyui install` there has been seen, not because the amdgpu premise is
-  # known to be absent; no ticket tracks lifting the gate. If that gate is lifted, note the `nvidia-*` check has
-  # no teeth on Windows (PyPI's Windows torch wheels are CPU builds).
+  # otherwise it touches only its own isolated runtime prefix.
+  #
+  # Native Linux only: @requires-os:linux keeps Windows out, and
+  # @requires-bare-metal keeps WSL2 out (it reports linux, so the first tag alone
+  # would not). WSL2 is excluded because no run of `comfyui install` there has
+  # been seen, not because the amdgpu premise is known to be absent; no ticket
+  # tracks lifting that gate. Separately, if Windows is ever admitted, note the
+  # `nvidia-*` check has no teeth there (PyPI's Windows torch wheels are CPU
+  # builds).
   @id:comfyui-install-preserves-the-rocm-runtime @requires-gpu @nightly @requires-os:linux @requires-bare-metal
   Scenario: comfyui-14 - Installing ComfyUI does not replace the ROCm runtime with a CUDA one
     Given a machine with a managed ROCm runtime
