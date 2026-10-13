@@ -19141,10 +19141,12 @@ pub(crate) mod tests {
     /// What the stand-in spawn and readiness wait saw of one restart.
     #[derive(Default)]
     struct SeenByRestart {
+        /// `Some` once the spawn ran; the request fields below are read then.
         argv: Option<Vec<String>>,
-        endpoint_key_file: Option<Option<PathBuf>>,
-        engine_envs_root: Option<Option<PathBuf>>,
-        readiness_key: Option<Option<String>>,
+        endpoint_key_file: Option<PathBuf>,
+        engine_envs_root: Option<PathBuf>,
+        waited: bool,
+        readiness_key: Option<String>,
         on_disk_while_waiting: Option<ManagedServiceRecord>,
     }
 
@@ -19195,8 +19197,8 @@ pub(crate) mod tests {
             move |request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
                 let mut seen = seen.borrow_mut();
                 seen.argv = Some(request.args.to_vec());
-                seen.endpoint_key_file = Some(request.endpoint_key_file.map(Path::to_path_buf));
-                seen.engine_envs_root = Some(request.engine_envs_root.map(Path::to_path_buf));
+                seen.endpoint_key_file = request.endpoint_key_file.map(Path::to_path_buf);
+                seen.engine_envs_root = request.engine_envs_root.map(Path::to_path_buf);
                 Ok(SpawnedManagedEngine {
                     pid: stand_in_child_pid(),
                     startup: ManagedEngineStartupCheck::Observed(None),
@@ -19208,7 +19210,8 @@ pub(crate) mod tests {
             let manifest_path = manifest_path.clone();
             move |_record: &ManagedServiceRecord, key: Option<&str>| {
                 let mut seen = seen.borrow_mut();
-                seen.readiness_key = Some(key.map(str::to_owned));
+                seen.waited = true;
+                seen.readiness_key = key.map(str::to_owned);
                 seen.on_disk_while_waiting = manifest_on_disk(&manifest_path);
                 EndpointReadiness::Serving
             }
@@ -19242,8 +19245,7 @@ pub(crate) mod tests {
 
         assert!(expected_key_file.is_some(), "the test stored a key file");
         assert_eq!(
-            seen.endpoint_key_file,
-            Some(expected_key_file),
+            seen.endpoint_key_file, expected_key_file,
             "the child must be handed the service's own endpoint key file"
         );
         assert!(
@@ -19251,13 +19253,13 @@ pub(crate) mod tests {
             "the pinned runtime has an engine env root for the child to be given"
         );
         assert_eq!(
-            seen.engine_envs_root,
-            Some(expected_envs_root),
+            seen.engine_envs_root, expected_envs_root,
             "the child must be given the pinned runtime's engine env root"
         );
+        assert!(seen.waited, "the restart reached its readiness wait");
         assert_eq!(
-            seen.readiness_key,
-            Some(Some("pin-restart-key".to_owned())),
+            seen.readiness_key.as_deref(),
+            Some("pin-restart-key"),
             "the readiness probe must authenticate with the service's key"
         );
 
