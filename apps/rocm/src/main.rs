@@ -10818,14 +10818,43 @@ fn restart_internal_managed_service(
     service_id: &str,
     runtime_pin: Option<&str>,
 ) -> Result<ManagedServiceRecord> {
+    let seams = restart_engine_seams();
     restart_internal_managed_service_with(
         paths,
         service_id,
         runtime_pin,
         terminate_recorded_service_pids,
-        &spawn_managed_engine_process,
-        &wait_for_restarted_service_ready,
+        &*seams.spawn,
+        &*seams.wait_ready,
     )
+}
+
+/// The readiness wait [`restart_internal_managed_service_with`] takes.
+type RestartReadinessWait<'a> =
+    dyn Fn(&ManagedServiceRecord, Option<&str>) -> EndpointReadiness + 'a;
+
+/// The spawn and readiness wait [`restart_internal_managed_service`] hands its
+/// restart.
+#[derive(Clone)]
+struct RestartEngineSeams {
+    spawn: std::rc::Rc<SpawnManagedEngine<'static>>,
+    wait_ready: std::rc::Rc<RestartReadinessWait<'static>>,
+}
+
+/// The real engine spawn and the real readiness wait — or, in a unit test that
+/// installed them, stand-ins. The override is how a test drives the production
+/// wrapper itself, and so pins what it forwards (its `runtime_pin` above all)
+/// rather than only what `restart_internal_managed_service_with` does with
+/// arguments a test passed it directly.
+fn restart_engine_seams() -> RestartEngineSeams {
+    #[cfg(test)]
+    if let Some(seams) = tests::RESTART_ENGINE_SEAMS.with(|seams| seams.borrow().clone()) {
+        return seams;
+    }
+    RestartEngineSeams {
+        spawn: std::rc::Rc::new(spawn_managed_engine_process),
+        wait_ready: std::rc::Rc::new(wait_for_restarted_service_ready),
+    }
 }
 
 /// The readiness wait a restarted service gets: the same 45 s the launch path
@@ -10855,7 +10884,7 @@ fn restart_internal_managed_service_with(
     runtime_pin: Option<&str>,
     terminate: impl FnOnce(&ManagedServiceRecord) -> (Vec<u32>, bool),
     spawn_engine: &SpawnManagedEngine<'_>,
-    wait_ready: &dyn Fn(&ManagedServiceRecord, Option<&str>) -> EndpointReadiness,
+    wait_ready: &RestartReadinessWait<'_>,
 ) -> Result<ManagedServiceRecord> {
     let record = load_service_for_restart(paths, service_id, runtime_pin)?;
     // Preserve the endpoint key across the restart: `stop_internal_managed_service`
@@ -25316,11 +25345,54 @@ install therock";
         Ok(())
     }
 
-    /// The pin through the real restart, not just through
-    /// [`load_service_for_restart`]: `restart_internal_managed_service_with`
-    /// must hand it to its own load, or the child is launched on the runtime it
-    /// was already using. The spawn seam is what lets this read the argv the
-    /// restart actually launches, and the record it writes for that child.
+    thread_local! {
+        /// Stand-ins for the spawn and readiness wait the production
+        /// [`restart_internal_managed_service`] uses, installed by
+        /// [`RestartSeamsGuard`]. Read by `restart_engine_seams`.
+        pub(crate) static RESTART_ENGINE_SEAMS: RefCell<Option<RestartEngineSeams>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Installs restart stand-ins on this test's thread for its lifetime.
+    struct RestartSeamsGuard;
+
+    impl RestartSeamsGuard {
+        fn install(seams: RestartEngineSeams) -> Self {
+            RESTART_ENGINE_SEAMS.with(|slot| *slot.borrow_mut() = Some(seams));
+            Self
+        }
+    }
+
+    impl Drop for RestartSeamsGuard {
+        fn drop(&mut self) {
+            RESTART_ENGINE_SEAMS.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// What the stand-in spawn and readiness wait saw of one restart.
+    #[derive(Default)]
+    struct SeenByRestart {
+        argv: Option<Vec<String>>,
+        endpoint_key_file: Option<Option<PathBuf>>,
+        engine_envs_root: Option<Option<PathBuf>>,
+        readiness_key: Option<Option<String>>,
+        on_disk_while_waiting: Option<ManagedServiceRecord>,
+    }
+
+    /// The pin through the production restart, not just through
+    /// [`load_service_for_restart`]: `restart_internal_managed_service` must
+    /// hand it on, and `restart_internal_managed_service_with` must hand it to
+    /// its own load, or the child is launched on the runtime it was already
+    /// using. The stand-ins are installed under the wrapper rather than passed
+    /// to `_with`, so dropping the pin from either fails this.
+    ///
+    /// The same restart pins the rest of what the child is started with — the
+    /// service's endpoint key file, the pinned runtime's engine env root — and
+    /// the key the readiness probe uses, since a public service restarted
+    /// without them comes back unauthenticated or on the wrong env. Its spawn
+    /// answers as the Windows watched spawn does (`Observed`, alive), and the
+    /// readiness wait reads the manifest: by then it must already name the
+    /// child as `"starting"`, which is what the `Observed` arm's write is for.
     #[test]
     fn a_pinned_restart_launches_and_records_the_child_on_the_pinned_runtime() -> Result<()> {
         let (root, paths) = test_paths("service-runtime-pin-restart");
@@ -25345,32 +25417,52 @@ install therock";
                 "env_id": "custom-env",
             }))?,
         )?;
-        let launched_argv = RefCell::new(None::<Vec<String>>);
-        let spawn = |request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
-            *launched_argv.borrow_mut() = Some(request.args.to_vec());
-            Ok(SpawnedManagedEngine {
-                pid: stand_in_child_pid(),
-                startup: ManagedEngineStartupCheck::Observed(None),
-            })
-        };
-        let wait = |_record: &ManagedServiceRecord, _key: Option<&str>| EndpointReadiness::Serving;
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-pin-restart", "pin-restart-key")?;
+        let manifest_path = paths.service_manifest_path("svc-pin-restart");
 
-        let outcome = restart_internal_managed_service_with(
-            &paths,
-            "svc-pin-restart",
-            Some(NEW_RUNTIME_KEY),
-            terminate_recorded_service_pids,
-            &spawn,
-            &wait,
-        );
-        let on_disk: ManagedServiceRecord =
-            serde_json::from_slice(&fs::read(paths.service_manifest_path("svc-pin-restart"))?)?;
+        let seen = std::rc::Rc::new(RefCell::new(SeenByRestart::default()));
+        let spawn = {
+            let seen = std::rc::Rc::clone(&seen);
+            move |request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
+                let mut seen = seen.borrow_mut();
+                seen.argv = Some(request.args.to_vec());
+                seen.endpoint_key_file = Some(request.endpoint_key_file.map(Path::to_path_buf));
+                seen.engine_envs_root = Some(request.engine_envs_root.map(Path::to_path_buf));
+                Ok(SpawnedManagedEngine {
+                    pid: stand_in_child_pid(),
+                    startup: ManagedEngineStartupCheck::Observed(None),
+                })
+            }
+        };
+        let wait = {
+            let seen = std::rc::Rc::clone(&seen);
+            let manifest_path = manifest_path.clone();
+            move |_record: &ManagedServiceRecord, key: Option<&str>| {
+                let mut seen = seen.borrow_mut();
+                seen.readiness_key = Some(key.map(str::to_owned));
+                seen.on_disk_while_waiting = manifest_on_disk(&manifest_path);
+                EndpointReadiness::Serving
+            }
+        };
+        let outcome = {
+            let _seams = RestartSeamsGuard::install(RestartEngineSeams {
+                spawn: std::rc::Rc::new(spawn),
+                wait_ready: std::rc::Rc::new(wait),
+            });
+            restart_internal_managed_service(&paths, "svc-pin-restart", Some(NEW_RUNTIME_KEY))
+        };
+        let on_disk = manifest_on_disk(&manifest_path).expect("the restart left a record");
+        let expected_key_file =
+            endpoint_keys::endpoint_key_file_if_present(&paths, "svc-pin-restart");
+        let expected_envs_root = env_root_for_service(&paths, "vllm", Some(NEW_RUNTIME_KEY), None)?;
         let _ = fs::remove_dir_all(&root);
 
         outcome?;
-        let argv = launched_argv
-            .into_inner()
-            .expect("the restart reached its spawn");
+        let seen = std::rc::Rc::try_unwrap(seen)
+            .ok()
+            .expect("the stand-ins were dropped with the restart")
+            .into_inner();
+        let argv = seen.argv.expect("the restart reached its spawn");
         assert_eq!(
             argv_flag_value(&argv, "--runtime-id"),
             Some(NEW_RUNTIME_KEY),
@@ -25378,6 +25470,37 @@ install therock";
         );
         assert_eq!(on_disk.runtime_id.as_deref(), Some(NEW_RUNTIME_KEY));
         assert_eq!(on_disk.env_id, None);
+
+        assert!(expected_key_file.is_some(), "the test stored a key file");
+        assert_eq!(
+            seen.endpoint_key_file,
+            Some(expected_key_file),
+            "the child must be handed the service's own endpoint key file"
+        );
+        assert!(
+            expected_envs_root.is_some(),
+            "the pinned runtime has an engine env root for the child to be given"
+        );
+        assert_eq!(
+            seen.engine_envs_root,
+            Some(expected_envs_root),
+            "the child must be given the pinned runtime's engine env root"
+        );
+        assert_eq!(
+            seen.readiness_key,
+            Some(Some("pin-restart-key".to_owned())),
+            "the readiness probe must authenticate with the service's key"
+        );
+
+        let waiting = seen
+            .on_disk_while_waiting
+            .expect("a record was on disk during the readiness wait");
+        assert_eq!(
+            waiting.status, "starting",
+            "a child the spawn saw alive is on record before the readiness wait"
+        );
+        assert_eq!(waiting.supervisor_pid, stand_in_child_pid());
+        assert_eq!(waiting.engine_pid, Some(stand_in_child_pid()));
         Ok(())
     }
 
