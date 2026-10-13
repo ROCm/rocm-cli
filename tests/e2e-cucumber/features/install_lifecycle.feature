@@ -323,3 +323,32 @@ Feature: Release install lifecycle
     Then the removal is refused with advice to repair or delete that record
     And the installed rocm binary and manifest are still present
     And the isolated XDG state is still present
+
+  # EAI-8014: the background helper restarts managed services on its own, so
+  # uninstall stops it first. Pinned alone, with no service record, so it is the
+  # helper stop being proven and not the service stop.
+  @id:lifecycle-linux-uninstall-stops-background-helper @lifecycle @requires-os:linux
+  Scenario: lifecycle-26 - Linux - uninstall stops the background helper
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And the background helper is running
+    When the user uninstalls from the installed binary
+    Then the removal is reported as complete
+    And the background helper is no longer running
+
+  # EAI-8014: a run that removes only the cache keeps `rocm services stop` and the
+  # service records, so it must not force-stop a server it leaves stoppable.
+  @id:lifecycle-linux-uninstall-cache-only-leaves-server @lifecycle @requires-os:linux
+  Scenario: lifecycle-27 - Linux - a cache-only uninstall leaves the managed server running and stoppable
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And a local server this machine manages is running
+    When the user uninstalls only the cache from the installed binary
+    Then the removal is reported as complete
+    And the cache-only run says the server is left running
+    And the local server this machine manages is still running
+    And the managed service record is still present
