@@ -266,7 +266,7 @@ the JSON report, not the human-readable one.
 ```
 rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm diagnose --model <model> [--json]
-rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
+rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N] [--json]
 ```
 
 `diagnose` matches this machine against a fixed catalog of known
@@ -343,6 +343,9 @@ failure).
 - `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
   NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
   `hipInfo.exe` (Windows) query needed to find the index and makes no change.
+- `--json`, used without a fix id, prints the catalog manifest as JSON. It
+  applies no fix and exits 0. Together with a fix id it is refused, with exit
+  code 1.
 
 ### ROCm installation
 
