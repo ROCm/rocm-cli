@@ -830,14 +830,27 @@ enum Item {
 fn synopsis_items(words: &[String]) -> Vec<Item> {
     let mut items = Vec::new();
     let mut group: Option<Vec<Vec<String>>> = None;
+    // Bracket depth inside `group`: a nested `[...]` (`[--restart-services
+    // [--yes]]`, `[--distro [NAME]]`) is optional *within* the outer group.
+    let mut depth = 0_usize;
     for (index, raw_word) in words.iter().enumerate() {
-        let opens = raw_word.starts_with('[');
-        let closes = raw_word.ends_with(']');
+        let opening = raw_word.chars().take_while(|c| *c == '[').count();
+        let closing = raw_word.chars().rev().take_while(|c| *c == ']').count();
         let word = raw_word.trim_matches(['[', ']']);
-        if opens && group.is_none() {
+        if opening > 0 && group.is_none() {
             group = Some(vec![Vec::new()]);
         }
         if let Some(alternatives) = group.as_mut() {
+            if opening > 0 && depth > 0 {
+                // The words before a nested group are a form of their own:
+                // `[--restart-services [--yes]]` allows `--restart-services`
+                // alone as well as with `--yes`.
+                let current = alternatives.last().cloned().unwrap_or_default();
+                if !current.is_empty() {
+                    alternatives.insert(alternatives.len() - 1, current);
+                }
+            }
+            depth += opening;
             if word == "|" {
                 alternatives.push(Vec::new());
             } else if !word.is_empty() && !is_ellipsis(word) {
@@ -857,7 +870,8 @@ fn synopsis_items(words: &[String]) -> Vec<Item> {
                     alternatives.push(current);
                 }
             }
-            if closes {
+            depth = depth.saturating_sub(closing);
+            if depth == 0 {
                 let alternatives = group.take().expect("open group");
                 items.push(Item::Optional(
                     alternatives.into_iter().filter(|a| !a.is_empty()).collect(),
@@ -1176,10 +1190,19 @@ const NOT_INVOCATIONS: &[(&str, &str, &str)] = &[
         "`launcher` label recorded in a benchmark result, not advice",
     ),
     (
-        "apps/rocm/src/main.rs",
-        "rocm services {} {service_id} --yes",
+        "apps/rocm/src/service_hints.rs",
+        "rocm services {action} {service_id} --yes",
         "the verb is a format argument; every value it takes is checked against the \
-         real message by `service_action_retry_advice_parses_for_generated_ids`",
+         real hint by `service_action_retry_advice_parses_for_generated_ids` (the \
+         `run_approved_service_action` verbs) and `every_service_action_hint_verb_parses` \
+         (each literal verb a caller passes)",
+    ),
+    (
+        "apps/rocm/src/runtime_services.rs",
+        "rocm runtimes {command} --restart-services --yes",
+        "the subcommand is a format argument; the real hint for every `rocm runtimes` \
+         subcommand that takes `--restart-services` is checked, and re-parsed to show it \
+         clears the refusal, by `runtime_restart_retry_advice_parses_and_clears_the_refusal`",
     ),
     (
         "crates/rocm-core/src/examine.rs",
@@ -1374,10 +1397,20 @@ fn every_source_is_scanned() {
     assert!(
         has(
             "apps/rocm/src/main.rs:",
-            "rocm services stop",
+            "rocm services prune --dry-run",
             Surface::CommandLine
         ),
-        "labelled `stop: rocm services stop …` line not found"
+        "labelled `Try: rocm services prune --dry-run` line not found: labelled-line \
+         extraction is broken"
+    );
+    assert!(
+        has(
+            "apps/rocm/src/main.rs:",
+            "rocm services prune --yes",
+            Surface::CommandLine
+        ),
+        "labelled `Then: rocm services prune --yes` line (after a `\\n` in the same \
+         literal) not found: per-line literal extraction is broken"
     );
     assert!(count(Origin::Rust, Surface::CommandLine) >= 90);
     assert!(count(Origin::Rust, Surface::InlineProse) >= 130);
@@ -1516,6 +1549,49 @@ fn synopsis_notation_expands_to_each_documented_form() {
         argv_variants("rocm --yes <natural language request>"),
         vec![vec!["rocm", "--yes", "start a local model"]]
     );
+    // A nested group is optional within the outer one: each prefix is a form.
+    assert_eq!(
+        argv_variants("rocm runtimes rollback [--restart-services [--yes]]"),
+        vec![
+            vec!["rocm", "runtimes", "rollback"],
+            vec!["rocm", "runtimes", "rollback", "--restart-services"],
+            vec![
+                "rocm",
+                "runtimes",
+                "rollback",
+                "--restart-services",
+                "--yes"
+            ],
+        ]
+    );
+    assert_eq!(
+        argv_variants("rocm storage [report [--json]] [--top N]"),
+        vec![
+            vec!["rocm", "storage"],
+            vec!["rocm", "storage", "report"],
+            vec!["rocm", "storage", "report", "--json"],
+            vec!["rocm", "storage", "--top", "1"],
+        ]
+    );
+}
+
+/// Side-by-side groups claim each flag works on its own. `--yes` on
+/// `runtimes activate`/`rollback` requires `--restart-services`, so writing
+/// them as `[--restart-services] [--yes]` advertises a command that fails;
+/// nesting the dependent flag says what the parser accepts.
+#[test]
+fn a_flag_that_requires_another_is_advised_only_with_it() {
+    let found = findings(&[fixture(
+        "rocm runtimes rollback [--restart-services] [--yes]",
+        Surface::CommandLine,
+    )]);
+    assert_eq!(found.len(), 1, "{}", render_findings(&found));
+    assert_eq!(found[0].argv, ["rocm", "runtimes", "rollback", "--yes"]);
+    let found = findings(&[fixture(
+        "rocm runtimes activate <runtime-key> [--restart-services [--yes]]",
+        Surface::CommandLine,
+    )]);
+    assert!(found.is_empty(), "{}", render_findings(&found));
 }
 
 /// Templated advice, checked through the real message function rather than
@@ -1529,7 +1605,7 @@ fn synopsis_notation_expands_to_each_documented_form() {
 /// per-character map, so one representative per class covers it.
 #[test]
 fn service_action_retry_advice_parses_for_generated_ids() {
-    use super::{AppPaths, SUPPORTED_ENGINES, run_approved_service_action};
+    use super::{AppPaths, run_approved_service_action};
 
     // Never touched: the missing-`--yes` branch bails before any disk access.
     let unused = std::env::temp_dir().join("rocm-advised-commands-never-created");
@@ -1538,6 +1614,33 @@ fn service_action_retry_advice_parses_for_generated_ids() {
         data_dir: unused.join("data"),
         cache_dir: unused.join("cache"),
     };
+    // The tools the `services stop` / `services restart` dispatch passes in.
+    let actions = [("stop_server", "stop"), ("restart_server", "restart")];
+    for id in generated_service_ids() {
+        for (tool, verb) in actions {
+            let error = run_approved_service_action(&paths, tool, &id, false)
+                .expect_err("an action without --yes is refused")
+                .to_string();
+            let advised = error
+                .lines()
+                .find_map(|line| line.strip_prefix("Try: "))
+                .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
+            let argv = split_words(advised);
+            assert_eq!(
+                verdict(&argv),
+                Verdict::Parses,
+                "advice {advised:?} for id {id:?} does not parse"
+            );
+            // It names the same action on the same service and carries the
+            // `--yes` the refusal asked for, so following it clears the gate.
+            assert_eq!(argv, ["rocm", "services", verb, id.as_str(), "--yes"]);
+        }
+    }
+}
+
+/// Service ids `generate_service_id` produces for every engine, from model
+/// references covering each character class it handles differently.
+fn generated_service_ids() -> Vec<String> {
     let long = "x".repeat(80);
     let model_refs = [
         "Qwen/Qwen3-0.6B",
@@ -1552,31 +1655,178 @@ fn service_action_retry_advice_parses_for_generated_ids() {
         "",
         long.as_str(),
     ];
-    // The tools the `services stop` / `services restart` dispatch passes in.
-    let actions = [("stop_server", "stop"), ("restart_server", "restart")];
-    for engine in SUPPORTED_ENGINES {
-        for model_ref in model_refs {
-            let id = rocm_core::generate_service_id(engine, model_ref);
-            for (tool, verb) in actions {
-                let error = run_approved_service_action(&paths, tool, &id, false)
-                    .expect_err("an action without --yes is refused")
-                    .to_string();
-                let advised = error
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Try: "))
-                    .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
-                let argv = split_words(advised);
-                assert_eq!(
-                    verdict(&argv),
-                    Verdict::Parses,
-                    "advice {advised:?} for id {id:?} does not parse"
-                );
-                // It names the same action on the same service and carries the
-                // `--yes` the refusal asked for, so following it clears the gate.
-                assert_eq!(argv, ["rocm", "services", verb, id.as_str(), "--yes"]);
+    super::SUPPORTED_ENGINES
+        .iter()
+        .flat_map(|engine| {
+            model_refs
+                .iter()
+                .map(move |model_ref| rocm_core::generate_service_id(engine, model_ref))
+        })
+        .collect()
+}
+
+/// `service_hints::service_action_hint(action, id)` is excluded from the scan
+/// because its verb is a format argument. The verbs come from its callers:
+/// `run_approved_service_action` (checked through the real message above) and
+/// string literals at the other call sites, which this test finds in the
+/// source and checks one by one. A call with any other kind of argument fails
+/// here, so a new caller cannot slip past both checks.
+#[test]
+fn every_service_action_hint_verb_parses() {
+    use super::service_hints;
+
+    let call = concat!("service_action_hint", "(");
+    let mut files = Vec::new();
+    walk(&repo_root().join("apps/rocm/src"), &["rs"], &[], &mut files);
+    let mut verbs: Vec<String> = Vec::new();
+    for file in &files {
+        if file.ends_with("advised_commands.rs") {
+            continue; // this test's own calls
+        }
+        let text = std::fs::read_to_string(file).expect("readable source");
+        for (index, line) in text.lines().enumerate() {
+            let Some(at) = line.find(call) else { continue };
+            let argument = &line[at + call.len()..];
+            let code = line.trim_start();
+            if code.starts_with("//") || code.starts_with("pub(crate) fn ") {
+                continue; // a comment, or the definition
+            }
+            if argument.starts_with("service_action_command(tool)") {
+                continue; // `service_action_retry_advice_parses_for_generated_ids`
+            }
+            let Some((verb, _)) = argument
+                .strip_prefix('"')
+                .and_then(|rest| rest.split_once('"'))
+            else {
+                panic!(
+                    "{}:{}: `service_action_hint` called with a verb this test \
+                     cannot check; pass a string literal or extend this test: {line}",
+                    file.display(),
+                    index + 1
+                )
+            };
+            let verb = verb.to_owned();
+            if !verbs.contains(&verb) {
+                verbs.push(verb);
             }
         }
     }
+    // `service_stop_hint` is `service_action_hint("stop", …)`.
+    verbs.push("stop".to_owned());
+    for expected in ["restart", "remove"] {
+        assert!(
+            verbs.iter().any(|verb| verb == expected),
+            "call site with {expected:?} not found ({verbs:?}): the scan is broken"
+        );
+    }
+    for id in generated_service_ids() {
+        let mut hints: Vec<(String, String)> = verbs
+            .iter()
+            .map(|verb| (verb.clone(), service_hints::service_action_hint(verb, &id)))
+            .collect();
+        hints.push(("stop".to_owned(), service_hints::service_stop_hint(&id)));
+        for (verb, hint) in hints {
+            let argv = split_words(&hint);
+            assert_eq!(
+                verdict(&argv),
+                Verdict::Parses,
+                "hint {hint:?} for id {id:?} does not parse"
+            );
+            assert_eq!(
+                argv,
+                ["rocm", "services", verb.as_str(), id.as_str(), "--yes"]
+            );
+        }
+    }
+}
+
+/// The `rocm runtimes <command> --restart-services --yes` retry hint, checked
+/// through the real refusal for every `rocm runtimes` subcommand that takes
+/// `--restart-services` (found in the clap tree, so a new one is covered too).
+/// The hint must parse, and parsed back it must be the same command with the
+/// approval added — following it clears the refusal that printed it.
+#[test]
+fn runtime_restart_retry_advice_parses_and_clears_the_refusal() {
+    use super::{Command, RuntimesCommand};
+    use crate::runtimes_cmd::ensure_runtime_service_restart_approved;
+
+    fn runtimes_command(argv: &[String]) -> RuntimesCommand {
+        let matches = cli_command()
+            .try_get_matches_from(argv)
+            .unwrap_or_else(|error| panic!("{argv:?} does not parse: {error}"));
+        match Cli::from_arg_matches(&matches).map(|cli| cli.command) {
+            Ok(Some(Command::Runtimes {
+                command: Some(command),
+            })) => command,
+            other => panic!("{argv:?} is not a `rocm runtimes` subcommand: {other:?}"),
+        }
+    }
+
+    // Runtime keys as `rocm install sdk` writes them, a runtime id, a key in
+    // other letter case (selectors match case-insensitively), and an adopted
+    // runtime's free-form `--runtime-key`.
+    let selectors = [
+        "release-pip-gfx120x-all-7-13-0",
+        "release-pip-gfx120x-all-7-12-0-devel",
+        "therock-7.13.0-gfx120x",
+        "RELEASE-PIP-GFX120X-ALL-7-13-0",
+        "my_adopted.rocm",
+    ];
+    let mut root = cli_command();
+    let runtimes = root
+        .find_subcommand_mut("runtimes")
+        .expect("`rocm runtimes` exists");
+    let mut checked = Vec::new();
+    for subcommand in runtimes.get_subcommands_mut() {
+        if !subcommand
+            .get_arguments()
+            .any(|arg| arg.get_long() == Some("restart-services"))
+        {
+            continue;
+        }
+        let name = subcommand.get_name().to_owned();
+        let takes_runtime = subcommand
+            .get_arguments()
+            .any(|arg| arg.is_positional() && arg.is_required_set());
+        let values: Vec<Option<&str>> = if takes_runtime {
+            selectors.iter().copied().map(Some).collect()
+        } else {
+            vec![None]
+        };
+        for value in values {
+            let mut argv: Vec<String> = vec!["rocm".into(), "runtimes".into(), name.clone()];
+            argv.extend(value.map(str::to_owned));
+            argv.push("--restart-services".into());
+            let refused = runtimes_command(&argv);
+            let error = ensure_runtime_service_restart_approved(&refused)
+                .expect_err("--restart-services without --yes is refused")
+                .to_string();
+            let advised = error
+                .lines()
+                .find_map(|line| line.strip_prefix("Try: "))
+                .unwrap_or_else(|| panic!("no `Try:` advice in: {error}"));
+            let retry = split_words(advised);
+            assert_eq!(
+                verdict(&retry),
+                Verdict::Parses,
+                "advice {advised:?} after {argv:?} does not parse"
+            );
+            let mut expected = argv.clone();
+            expected.push("--yes".into());
+            assert_eq!(
+                retry, expected,
+                "the advice must repeat what the user ran, with the approval added"
+            );
+            ensure_runtime_service_restart_approved(&runtimes_command(&retry))
+                .expect("following the advice clears the refusal");
+        }
+        checked.push(name);
+    }
+    assert_eq!(
+        checked,
+        ["activate", "rollback"],
+        "the subcommands taking --restart-services changed; check the hint covers them"
+    );
 }
 
 #[test]

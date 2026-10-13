@@ -490,8 +490,8 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key> [--restart-services] [--yes]
-rocm runtimes rollback [--restart-services] [--yes]
+rocm runtimes activate <runtime-key> [--restart-services [--yes]]
+rocm runtimes rollback [--restart-services [--yes]]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
