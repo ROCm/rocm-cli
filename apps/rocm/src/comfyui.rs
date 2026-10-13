@@ -3115,8 +3115,8 @@ mod archive_properties {
     use proptest::prelude::*;
 
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, Modes, entries, note_mode_scope, run_case, run_property,
-        run_round_trip, tar_gz_bytes,
+        ESCAPES_ONLY, Entry, Expect, Kind, Layout, Modes, entries, note_mode_scope, run_case,
+        run_property, run_round_trip, tar_gz_bytes,
     };
 
     /// The unpack plus the first write `install` makes into the result: the
@@ -3133,6 +3133,25 @@ mod archive_properties {
         Ok(())
     }
 
+    /// `entry` moved under `a/`, unless its name is absolute (re-rooted, it
+    /// already lands deep inside the extraction root). A relative symlink
+    /// target resolves from the link's own directory, now one level deeper,
+    /// so it climbs one more to land where it did unmoved: `../outside`
+    /// still escapes rather than stopping at `dest/outside`.
+    fn moved_one_level_down(mut entry: Entry) -> Entry {
+        if entry.name.starts_with(b"/") || entry.name.starts_with(b"@") {
+            return entry;
+        }
+        entry.name.splice(0..0, *b"a/");
+        if let Kind::Symlink(target) = &mut entry.kind
+            && !target.starts_with(b"/")
+            && !target.starts_with(b"@")
+        {
+            target.splice(0..0, *b"../");
+        }
+        entry
+    }
+
     /// [`entries`] with every relative name moved one level down, under
     /// `a/`, and every symlink dropped that could still land directly in the
     /// extraction root: the shape that hits the known #522 defect
@@ -3142,7 +3161,9 @@ mod archive_properties {
     /// left alone: re-rooted, they land deep inside the extraction root.
     /// Moving names down rather than only dropping top-level links keeps
     /// "link, then write through it" in play, one level down where the
-    /// source tree is.
+    /// source tree is; a moved symlink's relative target gains a `../` so it
+    /// still resolves to the same place, and an escaping target still
+    /// escapes.
     fn entries_without_top_level_symlink() -> impl Strategy<Value = Vec<Entry>> {
         /// Lexical components, or `None` when the name climbs above the root.
         fn components(name: &[u8]) -> Option<Vec<&[u8]>> {
@@ -3161,15 +3182,7 @@ mod archive_properties {
         entries().prop_map(|entries| {
             let mut links: Vec<Vec<&[u8]>> = Vec::new();
             let mut kept = Vec::new();
-            let moved: Vec<Entry> = entries
-                .into_iter()
-                .map(|mut entry| {
-                    if !entry.name.starts_with(b"/") && !entry.name.starts_with(b"@") {
-                        entry.name.splice(0..0, *b"a/");
-                    }
-                    entry
-                })
-                .collect();
+            let moved: Vec<Entry> = entries.into_iter().map(moved_one_level_down).collect();
             for entry in &moved {
                 if matches!(entry.kind, Kind::Symlink(_))
                     && !entry.name.starts_with(b"/")
@@ -3187,6 +3200,72 @@ mod archive_properties {
             }
             kept
         })
+    }
+
+    /// Moving an entry down must not move where its symlink points: the
+    /// target, resolved lexically from the link's directory, names the same
+    /// place relative to the extraction root before and after.
+    #[test]
+    fn moving_an_entry_down_keeps_its_symlink_target_in_place() {
+        /// `dir` joined with `target`, `..` applied lexically; a leading `..`
+        /// that climbs above the root is kept.
+        fn resolve(dir: &[u8], target: &[u8]) -> Vec<Vec<u8>> {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for part in dir
+                .split(|b| *b == b'/')
+                .chain(target.split(|b| *b == b'/'))
+            {
+                match part {
+                    b"" | b"." => {}
+                    b".." if out.last().is_some_and(|last| last != b"..") => {
+                        out.pop();
+                    }
+                    _ => out.push(part.to_vec()),
+                }
+            }
+            out
+        }
+        for target in [
+            &b"../outside"[..],
+            b"../../outside",
+            b"../victim",
+            b".",
+            b"l/../..",
+            b"a",
+        ] {
+            let moved = moved_one_level_down(Entry {
+                name: b"l".to_vec(),
+                kind: Kind::Symlink(target.to_vec()),
+                mode: 0o777,
+            });
+            assert_eq!(moved.name, b"a/l");
+            let Kind::Symlink(moved_target) = moved.kind else {
+                panic!("still a symlink");
+            };
+            assert_eq!(
+                resolve(b"a", &moved_target),
+                resolve(b"", target),
+                "{} moved to {}",
+                String::from_utf8_lossy(target),
+                String::from_utf8_lossy(&moved_target)
+            );
+        }
+        // Absolute targets and absolute names are left alone.
+        let absolute = moved_one_level_down(Entry {
+            name: b"l".to_vec(),
+            kind: Kind::Symlink(b"@OUT/sentinel".to_vec()),
+            mode: 0o777,
+        });
+        assert!(matches!(absolute.kind, Kind::Symlink(t) if t == b"@OUT/sentinel"));
+        assert_eq!(
+            moved_one_level_down(Entry {
+                name: b"/x".to_vec(),
+                kind: Kind::Dir,
+                mode: 0o755
+            })
+            .name,
+            b"/x"
+        );
     }
 
     fn property(
@@ -3220,11 +3299,6 @@ mod archive_properties {
             Ok(())
         })
     }
-
-    const ESCAPES_ONLY: Expect = Expect {
-        modes: Modes::Unchecked,
-        no_outward_links: false,
-    };
 
     /// What holds today: with the #522 shape (a top-level symlink) left out,
     /// the unpack and the first install write stay inside the app root.
