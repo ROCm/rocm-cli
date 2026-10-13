@@ -1892,6 +1892,19 @@ fn repo_native_method_from_markers(existing: &[&str]) -> Option<(&'static str, V
     }
 }
 
+/// Whether a lowercased repo-directory entry name is a live ROCm/AMDGPU repo
+/// file, as opposed to one fix-7/fix-12 already told the user to quarantine
+/// (`mv foo foo.bak`). Without this, `amdgpu.list.bak` sitting next to the
+/// reinstalled `amdgpu.list` after following that advice counts as a second
+/// stale repo and re-triggers the same fix.
+// `name` is already lowercased by the caller, so a plain suffix match is fine.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn is_live_rocm_repo_file_name(name: &str) -> bool {
+    let quarantined =
+        name.ends_with(".bak") || name.ends_with(".save") || name.ends_with(".disabled");
+    !quarantined && (name.contains("rocm") || name.contains("amdgpu") || name.contains("radeon"))
+}
+
 fn probe_rocm_install(e: &mut Examination) {
     // Shared with the human `rocm examine` report and the fix-6 PATH runner so
     // all three agree on which install is the active one. Handles versioned
@@ -1948,7 +1961,7 @@ fn probe_rocm_install(e: &mut Examination) {
         };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_lowercase();
-            if name.contains("rocm") || name.contains("amdgpu") || name.contains("radeon") {
+            if is_live_rocm_repo_file_name(&name) {
                 let full = entry.path().to_string_lossy().into_owned();
                 if !e.rocm_repos_seen.contains(&full) {
                     e.rocm_repos_seen.push(full);
@@ -3095,6 +3108,16 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_live_rocm_repo_file_name_skips_quarantined_files() {
+        assert!(is_live_rocm_repo_file_name("amdgpu.list"));
+        assert!(is_live_rocm_repo_file_name("rocm.repo"));
+        assert!(!is_live_rocm_repo_file_name("amdgpu.list.bak"));
+        assert!(!is_live_rocm_repo_file_name("amdgpu.list.save"));
+        assert!(!is_live_rocm_repo_file_name("amdgpu.list.disabled"));
+        assert!(!is_live_rocm_repo_file_name("unrelated.list"));
+    }
 
     /// Serialises the tests that read or replace the process-global
     /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test

@@ -1034,8 +1034,12 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
         ));
     }
     commands.push("sudo apt update".to_owned());
-    commands.push("# If apt now resolves, reinstall via the repo-native flow only:".to_owned());
-    commands.push("#   rocm install driver".to_owned());
+    commands.push(
+        "# If apt now resolves, reinstall the driver only (review the plan, then approve):"
+            .to_owned(),
+    );
+    commands.push("#   rocm install driver --dkms   # review the plan".to_owned());
+    commands.push("#   rocm install driver --dkms --yes   # reinstalls the driver only".to_owned());
     let fix = Fix {
         summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve apt before re-running any installer.".to_owned(),
         commands,

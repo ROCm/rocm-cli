@@ -69,13 +69,6 @@ async fn user_inspects_system(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
-#[when("the user inspects the system as machine-readable JSON")]
-async fn user_inspects_system_as_json(world: &mut E2eWorld) {
-    let (stdout, _, rc) = crate::run_rocm(world, &["examine", "--json"]);
-    world.cli_output = Some(stdout);
-    world.cli_rc = Some(rc);
-}
-
 #[when("the user asks for help")]
 async fn user_asks_help(world: &mut E2eWorld) {
     let (stdout, _, _) = crate::run_rocm(world, &["help"]);
@@ -414,11 +407,13 @@ async fn assert_install_method_is_current(world: &mut E2eWorld) {
     // lane) legitimately resolves to "repo-native" instead of
     // "runfile-or-tarball". Either current name passing and either retired
     // name failing is exactly the coverage a revert of the rename needs.
+    // "zypper" is excluded: `probe_rocm_install` reports SUSE via its `rpm -q`
+    // branch, so it always yields "dnf", never "zypper". "none" is excluded
+    // too: this scenario plants an install, so "none" would mean the planted
+    // install went undetected, which is the regression this scenario exists
+    // to catch, not a value it should tolerate.
     assert!(
-        matches!(
-            method,
-            "apt" | "dnf" | "zypper" | "repo-native" | "runfile-or-tarball" | "none"
-        ),
+        matches!(method, "apt" | "dnf" | "repo-native" | "runfile-or-tarball"),
         "expected a current rocm_install_method name, got {method:?}: {json}"
     );
 }

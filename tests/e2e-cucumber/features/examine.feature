@@ -119,7 +119,7 @@ Feature: GPU detection and system inspection
     Then the inspection reports Linux as the operating system
     And the inspection reports that the host is WSL
 
-  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_DRIVER_VERSION:-...}` shell
+  # The dry-run plan used to print the raw `${ROCM_CLI_AMDGPU_VERSION:-7.2.4}` shell
   # placeholder on its `repo_version:` line instead of the effective version, so
   # the preview a user reviews before approving disagreed with what the install
   # would actually pull. The plan is rendered on every Linux host regardless of
@@ -287,9 +287,10 @@ Feature: GPU detection and system inspection
   # developer machines and self-hosted GPU runners have them, a clean mock
   # lane does not), not just on the install this scenario plants. No GPU
   # needed: the install is planted by the harness (`plant_unmanaged_rocm`),
-  # same as examine-06.
-  @id:examine-reports-a-current-install-method-name
+  # same as examine-06. Linux/WSL only, like examine-12: `probe_rocm_install`
+  # only runs there, so `rocm_install_method` is empty on Windows.
+  @id:examine-reports-a-current-install-method-name @requires-os:linux
   Scenario: examine-20 - System inspection reports a current install-method name, not the retired amdgpu-install naming
     Given a machine with a ROCm install that was not set up by the CLI
-    When the user inspects the system as machine-readable JSON
+    When the user inspects the system in machine-readable form
     Then the inspection reports a current install-method name

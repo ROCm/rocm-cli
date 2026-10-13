@@ -6015,7 +6015,7 @@ pub(crate) fn parse_os_release_field(text: &str, key: &str) -> Option<String> {
 /// The real host's `/etc/os-release`.
 ///
 /// Deliberately not routed through `rocm_core::host_path`: every caller builds
-/// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
+/// a package-manager plan (`apt`, `dnf`, `zypper`) that then runs
 /// against the real machine, so a simulated host root must not choose its
 /// distro. The descriptive distro name `examine` reports comes from
 /// `rocm_core::detect_distro_name`, which does follow a simulated root.

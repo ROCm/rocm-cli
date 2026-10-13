@@ -464,8 +464,8 @@ struct DriverPassiveCheck {
 /// Release of ROCDXG installed on WSL2, overridable for trying another build.
 ///
 /// Resolved once at plan-build time via [`resolve_shell_default_template`], the
-/// same way `ROCM_CLI_AMDGPU_VERSION` is handled for the bare-metal repository
-/// pin. The concrete value is baked into the archive name, the release URL and
+/// same way `ROCM_CLI_AMDGPU_DRIVER_VERSION` is validated for the bare-metal
+/// repository pin. The concrete value is baked into the archive name, the release URL and
 /// the `repo_version:` line, so the plan a user reviews names the build the
 /// install will actually fetch rather than an unexpanded `${...}` placeholder.
 ///
@@ -809,15 +809,38 @@ fn build_driver_install_plan(
     // written repo file has a working baseurl regardless of shell. The value is
     // interpolated straight into that single-quoted command, so it's restricted
     // to a safe URL path segment here rather than trusted verbatim: a value
-    // containing `'` would otherwise close the quoting and inject shell.
-    let repo_version_expr = std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION")
-        .ok()
-        .filter(|v| {
-            !v.is_empty()
+    // containing `'` would otherwise close the quoting and inject shell. An
+    // invalid override is refused rather than silently falling back to
+    // `latest`, the same way `wsl_rocdxg_driver_plan` refuses a malformed
+    // `ROCM_CLI_ROCDXG_VERSION` below -- a user who set this expecting a
+    // specific release should see why it did not take effect, not an
+    // unexplained `latest`.
+    let repo_version_expr = match std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION") {
+        Err(_) => "latest".to_owned(),
+        Ok(v)
+            if !v.is_empty()
                 && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-        })
-        .unwrap_or_else(|| "latest".to_owned());
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) =>
+        {
+            v
+        }
+        Ok(v) => {
+            return DriverInstallPlan {
+                supported: false,
+                mutating: false,
+                policy: "invalid_driver_version_override".to_owned(),
+                os_id: String::new(),
+                version_id: String::new(),
+                codename: String::new(),
+                repo_version_expr: format!("{v:?}"),
+                reason: "ROCM_CLI_AMDGPU_DRIVER_VERSION is not a well-formed amdgpu driver release. It is interpolated into privileged shell commands, so only letters, digits, and `. _ -` are accepted.".to_owned(),
+                preflight_checks: Vec::new(),
+                commands: Vec::new(),
+                checks: vec!["rocm examine".to_owned()],
+                reboot_required: false,
+            };
+        }
+    };
     if examine.os == "windows" {
         return DriverInstallPlan {
             supported: false,
@@ -885,8 +908,7 @@ fn build_driver_install_plan(
         // neighbors below. The gap is only the e2e path: the real `rocm`
         // binary's `read_os_release()` reads `/etc/os-release` with no
         // override, so no lane or test host can reach this arm through the
-        // CLI itself. (A prior version of this comment overstated the gap to
-        // the unit level too; corrected here after review caught it.)
+        // CLI itself.
         ("ubuntu", "26.04") => {
             let sudo = escalation.prefix();
             DriverInstallPlan {
@@ -913,10 +935,11 @@ fn build_driver_install_plan(
                 // arm, holds passive verification targets only -- the mutating
                 // install command above belongs in `reason`, not here.
                 checks: vec!["rocm examine".to_owned(), "rocminfo".to_owned()],
-                // Guidance only, but `apt install rocm` pulls in the amdgpu
-                // kernel driver in-tree -- same conservative default as the
-                // other guidance-only arms above.
-                reboot_required: true,
+                // The amdgpu kernel driver ships in-tree with the kernel itself,
+                // not with this guidance's `apt install rocm` -- that command
+                // installs the userspace ROCm stack only, so nothing changes on
+                // the kernel side and no reboot is needed for it to take effect.
+                reboot_required: false,
             }
         }
         ("debian", "12" | "13") => {
@@ -1501,7 +1524,7 @@ fn driver_command(phase: DriverCommandPhase, command: &str) -> DriverPlanCommand
 /// once at plan-build time so the concrete value is baked into both the
 /// human-readable summary and the commands the plan runs, rather than leaking an
 /// unexpanded `${...}` placeholder into user-facing output or depending on the
-/// runtime shell — which, for the single-quoted apt `sources.list` line, would
+/// runtime shell — which, for the single-quoted WSL ROCDXG download command, would
 /// never expand it at all.
 ///
 /// Only a single, flat `${VAR:-default}` template is recognized. Anything else —
@@ -2343,7 +2366,54 @@ VERSION_CODENAME=noble
             PrivilegeEscalation::Sudo,
         );
 
-        assert_eq!(plan.repo_version_expr, "latest");
+        assert!(!plan.supported);
+        assert_eq!(plan.policy, "invalid_driver_version_override");
+        assert!(plan.reason.contains("ROCM_CLI_AMDGPU_DRIVER_VERSION"));
+        assert!(plan.commands.is_empty());
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("pwned"))
+        );
+    }
+
+    #[test]
+    fn driver_plan_accepts_a_valid_version_override_and_uses_it_in_the_url() {
+        let mut env = ScopedTestEnv::with_amd_overrides_cleared();
+        env.set("ROCM_CLI_AMDGPU_DRIVER_VERSION", "30.10");
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+        let rendered = render_driver_install_plan(&plan, false, false);
+
+        assert_eq!(plan.repo_version_expr, "30.10");
+        assert!(rendered.contains("amdgpu/30.10/"));
+    }
+
+    #[test]
+    fn driver_plan_falls_back_on_a_hostile_codename() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04"
+VERSION_CODENAME='; touch /tmp/pwned; echo '
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_eq!(plan.codename, "noble");
         assert!(
             plan.commands
                 .iter()
@@ -2580,6 +2650,7 @@ VERSION_ID="9.7"
         assert!(
             rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/rhel/9.7/main/x86_64")
         );
+        assert!(rendered.contains("gpgcheck=1"));
         assert!(rendered.contains("/etc/yum.repos.d/amdgpu.repo"));
         assert!(rendered.contains("Execute: sudo dnf install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -2732,6 +2803,7 @@ VERSION_ID="15.7"
         assert!(
             rendered.contains("baseurl=https://repo.radeon.com/amdgpu/latest/sle/15.7/main/x86_64")
         );
+        assert!(rendered.contains("gpgcheck=1"));
         assert!(rendered.contains("/etc/zypp/repos.d/amdgpu.repo"));
         assert!(rendered.contains("Execute: sudo zypper install -y amdgpu-dkms"));
         assert!(rendered.contains("approval: required"));
@@ -2787,7 +2859,7 @@ VERSION_ID="41"
         // `dkms: true` is passed deliberately: WSL2 has no kernel module to
         // build, so the flag must not pull in the bare-metal path.
         //
-        // `build_driver_install_plan` resolves `${ROCM_CLI_AMDGPU_VERSION:-...}`
+        // `build_driver_install_plan` reads `ROCM_CLI_AMDGPU_DRIVER_VERSION`
         // from process env before it reaches the WSL branch, and the WSL branch
         // then reads the three ROCDXG vars — an exported
         // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and

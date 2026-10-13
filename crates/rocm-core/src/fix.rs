@@ -500,8 +500,12 @@ const RECIPES: &[FixRecipe] = &[
         title: "Reset repo-native install state and reinstall",
         rationale: "The repo-native package-manager install left a half-configured DKMS / repo state. Clear the broken package state, quarantine the repo files rocm-cli's install wrote, let the package manager forget the broken state, then reinstall via rocm-cli's own repo-native flow.",
         commands: &[
-            "# Run only the block matching your package manager:",
-            "sudo dpkg --configure -a && sudo apt-get install -f && sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
+            "# Run only the block matching your package manager. On Debian/Ubuntu, run all",
+            "# three lines even if an earlier one reports an error -- the purge must not",
+            "# be skipped just because the half-configured state made `install -f` fail:",
+            "sudo dpkg --configure -a      # Debian/Ubuntu",
+            "sudo apt-get install -f       # Debian/Ubuntu",
+            "sudo apt-get purge -y amdgpu-dkms   # Debian/Ubuntu",
             "sudo dnf remove -y amdgpu-dkms                                                             # RHEL/Fedora/Rocky/Alma/Oracle",
             "sudo zypper remove -y amdgpu-dkms                                                          # SLES/openSUSE",
             "# sudo mv /etc/apt/sources.list.d/amdgpu.list /etc/apt/sources.list.d/amdgpu.list.bak       # or the yum/zypp equivalent; quarantine, do not delete yet",
@@ -3207,5 +3211,43 @@ mod tests {
             "reinstall command must actually install (bare 'rocm install driver' is a non-mutating preflight no-op): {commands}"
         );
         assert!(recipe.verify.contains("repo-native"));
+        assert!(
+            !recipe
+                .commands
+                .iter()
+                .any(|c| c.contains("configure -a &&") || c.contains("install -f &&")),
+            "the apt block must not chain configure/install -f into the purge with `&&`: \
+             a failure there must not skip the purge: {commands}"
+        );
+    }
+
+    #[test]
+    fn fix_12_apt_commands_match_the_diagnose_copy_verbatim() {
+        // `crate::diagnose` builds its own apt command list for fix-12 rather
+        // than reusing this recipe (it branches per detected package-manager
+        // family, which this catalog entry cannot do -- it prints guidance for
+        // every family at once). Pin the three apt lines here so the two
+        // copies cannot drift the way they did before: diagnose.rs ran them as
+        // separate commands while this recipe chained them with `&&`.
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-12-installer")
+            .expect("fix-12-installer recipe must exist");
+        let apt_commands_without_trailing_comment: Vec<&str> = recipe
+            .commands
+            .iter()
+            .filter(|c| c.trim_end().ends_with("# Debian/Ubuntu"))
+            .map(|c| c.split('#').next().unwrap().trim_end())
+            .take(3)
+            .collect();
+        assert_eq!(
+            apt_commands_without_trailing_comment,
+            vec![
+                "sudo dpkg --configure -a",
+                "sudo apt-get install -f",
+                "sudo apt-get purge -y amdgpu-dkms",
+            ],
+            "diagnose.rs's apt family emits these three commands in this order for fix-12-installer"
+        );
     }
 }
