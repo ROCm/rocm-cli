@@ -852,7 +852,8 @@ is left in place. On Windows, names that differ only in case (`readme.md`,
 
 The new copy is unpacked before the existing one is touched, so a failed
 download, or a download that is not a ComfyUI release (no `main.py` at its
-top), leaves the install as it was. `--reinstall --dry-run` names the folder
+top), leaves the install as it was; such a download is not kept, so the next
+attempt downloads again. `--reinstall --dry-run` names the folder
 whose code would be replaced, which of the kept folders it holds, and whether
 an entry of yours named like the new release's code would be set aside or
 replaced; which entries those are is only known once the new release is

@@ -338,9 +338,8 @@ fn install_release_tree_removing_with(
         {
             continue;
         }
-        if is_release_owned(&name) {
-            to_remove.push(entry.path());
-        } else if text.starts_with(COPY_IN_PROGRESS_PREFIX) {
+        // Release code, and a leftover copy of it in progress.
+        if is_release_owned(&name) || text.starts_with(COPY_IN_PROGRESS_PREFIX) {
             to_remove.push(entry.path());
         } else if !text.starts_with(CLI_FILE_PREFIX) {
             report.left_in_place.push(text.into_owned());

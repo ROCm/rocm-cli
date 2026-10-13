@@ -105,9 +105,10 @@ Feature: ComfyUI install reports progress and makes failures actionable
   # without redirecting any of them. A reinstall now replaces only the code
   # around those. These scenarios plant a used install, then reinstall from a
   # loopback archive server: the success path, the path where the download
-  # fails, the dry run, a reinstall attempted while ComfyUI runs, an
-  # interrupted reinstall, a user's entry set aside, and a failure after the
-  # new code is in place. Each asserts what the CLI prints together with what
+  # fails, the dry run, a reinstall attempted while ComfyUI runs (also one
+  # started during the download), an interrupted reinstall, a user's entry set
+  # aside, a failure after the new code is in place, and a download that is
+  # not a ComfyUI release. Each asserts what the CLI prints together with what
   # is actually on disk afterwards. Linux-only because the planted runtime
   # uses `.so` names and a POSIX-shell Python stand-in.
   #
