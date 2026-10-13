@@ -13,13 +13,13 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-pulldown-cmark.workspace = true
 e2e-report = { path = "../crates/e2e-report" }
 rocm-core = { path = "../crates/rocm-core" }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+toml = "1.1"
 
 # `cargo xtask package` builds `.tar.gz` on Unix and `.zip` on Windows, so each
 # archive backend is pulled in only for the platform that emits that format.

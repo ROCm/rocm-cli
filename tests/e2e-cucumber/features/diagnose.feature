@@ -276,15 +276,23 @@ Feature: Diagnosing failures and listing fixes
   # diagnose-05 only proves the manual/zero-optional-flags wording, because
   # PREVIEW_FIX_ID (fix-1-arch) needs none of sudo/reboot/re-login. The
   # sudo+re-login combination only exists on a fix gated to bare-metal Linux
-  # (fix-4-render-group), so it needs its own scenario -- but, like
-  # diagnose-14, it is deliberately not OS-gated: `print_recipe` runs before
-  # the fix's own platform gate (see `apply` in fix.rs), so the Flags: text
-  # under test renders identically regardless of which lane runs it. The step
-  # asserts only that printed text, never the exit code -- `fix-4-render-group`
-  # gates its own dry-run on host state ($USER, `usermod`/`sudo` on PATH), so
-  # unlike PREVIEW_FIX_ID its exit code is not guaranteed to be 0 everywhere.
-  @id:diagnose-fix-preview-states-required-flags
-  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable
+  # (fix-4-render-group), so it needs its own scenario.
+  #
+  # Unlike diagnose-14, this one IS OS-gated. `print_recipe` still runs before
+  # the fix's own platform gate (see `apply` in fix.rs), but the Flags: line it
+  # prints comes from `class_here()`, which looks up the catalog entry for the
+  # *running* host's OS. "AUTO" only renders where `fix-4-render-group` is
+  # actually `Auto` -- bare-metal Linux. Everywhere else (`applies_on` has no
+  # other member) `class_here()` falls back to PRINT-ONLY, the generic "this
+  # fix does not apply here" answer diagnose-11 already covers -- not a second,
+  # platform-specific behaviour worth asserting under this scenario's name.
+  #
+  # The step still asserts only the printed Flags: text, never the exit code --
+  # `fix-4-render-group` gates its own dry-run on host state ($USER,
+  # `usermod`/`sudo` on PATH), so unlike PREVIEW_FIX_ID its exit code is not
+  # guaranteed to be 0 even on Linux.
+  @id:diagnose-fix-preview-states-required-flags @requires-os:linux @requires-bare-metal
+  Scenario: diagnose-20 - Previewing a fix that needs sudo and a re-login says so, and that it's auto-applicable here
     Given a user who has chosen a fix that needs sudo and a re-login
     When the user previews that fix without applying it
     Then the preview states that the fix requires sudo and a re-login
@@ -381,3 +389,170 @@ Feature: Diagnosing failures and listing fixes
     When the user asks the CLI to diagnose with both flags
     Then the CLI refuses and says --model answers for this machine, not the one --distro names
     And no model verdict is reported
+
+  # One entry behaves differently depending on the machine: it persists the
+  # change on Windows, and on Linux it only reports where the value is set,
+  # because the code that would write it takes no options and never does.
+  # The listing said "the CLI will run this" on both, so a user on Linux — and
+  # an agent reading the same listing — was told a change was coming that never
+  # came. Host-independent on purpose: the assertion is that the listing agrees
+  # with the machine in front of it, whichever machine that is.
+  @id:diagnose-fix-applicability-is-per-machine
+  Scenario: diagnose-27 - A fix that only explains itself here is not advertised as one the CLI will run
+    Given a fix the CLI carries out on one kind of machine and only explains on another
+    When the user asks the CLI which fixes it offers
+    Then that fix is shown as what it does on this machine
+
+  # The other half of the same defect. This entry does have a fix and the CLI
+  # will carry it out, but not until it is told which device to pin; asked
+  # plainly it prints the query that identifies one and stops. It was marked as
+  # a fix the CLI applies, so the report of a change that never happened looked
+  # like success.
+  # @requires-bare-metal because the entry under test is scoped to bare-metal
+  # Linux and Windows. On WSL it is refused at the platform gate instead, which
+  # is a different contract with its own scenario — and the right one, since the
+  # catalog does not claim this remedy applies there.
+  @id:diagnose-fix-needing-an-argument-says-so @requires-bare-metal
+  Scenario: diagnose-28 - A fix that needs more information says what it needs and changes nothing
+    Given a user who has chosen a fix that cannot run until it is told what to act on
+    When the user asks the CLI to apply it without saying what to act on
+    Then the CLI names what it still needs and reports no change
+
+  # Nothing here sends a report -- transport does not exist yet -- so what these
+  # two prove is the part that has to be right before it does: that the machine
+  # can see exactly what would be published, and that asking produces either a
+  # report or a stated refusal and never a silent send.
+  #
+  # Host-independent on purpose, and the branches land on different lanes. A
+  # lane with an AMD GPU on the compatibility matrix exercises the prepared
+  # report; a lane without one exercises the unreadable-architecture refusal,
+  # which is the case the mock lane actually has. The WSL lane reaches neither:
+  # `examine` returns before any GPU probe there, so it refuses because the
+  # platform was never inspected, whatever hardware it holds. Saying "a lane
+  # without an allowlisted GPU exercises the refusal" would be wrong for that
+  # lane, and would record the guard as firing correctly when it fired for an
+  # unrelated structural reason. Written so that whichever branch a lane
+  # reaches is a real assertion rather than a skip.
+  @id:diagnose-report-is-shown-and-not-sent
+  Scenario: diagnose-29 - Asking what a report would say shows it and sends nothing
+    When the user asks the CLI what a report would carry
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+
+  # The rule this guards is that a report is assembled field by field, never by
+  # copying a larger structure. The unit tests sweep for planted markers; this
+  # asserts the same property against whatever this real machine happens to be,
+  # which is the case a fixture cannot reproduce.
+  @id:diagnose-report-carries-no-identifying-detail
+  Scenario: diagnose-30 - What a report would carry never identifies the machine
+    When the user asks the CLI what a report would carry in machine-readable form
+    Then the answer names no user, no host, and no file path
+
+  # `--send` promises the report is always read before its form is offered.
+  # That promise only holds if asking for the form without asking to see the
+  # report first is refused outright, before anything about this machine is
+  # examined — so this is the same exit code any other argument mistake gets,
+  # not a diagnosis outcome, and it is true on every host and every lane.
+  @id:diagnose-send-without-report-is-refused
+  Scenario: diagnose-31 - Asking the CLI for a way to send a report, without asking to see it first, is refused
+    When the user asks the CLI for a way to send a report, without asking to see the report first
+    Then the CLI refuses and explains that the report must be requested too
+
+  # Forces the same headless shape a server or container presents: no display,
+  # no forwarded display, no override asking for a browser anyway. Linux-only
+  # because the CLI only reads the environment for this decision on Linux;
+  # Windows and macOS always treat a user as present, so there is no
+  # environment that forces this branch on those hosts.
+  #
+  # Host-independent beyond that, and for the same structural reason
+  # diagnose-29 and diagnose-30 are: the WSL lane refuses before any GPU
+  # probe, and most other lanes have no GPU on the compatibility matrix
+  # either, so a report is prepared on some lanes and refused on others.
+  # Written so whichever branch a lane reaches is a real assertion rather
+  # than a skip.
+  @id:diagnose-send-on-a-headless-machine-prints-instead-of-opening @requires-os:linux
+  Scenario: diagnose-32 - Asking to send on a machine with no desktop prints the address and a link instead of starting a mail client
+    When the user asks the CLI for a way to send a report, with no desktop available to open it on
+    Then the CLI either shows the whole report or says why it will not prepare one
+    And the CLI states that nothing has been sent
+    And the CLI prints the address to mail and a link, and starts nothing
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of. When the copy that loads belongs to a different
+  # installation than the runtime, compilation fails with an error naming
+  # neither. Both remedies — remove one stack, or reorder the search path — can
+  # break a working Python environment, and which is right depends on which
+  # stack the user means to keep. So the CLI states them and changes nothing.
+  #
+  # The conflict itself cannot be provoked here: the suite cannot install a
+  # second ROCm stack, and the detection rule is proven by unit tests that build
+  # the machine state directly. What this pins is the half that matters if the
+  # entry ever stops being advisory — that asking for it changes nothing and
+  # recommends neither option.
+  #
+  # `@requires-os:linux` because `fix-18-comgr-conflict` is registered for
+  # `["linux", "wsl"]` (comgr and LD_LIBRARY_PATH are POSIX-loader concepts, not
+  # Windows ones). Unlike diagnose-20's preview, this step applies the fix for
+  # real, so it goes through the fix's own platform gate and would be refused
+  # for the wrong reason -- "wrong OS", not "advisory" -- on a native Windows
+  # lane. `@requires-os:linux` matches WSL2 too, which is where this fix does
+  # apply.
+  @id:diagnose-fix-comgr-conflict-is-advisory-only @requires-os:linux
+  Scenario: diagnose-33 - The fix for a shadowed compilation library changes nothing and recommends nothing
+    Given a user who has chosen the fix for a shadowed compilation library
+    When the user asks the CLI to apply that fix
+    Then the CLI explains that it will not make the change itself
+    And the CLI offers both options without ranking them
+
+  # The skill that drives this CLI states, in prose, which entries exist and what
+  # the CLI does with each. Every one of those is a copy of something the binary
+  # already knows, and a copy can go stale silently. This is the machine-readable
+  # form that replaces the copying — what a tool reads instead of parsing the
+  # listing meant for people.
+  @id:diagnose-fix-catalog-is-machine-readable
+  Scenario: diagnose-34 - A tool can read the catalog without parsing prose
+    When a tool asks the CLI for its catalog in machine-readable form
+    Then the catalog names every entry and what the CLI does with each
+    And it gives the meaning of every exit code the CLI can return
+
+  # `--json` describes the whole catalog, so pairing it with one entry is a
+  # question with no answer. Refusing beats ignoring the flag: a caller that
+  # asked for machine-readable output and silently got something else has no way
+  # to notice.
+  @id:diagnose-fix-catalog-json-rejects-a-fix-id
+  Scenario: diagnose-35 - Asking to apply one fix in machine-readable form is refused
+    Given a user who has chosen a known fix
+    When the user asks the CLI to apply that fix in machine-readable form
+    Then the CLI refuses and explains that the two cannot be combined
+
+  # vLLM runs on Linux and WSL, but not native Windows. This scenario is
+  # GPU-independent: it supplies the captured startup error as symptom text and
+  # proves the public diagnosis output preserves both branches of the remedy.
+  @id:diagnose-vllm-oom-is-conditional @requires-os:linux
+  Scenario: diagnose-36 - A vLLM startup OOM receives conditional remediation
+    Given a user whose vLLM server ran out of GPU memory
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then the diagnosis identifies the vLLM startup OOM
+    And the OOM remedy distinguishes a busy GPU from a model that does not fit
+    # A report that names `rocm fix <id>` and a `rocm fix` that then refuses that
+    # id leaves the user worse off than no fix path at all. The two halves are
+    # selected by separate platform lists -- the checker's, and the recipe's
+    # against the RUNNING os, where WSL2 is its own family -- so they can
+    # disagree while each looks right alone. Every Linux lane runs this step; the
+    # WSL one is where the two lists can differ.
+    And the CLI can act on the fix the diagnosis named
+
+  # `--symptom` is where a user pastes a raw terminal capture, and a terminal
+  # capture is full of line advances that are not `\n`: a progress bar repaints
+  # with `\r`, and curses- and `rich`-style progress UIs move down with `ESC E`,
+  # `ESC D` or `CSI n B` (terminfo's `nel`, `ind` and `cud1`). If those are not
+  # line boundaries the whole paste collapses into a single line, a `vllm`
+  # mention anywhere in it anchors another engine's OOM, and the user is told
+  # with high confidence that vLLM ran out of memory -- quoting the other
+  # engine's error text back as the evidence for it. A confidently wrong cause is
+  # worse than no cause, so this is pinned at the level the user sees it.
+  @id:diagnose-vllm-oom-not-attributed-across-rendered-lines @requires-os:linux
+  Scenario: diagnose-37 - Another engine's OOM is not blamed on a vLLM mention elsewhere in the paste
+    Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
+    When the user asks the CLI to diagnose that symptom in machine-readable form
+    Then no vLLM startup OOM is reported

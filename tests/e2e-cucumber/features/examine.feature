@@ -174,7 +174,6 @@ Feature: GPU detection and system inspection
     Given a managed runtime is active
     When the user inspects the system both for reading and for scripting
     Then the framework report names the runtime's interpreter
-
   # EAI-8950. The text form repairs a lost registry entry from the install tree
   # before rendering (`recover_setup_runtime_registration`), so it names the
   # folder; `--json` skips that call because it writes, and used to answer
@@ -222,3 +221,57 @@ Feature: GPU detection and system inspection
     Given a machine with an AMD GPU
     When the user inspects the system both for reading and for scripting
     Then it lists one AMD GPU per kernel GPU node, each with its PCI address and gfx target
+
+  # HIP compiles device code at run time through a library a machine can hold
+  # more than one copy of — a system ROCm install and a ROCm Python wheel each
+  # ship one, and this CLI installs the second itself. When the copy that loads
+  # is not the one the active runtime needs, compilation fails with an error
+  # naming neither the library nor the second copy. Nothing looked past the
+  # first match before, so the second copy could not be seen at all.
+  #
+  # No GPU needed: the suite cannot install a second ROCm stack, so it cannot
+  # prove the two-copy case. What every lane can prove is that the inspection
+  # answers the question at all rather than staying silent, and that finding
+  # none is reported as a finding rather than a failure — which is the case
+  # the mock lane actually has. The two-copy behaviour is proven by unit tests
+  # that build the directory layout directly.
+  #
+  # `@requires-os:linux` because `probe_comgr` only runs for `os_family`
+  # "linux" or "wsl" (see `examine.rs`); on native Windows it is never called,
+  # so `comgr_paths: []` and `comgr_selected: null` would hold by nothing more
+  # than `Examination`'s own defaults, and the assertions below would pass
+  # whether the probe ran and found nothing or never ran at all. WSL reports
+  # `os_family` "linux" (see `expectation.rs`), so this still runs there.
+  @id:examine-reports-code-object-manager-copies @requires-os:linux
+  Scenario: examine-18 - The inspection says which code object manager libraries the machine holds
+    When the user inspects the system in machine-readable form
+    Then the inspection lists the code object manager libraries it found
+    And it names which of them would load, or says it found none
+    And it lists the HIP runtime libraries the machine holds the same way
+    And it names which HIP runtime copy would load, or says it found none
+
+  # The copy this CLI installs itself, which is the case the whole entry exists
+  # for: the install path puts ROCm wheels into a managed environment, so a user
+  # on a host that already carries system ROCm ends up holding both copies
+  # having done nothing unusual.
+  #
+  # `@requires-gpu` because the precondition installs the SDK, and only a GPU
+  # lane does that. This is the half the unit tests cannot reach: they build the
+  # directory layout by hand, so they prove the search understands a layout we
+  # described, not that it matches the one the installer actually produces. A
+  # real managed runtime is the only thing that distinguishes those.
+  #
+  # `@requires-os:linux` because `probe_comgr` only ever looks for `libamd_comgr`
+  # and `libamdhip64` -- ELF shared-object names, found via `LD_LIBRARY_PATH`,
+  # the loader cache, or an install root's `lib/` tree. None of that exists on
+  # native Windows, which ships `.dll`s under other names, so the assertion
+  # that a managed runtime's library must be found does not hold there. WSL
+  # reports `os_family` "linux" (see `expectation.rs`), so this still runs on
+  # the WSL lane, where the managed runtime really does carry a `.so`. This
+  # matches `check_18_comgr_conflict`'s own `&["linux", "wsl"]` gate in
+  # diagnose.rs -- the same boundary, stated once there and once here.
+  @id:examine-finds-the-managed-runtimes-own-compilation-library @requires-gpu @requires-os:linux
+  Scenario: examine-19 - The inspection finds the compilation library the CLI installed itself
+    Given a managed runtime is active
+    When the user inspects the system in machine-readable form
+    Then the inspection attributes a code object manager library to that runtime

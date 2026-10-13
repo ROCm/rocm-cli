@@ -146,12 +146,13 @@ fn label_for_root_report(dir: &Path) -> String {
     }
 }
 
-/// Strips the literal `${{ matrix.channel }}` template segment nightly's
-/// per-lane matrix inserts into its artifact names, so a name like
-/// `e2e-gpu-${{ matrix.channel }}-report` compares as its canonical
-/// `e2e-gpu-report` base. This scan is text-based over the raw workflow
-/// source and does not simulate matrix expansion, so the template text
-/// would otherwise appear verbatim and never match anything.
+/// Strips the literal `${{ matrix.channel }}` template segment a channel
+/// matrix inserts into its artifact names — nightly's six GPU lanes and, per
+/// ROCMAI-125, `e2e-gpu-strix-ubuntu`'s per-PR `[release, nightly]` leg — so
+/// a name like `e2e-gpu-${{ matrix.channel }}-report` compares as its
+/// canonical `e2e-gpu-report` base. This scan is text-based over the raw
+/// workflow source and does not simulate matrix expansion, so the template
+/// text would otherwise appear verbatim and never match anything.
 #[cfg(test)]
 pub(crate) fn without_channel_matrix_segment(name: &str) -> String {
     name.replace("-${{ matrix.channel }}-", "-")
@@ -260,9 +261,11 @@ mod tests {
 
     #[test]
     fn the_nightly_lanes_publish_the_same_platforms_as_the_per_pr_lanes() {
-        // The nightly workflow exists to run *more* scenarios on the *same*
-        // platforms. If the two ever diverge, the nightly grid is comparing
-        // different hardware than the PR grid without saying so.
+        // The nightly workflow exists to run *more* scenarios on *at least*
+        // the per-PR platforms, plus lanes the per-PR smoke gate deliberately
+        // skips (e.g. rad3, mi350p -- ROCMAI-125). If a per-PR platform ever
+        // stopped running nightly, the nightly grid would be silently
+        // comparing different hardware than the PR grid.
         let lanes = |file: &str| {
             let names = uploaded_e2e_artifacts(
                 &Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -286,7 +289,16 @@ mod tests {
             names.dedup();
             names
         };
-        assert_eq!(lanes("nightly.yml"), lanes("e2e-selfhosted.yml"));
+        let nightly = lanes("nightly.yml");
+        let per_pr = lanes("e2e-selfhosted.yml");
+        assert!(
+            !per_pr.is_empty(),
+            "per-PR lane scan found nothing to check"
+        );
+        assert!(
+            per_pr.iter().all(|p| nightly.contains(p)),
+            "every per-PR platform must also run nightly: per_pr={per_pr:?} nightly={nightly:?}"
+        );
     }
 
     #[test]

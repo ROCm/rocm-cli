@@ -473,6 +473,14 @@ async fn user_inspects_for_scripting_first(world: &mut E2eWorld) {
     world.cli_rc = Some(rc);
 }
 
+#[when("the user inspects the system in machine-readable form")]
+async fn user_inspects_for_scripting(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["examine", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the user inspects the system without probing frameworks")]
 async fn user_inspects_skipping_frameworks(world: &mut E2eWorld) {
     let (stdout, stderr, rc) =
@@ -1012,4 +1020,256 @@ async fn assert_gpus_match_kfd_nodes(world: &mut E2eWorld) {
              {gpu:#?}"
         );
     }
+}
+
+#[then("the inspection lists the code object manager libraries it found")]
+async fn assert_comgr_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("comgr_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Each entry has to carry enough to act on. A list of bare paths would not
+    // say which install a copy belongs to, which is the whole question.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported copy is missing `{field}`, so a reader cannot tell \
+                 where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+#[then("it lists the HIP runtime libraries the machine holds the same way")]
+async fn assert_hip_copies_reported(world: &mut E2eWorld) {
+    assert_eq!(
+        world.cli_rc,
+        Some(0),
+        "finding no library is a finding, not a failure"
+    );
+    let value = parsed_json(world);
+    let copies = value
+        .get("hip_paths")
+        .unwrap_or_else(|| panic!("the inspection never answered the question:\n{value:#}"));
+    let copies = copies
+        .as_array()
+        .unwrap_or_else(|| panic!("the answer has to be a list of copies:\n{copies:#}"));
+    // Whether the code object manager belongs to the active runtime is a
+    // question about two libraries, not one -- so the HIP side has to carry
+    // the same `install_root` attribution the comgr side does, or there is
+    // nothing for the conflict check to compare against.
+    for copy in copies {
+        for field in ["path", "real_path", "version", "source", "install_root"] {
+            assert!(
+                copy.get(field).is_some(),
+                "a reported HIP runtime copy is missing `{field}`, so a reader \
+                 cannot tell where it came from:\n{copy:#}"
+            );
+        }
+    }
+}
+
+// Sources the loader itself actually consults, mirrored from
+// `LOADER_PATH_SOURCES` in `rocm-core`'s `examine.rs`: a `rocm-install` or
+// `managed-runtime` hit is evidence a copy exists, not evidence anything
+// would load it. Shared by the HIP and comgr selection assertions below so
+// the two cannot drift apart.
+const LOADER_PATH_SOURCES: [&str; 3] = ["active-runtime", "ld-library-path", "loader-cache"];
+
+#[then("it names which HIP runtime copy would load, or says it found none")]
+async fn assert_hip_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["hip_paths"]
+        .as_array()
+        .expect("hip_paths must be a list")
+        .clone();
+    let selected = value
+        .get("hip_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+        // Same reasoning as the comgr assertion below: `hip_paths: []` and
+        // `hip_selected: null` also hold by nothing more than `Examination`'s
+        // own defaults, so without this the assertion cannot tell "probed,
+        // found none" from "never probed".
+        let notes = value["notes"].as_array().expect("notes must be a list");
+        assert!(
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|note| note.contains("no libamdhip64 found")),
+            "no HIP runtime copies were reported, but the inspection's notes \
+             never say the search ran and found none -- so this cannot tell \
+             \"probed, found nothing\" from \"never probed\":\n{value:#}"
+        );
+    } else if selected.is_null() {
+        // Copies exist, but none sits on a tier the loader itself consults --
+        // every hit is a `rocm-install` or `managed-runtime` copy nothing has
+        // put on the library path, in the loader cache, or in front of an
+        // active runtime. This is `select_loader_copy` returning `None` on
+        // purpose (pinned there for `libamdhip64` directly), not a gap in the
+        // step -- without this arm it fell into the branch below and panicked
+        // on a state the CLI deliberately produces.
+        for copy in &copies {
+            let source = copy
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("every copy must name its source:\n{copy:#}"));
+            assert!(
+                !LOADER_PATH_SOURCES.contains(&source),
+                "a copy on a loader-consulted tier ({source}) was found, but none was \
+                 selected -- the selection must have missed a real loader-path hit:\n{value:#}"
+            );
+        }
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("copies were found but none was selected:\n{value:#}"));
+        let selected_source = selected
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name its source:\n{value:#}"));
+        assert!(
+            LOADER_PATH_SOURCES.contains(&selected_source),
+            "the selected copy's source ({selected_source}) is not one the loader actually \
+             consults; a rocm-install or managed-runtime hit must never be reported as \
+             \"would load\":\n{value:#}"
+        );
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
+}
+
+#[then("it names which of them would load, or says it found none")]
+async fn assert_comgr_selection_is_stated(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["comgr_paths"]
+        .as_array()
+        .expect("comgr_paths must be a list")
+        .clone();
+    let selected = value
+        .get("comgr_selected")
+        .unwrap_or_else(|| panic!("the inspection never said which copy wins:\n{value:#}"));
+
+    // The two have to agree. "Some copies exist but none was selected" would
+    // leave a reader unable to tell which one the loader picks, which is the
+    // only thing the list is for.
+    if copies.is_empty() {
+        assert!(
+            selected.is_null(),
+            "no copies were found, so none can have been selected:\n{selected:#}"
+        );
+        // `comgr_paths: []` and `comgr_selected: null` are also what an
+        // `Examination` defaults to, so on their own they would pass whether
+        // the probe ran and found nothing or never ran at all -- exactly the
+        // state of every lane where this scenario is the only coverage. The
+        // "no libamd_comgr found" note is pushed only by the probe actually
+        // running and coming up empty (see `probe_comgr` in examine.rs), so
+        // requiring it here is what makes this assertion prove the probe ran.
+        let notes = value["notes"].as_array().expect("notes must be a list");
+        assert!(
+            notes
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|note| note.contains("no libamd_comgr found")),
+            "no code object manager copies were reported, but the inspection's \
+             notes never say the search ran and found none -- so this cannot \
+             tell \"probed, found nothing\" from \"never probed\":\n{value:#}"
+        );
+    } else if selected.is_null() {
+        // Copies exist, but none sits on a tier the loader itself consults --
+        // every hit is a `rocm-install` or `managed-runtime` copy nothing has
+        // put on the library path, in the loader cache, or in front of an
+        // active runtime. Reporting `null` here, rather than naming the first
+        // entry regardless of its tier, is the whole fix: a leftover
+        // `/opt/rocm-*` install or an inactive managed runtime must not be
+        // reported as "the library that loads" just because it was found.
+        for copy in &copies {
+            let source = copy
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("every copy must name its source:\n{copy:#}"));
+            assert!(
+                !LOADER_PATH_SOURCES.contains(&source),
+                "a copy on a loader-consulted tier ({source}) was found, but none was \
+                 selected -- the selection must have missed a real loader-path hit:\n{value:#}"
+            );
+        }
+    } else {
+        let path = selected
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name a path:\n{value:#}"));
+        let selected_source = selected
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("the selected copy must name its source:\n{value:#}"));
+        assert!(
+            LOADER_PATH_SOURCES.contains(&selected_source),
+            "the selected copy's source ({selected_source}) is not one the loader actually \
+             consults; a rocm-install or managed-runtime hit must never be reported as \
+             \"would load\":\n{value:#}"
+        );
+        assert_eq!(
+            Some(path),
+            copies[0].get("path").and_then(serde_json::Value::as_str),
+            "the selected copy has to be the first in search order; anything else \
+             means the list and the verdict disagree about what the loader does"
+        );
+    }
+}
+
+#[then("the inspection attributes a code object manager library to that runtime")]
+async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
+    let value = parsed_json(world);
+    let copies = value["comgr_paths"]
+        .as_array()
+        .expect("comgr_paths must be a list")
+        .clone();
+
+    // The precondition installed a managed runtime, so one has to be there.
+    // Without this the assertion below is satisfied by a machine holding no
+    // copies at all, which is the state that hid this gap in the first place.
+    assert!(
+        !copies.is_empty(),
+        "a managed runtime is installed, so the inspection cannot report zero \
+         code object manager libraries:\n{value:#}"
+    );
+
+    // `active-runtime`, not `managed-runtime`: the precondition makes this
+    // runtime the *active* one, and the search checks the active runtime's own
+    // directories first, ahead of the generic managed-runtime scan, so that is
+    // the label this copy gets -- the later `managed-runtime` hit for the same
+    // resolved file is the dedup's job to drop, not a second, differently
+    // labelled copy. Accepting either label is what proves "the CLI's own
+    // installed copy was found" without over-specifying which of the two
+    // overlapping sources happened to see it first.
+    assert!(
+        copies.iter().any(|copy| {
+            matches!(
+                copy.get("source").and_then(|s| s.as_str()),
+                Some("managed-runtime" | "active-runtime")
+            )
+        }),
+        "the CLI installed this runtime and its ROCm wheels, so the search has to \
+         find the copy it put there. Reported copies:\n{copies:#?}"
+    );
 }

@@ -32,9 +32,11 @@ for Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
+
+For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
@@ -228,6 +230,7 @@ form works depends on the engine your GPU selects.
 | `rocm examine` | Check GPU, ROCm install, engines, and managed folders |
 | `rocm diagnose` | Match this machine against known ROCm/PyTorch/llama.cpp failure modes |
 | `rocm diagnose --model <model>` | Say whether a model will run here, before downloading it |
+| `rocm diagnose --report` | Show what this machine would contribute to a problem report, and send nothing |
 | `rocm fix [<fix-id>]` | Apply a fix reported by `rocm diagnose` |
 | `rocm install sdk` | Install TheRock ROCm wheels into a managed Python environment |
 | `rocm install driver` | Install the AMD kernel driver on Linux |
@@ -261,7 +264,7 @@ the JSON report, not the human-readable one.
 ### Diagnose and fix
 
 ```
-rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]]
+rocm diagnose [--symptom TEXT] [--top N] [--json] [--distro [NAME]] [--report]
 rocm diagnose --model <model> [--json]
 rocm fix [<fix-id>] [--yes] [--dry-run] [--device-index N]
 ```
@@ -281,22 +284,58 @@ fix` takes the id, not the position.
   this machine (nothing needs to be installed inside the distribution — name
   it only when more than one is installed). Inspecting remotely this way
   skips checks that need to read the distribution's own environment
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
-  `rocm diagnose` inside the distribution for those.
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) and the
+  library and shared-memory checks (`fix-18-comgr-conflict`,
+  `fix-19-shm-too-small`) — run `rocm diagnose` inside the distribution for
+  those.
+- `--report` shows exactly what this machine would contribute to a problem
+  report, and sends nothing — there is no transport yet, and there will be no
+  automatic one: a report leaves a machine only by its owner's own action. The
+  content is deliberately narrow (a schema version, the matched entry, whether
+  a fix was offered for it, the GPU architecture and which compatibility
+  matrix snapshot it was checked against, the OS family, distribution and
+  major version, the ROCm release, the inference engine and its release, the
+  CLI version), and it carries no host name, user name, file path, or error
+  text. The ROCm release and the inference engine's release are each cut
+  back to a release, so a build number that would narrow toward one machine
+  never appears there; the CLI's own version is the exception, since it names
+  the tool that wrote the report rather than something read off the machine.
+  The distribution is checked against a list of known names rather than
+  repeated from the machine. Hardware that is not on AMD's published
+  compatibility matrix produces no report at all, and the CLI says why. So
+  does a WSL machine, for a different reason: this CLI does not inspect the
+  GPU on WSL yet, so it cannot confirm the hardware is on the compatibility
+  matrix and says that rather than claiming the architecture could not be
+  read.
+- `--send`, which requires `--report`, additionally offers a prefilled mail
+  carrying that report. It still sends nothing: the mail opens already filled
+  in with the content `--report` just printed, addressed to `ROCmCLI@amd.com`,
+  and it leaves the machine only when you send it yourself. Requiring
+  `--report` is what guarantees the content is shown before the mail is
+  offered. A mail client opens only when you asked and the machine looks like
+  a desktop you are at; over SSH, with no display, or with `ROCM_NO_BROWSER`
+  set, the address and the link are printed instead, which is also what
+  happens on a machine with no mail client. It is not combinable with
+  `--json`, which exists for scripts, and a script is not a person who can
+  read a mail before sending it. Note that a mail carries your address, which
+  the report itself does not.
 
 `fix` applies a known fix by the `id:` that `diagnose` reported — not the
 ranking position noted above, which isn't a stable name. Run it with no id
-to list the whole catalog. Each fix is marked AUTO (this command carries out
-the change) or PRINT-ONLY (it prints the steps for you to run yourself —
-usually because the right command depends on a choice only you can make,
-sometimes because it also needs sudo or a reboot).
+to list the whole catalog. Each fix carries a marker saying what happens on
+this machine: AUTO (this command carries out the change), NEEDS-ARG (it will,
+once given the argument it names), PRINT-ONLY (it prints the steps for you to
+run yourself — usually because the right command depends on a choice only you
+can make, sometimes because it also needs sudo or a reboot), or DIAGNOSE-ONLY
+(no reliable fix exists, so nothing will be changed -- no catalog entry
+carries this marker today; it is reserved for a future detect-but-cannot-repair
+failure).
 
 - `--dry-run` shows any fix's plan without changing anything.
 - `--yes` skips the interactive confirmation once you've reviewed it.
-- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`;
-  without it, that fix only prints the `rocminfo` (Linux) or `hipInfo.exe`
-  (Windows) query needed to find the index and makes no change, despite
-  being marked AUTO.
+- `--device-index` pins the discrete GPU index for `fix-9-igpu-dgpu`, marked
+  NEEDS-ARG; without it, that fix only prints the `rocminfo` (Linux) or
+  `hipInfo.exe` (Windows) query needed to find the index and makes no change.
 
 ### ROCm installation
 
@@ -417,8 +456,8 @@ Manage multiple side-by-side ROCm runtimes:
 
 ```
 rocm runtimes list
-rocm runtimes activate <runtime-key>
-rocm runtimes rollback
+rocm runtimes activate <runtime-key> [--restart-services] [--yes]
+rocm runtimes rollback [--restart-services] [--yes]
 rocm runtimes uninstall <runtime-key> [--yes] [--dry-run]
 rocm runtimes import <manifest-file> [--replace]
 rocm runtimes adopt --python <path> [--root <path>] [--runtime-id ID]
@@ -431,6 +470,69 @@ by the packages they were installed from, not by version alone, so one version
 can appear more than once: a `--devel` install and a plain one of the same
 version are two separate runtimes, as are two installs that resolved different
 GPU device payloads.
+
+`activate` and `rollback` change which runtime the next install or server
+picks up. A server that is already running is not moved: it keeps serving on
+the runtime it started with until it is restarted. Both commands count the
+servers they leave behind and name each one, from what those servers themselves
+recorded:
+
+```
+  services_on_previous_runtime: 2
+    - svc-a engine=vllm recorded_runtime=<old-runtime-key>
+    - svc-b engine=vllm recorded_runtime=<old-runtime-key>
+  note: those keep serving on their recorded runtime until they are restarted; run `rocm runtimes activate <runtime-key> --restart-services --yes` to move them
+```
+
+When nothing is left behind the count is `services_on_previous_runtime: 0`. A
+running server whose record names no runtime is counted separately under
+`services_with_unrecorded_runtime:`, because what it loaded cannot be read back
+from the record. Only servers on an engine that brings its own runtime
+(`lemonade`) are never counted; an `env_id` recorded in a service record is not
+a pin and does not exempt the server. The same summary appears in the
+`rocm install sdk` and `rocm update --apply --activate` reports, which activate
+a runtime without taking `--restart-services` themselves — which is why the note
+names the `rocm runtimes activate` invocation that does, rather than a flag to
+add to whatever was just run.
+
+The note's command re-activates the runtime that is already active, which moves
+the servers without moving the runtime. Re-activating the active runtime prints
+`changed_from_runtime_key: <unchanged>` and keeps the existing rollback target.
+
+Add `--restart-services` to move those servers onto the newly active runtime
+rather than leave them behind; each one is put on the new runtime and then
+restarted. Moving a server also clears any `env_id` stored in its record; the
+engine writes its own back on the next launch. That restarts running servers,
+so it requires `--yes` and never prompts, the same as
+`rocm services restart <service-id> --yes`.
+
+After each restart the command waits up to 45 seconds for the server to answer
+an inference request, and the summary lists the outcomes separately:
+
+```
+  services_restarted: 1
+    - svc-a
+  services_restarted_not_yet_serving: 1
+    - svc-b status=starting (check `rocm services logs svc-b` if it does not come up)
+  services_restart_failed: 1
+    - svc-c: <error>
+```
+
+- `services_restarted` lists servers that answered an inference request.
+- `services_restarted_not_yet_serving` lists servers that were respawned but had
+  not answered when the wait ended. The command still exits 0 for these; if one
+  does not come up, check `rocm services logs <service-id>`.
+- `services_restart_failed` lists servers that could not be restarted, and the
+  command exits with an error.
+
+Servers are handled one at a time and a failure does not stop the rest: every
+failure is named in the summary and its record is put back on the runtime it
+last ran on. After a failure the server is read back: one that is still live
+stays counted under `services_on_previous_runtime`, and one that is not is
+reported as stopped by the attempt. The error says which is which. Read
+`rocm services logs <service-id>` first — a restart that just failed is likely
+to fail the same way again — then start a stopped server with
+`rocm services restart <service-id> --yes` once the cause is fixed.
 
 `uninstall` prompts for confirmation unless `--yes` is passed; outside an
 interactive terminal `--yes` is required. `--dry-run` prints the plan and
@@ -536,7 +638,7 @@ requested this time; otherwise it errors out instead of silently serving with
 different settings. If you previously started a service with `--temperature`
 (or another sampling flag) and now run `rocm serve` for the same model without
 flags — or with different ones — stop the existing service first (`rocm
-services stop`) or match the original flags.
+services stop <service-id> --yes`) or match the original flags.
 
 By default the server runs in the background under rocm-cli's supervision and
 prints a deployment summary — a progress indicator while it starts, then a table
@@ -566,7 +668,8 @@ Log in with `huggingface-cli login` or set `HF_TOKEN` in your environment
 before serving gated models.
 
 `--gpu` selects which AMD GPU the server runs on. `auto` (the default) probes
-per-GPU VRAM with `amd-smi` and picks the lowest-numbered GPU that is idle and
+per-GPU VRAM (via `amd-smi`, or the amdgpu DRM sysfs counters when `amd-smi` is
+not installed) and picks the lowest-numbered GPU that is idle and
 not already used by another rocm-cli server (managed or foreground), falling
 back to the GPU with the most free memory. Pass a single index (`--gpu 1`) to
 pin a specific device. The
@@ -580,8 +683,8 @@ Manage background servers started with `--managed`:
 ```
 rocm services list [--all] [--json]
 rocm services logs <service-id>
-rocm services stop <service-id> [--yes]
-rocm services restart <service-id> [--yes]
+rocm services stop <service-id> --yes
+rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
@@ -779,6 +882,14 @@ rocm logs [--service <service-id>] [--search TERM ...]
 rocm uninstall [--yes] [--dry-run]
                [--keep-binaries] [--keep-config] [--keep-data] [--keep-cache]
 ```
+
+On Linux, if a config, data, or cache folder is a link to somewhere else (for
+example a cache moved to a bigger disk), `rocm uninstall` removes the link and
+leaves the folder it points to alone, whether or not the setting ends in a `/`.
+
+If `rocm uninstall` cannot check whether one of those folders is there (for
+example, a link on the way loops back on itself), it stops with an error naming
+the folder before anything is removed.
 
 ### Shell completions
 

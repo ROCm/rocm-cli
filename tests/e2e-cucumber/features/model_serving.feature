@@ -160,6 +160,13 @@ Feature: Model serving
   # fallback). Runs on GPU hardware: on a no-GPU host the GPU-required pre-flight
   # refuses ("no usable AMD GPU") before the index is ever validated, so the
   # index-specific rejection can only be observed where a real device is present.
+  #
+  # This is the live coverage for an index the host does not have. The *masked*
+  # sub-case — an index that exists but is hidden by an active visibility mask —
+  # is a different refusal and owns its own scenarios, serve-19 and serve-20.
+  # The step here accepts several refusal wordings only because which authority
+  # answers depends on the lane: the visible set when it could be enumerated,
+  # the raw amd-smi count when it could not.
   @id:serve-absent-gpu-index-rejected @requires-gpu @requires-os:linux
   Scenario: serve-16 - Serving pinned to a GPU that does not exist is refused
     When the user serves a model pinned to a GPU index that does not exist
@@ -268,3 +275,49 @@ Feature: Model serving
     Given a local server attempt has failed
     When the user lists running services
     Then the list reports the attempt and how to look at it
+
+  # Pre-launch OOM guidance (EAI-8058). When the GPU a serve is pinned to is
+  # nearly out of VRAM, the plan must warn before launch and — for vLLM — name the
+  # `--gpu-memory-utilization` knob that avoids the OOM, closing the loop with the
+  # `diagnose`/`fix` catalog. The GPU lane's real cards are comfortably free, so the
+  # near-full reading is injected via `ROCM_E2E_FORCE_LOW_VRAM` in debug/test builds:
+  # a single synthetic device on this non-APU host keeps the warning honest, while
+  # the engine still launches against the real, free device. Runs on the vLLM GPU
+  # lane; the mock lane has no GPU to pin, and an APU's shared-memory carveout would
+  # legitimately withhold the warning. `--managed` serves under the GPU-required
+  # device policy, which refuses before it ever builds a plan unless a ROCm
+  # runtime is active — hence the same `a managed runtime is active` precondition
+  # every other real-serve scenario on this lane opens with.
+  @id:serve-vllm-low-vram-oom-guidance @requires-gpu @requires-engine:vllm @requires-os:linux
+  Scenario: serve-23 - A vLLM serve plan on a nearly-full GPU points at the memory knob
+    Given a managed runtime is active
+    And the selected GPU is reported nearly out of VRAM
+    When the user previews a vLLM serve plan pinned to that GPU
+    Then the serve plan warns the GPU is low on VRAM
+    And the serve plan explains how to lower vLLM's memory reservation
+
+  # `--require-api-key` reuse refusal (#604). A running server's key is read once
+  # at launch; reuse cannot retroactively satisfy a demand for auth the server
+  # never got, so the idempotency guard refuses instead of upgrading the record
+  # in place (see `spawn_managed_engine_child` in `service_launch.rs`). This is the
+  # local-side proof that the printed stop hint is not just present but correct
+  # and directly runnable: the scenario stops the service with it and checks the
+  # record is left `stopped`, the same proof `@id:service-stop-yes-stops-a-
+  # running-service` gives the summary's own hint. The idempotency match is keyed
+  # on (engine, canonical model id) only — not a real listening port or process —
+  # so a planted record is enough; no actual Lemonade load is needed. Runs on the
+  # Lemonade GPU lane because `--managed` serve still refuses before reaching
+  # this guard without a live GPU, same as every other `@requires-gpu` scenario
+  # on this lane. Linux-only: `--require-api-key` forces auth even on a loopback
+  # bind, and the serve path's `ensure_public_bind_engine_supported` guard
+  # (defined in `service_launch.rs`, called from `serve_cmd.rs`) refuses that combination
+  # for Lemonade on Windows (its server can't receive the key through the
+  # Windows detached-spawn primitive), so this scenario cannot reach the
+  # refusal it exercises there.
+  @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
+  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
+    Given a managed runtime is active
+    And an unauthenticated Lemonade service is already running for that model
+    When the user serves that same model again with --require-api-key
+    Then the CLI refuses and names the exact command to stop the existing service
+    And running that command actually stops the service

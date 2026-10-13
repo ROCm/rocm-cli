@@ -140,6 +140,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-multi-gpu` | Premise is a host with **more than one** AMD GPU present. Resolves to **skip** wherever the probed device count is not known to exceed one: a single-GPU host such as Strix Halo, and any host whose count could not be read (non-Linux, or WSL, which exposes neither a KFD topology nor an amdgpu DRM card). `@requires-gpu` cannot express this — it asks only whether *a* device is usable — so scenarios carry both. The count comes from the capability probe's `amd_gpu_count`, which mirrors the product's KFD+DRM rule rather than counting `amd-smi list` — the gate must ask the same "how many devices are present" question `--gpu` validation is built on, and `amd-smi` is only a best-effort fallback that may be absent or disagree. |
 | `@requires-bare-metal` | Premise is a host running the in-tree amdgpu driver, so it does not hold under WSL2. Resolves to **skip** there. `@requires-os:linux` cannot express this: WSL2 reports an `os_family` of `linux`. |
 | `@requires-wsl` | The inverse: premise **is** a WSL2 host. Resolves to **skip** on native Linux, native Windows, and everything else. |
+| `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
 | `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
@@ -175,8 +176,6 @@ self-hosted runner can never stall `ci.yml`'s merge-required checks:
 | `e2e-gpu-strix-ubuntu` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu (self-hosted) | no |
 | `e2e-gpu-strix-windows` | `e2e-selfhosted.yml` | Strix Halo / Windows (self-hosted) | no |
 | `e2e-wsl` | `e2e-selfhosted.yml` | Strix Halo / Ubuntu under WSL2 (self-hosted) | no |
-| `e2e-gpu-rad3` | `e2e-selfhosted.yml` | Radeon R9700 (self-hosted) | no |
-| `e2e-gpu-mi350p` | `e2e-selfhosted.yml` | MI350P (self-hosted) | no |
 
 The blocking mock job passes when every applicable scenario is pass-or-xfail with
 no XPASS or unexpected failure; the GPU jobs are non-blocking. Each workflow
@@ -187,14 +186,17 @@ Ubuntu distro under WSL2 on the Strix Halo box, so it is the only lane that
 exercises `@requires-wsl` scenarios; `@requires-bare-metal` scenarios resolve to
 skip there.
 
-The nightly workflow covers the same hardware as the table above, as
-non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
+The nightly workflow covers a strict superset of the hardware in the table
+above, as non-blocking lanes (`e2e-gpu-nightly`, `e2e-gpu-nightly-rad3`,
 `e2e-gpu-nightly-mi350p`, `e2e-gpu-nightly-strix`,
 `e2e-gpu-nightly-strix-windows`, `e2e-wsl-nightly`) with
 `E2E_INCLUDE_NIGHTLY=1`, then consolidates them into the same cross-platform
-grid. The shared large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on
-MI300X and the hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL`
-checkpoint through Lemonade on Strix Halo.
+grid. `e2e-gpu-nightly-rad3` and `e2e-gpu-nightly-mi350p` have no per-PR
+counterpart — both were demoted from per-PR to nightly-only per ROCMAI-125 —
+so nightly is where their regression coverage now lives. The shared
+large-model scenario serves `Qwen/Qwen3.6-27B` through vLLM on MI300X and the
+hardware-verified `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_XL` checkpoint through
+Lemonade on Strix Halo.
 
 Use the self-hosted E2E workflow dispatch to run either model independently on a
 ref (the GPU platform / `include_nightly` / `name_filter` inputs live on
@@ -243,7 +245,7 @@ The `.feature` file is both the spec and the test input — cucumber reads it at
 - **Isolated state.** Each scenario uses isolated config, data, and cache directories. Tests never touch `~/.rocm`.
 - **Behavioral language.** Feature files describe what users care about, not implementation details. How steps are implemented (mock vs real, which port, which API) stays in the step functions.
 - **OS-assigned ports.** The mock server binds to `127.0.0.1:0` to avoid port conflicts between tests.
-- **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id>`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
+- **A message is asserted with the state it describes.** A `Then` step matching printed output ("no existing SDK was found", "becomes the active default runtime", "stop them with `rocm services stop <id> --yes`") asserts the resulting state in the same scenario — the file that was or was not written, the runtime that is or is not active, the advice's named command actually clearing the condition. Matching the text alone certifies the wording, not the truth of it, which is how a scenario passes over a CLI that is wrong about what it did. See AGENTS.md §3.
 
 ## The rocm-doctor skill contract
 

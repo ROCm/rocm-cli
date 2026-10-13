@@ -179,6 +179,25 @@ Keep docs and behavior claims in sync while editing:
   drifts independently, so grep for the claim's wording across all of them,
   not just the surface you're editing, and check each against the actual
   code path
+- cite a specific repo file in markdown as a link relative to the citing
+  file — `[fix.rs](../crates/rocm-core/src/fix.rs)` from `docs/` — not as a
+  bare backtick path: the `docs-links` CI job and the `lychee` prek hook
+  fail when a link's target is moved or deleted, but cannot see a bare
+  path go stale. Point at a line by naming the symbol, never as
+  `file.rs:42` (lychee reads `:42` as part of the filename and fails); a
+  `#L42` anchor on a source file passes but is never checked. Commit a
+  newly linked file together with the link: the hook checks the working
+  tree, CI only committed files. Keep a mention bare when no tracked file
+  is meant — a generic "don't grow `main.rs`", a deleted file named
+  historically, a glob, gitignored or generated output such as cucumber's
+  `report.json` — and where the rule does not apply: `.github/` (its
+  templates become issue and PR bodies, where a relative link breaks),
+  `docs/rocm-docs/` (Sphinx source built into a separate site, excluded
+  from `docs-links`), README.md and CONTRIBUTING.md (`{include}`d into
+  that site, where `docs-build`'s `sphinx-build -W` fails on a link to a
+  file outside it), and a link leaving a skill folder in `skills/`
+  (published or embedded elsewhere, §7). This covers citations you add or
+  edit, not converting existing bare paths in an unrelated change
 
 ## 6) rocm-cli Architecture Guardrails
 
@@ -291,11 +310,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 python scripts/smoke_local.py
 ```
 
+Deleting or weakening a test is a change in its own right: every crate has a committed
+coverage floor in `coverage-floors.toml`, and `cargo xtask coverage` fails when one drops
+below it. If a drop is legitimate, re-bless with `cargo xtask coverage --bless` and say in
+the commit why — do not re-bless to clear a red check.
+
 When relevant to touched behavior, also run targeted checks from `docs/testing.md`, such as:
 
 - focused Rust test groups for touched modules
 - engine-specific GPU self-tests (`--self-test`) or live GPU tests when hardware is available
-- release gate checks for release-path changes (`python scripts/single_exe_release_gate.py`)
+- release gate checks for release-path changes (`python scripts/release_readiness.py --self-test`,
+  and the install-lifecycle scenarios: `E2E_INCLUDE_LIFECYCLE=1 E2E_ONLY_LIFECYCLE=1 cargo xtask e2e`)
 
 **Execution environment expectations:**
 

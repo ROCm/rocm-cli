@@ -96,14 +96,17 @@ fn write_fixture(path: &Path, contents: &str) {
 
 /// Writes an executable POSIX shell script, standing in for a real binary the
 /// CLI shells out to (`uv`, the runtime's Python).
+///
+/// Written via [`rocm_core::fake_executable::write_fake_executable`], not
+/// `std::fs::write`: scenarios run concurrently, and a write fd another
+/// scenario's spawn inherits makes the CLI's first run of the shim fail with
+/// `Text file busy`.
 fn write_shim(path: &Path, body: &str) {
-    write_fixture(path, body);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("failed to chmod fake {}: {e}", path.display()));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("failed to create fixture directory");
     }
+    rocm_core::fake_executable::write_fake_executable(path, body)
+        .unwrap_or_else(|e| panic!("failed to write fake {}: {e}", path.display()));
 }
 
 /// Writes a fake runtime Python that answers both forms `probe_comfyui`'s
@@ -361,6 +364,51 @@ async fn cli_succeeds_and_shows_progress(world: &mut E2eWorld) {
     assert!(
         stdout.contains("Resolved 3 packages"),
         "expected uv's progress output to be streamed through to stdout, got:\n{stdout}"
+    );
+}
+
+/// The `folder:` line `install` and `status` both print names this
+/// directory, not the runtime root or the bare app root; the fixture
+/// plants only `requirements.txt` here (production also has `main.py`).
+fn expected_comfyui_folder_line(world: &E2eWorld) -> String {
+    let source_dir = install_root(world)
+        .join("apps")
+        .join("comfyui")
+        .join("source");
+    format!("  folder: {}\n", source_dir.display())
+}
+
+#[then("the install output's folder: line names the ComfyUI source checkout")]
+async fn install_folder_line_names_source_checkout(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let expected = expected_comfyui_folder_line(world);
+    assert!(
+        stdout.contains(&expected),
+        "expected install output to contain {expected:?}, got:\n{stdout}"
+    );
+}
+
+#[when("the user checks ComfyUI status")]
+async fn user_checks_comfyui_status(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["comfyui", "status"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("status names the same ComfyUI source folder as the install")]
+async fn status_names_same_comfyui_source_folder(world: &mut E2eWorld) {
+    let stdout = world.cli_output.clone().unwrap_or_default();
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    let rc = world.cli_rc.unwrap_or(-1);
+    let expected = expected_comfyui_folder_line(world);
+    assert!(
+        rc == 0,
+        "expected `rocm comfyui status` to succeed, got rc={rc}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "expected status output to contain {expected:?}, got:\n{stdout}"
     );
 }
 

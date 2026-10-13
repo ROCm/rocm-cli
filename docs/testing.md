@@ -113,6 +113,20 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Tests that run a fake executable
+
+Plant a stand-in `python`, `uv`, `amd-smi`, ... with
+`rocm_core::fake_executable::write_fake_executable`, not `std::fs::write`
+followed by `set_permissions(0o755)`. On Linux the plain write makes the first
+run of the fake fail intermittently with `Text file busy (os error 26)`: while
+the write fd is open, a test on another thread can spawn a child, and that child
+keeps a copy of the fd until its own `exec` (`O_CLOEXEC` closes it only then).
+The kernel refuses to execute a file any process still has open for writing, so
+the fake's first run can land in that window. The helper has a short-lived
+child write the file instead, so this process never holds a write fd on it. The
+same applies to E2E steps: scenarios run concurrently in one process, and the
+`rocm` child that runs the shim can be the one refused.
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -124,6 +138,42 @@ If the workspace is already built:
 ```bash
 python scripts/smoke_local.py --skip-build
 ```
+
+## Coverage floors
+
+Every workspace crate (except the `e2e-cucumber` harness) has a committed line-coverage
+floor in `coverage-floors.toml`. CI fails when a crate drops more than a small tolerance
+below its floor, so deleting a test is a check failure rather than a silent loss.
+
+Check the floors locally. This needs both the instrumentation tooling and the LLVM
+tools the toolchain ships separately — CI installs the same two:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+cargo xtask coverage
+```
+
+After adding tests, ratchet the floors up to the new measurement:
+
+```bash
+cargo xtask coverage --bless
+```
+
+`--bless` rewrites `coverage-floors.toml`; commit the result. Lowering a floor is
+allowed but deliberate — it shows up as a diff a reviewer has to approve, so say in the
+commit why coverage legitimately dropped (a crate shrank, tests moved elsewhere) rather
+than re-blessing to make a red check go away.
+
+Adding a workspace crate fails the check until that crate has a floor, so a new crate
+cannot land outside the gate. A crate that no test binary compiles at all never shows up
+in the coverage report; both the check and `--bless` fail on it by name, and the way out
+is tests or an entry in `EXCLUDED` in `xtask/src/coverage.rs` with the reason — there is
+no measurement to bless a floor from.
+
+These are `cargo llvm-cov` line percentages, which count `#[cfg(test)]` modules as
+covered source. That inflates the numbers and damps the gate — see the module comment in
+`xtask/src/coverage.rs` for what the measurement is and is not good for.
 
 ## Remote control-channel checks
 
@@ -180,8 +230,10 @@ cargo xtask affected --base origin/main
 which prints the cargo package flags to test (`--workspace`, or `-p <crate> …`,
 or nothing when no crate is affected). It falls back to `--workspace` for any
 change that can't be confined to specific crates (the lockfile, the toolchain
-file, the workspace root manifest, or CI config). On `main` and in the merge
-queue the full workspace always runs. For local verification, keep using
+file, the workspace root manifest, CI config, or a doc an xtask test reads —
+`MANIFEST.md`, `CONTRIBUTING.md`, `docs/ci-hardware-testing.md`,
+`tests/e2e-cucumber/README.md`). On `main`
+and in the merge queue the full workspace always runs. For local verification, keep using
 `cargo test --workspace --all-targets` above — `affected` is a CI optimization.
 
 The smoke path is the cross-platform local no-fallback acceptance surface. It
@@ -454,9 +506,40 @@ Activate one validated runtime:
 
 ```bash
 rocm runtimes activate <runtime_key>
+rocm runtimes activate <runtime_key> --restart-services --yes
 ```
 
-Engine installs and managed serving inherit this active runtime by default.
+New engine installs and new serve launches use this active runtime by default.
+Already-running managed servers do not follow the activation: each one keeps
+the runtime recorded in its service record until it is restarted. The
+activation report says so from that recorded state rather than as a fixed
+note — it prints `services_on_previous_runtime: <n>` with one line per stale
+service (`- <service_id> engine=<engine> recorded_runtime=<key>`), and
+`services_on_previous_runtime: 0` when nothing is left behind. Live services
+whose record names no runtime are counted separately under
+`services_with_unrecorded_runtime:`. Only services on an engine that
+manages its own runtime (`lemonade`) are never counted as stale; an `env_id`
+recorded in a service record is not a pin and does not exempt the service.
+
+`--restart-services` moves those services: it rewrites each service record onto
+the newly active runtime and then restarts it. Moving a service also clears any
+`env_id` stored in its record; the engine writes its own back on the next
+launch. It requires `--yes` and never prompts, the same idiom as
+`rocm services restart <id> --yes` and `rocm runtimes uninstall --yes`. Restart
+is best effort per service — every failure is named, its record is put back on
+the runtime it actually ran on, and the command exits non-zero. After a failure
+the service is read back: one that is still live stays counted under
+`services_on_previous_runtime`, and one that is not is reported as stopped by
+the attempt. The error says which is which. `services_restarted` lists only
+servers that answered an inference request after the restart; one that was
+respawned but had not answered when the restart stopped waiting (45 seconds) is
+listed under `services_restarted_not_yet_serving` instead, and does not fail the
+command.
+
+Activating the runtime that is already active changes nothing: the report prints
+`changed_from_runtime_key: <unchanged>` and the existing rollback target is kept,
+so the activation command in the report's own note can be run safely.
+
 If no runtime is active, pass `--runtime-id` explicitly or activate one first;
 the CLI does not fall back to a built-in TheRock selector.
 
@@ -464,14 +547,27 @@ Normal user testing should switch versions by activating the exact runtime key
 printed by `rocm runtimes list`. The TUI equivalent is `/runtimes`, then arrow
 to an installed ROCm entry and press Enter.
 
+A runtime selector is matched against keys exactly first. If it matches no key
+exactly but more than one key ignoring letter case — possible on a
+case-sensitive filesystem, where `Foo` and `foo` are separate registry entries —
+every command that resolves a runtime selector through the shared resolver
+refuses and lists the matching keys instead of picking one. Two exceptions
+remain: ComfyUI's installer (`comfyui install --runtime-id`) keeps its own lookup
+and still takes the first case-insensitive match, and `config set-default-runtime`
+and `config set-engine --runtime-id` store a selector without resolving it. For
+`runtimes activate`, `@id:runtime-lifecycle-case-twin-selector-refused` also
+checks that nothing became active and that naming one key exactly then works.
+
 Developer-only previous-runtime regression check:
 
 ```bash
 rocm runtimes rollback
+rocm runtimes rollback --restart-services --yes
 ```
 
 This command validates the saved previous-runtime marker, but it is not the
-primary user-facing way to switch ROCm installs.
+primary user-facing way to switch ROCm installs. It reports and restarts
+running services exactly as `activate` does.
 
 Import an existing rocm-cli/TheRock runtime manifest in read-only mode:
 
@@ -511,6 +607,32 @@ cargo test -p rocm-engine-vllm stdio_protocol_routes_all_methods_without_side_ef
 cargo test -p rocm-engine-vllm
 cargo test -p rocmd event_collector
 cargo test -p rocmd event_dispatcher
+```
+
+## Uninstall And Download Removal
+
+`rocm uninstall` and `rocm storage remove-downloads` both end in the same
+removal helper. Their property tests build a real sandbox tree with planted
+symlinks (live, dangling, and spelled with a trailing `/` or `/.`), sibling
+folders whose names are prefixes of a removed root, and sentinel files outside
+it. Each case runs the real plan and removal code, then compares the tree by
+`(dev, ino)` against what the review listed:
+
+```bash
+cargo test -p rocm --bin rocm deletion_properties
+ROCM_DELETION_PROP_CASES=4096 cargo test -p rocm --bin rocm deletion_properties
+```
+
+The default is 256 cases; `ROCM_DELETION_PROP_CASES` raises it for a deeper
+local run. They are Unix-only because they plant symlinks.
+
+The `uninstall-NN` E2E scenarios (`features/uninstall.feature`) check the same
+behaviour through the built binary, confined to the scenario's own folder,
+including a folder that cannot be checked stopping the uninstall before
+anything is removed:
+
+```bash
+cargo xtask e2e -- -n "uninstall-"
 ```
 
 ## Provider-Assisted Planning
@@ -623,8 +745,18 @@ happens before anything is stopped, so it cannot take down a running service. A
 stop therefore drops the key only once it has confirmed the engine is gone —
 otherwise the CLI would lock itself out of a service that is still running and
 still enforcing the key — and the deferred cleanup lands on the liveness refresh
-that later observes the process dead. There is no e2e coverage of `services
-stop`/`restart` or endpoint auth; these paths are unit-tested only.
+that later observes the process dead. `service-stop-01`
+(`features/service_stop.feature`) covers `services stop` succeeding against a
+running record on the mock lane and the record being persisted as stopped;
+there is still no e2e coverage of the key being dropped or `services restart`,
+which remain unit-tested only. Reusing a running service for a
+`--require-api-key` request it never had is refused rather than silently
+upgraded — `serve-24` (`features/model_serving.feature`, Lemonade GPU lane,
+Linux-only since the Windows managed Lemonade spawn can't enforce the key)
+covers the local refusal and that its printed stop hint actually clears it;
+`remote-15` (`features/remote.feature`, `@requires-docker`) covers the same
+refusal on `rocm remote serve`, reusing the fake remote's own deterministic
+service id.
 
 `rocm services remove` / `rocm services prune` are the one place a key file is
 dropped for a service that was never stopped: the record itself is being
@@ -1268,3 +1400,74 @@ The e2e suite (`cargo xtask e2e -- -n diagnose-2`) exercises all four verdicts,
 including the two that need a synthetic signed catalog to trigger
 deterministically (`ModelNotCurated`, `Degraded`) since no built-in recipe can
 produce them on an arbitrary real host.
+
+## Doctor Report Preflight
+
+Preview the content a problem report would carry, without sending anything:
+
+```bash
+rocm diagnose --report
+rocm diagnose --report --json
+```
+
+The command refuses rather than prepares a report on three hosts, and the
+three reasons are not interchangeable. One holds an architecture the ROCm
+compatibility matrix does not list as supported (`unreleased-hardware`). One
+has an AMD GPU architecture that could not be read (`architecture-unreadable`).
+The third is any WSL host (`platform-not-probed`): `examine` returns before
+any GPU probe runs there, so nothing has looked, and saying the architecture
+could not be read would state a finding about hardware nothing inspected. All
+three exit 0 and are told apart by `--json`'s `refused` field, and the refusal
+envelope also carries `architecture_matrix`, the same compatibility-matrix
+snapshot stamp a genuine report carries, so a refusal is just as traceable to
+a matrix revision as a report is.
+
+Offer a prefilled mail carrying that report, which still sends nothing:
+
+```bash
+rocm diagnose --report --send
+```
+
+Two argument rules are worth checking by hand, because both are the kind that
+only break when somebody reorders a declaration. `--send` without `--report`
+must be refused, since showing the content first is the guarantee `--send`
+makes. `--send` with `--json` must also be refused: that combination is for
+scripts, and starting a browser from a scripted invocation is not wanted.
+
+Whether `--send` opens a mail client or prints the address and link depends on
+the machine, and the printed line says which happened. It prints rather than
+opens over SSH, with no `DISPLAY` or `WAYLAND_DISPLAY` on Linux, or with
+`ROCM_NO_BROWSER` set to a non-empty value. A machine with no mail client
+configured reaches the same printed form, which is why the address appears on
+its own and not only inside the `mailto:` link. That is the common case on
+servers and in containers. The opt-out is the easiest to check on a desktop:
+
+```bash
+ROCM_NO_BROWSER=1 rocm diagnose --report --send
+```
+
+The destination is `ROCmCLI@amd.com`, fixed in code. A report also carries its
+classification in the mail subject, because a mailbox has no labels: the
+subject names the matched catalog entry, or `unrecognised`, then the
+architecture and the distribution. Check that the subject carries no field the
+report body does not.
+
+On a host with an approved architecture (see `APPROVED_ARCHITECTURES` in
+`crates/rocm-core/src/report.rs`), the command prints the full `Report`:
+`schema`, `architecture`, `architecture_matrix`, `entry`, `os_family`,
+`os_major`, `distro`, `rocm`, `engine`, `engine_version`, `cli_version`, and
+`fix_offered`. This path has not been exercised against real hardware in CI;
+verifying it needs a lane whose GPU architecture is on the allowlist.
+
+Four of those fields — `distro`, `rocm`, `engine`, and `engine_version` — can
+answer with a word rather than a value, and the words are not interchangeable.
+`none` means the thing is absent, `unknown` means this build looked and could
+not tell, and `other` means a distribution was named but is not one this build
+recognises. A host with no ROCm installed reports `"rocm": "none"`, while a
+host whose install exists but whose version could not be read reports `"rocm":
+"unknown"` — worth checking by hand on a machine with a partial install, since
+the two are easy to merge by accident and a counter cannot tell them apart
+afterwards. `engine`/`engine_version` carry the same distinction: a host a
+probe found no engine on reports `"engine": "none"`, while a host whose engine
+probe never ran (skipped rather than completed) reports `"engine": "unknown"`,
+since a probe that never ran cannot say an engine is absent.

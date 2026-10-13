@@ -37,11 +37,13 @@ mod e2e {
     pub mod runtime_lifecycle_steps;
     pub mod runtime_steps;
     pub mod service_cleanup_steps;
+    pub mod service_stop_steps;
     pub mod serving_steps;
     pub mod skill_steps;
     pub mod storage_steps;
     pub mod therock_steps;
     pub mod tui_driver;
+    pub mod uninstall_steps;
     pub mod update_steps;
 }
 
@@ -1173,6 +1175,10 @@ async fn main() {
     use e2e_cucumber::monotonic_clock::MonotonicClockWriter;
 
     let dir = results_dir();
+
+    // Baseline for the diagnostics log the lane uploads; see the `run()` boundary
+    // below and `harness_diagnostics` for what it is answering.
+    e2e_cucumber::harness_diagnostics::record_startup(&dir);
     let json_file =
         std::fs::File::create(dir.join("report.json")).expect("failed to create report.json");
     let junit_file =
@@ -1257,7 +1263,11 @@ async fn main() {
         } else {
             64
         };
-    let summary = E2eWorld::cucumber()
+    // Wrapped, not hooked — see `harness_diagnostics::run_or_record`, which this is
+    // handed to below. cucumber replaces the panic hook with an empty one for the
+    // whole run, so a panic raised by the *writer* unwinds out of here with that
+    // silencing hook still installed and prints nothing at all.
+    let cucumber_run = E2eWorld::cucumber()
         .max_concurrent_scenarios(max_concurrent)
         // Record the scenario name on the World before each scenario so every
         // `rocm` invocation can be tied back to its scenario for the coverage
@@ -1342,8 +1352,8 @@ async fn main() {
                 }
                 run
             }
-        })
-        .await;
+        });
+    let summary = e2e_cucumber::harness_diagnostics::run_or_record(&dir, cucumber_run).await;
 
     // Generate the HTML report before exiting so the artifact still uploads on
     // failure.

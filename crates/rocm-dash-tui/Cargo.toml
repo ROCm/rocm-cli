@@ -57,3 +57,12 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # dependency — the production signal path goes through `tokio::signal`.
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+# Property-based tests for the MiB/GiB/TiB formatters in `ui::format`. "A size
+# is printed in its own unit" has to hold at every unit boundary, and the narrow
+# band where `{:.1}` rounding reaches 1024.0 is exactly the input a hand-picked
+# example misses. Same version and features as rocm-core's, so no new crate or
+# feature enters the lockfile. Test-only, so it adds nothing to any shipped
+# binary.
+proptest = { version = "1", default-features = false, features = ["std"] }
