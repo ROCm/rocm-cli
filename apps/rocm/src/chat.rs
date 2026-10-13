@@ -7479,7 +7479,11 @@ mod command_preview_properties {
 
     proptest! {
         /// The central property, at the renderer: any argv renders to a line
-        /// that splits back to that argv.
+        /// that splits back to that argv — so, among other things, no argument
+        /// adds or loses a whitespace-delimited word. That `;`, `|` or `>`
+        /// inside a value stay data is a different claim, which `shlex` cannot
+        /// check (it treats none of them as operators); the quoter's real-`sh`
+        /// property in `rocm-dash-tui`'s `ui::exec` does, on unix.
         #[test]
         fn a_rendered_tool_call_splits_back_to_its_argv(
             args in hostile_argv()
@@ -7530,17 +7534,6 @@ mod command_preview_properties {
                 preview,
                 request.args
             );
-        }
-
-        /// Nothing an argument contains can add a word to the command line, so
-        /// a `;`, `|` or `>` in a value can never read as a second command.
-        #[test]
-        fn an_argument_can_never_add_a_word_to_the_preview(
-            args in hostile_argv()
-        ) {
-            let preview = format_structured_tool_call("rocm", &args);
-            let split = split_preview(&preview).expect("preview must parse");
-            prop_assert_eq!(split.len(), args.len() + 1, "preview = {:?}", preview);
         }
 
         /// A control character is refused rather than rendered. Quoting cannot
