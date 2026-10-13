@@ -80,6 +80,10 @@ pub struct E2eWorld {
     /// does not establish that the prune blocked. Set by the When step that
     /// measures it; `None` everywhere else.
     pub cli_elapsed: Option<std::time::Duration>,
+    /// The `ROCM_CLI_DATA_DIR` value a refusal told the user to set, read from
+    /// its stderr by the first step that follows that advice, so later steps
+    /// can follow it again after other commands have replaced `cli_stderr`.
+    pub suggested_data_dir: Option<String>,
     /// Extra environment for `rocm remote` scenarios: a `PATH` carrying the
     /// tailscale stand-in, and the status document it should serve. Set by a
     /// Given step so the When steps stay about what the user does.
@@ -295,6 +299,7 @@ impl Default for E2eWorld {
             cli_stderr: None,
             cli_rc: None,
             cli_elapsed: None,
+            suggested_data_dir: None,
             remote_env: Vec::new(),
             launch_release: None,
             launch_stage: None,

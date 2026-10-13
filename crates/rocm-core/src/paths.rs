@@ -13,7 +13,6 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::RocmCliConfig;
 use crate::runtime::env_path_override;
 use crate::runtime::{
     default_cache_dir, default_config_dir, default_data_dir, managed_runtime_cache_dir,
@@ -319,16 +318,10 @@ fn configured_managed_root_from_config(paths: &AppPaths) -> Result<Option<PathBu
     let unreadable = |detail: String| {
         unreadable_config_error(&path, &detail, recorded_root_in_damaged_config(&bytes))
     };
-    // Whatever `load` accepts, discovery reads the same way.
-    if let Ok(config) = serde_json::from_slice::<RocmCliConfig>(&bytes) {
-        // JSON strings are UTF-8, so the lossy view is exact; trimmed like
-        // the lenient path below.
-        return Ok(config.setup.therock_venv.and_then(|root| {
-            let text = root.to_string_lossy();
-            let text = text.trim();
-            (!text.is_empty()).then(|| PathBuf::from(text))
-        }));
-    }
+    // One reading for every file: a file `load` accepts holds `setup` as an
+    // object (or not at all) and `therock_venv` as a string (or null), and this
+    // reads those exactly as `load` does, so a typed parse first would only
+    // repeat the work.
     let value = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|error| unreadable(format!("not valid JSON: {error}")))?;
     let Some(top) = value.as_object() else {
@@ -358,8 +351,11 @@ fn configured_managed_root_from_config(paths: &AppPaths) -> Result<Option<PathBu
 /// advice that is true of what each way out actually does:
 ///
 /// - repairing the file restores everything;
-/// - `ROCM_CLI_DATA_DIR` only tells discovery where the data is — commands
-///   that read settings still fail on the broken file;
+/// - `ROCM_CLI_DATA_DIR` only tells discovery where the data is. The file
+///   stays broken: every command that changes settings loads it strictly and
+///   still stops, and of the read-only ones some stop too while the rest load
+///   it leniently and run on default settings. None of the lenient ones saves
+///   what it loaded, so none of them overwrites the file;
 /// - moving the file aside resets every setting, and puts the data dir back
 ///   to the default, so runtimes in a custom folder need `ROCM_CLI_DATA_DIR`.
 ///
@@ -371,8 +367,8 @@ fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>)
             let data_root = managed_runtime_data_root(&recorded);
             (
                 format!(
-                    "It still names {} as the ROCm folder: setting ROCM_CLI_DATA_DIR={} lets \
-                     commands find those runtimes meanwhile",
+                    "It still names {} as the ROCm folder: setting ROCM_CLI_DATA_DIR={} points \
+                     commands back at it meanwhile",
                     recorded.display(),
                     data_root.display()
                 ),
@@ -384,8 +380,8 @@ fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>)
             )
         }
         None => (
-            "Setting ROCM_CLI_DATA_DIR to the folder that holds your runtimes lets commands \
-             find them meanwhile"
+            "Setting ROCM_CLI_DATA_DIR to the folder that holds your runtimes points commands \
+             back at it meanwhile"
                 .to_owned(),
             "runtimes installed into a custom folder then need ROCM_CLI_DATA_DIR set to that \
              folder"
@@ -394,9 +390,10 @@ fn unreadable_config_error(path: &Path, detail: &str, recorded: Option<PathBuf>)
     };
     anyhow::anyhow!(
         "cannot tell where rocm-cli keeps its data: {} cannot be read ({detail}). Repair that \
-         file to restore your settings. {data_hint}, but commands that read your settings keep \
-         failing until the file is repaired. Moving the file aside resets every setting to its \
-         default, and {aside_hint}",
+         file to restore your settings. {data_hint}. Until the file is repaired, any command \
+         that changes settings still stops on it, and other commands either stop too or run on \
+         default settings. Moving the file aside resets every setting to its default, and \
+         {aside_hint}",
         path.display(),
         data_hint = data_dir_hint,
     )
@@ -446,7 +443,45 @@ mod persisted_paths_props;
 mod tests {
     use super::*;
 
+    use crate::RocmCliConfig;
     use crate::test_support::temp_app_paths;
+
+    /// For every `config.json` that `load` accepts, discovery reads the
+    /// recorded folder as `load` does: the saved `therock_venv`, trimmed, and
+    /// nothing when it is absent or blank.
+    #[test]
+    fn discovery_reads_the_recorded_folder_of_a_loadable_config_as_load_does() -> Result<()> {
+        let (root, paths) = temp_app_paths("discovery-agrees-with-load");
+        for recorded in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("/data/rocm"),
+            Some("  /data/rocm  "),
+            Some("/données/rocm"),
+        ] {
+            let config = RocmCliConfig {
+                setup: crate::SetupConfig {
+                    therock_venv: recorded.map(PathBuf::from),
+                    ..crate::SetupConfig::default()
+                },
+                ..RocmCliConfig::default()
+            };
+            config.save(&paths)?;
+            let loaded = RocmCliConfig::load(&paths)?;
+            let expected = loaded.setup.therock_venv.and_then(|root| {
+                let text = root.to_string_lossy().trim().to_owned();
+                (!text.is_empty()).then(|| PathBuf::from(text))
+            });
+            assert_eq!(
+                configured_managed_root_from_config(&paths)?,
+                expected,
+                "recorded {recorded:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
 
     #[test]
     fn audit_events_path_lives_under_data_audit() {
@@ -565,7 +600,8 @@ mod tests {
                 "cannot tell where rocm-cli keeps its data",
                 "config.json",
                 "Repair that file",
-                "commands that read your settings keep failing",
+                "any command that changes settings still stops on it",
+                "run on default settings",
                 "Moving the file aside resets every setting",
             ] {
                 assert!(

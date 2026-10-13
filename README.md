@@ -944,10 +944,11 @@ replaced with defaults. Unless `ROCM_CLI_DATA_DIR` is set, the file also records
 where runtimes are kept; when it is too damaged to read even that, commands stop
 and say how to recover (`rocm diagnose` still runs). Repairing the file
 restores everything. Setting `ROCM_CLI_DATA_DIR` (the error names the folder
-when the file still shows it) lets commands find their runtimes meanwhile, but
-commands that read settings keep failing until the file is repaired. Moving
-the file aside resets every setting to its default, and runtimes in a custom
-folder then need `ROCM_CLI_DATA_DIR`.
+when the file still shows it) points commands back at your runtimes' folder
+meanwhile; until the file is repaired, any command that changes settings still
+stops on it, and other commands either stop too or run on default settings.
+Moving the file aside resets every setting to its default, and runtimes in a
+custom folder then need `ROCM_CLI_DATA_DIR`.
 
 ### Setup
 

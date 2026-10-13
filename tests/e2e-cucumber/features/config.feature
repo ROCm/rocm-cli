@@ -73,16 +73,41 @@ Feature: Configuration mutations
   # instead makes them disappear from every answer, and later writes land in
   # the wrong place. The CLI stops, says which file, which folder it still
   # names, and how to recover, and leaves the file alone so nothing more is
-  # lost. Each way out it offers is then taken, as printed.
+  # lost. Two of the ways out it offers are then taken as printed — naming the
+  # data folder it suggests, and moving the file aside — and what it says each
+  # one does is checked. Repairing the file is not exercised here.
   @id:config-unreadable-settings-not-guessed
   Scenario: config-09 - A settings file the CLI cannot read stops it instead of hiding the user's runtimes
     Given the CLI's settings file was cut short just after it recorded a custom ROCm folder
     When the user checks the CLI version without naming a data folder
     Then the CLI refuses, naming the settings file, the recorded folder and how to recover
     And the settings file is left exactly as it was
-    When the user checks the CLI version with the data folder the refusal suggested
-    Then the CLI reports its version
+    When the user opens the CLI with the data folder the refusal suggested
+    Then the CLI keeps its data in the recorded folder, on default settings
     And the settings file is left exactly as it was
-    When the user moves the settings file aside and checks the CLI version without naming a data folder
-    Then the CLI reports its version
-    And the moved-aside settings file is left exactly as it was
+    When the user changes a setting with the data folder the refusal suggested
+    Then the CLI refuses to change the setting
+    And the settings file is left exactly as it was
+    When the user moves the settings file aside and opens the CLI without naming a data folder
+    Then the CLI keeps its data in its default folder, on default settings
+
+  # Saving settings replaces config.json in one step, but must not change what
+  # the user set up around it: a file only its owner may read stays that way,
+  # and a settings file that is a link (a dotfiles checkout, say) stays a link
+  # while the file it points at gets the new settings. These are Unix
+  # permissions and links, so the scenarios run on Linux only.
+  @id:config-save-keeps-a-private-settings-file-private @requires-os:linux
+  Scenario: config-10 - Changing a setting keeps a private settings file private
+    Given a settings file that only its owner can read
+    When the user turns telemetry off
+    Then the CLI confirms the telemetry mode and states the policy
+    And the settings file is still readable only by its owner
+    And the settings file records telemetry as off
+
+  @id:config-save-keeps-a-linked-settings-file-linked @requires-os:linux
+  Scenario: config-11 - Changing a setting through a linked settings file keeps the link
+    Given a settings file that is a link to a file kept elsewhere
+    When the user turns telemetry off
+    Then the CLI confirms the telemetry mode and states the policy
+    And the settings file is still a link to that file
+    And the linked-to file records telemetry as off
