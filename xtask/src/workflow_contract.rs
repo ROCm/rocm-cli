@@ -364,6 +364,12 @@ mod tests {
     fn a_column_zero_comment_does_not_end_the_jobs_block() {
         let text = "on: push\njobs:\n  first:\n    runs-on: x\n# ---- later lanes ----\n  second:\n    runs-on: y\nenv:\n  A: b\n";
         assert_eq!(job_ids(text), ["first", "second"]);
+
+        // A comment directly above the next top-level key belongs to that key.
+        let text = "jobs:\n  only:\n    runs-on: x\n\n# shared settings\nenv:\n  A: b\n";
+        let jobs = top_level_block(text, "jobs");
+        assert!(!jobs.contains("shared settings"), "{jobs:?}");
+        assert!(jobs.trim_end().ends_with("runs-on: x"), "{jobs:?}");
     }
 
     /// Extract the direct scalar entries from a named job-level mapping such as
@@ -470,7 +476,9 @@ mod tests {
     }
 
     /// Extract a top-level YAML value/block, stopping at the next column-zero
-    /// key or comment. This is deliberately small: workflow contract tests
+    /// key. Column-zero comments inside the block do not end it, and comment
+    /// and blank lines directly above the next key are left out. This is
+    /// deliberately small: workflow contract tests
     /// inspect only checked-in files with the repository's established layout.
     fn top_level_block(text: &str, key: &str) -> String {
         let marker = format!("{key}:");
@@ -1735,7 +1743,8 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     ///
     /// Two shapes carry shell: a plain `run: |` step, and the WSL lanes, which
     /// hand a here-string to `Invoke-WslBash.ps1`. A step that is PowerShell end
-    /// to end yields `None`; `preflight_powershell_script` carries those.
+    /// to end yields `None`; `preflight_powershell_script` carries those. Like
+    /// every caller of [`run_block`], only the literal `run: |` form is read.
     fn preflight_shell_script(step: &str) -> Option<String> {
         let body = run_block(step)?;
         let body = match body
@@ -2164,7 +2173,12 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             let step = step_block(&lines, settle);
             let body = run_block(&step)
                 .and_then(|block| dedent(&block))
-                .unwrap_or_else(|| panic!("{workflow}'s clock-settling step has no `run: |` body"));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{workflow}'s clock-settling step has no `run: |` body (only the literal \
+                         `run: |` form is read; `run: |-`, `run: >` and one-line `run:` are not)"
+                    )
+                });
             bodies.push((workflow, body));
         }
         let [(first, first_body), (second, second_body)] = bodies.as_slice() else {
