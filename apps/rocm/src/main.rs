@@ -958,7 +958,8 @@ enum ComfyuiCommand {
         /// ships, and lists it. Refused while the ComfyUI started by `rocm comfyui start` is
         /// running or still starting, checked before the download and again just before the code
         /// is replaced, unless rocm-cli's saved record of it cannot be read, which it then says.
-        /// A download that is not a ComfyUI release (no main.py) changes nothing.
+        /// A download that is not a ComfyUI release (no main.py) is discarded and the install
+        /// is left as it was.
         #[arg(long)]
         reinstall: bool,
         /// Show what would happen without changing files.

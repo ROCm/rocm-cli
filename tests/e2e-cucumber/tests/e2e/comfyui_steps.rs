@@ -46,7 +46,7 @@
 //! entirely — this scenario is about the download spinner, not the
 //! dependency install already covered above.
 //!
-//! `comfyui-05` to `comfyui-12` cover `--reinstall` over a used install: one
+//! `comfyui-05` to `comfyui-13` cover `--reinstall` over a used install: one
 //! file of the user's in every entry of `source/` a reinstall keeps, plus
 //! release code. The new release comes from the same loopback server
 //! (unpaced), at a path that 404s for the failed-download case. Each `Then`
@@ -733,15 +733,17 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
 /// torch stack, so the dependency install is filtered down to nothing and
 /// skipped — this scenario is about the swap, not the `uv` step.
 async fn serve_comfyui_release(world: &mut E2eWorld, served_path: &str, extra: &[(&str, &str)]) {
-    serve_comfyui_release_with(world, served_path, extra, || {}).await;
+    serve_comfyui_release_with(world, served_path, extra, true, || {}).await;
 }
 
-/// [`serve_comfyui_release`], running `on_request` when the release is
-/// requested, before any of it is sent.
+/// [`serve_comfyui_release`], without `main.py` unless `ships_main_py`, and
+/// running `on_request` when the release is requested, before any of it is
+/// sent.
 async fn serve_comfyui_release_with(
     world: &mut E2eWorld,
     served_path: &str,
     extra: &[(&str, &str)],
+    ships_main_py: bool,
     on_request: impl Fn() + Send + Sync + 'static,
 ) {
     let build_dir = root(world).join("comfyui-fixture").join("release-build");
@@ -758,6 +760,9 @@ async fn serve_comfyui_release_with(
     .chain(extra)
     {
         write_fixture(&release.join(relative), contents);
+    }
+    if !ships_main_py {
+        std::fs::remove_file(release.join("main.py")).expect("main.py was just written");
     }
     let contents = build_gzip_tarball(&build_dir, "comfyui-release.tar.gz", "ComfyUI-master").await;
     let served = root(world).join("comfyui-fixture").join("release-serve");
@@ -784,6 +789,47 @@ async fn serve_comfyui_release_with(
 #[given("a newer ComfyUI release is available to download")]
 async fn newer_comfyui_release(world: &mut E2eWorld) {
     serve_comfyui_release(world, "archive/comfyui-release.tar.gz", &[]).await;
+}
+
+/// A well-formed archive laid out like a release, but with no `main.py`: not
+/// ComfyUI, or a layout this CLI does not know.
+#[given("the newer ComfyUI release offered for download has no main.py")]
+async fn comfyui_release_without_main_py(world: &mut E2eWorld) {
+    serve_comfyui_release_with(world, "archive/comfyui-release.tar.gz", &[], false, || {}).await;
+}
+
+#[then("the reinstall fails saying the download is not a ComfyUI release, and does not keep it")]
+async fn reinstall_rejects_non_comfyui_download(world: &mut E2eWorld) {
+    let stderr = world.cli_stderr.clone().unwrap_or_default();
+    assert_ne!(
+        world.cli_rc,
+        Some(0),
+        "expected the reinstall to fail\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("is not a ComfyUI release") && stderr.contains("main.py"),
+        "the failure must say the download is not a ComfyUI release, got:\n{stderr}"
+    );
+    // Nothing was changed, so no command is named to finish anything.
+    assert!(!stderr.contains("rocm comfyui install"), "{stderr}");
+    let app_root = comfyui_source_dir(world)
+        .parent()
+        .expect("source has a parent")
+        .to_path_buf();
+    assert!(
+        !app_root
+            .join("downloads")
+            .join("ComfyUI-master.tar.gz")
+            .exists(),
+        "the rejected download must not be kept for the next attempt"
+    );
+    assert!(
+        !comfyui_source_dir(world)
+            .join(".rocm-cli-reinstall-in-progress")
+            .exists(),
+        "no reinstall was started, so none is left unfinished"
+    );
+    assert_staging_folder_empty(world);
 }
 
 #[given("the ComfyUI release download fails")]
@@ -1062,11 +1108,17 @@ async fn comfyui_started_during_download(world: &mut E2eWorld) {
     let path = running_state_path(world);
     let state = running_state_json(world, spawn_stand_in(), port);
     let fired = std::sync::atomic::AtomicBool::new(false);
-    serve_comfyui_release_with(world, "archive/comfyui-release.tar.gz", &[], move || {
-        if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            write_fixture(&path, &state);
-        }
-    })
+    serve_comfyui_release_with(
+        world,
+        "archive/comfyui-release.tar.gz",
+        &[],
+        true,
+        move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                write_fixture(&path, &state);
+            }
+        },
+    )
     .await;
 }
 

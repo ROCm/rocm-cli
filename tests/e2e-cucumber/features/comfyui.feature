@@ -247,3 +247,14 @@ Feature: ComfyUI install reports progress and makes failures actionable
     And the user reinstalls ComfyUI
     Then the reinstall reports the user's folders as kept and they still hold the user's files
     And ComfyUI's code is the newer release
+
+  # A download that unpacks but has no main.py is not installed: the reinstall
+  # would otherwise remove the installed code and put nothing startable in its
+  # place. It is not kept either, so the next attempt downloads again.
+  @id:comfyui-reinstall-rejects-download-without-main-py @requires-os:linux
+  Scenario: comfyui-13 - A ComfyUI reinstall whose download is not a ComfyUI release leaves the install untouched
+    Given a ComfyUI install holding the user's models, workflows, images and custom nodes
+    And the newer ComfyUI release offered for download has no main.py
+    When the user reinstalls ComfyUI
+    Then the reinstall fails saying the download is not a ComfyUI release, and does not keep it
+    And the existing ComfyUI code and the user's files are untouched

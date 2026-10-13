@@ -526,21 +526,22 @@ The running guard is tested against a ComfyUI answering on its port
 (`running`) and one whose process is up but whose port is not answering yet
 (`starting`).
 
-The e2e scenarios `comfyui-05` to `comfyui-12`
+The e2e scenarios `comfyui-05` to `comfyui-13`
 ([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
 GPU) cover the same through the built binary: what is kept, replaced and left
 in place (also when the saved run state is unreadable), a failed download, the
 dry run, a reinstall refused while ComfyUI runs (which the dry run says
-first), `start` refusing a half-replaced folder until the command it names is
+first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
 run, the answer to a plain-words status question
 (`rocm "what is the comfyui status"`) while ComfyUI starts and while a
 reinstall is unfinished, a folder of the user's set aside when the new release
 ships one of the same name, a reinstall that fails after the swap naming
-what it replaced and the command that finishes it, and a ComfyUI started
-while the reinstall downloads, which the check just before the swap refuses:
+what it replaced and the command that finishes it, a ComfyUI started while
+the reinstall downloads, which the check just before the swap refuses, and a
+download that is not a ComfyUI release, which is neither installed nor kept:
 
 ```bash
-cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-2])"
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 ```
 
 ## Runtime Selection And Activation

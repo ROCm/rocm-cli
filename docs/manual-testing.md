@@ -500,6 +500,10 @@ Expected result:
   terminal while the reinstall is still downloading: once the download
   finishes, the reinstall is refused before it replaces any code, names
   `rocm comfyui stop`, and the ComfyUI folder is unchanged.
+- A download that is not a ComfyUI release (no `main.py` in its top folder)
+  is hard to produce by hand; `comfyui-13` serves one and checks that the
+  reinstall fails saying so, leaves the install as it was and does not keep
+  the download.
 - With ComfyUI stopped (which removes rocm-cli's saved record of it), create
   `apps/comfyui/state/running.json` under rocm-cli's data folder containing
   only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
