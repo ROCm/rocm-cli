@@ -499,7 +499,7 @@ without an entry to set aside), unknown entries and `datasets/` left in place,
 an unreadable or malformed release record or swap marker, an entry that
 cannot be removed, the copy taken when the release cannot be renamed into
 place across filesystems, `main.py` removed first and moved in last, a
-release without `main.py` refused before anything changes, and the
+release without `main.py` refused before an existing install changes, and the
 `replaced:` list of an install with no record staying complete when its swap
 is interrupted at any step. The symlink tests (symlinked model folders, links
 inside them, loops, dangling links, copying links without following them), the

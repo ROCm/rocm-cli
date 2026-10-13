@@ -220,9 +220,11 @@ fn install_release_tree_removing_with(
         bail!("{} exists but is not a folder", source.display());
     }
     // Not a ComfyUI release, or one laid out differently: installing it would
-    // remove the installed code and put nothing startable in its place.
-    // `install` already rejects such an archive while unpacking it (and drops
-    // the cached copy); this keeps the swap safe for any caller.
+    // remove the installed code and put nothing startable in its place. Over
+    // an existing install, `install` already rejects such an archive while
+    // unpacking it (and drops the cached copy); this keeps the swap itself
+    // from ever emptying an install. A first install is not checked: there is
+    // nothing to remove, and `start` names a missing main.py.
     if !new_names.iter().any(|name| name == ENTRY_POINT) {
         bail!(
             "the downloaded ComfyUI release has no {ENTRY_POINT} at the top of {}; nothing \
