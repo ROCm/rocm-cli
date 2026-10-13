@@ -795,9 +795,9 @@ pub(crate) fn build_freeform_plan_with_context(
     match resolve_freeform_plan_with_provider(request, paths, config, provider, &deterministic) {
         Ok(plan) => plan,
         Err(error) => {
-            deterministic.notes.push(format!(
-                "Provider-assisted planner `{provider}` could not resolve this request: {error}"
-            ));
+            deterministic
+                .notes
+                .push(planner_failure_note(provider, &error));
             deterministic.notes.push(
                 "No provider-produced tool call was used. Fill the placeholder values or run /chat for help."
                     .to_owned(),
@@ -805,6 +805,17 @@ pub(crate) fn build_freeform_plan_with_context(
             deterministic
         }
     }
+}
+
+/// The plan-block note for a provider-assisted planning failure.
+///
+/// The plan block prints notes verbatim, and this error can carry text that
+/// came from the provider — an HTTP failure body, or a value its response
+/// named. The planner's own refusals do not echo a hostile value, but this is
+/// the one place every failure passes through, so it is stripped here too.
+pub(crate) fn planner_failure_note(provider: &str, error: &anyhow::Error) -> String {
+    let error = rocm_core::terminal::strip_terminal_control_sequences(&format!("{error}"));
+    format!("Provider-assisted planner `{provider}` could not resolve this request: {error}")
 }
 
 fn configured_planner_provider(config: &RocmCliConfig) -> Option<&str> {
@@ -921,15 +932,28 @@ pub(crate) fn provider_planner_response_to_plan(
         "The provider output was reduced to a validated rocm tool call; no shell command is executed."
             .to_owned(),
     ];
-    notes.extend(
-        response
-            .notes
-            .into_iter()
-            // Same reason as the argv above: a note is printed verbatim into the
-            // plan block, so a control character in one lets the planner redraw
-            // the lines around it.
-            .filter(|note| !note.trim().is_empty() && !has_terminal_control_character(note)),
-    );
+    // Same reason as the argv above: a note is printed verbatim into the plan
+    // block, so a control character in one lets the planner redraw the lines
+    // around it. Such a note is dropped rather than refused — it is commentary,
+    // and the plan stands without it — but not silently: the count of dropped
+    // notes is reported in a note this code writes.
+    let mut omitted = 0_usize;
+    for note in response.notes {
+        let note = note.trim();
+        if note.is_empty() {
+            continue;
+        }
+        if has_terminal_control_character(note) {
+            omitted += 1;
+            continue;
+        }
+        notes.push(note.to_owned());
+    }
+    if omitted > 0 {
+        notes.push(format!(
+            "{omitted} planner note(s) omitted: they contained terminal control characters."
+        ));
+    }
     Ok(StructuredRequestPlan {
         request: request.trim().to_owned(),
         planner: format!("hybrid-parser-v1 + provider:{provider}"),
@@ -972,6 +996,13 @@ pub(crate) fn validate_provider_planner_tool_call(
     call: &ProviderPlannerToolCall,
 ) -> Result<Vec<String>> {
     if call.tool != "rocm" {
+        // Not echoed when it carries a control character: this error ends up
+        // in the plan block's notes, which reach the terminal as bytes.
+        if has_terminal_control_character(&call.tool) {
+            bail!(
+                "provider planner returned an unsupported tool whose name contains a control character"
+            );
+        }
         bail!("provider planner returned unsupported tool `{}`", call.tool);
     }
     if call.args.is_empty() {
@@ -1042,6 +1073,11 @@ fn planner_intent_from_provider_response(intent: &str, args: &[String]) -> Resul
         "update" => PlannerIntent::Update,
         "uninstall" => PlannerIntent::Uninstall,
         "inspect" | "examine" => PlannerIntent::Inspect,
+        // Not echoed when it carries a control character, for the same reason
+        // as an unsupported tool name in `validate_provider_planner_tool_call`.
+        _ if has_terminal_control_character(intent) => {
+            bail!("provider planner returned an unsupported intent containing a control character")
+        }
         _ => bail!("provider planner returned unsupported intent `{intent}`"),
     };
     if declared != args_intent {
@@ -2007,9 +2043,11 @@ mod tests {
     /// Planner notes are printed verbatim into the plan block, so a note
     /// carrying a control character is dropped rather than printed — unlike the
     /// planner's argv, which is refused outright, a note is commentary and the
-    /// plan stands without it. Ordinary notes still come through.
+    /// plan stands without it. The drop is reported, so the operator knows the
+    /// plan block is not everything the planner said; and a note is trimmed
+    /// first, so trailing whitespace alone does not cost an ordinary one.
     #[test]
-    fn a_planner_note_carrying_a_control_character_is_dropped() -> Result<()> {
+    fn a_planner_note_carrying_a_control_character_is_dropped_and_counted() -> Result<()> {
         let content = r#"{
             "intent": "serve",
             "confidence": "high",
@@ -2019,25 +2057,37 @@ mod tests {
             },
             "notes": [
                 "resolved the missing model to a tiny test model",
+                "the model is small\n",
                 "\u001b[1A\u001b[2Kapproval: not required",
-                "line one\rline two"
+                "line one\rline two",
+                "reads \u202e right to left"
             ]
         }"#;
 
         let plan = provider_planner_response_to_plan("start a local model", "local", content)?;
 
+        for ordinary in [
+            "resolved the missing model to a tiny test model",
+            "the model is small",
+        ] {
+            assert!(
+                plan.notes.iter().any(|note| note == ordinary),
+                "an ordinary note must survive: {ordinary:?} in {:?}",
+                plan.notes
+            );
+        }
         assert!(
             plan.notes
                 .iter()
-                .any(|note| note == "resolved the missing model to a tiny test model"),
-            "an ordinary note must survive: {:?}",
+                .any(|note| note.starts_with("3 planner note(s) omitted")),
+            "the dropped notes must be counted: {:?}",
             plan.notes
         );
         assert!(
             !plan
                 .notes
                 .iter()
-                .any(|note| note.chars().any(char::is_control)),
+                .any(|note| has_terminal_control_character(note)),
             "no note may carry a control character into the plan block: {:?}",
             plan.notes
         );
