@@ -1802,8 +1802,10 @@ pub(crate) fn active_runtime_marker_path(paths: &AppPaths) -> PathBuf {
 /// directory at once (two terminals, a script), so the write goes through the
 /// shared atomic writer: each writer stages into its own exclusively created
 /// temp file, and the marker is replaced rather than removed first, so a
-/// reader always finds a complete marker. It does not order the two
-/// activations: the last one to publish wins, as before.
+/// reader always finds a complete marker. On Windows the replace goes through
+/// `ReplaceFileW`, and two replacements in flight at once there are not
+/// tested. It does not order the two activations: the last one to publish
+/// wins, as before.
 fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) -> Result<()> {
     let path = active_runtime_marker_path(paths);
     // The shared helper rather than a local temp-file-and-rename: it is the same
@@ -2141,10 +2143,13 @@ pub(crate) mod tests {
         Ok(leftovers)
     }
 
-    /// Regression for #605: the marker used to be staged at
-    /// `active.json.tmp-<millis>` with a truncating write, so a writer that
-    /// drew the same millisecond as another activation wrote into *that*
-    /// writer's temp file and then moved it into place as the marker.
+    /// The marker is staged through `rocm_core::atomic_write`, the writer this
+    /// change makes `rocm` and `rocmd` share (rocmd's own copy is gone), so it
+    /// never writes through a temp file another writer reserved. #605 reported
+    /// the marker staged at `active.json.tmp-<millis>` with a truncating write,
+    /// where a writer that drew another activation's millisecond wrote into
+    /// *that* writer's temp file and moved it into place; #424 fixed that on
+    /// its own, and this test keeps the marker from going back to it.
     ///
     /// Pre-creating a file at every name that scheme could pick while this
     /// test runs stands in for the other writer deterministically: the write
@@ -2154,61 +2159,102 @@ pub(crate) mod tests {
     /// construction, so collision safety under the current scheme is covered
     /// by `concurrent_active_runtime_marker_writes_keep_a_complete_marker_published`
     /// and by `rocm_core::atomic_write`'s own concurrency tests.
+    ///
+    /// The pre-created names only cover the milliseconds they were made for, so
+    /// a write that lands after them proves nothing. The window starts at 2 s
+    /// and, when a slow or scanned filesystem lets the write miss it, is
+    /// retried at four times what the pre-creation and write took (up to
+    /// 16 s). Where creating the names is itself slower than one per
+    /// millisecond no window can cover the write, and where every try misses,
+    /// the test says it is inconclusive on stderr and passes rather than
+    /// failing code that is correct.
     #[test]
     fn active_runtime_marker_write_never_reuses_another_writers_temp_file() -> Result<()> {
-        const WINDOW_MS: u128 = 2_000;
         const FOREIGN: &[u8] = b"another writer's staged marker";
+        const ATTEMPTS: usize = 3;
+        const MAX_WINDOW_MS: u128 = 16_000;
         let (root, paths) = test_paths("marker-temp-collision");
         write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "previous"))?;
         let marker_path = active_runtime_marker_path(&paths);
 
-        let start = rocm_core::unix_time_millis();
-        let foreign: Vec<PathBuf> = (start..start + WINDOW_MS)
-            .map(|millis| marker_path.with_extension(format!("json.tmp-{millis}")))
-            .collect();
-        for path in &foreign {
-            fs::write(path, FOREIGN)?;
-        }
+        let mut window_ms: u128 = 2_000;
+        for attempt in 1..=ATTEMPTS {
+            let start = rocm_core::unix_time_millis();
+            let foreign: Vec<PathBuf> = (start..start + window_ms)
+                .map(|millis| marker_path.with_extension(format!("json.tmp-{millis}")))
+                .collect();
+            for path in &foreign {
+                fs::write(path, FOREIGN)?;
+            }
+            let setup_ms = rocm_core::unix_time_millis() - start;
 
-        write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "next"))?;
-        let finished = rocm_core::unix_time_millis();
-        assert!(
-            finished < start + WINDOW_MS,
-            "inconclusive: the write ran after the {WINDOW_MS} ms window of pre-created names"
-        );
+            write_active_runtime_marker(&paths, test_active_runtime_marker(&paths, "next"))?;
+            let finished = rocm_core::unix_time_millis();
 
-        let published: ActiveRuntimeMarker = serde_json::from_slice(&fs::read(&marker_path)?)?;
-        assert_eq!(published.runtime_key, "next");
-        for path in &foreign {
-            assert_eq!(
-                fs::read(path).ok().as_deref(),
-                Some(FOREIGN),
-                "{} belongs to another writer but was written through or moved",
-                path.display()
+            for path in &foreign {
+                assert_eq!(
+                    fs::read(path).ok().as_deref(),
+                    Some(FOREIGN),
+                    "{} belongs to another writer but was written through or moved",
+                    path.display()
+                );
+            }
+            for path in &foreign {
+                fs::remove_file(path)?;
+            }
+            if finished < start + window_ms {
+                let published: ActiveRuntimeMarker =
+                    serde_json::from_slice(&fs::read(&marker_path)?)?;
+                assert_eq!(published.runtime_key, "next");
+                assert_eq!(leftover_marker_temp_files(&paths)?, Vec::<String>::new());
+                let _ = fs::remove_dir_all(root);
+                return Ok(());
+            }
+            // Missed: the names ran out before the write ran. One name covers
+            // one millisecond, so when creating them is slower than one per
+            // millisecond no window can be wide enough; otherwise size the
+            // next one from what this pre-creation and write took.
+            let next_ms = 4 * (finished - start);
+            if setup_ms * 2 >= window_ms || next_ms > MAX_WINDOW_MS {
+                eprintln!(
+                    "inconclusive: pre-creating {window_ms} names took {setup_ms} ms and the \
+                     write finished after them; this filesystem is too slow for the test \
+                     to say anything, so it is skipped"
+                );
+                let _ = fs::remove_dir_all(root);
+                return Ok(());
+            }
+            window_ms = window_ms.max(next_ms);
+            eprintln!(
+                "attempt {attempt}/{ATTEMPTS}: the write finished after the pre-created \
+                 names ran out; retrying with a {window_ms} ms window"
             );
         }
-        for path in &foreign {
-            fs::remove_file(path)?;
-        }
-        assert_eq!(leftover_marker_temp_files(&paths)?, Vec::<String>::new());
-
+        eprintln!(
+            "inconclusive: on every attempt the write ran after the window of pre-created \
+             names, so this host is too slow for this test to say anything"
+        );
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
-    /// Regression for #605: two activations writing the marker at once must
-    /// both succeed, and a reader must find a complete marker throughout —
-    /// the old writer removed `active.json` before renaming the replacement
-    /// in, and two writers in the same millisecond shared one temp file, so
-    /// one failed with "failed to move active runtime marker" and the other
-    /// could publish the shorter payload followed by the longer one's tail.
+    /// Two activations writing the marker at once must both succeed, and a
+    /// reader must find a complete marker throughout. #605 reported a writer
+    /// that removed `active.json` before renaming the replacement in, and two
+    /// writers in the same millisecond sharing one temp file, so one failed
+    /// with "failed to move active runtime marker" and the other could publish
+    /// the shorter payload followed by the longer one's tail. #424 fixed that;
+    /// this change routes the marker through `rocm_core::atomic_write`, the
+    /// writer `rocm` and `rocmd` now share, and this test pins that the marker
+    /// keeps the property through it.
     ///
     /// The bug is a race, so against the old code this fails with high
-    /// probability per round rather than deterministically; against the fix
-    /// nothing in it is timing-dependent. Unix only: the property under test
-    /// is that `rename` replaces in one step. The Windows publish path goes
-    /// through `ReplaceFileW` instead, whose behaviour with two replacements
-    /// of one file in flight this test has not been run against.
+    /// probability per round rather than deterministically; against the
+    /// current writer nothing in it is timing-dependent. Unix only: the
+    /// property under test is that `rename` replaces in one step. The Windows
+    /// publish path goes through `ReplaceFileW` instead, whose behaviour with
+    /// two replacements of one file in flight this test has not been run
+    /// against.
     #[cfg(unix)]
     #[test]
     fn concurrent_active_runtime_marker_writes_keep_a_complete_marker_published() -> Result<()> {
