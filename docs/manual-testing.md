@@ -164,9 +164,10 @@ Expected result:
   `libraries`, and `devel` only when `--devel` is passed), alongside pinned
   `torchaudio` from the TheRock index. For ROCm 10, the plan's
   `torchaudio_selection:` line says whether that torchaudio is the
-  hardware-verified build for the ROCm line (10.1: `2.11.0.2`) or the newest
-  published one, which it marks as not hardware-verified. On a host with no detectable AMD GPU the
-  preview reports `device_target: undetermined` and a real install refuses
+  hardware-verified build for the ROCm line (the vLLM ROCm 10.x row's exact
+  torchaudio pin, when that row has one) or the newest published one, which it
+  marks as not hardware-verified (a real install also logs that as a `Note:`).
+  On a host with no detectable AMD GPU the preview reports `device_target: undetermined` and a real install refuses
   rather than pulling every published device payload.
 - rocm-cli chooses the newest exact ROCm build suffix common to the SDK package
   and the PyTorch stack for the current Python/platform wheel tags, then pins
