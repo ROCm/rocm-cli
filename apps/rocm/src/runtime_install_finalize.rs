@@ -24,13 +24,17 @@ use rocm_core::{
 };
 use rocm_engine_protocol::{EngineMethod, InstallRequest, InstallResponse};
 
-use crate::engines_cmd::{env_root_for_engine_install, runtime_key_for_python};
-use crate::runtimes_cmd::{activate_runtime, newest_installed_runtime_manifest};
+use crate::engines_cmd::{
+    engine_manages_own_runtime, env_root_for_engine_install, runtime_key_for_python,
+    runtime_manifest_for_selector,
+};
+use crate::runtimes_cmd::{
+    activate_runtime, newest_installed_runtime_manifest, recover_setup_runtime_registration,
+};
 use crate::therock;
 use crate::{
-    ROLLBACK_RECOVERY_HINT, engine_manages_own_runtime, engine_request_with_env_root,
-    record_cli_audit_event, recover_setup_runtime_registration, runtime_manifest_for_selector,
-    runtime_services, sanitize_log_value,
+    ROLLBACK_RECOVERY_HINT, engine_request_with_env_root, record_cli_audit_event, runtime_services,
+    sanitize_log_value,
 };
 
 #[derive(Debug, Clone)]
@@ -1933,7 +1937,9 @@ pub(crate) fn render_sdk_install_success(finalized: &SdkInstallFinalization) -> 
     output
 }
 
-pub(crate) fn finalize_successful_sdk_install(paths: &AppPaths) -> Result<Option<SdkInstallFinalization>> {
+pub(crate) fn finalize_successful_sdk_install(
+    paths: &AppPaths,
+) -> Result<Option<SdkInstallFinalization>> {
     let Some(manifest) = newest_installed_runtime_manifest(paths)? else {
         return Ok(None);
     };
@@ -3321,5 +3327,4 @@ pub(crate) mod tests {
         // A multi-line failure must stay on one reported line.
         assert_eq!(rendered.lines().count(), 1, "{rendered}");
     }
-
 }

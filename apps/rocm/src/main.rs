@@ -58,14 +58,16 @@ mod uninstall;
 // the same reason `engines_cmd`'s runtime-resolution helpers are re-imported.
 use crate::automations::automations;
 use crate::driver_install::{install_driver, reconcile_driver_install};
-use crate::engines_cmd::{engine_manages_own_runtime, engines, env_root_for_service, runtime_manifest_for_selector};
+use crate::engines_cmd::{
+    engine_manages_own_runtime, engines, env_root_for_service, runtime_manifest_for_selector,
+};
 use crate::runtime_install_finalize::{
     SdkInstallConsents, empty_as_unknown, ensure_libatomic_for_torch, ensure_libnuma_for_torch,
     finalize_successful_sdk_install, finish_sdk_install, maybe_auto_install_sdk_preferred_engine,
     print_sdk_install_success,
 };
 use crate::runtimes_cmd::{
-    RuntimeActivationResult, active_runtime_marker_path, activate_runtime,
+    RuntimeActivationResult, activate_runtime, active_runtime_marker_path,
     current_runtime_manifest, default_runtime_id_matches, recover_setup_runtime_registration,
     render_runtimes_text, runtime_keys_text, runtime_usability_status, runtimes,
     select_runtime_manifest, setup_runtime_paths, toolchain_state_text,
@@ -19876,7 +19878,6 @@ model recipes
         }
     }
 
-
     #[test]
     fn install_sdk_chat_and_mcp_args_approve_the_replacement_for_a_non_interactive_spawn() {
         // The chat/MCP surfaces spawn `rocm` with null stdin, so the consent
@@ -19922,7 +19923,6 @@ model recipes
             );
         }
     }
-
 
     #[test]
     fn chat_rocm_command_runs_read_only_and_rejects_risky_shapes() {
@@ -23674,7 +23674,6 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
-
     #[test]
     fn serve_notes_surface_the_ignored_engine_flag_in_summary_mode() {
         // The interactive summary is what a default `rocm serve` prints, so a flag
@@ -24400,7 +24399,6 @@ install therock";
         assert!(vram_capacity_is_meaningful(None, 1));
     }
 
-
     /// The `ROCM_E2E_FORCE_LOW_VRAM` hook must synthesize a reading that actually
     /// trips the serve-plan low-VRAM warning on a non-APU (vLLM-lane) host, and
     /// stay inert when the var is unset. This is what the `@requires-gpu`
@@ -24581,29 +24579,9 @@ install therock";
         assert!(off.contains("    openai: enabled"));
     }
 
-
-
-
-
-
-
-
-
-
     /// The two runtimes every activation/reconciliation test switches between.
     pub(crate) const OLD_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-12-0";
     pub(crate) const NEW_RUNTIME_KEY: &str = "release-pip-gfx120x-all-7-13-0";
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn runtime_activation_restart_services_requires_yes() {
@@ -24656,9 +24634,6 @@ install therock";
             "the rollback refusal must name rollback, not activate:\n{rollback_error}"
         );
     }
-
-
-
 
     #[test]
     fn pinning_a_service_record_to_a_runtime_drops_its_env_pin() -> Result<()> {
@@ -25134,28 +25109,6 @@ install therock";
         Ok(())
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// The same question — "is this a system location?" — also keeps the local
     /// assistant from installing into one, and there the folder arrives as
     /// free-form JSON from a model rather than from a file the user wrote. A
@@ -25184,17 +25137,6 @@ install therock";
             "accepted as a user install folder: {accepted:?}"
         );
     }
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn engine_plugin_discovery_finds_runtime_binary() -> Result<()> {
@@ -25232,26 +25174,6 @@ install therock";
         Ok(())
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     #[test]
     fn install_sdk_survives_an_engine_install_failure() -> Result<()> {
         let (_root, paths) = test_paths("install-sdk-engine-failure");
@@ -25282,35 +25204,6 @@ install therock";
         );
         Ok(())
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn render_engine_inventory_text_surfaces_external_plugin_policy() {
@@ -26409,7 +26302,6 @@ install therock";
              must not hint at a command that immediately fails:\n{rendered}"
         );
     }
-
 
     pub(crate) fn test_runtime_manifest_for_update(
         runtime_key: &str,

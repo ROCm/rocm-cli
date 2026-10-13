@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::therock;
 use crate::{
-    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, confirm_uninstall,
-    record_cli_audit_event, runtime_services,
+    ROLLBACK_RECOVERY_HINT, RuntimesCommand, cli_report, confirm_uninstall, record_cli_audit_event,
+    runtime_services,
 };
 
 pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
@@ -325,13 +325,13 @@ pub(crate) fn runtimes(command: Option<RuntimesCommand>) -> Result<()> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ActiveRuntimeMarker {
-    pub(crate) runtime_id: String,
+    runtime_id: String,
     pub(crate) runtime_key: String,
-    pub(crate) manifest_path: PathBuf,
-    pub(crate) install_root: PathBuf,
-    pub(crate) previous_runtime_id: Option<String>,
+    manifest_path: PathBuf,
+    install_root: PathBuf,
+    previous_runtime_id: Option<String>,
     pub(crate) previous_runtime_key: Option<String>,
-    pub(crate) activated_at_unix_ms: u128,
+    activated_at_unix_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -1804,7 +1804,9 @@ fn write_active_runtime_marker(paths: &AppPaths, marker: ActiveRuntimeMarker) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::runtime_install_finalize::{finalize_successful_sdk_install, render_sdk_install_success};
+    use crate::runtime_install_finalize::{
+        finalize_successful_sdk_install, render_sdk_install_success,
+    };
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{
         NEW_RUNTIME_KEY, OLD_RUNTIME_KEY, plant_service_record_on_runtime, test_paths,
@@ -4295,5 +4297,4 @@ pub(crate) mod tests {
         let _ = fs::remove_dir_all(root);
         Ok(())
     }
-
 }

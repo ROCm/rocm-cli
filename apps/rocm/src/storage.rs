@@ -942,8 +942,9 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 // only in letter case are distinct installs here, so a lookup
                 // that folded them together would delete a different runtime
                 // than the one the user just confirmed.
-                let result = crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
-                    .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
+                let result =
+                    crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
+                        .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
                 // `uninstall_runtime` re-evaluates ownership itself and can
                 // decline to delete the folder while still clearing the
                 // registry entry. Reporting the space as reclaimed then would
