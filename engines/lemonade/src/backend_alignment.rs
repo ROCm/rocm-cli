@@ -608,7 +608,7 @@ fn rocm_backend_resolves(
 /// matched by filename *prefix* rather than an exact name: TheRock's Windows HIP
 /// runtime ships a version-suffixed `amdhip64_N.dll`, which the loader resolves by
 /// import name, not by any one literal file existing.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 const ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES: [&str; 4] =
     ["amdhip64", "hipblas", "rocblas", "hsa-runtime64"];
 
@@ -631,9 +631,6 @@ fn rocm_backend_resolves(
     let Some(backend_dir) = llama_server_binary.parent() else {
         return false;
     };
-    if !backend_dir.join("ggml-hip.dll").is_file() {
-        return false;
-    }
     let Ok(env_vars) =
         lemonade_process_environment_vars(process_env, &ParentRuntimeEnvironment::current())
     else {
@@ -645,9 +642,21 @@ fn rocm_backend_resolves(
     let search_dirs: Vec<PathBuf> = std::iter::once(backend_dir.to_path_buf())
         .chain(std::env::split_paths(path))
         .collect();
-    ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES
-        .iter()
-        .all(|shortname| library_present_in(shortname, &search_dirs))
+    windows_backend_resolves(backend_dir, &search_dirs)
+}
+
+/// The actual DLL-presence verification `rocm_backend_resolves` (Windows) checks
+/// once it has a backend directory and search path: split out, and compiled
+/// under `cfg(test)` on every target (not just real Windows builds), so
+/// `cargo test` exercises this logic -- the part that was previously
+/// untested end-to-end -- on the ordinary Linux CI lane too, not only the
+/// separate self-hosted Windows job.
+#[cfg(any(target_os = "windows", test))]
+fn windows_backend_resolves(backend_dir: &Path, search_dirs: &[PathBuf]) -> bool {
+    backend_dir.join("ggml-hip.dll").is_file()
+        && ROCM_BACKEND_REQUIRED_LIBRARY_SHORTNAMES
+            .iter()
+            .all(|shortname| library_present_in(shortname, search_dirs))
 }
 
 /// Whether some file directly inside any of `search_dirs` looks like the DLL for
@@ -656,7 +665,7 @@ fn rocm_backend_resolves(
 /// unsuffixed ones (`hipblas.dll`), but a distinct sibling library that merely
 /// starts with the same letters (`hipblaslt.dll` vs. shortname `"hipblas"`) does
 /// not.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn library_present_in(shortname: &str, search_dirs: &[PathBuf]) -> bool {
     search_dirs.iter().any(|dir| {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -1847,6 +1856,29 @@ mod tests {
 
         fs::remove_file(bin_dir.join("hipblas.dll")).unwrap();
         assert!(!rocm_backend_resolves(&llama_server_binary, &process_env));
+    }
+
+    #[test]
+    fn windows_backend_resolves_requires_every_dll_present_across_search_dirs() {
+        // Runs on every target (see windows_backend_resolves's cfg), so this --
+        // unlike rocm_backend_resolves_requires_every_dll_present above -- also
+        // exercises the DLL-presence verification on the ordinary Linux CI lane.
+        let root = scratch_dir("windows-backend-resolves");
+        let backend_dir = root.join("backend");
+        let path_dir = root.join("path-entry");
+        fs::create_dir_all(&backend_dir).unwrap();
+        fs::create_dir_all(&path_dir).unwrap();
+        fs::write(backend_dir.join("ggml-hip.dll"), b"x").unwrap();
+        fs::write(backend_dir.join("amdhip64_7.dll"), b"x").unwrap();
+        fs::write(path_dir.join("hipblas.dll"), b"x").unwrap();
+        fs::write(path_dir.join("rocblas.dll"), b"x").unwrap();
+        fs::write(path_dir.join("hsa-runtime64.dll"), b"x").unwrap();
+
+        let search_dirs = [backend_dir.clone(), path_dir.clone()];
+        assert!(windows_backend_resolves(&backend_dir, &search_dirs));
+
+        fs::remove_file(path_dir.join("hipblas.dll")).unwrap();
+        assert!(!windows_backend_resolves(&backend_dir, &search_dirs));
     }
 
     #[test]
