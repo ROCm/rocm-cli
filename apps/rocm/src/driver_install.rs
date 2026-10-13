@@ -840,8 +840,20 @@ fn build_driver_install_plan(
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
     let version_id = parse_os_release_field(os_release_text, "VERSION_ID").unwrap_or_default();
+    // `codename` is interpolated unsanitized into the same single-quoted
+    // `printf '...' | tee` command as `repo_version_expr` above, so an
+    // os-release-sourced value gets the same char allow-list: a crafted
+    // VERSION_CODENAME/UBUNTU_CODENAME (compromised or custom base image)
+    // could otherwise break out of the quoting and inject shell. An invalid
+    // value is treated as absent, falling through to the trusted static
+    // `codename_for_version` mapping rather than being used verbatim.
     let codename = parse_os_release_field(os_release_text, "VERSION_CODENAME")
         .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
+        .filter(|v| {
+            !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
     let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
@@ -3133,7 +3145,7 @@ VERSION_ID="41"
 
         let _env = scoped_rocdxg_env();
         let plan = wsl_rocdxg_driver_plan(PrivilegeEscalation::Sudo);
-        let version = plan.repo_version.clone();
+        let version = plan.repo_version_expr.clone();
         let pinned = ROCDXG_PINNED_DIGESTS
             .iter()
             .find_map(|(pinned_version, digest)| {

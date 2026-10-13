@@ -1380,17 +1380,27 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
     .map_or("apt", crate::openmpi::PackageManager::as_str)
 }
 
+/// Whether `rocm_install_method` indicates a package-manager-driven install,
+/// covering both the marker-file-based `"repo-native"` value and the
+/// dpkg/rpm-query fallback's `"apt"`/`"dnf"` (see `probe_rocm_install` in
+/// `examine.rs`): a host without one of `REPO_NATIVE_INSTALL_MARKERS` present
+/// but whose package manager confirms `rocm-hip-runtime` is installed is
+/// still repo-native-managed, just detected a different way.
+fn is_repo_native_installed(method: &str) -> bool {
+    matches!(method, "repo-native" | "apt" | "dnf")
+}
+
 fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let method = &e.rocm_install_method;
-    if method == "repo-native" {
+    if is_repo_native_installed(method) {
         evidence.push("ROCm was installed via the repo-native package-manager flow".to_owned());
     }
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_DPKG_BROKEN);
     score += kw_score;
     evidence.extend(kw_ev);
-    if method == "repo-native" && kw_score > 0 {
+    if is_repo_native_installed(method) && kw_score > 0 {
         score += 20;
     }
 
@@ -5819,6 +5829,35 @@ mod tests {
             "must not claim repo-native evidence for a non-repo-native install: {:?}",
             hit.evidence
         );
+    }
+
+    #[test]
+    fn repo_native_broken_claims_repo_native_evidence_for_dpkg_rpm_fallback_methods() {
+        // probe_rocm_install (examine.rs) falls back to the literal "apt"/"dnf"
+        // when dpkg/rpm confirms the package is installed but no marker file
+        // was found. Those hosts are still repo-native-managed, so the evidence
+        // line and +20 score bonus must fire for them too, not just the
+        // marker-file-detected literal "repo-native" case covered above.
+        for method in ["apt", "dnf"] {
+            let mut e = linux_base();
+            e.rocm_install_method = method.to_owned();
+            let report = diagnose(
+                &e,
+                "dpkg: error processing package amdgpu-dkms (half-configured)",
+            );
+            let hit = report
+                .matched
+                .iter()
+                .find(|d| d.id == "fix-12-installer")
+                .expect("dpkg keyword evidence alone should still surface fix-12");
+            assert!(
+                hit.evidence
+                    .iter()
+                    .any(|l| l.contains("installed via the repo-native package-manager flow")),
+                "method {method:?} is a repo-native fallback and must claim repo-native evidence: {:?}",
+                hit.evidence
+            );
+        }
     }
 
     #[test]
