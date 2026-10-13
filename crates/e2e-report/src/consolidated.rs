@@ -894,11 +894,10 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// platform/tier (e.g. "GPU Strix Windows (known bugs)"). New platforms need no
 /// code change — the caller just passes more inputs.
 ///
-/// Thin wrapper around [`generate_consolidated_from_reports`] for a caller
-/// that only needs the HTML output. A caller that also wants
-/// [`consolidated_summary_markdown`] from the same `inputs` should call
-/// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead; see there for why.
+/// Thin wrapper around [`generate_consolidated_from_reports`]. **Deprecated**
+/// (see below) for every caller, including one that only needs the HTML
+/// output — call [`load_platform_reports`] once and
+/// [`generate_consolidated_from_reports`] directly instead.
 #[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
             consolidated_summary_markdown from the same `inputs` should call \
             load_platform_reports once and use generate_consolidated_from_reports/\
@@ -915,8 +914,8 @@ pub fn generate_consolidated(
 ///
 /// `reports` comes from [`load_platform_reports`], used instead of reparsing
 /// `inputs` itself. `inputs` is still needed for the expectation grid, which
-/// is keyed differently and parses its own sidecars independently of
-/// `reports`.
+/// is keyed differently and re-parses `report.json` and `platform.json` from
+/// `inputs`, independently of `reports`.
 pub fn generate_consolidated_from_reports(
     reports: &[PlatformReport],
     inputs: &[(String, PathBuf)],
@@ -987,11 +986,10 @@ pub fn generate_consolidated_from_reports(
 /// piping into `$GITHUB_STEP_SUMMARY`. Same inputs as
 /// [`generate_consolidated`].
 ///
-/// Thin wrapper around [`consolidated_summary_markdown_from_reports`] for a
-/// caller that only needs the markdown output. A caller that also wants
-/// [`generate_consolidated`] from the same `inputs` should call
-/// [`load_platform_reports`] once and use the `_from_reports` entry points
-/// directly instead; see there for why.
+/// Thin wrapper around [`consolidated_summary_markdown_from_reports`].
+/// **Deprecated** (see below) for every caller, including one that only
+/// needs the markdown output — call [`load_platform_reports`] once and
+/// [`consolidated_summary_markdown_from_reports`] directly instead.
 #[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
             generate_consolidated from the same `inputs` should call \
             load_platform_reports once and use generate_consolidated_from_reports/\
@@ -1005,8 +1003,9 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
 ///
 /// `reports` comes from [`load_platform_reports`], used instead of reparsing
 /// `inputs` itself. `inputs` is still needed for the expectation grid and
-/// scenario reference sections, which are keyed differently and parse their
-/// own sidecars independently of `reports`.
+/// scenario reference sections, which are keyed differently and re-parse
+/// `report.json` from `inputs` (the grid also re-parses `platform.json`),
+/// independently of `reports`.
 pub fn consolidated_summary_markdown_from_reports(
     reports: &[PlatformReport],
     inputs: &[(String, PathBuf)],
