@@ -11,7 +11,7 @@
 //! reclaim the space.
 //!
 //! The removal path deliberately owns no deletion logic of its own. Runtime
-//! removal delegates to [`crate::uninstall_runtime`] per selected key so
+//! removal delegates to [`crate::runtimes_cmd::uninstall_runtime`] per selected key so
 //! config/marker cleanup stays in one place, and the guard that decides whether
 //! a folder may be touched at all is the existing
 //! [`crate::should_remove_runtime_install_root`]. What lives here is only the
@@ -26,10 +26,13 @@ use anyhow::{Context, Result, bail};
 use rocm_core::{AppPaths, RocmCliConfig, interactive_terminal, runtime_install_root_is_protected};
 use serde::Serialize;
 
+use crate::runtimes_cmd::{
+    ActiveRuntimeMarker, InstallRootDecision, active_runtime_marker_path,
+    should_remove_runtime_install_root,
+};
 use crate::{
-    ActiveRuntimeMarker, InstallRootDecision, StorageCommand, UninstallPlan, UninstallPlanEntry,
-    active_runtime_marker_path, confirm_uninstall, format_bytes, remove_path,
-    should_remove_runtime_install_root, therock,
+    StorageCommand, UninstallPlan, UninstallPlanEntry, confirm_uninstall, format_bytes,
+    remove_path, therock,
 };
 
 /// Recent installs kept per retention bucket by default (see
@@ -939,8 +942,9 @@ pub(crate) fn storage(command: Option<StorageCommand>) -> Result<()> {
                 // only in letter case are distinct installs here, so a lookup
                 // that folded them together would delete a different runtime
                 // than the one the user just confirmed.
-                let result = crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
-                    .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
+                let result =
+                    crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)
+                        .with_context(|| format!("failed to remove {}", entry.runtime_key))?;
                 // `uninstall_runtime` re-evaluates ownership itself and can
                 // decline to delete the folder while still clearing the
                 // registry entry. Reporting the space as reclaimed then would
@@ -1694,7 +1698,7 @@ mod tests {
         assert_eq!(planned, vec!["old"]);
 
         for entry in &plan.remove {
-            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
         }
 
         assert!(!old.install_root.exists(), "planned folder must be gone");
@@ -1792,7 +1796,7 @@ mod tests {
             {
                 continue;
             }
-            crate::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
+            crate::runtimes_cmd::uninstall_runtime(&paths, &mut config, &entry.runtime_key)?;
         }
 
         let registry = paths.data_dir.join("runtimes").join("registry");
