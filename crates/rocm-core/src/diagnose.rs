@@ -16,6 +16,8 @@
 //! stay behaviorally identical.
 
 use crate::examine::{Examination, WslFacts};
+#[cfg(test)]
+use crate::rocm_install::discover_rocm_installs_in;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -3957,7 +3959,7 @@ mod tests {
         std::fs::create_dir_all(install.join("bin")).expect("plant a fake versioned install");
         std::fs::write(install.join("bin").join("rocminfo"), "").expect("plant the install marker");
 
-        let discovered = crate::discover_rocm_installs_in(std::slice::from_ref(&opt), None);
+        let discovered = discover_rocm_installs_in(std::slice::from_ref(&opt), None);
         let found = discovered
             .first()
             .expect("the resolver must find a versioned-only install");

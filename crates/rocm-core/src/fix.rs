@@ -15,6 +15,10 @@
 //! place.
 
 use crate::examine::{run, which};
+#[cfg(test)]
+use crate::rocm_install::{
+    RocmLayout, discover_rocm_installs_in_layout, discover_rocm_installs_on_host_in,
+};
 use crate::{runtime_is_linux, runtime_is_windows};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
@@ -2011,10 +2015,7 @@ fn newest_rocm_install_dir_in(
     search_dirs: &[std::path::PathBuf],
     env_override: Option<&std::path::Path>,
 ) -> String {
-    first_install_path(crate::discover_rocm_installs_on_host_in(
-        search_dirs,
-        env_override,
-    ))
+    first_install_path(discover_rocm_installs_on_host_in(search_dirs, env_override))
 }
 
 #[cfg(test)]
@@ -2116,17 +2117,14 @@ mod tests {
         // the regression waits for the Windows lane to surface it. The seam
         // already takes the layout, so driving it with both discriminates on
         // every host for the cost of one loop.
-        let by_layout: Vec<(crate::RocmLayout, bool)> = [
-            (crate::RocmLayout::Siblings, "rocm-6.2.0"),
-            (crate::RocmLayout::Children, "6.2"),
+        let by_layout: Vec<(RocmLayout, bool)> = [
+            (RocmLayout::Siblings, "rocm-6.2.0"),
+            (RocmLayout::Children, "6.2"),
         ]
         .into_iter()
         .map(|(layout, decoy)| {
-            let installs = crate::discover_rocm_installs_in_layout(
-                std::slice::from_ref(&searched),
-                None,
-                layout,
-            );
+            let installs =
+                discover_rocm_installs_in_layout(std::slice::from_ref(&searched), None, layout);
             (
                 layout,
                 installs.iter().any(|install| install.path.ends_with(decoy)),
@@ -2394,6 +2392,14 @@ mod tests {
         // `current_os()` reports the same answer `is_wsl_host()` does on
         // whatever machine actually runs it, whether that is a bare-metal CI
         // runner, Windows, or a real WSL host.
+        //
+        // In an `e2e-test-hooks` build both calls read through the simulated
+        // host root, which another test may be setting and clearing, so hold
+        // its lock to compare two answers about the same host. Without the
+        // feature the lock is uncontended and costs nothing.
+        let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
             current_os() == "wsl",
             crate::is_wsl_host(),

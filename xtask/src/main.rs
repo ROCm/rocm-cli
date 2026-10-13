@@ -5,13 +5,12 @@
 //! Repository task runner.
 //!
 //! Provides release-artifact signing, the MANIFEST.md dependency-table
-//! generator, third-party-notices generation, commit-trust verification, and
-//! PowerShell linting. Each command's implementation lives in its own module;
-//! this file holds only the CLI definition and dispatch. Run via the workspace
-//! alias `cargo xtask <command>`.
+//! generator, third-party-notices generation, commit-trust verification,
+//! PowerShell linting, and markdown-link checking. Each command's
+//! implementation lives in its own module; this file holds only the CLI
+//! definition and dispatch. Run via the workspace alias `cargo xtask <command>`.
 
 mod affected;
-mod architecture_doc;
 mod catalog;
 mod coverage;
 mod crate_edges;
@@ -20,6 +19,7 @@ mod e2e;
 mod e2e_prewarm;
 mod e2e_report;
 mod env_mutation_contract;
+mod lychee;
 mod manifest;
 mod package;
 mod paths;
@@ -104,13 +104,6 @@ pub(crate) enum Command {
     /// edge outside the allowlist pinned in `xtask/src/crate_edges.rs`.
     /// Dev-dependency edges are exempt (Cargo permits those to cycle).
     CheckCrateEdges,
-    /// Fail, naming every one, if a path cited (in backticks) in
-    /// `docs/architecture.md` isn't found where it's cited. Exactly where a
-    /// citation is checked depends on its shape (a slash path, a bare
-    /// filename, a bare directory name) — the failure message names the
-    /// expected location per citation; see `citation_exists`'s doc comment
-    /// in `xtask/src/architecture_doc.rs` for the full rule.
-    CheckArchitectureDoc,
     /// Regenerate the published Doctor catalog manifest from the compiled catalog.
     Catalog {
         /// Verify the published manifest is current without writing; exit
@@ -146,6 +139,14 @@ pub(crate) enum Command {
         /// Skip silently when cargo-about is missing or not the pinned version, instead of
         /// failing. For the local git hook; conflicts with --check so CI's gate always runs.
         #[arg(long, conflicts_with = "check")]
+        if_available: bool,
+    },
+    /// Check that every local markdown link resolves, with lychee and the committed
+    /// `lychee.toml` (the local counterpart of the `docs-links` CI job).
+    Lychee {
+        /// Warn and pass when lychee is not installed, instead of failing. For the
+        /// local git hook; the `docs-links` CI job stays the gate.
+        #[arg(long)]
         if_available: bool,
     },
     /// Verify that commits in a range are cryptographically signed and carry a
@@ -278,7 +279,6 @@ fn run() -> Result<()> {
         Command::VerifyPinnedKeys => verify_pinned_keys::run()?,
         Command::Affected { base } => affected::run(base)?,
         Command::CheckCrateEdges => crate_edges::run()?,
-        Command::CheckArchitectureDoc => architecture_doc::run()?,
         Command::Catalog { check } => catalog::run(check)?,
         Command::Coverage { bless } => coverage::run(bless)?,
         Command::Manifest { check } => manifest::run(check)?,
@@ -286,6 +286,7 @@ fn run() -> Result<()> {
             check,
             if_available,
         } => tpn::run(check, if_available)?,
+        Command::Lychee { if_available } => lychee::run(if_available)?,
         Command::VerifyCommits {
             base,
             require_verified,

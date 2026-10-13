@@ -202,6 +202,10 @@ fn mount_owns_path(path: &Path, mount_point: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn mount_owns_path(_path: &Path, _mount_point: &Path) -> bool {
     true
 }
@@ -727,8 +731,10 @@ mod tests {
     /// * Uniform within one unit's range, `[1024^k, 1024^(k+1))`, except
     ///   that the `B` range starts at 0 so zero is drawn too. About half
     ///   of each range lies below half of the next unit, so a loop that
-    ///   promotes too early is caught on about half of this arm's draws,
-    ///   which is within a handful of draws across the whole strategy.
+    ///   promotes too early is caught on about half of the draws in every
+    ///   range but the largest, where there is nothing left to promote to
+    ///   — two fifths of this arm's draws, which is within a handful of
+    ///   draws across the whole strategy.
     /// * A window just below each `1024^k` boundary. The window has to SCALE
     ///   with the boundary, because the band where `:.1` rounding pushes the
     ///   mantissa up to 1024.0 is itself proportional: it spans the top

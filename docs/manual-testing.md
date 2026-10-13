@@ -122,7 +122,9 @@ rocm runtimes activate <runtime_key>
 rocm examine
 ```
 
-Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`.
+Replace `<runtime_key>` with the exact key printed by `rocm runtimes list`. Keys
+are matched exactly first; a selector that matches two installed keys only by
+letter case is refused with both keys listed, so copy the key as printed.
 Omit `--prefix` if you want rocm-cli to choose its standard managed folder.
 
 Section 1 has already made a managed runtime the active default, so the
@@ -172,6 +174,14 @@ Expected result:
   pinned `rocm[libraries,device-…]` install succeeds. The compiler toolchain is
   not required for validation to pass; `--devel` adds `devel` to those extras.
 - `rocm examine` reports the active runtime as ready.
+- `rocm runtimes activate <runtime_key>` ends its report with a count of the
+  running local servers left on the previous runtime. Nothing is serving yet at
+  this point, so it must read `services_on_previous_runtime: 0`. A fixed note
+  about running services in place of that count means this test fails.
+- `rocm runtimes activate <runtime_key> --restart-services` without `--yes`
+  refuses, names `--restart-services --yes` as the way to repeat it, and leaves
+  the active runtime alone. Section 4 exercises the same report and the same
+  flags with a server actually running.
 
 Developer-only deterministic override:
 
@@ -243,6 +253,144 @@ Expected result:
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
+
+The rest of this section needs a **vLLM** server running, on Linux or WSL, and
+two runtimes to move it between. Nothing earlier in this document sets either
+up: section 3 serves Lemonade and then stops it on both of its branches, the
+block just above stops whatever was left, and section 2 leaves one runtime.
+
+**Get two distinct runtime keys.** A wheel runtime key is built from the
+channel, the version and a fingerprint of the exact packages installed, in the
+shape `release-wheel-multi-arch-<version>-<hash>`; `--prefix` is not part of it.
+A second `rocm install sdk` with the same options therefore resolves to the same
+key and replaces the first runtime instead of adding one. Change something that
+is part of the package set. `--devel` does that: per its help text, passing it
+over a plain install of the same version creates a second side-by-side runtime
+and activates it. Leave `--prefix` off so the new runtime gets its own managed
+folder rather than reusing section 2's:
+
+```powershell
+rocm install sdk --channel release --format wheel --devel --approve-replacing-active-default
+rocm runtimes list
+```
+
+If section 2's runtime was itself installed with `--devel`, drop `--devel` here
+and pass `--version <other-version>` instead, using a version the release
+channel publishes. `rocm runtimes list` must now show two keys. Call the one
+section 2 left `<runtime_key_a>` and the new one `<runtime_key_b>`, copied as
+printed.
+
+**Install vLLM into each runtime.** vLLM is installed per runtime, into that
+runtime's own `engines` folder, so a runtime without it can neither serve nor
+receive a moved server; skipping this makes the steps below fail early:
+
+```bash
+rocm engines install vllm --runtime-id <runtime_key_a> --yes
+rocm engines install vllm --runtime-id <runtime_key_b> --yes
+```
+
+`--yes` approves required system-package installs such as OpenMPI, which can
+call `sudo`. If the `install sdk` report above already printed an
+`engine auto-install` block for vLLM, that runtime has it; `--reinstall` is the
+flag that forces a reinstall when the engine already exists.
+
+**Start from runtime A.** Make it the active runtime and start a server on it.
+`--runtime-id` names the runtime explicitly, so the server's recorded runtime
+does not depend on any saved engine preference:
+
+```bash
+rocm runtimes activate <runtime_key_a>
+rocm serve Qwen/Qwen3.5-4B --engine vllm --device gpu_required --managed --runtime-id <runtime_key_a>
+rocm services
+```
+
+`rocm services` must list it as running before you go on; note its service id.
+Re-running section 3's Lemonade command instead does not work here: Lemonade
+brings its own runtime and is deliberately never counted by the reconciler, so
+every step below would report `services_on_previous_runtime: 0`, print no
+`note:` line to read the next command from, and verify nothing.
+
+Switching runtimes does not move a server that is already running. Activate
+runtime B without the restart flag and read what the report says about the
+server you just started:
+
+```powershell
+rocm services
+rocm runtimes activate <runtime_key_b>
+```
+
+The server keeps serving on the runtime it started with, so the report must
+read `services_on_previous_runtime: 1` and name it with
+`recorded_runtime=<runtime_key_a>`. Move it with the command the report's own
+note gives you — which is a second `activate` of the key that is *already*
+active:
+
+```powershell
+rocm runtimes activate <runtime_key_b> --restart-services --yes
+rocm runtimes list
+```
+
+That report must read `services_restarted: 1` (or, if the server had not
+answered an inference request within the 45-second wait,
+`services_restarted_not_yet_serving: 1`; see `rocm services logs <service-id>`)
+and `changed_from_runtime_key: <unchanged>`.
+
+Run these in this order. Each step sets up the next, and a step run against a
+runtime the server is already recorded on has nothing to move: the reconciler
+only restarts servers whose recorded runtime differs from the one being
+activated, so it would report `services_on_previous_runtime: 0`, print no
+`services_restarted:` line, and verify nothing.
+
+That second command is the no-op-activation case on purpose: it moves the
+servers without moving the runtime, and it must leave the rollback target
+alone. `rocm runtimes list` must still show one afterwards — an activation that
+cleared it would break the `next step: if this causes problems, run rocm
+runtimes rollback` line printed directly beneath the note.
+
+Now the server is recorded on `<runtime_key_b>`, so rolling back is a real
+switch away from it and exercises the same restart path from the other command.
+It restarts the server onto `<runtime_key_a>`, which is why that runtime needed
+vLLM too:
+
+```powershell
+rocm runtimes rollback --restart-services --yes
+```
+
+Expected result:
+
+- The activation report counts the running servers left on the previous runtime
+  under `services_on_previous_runtime: <n>` and names each one as
+  `- <service-id> engine=<engine> recorded_runtime=<runtime_key>`, then says
+  they keep serving on their recorded runtime until they are restarted, naming
+  `rocm runtimes activate <runtime_key> --restart-services --yes` as the way to
+  move them.
+- A Lemonade server is never counted, because that engine brings its own
+  runtime: with only Lemonade serving, the count stays
+  `services_on_previous_runtime: 0`. That is why the steps above start a vLLM
+  server — it is what makes the count non-zero. A server started with `--env-id`
+  is counted just like any
+  other: the `env_id` recorded in the service record is not a pin and does not
+  exempt it from `services_on_previous_runtime`.
+- A running server whose record names no runtime is counted apart, under
+  `services_with_unrecorded_runtime:`.
+- Re-activating the already-active runtime with `--restart-services --yes`
+  stops and respawns each counted server onto it, listing them under
+  `services_restarted: <n>` and dropping them from
+  `services_on_previous_runtime`, while `rocm runtimes list` still marks the
+  same rollback target as before.
+- The rollback switches back and restarts each counted server onto the runtime
+  it restored, listing them under `services_restarted: <n>`; `rocm services`
+  shows them running again.
+- A server that fails to restart is named under
+  `services_restart_failed: <n>`, its record is put back on the runtime it last
+  ran on, and the command exits with an error instead of reporting success. The
+  error names the servers read back as stopped separately from the ones read
+  back as still live: a stopped one shows as stopped in `rocm services` and
+  drops out of `services_on_previous_runtime`, while a live one keeps serving
+  and stays counted there. These steps can only produce the stopped branch —
+  the live branch needs a running server bound to a public host whose endpoint
+  key is gone, which nothing here creates, and it is covered by the unit tests.
+  Verify the stopped branch against `rocm services`.
 
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:
@@ -317,6 +465,57 @@ Expected result:
 - The server starts on `http://127.0.0.1:18188`.
 - Status shows the local URL and current state.
 - Stop shuts down the saved process.
+
+Reinstall over a used install. Put a file in the folder `rocm comfyui
+models-path` prints, save a workflow in the UI, generate one image, stop
+ComfyUI, then:
+
+```powershell
+rocm comfyui install --reinstall --dry-run
+rocm comfyui install --reinstall
+```
+
+Expected result:
+
+- The dry run prints `reinstall: replaces the ComfyUI code in <folder>`,
+  `keeps:` naming the preserved folders the install has (from `models, user,
+  output, input, custom_nodes, datasets, extra_model_paths.yaml`),
+  `leaves in place:`, and either `sets aside:` or, for an install made before
+  rocm-cli recorded what its release shipped, `replaces:`. Its
+  `install command:` ends in `--reinstall`. The ComfyUI folder is not changed.
+- The reinstall prints `kept:` naming the folders the install already had,
+  and the model file, the saved workflow and the image are all still there
+  afterwards, unchanged. Put a file such as `styles.csv` at the top of that
+  folder first: it is listed under `left in place:` and still there after.
+  For an install made before the record, the reinstall also prints
+  `replaced:` naming the code entries it deleted.
+- With the network disconnected (and no archive cached under the ComfyUI
+  folder's `downloads/`), the reinstall fails and the existing install and
+  your files are untouched.
+- With ComfyUI started (`rocm comfyui start`), the dry run prints a `note:`
+  that the reinstall is refused until `rocm comfyui stop`. The reinstall is
+  then refused and names `rocm comfyui stop`; after running that, the
+  reinstall goes ahead.
+- With no archive cached, start ComfyUI (`rocm comfyui start`) from another
+  terminal while the reinstall is still downloading: once the download
+  finishes, the reinstall is refused before it replaces any code, names
+  `rocm comfyui stop`, and the ComfyUI folder is unchanged.
+- A download that is not a ComfyUI release (no `main.py` in its top folder)
+  is hard to produce by hand; `comfyui-13` serves one and checks that the
+  reinstall fails saying so, leaves the install as it was and does not keep
+  the download.
+- With ComfyUI stopped (which removes rocm-cli's saved record of it), create
+  `apps/comfyui/state/running.json` under rocm-cli's data folder containing
+  only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
+  is running, and goes ahead.
+- If the reinstall fails after the new code is in place (on a host where the
+  AMD GPU check fails, say), the error names what was replaced or set aside
+  and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
+  command finishes the install and `rocm comfyui status` shows
+  `installed: yes`.
+
+Interrupting the code swap itself is hard to time by hand; the unit test
+`interrupted_swap_converges_when_run_again` stops it at every step instead.
 
 For the stricter developer GPU test:
 

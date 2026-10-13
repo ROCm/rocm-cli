@@ -148,14 +148,13 @@ mod tests {
         // `validated_log_dir` barrier and keeps assertions stable where
         // `$TMPDIR` is itself a symlink). Use `expect` rather than falling back
         // to the raw `temp_dir()` so the env-derived path is never used
-        // un-canonicalized. Name-scoped with pid + millis to stay unique across
-        // parallel test threads and repeated runs.
+        // un-canonicalized. Name-scoped with a per-process unique suffix so
+        // parallel test threads and repeated runs never share a root.
         let base = std::fs::canonicalize(std::env::temp_dir())
             .expect("OS temp dir must exist and canonicalize");
         let root = base.join(format!(
-            "rocm-cli-logging-test-{name}-{}-{}",
-            std::process::id(),
-            rocm_core::unix_time_millis()
+            "rocm-cli-logging-test-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         let _ = std::fs::remove_dir_all(&root);
         (
@@ -166,6 +165,11 @@ mod tests {
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn temp_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| temp_paths("same-label").0);
     }
 
     #[test]

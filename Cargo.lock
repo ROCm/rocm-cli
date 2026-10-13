@@ -3196,17 +3196,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pulldown-cmark"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
-dependencies = [
- "bitflags 2.13.0",
- "memchr",
- "unicase",
-]
-
-[[package]]
 name = "quick-xml"
 version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3680,6 +3669,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -3698,6 +3688,7 @@ dependencies = [
  "anyhow",
  "cc",
  "directories",
+ "flate2",
  "libc",
  "proptest",
  "rand 0.9.4",
@@ -3707,6 +3698,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "sysinfo",
+ "tar",
+ "tempfile",
  "toml",
  "ureq",
  "windows-sys 0.61.2",
@@ -3810,6 +3803,7 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "proptest",
  "rocm-core",
  "rocm-deps",
  "rocm-engine-protocol",
@@ -6014,7 +6008,6 @@ dependencies = [
  "clap",
  "e2e-report",
  "flate2",
- "pulldown-cmark",
  "rocm-core",
  "semver",
  "serde",

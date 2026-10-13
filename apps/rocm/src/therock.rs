@@ -4647,7 +4647,7 @@ fn temp_sibling_path(path: &Path, suffix: &OsStr) -> Result<PathBuf> {
     Ok(parent.join(file_name))
 }
 
-fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_id = format!("{}-{}", std::process::id(), unix_time_millis());
     write_file_atomically_with(
         path,
@@ -8779,9 +8779,8 @@ mod tests {
     #[cfg(unix)]
     fn linked_runtimes_paths(name: &str) -> (PathBuf, AppPaths, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-cli-linked-runtimes-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-linked-runtimes-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         fs::create_dir_all(root.join("data")).unwrap();
         let root = root.canonicalize().unwrap();
@@ -8794,6 +8793,14 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (root, paths, real)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_runtimes_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            linked_runtimes_paths("same-label").0
+        });
     }
 
     #[test]
@@ -9174,7 +9181,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_python_with_venv(dir: &Path, name: &str) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = r#"#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -9192,8 +9199,7 @@ PY
 fi
 echo Python 3.12.10
 "#;
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9204,13 +9210,12 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then\n  echo {tag}\n  exit 0\nfi\necho {version}\n"
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -9221,7 +9226,7 @@ echo Python 3.12.10
         tag: &str,
         version: &str,
     ) -> Result<PathBuf> {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
         let path = dir.join(name);
         let script = format!(
             r#"#!/bin/sh
@@ -9241,8 +9246,7 @@ fi
 exit 1
 "#
         );
-        fs::write(&path, script)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&path, script)?;
         Ok(path)
     }
 
@@ -10148,8 +10152,10 @@ exit 1
     #[cfg(windows)]
     #[test]
     fn install_sdk_rejects_tarball_on_windows_before_resolution() {
-        let root = workspace_test_artifact_dir()
-            .join(format!("rocm-cli-therock-test-{}", unix_time_millis()));
+        let root = workspace_test_artifact_dir().join(format!(
+            "rocm-cli-therock-test-{}",
+            crate::test_support::unique_suffix()
+        ));
         let paths = AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
@@ -10947,9 +10953,8 @@ exit 1
 
     fn test_paths(name: &str) -> (PathBuf, AppPaths) {
         let root = workspace_test_artifact_dir().join(format!(
-            "rocm-cli-therock-test-{name}-{}-{}",
-            std::process::id(),
-            unix_time_millis()
+            "rocm-cli-therock-test-{name}-{}",
+            crate::test_support::unique_suffix()
         ));
         (
             root.clone(),
@@ -10959,6 +10964,11 @@ exit 1
                 cache_dir: root.join("cache"),
             },
         )
+    }
+
+    #[test]
+    fn test_paths_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| test_paths("same-label").0);
     }
 
     fn workspace_test_artifact_dir() -> PathBuf {
@@ -11171,5 +11181,58 @@ exit 1
             !kernel_section.contains(r#"out["device_count"] ="#),
             "a kernel failure must preserve the enumerated device count"
         );
+    }
+}
+
+/// Property tests for the SDK tarball unpack, judged on the filesystem by
+/// `crate::archive_props`. Extraction is the system `tar` resolved from
+/// `PATH` (GNU tar on the Linux CI runners), so these pin what that `tar`
+/// guarantees through `extract_tarball_and_discard_archive`.
+#[cfg(all(test, unix))]
+mod archive_properties {
+    use super::extract_tarball_and_discard_archive;
+    use crate::archive_props::{
+        Expect, Modes, entries, note_mode_scope, run_case, run_property, run_round_trip,
+        tar_gz_bytes,
+    };
+
+    /// No escape, and no setuid/setgid or world-writable entry. The modes are
+    /// what the system `tar` gives an unprivileged user, so they are not
+    /// judged when this runs as root (see `Modes`).
+    #[test]
+    fn sdk_tarball_unpack_never_writes_outside_the_install_root() {
+        let expect = Expect {
+            modes: Modes::SafeUnlessRoot,
+            no_outward_links: false,
+        };
+        note_mode_scope("therock", expect.modes);
+        run_property("therock", 256, entries(), Some(5), |layout, entries| {
+            run_case(
+                layout,
+                "sdk.tar.gz",
+                &tar_gz_bytes(entries),
+                &[&layout.dest],
+                &layout.dest,
+                |layout, archive| {
+                    extract_tarball_and_discard_archive(archive, &layout.dest).map(|_| ())
+                },
+            )
+            .judge(expect)
+        })
+        .unwrap();
+    }
+
+    /// The other direction: a well-formed tarball is extracted in full, into
+    /// the install root it was given. An unpack that wrote somewhere else
+    /// entirely escapes the oracle above; this catches it.
+    #[test]
+    fn sdk_tarball_unpack_extracts_a_benign_tarball_into_the_install_root() {
+        run_round_trip("therock-benign", |layout, entries| {
+            let archive = layout.base.join("sdk.tar.gz");
+            std::fs::write(&archive, tar_gz_bytes(entries))?;
+            extract_tarball_and_discard_archive(&archive, &layout.dest)?;
+            Ok(layout.dest.join("top"))
+        })
+        .unwrap();
     }
 }

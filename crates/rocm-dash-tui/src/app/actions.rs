@@ -11,9 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use crate::ui;
 
 use super::AppState;
-use super::scrollbar::{PaneFocus, ScrollTarget};
 use super::summary::summarize_json_value;
-use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal};
+use super::types::{ActiveTab, ChatConsent, ChatKeyCtx, Modal, PaneFocus, ScrollTarget};
 #[cfg(test)]
 use super::types::{ChatProvider, ChatRole};
 
@@ -755,9 +754,7 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
+    use super::super::test_support::press;
 
     fn hk(c: KeyCode, tab: ActiveTab) -> KeyAction {
         handle_key(press(c), tab, &Modal::None, ChatKeyCtx::default())

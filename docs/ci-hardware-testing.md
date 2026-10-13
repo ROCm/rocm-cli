@@ -153,6 +153,14 @@ included. Each joins its platforms'
 reports — including partial or failed runs — by scenario id into one HTML report
 and GitHub step summary.
 
+On `main`, the `publish-e2e-wiki` job in `nightly.yml` also copies the
+consolidated nightly matrix to the `E2E-Support-Matrix` page of the repository
+wiki, overwriting it each night (the page header names the run, commit and
+date). It skips cancelled runs and runs that consolidated no platforms. One-time
+setup: enable the wiki and save its first page in the GitHub web UI, because
+GitHub does not create the wiki's git repository until then and the job fails
+with that explanation until it exists.
+
 The lane artifacts are named canonically (`e2e-report`, `e2e-gpu-report`,
 `e2e-gpu-rad3-report`, `e2e-gpu-mi350p-report`, `e2e-gpu-strix-ubuntu-report`,
 `e2e-gpu-strix-windows-report`, `e2e-gpu-strix-wsl-report`) in `ci.yml` and

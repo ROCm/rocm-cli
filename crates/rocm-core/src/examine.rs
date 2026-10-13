@@ -85,8 +85,14 @@ pub struct Gpu {
 }
 
 /// Stat of a device node such as `/dev/kfd` or `/dev/dri/renderD*`.
+///
+/// `path` is always the logical host path (`/dev/kfd`), as `rocm examine
+/// --json` reports it. When a test build re-roots hardware probes (see
+/// [`crate::host_path`]), the node is read under that root, but the root never
+/// appears here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Device {
+    /// The logical host path of the node, never the re-rooted one.
     pub path: String,
     pub exists: bool,
     pub mode: String,
@@ -499,7 +505,8 @@ impl Examination {
         if e.os_family == "linux" {
             probe_cpu_linux(&mut e);
             probe_gpus_lspci(&mut e);
-            probe_gpus_after_lspci(&mut e, GpuProbeSources::host());
+            let kfd_nodes = crate::host_path("/sys/class/kfd/kfd/topology/nodes");
+            probe_gpus_after_lspci(&mut e, GpuProbeSources::host(&kfd_nodes));
             summarise_gpu_categories(&mut e);
             probe_modules(&mut e);
             probe_user(&mut e);
@@ -666,6 +673,12 @@ fn read_text(path: &str) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// [`read_text`] for an absolute host path, read where [`crate::host_path`]
+/// says the host is.
+fn read_host_text(path: &str) -> String {
+    std::fs::read_to_string(crate::host_path(path)).unwrap_or_default()
+}
+
 /// Whether `program` resolves on `PATH` (best-effort, no execution).
 pub(crate) fn which(program: &str) -> bool {
     let Ok(path) = std::env::var("PATH") else {
@@ -714,8 +727,8 @@ fn probe_os(e: &mut Examination) {
     if runtime_is_linux() {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
-        e.kernel_cmdline = read_text("/proc/cmdline").trim().to_owned();
-        let osr = read_text("/etc/os-release");
+        e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
+        let osr = read_host_text("/etc/os-release");
         for line in osr.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -759,7 +772,7 @@ fn probe_wsl(e: &mut Examination) {
         },
         dxg_device: summary.as_ref().is_some_and(|s| s.dxg_device),
         dxcore: summary.as_ref().is_some_and(|s| s.dxcore),
-        wsl_lib_dir: Path::new("/usr/lib/wsl/lib").is_dir(),
+        wsl_lib_dir: crate::host_path("/usr/lib/wsl/lib").is_dir(),
         librocdxg: summary.as_ref().is_some_and(|s| s.librocdxg),
         rocdxg_dids: summary.as_ref().is_some_and(|s| s.rocdxg_dids),
         // `None` when ldconfig itself could not be run, which the summary's
@@ -1036,7 +1049,7 @@ fn parse_iommu_param(cmdline: &str) -> Option<String> {
 }
 
 fn probe_cpu_linux(e: &mut Examination) {
-    let txt = read_text("/proc/cpuinfo");
+    let txt = read_host_text("/proc/cpuinfo");
     for line in txt.lines() {
         if (e.cpu_vendor == "unknown")
             && line.starts_with("vendor_id")
@@ -1450,12 +1463,13 @@ struct GpuProbeSources<'a> {
     sysfs_gfx_target: fn() -> Option<String>,
 }
 
-impl GpuProbeSources<'_> {
-    /// The real host: the kernel's own KFD topology, the `rocminfo` on `PATH`,
-    /// and the sysfs target read.
-    fn host() -> Self {
+impl<'a> GpuProbeSources<'a> {
+    /// The real host: the kernel's own KFD topology (read at `kfd_nodes`, which
+    /// is [`crate::host_path`]'s answer for it), the `rocminfo` on `PATH`, and
+    /// the sysfs target read.
+    fn host(kfd_nodes: &'a Path) -> Self {
         Self {
-            kfd_nodes: Path::new("/sys/class/kfd/kfd/topology/nodes"),
+            kfd_nodes,
             rocminfo: None,
             sysfs_gfx_target: crate::detect_linux_sysfs_gfx_target,
         }
@@ -1697,7 +1711,7 @@ fn probe_modules(e: &mut Examination) {
     let module_text = if rc == 0 {
         Some(out.lines().skip(1).collect::<Vec<_>>().join("\n"))
     } else {
-        let txt = read_text("/proc/modules");
+        let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
     };
     if let Some(text) = module_text {
@@ -1710,7 +1724,7 @@ fn probe_modules(e: &mut Examination) {
     }
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
+        let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1720,8 +1734,9 @@ fn probe_modules(e: &mut Examination) {
             }
             let body = read_text(&path.to_string_lossy());
             if body.lines().any(line_blacklists_amdgpu) {
+                // The logical path, not where the probe read it.
                 e.amdgpu_blacklisted_in
-                    .push(path.to_string_lossy().into_owned());
+                    .push(format!("{dir}/{}", entry.file_name().to_string_lossy()));
             }
         }
     }
@@ -1742,13 +1757,13 @@ fn line_blacklists_amdgpu(line: &str) -> bool {
 
 fn probe_devices(e: &mut Examination) {
     e.kfd = Some(stat_device("/dev/kfd", &e.user_name, &e.user_groups));
-    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+    if let Ok(entries) = std::fs::read_dir(crate::host_path("/dev/dri")) {
         let mut render: Vec<String> = entries
             .flatten()
             .filter_map(|entry| {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 name.starts_with("renderD")
-                    .then(|| entry.path().to_string_lossy().into_owned())
+                    .then(|| format!("/dev/dri/{name}"))
             })
             .collect();
         render.sort();
@@ -1759,16 +1774,19 @@ fn probe_devices(e: &mut Examination) {
     }
 }
 
+/// Stat the device node at the logical host path `path` (`/dev/kfd`), reading
+/// it where [`crate::host_path`] puts it but reporting the logical path.
 fn stat_device(path: &str, user_name: &str, user_groups: &[String]) -> Device {
+    let host = crate::host_path(path);
     let mut device = Device {
         path: path.to_owned(),
-        exists: Path::new(path).exists(),
+        exists: host.exists(),
         ..Device::default()
     };
     if !device.exists {
         return device;
     }
-    let (rc, out, _) = run("stat", &["-c", "%A|%U|%G", path], SHORT);
+    let (rc, out, _) = run("stat", &["-c", "%A|%U|%G", &host.to_string_lossy()], SHORT);
     if rc == 0 {
         let fields: Vec<&str> = out.trim().split('|').collect();
         if fields.len() == 3 {
@@ -2801,7 +2819,7 @@ fn probe_shared_memory_at(e: &mut Examination, path: &str) {
 /// keep distinct from zero: a machine that could not be measured is not a
 /// machine with no space.
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in lib.rs
+#[allow(unsafe_code)] // statvfs FFI; the same pattern as the Win32 calls in process.rs
 fn filesystem_size(path: &str) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path).ok()?;
     // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
@@ -2825,19 +2843,23 @@ fn filesystem_size(path: &str) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(target_os = "linux"))]
+// Platform stub. The `cfg` sibling calls non-const code, so making only this
+// arm `const` would give the two platforms different signatures and push
+// `missing_const_for_fn` onto every caller in turn.
+#[allow(clippy::missing_const_for_fn)]
 fn filesystem_size(_path: &str) -> Option<(u64, u64)> {
     None
 }
 
 fn probe_container(e: &mut Examination) {
     for (marker, kind) in [("/.dockerenv", "docker"), ("/run/.containerenv", "podman")] {
-        if Path::new(marker).exists() {
+        if crate::host_path(marker).exists() {
             e.in_container = true;
             e.container_kind = kind.to_owned();
             return;
         }
     }
-    let cg = read_text("/proc/1/cgroup");
+    let cg = read_host_text("/proc/1/cgroup");
     if !cg.is_empty()
         && ["docker", "containerd", "lxc", "kubepods", "podman"]
             .iter()
@@ -3877,7 +3899,11 @@ mod tests {
     fn the_managed_copy_this_cli_installs_is_reachable() {
         let (root, site_packages) = wheel_runtime_on_disk("found");
         let mut dirs = Vec::new();
-        crate::collect_managed_runtime_library_paths(&root, site_packages.as_deref(), &mut dirs);
+        crate::host_gpu::collect_managed_runtime_library_paths(
+            &root,
+            site_packages.as_deref(),
+            &mut dirs,
+        );
 
         let expected = site_packages
             .expect("fixture always records site_packages")
@@ -3914,7 +3940,7 @@ mod tests {
         fs::create_dir_all(root.join("lib")).unwrap();
 
         let mut dirs = Vec::new();
-        crate::collect_managed_runtime_library_paths(&root, None, &mut dirs);
+        crate::host_gpu::collect_managed_runtime_library_paths(&root, None, &mut dirs);
         assert!(
             dirs.contains(&root.join("lib")),
             "a root-format runtime keeps its libraries under the root, and that has to keep \
@@ -4374,18 +4400,16 @@ mod tests {
     /// runtime.
     #[cfg(unix)]
     fn plant_fake_runtime_interpreter(label: &str) -> (std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-{label}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-{label}-{}",
+            crate::test_support::unique_suffix()
         ));
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let python = root.join("python");
-        std::fs::write(
-            &python,
+        write_fake_executable(&python,
             format!(
                 "#!/bin/sh\n\
                  case \"${env}\" in\n\
@@ -4399,14 +4423,20 @@ mod tests {
             ),
         )
         .expect("plant the fake interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the fake interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,
             library_paths: vec![libs],
         };
         (root, interpreter)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plant_fake_runtime_interpreter_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_fake_runtime_interpreter("same-label").0
+        });
     }
 
     #[test]
@@ -4477,18 +4507,17 @@ mod tests {
     fn plant_loader_path_recording_interpreter(
         label: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, FrameworkInterpreter) {
-        use std::os::unix::fs::PermissionsExt;
+        use crate::fake_executable::write_fake_executable;
 
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-{label}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-{label}-{}",
+            crate::test_support::unique_suffix()
         ));
         let libs = root.join("lib");
         std::fs::create_dir_all(&libs).expect("plant the runtime library dir");
         let recorded = root.join("loader-path");
         let python = root.join("python");
-        std::fs::write(
+        write_fake_executable(
             &python,
             format!(
                 "#!/bin/sh\n\
@@ -4500,14 +4529,20 @@ mod tests {
             ),
         )
         .expect("plant the recording interpreter");
-        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755))
-            .expect("make the recording interpreter executable");
 
         let interpreter = FrameworkInterpreter {
             python,
             library_paths: vec![libs],
         };
         (root, recorded, interpreter)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plant_loader_path_recording_interpreter_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_loader_path_recording_interpreter("same-label").0
+        });
     }
 
     #[test]
@@ -4835,9 +4870,8 @@ mod tests {
     /// the caller removes `root` once the read is done.
     fn plant_kfd_topology(tag: &str, gpu_nodes: &[(u32, u32)]) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "rocm-core-examine-kfd-{tag}-{}-{}",
-            std::process::id(),
-            crate::unix_time_millis()
+            "rocm-core-examine-kfd-{tag}-{}",
+            crate::test_support::unique_suffix()
         ));
         let nodes = root.join("nodes");
         std::fs::create_dir_all(nodes.join("0")).expect("plant the CPU node");
@@ -4859,6 +4893,13 @@ mod tests {
             .expect("plant the GPU node properties");
         }
         (root, nodes)
+    }
+
+    #[test]
+    fn plant_kfd_topology_gives_each_call_its_own_root_even_for_one_label() {
+        crate::test_support::assert_each_call_gets_its_own_root(|| {
+            plant_kfd_topology("same-label", &[]).0
+        });
     }
 
     #[test]
@@ -5408,4 +5449,117 @@ mod tests {
             );
         }
     }
+
+    /// The probes themselves, not just `host_path`, answer from a simulated
+    /// host root. Plants a bare-metal machine with one GPU, inside a Podman
+    /// container, then runs the converted probes and asserts they describe it
+    /// rather than the machine the test runs on. A probe that still names its
+    /// absolute path directly reads the real host and fails here.
+    ///
+    /// The container is planted twice — first by Podman's marker, then by the
+    /// cgroup alone with no marker — so a probe reading the real host's markers
+    /// or cgroup answers differently whether the test runs bare, under Docker
+    /// or under Podman. The GPU is a gfx1101. WSL is checked in both
+    /// directions: first a non-WSL `/proc/version`, then a WSL kernel, then a
+    /// `/dev/dxg` alone. The positive answers are the ones a bare-metal runner
+    /// cannot give, so they catch an unrouted WSL read anywhere but on a real
+    /// WSL host.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn converted_probes_read_the_simulated_host_root() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-host-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let plant = |relative: &str, body: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("planted path has a parent"))
+                .expect("create planted directory");
+            std::fs::write(path, body).expect("write planted file");
+        };
+        plant(
+            "sys/class/kfd/kfd/topology/nodes/0/properties",
+            "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\n",
+        );
+        plant(
+            "sys/class/kfd/kfd/topology/nodes/1/properties",
+            "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
+        );
+        plant("dev/kfd", "");
+        plant(
+            "proc/version",
+            "Linux version 6.8.0-generic (buildd@lcy02)\n",
+        );
+        plant("run/.containerenv", "");
+
+        let (gpu_nodes, gfx_target, kfd, wsl, podman, cgroup_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+
+            let gpu_nodes = crate::host_gpu::linux_kfd_gpu_node_count();
+            let gfx_target = crate::host_gpu::detect_linux_kfd_gfx_target();
+            let kfd = stat_device("/dev/kfd", "nobody", &[]);
+            let wsl = crate::is_wsl_host();
+            let mut podman = Examination::default();
+            probe_container(&mut podman);
+
+            // Without a marker file, only the cgroup can say "container".
+            std::fs::remove_file(root.join("run/.containerenv")).expect("remove marker");
+            plant("proc/1/cgroup", "0::/kubepods/besteffort/pod1234\n");
+            let mut cgroup_only = Examination::default();
+            probe_container(&mut cgroup_only);
+
+            // Now make the same root read as WSL, one signal at a time. "Not
+            // WSL" is what a bare-metal runner answers anyway, so only these
+            // positive answers fail when a WSL read misses the root.
+            plant(
+                "proc/version",
+                "Linux version 5.15.167.4-microsoft-standard-WSL2 (root@build)\n",
+            );
+            let wsl_by_kernel = crate::is_wsl_host();
+            plant(
+                "proc/version",
+                "Linux version 6.8.0-generic (buildd@lcy02)\n",
+            );
+            plant("dev/dxg", "");
+            let wsl_by_dxg = crate::is_wsl_host();
+
+            (
+                gpu_nodes,
+                gfx_target,
+                kfd,
+                (wsl, wsl_by_kernel, wsl_by_dxg),
+                podman,
+                cgroup_only,
+            )
+        };
+        std::fs::remove_dir_all(&root).ok();
+        let (wsl, wsl_by_kernel, wsl_by_dxg) = wsl;
+
+        assert_eq!(gpu_nodes, Some(1), "one GPU node in the planted topology");
+        assert_eq!(gfx_target.as_deref(), Some("gfx1101"));
+        assert!(kfd.exists, "the planted /dev/kfd is found");
+        assert_eq!(kfd.path, "/dev/kfd", "the logical path is reported");
+        assert!(!wsl, "the planted host is bare metal, not WSL");
+        assert!(wsl_by_kernel, "a planted WSL kernel reads as WSL");
+        assert!(wsl_by_dxg, "a planted /dev/dxg reads as WSL");
+        assert!(podman.in_container);
+        assert_eq!(podman.container_kind, "podman");
+        assert!(cgroup_only.in_container);
+        assert_eq!(cgroup_only.container_kind, "container");
+    }
 }
+
+/// Property tests for the driver-side text readers above; a child module so it
+/// can reach them while they stay private.
+#[cfg(test)]
+#[path = "examine_driver_proptests.rs"]
+mod driver_proptests;
