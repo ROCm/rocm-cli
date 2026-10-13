@@ -5,12 +5,20 @@ Feature: Interactive dashboard
   # only for now: portable-pty compiles on Windows via ConPTY, but that path is
   # not yet promoted to a blocking contract (tracked as a follow-up).
 
+  # #534: the ROCm view's `Runs:` line is a command a user can copy into a
+  # shell, and it named `rocm doctor`, a subcommand that does not exist. The
+  # unit test beside the action list checks each label against what its screen
+  # runs; the diagnose steps here check the line the user actually sees. They
+  # extend this journey rather than open another dashboard session, which would
+  # add load to the no-GPU lane's timing-sensitive dash scenarios.
   @id:dash-opens-and-navigates @requires-os:linux
   Scenario: dash-01 - A user opens the dashboard and navigates to ROCm setup
     When the user opens the dashboard with demo data
     Then the dashboard home view is displayed
     When the user opens the ROCm view
     Then ROCm setup actions are displayed
+    When the user selects the ROCm diagnose action
+    Then the diagnose action says it runs rocm examine
     When the user quits the dashboard
     Then the dashboard exits successfully
 
