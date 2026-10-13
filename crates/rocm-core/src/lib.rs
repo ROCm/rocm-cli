@@ -7629,5 +7629,4 @@ last_installed_runtime_id = "therock-release"
         let output = test_process_output("  \n", "   ");
         assert_eq!(command_failure_detail(&output), "no output");
     }
-
 }
