@@ -544,9 +544,9 @@ fn unwind_partial_serve(
     }
 
     if let Some(service_id) = service_id {
-        match transport.exec(&format!(
-            "{remote_cli} services stop {} --yes",
-            shell_quote(service_id)
+        match transport.exec(&crate::service_hints::remote_service_stop_hint(
+            remote_cli,
+            &shell_quote(service_id),
         )) {
             Ok(outcome) if outcome.success => {}
             Ok(outcome) => leftovers.push(format!(
@@ -729,7 +729,8 @@ fn discover_started_service(
              A running server cannot be given a key it did not start with, so publishing this \
              endpoint would expose it on the tailnet while printing a key it would reject.\n\
              Stop it and run this again: ssh into the machine and run \
-             `{remote_cli} services stop {service_id}`."
+             `{}`.",
+            crate::service_hints::remote_service_stop_hint(remote_cli, &service_id)
         );
     }
     Ok(service_id)
@@ -1094,10 +1095,9 @@ fn stop_with_transport(
     // live publish is a refused connection, but a live model behind a forgotten
     // publish is an open GPU endpoint nobody is tracking.
     let withdrawn = publish::withdraw(transport, record.tailnet_port, record.remote_port);
-    let stopped = transport.exec(&format!(
-        "{} services stop {} --yes",
-        record.remote_cli,
-        shell_quote(&record.remote_service_id)
+    let stopped = transport.exec(&crate::service_hints::remote_service_stop_hint(
+        &record.remote_cli,
+        &shell_quote(&record.remote_service_id),
     ));
     let stop_failure = describe_stop_failure(&stopped);
     let model_stopped = stop_failure.is_none();
@@ -1541,9 +1541,24 @@ mod tests {
             error.contains("already serving on port 11434"),
             "the refusal must say what it found: {error}"
         );
+        // The printed hint must be the exact, directly-runnable command:
+        // `main.rs`'s `service_actions_require_yes_and_render_sandbox_result`
+        // proves this exact form (`rocm services stop <id> --yes`) is the one
+        // the approval gate itself recommends on the local side, and this
+        // message tells the user to run the same CLI's own `services stop` on
+        // the remote. That running this form actually clears *this* refusal —
+        // a service the remote reused instead of starting fresh — is proven on
+        // the remote's own CLI by
+        // `@id:remote-serve-refuses-reusing-already-serving-session`
+        // (`tests/e2e-cucumber/features/remote.feature`, remote-15), which
+        // reproduces this exact condition over the container, runs the printed
+        // hint there, and asserts the service is actually gone — not by
+        // `stop_managed_services` in `tests/e2e-cucumber/tests/e2e.rs`, which
+        // runs this same invocation as best-effort teardown and never asserts
+        // success.
         assert!(
-            error.contains("services stop already-there"),
-            "the refusal must name the way out: {error}"
+            error.contains("services stop already-there --yes"),
+            "the refusal must name the way out, directly runnable with --yes: {error}"
         );
     }
 
@@ -2045,9 +2060,10 @@ mod tests {
         assert!(
             transport.calls().iter().any(|call| matches!(
                 call,
-                TransportCall::Exec { command, .. } if command.contains("services stop svc-1")
+                TransportCall::Exec { command, .. } if command.contains("services stop svc-1 --yes")
             )),
-            "the started model should have been stopped: {:?}",
+            "the started model should have been stopped with the same directly-runnable form \
+             the hint prints, --yes included: {:?}",
             transport.calls()
         );
         let _ = std::fs::remove_dir_all(root);

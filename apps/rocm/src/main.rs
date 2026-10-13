@@ -19,6 +19,7 @@ mod provider_keys;
 mod providers;
 mod remote;
 mod serve_summary;
+mod service_hints;
 mod storage;
 mod therock;
 mod uninstall;
@@ -973,7 +974,7 @@ enum ServicesCommand {
     Stop {
         /// Service id from `rocm services list`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; stop refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -981,7 +982,7 @@ enum ServicesCommand {
     Restart {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; restart refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -994,7 +995,7 @@ enum ServicesCommand {
     Remove {
         /// Service id from `rocm services list --all`.
         service_id: String,
-        /// Do not ask for confirmation.
+        /// Required; remove refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -1026,7 +1027,7 @@ enum ServicesCommand {
         /// Show what would be removed, without removing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Do not ask for confirmation.
+        /// Required unless --dry-run; prune refuses without it.
         #[arg(long)]
         yes: bool,
     },
@@ -7179,11 +7180,11 @@ fn spawn_managed_engine_child(
             bail!(
                 "managed service `{}` is already running for engine `{engine}` and model `{}` \
                  without authentication, and a running server cannot be given a key it did not \
-                 start with; stop it with `rocm services stop {}` and run the command again to \
+                 start with; stop it with `{}` and run the command again to \
                  serve it with `--require-api-key`",
                 existing.service_id,
                 resolve.canonical_model_id,
-                existing.service_id
+                service_hints::service_stop_hint(&existing.service_id)
             );
         }
         record_cli_audit_event(
@@ -7707,7 +7708,10 @@ fn run_attached_service(
             println!("  endpoint: {}", report.endpoint_url);
             println!("  status: {}", report.status);
             println!("  logs: rocm logs {}", report.service_id);
-            println!("  stop: rocm services stop {} --yes", report.service_id);
+            println!(
+                "  stop: {}",
+                service_hints::service_stop_hint(&report.service_id)
+            );
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
@@ -7746,7 +7750,7 @@ fn run_attached_service(
             println!("  endpoint: {endpoint}");
             println!("  list: rocm services");
             println!("  logs: rocm logs {service_id}");
-            println!("  stop: rocm services stop {service_id} --yes");
+            println!("  stop: {}", service_hints::service_stop_hint(&service_id));
             record_cli_audit_event(
                 &paths,
                 "service",
@@ -8189,9 +8193,9 @@ fn run_approved_service_action(
     validate_service_id(service_id)?;
     if !yes {
         bail!(
-            "{} local server `{service_id}` requires --yes.\n\nTry: rocm services {} {service_id} --yes",
+            "{} local server `{service_id}` requires --yes.\n\nTry: {}",
             service_action_verb(tool),
-            service_action_command(tool)
+            service_hints::service_action_hint(service_action_command(tool), service_id)
         );
     }
     let sandbox_tool = sandbox_tool_arg_from_service_tool(tool)?;
@@ -8392,13 +8396,15 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     // advice a user takes away from it.
     if managed_service_record_is_in_use(&record) {
         bail!(
-            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: rocm services stop {service_id} --yes",
-            record.status
+            "local server `{service_id}` is {} and cannot be removed while it is running.\n\nTry: {}",
+            record.status,
+            service_hints::service_stop_hint(service_id)
         );
     }
     if !yes {
         bail!(
-            "Removing local server record `{service_id}` requires --yes.\n\nTry: rocm services remove {service_id} --yes"
+            "Removing local server record `{service_id}` requires --yes.\n\nTry: {}",
+            service_hints::service_action_hint("remove", service_id)
         );
     }
 
@@ -8414,7 +8420,8 @@ fn remove_managed_service_record(paths: &AppPaths, service_id: &str, yes: bool) 
     let _ = writeln!(output, "  log: {}", artifacts.log.display());
     let _ = writeln!(
         output,
-        "After this, `rocm services logs {service_id}` and `rocm services restart {service_id} --yes` no longer work."
+        "After this, `rocm services logs {service_id}` and `{}` no longer work.",
+        service_hints::service_action_hint("restart", service_id)
     );
     let _ = writeln!(output);
 
@@ -8625,8 +8632,10 @@ fn build_service_prune_plan(
         if managed_service_record_is_in_use(&record) {
             plan.skipped_live += 1;
             plan.skipped.push(format!(
-                "{} is {} — stop it first with `rocm services stop {} --yes`",
-                record.service_id, record.status, record.service_id
+                "{} is {} — stop it first with `{}`",
+                record.service_id,
+                record.status,
+                service_hints::service_stop_hint(&record.service_id)
             ));
             continue;
         }
@@ -18351,14 +18360,14 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         ) {
             let _ = writeln!(
                 output,
-                "  stop: rocm services stop {} --yes",
-                record.service_id
+                "  stop: {}",
+                service_hints::service_stop_hint(&record.service_id)
             );
         } else {
             let _ = writeln!(
                 output,
-                "  restart: rocm services restart {} --yes",
-                record.service_id
+                "  restart: {}",
+                service_hints::service_action_hint("restart", &record.service_id)
             );
         }
     }
@@ -30733,9 +30742,21 @@ install therock";
             message.contains("without authentication"),
             "the refusal must say why it refused: {message}"
         );
+        // The printed hint must be the exact, directly-runnable command: this
+        // same file's `service_actions_require_yes_and_render_sandbox_result`
+        // proves this exact form (`rocm services stop <id> --yes`) is the one
+        // the approval gate itself recommends. That running this form actually
+        // clears *this* refusal — a service reused without the key it is now
+        // being asked to require — is proven by
+        // `@id:serve-require-api-key-refuses-unauthenticated-reuse`
+        // (`tests/e2e-cucumber/features/model_serving.feature`, serve-24),
+        // which reproduces this exact condition, runs the printed hint, and
+        // asserts the record is left `stopped` — not by `stop_managed_services`
+        // in `tests/e2e-cucumber/tests/e2e.rs`, which runs this same
+        // invocation as best-effort teardown and never asserts success.
         assert!(
-            message.contains("rocm services stop lemonade-qwen-3000"),
-            "the refusal must name the way out, with the service to stop: {message}"
+            message.contains("rocm services stop lemonade-qwen-3000 --yes"),
+            "the refusal must name the way out, with the service to stop, directly runnable with --yes: {message}"
         );
         Ok(())
     }
