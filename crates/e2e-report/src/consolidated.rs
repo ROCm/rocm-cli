@@ -899,6 +899,10 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// [`consolidated_summary_markdown`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
 /// directly instead; see there for why.
+#[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
+            consolidated_summary_markdown from the same `inputs` should call \
+            load_platform_reports once and use generate_consolidated_from_reports/\
+            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
     html_out: &Path,
@@ -988,6 +992,10 @@ pub fn generate_consolidated_from_reports(
 /// [`generate_consolidated`] from the same `inputs` should call
 /// [`load_platform_reports`] once and use the `_from_reports` entry points
 /// directly instead; see there for why.
+#[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
+            generate_consolidated from the same `inputs` should call \
+            load_platform_reports once and use generate_consolidated_from_reports/\
+            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
 }
@@ -1506,6 +1514,11 @@ fn platform_section(report: &PlatformReport) -> Markup {
 }
 
 #[cfg(test)]
+// Several tests below exercise the deprecated generate_consolidated/
+// consolidated_summary_markdown wrappers directly (including proving they
+// still agree with the _from_reports entry points they now delegate to); the
+// deprecation targets outside callers, not this crate's own tests of them.
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::command_coverage::{KNOWN_COMMAND_SURFACE, command_coverage_summary};
@@ -1875,6 +1888,38 @@ mod tests {
         assert_eq!(reports[1].desc.platform, "Mock");
     }
 
+    /// Build a `PlatformReport` directly from its sortable fields, bypassing
+    /// `PlatformReport::load`'s on-disk parsing. Shared by the `report_sort_key`
+    /// tests below, which each need every field combination free of signal
+    /// that isn't itself in the key.
+    fn mk_sort_key_report(
+        platform: &str,
+        os: &str,
+        known_bugs: bool,
+        channel_from_name: Option<&'static str>,
+        manifest_channel: Option<&str>,
+    ) -> PlatformReport {
+        PlatformReport {
+            desc: Descriptor {
+                platform: platform.to_string(),
+                os: os.to_string(),
+                known_bugs,
+                channel_from_name,
+            },
+            label: String::new(),
+            features: Vec::new(),
+            stats: Stats::new(),
+            xfail: XfailReport::default(),
+            is_known_bugs: false,
+            commands: Vec::new(),
+            tally: None,
+            versions: PlatformVersions {
+                channel: manifest_channel.map(str::to_string),
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn report_sort_key_orders_by_every_dimension() {
         // `keys == sorted(keys)` (the test above) derives its expectation from
@@ -1912,30 +1957,9 @@ mod tests {
         // `channel` ties {A1, A2} and {A3, A4}, and this feed order puts the
         // later element of each tied pair first, so a dropped field changes the
         // output instead of the stable sort coincidentally restoring it.
-        fn mk(
-            platform: &str,
-            os: &str,
-            known_bugs: bool,
-            channel: Option<&'static str>,
-        ) -> PlatformReport {
-            PlatformReport {
-                desc: Descriptor {
-                    platform: platform.to_string(),
-                    os: os.to_string(),
-                    known_bugs,
-                    channel_from_name: channel,
-                },
-                label: String::new(),
-                features: Vec::new(),
-                stats: Stats::new(),
-                xfail: XfailReport::default(),
-                is_known_bugs: false,
-                commands: Vec::new(),
-                tally: None,
-                versions: PlatformVersions::default(),
-            }
-        }
-
+        let mk = |platform, os, known_bugs, channel| {
+            mk_sort_key_report(platform, os, known_bugs, channel, None)
+        };
         let a1 = mk("Alpha", "Able", false, None);
         let a2 = mk("Alpha", "Able", false, Some("nightly"));
         let a3 = mk("Alpha", "Able", true, None);
@@ -1980,31 +2004,9 @@ mod tests {
         // `channel_from_name` directly instead of calling `effective_channel()`
         // would still pass it. This fixture gives the two sources conflicting
         // values so the sort key is pinned to the one that must win.
-        fn mk(
-            channel_from_name: Option<&'static str>,
-            manifest_channel: Option<&str>,
-        ) -> PlatformReport {
-            PlatformReport {
-                desc: Descriptor {
-                    platform: "Alpha".to_string(),
-                    os: "Able".to_string(),
-                    known_bugs: false,
-                    channel_from_name,
-                },
-                label: String::new(),
-                features: Vec::new(),
-                stats: Stats::new(),
-                xfail: XfailReport::default(),
-                is_known_bugs: false,
-                commands: Vec::new(),
-                tally: None,
-                versions: PlatformVersions {
-                    channel: manifest_channel.map(str::to_string),
-                    ..Default::default()
-                },
-            }
-        }
-
+        let mk = |channel_from_name, manifest_channel| {
+            mk_sort_key_report("Alpha", "Able", false, channel_from_name, manifest_channel)
+        };
         let artifact_only = mk(Some("nightly"), None);
         let manifest_disagrees = mk(Some("nightly"), Some("release"));
 

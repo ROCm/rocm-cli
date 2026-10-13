@@ -15,9 +15,12 @@ mod parse;
 mod single_report;
 
 pub use consolidated::{
-    PlatformReport, RunMeta, consolidated_summary_markdown,
-    consolidated_summary_markdown_from_reports, generate_consolidated,
+    PlatformReport, RunMeta, consolidated_summary_markdown_from_reports,
     generate_consolidated_from_reports, load_platform_reports,
 };
+// Re-exporting the two deprecated wrappers is not itself a use of them; their
+// own deprecation fires at each caller's call site instead.
+#[allow(deprecated)]
+pub use consolidated::{consolidated_summary_markdown, generate_consolidated};
 pub use parse::{XfailReport, evaluate_xfail, scenario_results_by_id};
 pub use single_report::generate;
