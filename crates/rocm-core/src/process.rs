@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::examine::truncate_to_chars;
 use std::io::{ErrorKind, Read};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -692,6 +692,14 @@ impl Capture {
                     Err(error) => {
                         // Recorded only while someone is still listening: after
                         // `take()` the failure slot is as unread as the buffer.
+                        //
+                        // Checked under `buffer`'s lock, the same one `take()`
+                        // marks `abandoned` under, for the reason the `Ok`
+                        // branch uses it: a bare load can observe `abandoned ==
+                        // false`, have `take()` mark it and drain the failure
+                        // slot in between, and then store a real read error
+                        // where nothing will look for it again.
+                        let _buffer = sink.lock();
                         if !sink.abandoned.load(Ordering::Acquire) {
                             *sink.failure() = Some(error);
                         }
@@ -739,6 +747,17 @@ impl Capture {
         };
         (bytes, self.failure().take())
     }
+
+    /// Mark the capture abandoned and release what it holds, for an error path
+    /// that returns before `take()` would.
+    ///
+    /// `take()` is the only place that sets `abandoned`, so going through it
+    /// keeps "marked" and "emptied" a single step with one implementation. The
+    /// bytes and any read error are dropped because a caller on this path is
+    /// already reporting something else.
+    fn abandon(&self) {
+        drop(self.take());
+    }
 }
 
 /// Run `command` to completion with both output streams captured, giving up
@@ -784,23 +803,36 @@ pub fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) ->
     let stdout = Capture::draining(child.stdout.take());
     let stderr = Capture::draining(child.stderr.take());
 
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to poll {label}"))?
-        {
-            break status;
+    run_captured(child, stdout, stderr, timeout, label)
+}
+
+/// The rest of [`run_with_timeout`] once the child is spawned and both readers
+/// are running.
+///
+/// Generic over [`Waitable`] rather than taking a `Child` so that the wait
+/// loop's two failure paths — which are the only ways out of this function that
+/// skip the normal `take()` — are reachable from a test.
+fn run_captured<C: Waitable>(
+    mut child: C,
+    stdout: Capture,
+    stderr: Capture,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output> {
+    // The single error path between `Capture::draining` above and the `take()`
+    // pair below, and it must abandon both captures before it propagates.
+    // `take()` is what marks a reader abandoned, and an abandoned reader is
+    // what stops a buffer nobody will read again from growing for as long as a
+    // grandchild holds the pipe open. Returning the error straight out of the
+    // wait loop — the shape this replaced — left both readers appending
+    // forever, in a daemon that probes every 60 seconds.
+    let (status, timed_out) = match wait_bounded(&mut child, timeout, label) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            stdout.abandon();
+            stderr.abandon();
+            return Err(error);
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            timed_out = true;
-            break child
-                .wait()
-                .with_context(|| format!("failed to reap timed-out {label}"))?;
-        }
-        thread::sleep(POLL_INTERVAL);
     };
 
     let drained_by = Instant::now() + DRAIN_GRACE;
@@ -815,6 +847,60 @@ pub fn run_with_timeout(mut command: Command, timeout: Duration, label: &str) ->
         label,
         timeout,
     )
+}
+
+/// Wait for `child` to exit, killing it once `timeout` has passed.
+///
+/// Returns the status and whether the deadline is what ended the wait. Kept
+/// free of the captures so that it has exactly one caller to get the
+/// abandon-on-error handling right, rather than one per `?`.
+fn wait_bounded<C: Waitable>(
+    child: &mut C,
+    timeout: Duration,
+    label: &str,
+) -> Result<(ExitStatus, bool)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to poll {label}"))?
+        {
+            return Ok((status, false));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .with_context(|| format!("failed to reap timed-out {label}"))?;
+            return Ok((status, true));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The three child operations [`wait_bounded`] needs.
+///
+/// A trait only so a test can fail `try_wait` or the post-kill `wait` on
+/// demand: both are error paths that skip the normal `take()`, and provoking
+/// either from a real child needs the kernel to refuse to reap a process.
+trait Waitable {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<ExitStatus>;
+}
+
+impl Waitable for Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        Child::wait(self)
+    }
 }
 
 /// Turn what the wait loop and the two readers produced into the call's result.
@@ -833,28 +919,26 @@ fn assemble_output(
     label: &str,
     timeout: Duration,
 ) -> Result<Output> {
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+
     if timed_out {
-        let quoted_stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-        let quoted_stdout = String::from_utf8_lossy(&stdout).trim().to_owned();
+        // `command_failure_detail` is the crate's one "which stream explains
+        // this failure" rule — stderr, else stdout, else "no output" — shared
+        // since #584 so callers cannot quietly disagree about the order.
+        //
         // Truncated, not dropped: what the child managed to say before it
         // stalled is usually the whole explanation, and the timeout is named
         // first either way, so a reader who only sees the head still learns
         // which command gave up and why.
-        //
-        // stderr first because that is where a child explains itself; stdout
-        // only as a fallback, since a child whose whole output is data has
-        // nothing else to offer.
         bail!(
             "{label} exceeded {}s timeout: {}",
             timeout.as_secs(),
             truncate_to_chars(
-                if !quoted_stderr.is_empty() {
-                    quoted_stderr
-                } else if !quoted_stdout.is_empty() {
-                    quoted_stdout
-                } else {
-                    "no output".to_owned()
-                },
+                crate::command_failure_detail(&output),
                 MAX_QUOTED_OUTPUT_CHARS,
             )
         );
@@ -868,11 +952,7 @@ fn assemble_output(
             .with_context(|| format!("failed to read the output of {label}"));
     }
 
-    Ok(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -1261,6 +1341,112 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(capture.is_finished(), "the reader never finished");
+    }
+
+    /// A child that never exits on its own and fails whichever of the wait
+    /// loop's two calls the test asks it to.
+    struct FailingChild {
+        /// `true`: `try_wait` reports an error rather than "still running", so
+        /// the loop's first `?` fires. `false`: it stays running until the
+        /// deadline, and the post-kill `wait` is what fails.
+        fail_poll: bool,
+    }
+
+    impl Waitable for FailingChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            if self.fail_poll {
+                return Err(std::io::Error::from(ErrorKind::PermissionDenied));
+            }
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        }
+    }
+
+    /// Drive `run_captured` with a child that fails one of the wait loop's two
+    /// calls, and assert the error is reported *and* both readers are left
+    /// abandoned.
+    fn assert_wait_failure_abandons_both_readers(
+        child: FailingChild,
+        timeout: Duration,
+        expected: &str,
+    ) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let out_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let err_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stdout = Capture::draining(Some(EndlessPipe {
+            reads: Arc::clone(&out_reads),
+            stop: Arc::clone(&stop),
+        }));
+        let stderr = Capture::draining(Some(EndlessPipe {
+            reads: Arc::clone(&err_reads),
+            stop: Arc::clone(&stop),
+        }));
+
+        let wait_for_reads = |counter: &Arc<std::sync::atomic::AtomicUsize>, target: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while counter.load(Ordering::Acquire) < target && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                counter.load(Ordering::Acquire) >= target,
+                "the reader stalled before {target} reads"
+            );
+        };
+
+        // Both readers are accumulating before the call, so an empty buffer
+        // afterwards is the abandon working rather than a reader that never ran.
+        wait_for_reads(&out_reads, 4);
+        wait_for_reads(&err_reads, 4);
+
+        let error = run_captured(child, stdout.clone(), stderr.clone(), timeout, "process")
+            .expect_err("a failed wait must be reported, not swallowed");
+        assert!(
+            format!("{error:#}").contains(expected),
+            "expected {expected:?} in {error:#}"
+        );
+
+        // ~200KB more per stream: what a reader that was never marked abandoned
+        // accumulates into a buffer nobody will ever read again.
+        wait_for_reads(&out_reads, out_reads.load(Ordering::Acquire) + 50);
+        wait_for_reads(&err_reads, err_reads.load(Ordering::Acquire) + 50);
+        for (name, capture) in [("stdout", &stdout), ("stderr", &stderr)] {
+            let leaked = capture.lock().len();
+            assert_eq!(
+                leaked, 0,
+                "an error out of the wait loop returns before the `take()` pair, so it must \
+                 abandon both readers itself or they grow a buffer nobody will read for as \
+                 long as a grandchild holds the pipe; {name} accumulated {leaked} bytes"
+            );
+        }
+
+        stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_failure_to_poll_the_child_still_abandons_both_readers() {
+        assert_wait_failure_abandons_both_readers(
+            FailingChild { fail_poll: true },
+            Duration::from_secs(30),
+            "failed to poll process",
+        );
+    }
+
+    #[test]
+    fn a_failure_to_reap_a_timed_out_child_still_abandons_both_readers() {
+        // Zero timeout so the loop reaches the post-kill reap — the other `?` —
+        // on its first pass.
+        assert_wait_failure_abandons_both_readers(
+            FailingChild { fail_poll: false },
+            Duration::ZERO,
+            "failed to reap timed-out process",
+        );
     }
 
     /// A successful `ExitStatus` to feed `assemble_output`.

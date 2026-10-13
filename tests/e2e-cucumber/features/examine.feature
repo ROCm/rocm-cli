@@ -290,9 +290,9 @@ Feature: GPU detection and system inspection
   # the automation watcher. (Not `examine_snapshot`: that sandbox tool returns
   # an `ExamineSummary` only and never reads this snapshot.)
   #
-  # The size of the output is the whole premise, so the stub emits ~150KiB --
-  # over two buffers. A stub that printed a few hundred bytes would pass against
-  # the defect and test nothing.
+  # The size of the output is the whole premise, so the stub emits ~203KiB --
+  # over three buffers. A stub that printed a few hundred bytes would pass
+  # against the defect and test nothing.
   #
   # No GPU needed, and deliberately so: the symptom needs a multi-GPU host to
   # occur naturally, which would strand this on a lane that does not run per-PR.
@@ -353,4 +353,4 @@ Feature: GPU detection and system inspection
   Scenario: examine-22 - A stalled monitor probe keeps the static data and explains itself
     Given amd-smi answers the first probe and then stalls on the second
     When the daemon gathers a bridge snapshot
-    Then the snapshot keeps the first probe's GPUs and explains the second with a bounded timeout
+    Then the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout

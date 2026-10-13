@@ -10,8 +10,8 @@ use crate::E2eWorld;
 
 /// How many GPU entries the stub `amd-smi` describes.
 ///
-/// Chosen for the size of the resulting JSON, not for realism: it clears
-/// ~150KiB, comfortably past the ~64KiB pipe buffer whose overflow is the whole
+/// Chosen for the size of the resulting JSON, not for realism: it serialises to
+/// ~203KiB, comfortably past the ~64KiB pipe buffer whose overflow is the whole
 /// premise of `examine-20`. A stub that printed a few hundred bytes would pass
 /// against the defect.
 const STUB_GPU_COUNT: usize = 1200;
@@ -1297,10 +1297,10 @@ async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
     );
 }
 
-/// Write the stub's ~150KiB `payload.json` and return its path.
+/// Write the stub's ~203KiB `payload.json` and return its path.
 ///
-/// Shared by the two stub scenarios below, which differ only in what the script
-/// does after printing it.
+/// Shared by the three stub scenarios below, which differ only in what the
+/// script does after printing it.
 fn write_stub_payload(world: &E2eWorld) -> PathBuf {
     let bin_dir = stub_bin_dir(world);
     std::fs::create_dir_all(&bin_dir).expect("failed to create the amd-smi stub directory");
@@ -1485,7 +1485,7 @@ async fn assert_telemetry_survived_large_output(world: &mut E2eWorld) {
 /// The ceiling the stalled-probe note must stay under.
 ///
 /// Set against `run_with_timeout`'s 2000-character quote bound plus the error
-/// chain around it, and ~40x below the ~150KiB payload the stub prints, so this
+/// chain around it, and ~52x below the ~203KiB payload the stub prints, so this
 /// asks "is it bounded at all" rather than pinning a constant that is a tuning
 /// decision.
 const MAX_NOTE_CHARS: usize = 4000;
@@ -1540,7 +1540,9 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
     );
 }
 
-#[then("the snapshot keeps the first probe's GPUs and explains the second with a bounded timeout")]
+#[then(
+    "the snapshot keeps the first probe's GPUs and explains the second with a bounded note naming the timeout"
+)]
 async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eWorld) {
     let rc = world.cli_rc.expect("no rocmd exit status recorded");
     let stdout = world.cli_output.as_ref().expect("no rocmd output recorded");
