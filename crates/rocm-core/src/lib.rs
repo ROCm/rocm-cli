@@ -6444,6 +6444,21 @@ mod tests {
         Ok(())
     }
 
+    /// Serialise a test that reads a device node through [`kfd_readable`].
+    ///
+    /// The gate resolves its device through `host_path`, so in an
+    /// `e2e-test-hooks` build another test setting `ROCM_CLI_TEST_HOST_ROOT`
+    /// process-wide would re-root this test's own tempdir device out from under
+    /// it, and the gate would decline a device the test had just created. This
+    /// is the same lock `fix.rs` holds for the same reason; without the feature
+    /// it is uncontended and costs nothing.
+    #[cfg(target_os = "linux")]
+    fn host_root_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::hardware_root::HOST_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// The gate has to stop the *spawn*, not merely report a failure after the
     /// fact: the launch that already happened is the launch that hangs. The
     /// fake `amd-smi` leaves a marker file, so its absence is direct evidence
@@ -6464,6 +6479,7 @@ mod tests {
         if is_wsl_host() {
             return Ok(());
         }
+        let _host_root = host_root_guard();
 
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-kfd-gate-{}", unix_time_millis()));
@@ -6686,6 +6702,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_kfd_gate_honours_a_simulated_root_but_keeps_the_real_device_veto() -> Result<()> {
+        let _host_root = host_root_guard();
         let temp_root =
             std::env::temp_dir().join(format!("rocm-cli-kfd-root-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
@@ -6733,17 +6750,15 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn the_public_amd_smi_entry_point_gates_on_the_real_kfd_device() {
+        let _host_root = host_root_guard();
         #[cfg(feature = "e2e-test-hooks")]
         let _simulated_host = {
-            let guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let root = tempfile::tempdir().expect("a simulated host root");
             let variable = crate::test_env::RestoredEnvVar::set(
                 crate::hardware_root::TEST_HOST_ROOT_ENV,
                 root.path(),
             );
-            (guard, variable, root)
+            (variable, root)
         };
 
         let gate_allows = kfd_readable(Path::new(KFD_DEVICE));
@@ -6777,6 +6792,8 @@ mod tests {
         if is_wsl_host() {
             return Ok(());
         }
+
+        let _host_root = host_root_guard();
 
         const PAYLOAD_CHARS: usize = 200_000;
 
