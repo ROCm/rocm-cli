@@ -109,13 +109,14 @@ fn stop_then_remove_with(
     let mut removed: Vec<String> = Vec::new();
     for (index, entry) in plan.actions.iter().enumerate() {
         if let Err(error) = remove(&entry.path) {
-            let remaining: Vec<String> = plan.actions[index..]
+            let failed = format!("{} {}", entry.kind, entry.path.display());
+            let untouched: Vec<String> = plan.actions[index + 1..]
                 .iter()
                 .map(|entry| format!("{} {}", entry.kind, entry.path.display()))
                 .collect();
             return Err(error
                 .context(format!("failed to remove {}", entry.path.display()))
-                .context(partial_removal_note(&removed, &remaining)));
+                .context(partial_removal_note(&removed, &failed, &untouched)));
         }
         println!("removed {} {}", entry.kind, entry.path.display());
         removed.push(format!("{} {}", entry.kind, entry.path.display()));
@@ -132,18 +133,27 @@ fn write_stop_warnings(out: &mut impl std::io::Write, report: &ManagedServiceSto
 }
 
 /// What a removal that stopped partway has to tell its operator.
-fn partial_removal_note(removed: &[String], remaining: &[String]) -> String {
-    if removed.is_empty() {
-        return "uninstall stopped on its first removal; nothing was removed".to_owned();
-    }
+///
+/// The entry that failed is reported apart from the untouched ones: removing a
+/// directory deletes its children one by one, so it can fail after deleting
+/// some of them, and "still present" would then overstate what is left.
+fn partial_removal_note(removed: &[String], failed: &str, untouched: &[String]) -> String {
+    let removed_part = if removed.is_empty() {
+        "no entry was removed completely".to_owned()
+    } else {
+        format!("Already removed: {}", removed.join(", "))
+    };
+    let untouched_part = if untouched.is_empty() {
+        String::new()
+    } else {
+        format!(". Not attempted: {}", untouched.join(", "))
+    };
     format!(
-        "uninstall stopped partway. Already removed: {}. Still present: {}. What was already \
-         removed can include the `rocm`/`rocmd` binaries and the service records, so `rocm \
-         services stop` may no longer work; if a managed server may still be running, find \
-         and stop it by hand, then re-run uninstall (or delete what is left) once the cause \
-         is fixed",
-        removed.join(", "),
-        remaining.join(", ")
+        "uninstall stopped partway. {removed_part}. Failed, and may be partly removed: \
+         {failed}{untouched_part}. What was already removed can include the `rocm`/`rocmd` \
+         binaries and the service records, so `rocm services stop` may no longer work; if a \
+         managed server may still be running, find and stop it by hand, then re-run \
+         uninstall (or delete what is left) once the cause is fixed"
     )
 }
 
@@ -253,7 +263,10 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains(&format!("Still present: data {}", data.display())),
+            message.contains(&format!(
+                "Failed, and may be partly removed: data {}",
+                data.display()
+            )),
             "{message}"
         );
         assert!(message.contains("directory not empty"), "{message}");
@@ -274,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removal_that_fails_first_says_nothing_was_removed() {
+    fn a_removal_that_fails_first_reports_the_failed_entry_as_possibly_partial() {
         let (root, plan) = plan_removing_one_file("fails-first");
         let doomed = plan.actions[0].path.clone();
 
@@ -286,8 +299,65 @@ mod tests {
         .expect_err("a failing removal must fail the uninstall");
 
         let message = format!("{error:#}");
-        assert!(message.contains("nothing was removed"), "{message}");
+        assert!(
+            message.contains("no entry was removed completely"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "Failed, and may be partly removed: {} {}",
+                plan.actions[0].kind,
+                doomed.display()
+            )),
+            "{message}"
+        );
         assert!(doomed.is_file(), "nothing was removed, as the note says");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_directory_removal_that_deletes_some_children_then_fails_is_reported_as_partial() {
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-partial-dir-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let data = root.join("data");
+        fs::create_dir_all(&data).expect("seed data");
+        fs::write(data.join("a"), b"a").expect("seed a");
+        fs::write(data.join("b"), b"b").expect("seed b");
+        let plan = UninstallPlan {
+            actions: vec![UninstallPlanEntry {
+                kind: "data",
+                path: data.clone(),
+            }],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                // Like `remove_dir_all` failing midway: one child is gone, the
+                // directory is not.
+                fs::remove_file(path.join("a"))?;
+                bail!("directory not empty")
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!(
+                "Failed, and may be partly removed: data {}",
+                data.display()
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("Still present"), "{message}");
+        assert!(!data.join("a").exists() && data.join("b").exists());
         let _ = fs::remove_dir_all(root);
     }
 
