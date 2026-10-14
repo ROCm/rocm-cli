@@ -1084,8 +1084,15 @@ jobs:
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
-      # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results. `rocm-smi` itself isn't
+      # GPU that IS present but stays held fails the job, since that would
+      # corrupt the serve scenarios' results — though "held" means less here
+      # than on the native lanes: this body keeps only the free-memory floor and
+      # does not run `reclaim-gpu.sh --assert-clear`, so a serve holding a few
+      # GiB of a whole GTT aperture clears it. The script is not invoked because
+      # this body runs inside the WSL distro through Invoke-WslBash.ps1, where
+      # the repo checkout is not at a path this step can assume. See #446;
+      # closing it is follow-up work, with the equivalent Windows gap.
+      # `rocm-smi` itself isn't
       # installed by any step above (the maintainer's ask covered `/dev/dxg` +
       # `librocdxg.so`, not a full ROCm apt stack), so this step is expected to
       # warn-and-skip rather than report a real reading — a deliberate scope

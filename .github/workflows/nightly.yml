@@ -1163,8 +1163,18 @@ jobs:
       # access under WSL is exactly what this lane is proving out, so an absent
       # rocm-smi is a reported condition, not a job failure: the capability probe
       # then resolves @requires-gpu scenarios to skip and the rest still runs. A
-      # GPU that IS present but stays held by a leftover serve still fails, since
-      # that would corrupt the serve scenarios' results.
+      # GPU that IS present but stays held fails the job, since that would
+      # corrupt the serve scenarios' results.
+      #
+      # What "held" means here is weaker than on the native lanes, and the
+      # difference is the whole of #446. This body keeps only the free-memory
+      # floor; it does not run `reclaim-gpu.sh --assert-clear`, which is what
+      # actually catches a leftover serve. Against a whole GTT aperture the
+      # floor trips only near exhaustion, so a serve holding a few GiB clears
+      # it. The script is not invoked because this body runs inside the WSL
+      # distro through Invoke-WslBash.ps1, where the repo checkout is not at a
+      # path this step can assume. Closing it is follow-up work, tracked with
+      # the equivalent Windows gap.
       - name: GPU preflight (advisory bounded wait)
         shell: powershell
         run: |
