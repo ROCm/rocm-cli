@@ -335,8 +335,9 @@ Feature: Interactive dashboard
   # the real folder browser lists that child by its fixed-length entry
   # label rather than the host-length-dependent header path (see
   # ADOPT_SCENARIO_CHILD's doc comment). The space is in the child's name,
-  # not the scenario's own cwd; a whitespace path through spawn_in itself
-  # remains follow-up work for #500.
+  # not the scenario's own cwd — it exercises the browser's whitespace
+  # rendering; a whitespace path through spawn_in itself remains follow-up
+  # work for #500.
   @id:dash-onboarding-adopt-honors-spawn-cwd @requires-os:linux
   Scenario: dash-25 - Adopt existing opens the folder browser rooted at the session's own working directory
     When the user opens the dashboard in a scenario-owned folder
