@@ -777,9 +777,14 @@ fn oom_utilization_hint(log_tail: &str) -> String {
     // back to the canonical symptom so the printed command always reports a
     // cause rather than reading as "the tool checked and there's no known
     // cause". Selecting the line is the shared helper's job, so this surface and
-    // the `rocm` CLI serve summary route to `rocm diagnose` identically instead
-    // of hand-rolling the selection twice; it classifies each line with the
-    // *same* rule the diagnose checker uses. Its guarantee is specifically that
+    // the `rocm` CLI serve summary apply one selection *rule* to `rocm diagnose`
+    // instead of hand-rolling it twice; it classifies each line with the *same*
+    // rule the diagnose checker uses. One rule is not one answer: the two read
+    // the shared log at different points, with this bail's own sanitized echo
+    // written into it in between, so for a colourised line they can print
+    // different (both sound) `--symptom` arguments -- this one the canonical
+    // symptom, the CLI the rendered row. See `rocm_core::vllm_log_segments` for
+    // the measurement. Its guarantee is specifically that
     // a line passing `quotable_in_single_quotes` is diagnosable -- not that
     // every returned line is -- which is exactly what the branch below needs,
     // since the non-quotable branch substitutes the canonical symptom anyway.
@@ -1620,6 +1625,80 @@ mod tests {
                 .all(|segment| rocm_core::vllm_oom_diagnose_symptom(segment).is_none()),
             "keeping the echo out of the CLI's selection leaves no OOM line at all: \
              {still_selectable:?}"
+        );
+        Ok(())
+    }
+
+    /// Pins a **known gap**, not desired behaviour: when the OOM line sits near
+    /// the start of the window this engine scans, the `rocm serve` summary's
+    /// note disappears even though this engine diagnosed the OOM.
+    ///
+    /// Both surfaces use the same tail *budget*
+    /// (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`), but not the same
+    /// window. This engine scans the last N raw lines and bails; the supervisor
+    /// appends that whole bail — a header, the tail echoed as rendered rows, and
+    /// the hint — to the same shared log; the CLI then reads N lines of the
+    /// *longer* file. So the CLI's window always reaches less far back into the
+    /// original log than this one did, and when the bail is itself longer than N
+    /// rows it holds nothing the engine wrote directly. With the OOM line
+    /// followed by 77 further lines it is diagnosed here and invisible there.
+    ///
+    /// Closing it is a design decision rather than a tweak, which is why it is
+    /// pinned instead of fixed. Re-windowing the CLI to the N lines *before* the
+    /// bail would restore agreement, but the raw colourised line comes back into
+    /// view with it and the note stops quoting the user's own rendered row —
+    /// trading this gap for the regression
+    /// `the_colourised_round_trip_quotes_the_row_the_terminal_drew` exists to
+    /// prevent. Recording the engine's selected symptom as structured data
+    /// alongside the log would remove the class. **Update this test when the gap
+    /// closes; do not delete it.**
+    #[test]
+    fn the_cli_window_can_miss_an_oom_the_engine_saw() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let mut log = String::new();
+        for shard in 0..200 {
+            writeln!(log, "INFO vllm.engine loading shard {shard}").expect("write to String");
+        }
+        writeln!(log, "{exception}").expect("write to String");
+        // Enough trailing lines that the OOM still sits inside this engine's
+        // window (78 lines from the end, budget 80) but far enough from the end
+        // that the appended bail pushes its echo out of the CLI's.
+        for worker in 0..77 {
+            writeln!(log, "INFO vllm.engine shutting down worker {worker}")
+                .expect("write to String");
+        }
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-window-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, &log)?;
+
+        // Read 1 — the engine. It sees the OOM and says so.
+        let context = startup_log_context(Some(path.as_path()));
+        assert!(
+            context.contains(rocm_core::VLLM_OOM_DETECTED_PREFIX),
+            "the engine must diagnose this OOM, or the test proves nothing: {context:?}"
+        );
+
+        // The supervisor appends the whole bail to the same log.
+        fs::write(
+            &path,
+            format!(
+                "{log}Error: vLLM server process exited before becoming ready \
+                 (status: exit status: 1){context}\n"
+            ),
+        )?;
+        let tail =
+            rocm_core::tail_lines(&path, STARTUP_FAILURE_LOG_TAIL_LINES, MAX_TAIL_READ)?.join("\n");
+        fs::remove_file(&path).ok();
+
+        // Read 2 — the CLI, same budget, later file. The gap.
+        assert!(
+            rocm_core::vllm_oom_diagnose_symptom(&tail).is_none(),
+            "this test pins the known window gap; if the CLI now finds the OOM the gap is \
+             closed — update the test, `append_oom_serve_note`'s comment and the README's \
+             \"absence is not evidence\" list together: {tail:?}"
         );
         Ok(())
     }

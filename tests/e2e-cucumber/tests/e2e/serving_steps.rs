@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1214,6 +1215,106 @@ async fn plant_unrelated_live_lemonade_serve(world: &mut E2eWorld) {
     );
 }
 
+/// The install tree whose manifest `recover_setup_runtime_registration` would
+/// re-file into the registry, and the registry directory it would write it to.
+fn setup_runtime_fixture_paths(world: &E2eWorld) -> (PathBuf, PathBuf) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path();
+    (
+        root.join("setup-runtime"),
+        root.join("data").join("runtimes").join("registry"),
+    )
+}
+
+/// Makes the refusal's *ordering* observable, which no assertion in serve-25/27/28
+/// could do before.
+///
+/// `rocm serve` resolves its runtime selection with
+/// `validate_engine_selection_runtime`, and on the default path (no `--runtime-id`
+/// / `--env-id`) that reaches `recover_setup_runtime_registration`, which
+/// `create_dir_all`s and writes a runtime registry manifest — and can fail with a
+/// manifest error that has nothing to do with the GPU. `serve_cmd.rs`'s comment
+/// says in so many words that the call must therefore stay *below* the no-GPU
+/// bail. Nothing enforced it: `recover_setup_runtime_registration` returns early
+/// when no setup venv is configured, the e2e roots carry none, so moving the call
+/// above the bail left every refusal scenario green.
+///
+/// This plants the one state that makes the write reachable — a configured setup
+/// venv holding its own `.rocm-cli-runtime.json` — so the paired `Then` can assert
+/// the registry is still empty after the refusal. Move the call above the bail and
+/// the manifest appears and that assertion fails.
+#[given("setup names an unregistered runtime folder")]
+async fn plant_unregistered_setup_runtime(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_path_buf();
+    let (install_root, registry) = setup_runtime_fixture_paths(world);
+    std::fs::create_dir_all(&install_root).expect("failed to create setup runtime root");
+    std::fs::write(install_root.join("payload.txt"), "payload")
+        .expect("failed to write runtime payload");
+    // Black-box: plain JSON matching the CLI's on-disk schemas, not a typed
+    // import. The manifest has to pass `validate_runtime_manifest_for_activation`
+    // or recovery bails before the write and the scenario proves nothing.
+    let manifest = serde_json::json!({
+        "runtime_key": "therock-release-gfx942-1.0.0",
+        "runtime_id": "therock-release:gfx942",
+        "channel": "release",
+        "format": "tarball",
+        "family": "gfx942",
+        "family_source": "manual",
+        "version": "1.0.0",
+        "install_root": install_root,
+        "selected_artifact_url": "https://example.invalid/release-tarball-gfx942.tar.gz",
+        "installed_at_unix_ms": 1_700_000_000_000u64,
+    });
+    std::fs::write(
+        install_root.join(".rocm-cli-runtime.json"),
+        serde_json::to_string_pretty(&manifest).expect("failed to serialize runtime manifest"),
+    )
+    .expect("failed to write local runtime manifest");
+    std::fs::write(
+        root.join("config").join("config.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "setup": { "therock_venv": install_root },
+        }))
+        .expect("failed to serialize config"),
+    )
+    .expect("failed to write config");
+    // The registry starts empty, and that IS the state under test — assert it
+    // rather than assume it, so a fixture that pre-populated it could not make
+    // the paired `Then` vacuous in the other direction.
+    assert!(
+        !registry.is_dir() || std::fs::read_dir(&registry).into_iter().flatten().count() == 0,
+        "the runtime registry must start empty for this scenario to mean anything"
+    );
+}
+
+#[then("no runtime registry manifest was written")]
+async fn assert_no_runtime_manifest_written(world: &mut E2eWorld) {
+    let (_, registry) = setup_runtime_fixture_paths(world);
+    let entries: Vec<String> = std::fs::read_dir(&registry)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.is_empty(),
+        "a serve refused for want of a GPU must not have resolved its runtime selection \
+         first: `recover_setup_runtime_registration` re-filed {entries:?} into {}. That call \
+         belongs below the no-GPU bail — it writes to disk and can fail with a \
+         runtime-manifest error in place of the no-GPU message.\n{}",
+        registry.display(),
+        serve_output(world)
+    );
+}
+
 /// Serve a Lemonade model under the GPU-required default while the unrelated
 /// live service planted above exists. No fault-injection env var: the scripted
 /// Lemonade backend failure would waive the very GPU pre-flight this scenario
@@ -1503,31 +1604,38 @@ async fn assert_no_oom_memory_guidance(world: &mut E2eWorld) {
 }
 
 #[given("a managed vLLM launch will run out of GPU memory")]
-async fn plant_oom_launch(_world: &mut E2eWorld) {
+async fn plant_oom_launch(world: &mut E2eWorld) {
     // Nothing to plant on disk: unlike the reuse case, this scenario drives a
     // real `rocm serve` launch. The launch's failed-with-OOM state (an owned log
     // carrying a real allocator signature, status "starting", nothing reused) is
-    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook,
-    // armed per-invocation by the env var set in the next step. This step exists
-    // to state the scenario's premise.
+    // fabricated inside the CLI by the test-only `e2e-oom-fault-injection` hook.
+    //
+    // Arming that hook is what this `Given` does, via the World's `command_env`
+    // fixture channel — the premise belongs to the premise step, and the `When`
+    // below stays a plain user action with no mechanism in it. It previously sat
+    // in the `When`, which left this step a no-op whose deletion changed nothing.
+    //
+    // The consumer of this variable is `e2e_simulate_oom_launch` in
+    // `apps/rocm/src/service_launch.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared
+    // through `e2e-report`, whose producer and consumer are both test-side), the
+    // consumer here is the shipped binary's crate, which must not depend on the
+    // e2e harness — so the name is spelled out on both sides. A typo fails loudly
+    // rather than silently skipping: the fault injection would not arm, the real
+    // GPU pre-flight would bail, and the `Then` steps would fail.
+    world
+        .command_env
+        .push(("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1".into()));
 }
 
 #[when("the user opens the interactive serve summary for that launch")]
 async fn open_oom_launch_summary(world: &mut E2eWorld) {
-    // Arm the CLI's test-only OOM-launch fault injection for this child only (the
-    // mock-lane binary is built with `e2e-oom-fault-injection`). The GPU-required
-    // pre-flight is bypassed for the simulated launch, so no GPU is touched; the
-    // launch resolves the model, "spawns", writes an OOM log it owns, and reports
-    // `starting` — exactly the state the memory-guidance note keys on.
-    //
-    // The consumer of this variable is `e2e_simulate_oom_launch` in
-    // `apps/rocm/src/main.rs`. Unlike `OOM_FAULT_INJECTION_ENV` (shared through
-    // `e2e-report`, whose producer and consumer are both test-side), the
-    // consumer here is the shipped binary's crate, which must not depend on the
-    // e2e harness — so the name is spelled out on both sides. A typo fails
-    // loudly rather than silently skipping: the fault injection would not arm,
-    // the real GPU pre-flight would bail, and the step below would fail.
-    let mut session = TuiSession::spawn_with_env(
+    // A plain user action. The fault injection the premise arms (see the `Given`
+    // above) rides along on the World's `command_env`, which `TuiSession::spawn`
+    // applies per-child. With it armed, the GPU-required pre-flight is bypassed
+    // for the simulated launch, so no GPU is touched; the launch resolves the
+    // model, "spawns", writes an OOM log it owns, and reports `starting` —
+    // exactly the state the memory-guidance note keys on.
+    let mut session = TuiSession::spawn(
         world,
         &[
             "serve",
@@ -1537,7 +1645,6 @@ async fn open_oom_launch_summary(world: &mut E2eWorld) {
             "--env-id",
             "e2e-oom-launch",
         ],
-        &[("ROCM_E2E_SIMULATE_OOM_LAUNCH", "1")],
     )
     .unwrap_or_else(|error| panic!("failed to open interactive serve summary: {error}"));
     session

@@ -264,10 +264,20 @@ a tiny model. rocm-cli helps in three ways:
   The printed command quotes your actual failing line when it can be rendered as
   one intact single-quoted argument; a line carrying an apostrophe or terminal
   control bytes falls back to the canonical symptom below rather than handing you
-  a command whose quoting the log text broke. The same rule applies to the
-  `rocm serve` summary's out-of-memory note, which builds the same command from
-  the same engine log — both surfaces share one guard, so neither can hand you a
-  half-quoted command the other rejects. Lines rocm-cli wrote into that log
+  a command whose quoting the log text broke. The `rocm serve` summary's
+  out-of-memory note applies that same guard, from the same shared helper, to the
+  same engine log — so neither surface can hand you a half-quoted command the
+  other would reject.
+
+  Sharing the guard is not the same as the two always printing the *same*
+  command, and for a **colourised** line they do not. The engine reads the log
+  first, refuses the raw escape-bearing line, and prints the canonical symptom.
+  Its failure message then echoes the log tail back into that same shared file as
+  the rows a terminal would have drawn, and the serve summary reads afterwards —
+  so the note quotes that rendered row instead. Both arguments are sound: the row
+  is text the terminal really printed, it carries no control bytes, and anything
+  the guard accepts is diagnosable. They are two reads of a file that changed in
+  between, not a disagreement about the rule. Lines rocm-cli wrote into that log
   itself are skipped when picking the line, so the note quotes *your* error
   rather than the hint printed above it: the supervisor and the engine share one
   log file, and the engine's failure — hint included — is appended to it after

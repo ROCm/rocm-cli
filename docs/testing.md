@@ -1466,6 +1466,15 @@ passing an id to it silently selects nothing.
   serving a different model is refused before any engine starts, and nothing is
   prepared or downloaded. Lemonade specifically, because it manages its own
   runtime and so is the engine whose preparation is user-visible.
+  It carries a second premise — a configured setup venv the runtime registry has
+  not yet recorded — which makes the refusal's *ordering* observable. `rocm
+  serve` resolves its runtime selection below the no-GPU bail deliberately,
+  because that resolution reaches `recover_setup_runtime_registration`, which
+  writes a runtime registry manifest and can fail with a manifest error that has
+  nothing to do with the GPU. Recovery returns early when no setup venv is
+  configured, and no other e2e root has one, so without this fixture the call
+  could be hoisted above the bail with every refusal scenario still green. The
+  final `Then` asserts the registry is still empty after the refusal.
 - serve-28, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
   service for the *same* model, which this invocation nonetheless cannot reuse
   (`--require-api-key` against a service that has no key), also does not soften

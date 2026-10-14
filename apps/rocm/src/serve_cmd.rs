@@ -855,6 +855,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // problem, instead of failing fast. The reuse pre-gate above needs the answer
     // early and already paid for it when a reusable service exists; take that
     // answer rather than repeating the registry recovery.
+    //
+    // The ordering is enforced by `@id:serve-unrelated-live-service-still-fails-fast`
+    // (serve-27), which plants a configured-but-unregistered setup venv — the one
+    // state that makes the recovery's write reachable — and asserts the runtime
+    // registry is still empty after the refusal. Without that fixture the call
+    // could be hoisted above the bail with the whole suite green, because
+    // `recover_setup_runtime_registration` returns early when no setup venv is
+    // configured and the other e2e roots carry none.
     let resolved_selection = match resolved_selection {
         Some(selection) => selection,
         None => validate_engine_selection_runtime(
@@ -1090,9 +1098,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             // is machine-readable by design and is not the place to grow prose,
             // but it does mean the same failed launch is explained in one
             // invocation and not the other.
+            // The engine *name*, not `engine_serves_vllm`: the note's gate is
+            // derived inside `append_oom_serve_note` from the value it is about,
+            // because a boolean here was a call-site seam no test could hold.
             let notes = append_oom_serve_note(
                 notes,
-                engine_serves_vllm,
+                &selected_engine,
                 report.already_running,
                 &report.status,
                 report.log_path.as_deref(),

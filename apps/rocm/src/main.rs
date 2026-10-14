@@ -3752,12 +3752,26 @@ fn collect_serve_notes(
 /// absent from the pre-launch guess.
 fn append_oom_serve_note(
     mut notes: Vec<String>,
-    engine_is_vllm: bool,
+    engine: &str,
     already_running: bool,
     status: &str,
     log_path: Option<&Path>,
 ) -> Vec<String> {
-    if !engine_is_vllm || already_running || !serve_summary::serve_failed_to_become_ready(status) {
+    // Takes the engine *name*, not a pre-computed "is vLLM" boolean, and that is
+    // deliberate: the caller holds `selected_engine` either way, and a bool
+    // argument is a seam no test here can hold. Forcing it to `true` at the call
+    // site left the whole suite green while handing a failed *Lemonade* launch
+    // vLLM's `--gpu-memory-utilization` advice, because the only engine whose
+    // managed launch any lane can fail is vLLM (Lemonade manages its own runtime,
+    // so a fault-injected Lemonade launch would have to install one first).
+    // Deriving the gate from the value it is about — AGENTS.md section 3's "a
+    // message computed from the decision cannot disagree with it" — moves the
+    // branch inside, where `append_oom_serve_note_is_withheld_when_it_does_not_apply`
+    // kills it.
+    if !engine.eq_ignore_ascii_case("vllm")
+        || already_running
+        || !serve_summary::serve_failed_to_become_ready(status)
+    {
         return notes;
     }
     // Whether the pre-launch low-VRAM warning already printed the shared hint.
@@ -3770,10 +3784,22 @@ fn append_oom_serve_note(
     let Some(log_path) = log_path else {
         return notes;
     };
-    // Read the same tail budget the engine's own OOM surfaces use
-    // (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`) so the CLI serve summary
-    // and the engine agree on what counts as "the tail" of a failed launch,
-    // rather than drifting apart on independent magic literals.
+    // The same tail *budget* the engine's own OOM surfaces use
+    // (`rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES`), so the two surfaces do
+    // not drift apart on independent magic literals.
+    //
+    // Equal budgets are NOT equal windows, and the difference is a measured gap
+    // rather than a theoretical one. The engine scans the last N *raw* lines and
+    // then bails; the supervisor appends that whole bail — a header, the tail
+    // echoed as rendered rows, and the hint — to the same shared log. This read
+    // happens afterwards, so the same N lines reach strictly further back in the
+    // engine's view than in this one, and when the bail is itself longer than N
+    // rows the window here holds nothing the engine wrote directly. An OOM line
+    // sitting near the *start* of the engine's window is therefore diagnosed by
+    // the engine and missed here: measured, an OOM followed by 77 further lines
+    // gives `engine_hinted = true` and no note at all. Pinned as a known gap by
+    // `the_cli_window_can_miss_an_oom_the_engine_saw` in `engines/vllm`; the
+    // README's "absence is not evidence" list names this condition.
     let log_tail = read_optional_tail_lines(
         log_path,
         rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES,
@@ -24053,7 +24079,7 @@ install therock";
             "loading weights\ntorch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
         )
         .expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes
@@ -24072,19 +24098,34 @@ install therock";
 
         // A ready serve is healthy even if the log mentions memory.
         assert!(
-            append_oom_serve_note(Vec::new(), true, false, "ready", Some(&log_path)).is_empty()
+            append_oom_serve_note(Vec::new(), "vllm", false, "ready", Some(&log_path)).is_empty()
         );
-        // A non-vLLM engine has no `--gpu-memory-utilization` to reach for.
+        // A non-vLLM engine has no `--gpu-memory-utilization` to reach for, so a
+        // failed Lemonade launch whose log happens to carry an allocator OOM
+        // signature — a kernel OOM killer, a sibling process, ROCm's own
+        // allocator under a different engine — must be given no note at all.
+        // This is the regression that stayed green while the gate was a boolean
+        // the caller computed: showing a Lemonade failure a flag Lemonade does
+        // not accept. The engine name is the only input distinguishing the two
+        // calls below, so this pair kills the gate.
         assert!(
-            append_oom_serve_note(Vec::new(), false, false, "starting", Some(&log_path)).is_empty()
+            append_oom_serve_note(Vec::new(), "lemonade", false, "starting", Some(&log_path))
+                .is_empty(),
+            "a failed non-vLLM launch must never be shown vLLM's memory knobs"
+        );
+        assert!(
+            !append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path))
+                .is_empty(),
+            "the same log under vLLM must produce the note, or the line above proves nothing"
         );
         // A missing log gives no signal to branch on.
-        assert!(append_oom_serve_note(Vec::new(), true, false, "starting", None).is_empty());
+        assert!(append_oom_serve_note(Vec::new(), "vllm", false, "starting", None).is_empty());
 
         // A failure whose log carries no OOM signature is left alone.
         fs::write(&log_path, "OSError: model weights not found\n").expect("rewrite log");
         assert!(
-            append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path)).is_empty()
+            append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path))
+                .is_empty()
         );
         let _ = fs::remove_file(&log_path);
     }
@@ -24103,7 +24144,7 @@ install therock";
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
         )
         .expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, false, "running", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "running", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes.is_empty(),
@@ -24126,7 +24167,7 @@ install therock";
             "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.\n",
         )
         .expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, true, "starting", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), "vllm", true, "starting", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes.is_empty(),
@@ -24155,7 +24196,7 @@ install therock";
         ];
         let notes = append_oom_serve_note(
             pre_launch_notes.clone(),
-            true,
+            "vllm",
             false,
             "starting",
             Some(&log_path),
@@ -24218,7 +24259,7 @@ install therock";
             std::process::id()
         ));
         fs::write(&log_path, format!("{in_window}\n")).expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes
@@ -24237,7 +24278,7 @@ install therock";
             std::process::id()
         ));
         fs::write(&log_path, format!("{out_of_window}\n")).expect("write log");
-        let notes = append_oom_serve_note(Vec::new(), true, false, "starting", Some(&log_path));
+        let notes = append_oom_serve_note(Vec::new(), "vllm", false, "starting", Some(&log_path));
         let _ = fs::remove_file(&log_path);
         assert!(
             notes.is_empty(),

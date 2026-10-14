@@ -379,13 +379,25 @@ Feature: Model serving
   # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
   # no service planted at all, and serve-25 plants the SAME model, so neither
   # discriminates the model keying — this one does.
+  #
+  # The second premise makes the refusal's ORDERING observable. `rocm serve`
+  # resolves its runtime selection below the bail on purpose: that resolution
+  # reaches `recover_setup_runtime_registration`, which writes a runtime registry
+  # manifest and can fail with a manifest error in place of the no-GPU message.
+  # Nothing enforced the ordering, because recovery returns early when no setup
+  # venv is configured and the e2e roots carry none — so moving the call above
+  # the bail left all three refusal scenarios green. Planting a configured setup
+  # venv that the registry has not yet recorded is what makes the write reachable,
+  # and the last Then is what refuses it.
   @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
   Scenario: serve-27 - A live service for another model does not soften the no-GPU refusal
     Given a live managed Lemonade serve for an unrelated model
+    And setup names an unregistered runtime folder
     When the user serves a different model with Lemonade under the GPU-required default
     Then serving is refused before any engine starts
     And the user is told no AMD GPU was detected
     And no engine was prepared for GPU serving
+    And no runtime registry manifest was written
 
   # Regression test for the reuse pre-gate's *acceptance* term (EAI-8059
   # review). serve-25 plants a record this invocation really can reuse, and

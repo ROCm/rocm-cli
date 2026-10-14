@@ -688,11 +688,18 @@ it — `--gpu-memory-utilization <fraction greater than 0 and at most 1>` and
 model simply does not fit, and printing a
 `rocm diagnose --symptom '<your failing line>'` command for the full
 busy-GPU-versus-model-too-large breakdown. A failing line that cannot be placed
-in a shell-quoted argument intact — one containing an apostrophe or terminal
-control bytes — is replaced by a canonical vLLM OOM symptom, which reports the
-same cause. See
+in a shell-quoted argument intact — one containing an apostrophe, for instance —
+is replaced by a canonical vLLM OOM symptom, which reports the same cause.
+
+A line carrying **terminal control bytes** (vLLM's colourised logger, or a
+progress-bar repaint) is the one case where the two surfaces can print different
+commands for the same failure, and both are sound. The engine's own failure
+message refuses the raw line and falls back to the canonical symptom. The serve
+summary reads the log *after* the engine has echoed its tail into it as the rows
+a terminal would have drawn, so the note quotes that rendered row — real text the
+terminal printed, carrying no control bytes — instead. See
 [docs/vllm.md](https://github.com/ROCm/rocm-cli/blob/main/docs/vllm.md) for the
-flag itself and the quoting rule the printed command follows.
+flag itself and the quoting rule each printed command follows.
 
 The note is deliberately narrow, so its absence is not evidence that memory was
 fine. It appears only when all of the following hold:
@@ -720,6 +727,15 @@ fine. It appears only when all of the following hold:
   at all, so the running service's log is never read and this invocation is
   never blamed for another process's failure. Read that service's own log with
   `rocm services logs <service-id>` instead.
+- **The failing line is still near the end of the log.** The summary reads a
+  fixed tail of the engine log, and it reads it *after* the engine has appended
+  its own failure message — which echoes that same tail back — to the file. A
+  launch that OOMs and then logs another ~80 lines of shutdown can therefore push
+  the allocator line out of the window the summary sees, and no note appears even
+  though the engine's own message (in `rocm services logs <service-id>`, or in
+  `--verbose`/`--foreground` output) names the OOM. The engine's message is the
+  authority on whether the launch ran out of memory; this note is the convenience
+  copy.
 
 If the pre-launch low-VRAM warning already printed the
 `--gpu-memory-utilization` advice for the selected GPU, the OOM note drops that
@@ -744,12 +760,16 @@ for a model whose name does not overlap — those still fail fast with the usual
 message and prepare nothing.
 
 Matching the engine and model is necessary but not sufficient. The exemption
-applies only when the service would *actually* be reused, which is the same test
-the launch itself applies: the recipe settings must match (the sampling-control
-rule under [Model serving](#model-serving) above), a `--require-api-key` request must be
-satisfiable by a service that already has a key, and the service's own device
-policy must be at least as strong as this invocation's. A live service that
-fails any of those is not reusable, so it buys no bypass — `rocm serve` refuses
+applies only when the service would *actually* be reused, which is the same
+predicate the launch itself applies: the recipe settings must match (the
+sampling-control rule under [Model serving](#model-serving) above), and a
+`--require-api-key` request must be satisfiable by a service that already has a
+key. The exemption adds one device-policy term that the launch does not check,
+because only this decision gates the GPU refusal: a `gpu_required` serve is not
+exempted by a service recorded as `cpu_only`. That is the only policy pair
+refused — any other combination, including a record that predates the field and
+so names no policy at all, is accepted. A live service that fails any of those
+is not reusable, so it buys no bypass — `rocm serve` refuses
 on the GPU first, which is the accurate message and leaves your running server
 alone. (Telling you to stop it and re-run would not help: the re-run would have
 nothing left to reuse and would hit the same GPU refusal.)
