@@ -333,11 +333,17 @@ pub(crate) fn ensure_public_service_has_endpoint_key(
     // the service precisely so recovery can honour it without re-deriving it
     // from an address that no longer answers the question.
     if requires_api_key && !key_present {
+        let public_flag = if rocm_engine_protocol::is_public_bind_host(host) {
+            " --allow-public-bind"
+        } else {
+            ""
+        };
         bail!(
             "refusing to recover a service that was launched with an endpoint API key but no \
              longer has one: it would come back up without authentication, and something \
              outside this machine may still be publishing its port. Relaunch it with \
-             `rocm serve --require-api-key` to issue a new key."
+             `rocm serve <model> --host {host} --port <port>{public_flag} --require-api-key` \
+             to issue a new key."
         );
     }
     if rocm_engine_protocol::is_public_bind_host(host) && !key_present {
@@ -461,9 +467,11 @@ mod tests {
         for host in ["127.0.0.1", "localhost", "::1"] {
             let error = ensure_public_service_has_endpoint_key(host, false, true)
                 .expect_err("a service launched with a key must not be recovered without one");
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("without authentication"), "{rendered}");
             assert!(
-                format!("{error:#}").contains("without authentication"),
-                "{error:#}"
+                rendered.contains(&format!("rocm serve <model> --host {host} --port <port>")),
+                "the relaunch command must be one that can be run: {rendered}"
             );
         }
         // With the key still present, recovery proceeds.
