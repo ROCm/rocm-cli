@@ -143,7 +143,7 @@ Scenarios carry stable-id and capability tags:
 | `@requires-case-sensitive-fs` | Premise is two files whose names differ only in letter case. Resolves to **skip** where the scenarios' temp root folds case. The capability probe's `case_sensitive_fs` writes two such names in its own temp dir, which follows `$TMPDIR` like every scenario's isolated root, and checks they stayed two files. `@requires-os:linux` cannot express this: `$TMPDIR` on Linux, WSL2 included, can sit on a casefolded directory or a mounted Windows drive. |
 | `@requires-engine:<vllm\|lemonade>` | Pins the serve engine. Resolves to skip where that engine can't start (e.g. vLLM on a lemonade-only Strix host). |
 | `@requires-os:<linux\|windows>` | Premise is OS-specific; skip on other OSes. |
-| `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model). |
+| `@serve-timeout:<secs>` | Lengthen the serve-readiness wait for a genuinely slow serve (e.g. a large model); also raises the CLI's own vLLM and Lemonade readiness caps (`ROCM_CLI_VLLM_READY_TIMEOUT_SECS`, `ROCM_CLI_LEMONADE_READY_TIMEOUT_SECS`) to match. |
 | `@nightly` | Expensive scenario skipped by default; included when `E2E_INCLUDE_NIGHTLY=1`. |
 | `@lifecycle` | Expensive, OS-mutating release-lifecycle scenario (packaging + real installer + install/uninstall). Skipped by default; included when `E2E_INCLUDE_LIFECYCLE=1`. `E2E_ONLY_LIFECYCLE=1` selects only this set without bypassing expectation resolution. |
 
