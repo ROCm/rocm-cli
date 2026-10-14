@@ -23,7 +23,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(any(test, target_os = "linux"))]
+// Test-only now: the Linux sandbox timeout no longer runs its own sleep-poll
+// loop, it delegates to `rocm_core::run_command_with_timeout`.
+#[cfg(test)]
 use std::thread;
 use std::time::Duration;
 

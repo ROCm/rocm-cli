@@ -2792,6 +2792,12 @@ mod tests {
     /// this test, and a hang is not a readable failure. The readable control in
     /// the same test stops the whole thing passing vacuously, e.g. if
     /// `device_readable_within` were mutated to return `false` unconditionally.
+    ///
+    /// The FIFO is created by shelling out to `mkfifo(1)` rather than calling
+    /// `libc::mkfifo`: the workspace lints deny `unsafe_code`, and one test
+    /// fixture does not justify an exception. The tool is coreutils, so it is
+    /// present wherever this test runs; a host without it skips rather than
+    /// fails, since a missing fixture is not evidence about the probe.
     #[test]
     #[cfg(target_os = "linux")]
     fn the_kfd_probe_declines_a_device_whose_open_blocks_instead_of_hanging() -> Result<()> {
@@ -2799,17 +2805,16 @@ mod tests {
             std::env::temp_dir().join(format!("rocm-cli-kfd-open-{}", unix_time_millis()));
         fs::create_dir_all(&temp_root)?;
         let fifo = temp_root.join("blocking-kfd");
-        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
-            .context("fifo path contained an interior NUL")?;
-        // SAFETY: `fifo_c` is a NUL-terminated path that lives across the call,
-        // and `mkfifo` only creates a node at it.
-        let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) };
-        assert_eq!(
-            made,
-            0,
-            "could not create the FIFO fixture: {}",
-            std::io::Error::last_os_error()
-        );
+        let made = Command::new("mkfifo")
+            .arg(&fifo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(&made, Ok(status) if status.success()) {
+            let _ = fs::remove_dir_all(&temp_root);
+            return Ok(());
+        }
 
         let probe_timeout = Duration::from_millis(300);
         let started = Instant::now();
