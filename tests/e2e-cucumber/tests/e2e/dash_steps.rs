@@ -110,6 +110,12 @@ async fn running_managed_model(world: &mut E2eWorld) {
 /// literal `rocm services stop e2e-mock --yes` the prompt prints, and that
 /// command signals whatever PID the record names. Without this step it
 /// signals the cucumber harness itself (SIGTERM, `KillScope::Tree`).
+///
+/// Writes the child's own start-time token (`supervisor_start_ticks`)
+/// alongside its pid, the same pair a real launch path writes, so the stop
+/// exercises `identity_state`'s start-time-verified match rather than the
+/// `(None, _) => Matches` best-effort arm a record with no token falls back
+/// to.
 #[given("the managed model's record points at a disposable process")]
 async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld) {
     let child = std::process::Command::new("sleep")
@@ -117,7 +123,8 @@ async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld)
         .spawn()
         .expect("failed to spawn disposable process for dash-27's stop-command step");
     let pid = child.id();
-    world.disposable_service_process = Some(child);
+    let supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+    world.recorded_process = Some(child);
 
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let services_dir = root.path().join("data").join("services");
@@ -130,6 +137,7 @@ async fn managed_model_record_points_at_disposable_process(world: &mut E2eWorld)
         ServiceRecordOptions {
             supervisor_pid: pid,
             engine_pid: Some(pid),
+            supervisor_start_ticks,
             ..ServiceRecordOptions::default()
         },
     );
@@ -915,7 +923,7 @@ async fn managed_model_no_longer_listed_as_running(world: &mut E2eWorld) {
 #[then("the disposable process has exited")]
 async fn disposable_process_has_exited(world: &mut E2eWorld) {
     let child = world
-        .disposable_service_process
+        .recorded_process
         .as_mut()
         .expect("no disposable process recorded for this scenario");
     let mut exited = false;

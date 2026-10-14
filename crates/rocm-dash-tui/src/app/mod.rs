@@ -785,7 +785,7 @@ impl AppState {
     }
 
     /// The quit-confirm prompt's `s` ("stop…") key (issue #145): rather than
-    /// only warning that a model keeps running, jump straight to the Services
+    /// only warning that a model may still be running, jump straight to the Services
     /// overlay — pre-focused on a managed instance that's actually serving —
     /// so the user can stop it there through its own proven approval+job+
     /// console flow (`ui::services_manager`), instead of only being told the

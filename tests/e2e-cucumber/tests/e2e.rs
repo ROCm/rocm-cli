@@ -158,16 +158,14 @@ pub struct E2eWorld {
     /// has something real to terminate. Held here so `Drop` can kill and reap
     /// it whatever the scenario's outcome, and so the stop's effect on it can
     /// be observed through the handle rather than by PID alone.
-    pub recorded_process: Option<std::process::Child>,
-    /// A disposable child process (`sleep`) a scenario can point a service
-    /// record's `supervisor_pid`/`engine_pid` at, for a step that must run a
-    /// real stop command against "e2e-mock" (`dash-27`). `register_mock_service`
+    ///
+    /// Also doubles as the disposable `sleep` child `dash-27` points
+    /// "e2e-mock"'s `supervisor_pid`/`engine_pid` at. `register_mock_service`
     /// deliberately points those fields at *this harness's own* PID so startup
     /// liveness checks see a live process — fine for every scenario that only
     /// reads the record, but a real `rocm services stop e2e-mock --yes` would
-    /// then signal the harness process itself. Reaped in `Drop`, before the
-    /// mock server and isolated directory, the same as `tui`.
-    pub disposable_service_process: Option<std::process::Child>,
+    /// then signal the harness process itself.
+    pub recorded_process: Option<std::process::Child>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -320,7 +318,6 @@ impl Default for E2eWorld {
             skill_reference: None,
             skill_symptom: None,
             recorded_process: None,
-            disposable_service_process: None,
         }
     }
 }
@@ -628,13 +625,6 @@ impl Drop for E2eWorld {
         // restoration; taking it here makes the ordering explicit.
         if let Some(lifecycle) = self.lifecycle.take() {
             drop(lifecycle);
-        }
-        // Best-effort: dash-27's own stop command may already have killed this,
-        // in which case `kill`/`wait` just observe that and return. Any survivor
-        // must not outlive the scenario on a persistent runner.
-        if let Some(mut child) = self.disposable_service_process.take() {
-            let _ = child.kill();
-            let _ = child.wait();
         }
         // Kill/reap any interactive TUI child FIRST — before the mock server it
         // may be talking to stops and before the isolated dir it reads is

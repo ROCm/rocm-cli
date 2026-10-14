@@ -674,8 +674,8 @@ pub fn run_launcher(chat_mock: bool) -> Result<()> {
             None => return Ok(()),
             Some(choice) => {
                 let route = launcher_route(choice);
-                // This session's own `q`/Esc must not re-ask "Still serving —
-                // quit anyway?" (issue #145's double-prompt fix) — the
+                // This session's own `q`/Esc must not re-ask "May still be
+                // serving — quit anyway?" (issue #145's double-prompt fix) — the
                 // launcher's own gate, re-entered at the top of this loop, is
                 // what actually governs process exit. Derived from `route`
                 // itself (`launcher_route_hosts_session`) rather than a bare

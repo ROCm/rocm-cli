@@ -48,7 +48,7 @@ pub struct ResolvedArgs {
     /// rather than the dashboard's own continuously-live probe), so it is the
     /// one that actually governs process exit when `true`. This
     /// session's own `q`/Esc/`/quit`/`/exit`/Esc-menu Quit row must then skip
-    /// its own confirm and exit immediately — otherwise it asks "Still
+    /// its own confirm and exit immediately — otherwise it asks "May still be
     /// serving — quit anyway?", the user says yes, control returns to the
     /// launcher loop, and the launcher immediately asks the exact same
     /// question again on its OWN next `q` — a prompt whose "yes" didn't

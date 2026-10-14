@@ -320,25 +320,42 @@ fn quit_confirm_body_with(
         // whether the listed ids are *still* serving, instead of claiming to
         // know either way — the trailer below is hedged to match, rather
         // than asserting present-tense that it does keep running.
-        if managed_ids.is_empty() {
-            body.push("A model was serving when this started.".to_string());
-        } else {
-            let mut ids: Vec<&String> = managed_ids.iter().collect();
-            ids.sort();
-            for id in ids.iter().take(5) {
-                body.push(format!("• {id} — stop it first:"));
-                body.push(format!("  rocm services stop {id} --yes"));
-            }
-            if let Some(line) = format::overflow_line(managed_ids.len(), 5) {
-                body.push(line);
-            }
+        //
+        // `managed_ids` is never empty here: `nothing_is_currently_being_served_with`
+        // already returned `false` above, and with `total == 0` that can only be
+        // because `snapshot.has_live_service` is `true` — every `ManagedRegistryProbe`
+        // in this tree (`LiveManagedRegistryProbe::snapshot`, `apps/rocm::dash`) derives
+        // both fields from the same `discover_managed_services` pass
+        // (`crates/rocm-dash-daemon/src/registry.rs`), which inserts an id into `seen`
+        // (-> `managed_ids`) for every record it also counts into `svcs` (->
+        // `has_live_service`), so a probe can never report "live" with no id to name.
+        // Asserted rather than branched on: a probe that someday broke that pairing
+        // should fail loudly here instead of silently falling back to a sentence that
+        // describes this PR's retired launch-time snapshot, not the live read it
+        // replaced.
+        debug_assert!(
+            !managed_ids.is_empty(),
+            "a live registry snapshot reported serving with no managed id to name"
+        );
+        let mut ids: Vec<&String> = managed_ids.iter().collect();
+        ids.sort();
+        for id in ids.iter().take(5) {
+            body.push(format!("• {id} — stop it first:"));
+            body.push(format!("  rocm services stop {id} --yes"));
+        }
+        if let Some(line) = format::overflow_line(managed_ids.len(), 5) {
+            body.push(line);
         }
     } else {
         // Sorted by `container_id` — the same key `services_manager::service_rows`
-        // sorts by for `AppState::quit_confirm_open_services_key`'s own row
-        // lookup — so the Nth instance named here is provably the one `s`
-        // focuses in the Services overlay, not merely whichever order this
-        // `HashMap`'s `values()` happened to yield.
+        // sorts by — rather than left in whichever order this `HashMap`'s
+        // `values()` happened to yield, so the listing is at least stable
+        // across renders. `s` does not focus "the Nth instance named here":
+        // `quit_confirm_open_services_key` always focuses the FIRST managed,
+        // still-serving row in `service_rows`' own order, which can include
+        // an unmanaged (Docker/Lemonade) entry this listing also shows ahead
+        // of it — so the row `s` focuses need not be the Nth line printed
+        // below.
         let mut sorted: Vec<_> = running().collect();
         sorted.sort_by(|a, b| a.container_id.cmp(&b.container_id));
         for i in sorted.into_iter().take(5) {
@@ -1081,45 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn quit_confirm_body_does_not_contradict_itself_during_the_startup_fallback() {
-        // Regression guard: with `instances` still empty (no daemon snapshot
-        // has landed yet) but the prompt open via the live registry read,
-        // the body must not say "Nothing is being served anymore." two lines
-        // above "It keeps running in the background after you quit." — a
-        // printed self-contradiction.
-        let mut state = AppState::new("t".into(), "default-dark".into());
-        with_registry_probe(&mut state, true, &[]);
-        assert!(state.instances.is_empty());
-        assert!(!state.has_received_snapshot);
-
-        let body = quit_confirm_body(&state);
-        assert!(
-            !body
-                .iter()
-                .any(|line| line.contains("Nothing is being served")),
-            "must not claim nothing is being served when the startup read said otherwise: {body:?}"
-        );
-        assert!(
-            body.iter().any(|line| line.contains("A model was serving")),
-            "must say a model was serving instead: {body:?}"
-        );
-        // The trailer must be hedged to match: this branch doesn't know
-        // whether the model is still serving, so a present-tense "It keeps
-        // running" would itself be the same class of overclaim the body line
-        // above is careful to avoid.
-        assert!(
-            !body.iter().any(|line| line.contains("It keeps running")),
-            "must not assert present-tense that it keeps running when this \
-             branch doesn't know: {body:?}"
-        );
-        assert!(
-            body.iter()
-                .any(|line| line.contains("may still be running")),
-            "must hedge the trailer the same way the body line above does: {body:?}"
-        );
-    }
-
-    #[test]
     fn quit_confirm_body_prints_the_stop_command_during_the_startup_fallback_when_the_registry_names_an_id()
      {
         // On a host whose dashboard-embedded daemon client never connects at
@@ -1148,15 +1126,15 @@ mod tests {
             "must print the real stop command from the live registry read even with no \
              daemon snapshot: {body:?}"
         );
-        assert!(
-            !body.iter().any(|line| line.contains("It keeps running")),
-            "must still hedge — the registry read can't confirm current liveness, only that \
-             the record hasn't been reconciled as stopped: {body:?}"
-        );
+        // Checked by requiring the hedge phrase itself, not by requiring the
+        // absence of the retired present-tense one: production never prints
+        // that exact retired string once hedged, so the negative alone can't
+        // fail.
         assert!(
             body.iter()
                 .any(|line| line.contains("may still be running")),
-            "must hedge the trailer the same way the no-id fallback does: {body:?}"
+            "must still hedge — the registry read can't confirm current liveness, only that \
+             the record hasn't been reconciled as stopped: {body:?}"
         );
     }
 
@@ -1190,9 +1168,16 @@ mod tests {
             body.iter()
                 .any(|line| line.contains("Nothing is being served"))
         );
+        // The early return in `quit_confirm_body_with` skips the trailer
+        // entirely, so no hedge should leak through either — not just the
+        // retired present-tense phrase, which production never prints once
+        // hedged and so can't tell a leaked trailer from no trailer at all.
         assert!(
-            !body.iter().any(|line| line.contains("It keeps running")),
-            "must not claim anything keeps running once a snapshot confirms nothing is serving: {body:?}"
+            !body
+                .iter()
+                .any(|line| line.contains("may still be running")),
+            "must not print any continued-running trailer once a snapshot confirms nothing is \
+             serving: {body:?}"
         );
     }
 
@@ -1206,10 +1191,9 @@ mod tests {
         // fix for only one can't quietly leave the other still titled wrong.
         let plain = AppState::new("t".into(), "default-dark".into());
         let req = quit_confirm_request(&plain, true);
-        assert!(
-            !req.title.contains("Still serving"),
-            "title must not claim serving when nothing is: {:?}",
-            req.title
+        assert_eq!(
+            req.title, "Nothing to confirm — quit?",
+            "title must not claim serving when nothing is"
         );
         assert!(
             req.body
@@ -1221,10 +1205,9 @@ mod tests {
         with_registry_probe(&mut snapshot_confirmed, true, &[]);
         snapshot_confirmed.has_received_snapshot = true;
         let req = quit_confirm_request(&snapshot_confirmed, true);
-        assert!(
-            !req.title.contains("Still serving"),
-            "title must not claim serving once a snapshot confirms it stopped: {:?}",
-            req.title
+        assert_eq!(
+            req.title, "Nothing to confirm — quit?",
+            "title must not claim serving once a snapshot confirms it stopped"
         );
     }
 
@@ -1259,20 +1242,16 @@ mod tests {
             "the dashboard's own title must hedge the same way the launcher's does: {:?}",
             dashboard.title
         );
-        assert!(
-            !dashboard
-                .body
-                .iter()
-                .any(|line| line.contains("It keeps running")),
-            "must not assert present-tense liveness the daemon never actually verified: {:?}",
-            dashboard.body
-        );
+        // Checked by requiring the hedge phrase itself: production never
+        // prints the retired present-tense wording once hedged, so a bare
+        // `!contains` against it can't fail.
         assert!(
             dashboard
                 .body
                 .iter()
                 .any(|line| line.contains("may still be running")),
-            "must hedge the trailer the same way the launcher's copy does: {:?}",
+            "must not assert present-tense liveness the daemon never actually verified — the \
+             trailer must hedge the same way the launcher's copy does: {:?}",
             dashboard.body
         );
 
@@ -1552,11 +1531,14 @@ mod tests {
     #[test]
     fn quit_confirm_body_lists_services_sorted_by_container_id() {
         // Round-5 review (PR #595): the body sorts by `container_id` — the
-        // same key `services_manager::service_rows` sorts by — so the Nth
-        // bullet is provably the instance `s`
-        // (`AppState::quit_confirm_open_services_key`) focuses in the
-        // Services overlay, not merely whichever order a `HashMap`'s
-        // `values()` happens to yield. `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
+        // same key `services_manager::service_rows` sorts by — so the
+        // listing is stable rather than left in whichever order a
+        // `HashMap`'s `values()` happens to yield. This does not mean `s`
+        // (`AppState::quit_confirm_open_services_key`) focuses the Nth
+        // bullet printed here: it always focuses the FIRST managed,
+        // still-serving row in `service_rows`' own order, which can include
+        // an unmanaged entry this listing also shows.
+        // `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
         // inserts ids (`svc-0`..`svc-5`) that already sort the same way
         // whether by id or insertion order, so it can't catch a regression
         // here — these ids are deliberately inserted out of sorted order.

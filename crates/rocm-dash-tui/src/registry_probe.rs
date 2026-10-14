@@ -28,9 +28,15 @@ use std::sync::Arc;
 /// [`ManagedRegistryProbe::snapshot`] was called.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ManagedRegistrySnapshot {
-    /// Whether any managed-service record is currently `ready`/`running` —
+    /// Whether any managed-service record is currently a live scrape target —
     /// the same statuses `Instance::status.is_serving()` treats as "actively
-    /// serving".
+    /// serving" (`ready`/`running`, including a `running` record still in a
+    /// recognized `startup_phase` — see `instance_status_for_record`), and
+    /// excluding one with no bound port (`port == 0`). An implementation
+    /// deriving both fields of this snapshot from one discovery pass (as
+    /// `LiveManagedRegistryProbe::snapshot` does) can never report this `true`
+    /// with `managed_ids` empty: the same pass that counts a record here is
+    /// the one that names its id there.
     pub has_live_service: bool,
     /// Ids of every managed-service record this host's own registry
     /// currently treats as a live scrape target — i.e. the ids

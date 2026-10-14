@@ -524,8 +524,8 @@ rocm
 
 Expected result:
 
-- A prompt appears naming the serving model and warning that it keeps
-  running in the background after you quit, with the real
+- A prompt appears naming the serving model and warning that it may
+  still be running in the background after you quit, with the real
   `rocm services stop <service-id> --yes` command (the actual id, not a
   placeholder) to stop it first. On a host where the dashboard's own daemon
   client never connects (Windows, for the whole session), the prompt still
