@@ -1202,7 +1202,10 @@ name. Every external call the script makes is bounded by `timeout 15`, the
 `--assert-clear` scan included: that scan reads `/proc/<pid>/cmdline` for every
 process, and a holder wedged in uninterruptible sleep — the state this gate
 fires on — can block the read. A scan that does not finish **fails** the
-preflight, with its own message, rather than being taken as a clear host. The
+preflight, with its own message, rather than being taken as a clear host; so
+does a scan that could not be run at all — a missing script, a flag the two
+scripts disagree about — which gets a third message rather than being reported
+as a surviving process nobody can then find. The
 floor is kept rather than replaced because the converse is just as
 real and the process check cannot see it: a non-E2E tenant on a shared host can
 exhaust the pool while running nothing the reclaim rules match. The two

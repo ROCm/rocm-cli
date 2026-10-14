@@ -213,8 +213,19 @@ while [[ "${first_poll}" -eq 1 ]] || [[ "${SECONDS}" -lt "${deadline}" ]]; do
     # Gate 2. Deliberately AFTER the memory floor rather than before it: a card
     # still draining from the reclaim step's kills is the transient the wait
     # above exists to absorb, and asking this first would report the processes
-    # that are on their way out. By here the memory is back, so anything the
-    # reclaim rules still match is a process that survived being reclaimed.
+    # that are on their way out as survivors.
+    #
+    # What that ordering does NOT establish, on these lanes, is that the drain
+    # has finished. The floor is 8/16 GiB against pools of ~62 and ~192 GiB, so
+    # on a healthy host it is met on the FIRST poll with no wait at all; it only
+    # delays anything past ~54/~176 GiB held. On a discrete lane, therefore,
+    # clearing the floor says nothing about whether a process the reclaim step
+    # SIGKILLed has finished exiting — what bounds that is the reclaim's own
+    # TERM grace period and kill loop, not this. The ordering is still the right
+    # way round, since asking before the floor can only be worse; it is simply
+    # not the proof of a settled card an earlier wording of this comment
+    # claimed. A process still dying when this runs is reported as a survivor,
+    # which is a false positive this gate can produce (#446).
     #
     # Shelled out to reclaim-gpu.sh rather than matched here: that script owns
     # the E2E_ROOTS / ENGINE_MARKERS rules, documents the over-match exposure,
@@ -235,8 +246,14 @@ while [[ "${first_poll}" -eq 1 ]] || [[ "${SECONDS}" -lt "${deadline}" ]]; do
     # the host is clear; passing on it would turn a hang into a silent green on
     # exactly the hosts #446 is about. `timeout` reports expiry as exit 124,
     # which is why the status is captured rather than tested with `if`: the
-    # three outcomes — clear, survivor named, never finished — have to be told
-    # apart, and reporting the third as either of the others misdescribes it.
+    # outcomes — clear, survivor named, never finished, and never ran at all —
+    # have to be told apart, and reporting any of them as another misdescribes
+    # it. "A leaked E2E engine process is still holding it (listed above)" is
+    # claimed ONLY for exit 1, the one code that means the scan ran and named
+    # somebody. Anything else that is not 0 or 124 — 127 for a missing script,
+    # 2 for an argument this script and reclaim-gpu.sh disagree about, a signal
+    # — printed that message with nothing listed above it, sending the reader
+    # to hunt for a process that was never found.
     assert_rc=0
     timeout 15 bash "${RECLAIM_SCRIPT}" --assert-clear || assert_rc=$?
     if [[ "${assert_rc}" -eq 0 ]]; then
@@ -244,8 +261,10 @@ while [[ "${first_poll}" -eq 1 ]] || [[ "${SECONDS}" -lt "${deadline}" ]]; do
     fi
     if [[ "${assert_rc}" -eq 124 ]]; then
       echo "::error::GPU preflight failed: the leaked-process scan (reclaim-gpu.sh --assert-clear) did not finish within 15s and was timed out — the host could NOT be shown clear. A process stuck in uninterruptible sleep blocks the /proc read this scan makes, which is the state a wedged GPU process is in, so this fails rather than passes."
-    else
+    elif [[ "${assert_rc}" -eq 1 ]]; then
       echo "::error::GPU preflight failed: the GPU has ${MIN_FREE_GIB}+ GiB free but a leaked E2E engine process is still holding it (listed above). The free-memory floor cannot see this: against this pool it only trips near exhaustion — see #446."
+    else
+      echo "::error::GPU preflight failed: the leaked-process scan (${RECLAIM_SCRIPT} --assert-clear) could not be run — it exited ${assert_rc}, which is neither clear (0), a named survivor (1) nor the 15s bound (124). A missing or unreadable script reports 127 and an unrecognised flag reports 2. Nothing was shown about this host either way, so this fails rather than passes."
     fi
     # Bounded for the same reason, and on this path more sharply: having just
     # learned the scan can stall, an unbounded diagnostic would spend the
