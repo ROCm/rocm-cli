@@ -1821,16 +1821,25 @@ impl ExamineSummary {
     /// it (for example the gfx90c Vega iGPU in Renoir / Cezanne APUs). Without
     /// it `compatible_therock_family: <unknown>` reads like a probe failure, when
     /// the GPU was in fact recognized and simply has no ROCm build.
+    ///
+    /// Classified by [`gpu_support_level`] rather than re-deriving the same
+    /// `(detected, covering family)` test here: this line and that function are
+    /// two renderings of one judgement, and the whole point of this change is
+    /// that support claims come from a single place. Every variant is spelled
+    /// out so that adding one is a compile error here rather than a silently
+    /// blank line.
     fn rocm_support_line(&self) -> String {
-        match (
-            self.detected_gfx_target.as_deref(),
-            self.compatible_therock_family.as_deref(),
-        ) {
-            (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => format!(
-                "  rocm_support: GPU detected ({gfx}) but not supported by ROCm; \
-                 the Vulkan backend can still be used\n"
+        let detected = self.detected_gfx_target.as_deref();
+        match gpu_support_level(detected, self.compatible_therock_family.as_deref()) {
+            // `VulkanOnly` is only ever returned for a detected target, so the
+            // fallback below is unreachable; it keeps the arm total without a
+            // panic path.
+            GpuSupportLevel::VulkanOnly => format!(
+                "  rocm_support: GPU detected ({}) but not supported by ROCm; \
+                 the Vulkan backend can still be used\n",
+                detected.unwrap_or_default()
             ),
-            _ => String::new(),
+            GpuSupportLevel::RocmHip | GpuSupportLevel::Unknown => String::new(),
         }
     }
 
