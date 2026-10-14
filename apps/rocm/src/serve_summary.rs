@@ -255,11 +255,17 @@ pub(crate) fn oom_memory_note(
     } else {
         format!("{} ", rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT)
     };
+    // The invocation comes from the shared constant rather than being spelled
+    // out: `is_rocm_authored_log_line` keys on that exact text to tell a line
+    // rocm-cli wrote into the engine log from a line the engine printed, and the
+    // CLI writes this note's surroundings back into that same log. A local copy
+    // that drifted would quietly stop being recognised there.
     Some(format!(
         "the serve attempt ran out of GPU memory. {hint}If the model simply does not fit in this \
          GPU's VRAM, lowering the reservation will not help — serve a smaller or quantized model \
          instead (rocm-cli serves one model on a single GPU). To have the tool pick the \
-         case-appropriate fix, run `rocm diagnose --symptom '{symptom}'`."
+         case-appropriate fix, run `{} '{symptom}'`.",
+        rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
     ))
 }
 

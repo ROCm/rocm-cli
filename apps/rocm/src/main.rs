@@ -462,9 +462,12 @@ rocm model --verbose"
     /// `rocm services logs <service-id>`.
     ///
     /// Under --device gpu_required (the default) this command refuses on a host with no
-    /// usable AMD GPU. Reusing an already-running managed server for the same engine and
-    /// model is the one exception: it launches nothing, so it is allowed through. A live
-    /// server for a different engine, or for a model whose name does not overlap, does
+    /// usable AMD GPU. Reusing an already-running managed server is the one exception: it
+    /// launches nothing, so it is allowed through. The exception applies only when the
+    /// server would actually be reused — same engine and model, matching recipe settings,
+    /// a key already present if --require-api-key is asked for, and a device policy at
+    /// least as strong as this one. A live server for a different engine, for a model
+    /// whose name does not overlap, or for one this run could not reuse anyway, does
     /// not soften the refusal, and nothing is prepared before it. Model names are matched
     /// leniently, so a live server whose name overlaps the one you asked for (`qwen` for a
     /// running `qwen3-8b-instruct`) does let engine preparation run before the refusal.

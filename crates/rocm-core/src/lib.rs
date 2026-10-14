@@ -2619,6 +2619,28 @@ fn segment_shows_oom(segment: &str) -> bool {
 /// would be stripped into a lookalike and printed rather than refused. Keeping
 /// the raw bytes here and doing the *scoring* on rendered rows inside
 /// [`segment_shows_oom`] is what lets both properties hold at once.
+///
+/// The bound on that guarantee is worth stating, because the obvious reading of
+/// it is wrong. It is a property of *this read of this text*: whatever text a
+/// caller hands in, a colourised OOM line inside it is refused and the canonical
+/// symptom printed. It is **not** an end-to-end property of a managed launch,
+/// and the reason is the engine's own bail. `startup_log_context` echoes the log
+/// tail as [`terminal::rendered_lines`] rows — it has to, since that text is
+/// printed to a terminal — and the supervisor appends that whole bail to the
+/// same shared log. The echo is then the *only* copy of the failing line inside
+/// the CLI's tail window: measured on a 200-line log, the engine's raw
+/// colourised line ends up 84 lines from the end and the window is
+/// `DEFAULT_LOG_TAIL_LINES` = 80. So the serve summary, which reads after the
+/// bail, selects the rendered row and quotes it instead of falling back.
+///
+/// That outcome is sound — the row is text the terminal really drew, it carries
+/// no control bytes or quotes, and quotable still implies diagnosable — but it
+/// does mean the engine and the CLI can print *different* `--symptom` arguments
+/// for the same colourised failure: the engine the canonical symptom, the CLI
+/// the user's rendered line. Filtering the echo out to force agreement is not an
+/// option: measured, it leaves no OOM line in the window at all and the serve
+/// note disappears for every real managed launch. Pinned, both halves, by
+/// `the_colourised_round_trip_quotes_the_row_the_terminal_drew`.
 fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
     log.lines()
         .flat_map(|line| line.split('\r'))
@@ -2632,9 +2654,16 @@ fn vllm_log_segments(log: &str) -> impl Iterator<Item = String> + '_ {
 /// Returns the user's actual failing *raw* line (so `diagnose` echoes their real
 /// error), selected with [`segment_shows_oom`], which is the checker's own rule.
 /// Shared by the vLLM engine's post-failure hint and the `rocm` CLI serve summary
-/// so both surfaces route to `diagnose` identically instead of hand-rolling the
-/// line selection twice. It is also the OOM *gate* for both: `None` is the "this
-/// tail is not an OOM" answer, so no caller needs a separate predicate first.
+/// so both surfaces apply one selection rule to the text they are given, instead
+/// of hand-rolling it twice. It is also the OOM *gate* for both: `None` is the
+/// "this tail is not an OOM" answer, so no caller needs a separate predicate
+/// first.
+///
+/// Sharing the rule is not the same as the two surfaces always printing the same
+/// command, and the difference is real rather than theoretical: they read the
+/// shared log at different points, and the engine's bail puts a sanitized echo of
+/// the tail into it in between. See [`vllm_log_segments`] for the measurement and
+/// for why closing the gap would cost the serve note entirely.
 ///
 /// The exact guarantee is narrower than "whatever comes back is diagnosable",
 /// and the difference is load-bearing. What holds is:
@@ -2714,11 +2743,19 @@ pub fn vllm_oom_diagnose_symptom(log_tail: &str) -> Option<String> {
 /// not an OOM at all) it falls back to stripping, which is lossless for the
 /// single-row case that is by far the common one.
 ///
+/// When more than one row scores, the **last** one is taken, for the same reason
+/// [`vllm_oom_diagnose_symptom`] scans its segments with `.rev()`: the newest
+/// line is the proximate failure and the earlier ones are the allocator's retry
+/// chatter leading up to it. Picking the first instead would make the display
+/// disagree with the selector about which line "the failure" is, inside the one
+/// message that prints both.
+///
 /// Pinned by `the_displayed_oom_line_is_a_row_the_terminal_actually_drew`.
 #[must_use]
 pub fn vllm_oom_display_line(segment: &str) -> String {
     terminal::rendered_lines(segment)
         .into_iter()
+        .rev()
         .find(|row| diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {row}")))
         .unwrap_or_else(|| terminal::strip_terminal_control_sequences(segment))
 }
@@ -4288,6 +4325,24 @@ last_installed_runtime_id = "therock-release"
         assert_eq!(
             vllm_oom_display_line("\u{1b}[31mOSError: model weights not found\u{1b}[0m"),
             "OSError: model weights not found"
+        );
+
+        // When several rows of one segment score, the newest wins — the same
+        // choice `vllm_oom_diagnose_symptom` makes with `.rev()` across
+        // segments. The two run inside one message, so picking opposite ends
+        // would have the hint display one line while the `--symptom` argument
+        // names another.
+        let retry = "RuntimeError: hipErrorOutOfMemory";
+        let proximate = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        assert!(
+            diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {retry}"))
+                && diagnose::vllm_oom_symptom_is_diagnosable(&format!("vllm: {proximate}")),
+            "both rows must score, or this fixture cannot discriminate which end is taken"
+        );
+        assert_eq!(
+            vllm_oom_display_line(&format!("{retry}\u{1b}[1A{proximate}")),
+            proximate,
+            "the displayed row must be the last one that scored, not the first"
         );
     }
 

@@ -113,7 +113,7 @@ async fn plant_running_service(world: &mut E2eWorld) {
 /// prints: `rocm services stop <id> --yes`. Built from the known
 /// [`SERVICE_ID`] rather than parsed out of any printed hint — nothing here
 /// ties this literally back to `serve_summary.rs`'s own output; that
-/// equivalence is what the hint-specific scenarios (`serve-27`, remote-15)
+/// equivalence is what the hint-specific scenarios (`serve-24`, remote-15)
 /// prove, by asserting the hint text first and then running it.
 #[when("the user stops it with --yes")]
 async fn stop_with_yes(world: &mut E2eWorld) {

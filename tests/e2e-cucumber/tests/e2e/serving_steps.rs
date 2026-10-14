@@ -1255,6 +1255,36 @@ async fn open_oom_serve_summary(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
+/// Serve the *same* model the live planted record names, but ask for an API key
+/// the running service never had.
+///
+/// Liveness, engine and canonical model id all match, so the reuse pre-gate's
+/// outer condition holds and the record is a candidate — but
+/// `managed_service_reuse_refusal` answers `MissingApiKey`, so this invocation
+/// cannot actually reuse it and must not be granted the bypass of the
+/// no-usable-GPU refusal that a real reuse earns. `--env-id` satisfies model
+/// resolution without installing a runtime, the same way the reuse scenario
+/// does; captured pipe output rather than a PTY, because the expected outcome
+/// is a refusal on stderr and not a deployment summary.
+#[when("the user serves that same model with --require-api-key under the GPU-required default")]
+async fn user_serves_live_model_requiring_a_key(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &[
+            "serve",
+            OOM_GUIDANCE_MODEL,
+            "--engine",
+            "vllm",
+            "--env-id",
+            "e2e-oom",
+            "--require-api-key",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
 #[when("the CLI reports the service as ready")]
 async fn when_cli_reports_ready(world: &mut E2eWorld) {
     // Read readiness from the CLI's own view (`services list`), not a direct
@@ -1353,6 +1383,25 @@ async fn assert_no_gpu_message(world: &mut E2eWorld) {
     assert!(
         output.to_lowercase().contains("no usable amd gpu"),
         "expected a no-AMD-GPU message, got:\n{output}"
+    );
+}
+
+/// The discriminating assertion for the reuse pre-gate's acceptance term.
+///
+/// `spawn_managed_engine_child`'s reuse refusal is the only thing in `serve`
+/// that prints `rocm services stop`, and it is reachable only once the no-GPU
+/// bail has been bypassed. So its absence says the bypass was *not* granted —
+/// which is the whole point, since that advice cannot clear a no-GPU condition
+/// and stopping the service only removes the thing the re-run would have
+/// reused. Matched on the command token the CLI owns rather than the sentence
+/// around it. Captured pipe output, so a plain `contains` is right.
+#[then("the user is not told to stop the running server")]
+async fn assert_no_stop_the_running_server_advice(world: &mut E2eWorld) {
+    let output = serve_output(world);
+    assert!(
+        !output.contains("rocm services stop"),
+        "a live service this invocation cannot reuse must refuse on the GPU, not send the \
+         user to stop it and re-run into the same refusal:\n{output}"
     );
 }
 
@@ -1549,7 +1598,7 @@ async fn assert_oom_launch_quotes_the_real_line(world: &mut E2eWorld) {
     // The only assertion in this scenario that can fail on the symptom
     // *selection*. The other two Then steps match text `oom_memory_note` emits
     // unconditionally, so deleting the `is_rocm_authored_log_line` filter — or
-    // dropping the `rocm diagnose` sentence altogether — left serve-25 green
+    // dropping the `rocm diagnose` sentence altogether — left serve-26 green
     // while the note silently fell back to the canonical symptom. That is the
     // bug the fixture's engine-error block was added to expose, and nothing
     // asserted it.

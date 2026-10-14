@@ -307,14 +307,15 @@ enum ManagedSpawn {
     },
 }
 
-/// Why a live managed service matching this engine and model still cannot be
-/// reused by this invocation — or `None` when it genuinely can.
+/// The ways a live managed service that already matches on liveness, engine and
+/// canonical model id can still be unusable by this invocation.
 ///
-/// Liveness, engine and canonical model id are necessary but not sufficient:
+/// Those three terms are necessary but not sufficient:
 /// [`spawn_managed_engine_child`] refuses reuse on two further terms, and under
-/// `gpu_required` the serve path adds a third. Both the spawn and `serve()`'s
-/// reuse pre-gate ask *this* function so the two cannot answer differently,
-/// which they previously did — see [`ManagedReuseRefusal`] for what that cost.
+/// `gpu_required` the serve path adds a third. One variant per term.
+/// [`managed_service_reuse_refusal`] is the single decision procedure both
+/// callers ask, so the two cannot answer differently — which they previously
+/// did; see that function for what the disagreement cost.
 pub(crate) enum ManagedReuseRefusal {
     /// The live service was started with different serve options.
     RecipeMismatch,
@@ -337,7 +338,8 @@ pub(crate) enum ManagedReuseRefusal {
     DevicePolicyTooWeak,
 }
 
-/// See [`ManagedReuseRefusal`].
+/// Why this invocation cannot reuse `existing` — or `None` when it genuinely
+/// can. See [`ManagedReuseRefusal`] for the terms this answers on.
 ///
 /// This exists because `serve()`'s reuse pre-gate lets a matching live service
 /// skip the no-usable-AMD-GPU refusal. Deciding that bypass on a *weaker* test

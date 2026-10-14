@@ -296,71 +296,6 @@ Feature: Model serving
     Then the serve plan warns the GPU is low on VRAM
     And the serve plan explains how to lower vLLM's memory reservation
 
-  # Regression test (EAI-8059 review): re-issuing `serve` against an
-  # already-running managed service must never blame *this* invocation for the
-  # other process's failure — nothing was launched here, so there is nothing for
-  # it to have OOM'd on. What this scenario covers end-to-end is that the reuse
-  # summary carries no memory guidance; it does NOT discriminate the
-  # `already_running` clause of `append_oom_serve_note`'s guard, because the real
-  # reuse path reports `log_path: None` and the note is withheld on that ground
-  # alone. The planted OOM log therefore states the premise (a live service whose
-  # log does carry a real allocator signature) rather than driving the assertion.
-  # The `already_running` clause itself is pinned by the unit test
-  # `append_oom_serve_note_ignores_an_already_running_services_log`, which feeds
-  # it an OOM-bearing log path directly.
-  # Runs on the no-GPU mock host: reusing an already-running managed service
-  # launches nothing and pins no GPU, so `rocm serve` bypasses the GPU-required
-  # pre-flight and reaches the reuse short-circuit even here. It therefore gates
-  # every PR and allocates no GPU memory.
-  @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
-  Scenario: serve-24 - Reusing an already-running serve never blames it for another process's OOM
-    Given a live managed vLLM serve has an OOM startup log
-    When the user opens its interactive serve summary
-    Then the summary reflects the reused already-running service
-    And the deployment summary does not blame this invocation for GPU memory
-
-  # Positive counterpart of serve-24 (EAI-8059 review asked for both): when
-  # THIS invocation launches a managed vLLM serve that OOMs and never becomes
-  # ready, the summary MUST name the memory knobs. A real launch cannot run on a
-  # GPU-less host, so the mock lane build compiles in a test-only fault-injection
-  # hook (feature `e2e-oom-fault-injection`, armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
-  # that fabricates exactly that failed-launch state — an owned log carrying a real
-  # allocator OOM signature, status "starting", nothing reused. The hook is absent
-  # from shipped binaries, so @requires-oom-fault-injection skips this on the
-  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane,
-  # where xtask builds the binary with the feature. @requires-no-gpu because the
-  # fabricated launch stands in for the GPU the mock lane does not have.
-  @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
-  Scenario: serve-25 - A launch that runs out of GPU memory names the memory knobs
-    Given a managed vLLM launch will run out of GPU memory
-    When the user opens the interactive serve summary for that launch
-    Then the deployment summary blames this launch for GPU memory
-    And the deployment summary names the GPU memory knobs
-    And the deployment summary quotes the engine's own failing line
-
-  # Regression test for the GPU fail-fast contract (EAI-8059 review). The reuse
-  # pre-gate that lets an already-running service skip the no-usable-GPU bail used
-  # to key on the ENGINE alone, so any live managed service was enough to pull the
-  # reuse probe's engine work — for a self-managing engine, an
-  # `ensure_self_managed_engine_ready` that prints "Preparing <engine> for GPU
-  # serving..." and downloads an install — in front of the bail. On a GPU-less
-  # host that is exactly backwards: the invocation can never reuse a service for a
-  # DIFFERENT model, so it must refuse first and prepare nothing.
-  #
-  # Lemonade specifically, because it is the engine that manages its own runtime
-  # and therefore the one whose preparation is user-visible; the planted record
-  # names lemonade too, so the engine matches and the MODEL is the only thing
-  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
-  # no service planted at all, and serve-24 plants the SAME model, so neither
-  # discriminates the model keying — this one does.
-  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
-  Scenario: serve-26 - A live service for another model does not soften the no-GPU refusal
-    Given a live managed Lemonade serve for an unrelated model
-    When the user serves a different model with Lemonade under the GPU-required default
-    Then serving is refused before any engine starts
-    And the user is told no AMD GPU was detected
-    And no engine was prepared for GPU serving
-
   # `--require-api-key` reuse refusal (#604). A running server's key is read once
   # at launch; reuse cannot retroactively satisfy a demand for auth the server
   # never got, so the idempotency guard refuses instead of upgrading the record
@@ -380,9 +315,101 @@ Feature: Model serving
   # Windows detached-spawn primitive), so this scenario cannot reach the
   # refusal it exercises there.
   @id:serve-require-api-key-refuses-unauthenticated-reuse @requires-gpu @requires-engine:lemonade @requires-os:linux
-  Scenario: serve-27 - Reusing a running server without a key refuses a --require-api-key request
+  Scenario: serve-24 - Reusing a running server without a key refuses a --require-api-key request
     Given a managed runtime is active
     And an unauthenticated Lemonade service is already running for that model
     When the user serves that same model again with --require-api-key
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
+
+  # Regression test (EAI-8059 review): re-issuing `serve` against an
+  # already-running managed service must never blame *this* invocation for the
+  # other process's failure — nothing was launched here, so there is nothing for
+  # it to have OOM'd on. What this scenario covers end-to-end is that the reuse
+  # summary carries no memory guidance; it does NOT discriminate the
+  # `already_running` clause of `append_oom_serve_note`'s guard, because the real
+  # reuse path reports `log_path: None` and the note is withheld on that ground
+  # alone. The planted OOM log therefore states the premise (a live service whose
+  # log does carry a real allocator signature) rather than driving the assertion.
+  # The `already_running` clause itself is pinned by the unit test
+  # `append_oom_serve_note_ignores_an_already_running_services_log`, which feeds
+  # it an OOM-bearing log path directly.
+  # Runs on the no-GPU mock host: reusing an already-running managed service
+  # launches nothing and pins no GPU, so `rocm serve` bypasses the GPU-required
+  # pre-flight and reaches the reuse short-circuit even here. It therefore gates
+  # every PR and allocates no GPU memory.
+  @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
+  Scenario: serve-25 - Reusing an already-running serve never blames it for another process's OOM
+    Given a live managed vLLM serve has an OOM startup log
+    When the user opens its interactive serve summary
+    Then the summary reflects the reused already-running service
+    And the deployment summary does not blame this invocation for GPU memory
+
+  # Positive counterpart of serve-25 (EAI-8059 review asked for both): when
+  # THIS invocation launches a managed vLLM serve that OOMs and never becomes
+  # ready, the summary MUST name the memory knobs. A real launch cannot run on a
+  # GPU-less host, so the mock lane build compiles in a test-only fault-injection
+  # hook (feature `e2e-oom-fault-injection`, armed by `ROCM_E2E_SIMULATE_OOM_LAUNCH`)
+  # that fabricates exactly that failed-launch state — an owned log carrying a real
+  # allocator OOM signature, status "starting", nothing reused. The hook is absent
+  # from shipped binaries, so @requires-oom-fault-injection skips this on the
+  # self-hosted lanes (prebuilt release binary) and it runs on the mock lane,
+  # where xtask builds the binary with the feature. @requires-no-gpu because the
+  # fabricated launch stands in for the GPU the mock lane does not have.
+  @id:serve-oom-launch-memory-guidance @requires-no-gpu @requires-os:linux @requires-oom-fault-injection
+  Scenario: serve-26 - A launch that runs out of GPU memory names the memory knobs
+    Given a managed vLLM launch will run out of GPU memory
+    When the user opens the interactive serve summary for that launch
+    Then the deployment summary blames this launch for GPU memory
+    And the deployment summary names the GPU memory knobs
+    And the deployment summary quotes the engine's own failing line
+
+  # Regression test for the GPU fail-fast contract (EAI-8059 review). The reuse
+  # pre-gate that lets an already-running service skip the no-usable-GPU bail used
+  # to key on the ENGINE alone, so any live managed service was enough to pull the
+  # reuse probe's engine work — for a self-managing engine, an
+  # `ensure_self_managed_engine_ready` that prints "Preparing <engine> for GPU
+  # serving..." and downloads an install — in front of the bail. On a GPU-less
+  # host that is exactly backwards: the invocation can never reuse a service for a
+  # DIFFERENT model, so it must refuse first and prepare nothing.
+  #
+  # Lemonade specifically, because it is the engine that manages its own runtime
+  # and therefore the one whose preparation is user-visible; the planted record
+  # names lemonade too, so the engine matches and the MODEL is the only thing
+  # keeping the pre-gate shut. Scenario 13 already covers the plain refusal with
+  # no service planted at all, and serve-25 plants the SAME model, so neither
+  # discriminates the model keying — this one does.
+  @id:serve-unrelated-live-service-still-fails-fast @requires-no-gpu
+  Scenario: serve-27 - A live service for another model does not soften the no-GPU refusal
+    Given a live managed Lemonade serve for an unrelated model
+    When the user serves a different model with Lemonade under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And no engine was prepared for GPU serving
+
+  # Regression test for the reuse pre-gate's *acceptance* term (EAI-8059
+  # review). serve-25 plants a record this invocation really can reuse, and
+  # serve-27 plants one for a different model, so the gate's outer condition is
+  # false there. Neither reaches the case this one does: a live service that
+  # matches on liveness, engine and canonical model id — so the outer condition
+  # holds — but that `spawn_managed_engine_child` would still refuse. Deciding
+  # the no-GPU bypass on the weaker test sent the user to a dead end: the bail
+  # was skipped, the spawn told them to stop the running server and re-run, and
+  # the re-run — with nothing left to reuse — hit the no-GPU refusal the first
+  # run had bypassed. The advice named a command that could not clear the
+  # condition.
+  #
+  # `--require-api-key` against a service that has no key is the cheapest way to
+  # make `managed_service_reuse_refusal` answer Some on a record that is
+  # otherwise a perfect match; the recipe-mismatch term would do as well. The
+  # discriminating assertion is the absence of the stop advice: with the gate
+  # back on `existing_live_managed_service(..).is_some()` the run reaches the
+  # spawn and prints it. `--env-id` satisfies model resolution without
+  # installing a runtime, exactly as serve-25 does.
+  @id:serve-unreusable-live-service-still-fails-fast @requires-no-gpu @requires-os:linux
+  Scenario: serve-28 - A live service this invocation cannot reuse does not soften the no-GPU refusal
+    Given a live managed vLLM serve has an OOM startup log
+    When the user serves that same model with --require-api-key under the GPU-required default
+    Then serving is refused before any engine starts
+    And the user is told no AMD GPU was detected
+    And the user is not told to stop the running server

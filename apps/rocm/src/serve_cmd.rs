@@ -4,12 +4,18 @@
 
 //! `rocm serve` command handler and engine-recipe overrides.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — the
-//! `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
+//! Originally a mechanical relocation from `main.rs` with no behavior change —
+//! the `dispatch()` call site stays byte-identical (`serve(ServeArgs { .. })`,
 //! re-imported via `use crate::serve_cmd::{ServeArgs, select_serve_engine, serve};`
 //! — `select_serve_engine` rides along for `assess_model_for_host`, not dispatch).
 //! `Cli` is not referenced from this file; `DevicePolicyArg` (part of the clap arg tree)
 //! is, via `use crate::DevicePolicyArg`.
+//!
+//! That "no behavior change" describes the move itself, not the file's history
+//! since: EAI-8059 added the model-keyed reuse pre-gate below, which is new
+//! serve behaviour and the one thing that can run ahead of the no-usable-GPU
+//! bail. Read the comment at the pre-gate, not this paragraph, for what the
+//! serve path does today.
 //!
 //! `collect_serve_notes` and `validate_pinned_gpu_index` stay in `main.rs`
 //! (no entanglement; a later pass can relocate them). The

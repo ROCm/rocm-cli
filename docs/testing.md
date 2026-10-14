@@ -1371,43 +1371,54 @@ cargo test -p xtask the_release_workflow_builds_no_feature_gated_binaries
 cargo test -p xtask prebuilt_e2e_lanes_enable_test_hooks
 ```
 
-E2E scenarios, in `tests/e2e-cucumber/features/model_serving.feature`. Run the
-suite unfiltered and let the harness select:
+E2E scenarios, in
+[`tests/e2e-cucumber/features/model_serving.feature`](../tests/e2e-cucumber/features/model_serving.feature).
+Run the suite unfiltered and let the harness select:
 
 ```bash
 cargo xtask e2e
 ```
 
-There is deliberately no focused command for these three. Cucumber 0.23 honours
+There is deliberately no focused command for these four. Cucumber 0.23 honours
 *either* its own CLI filter *or* the harness closure, never both, so `-n` or
 `--tags` bypasses the OS, capability and expectation resolution that decides
 whether a scenario may run at all (see the comment at
-`tests/e2e-cucumber/tests/e2e.rs`, above `only_lifecycle`). That matters most
-for serve-25, which is gated on the `@requires-oom-fault-injection` capability:
+[`tests/e2e-cucumber/tests/e2e.rs`](../tests/e2e-cucumber/tests/e2e.rs), above
+`only_lifecycle`). That matters most
+for serve-26, which is gated on the `@requires-oom-fault-injection` capability:
 selected from the CLI it would run on a binary built without the hook and fail
 for the wrong reason. Note also that `-n` matches the scenario *name*
-(`serve-24 - Reusing an already-running serve ...`), not the `@id:` tag, so
+(`serve-25 - Reusing an already-running serve ...`), not the `@id:` tag, so
 passing an id to it silently selects nothing.
 
-- serve-24, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
+- serve-25, `@id:serve-oom-memory-guidance` — a `serve` that reuses an
   already-running vLLM service whose log *does* carry an OOM traceback prints
   the reuse summary with no memory guidance in it.
-- serve-25, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
+- serve-26, `@id:serve-oom-launch-memory-guidance` — a launch that runs out of
   GPU memory blames this launch and names the knobs. The positive counterpart of
-  serve-24.
-- serve-26, `@id:serve-unrelated-live-service-still-fails-fast` — a live
+  serve-25.
+- serve-27, `@id:serve-unrelated-live-service-still-fails-fast` — a live
   Lemonade service for an *unrelated* model does not soften the no-GPU refusal:
   serving a different model is refused before any engine starts, and nothing is
   prepared or downloaded. Lemonade specifically, because it manages its own
   runtime and so is the engine whose preparation is user-visible.
+- serve-28, `@id:serve-unreusable-live-service-still-fails-fast` — a live vLLM
+  service for the *same* model, which this invocation nonetheless cannot reuse
+  (`--require-api-key` against a service that has no key), also does not soften
+  the refusal. This is the pre-gate's *acceptance* term, which serve-25 and
+  serve-27 cannot reach: serve-25 plants a record that really is reusable, and
+  serve-27 fails the gate's outer engine/model condition before the acceptance
+  test runs. The discriminating assertion is that the `rocm services stop`
+  advice is absent — that advice is printed only from the spawn, which is
+  reachable only once the no-GPU bail has been bypassed.
 
-All three carry `@requires-no-gpu` (their premise is a host with no usable AMD
-GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-24
-and serve-25 also carry `@requires-os:linux`.
+All four carry `@requires-no-gpu` (their premise is a host with no usable AMD
+GPU), so they get their live coverage on the GitHub-hosted mock lane; serve-25,
+serve-26 and serve-28 also carry `@requires-os:linux`.
 
 ### The OOM fault-injection capability
 
-serve-25 needs a managed launch that really failed on VRAM, which a GPU-less CI
+serve-26 needs a managed launch that really failed on VRAM, which a GPU-less CI
 host cannot produce. It is therefore driven by a test-only fault-injection hook:
 the `rocm` crate feature `e2e-oom-fault-injection`, armed at run time by
 `ROCM_E2E_SIMULATE_OOM_LAUNCH=1`, makes `rocm serve` fabricate the on-disk state
@@ -1425,13 +1436,22 @@ from that variable alone, and xtask clears it rather than inheriting it when it
 was handed a prebuilt binary.
 
 Consequently, every lane that runs a **prebuilt** `ROCM_CLI_BINARY` — the
-self-hosted lanes in `e2e-selfhosted.yml`, the `nightly.yml` lanes, and the
-Windows lifecycle lane in `ci.yml` — has the hook compiled out and resolves
-serve-25 to a reported **skip**, not a silent pass. It gates PRs on the
-GitHub-hosted mock lane, which lets `cargo xtask e2e` build the binary itself.
-The prebuilt lanes' `--features` floor is asserted as a superset check rather
-than an exact match for this reason; see the test notes on
-`assert_prebuilt_e2e_lanes_enable_test_hooks` in `xtask/src/workflow_contract.rs`.
+self-hosted lanes in [`e2e-selfhosted.yml`](../.github/workflows/e2e-selfhosted.yml)
+and the [`nightly.yml`](../.github/workflows/nightly.yml) lanes — has the hook
+compiled out and resolves serve-26 to a reported **skip**, not a silent pass. It
+gates PRs on the GitHub-hosted mock lane, which lets `cargo xtask e2e` build the
+binary itself. The prebuilt lanes' `--features` floor is asserted as a superset
+check rather than an exact match for this reason; see the test notes on
+`assert_prebuilt_e2e_lanes_enable_test_hooks` in
+[`xtask/src/workflow_contract.rs`](../xtask/src/workflow_contract.rs).
+
+Be precise about *which* gate produces the skip, because the hook is not always
+the one that decides. On the Windows lifecycle lane in
+[`ci.yml`](../.github/workflows/ci.yml) the hook is compiled out too, but
+serve-26 is never selected there at all: that lane runs `E2E_ONLY_LIFECYCLE` and
+the scenario carries `@requires-os:linux`. On the GPU lanes it is
+`@requires-no-gpu` that excludes it. The missing hook is the deciding gate only
+where a Linux, GPU-less lane runs a prebuilt binary.
 
 ## Windows Tool Notes
 

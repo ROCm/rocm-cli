@@ -1479,6 +1479,174 @@ mod tests {
         Ok(())
     }
 
+    /// Two branches `the_echoed_tail_never_welds…` cannot reach, because its
+    /// fixture breaks on a bare `\r` and so its *selected segment* is already
+    /// one row by the time either branch runs. Both survived a mutation run
+    /// against the whole `process.rs` suite before this test existed:
+    ///
+    ///   - computing `oom_utilization_hint` from the sanitized summary instead
+    ///     of the raw tail (103 passed, exit 0), and
+    ///   - swapping `vllm_oom_display_line` for
+    ///     `strip_terminal_control_sequences` (103 passed, exit 0).
+    ///
+    /// `ESC[2K` is the discriminator. [`rocm_core::terminal::rendered_lines`]
+    /// ends a row on it, but `vllm_log_segments` does not split on it at all, so
+    /// the segment reaching both branches really does carry two rows and an
+    /// escape — which is what vLLM's colourised progress bar actually emits.
+    #[test]
+    fn the_hint_reads_the_raw_tail_and_displays_the_row_that_scored() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let repaint = format!("Loading weights: 90%\u{1b}[2K{exception}");
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-repaint-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, format!("{repaint}\n"))?;
+        let context = startup_log_context(Some(path.as_path()));
+        fs::remove_file(&path).ok();
+
+        // Branch 1 — the hint is computed from the *raw* tail. There the segment
+        // still carries the `ESC[2K`, so the quoting guard rejects it and the
+        // printed command names the canonical symptom. Computed from the
+        // sanitized summary instead, the escape is gone, the guard accepts, and
+        // the exception would be quoted verbatim.
+        assert!(
+            context.contains(&format!(
+                "`{} '{}'`",
+                rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
+            )),
+            "an escape-bearing segment must fall back to the canonical symptom: {context:?}"
+        );
+        assert!(
+            !context.contains(&format!("'vllm: {exception}'")),
+            "the raw segment is not quotable, so its rendered row must not be quoted: {context:?}"
+        );
+
+        // Branch 2 — the displayed line is the row that scored. Stripping the
+        // segment instead welds the progress bar onto the exception, producing a
+        // line vLLM never printed.
+        assert!(
+            context.contains(&format!(
+                "{}{exception})",
+                rocm_core::VLLM_OOM_DETECTED_PREFIX
+            )),
+            "the hint must display the scoring row alone: {context:?}"
+        );
+        assert!(
+            !context.contains(&format!("Loading weights: 90%{exception}")),
+            "the displayed line must never weld the progress bar onto the exception: {context:?}"
+        );
+        Ok(())
+    }
+
+    /// The end-to-end bound on the raw-split guarantee, measured rather than
+    /// assumed — and the reason the obvious tightening is not available.
+    ///
+    /// `vllm_log_segments` keeps raw bytes so a colourised OOM line is refused
+    /// by the quoting guard rather than printed as a stripped lookalike. That
+    /// holds for each surface on the text it reads. It does not survive the
+    /// engine's own bail: the echo here is necessarily sanitized (it goes to a
+    /// terminal), the supervisor appends the bail to the same shared log, and
+    /// the raw line then falls out of the CLI's `DEFAULT_LOG_TAIL_LINES` window.
+    /// So the two surfaces can print different `--symptom` arguments for one
+    /// failure. This pins both halves: that the difference exists and is
+    /// harmless, and that filtering the echo out would cost the note entirely.
+    #[test]
+    fn the_colourised_round_trip_quotes_the_row_the_terminal_drew() -> Result<()> {
+        let exception = "torch.OutOfMemoryError: HIP out of memory. Tried to allocate 7.21 GiB.";
+        let coloured = format!("\u{1b}[31m{exception}\u{1b}[0m");
+        let mut log = String::new();
+        for shard in 0..200 {
+            log.push_str(&format!("INFO vllm.engine loading shard {shard}\n"));
+        }
+        log.push_str(&format!("{coloured}\n"));
+        let path = std::env::temp_dir().join(format!(
+            "rocm-vllm-roundtrip-{}-{}.log",
+            std::process::id(),
+            current_unix_millis()
+        ));
+        fs::write(&path, &log)?;
+
+        // Read 1 — the engine. The raw segment carries escapes, so the guard
+        // rejects it and the canonical symptom is printed.
+        let context = startup_log_context(Some(path.as_path()));
+        assert!(
+            context.contains(&format!(
+                "`{} '{}'`",
+                rocm_core::VLLM_OOM_DIAGNOSE_COMMAND,
+                rocm_core::VLLM_OOM_CANONICAL_SYMPTOM
+            )),
+            "the engine must refuse the colourised line and fall back: {context:?}"
+        );
+
+        // The supervisor appends the whole bail to the same log.
+        fs::write(
+            &path,
+            format!(
+                "{log}Error: vLLM server process exited before becoming ready \
+                 (status: exit status: 1){context}\n"
+            ),
+        )?;
+        let tail = tail_lines(&path, STARTUP_FAILURE_LOG_TAIL_LINES)?.join("\n");
+        fs::remove_file(&path).ok();
+
+        // The measurement the bound rests on: the engine's raw line is no longer
+        // in the window the CLI reads. Only the sanitized echo of it is.
+        assert!(
+            !tail.contains(&coloured),
+            "the raw colourised line must be out of the window, or this test proves nothing"
+        );
+
+        // Read 2 — the CLI. It quotes the rendered row, not the canonical
+        // symptom. Different from read 1, and sound: the row is text the
+        // terminal drew, it is quotable, and quotable implies diagnosable.
+        let symptom = rocm_core::vllm_oom_diagnose_symptom(&tail)
+            .expect("the echoed tail must still carry a detectable OOM");
+        assert_eq!(symptom, format!("vllm: {exception}"));
+        assert!(rocm_core::quotable_in_single_quotes(&symptom));
+        assert!(rocm_core::vllm_oom_symptom_is_diagnosable(&symptom));
+
+        // And the half that forecloses the tightening. The echo is a full tail
+        // window plus the hint, so by the time the CLI reads, the window has
+        // scrolled past the `lines of startup log:` header entirely: it holds
+        // echoed rows and rocm-cli's own hint, and nothing the engine wrote
+        // directly. A filter anchored on that header therefore never fires.
+        let header = format!("Last {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:");
+        assert!(
+            !tail.contains(header.as_str()),
+            "the echo header must have scrolled out, or the window still holds raw engine output"
+        );
+        // Anchored on the hint instead and scanning newest-first — the only
+        // other marker available — suppression swallows the whole window and
+        // the serve summary's note disappears for every real managed launch.
+        let mut inside_echo = false;
+        let still_selectable: Vec<&str> = tail
+            .lines()
+            .flat_map(|line| line.split('\r'))
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter(|segment| {
+                if segment.contains(rocm_core::VLLM_OOM_DIAGNOSE_COMMAND) {
+                    inside_echo = true;
+                }
+                !inside_echo
+            })
+            .collect();
+        assert!(
+            still_selectable
+                .iter()
+                .all(|segment| rocm_core::vllm_oom_diagnose_symptom(segment).is_none()),
+            "keeping the echo out of the CLI's selection leaves no OOM line at all: \
+             {still_selectable:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn oom_utilization_hint_stays_quiet_for_unrelated_failures() {
         let unrelated = "ValueError: model architecture 'FooForCausalLM' is not supported";

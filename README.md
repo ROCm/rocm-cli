@@ -743,6 +743,17 @@ service for a different engine does not soften the refusal, and neither does one
 for a model whose name does not overlap — those still fail fast with the usual
 message and prepare nothing.
 
+Matching the engine and model is necessary but not sufficient. The exemption
+applies only when the service would *actually* be reused, which is the same test
+the launch itself applies: the recipe settings must match (the sampling-control
+rule under [Model serving](#model-serving) above), a `--require-api-key` request must be
+satisfiable by a service that already has a key, and the service's own device
+policy must be at least as strong as this invocation's. A live service that
+fails any of those is not reusable, so it buys no bypass — `rocm serve` refuses
+on the GPU first, which is the accurate message and leaves your running server
+alone. (Telling you to stop it and re-run would not help: the re-run would have
+nothing left to reuse and would hit the same GPU refusal.)
+
 Two limits are worth stating exactly, because they are easy to read as stronger
 than they are:
 
