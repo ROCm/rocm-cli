@@ -49,9 +49,11 @@ mod uninstall;
 // `runtime_key_for_python` because other root-level commands outside
 // `dispatch()` call them directly, the engine spawn seam
 // (`ManagedEngineSpawnRequest`, `SpawnManagedEngine`,
-// `spawn_managed_engine_process`, `watch_managed_engine_startup`) because
-// `restart_internal_managed_service` (also outside `dispatch()`) starts its
-// child through the same spawner as the launch path, and
+// `spawn_managed_engine_process`, `watch_managed_engine_startup`,
+// `ManagedStartupRecord`, `adopt_spawned_engine_child`) because
+// `restart_internal_managed_service` (also outside `dispatch()`) starts and
+// records its child through the same spawner and startup check as the launch
+// path, and
 // `ensure_public_service_has_endpoint_key`/`is_loopback_host` because the
 // loopback/endpoint-key checks below call them directly. `install()`'s SDK
 // path calls into `runtime_install_finalize` directly (not via `dispatch()`),
@@ -11074,9 +11076,9 @@ fn update_restarting_record(
 }
 
 /// Record the child a restart just started as `"starting"`, over the record its
-/// confirmed stop left (`stopped`). Fails when that record has changed since: the child
-/// is then running but unrecorded, and the caller has to hear that rather than
-/// a claim that the service restarted.
+/// confirmed stop left (`stopped`). Fails when that record has changed since:
+/// the child is then running but unrecorded, and the caller has to hear that
+/// rather than a claim that the service restarted.
 ///
 /// `runtime_pin` is re-applied here because the record on disk does not carry
 /// it: the restart's own load refreshed the record from the outgoing process's
@@ -24960,9 +24962,9 @@ install therock";
     /// Its pid is this test process, which keeps that marker in the record the
     /// restart loads — the load-time refresh settles a marker only once every
     /// recorded pid is gone — while the restart's own stop never signals it,
-    /// since a stop skips the caller's pid. So the record in the restart's hands
-    /// carries a marker, and any of its writes that does not clear it puts the
-    /// marker back on disk.
+    /// since a stop skips the caller's pid. That stop therefore confirms, and
+    /// clears the marker; a restart write applied to a stale copy of the record
+    /// would put it back on disk.
     fn previous_lemonade_run(paths: &AppPaths, service_id: &str, port: u16) -> Result<()> {
         let mut record = ManagedServiceRecord::new(
             paths,
@@ -25115,8 +25117,8 @@ install therock";
 
     /// The restart's counterpart of the launch test above: a death the spawn
     /// itself saw keeps the dead child off the record, which is retired naming
-    /// only the previous run's pids, as the stop left them. The restart is counted
-    /// and the stop's marker cleared, since a child did spawn. The old pids carry
+    /// only the previous run's pids, as the stop left them. The restart is counted,
+    /// since a child did spawn, and no stop marker is put back. The old pids carry
     /// whatever exposure to pid reuse the stopped record already had; the change
     /// adds none.
     #[test]
@@ -25158,16 +25160,13 @@ install therock";
     }
 
     /// A restart whose spawn fails has replaced nothing, so it must leave the
-    /// record exactly as its stop wrote it. Not retired as `"failed"`: after a
-    /// stop that could not confirm its process gone, that would wipe the stop's
-    /// pending-stop marker — which still has to reclaim the endpoint key once the
-    /// survivor exits — and stop the survivor's record counting as live, letting a
-    /// new `rocm serve` onto a port it may still hold. And no restart counted.
+    /// record exactly as its stop wrote it: not retired as `"failed"`, and no
+    /// restart counted.
     ///
     /// Compared byte for byte against the manifest as it stood when the spawn was
     /// attempted, i.e. right after the stop, so this holds whatever the stop
-    /// wrote. (A stop that cannot confirm is not reproducible here: the record's
-    /// pid would have to be a process `SIGKILL` cannot end.)
+    /// wrote. (A stop that cannot confirm never reaches the spawn — see
+    /// `restart_does_not_start_an_engine_over_an_unconfirmed_stop`.)
     #[test]
     fn a_restart_whose_spawn_fails_leaves_the_record_as_its_stop_wrote_it() -> Result<()> {
         let (root, paths) = test_paths("managed-restart-spawn-fails");
@@ -25209,6 +25208,60 @@ install therock";
             (after.status.as_str(), after.restart_count),
             ("stopped", 0),
             "the stop's `stopped` stands, and nothing was restarted"
+        );
+        Ok(())
+    }
+
+    /// A stop asked for while the restart's startup check runs persists its
+    /// marker before it signals anything. The restart's writes around that
+    /// check go to the record as it is on disk, never a copy it holds, so
+    /// retiring the dead child keeps the marker — the liveness refresh still
+    /// needs it to finish that stop.
+    #[test]
+    fn a_restart_retiring_a_dead_child_keeps_a_stop_asked_for_during_its_check() -> Result<()> {
+        let (root, paths) = test_paths("managed-restart-stop-during-check");
+        paths.ensure()?;
+        let service_id = "lemonade-qwen-restart-6";
+        previous_lemonade_run(&paths, service_id, 11532)?;
+        let manifest_path = paths.service_manifest_path(service_id);
+        let spawn = |_request: &ManagedEngineSpawnRequest<'_>| -> Result<SpawnedManagedEngine> {
+            let manifest_path = manifest_path.clone();
+            Ok(SpawnedManagedEngine {
+                pid: stand_in_child_pid(),
+                startup: ManagedEngineStartupCheck::Pending(Box::new(move || {
+                    let mut stopping = manifest_on_disk(&manifest_path)
+                        .expect("the child is on record before its check");
+                    stopping.stop_requested_unix_ms = Some(4_242);
+                    stopping.write()?;
+                    Ok(Some(exit_status_from_code(3)))
+                })),
+            })
+        };
+
+        let outcome = restart_internal_managed_service_with(
+            &paths,
+            service_id,
+            None,
+            terminate_recorded_service_pids,
+            &spawn,
+            &readiness_must_not_be_reached,
+        );
+        let after = manifest_on_disk(&manifest_path);
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            outcome.is_err(),
+            "a restart whose engine died at startup must fail"
+        );
+        let after = after.expect("the record is still on disk");
+        assert_eq!(
+            (
+                after.status.as_str(),
+                after.supervisor_pid,
+                after.stop_requested_unix_ms,
+            ),
+            ("failed", stand_in_child_pid(), Some(4_242)),
+            "the dead child is retired and the stop asked for meanwhile survives"
         );
         Ok(())
     }
