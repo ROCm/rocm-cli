@@ -2824,11 +2824,10 @@ mod tests {
         // CI timeout rather than a readable failure. Watched, it fails here with
         // a message naming the cause.
         let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
-        let probe_fifo = fifo.clone();
         thread::Builder::new()
             .name("kfd-open-probe-test".to_owned())
             .spawn(move || {
-                let _ = verdict_tx.send(device_readable_within(&probe_fifo, probe_timeout));
+                let _ = verdict_tx.send(device_readable_within(&fifo, probe_timeout));
             })
             .context("could not start the watched probe thread")?;
         let watchdog = probe_timeout * 20;
