@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Result, anyhow, bail};
-use rocm_core::AppPaths;
+use rocm_core::{AppPaths, runtime_home_dir};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -128,7 +128,11 @@ fn ensure_hf_checkpoint_downloaded(
         if direct_llama_model_path(&paths, &request.model_ref).is_some() {
             Ok(())
         } else {
-            bail!("Lemonade did not download `{}`", request.model_ref)
+            bail!(
+                "Lemonade did not download `{}` (searched {})",
+                request.model_ref,
+                describe_hf_cache_roots(&paths)
+            )
         }
     })();
     let _ = terminate_pid(child.id(), true);
@@ -178,8 +182,9 @@ pub(crate) fn ensure_direct_llama_model_available(
             Ok(())
         } else {
             bail!(
-                "Lemonade did not download `{}` for direct ROCm serving",
-                request.model_ref
+                "Lemonade did not download `{}` for direct ROCm serving (searched {})",
+                request.model_ref,
+                describe_hf_cache_roots(&paths)
             )
         }
     })();
@@ -338,12 +343,20 @@ pub(crate) fn direct_llama_model_path(paths: &AppPaths, model_ref: &str) -> Opti
 }
 
 fn hf_cache_roots(paths: &AppPaths) -> Vec<PathBuf> {
-    hf_cache_roots_from(paths, |name| std::env::var_os(name).map(PathBuf::from))
+    hf_cache_roots_from(
+        paths,
+        |name| std::env::var_os(name).map(PathBuf::from),
+        runtime_home_dir,
+    )
 }
 
-fn hf_cache_roots_from<F>(paths: &AppPaths, mut env_path: F) -> Vec<PathBuf>
+/// `home_dir` is only consulted when `HOME` is unset, which is always true on Windows
+/// (Lemonade still caches under `%USERPROFILE%\.cache\huggingface\hub`); it's injected
+/// so the fallback can be exercised without depending on the host's actual platform.
+fn hf_cache_roots_from<F, H>(paths: &AppPaths, mut env_path: F, home_dir: H) -> Vec<PathBuf>
 where
     F: FnMut(&str) -> Option<PathBuf>,
+    H: FnOnce() -> Option<PathBuf>,
 {
     let mut roots = Vec::new();
     if let Some(hub_cache) = env_path("HUGGINGFACE_HUB_CACHE") {
@@ -353,13 +366,27 @@ where
         push_hf_cache_root(&mut roots, hf_home.join("hub"));
     }
     push_hf_cache_root(&mut roots, paths.cache_dir.join("huggingface").join("hub"));
-    if let Some(home) = env_path("HOME") {
+    if let Some(home) = env_path("HOME").or_else(home_dir) {
         push_hf_cache_root(
             &mut roots,
             home.join(".cache").join("huggingface").join("hub"),
         );
     }
     roots
+}
+
+/// Render the cache directories `hf_cache_roots` searches, for use in an error message
+/// when none of them held the expected file.
+fn describe_hf_cache_roots(paths: &AppPaths) -> String {
+    let roots = hf_cache_roots(paths);
+    if roots.is_empty() {
+        return "no Hugging Face cache directories could be determined".to_owned();
+    }
+    roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn push_hf_cache_root(roots: &mut Vec<PathBuf>, path: PathBuf) {
@@ -741,12 +768,17 @@ mod tests {
             data_dir: PathBuf::from("data"),
             cache_dir: PathBuf::from("rocm-cache"),
         };
-        let roots = hf_cache_roots_from(&paths, |name| match name {
-            "HUGGINGFACE_HUB_CACHE" => Some(PathBuf::from("hf-hub")),
-            "HF_HOME" => Some(PathBuf::from("hf-home")),
-            "HOME" => Some(PathBuf::from("home")),
-            _ => None,
-        });
+        let roots = hf_cache_roots_from(
+            &paths,
+            |name| match name {
+                "HUGGINGFACE_HUB_CACHE" => Some(PathBuf::from("hf-hub")),
+                "HF_HOME" => Some(PathBuf::from("hf-home")),
+                "HOME" => Some(PathBuf::from("home")),
+                _ => None,
+            },
+            // `HOME` is set above, so the fallback must never be consulted.
+            || panic!("home_dir fallback must not run when HOME is set"),
+        );
 
         assert_eq!(
             roots,
@@ -759,6 +791,50 @@ mod tests {
                     .join("huggingface")
                     .join("hub"),
             ]
+        );
+    }
+
+    #[test]
+    fn hf_cache_roots_falls_back_to_platform_home_when_home_unset() {
+        // Windows never sets `HOME`, but Lemonade still caches under
+        // `%USERPROFILE%\.cache\huggingface\hub`; the lookup must fall back to the
+        // platform home directory (here standing in for `runtime_home_dir`, which
+        // itself resolves `USERPROFILE` on Windows) rather than skip the hub cache.
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("rocm-cache"),
+        };
+        let roots = hf_cache_roots_from(
+            &paths,
+            |_name| None,
+            || Some(PathBuf::from(r"C:\Users\dev")),
+        );
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("rocm-cache").join("huggingface").join("hub"),
+                PathBuf::from(r"C:\Users\dev")
+                    .join(".cache")
+                    .join("huggingface")
+                    .join("hub"),
+            ]
+        );
+    }
+
+    #[test]
+    fn hf_cache_roots_skips_home_fallback_when_platform_home_unavailable() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("rocm-cache"),
+        };
+        let roots = hf_cache_roots_from(&paths, |_name| None, || None);
+
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("rocm-cache").join("huggingface").join("hub")]
         );
     }
 }
