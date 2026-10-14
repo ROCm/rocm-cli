@@ -895,12 +895,11 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// code change — the caller just passes more inputs.
 ///
 /// Thin wrapper around [`generate_consolidated_from_reports`]. **Deprecated**
-/// (see below) for every caller, including one that only needs the HTML
-/// output — call [`load_platform_reports`] once and
-/// [`generate_consolidated_from_reports`] directly instead.
-#[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
-            consolidated_summary_markdown from the same `inputs` should call \
-            load_platform_reports once and use generate_consolidated_from_reports/\
+/// for every caller, including one that only needs the HTML output — call
+/// [`load_platform_reports`] once and [`generate_consolidated_from_reports`]
+/// directly instead.
+#[deprecated(note = "re-parses `inputs` on every call; call load_platform_reports \
+            once and use generate_consolidated_from_reports/\
             consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
@@ -987,12 +986,11 @@ pub fn generate_consolidated_from_reports(
 /// [`generate_consolidated`].
 ///
 /// Thin wrapper around [`consolidated_summary_markdown_from_reports`].
-/// **Deprecated** (see below) for every caller, including one that only
-/// needs the markdown output — call [`load_platform_reports`] once and
+/// **Deprecated** for every caller, including one that only needs the
+/// markdown output — call [`load_platform_reports`] once and
 /// [`consolidated_summary_markdown_from_reports`] directly instead.
-#[deprecated(note = "re-parses `inputs` on every call; a caller that also wants \
-            generate_consolidated from the same `inputs` should call \
-            load_platform_reports once and use generate_consolidated_from_reports/\
+#[deprecated(note = "re-parses `inputs` on every call; call load_platform_reports \
+            once and use generate_consolidated_from_reports/\
             consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
@@ -1003,9 +1001,9 @@ pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
 ///
 /// `reports` comes from [`load_platform_reports`], used instead of reparsing
 /// `inputs` itself. `inputs` is still needed for the expectation grid and
-/// scenario reference sections, which are keyed differently and re-parse
-/// `report.json` from `inputs` (the grid also re-parses `platform.json`),
-/// independently of `reports`.
+/// scenario reference sections, which are keyed differently and each build
+/// their own expectation grid from `inputs`, independently re-parsing
+/// `report.json` and `platform.json`, independently of `reports`.
 pub fn consolidated_summary_markdown_from_reports(
     reports: &[PlatformReport],
     inputs: &[(String, PathBuf)],
@@ -1885,6 +1883,48 @@ mod tests {
         assert_eq!(keys, sorted_keys);
         assert_eq!(reports[0].desc.platform, "MI300X");
         assert_eq!(reports[1].desc.platform, "Mock");
+    }
+
+    #[test]
+    fn load_platform_reports_sorts_by_os_and_known_bugs_too() {
+        // The test above only varies platform, and derives its expectation
+        // from `report_sort_key` itself, so a sort that dropped `os` or
+        // `known_bugs` would still pass both it and
+        // `report_sort_key_orders_by_every_dimension` below (which bypasses
+        // `load_platform_reports` entirely and sorts by `report_sort_key`
+        // directly). Go through `load_platform_reports` itself, vary os and
+        // known_bugs with platform held constant, and assert the resulting
+        // order as hard-coded values.
+        let windows_known_bugs = write_report(&feature_json(&[(&[], &["passed"])]));
+        let windows = write_report(&feature_json(&[(&[], &["passed"])]));
+        let ubuntu = write_report(&feature_json(&[(&[], &["passed"])]));
+        // Fed out of sort order: known_bugs-tier Windows, then plain Windows,
+        // then Ubuntu — the reverse of (Ubuntu, Windows, Windows+known_bugs).
+        let inputs = vec![
+            (
+                "e2e-gpu-strix-windows-known-bugs-report".to_string(),
+                windows_known_bugs.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-windows-report".to_string(),
+                windows.path().to_path_buf(),
+            ),
+            (
+                "e2e-gpu-strix-ubuntu-report".to_string(),
+                ubuntu.path().to_path_buf(),
+            ),
+        ];
+
+        let reports = load_platform_reports(&inputs);
+        let actual: Vec<_> = reports
+            .iter()
+            .map(|r| (r.desc.os.as_str(), r.desc.known_bugs))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![("Ubuntu", false), ("Windows", false), ("Windows", true)],
+            "load_platform_reports must sort by os and known_bugs too, not just platform"
+        );
     }
 
     /// Build a `PlatformReport` directly from its sortable fields, bypassing
