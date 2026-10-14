@@ -1087,7 +1087,9 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             "{workflow} job `{job}` should upload exactly one `e2e-*-report` artifact, \
              found {names:?}"
         );
-        names[0].to_owned()
+        // The report job has no `matrix` context, so a lane with a channel axis is
+        // checked through its `release` leg, which stands for the whole lane.
+        names[0].replace("${{ matrix.channel }}", "release")
     }
 
     #[test]

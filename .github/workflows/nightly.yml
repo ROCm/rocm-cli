@@ -716,6 +716,10 @@ jobs:
     name: E2E tests (W7900, incl. nightly-only)
     timeout-minutes: 90
     runs-on: [self-hosted, linux, w7900]
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [release, nightly]
     continue-on-error: true
     env:
       E2E_INCLUDE_NIGHTLY: "1"
@@ -803,7 +807,7 @@ jobs:
           # not a one-shot. See `xtask e2e-prewarm`.
           HF_HOME="$E2E_SHARED_CACHE_DIR/huggingface" \
           UV_CACHE_DIR="$E2E_SHARED_UV_CACHE_DIR" \
-            cargo xtask e2e-prewarm --channel release --prewarm-dir "$prewarm"
+            cargo xtask e2e-prewarm --channel ${{ matrix.channel }} --prewarm-dir "$prewarm"
 
           cargo xtask e2e
 
@@ -811,7 +815,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-gpu-w7900-report
+          name: e2e-gpu-w7900-${{ matrix.channel }}-report
           path: tests/e2e-cucumber/results/
 
   # Strix Halo counterpart to e2e-gpu-nightly. The same @nightly large-model
@@ -1780,7 +1784,9 @@ jobs:
       # flattens a single match into the root and loses its name. The list also
       # holds earlier attempts' artifacts, so a re-run that uploads nothing can
       # pass on the first attempt's report: this can miss a lane, but never
-      # flags one that did upload. LANE_REPORTS, and this script's behaviour,
+      # flags one that did upload. Every lane carries a `matrix.channel` axis and is
+      # checked through its `release` leg (the matrix context does not exist in
+      # this job), which stands for the whole lane. LANE_REPORTS, and this script's behaviour,
       # are pinned by xtask's workflow contract tests. The annotation quotes the
       # lane's `needs` result verbatim; on a `continue-on-error` lane it may read
       # `success` even though the lane failed, so the absent artifact is the
@@ -1792,13 +1798,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEEDS: ${{ toJSON(needs) }}
           LANE_REPORTS: |
-            e2e-gpu-nightly=e2e-gpu-report
-            e2e-gpu-nightly-rad3=e2e-gpu-rad3-report
-            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-report
-            e2e-gpu-nightly-w7900=e2e-gpu-w7900-report
-            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-report
-            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-report
-            e2e-wsl-nightly=e2e-gpu-strix-wsl-report
+            e2e-gpu-nightly=e2e-gpu-release-report
+            e2e-gpu-nightly-rad3=e2e-gpu-rad3-release-report
+            e2e-gpu-nightly-mi350p=e2e-gpu-mi350p-release-report
+            e2e-gpu-nightly-w7900=e2e-gpu-w7900-release-report
+            e2e-gpu-nightly-strix=e2e-gpu-strix-ubuntu-release-report
+            e2e-gpu-nightly-strix-windows=e2e-gpu-strix-windows-release-report
+            e2e-wsl-nightly=e2e-gpu-strix-wsl-release-report
         run: |
           uploaded=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
