@@ -367,9 +367,13 @@ pub(crate) fn managed_service_reuse_refusal(
     if require_api_key && !existing.requires_api_key {
         return Some(ManagedReuseRefusal::MissingApiKey);
     }
-    // Only `gpu_required` can be let down by the record's policy; a `cpu_only`
-    // invocation is satisfied by anything, and it never reaches the GPU bail.
-    if matches!(requested_device_policy, Some(DevicePolicy::GpuRequired))
+    // Every policy that reaches the no-usable-GPU bail can be let down by the
+    // record's, not just `gpu_required`: `serve()` gates that bail on
+    // `matches!(policy, CpuOnly)`, so `gpu_preferred` goes through it exactly as
+    // `gpu_required` does and must not buy its bypass from a `cpu_only` service
+    // either. A `cpu_only` invocation is satisfied by anything and never reaches
+    // the bail; `None` is the spawn, which is not gating the bail at all.
+    if !matches!(requested_device_policy, None | Some(DevicePolicy::CpuOnly))
         && existing.device_policy.as_deref() == Some("cpu_only")
     {
         return Some(ManagedReuseRefusal::DevicePolicyTooWeak);
@@ -1454,6 +1458,29 @@ mod tests {
             managed_service_reuse_refusal(&cpu_only, None, true, Some(&DevicePolicy::GpuRequired)),
             Some(ManagedReuseRefusal::DevicePolicyTooWeak)
         ));
+        // `gpu_preferred` reaches the same bail — `serve()` keys `cpu_only` off
+        // `matches!(policy, CpuOnly)` — so it must be refused on the same record.
+        // Keying the term on `GpuRequired` alone sold the bypass to every
+        // `--device gpu_preferred` serve.
+        assert!(
+            matches!(
+                managed_service_reuse_refusal(
+                    &cpu_only,
+                    None,
+                    true,
+                    Some(&DevicePolicy::GpuPreferred)
+                ),
+                Some(ManagedReuseRefusal::DevicePolicyTooWeak)
+            ),
+            "gpu_preferred goes through the no-usable-GPU bail too, so a cpu_only \
+             service must not buy it a bypass"
+        );
+        // A `cpu_only` serve never reaches the bail, so the term must not fire.
+        assert!(
+            managed_service_reuse_refusal(&cpu_only, None, true, Some(&DevicePolicy::CpuOnly))
+                .is_none(),
+            "a cpu_only invocation is satisfied by a cpu_only service"
+        );
         // The spawn passes no policy, so its acceptance on a GPU host is
         // unchanged by this term — deliberately, since widening it there is not
         // this change's business.

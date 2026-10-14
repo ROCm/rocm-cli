@@ -338,8 +338,15 @@ Feature: Model serving
   # launches nothing and pins no GPU, so `rocm serve` bypasses the GPU-required
   # pre-flight and reaches the reuse short-circuit even here. It therefore gates
   # every PR and allocates no GPU memory.
+  #
+  # Titled for what it proves, not for what it is about: the OOM-absence Then
+  # cannot fail on this path (the note is already withheld for the missing log
+  # path), so replacing the `append_oom_serve_note` call with a no-op leaves this
+  # scenario green — serve-26 is the one that goes red. What only this scenario
+  # proves is the reuse exemption itself: that a GPU-less host reaches the reuse
+  # summary at all.
   @id:serve-oom-memory-guidance @requires-no-gpu @requires-os:linux
-  Scenario: serve-25 - Reusing an already-running serve never blames it for another process's OOM
+  Scenario: serve-25 - Reuse succeeds on a GPU-less host and the summary carries no memory guidance
     Given a live managed vLLM serve has an OOM startup log
     When the user opens its interactive serve summary
     Then the summary reflects the reused already-running service
