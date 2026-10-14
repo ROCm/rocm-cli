@@ -9,6 +9,7 @@
 mod archive_props;
 mod automations;
 mod bootstrap;
+mod chat;
 mod chat_host_facts;
 mod cli_progress;
 mod cli_report;
@@ -5503,9 +5504,9 @@ fn chat_port_status_tool_calls_equivalent(
         return false;
     }
     let left_host =
-        json_string(left_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+        chat::json_string(left_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     let right_host =
-        json_string(right_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+        chat::json_string(right_object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     loopback_host_key(&left_host) == loopback_host_key(&right_host)
 }
 
@@ -6466,12 +6467,12 @@ fn append_chat_tool_results(
             continue;
         }
         validate_chat_tool_call(call)?;
-        let label = chat_tool_call_display_label(call);
+        let label = chat::chat_tool_call_display_label(call);
         if chat_tool_call_is_read_only(call) {
             report_chat_tool_progress(progress, &format!("Running ROCm check: {label}."));
             let result = run_chat_read_only_tool(paths, call)?;
             ran_read_only_tool = true;
-            let is_error = mcp_tool_result_is_error(&result);
+            let is_error = chat::mcp_tool_result_is_error(&result);
             read_only_tool_error |= is_error;
             report_chat_tool_progress(
                 progress,
@@ -6486,7 +6487,7 @@ fn append_chat_tool_results(
                 label,
                 chat_read_only_tool_status_label(is_error)
             );
-            let result_text = mcp_tool_result_text(&result);
+            let result_text = chat::mcp_tool_result_text(&result);
             let _ = writeln!(follow_up_text, "{}:", call.name);
             let _ = writeln!(follow_up_text, "{result_text}");
             for line in result_text.lines() {
@@ -6521,7 +6522,7 @@ fn chat_tool_call_requests_therock_install_without_prefix(call: &providers::Chat
         return false;
     };
     match call.name.as_str() {
-        "install_sdk" => json_string(object, "prefix").is_none(),
+        "install_sdk" => chat::json_string(object, "prefix").is_none(),
         "rocm_command" => rocm_command_args_install_sdk_without_prefix(object),
         _ => false,
     }
@@ -6552,7 +6553,7 @@ pub(crate) fn chat_tool_approval_request(
 ) -> Result<ChatToolApprovalRequest> {
     validate_chat_tool_call(call)?;
     if call.name == "rocm_command" {
-        let ChatRocmCommandAction::Approval {
+        let chat::ChatRocmCommandAction::Approval {
             args,
             pending_title,
             command_title,
@@ -6579,10 +6580,10 @@ pub(crate) fn chat_tool_approval_request(
             .arguments
             .as_object()
             .context("proposal_action arguments must be a JSON object")?;
-        let proposal_id = json_string(object, "proposal_id")
+        let proposal_id = chat::json_string(object, "proposal_id")
             .context("proposal_action requires non-empty `proposal_id`")?;
         let action =
-            json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+            chat::json_string(object, "action").context("proposal_action requires non-empty `action`")?;
         let pending_title = match action.as_str() {
             "approve" => "Approve proposal",
             "reject" => "Reject proposal",
@@ -6678,13 +6679,13 @@ fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Re
         .arguments
         .as_object()
         .context("proposal_action arguments must be a JSON object")?;
-    let proposal_id = json_string(object, "proposal_id")
+    let proposal_id = chat::json_string(object, "proposal_id")
         .context("proposal_action requires non-empty `proposal_id`")?;
     if proposal_id.len() > 128 {
         bail!("proposal_id too long");
     }
     let action =
-        json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+        chat::json_string(object, "action").context("proposal_action requires non-empty `action`")?;
     if !matches!(action.as_str(), "show" | "approve" | "reject") {
         bail!("proposal_action `action` must be one of show, approve, reject");
     }
@@ -6696,19 +6697,19 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
         .arguments
         .as_object()
         .context("install_sdk arguments must be a JSON object")?;
-    let channel = json_string(object, "channel").unwrap_or_else(|| "release".to_owned());
+    let channel = chat::json_string(object, "channel").unwrap_or_else(|| "release".to_owned());
     if !matches!(channel.as_str(), "release" | "nightly") {
         bail!("local assistant requested unsupported TheRock channel `{channel}`");
     }
-    let format = json_string(object, "format").unwrap_or_else(|| "wheel".to_owned());
+    let format = chat::json_string(object, "format").unwrap_or_else(|| "wheel".to_owned());
     if !matches!(format.as_str(), "wheel" | "tarball") {
         bail!("local assistant requested unsupported TheRock install format `{format}`");
     }
     if rocm_core::runtime_is_windows() && format != "wheel" {
         bail!("local assistant cannot request `{format}` installs on Windows; use wheel");
     }
-    let version = json_string(object, "version");
-    let build_date = json_string(object, "build_date");
+    let version = chat::json_string(object, "version");
+    let build_date = chat::json_string(object, "build_date");
     if version.is_some() && build_date.is_some() {
         bail!("local assistant cannot request both `version` and `build_date`");
     }
@@ -6723,7 +6724,7 @@ fn validate_chat_install_sdk_tool_call(call: &providers::ChatToolCall) -> Result
     if let Some(build_date) = build_date {
         therock::RuntimeVersionSelector::build_date(build_date)?;
     }
-    let Some(prefix) = json_string(object, "prefix") else {
+    let Some(prefix) = chat::json_string(object, "prefix") else {
         bail!(
             "local assistant must ask the user for a ROCm/TheRock install folder before requesting install_sdk"
         );
@@ -6750,7 +6751,7 @@ fn validate_chat_launch_server_tool_call(call: &providers::ChatToolCall) -> Resu
     {
         bail!("local assistant cannot request public network binding");
     }
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    let host = chat::json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     if !is_loopback_host(&host) {
         bail!("local assistant cannot request non-local host `{host}`");
     }
@@ -6770,7 +6771,7 @@ fn validate_chat_service_tool_call(call: &providers::ChatToolCall) -> Result<()>
         .as_object()
         .context("service tool arguments must be a JSON object")?;
     let service_id =
-        json_string(object, "service_id").context("service tool requires `service_id`")?;
+        chat::json_string(object, "service_id").context("service tool requires `service_id`")?;
     validate_service_id(&service_id)?;
     if call.name == "service_logs" {
         validate_optional_chat_integer(call, "lines", 1, 500)?;
@@ -6783,14 +6784,14 @@ fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: b
         .arguments
         .as_object()
         .context("watcher tool arguments must be a JSON object")?;
-    let watcher = json_string(object, "watcher").context("watcher tool requires `watcher`")?;
+    let watcher = chat::json_string(object, "watcher").context("watcher tool requires `watcher`")?;
     if watcher.len() > 128 {
         bail!("watcher id too long");
     }
     if builtin_watcher(&watcher).is_none() {
         bail!("local assistant requested unknown watcher `{watcher}`");
     }
-    if let Some(mode) = json_string(object, "mode") {
+    if let Some(mode) = chat::json_string(object, "mode") {
         if !allow_mode {
             bail!("local assistant cannot set `mode` when disabling a watcher");
         }
@@ -6806,7 +6807,7 @@ fn validate_chat_port_status_tool_call(call: &providers::ChatToolCall) -> Result
         .arguments
         .as_object()
         .context("port_status arguments must be a JSON object")?;
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    let host = chat::json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     if !is_loopback_host(&host) {
         bail!("local assistant cannot inspect non-local host `{host}`");
     }
@@ -6824,7 +6825,7 @@ fn validate_required_chat_string(call: &providers::ChatToolCall, key: &str) -> R
         .arguments
         .as_object()
         .context("tool arguments must be a JSON object")?;
-    json_string(object, key)
+    chat::json_string(object, key)
         .with_context(|| format!("ROCm tool `{}` requires non-empty `{key}`", call.name))?;
     Ok(())
 }
@@ -6857,26 +6858,18 @@ fn validate_optional_chat_integer(
     Ok(())
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum ChatRocmCommandAction {
-    ReadOnly(Vec<String>),
-    Approval {
-        args: Vec<String>,
-        pending_title: String,
-        command_title: String,
-    },
-}
-
 fn validate_chat_rocm_command_tool_call(call: &providers::ChatToolCall) -> Result<()> {
     chat_rocm_command_action(call).map(|_| ())
 }
 
-fn chat_rocm_command_action(call: &providers::ChatToolCall) -> Result<ChatRocmCommandAction> {
+fn chat_rocm_command_action(call: &providers::ChatToolCall) -> Result<chat::ChatRocmCommandAction> {
     let args = normalized_chat_rocm_command_args(call)?;
     chat_rocm_command_action_from_args(args)
 }
 
-fn normalized_chat_rocm_command_args(call: &providers::ChatToolCall) -> Result<Vec<String>> {
+pub(crate) fn normalized_chat_rocm_command_args(
+    call: &providers::ChatToolCall,
+) -> Result<Vec<String>> {
     let object = call
         .arguments
         .as_object()
@@ -6920,43 +6913,43 @@ fn normalized_chat_rocm_command_args(call: &providers::ChatToolCall) -> Result<V
     Ok(args)
 }
 
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
+fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<chat::ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
     let second = args.get(1).map(|value| value.to_ascii_lowercase());
     match first.as_deref() {
         Some("examine" | "version" | "model" | "models" | "daemon" | "logs") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("update") if !args.iter().any(|arg| arg == "--apply") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("runtimes") if second.as_deref().is_none_or(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("engines") if second.as_deref().is_some_and(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("services")
             if second
                 .as_deref()
                 .is_none_or(|value| matches!(value, "list" | "logs")) =>
         {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("automations") if second.as_deref().is_none_or(|value| value == "list") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("config") if second.as_deref() == Some("show") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("comfyui")
             if second
                 .as_deref()
                 .is_none_or(|value| matches!(value, "status" | "logs" | "log")) =>
         {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("install") if second.as_deref() == Some("sdk") => {
             // The chat/MCP surfaces spawn `rocm` with null stdin, so
@@ -6995,7 +6988,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
             if !args.iter().any(|arg| arg == "--dry-run") {
                 ensure_flag(&mut args, "--approve-replacing-active-default");
             }
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ROCm".to_owned(),
                 command_title: "Install".to_owned(),
@@ -7003,7 +6996,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("install") if second.as_deref() == Some("driver") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install driver".to_owned(),
                 command_title: "Install".to_owned(),
@@ -7011,7 +7004,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Apply ROCm update".to_owned(),
                 command_title: "Update".to_owned(),
@@ -7023,7 +7016,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .is_some_and(|value| value == "uninstall" || value == "remove")
                 && args.iter().any(|arg| arg == "--dry-run") =>
         {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("runtimes")
             if second
@@ -7031,25 +7024,25 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .is_some_and(|value| value == "uninstall" || value == "remove") =>
         {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Remove ROCm install".to_owned(),
                 command_title: "Runtimes".to_owned(),
             })
         }
-        Some("runtimes") => Ok(ChatRocmCommandAction::Approval {
+        Some("runtimes") => Ok(chat::ChatRocmCommandAction::Approval {
             args,
             pending_title: "Change ROCm runtime".to_owned(),
             command_title: "Runtimes".to_owned(),
         }),
         Some("engines") if second.as_deref() == Some("install") => {
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install engine".to_owned(),
                 command_title: "Engine".to_owned(),
             })
         }
-        Some("serve") => Ok(ChatRocmCommandAction::Approval {
+        Some("serve") => Ok(chat::ChatRocmCommandAction::Approval {
             args,
             pending_title: "Start local model server".to_owned(),
             command_title: "Serve".to_owned(),
@@ -7060,7 +7053,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .is_some_and(|value| matches!(value, "stop" | "restart")) =>
         {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Change local model server".to_owned(),
                 command_title: "Services".to_owned(),
@@ -7071,23 +7064,23 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .as_deref()
                 .is_some_and(|value| matches!(value, "enable" | "disable")) =>
         {
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Change automation".to_owned(),
                 command_title: "Automations".to_owned(),
             })
         }
-        Some("config") => Ok(ChatRocmCommandAction::Approval {
+        Some("config") => Ok(chat::ChatRocmCommandAction::Approval {
             args,
             pending_title: "Change settings".to_owned(),
             command_title: "Config".to_owned(),
         }),
         Some("uninstall") if args.iter().any(|arg| arg == "--dry-run") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("uninstall") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Uninstall ROCm CLI".to_owned(),
                 command_title: "Uninstall".to_owned(),
@@ -7097,11 +7090,11 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         // the assistant can run it directly. The two `remove-*` verbs delete
         // multi-gigabyte trees and go through the approval UI.
         Some("storage") if second.as_deref().is_none_or(|value| value == "report") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("storage") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Free up disk space".to_owned(),
                 command_title: "Storage".to_owned(),
@@ -7109,7 +7102,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("comfyui") if second.as_deref() == Some("install") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Install ComfyUI".to_owned(),
                 command_title: "ComfyUI".to_owned(),
@@ -7117,7 +7110,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("comfyui") if second.as_deref() == Some("start") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Start ComfyUI".to_owned(),
                 command_title: "ComfyUI".to_owned(),
@@ -7125,18 +7118,18 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
         }
         Some("comfyui") if second.as_deref() == Some("stop") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Stop ComfyUI".to_owned(),
                 command_title: "ComfyUI".to_owned(),
             })
         }
         Some("setup") if second.as_deref().is_none_or(|value| value == "status") => {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         Some("setup") if second.as_deref() == Some("reset") => {
             ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: "Reset first-time setup".to_owned(),
                 command_title: "Setup".to_owned(),
@@ -7151,7 +7144,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .as_deref()
                 .is_some_and(|value| matches!(value, "targets" | "doctor" | "status")) =>
         {
-            Ok(ChatRocmCommandAction::ReadOnly(args))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(args))
         }
         // `serve`, `attach` and `stop` start, publish or tear down something on
         // another machine, so they go through approval like any other mutation.
@@ -7161,7 +7154,7 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 .is_some_and(|value| matches!(value, "serve" | "attach" | "stop")) =>
         {
             let verb = second.as_deref().unwrap_or_default().to_owned();
-            Ok(ChatRocmCommandAction::Approval {
+            Ok(chat::ChatRocmCommandAction::Approval {
                 args,
                 pending_title: format!("Remote {verb}"),
                 command_title: "Remote".to_owned(),
@@ -7332,7 +7325,7 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
     if call.name == "rocm_command" {
         return matches!(
             chat_rocm_command_action(call),
-            Ok(ChatRocmCommandAction::ReadOnly(_))
+            Ok(chat::ChatRocmCommandAction::ReadOnly(_))
         );
     }
     // `proposal_action` is read-only only when showing a proposal; approve/reject
@@ -7341,7 +7334,7 @@ pub(crate) fn chat_tool_call_is_read_only(call: &providers::ChatToolCall) -> boo
         return call
             .arguments
             .as_object()
-            .and_then(|object| json_string(object, "action"))
+            .and_then(|object| chat::json_string(object, "action"))
             .as_deref()
             == Some("show");
     }
@@ -7453,20 +7446,11 @@ fn deterministic_summary_can_stand_alone(tool_text: &str) -> bool {
     !tool_text.contains("model recipes")
 }
 
-#[derive(Debug, Default)]
-struct DeterministicModelRecipe {
-    canonical_id: String,
-    min_gpu_mem_gib: Option<u32>,
-    engines: Vec<String>,
-    engine_statuses: Vec<String>,
-    warnings: Vec<String>,
-}
-
 fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("model recipes") {
         return None;
     }
-    let recipes = parse_deterministic_model_recipes(tool_text);
+    let recipes = chat::parse_deterministic_model_recipes(tool_text);
     if recipes.is_empty() {
         return None;
     }
@@ -7583,73 +7567,7 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-fn parse_deterministic_model_recipes(tool_text: &str) -> Vec<DeterministicModelRecipe> {
-    let mut recipes = Vec::new();
-    let mut current: Option<DeterministicModelRecipe> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim();
-        if let Some(recipe) = parse_model_recipe_header(trimmed) {
-            if let Some(previous) = current.replace(recipe) {
-                recipes.push(previous);
-            }
-            continue;
-        }
-        let Some(recipe) = current.as_mut() else {
-            continue;
-        };
-        if is_engine_status_line(trimmed) {
-            recipe.engine_statuses.push(trimmed.to_owned());
-        } else if let Some(warning) = trimmed.strip_prefix("warning:") {
-            recipe.warnings.push(warning.trim().to_owned());
-        }
-    }
-    if let Some(recipe) = current {
-        recipes.push(recipe);
-    }
-    recipes
-}
-
-fn parse_model_recipe_header(line: &str) -> Option<DeterministicModelRecipe> {
-    if !line.contains(" aliases=[") || !line.contains("min_gpu_mem=") {
-        return None;
-    }
-    let canonical_id = line.split_whitespace().next()?.to_owned();
-    let engines = parse_bracketed_csv(line, "engines=[", "]");
-    let min_gpu_mem_gib = line
-        .split_once("min_gpu_mem=")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u32>().ok());
-    Some(DeterministicModelRecipe {
-        canonical_id,
-        min_gpu_mem_gib,
-        engines,
-        engine_statuses: Vec::new(),
-        warnings: Vec::new(),
-    })
-}
-
-fn parse_bracketed_csv(line: &str, start: &str, end: &str) -> Vec<String> {
-    line.split_once(start)
-        .and_then(|(_, rest)| rest.split_once(end))
-        .map(|(values, _)| {
-            values
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn is_engine_status_line(line: &str) -> bool {
-    matches!(
-        line.split_once(':').map(|(engine, _)| engine),
-        Some("lemonade" | "vllm")
-    )
-}
-
-fn deterministic_engine_fit_summary(recipe: &DeterministicModelRecipe, engine: &str) -> String {
+fn deterministic_engine_fit_summary(recipe: &chat::DeterministicModelRecipe, engine: &str) -> String {
     let status = recipe
         .engine_statuses
         .iter()
@@ -7675,7 +7593,7 @@ fn deterministic_engine_fit_summary(recipe: &DeterministicModelRecipe, engine: &
     }
 }
 
-fn deterministic_available_engine_names(recipe: &DeterministicModelRecipe) -> Vec<String> {
+fn deterministic_available_engine_names(recipe: &chat::DeterministicModelRecipe) -> Vec<String> {
     let engines = recipe
         .engine_statuses
         .iter()
@@ -7734,16 +7652,6 @@ fn deterministic_comfyui_tool_summary(tool_text: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-#[derive(Debug, Default)]
-struct DeterministicServiceRow {
-    service_id: String,
-    engine: String,
-    model: String,
-    status: String,
-    running_state: String,
-    endpoint: String,
-}
-
 fn deterministic_services_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("Local Servers")
         && !tool_text.contains("managed_services:")
@@ -7751,7 +7659,7 @@ fn deterministic_services_tool_summary(tool_text: &str) -> Option<String> {
     {
         return None;
     }
-    let rows = parse_deterministic_service_rows(tool_text);
+    let rows = chat::parse_deterministic_service_rows(tool_text);
     let mut lines = Vec::new();
     let live = rows
         .iter()
@@ -7793,65 +7701,6 @@ fn deterministic_services_tool_summary(tool_text: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicServiceRow> {
-    let mut rows = Vec::new();
-    let mut current: Option<DeterministicServiceRow> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("- service_id=") {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            let mut row = DeterministicServiceRow::default();
-            for token in rest.split_whitespace() {
-                if let Some((key, value)) = token.split_once('=') {
-                    match key {
-                        "service_id" => row.service_id = value.to_owned(),
-                        "engine" => row.engine = value.to_owned(),
-                        "model" => row.model = value.to_owned(),
-                        "status" => row.status = value.to_owned(),
-                        "running_state" => row.running_state = value.to_owned(),
-                        "endpoint" => row.endpoint = value.to_owned(),
-                        _ => {}
-                    }
-                }
-            }
-            if row.running_state.is_empty() {
-                row.running_state = managed_service_running_state(&row.status).to_owned();
-            }
-            current = Some(row);
-            continue;
-        }
-        if let Some(service_id) = trimmed.strip_prefix("- ") {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            current = Some(DeterministicServiceRow {
-                service_id: service_id.to_owned(),
-                ..Default::default()
-            });
-            continue;
-        }
-        let Some(row) = current.as_mut() else {
-            continue;
-        };
-        if let Some(value) = trimmed.strip_prefix("status:") {
-            row.status = value.trim().to_owned();
-            row.running_state = managed_service_running_state(&row.status).to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("engine:") {
-            row.engine = value.trim().to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("model:") {
-            row.model = value.trim().to_owned();
-        } else if let Some(value) = trimmed.strip_prefix("endpoint:") {
-            row.endpoint = value.trim().to_owned();
-        }
-    }
-    if let Some(row) = current {
-        rows.push(row);
-    }
-    rows
-}
-
 fn deterministic_port_status_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("port_status:") && !tool_text.contains("listening:") {
         return None;
@@ -7874,18 +7723,11 @@ fn deterministic_port_status_tool_summary(tool_text: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-#[derive(Debug, Default)]
-struct DeterministicEngineRow {
-    engine: String,
-    runtime: String,
-    note: String,
-}
-
 fn deterministic_engine_inventory_tool_summary(tool_text: &str) -> Option<String> {
     if !tool_text.contains("Local model engines") {
         return None;
     }
-    let rows = parse_deterministic_engine_rows(tool_text);
+    let rows = chat::parse_deterministic_engine_rows(tool_text);
     if rows.is_empty() {
         return None;
     }
@@ -7903,45 +7745,6 @@ fn deterministic_engine_inventory_tool_summary(tool_text: &str) -> Option<String
         lines.push(line);
     }
     Some(lines.join("\n"))
-}
-
-fn parse_deterministic_engine_rows(tool_text: &str) -> Vec<DeterministicEngineRow> {
-    let mut rows = Vec::new();
-    let mut current: Option<DeterministicEngineRow> = None;
-    for line in tool_text.lines() {
-        let trimmed = line.trim().trim_start_matches("* ").trim_start();
-        if let Some(engine) = engine_name_from_inventory_line(trimmed) {
-            if let Some(row) = current.take() {
-                rows.push(row);
-            }
-            current = Some(DeterministicEngineRow {
-                engine: engine.to_owned(),
-                ..Default::default()
-            });
-            continue;
-        }
-        let Some(row) = current.as_mut() else {
-            continue;
-        };
-        if let Some(runtime) = trimmed.strip_prefix("runtime:") {
-            row.runtime = runtime.trim().to_owned();
-        } else if let Some(note) = trimmed.strip_prefix("note:") {
-            row.note = note.trim().to_owned();
-        }
-    }
-    if let Some(row) = current {
-        rows.push(row);
-    }
-    rows
-}
-
-fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
-    ["lemonade", "vllm"].into_iter().find(|engine| {
-        line == *engine
-            || line
-                .strip_prefix(*engine)
-                .is_some_and(|rest| rest.starts_with(char::is_whitespace))
-    })
 }
 
 fn should_request_local_tool_follow_up(
@@ -8035,7 +7838,7 @@ pub(crate) fn run_internal_mcp_call(
         }
         "port_status" => run_chat_port_status_tool(paths, &call),
         "service_logs" => {
-            let service_id = json_string(&arguments, "service_id")
+            let service_id = chat::json_string(&arguments, "service_id")
                 .context("service_logs requires `service_id`")?;
             let lines = arguments
                 .get("lines")
@@ -8079,7 +7882,7 @@ pub(crate) fn run_internal_mcp_call(
             ))
         }
         "natural_language_plan" => {
-            let request = json_string(&arguments, "request")
+            let request = chat::json_string(&arguments, "request")
                 .context("natural_language_plan requires `request`")?;
             let config = RocmCliConfig::load(paths).unwrap_or_default();
             let text = render_freeform_plan(&request, paths, &config);
@@ -8104,14 +7907,14 @@ pub(crate) fn run_internal_mcp_call(
         "rocm_command" => {
             let action = chat_rocm_command_action(&call)?;
             let output = match action {
-                ChatRocmCommandAction::ReadOnly(args) => {
+                chat::ChatRocmCommandAction::ReadOnly(args) => {
                     run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?
                 }
-                ChatRocmCommandAction::Approval { args, .. } if allow_mutation => {
+                chat::ChatRocmCommandAction::Approval { args, .. } if allow_mutation => {
                     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
                     run_rocm_capture_for_paths(paths, &refs, Duration::from_mins(2))?
                 }
-                ChatRocmCommandAction::Approval { .. } => {
+                chat::ChatRocmCommandAction::Approval { .. } => {
                     bail!("rocm_command changes local ROCm state and needs approval")
                 }
             };
@@ -8146,10 +7949,10 @@ pub(crate) fn run_internal_mcp_call(
             // by the read-only split above). proposal_action executes in-process
             // (via update_automation_proposal_status); it never delegates to the
             // subprocess arm.
-            let proposal_id = json_string(&arguments, "proposal_id")
+            let proposal_id = chat::json_string(&arguments, "proposal_id")
                 .context("proposal_action requires `proposal_id`")?;
             let action =
-                json_string(&arguments, "action").context("proposal_action requires `action`")?;
+                chat::json_string(&arguments, "action").context("proposal_action requires `action`")?;
             match action.as_str() {
                 "show" => {
                     let proposal = rocm_core::find_automation_proposal(paths, &proposal_id)
@@ -8243,10 +8046,10 @@ fn internal_mcp_tool_success(text: String, structured: serde_json::Value) -> ser
 
 fn internal_mcp_tool_result_from_command(
     prefix: &str,
-    output: CommandCapture,
+    output: chat::CommandCapture,
     is_error: bool,
 ) -> serde_json::Value {
-    let text = format!("{prefix}\n\n{}", command_capture_text(&output));
+    let text = format!("{prefix}\n\n{}", chat::command_capture_text(&output));
     serde_json::json!({
         "content": [
             {
@@ -8264,33 +8067,11 @@ fn internal_mcp_tool_result_from_command(
     })
 }
 
-fn command_capture_text(output: &CommandCapture) -> String {
-    if output.stderr.trim().is_empty() {
-        output.stdout.trim().to_owned()
-    } else if output.stdout.trim().is_empty() {
-        format!("stderr:\n{}", output.stderr.trim())
-    } else {
-        format!(
-            "stdout:\n{}\n\nstderr:\n{}",
-            output.stdout.trim(),
-            output.stderr.trim()
-        )
-    }
-}
-
-#[derive(Debug)]
-struct CommandCapture {
-    argv: Vec<String>,
-    exit_status: i32,
-    stdout: String,
-    stderr: String,
-}
-
 fn run_rocm_capture_for_paths(
     paths: &AppPaths,
     args: &[&str],
     timeout: Duration,
-) -> Result<CommandCapture> {
+) -> Result<chat::CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
     command
@@ -8301,7 +8082,7 @@ fn run_rocm_capture_for_paths(
     apply_app_path_env(&mut command, paths);
     let output = run_command_with_timeout(command, timeout)
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
-    Ok(CommandCapture {
+    Ok(chat::CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
             .chain(args.iter().map(|value| (*value).to_owned()))
             .collect(),
@@ -8315,9 +8096,9 @@ fn run_rocm_command_for_paths(
     paths: &AppPaths,
     args: &[String],
     _timeout: Duration,
-) -> Result<CommandCapture> {
+) -> Result<chat::CommandCapture> {
     match run_rocm_read_only_in_process(paths, args) {
-        Ok(stdout) => Ok(CommandCapture {
+        Ok(stdout) => Ok(chat::CommandCapture {
             argv: std::iter::once("rocm".to_owned())
                 .chain(args.iter().cloned())
                 .collect(),
@@ -8362,7 +8143,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         }
         [command] if command.eq_ignore_ascii_case("logs") => Ok(render_logs_text(paths)),
         [command, rest @ ..] if command.eq_ignore_ascii_case("logs") => {
-            let query = parse_optional_query(rest)?;
+            let query = chat::parse_optional_query(rest)?;
             Ok(render_logs_browser_text(paths, query.as_deref()))
         }
         [command] if command.eq_ignore_ascii_case("runtimes") => {
@@ -8430,7 +8211,7 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
         {
             comfyui::render_logs(
                 paths,
-                parse_optional_lines(rest).unwrap_or(DEFAULT_LOG_TAIL_LINES),
+                chat::parse_optional_lines(rest).unwrap_or(DEFAULT_LOG_TAIL_LINES),
             )
         }
         [command, rest @ ..]
@@ -8466,38 +8247,6 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
             format_structured_tool_call("rocm", args)
         ),
     }
-}
-
-fn parse_optional_query(args: &[String]) -> Result<Option<String>> {
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--query" | "-q" => {
-                let value = args
-                    .get(index + 1)
-                    .context("logs query flag requires a value")?;
-                return Ok(Some(value.to_owned()));
-            }
-            value if value.starts_with("--") => {}
-            value => return Ok(Some(value.to_owned())),
-        }
-        index += 1;
-    }
-    Ok(None)
-}
-
-fn parse_optional_lines(args: &[String]) -> Result<usize> {
-    let mut index = 0;
-    while index < args.len() {
-        if matches!(args[index].as_str(), "--lines" | "-n") {
-            let value = args.get(index + 1).context("lines flag requires a value")?;
-            return value
-                .parse::<usize>()
-                .context("lines flag must be a positive number");
-        }
-        index += 1;
-    }
-    Ok(DEFAULT_LOG_TAIL_LINES)
 }
 
 /// Map the parsed `install sdk` arguments onto the install request.
@@ -8594,8 +8343,8 @@ fn internal_mcp_install_sdk_args(
     arguments: &serde_json::Map<String, serde_json::Value>,
     dry_run: bool,
 ) -> Result<Vec<String>> {
-    let channel = json_string(arguments, "channel").unwrap_or_else(|| "release".to_owned());
-    let format = json_string(arguments, "format").unwrap_or_else(|| "wheel".to_owned());
+    let channel = chat::json_string(arguments, "channel").unwrap_or_else(|| "release".to_owned());
+    let format = chat::json_string(arguments, "format").unwrap_or_else(|| "wheel".to_owned());
     let mut argv = vec![
         "install".to_owned(),
         "sdk".to_owned(),
@@ -8604,7 +8353,7 @@ fn internal_mcp_install_sdk_args(
         "--format".to_owned(),
         format,
     ];
-    if let Some(prefix) = json_string(arguments, "prefix") {
+    if let Some(prefix) = chat::json_string(arguments, "prefix") {
         let prefix_path = Path::new(&prefix);
         if chat_install_prefix_is_system(prefix_path) {
             bail!(
@@ -8615,11 +8364,11 @@ fn internal_mcp_install_sdk_args(
         argv.push("--prefix".to_owned());
         argv.push(prefix);
     }
-    if let Some(version) = json_string(arguments, "version") {
+    if let Some(version) = chat::json_string(arguments, "version") {
         argv.push("--version".to_owned());
         argv.push(version);
     }
-    if let Some(build_date) = json_string(arguments, "build_date") {
+    if let Some(build_date) = chat::json_string(arguments, "build_date") {
         argv.push("--build-date".to_owned());
         argv.push(build_date);
     }
@@ -8638,7 +8387,7 @@ fn run_chat_read_only_tool(
         "port_status" => run_chat_port_status_tool(paths, call),
         "rocm_command" => {
             let action = chat_rocm_command_action(call)?;
-            let ChatRocmCommandAction::ReadOnly(args) = action else {
+            let chat::ChatRocmCommandAction::ReadOnly(args) = action else {
                 bail!("assistant read-only path cannot run mutating rocm_command");
             };
             let output = run_rocm_command_for_paths(paths, &args, Duration::from_mins(2))?;
@@ -8676,7 +8425,7 @@ fn run_chat_path_exists_tool(call: &providers::ChatToolCall) -> Result<serde_jso
         .arguments
         .as_object()
         .context("path_exists arguments must be a JSON object")?;
-    let path = json_string(object, "path").context("path_exists requires path")?;
+    let path = chat::json_string(object, "path").context("path_exists requires path")?;
     let path = Path::new(&path);
     let metadata = path.metadata().ok();
     let path_kind = metadata.as_ref().map_or("missing", |metadata| {
@@ -8718,12 +8467,12 @@ fn run_chat_port_status_tool(
         .arguments
         .as_object()
         .context("port_status arguments must be a JSON object")?;
-    let host = json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
+    let host = chat::json_string(object, "host").unwrap_or_else(|| DEFAULT_LOCAL_HOST.to_owned());
     let port = object
         .get("port")
         .and_then(serde_json::Value::as_u64)
         .context("port_status requires port")? as u16;
-    let reachable = loopback_tcp_port_is_reachable(&host, port);
+    let reachable = chat::loopback_tcp_port_is_reachable(&host, port);
     let host_key = loopback_host_key(&host);
     let matching_services = load_managed_services(paths)?
         .into_iter()
@@ -8780,123 +8529,11 @@ fn run_chat_port_status_tool(
     }))
 }
 
-fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
-    let Ok(addresses) = (host, port).to_socket_addrs() else {
-        return false;
-    };
-    addresses
-        .into_iter()
-        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
-}
-
-fn mcp_tool_result_text(value: &serde_json::Value) -> String {
-    value
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                        .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                        .flatten()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| value.to_string())
-}
-
-fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
-    value
-        .get("isError")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
 const fn chat_read_only_tool_status_label(is_error: bool) -> &'static str {
     if is_error {
         "reported an error"
     } else {
         "done"
-    }
-}
-
-fn chat_tool_display_label(name: &str) -> String {
-    match name {
-        "examine" => "Checked this computer".to_owned(),
-        "gpu_snapshot" => "Checked GPU status".to_owned(),
-        "engines" => "Checked local engines".to_owned(),
-        "services" => "Checked model servers".to_owned(),
-        "bridge_snapshot" => "Checked ROCm state".to_owned(),
-        "service_logs" => "Read server logs".to_owned(),
-        "automations" => "Checked automations".to_owned(),
-        "natural_language_plan" => "Planned ROCm request".to_owned(),
-        "path_exists" => "Checked folder path".to_owned(),
-        "port_status" => "Checked local port".to_owned(),
-        "update_check" => "Checked for ROCm updates".to_owned(),
-        "install_sdk_dry_run" => "Previewed ROCm install".to_owned(),
-        "install_sdk" => "Install ROCm".to_owned(),
-        "install_engine" => "Install engine".to_owned(),
-        "launch_server" => "Start local model server".to_owned(),
-        "stop_server" => "Stop local model server".to_owned(),
-        "watcher_enable" => "Enable automation".to_owned(),
-        "watcher_disable" => "Disable automation".to_owned(),
-        other => other.replace('_', " "),
-    }
-}
-
-fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> String {
-    if call.name != "rocm_command" {
-        return chat_tool_display_label(&call.name);
-    }
-    let Some(args) = normalized_chat_rocm_command_args(call).ok() else {
-        return "rocm command".to_owned();
-    };
-    match args.as_slice() {
-        [command] if command.eq_ignore_ascii_case("examine") => "Checked this computer".to_owned(),
-        [command]
-            if command.eq_ignore_ascii_case("model") || command.eq_ignore_ascii_case("models") =>
-        {
-            "Checked model recipes".to_owned()
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("engines")
-                && subcommand.eq_ignore_ascii_case("list") =>
-        {
-            "Checked local engines".to_owned()
-        }
-        [command] if command.eq_ignore_ascii_case("services") => "Checked model servers".to_owned(),
-        [command, subcommand, rest @ ..]
-            if command.eq_ignore_ascii_case("services")
-                && subcommand.eq_ignore_ascii_case("list")
-                && rest
-                    .iter()
-                    .all(|arg| matches!(arg.as_str(), "-a" | "--all")) =>
-        {
-            "Checked model servers".to_owned()
-        }
-        [command] if command.eq_ignore_ascii_case("comfyui") => "Checked ComfyUI".to_owned(),
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("comfyui")
-                && subcommand.eq_ignore_ascii_case("status") =>
-        {
-            "Checked ComfyUI".to_owned()
-        }
-        [command, subcommand, ..]
-            if command.eq_ignore_ascii_case("comfyui")
-                && matches!(subcommand.to_ascii_lowercase().as_str(), "logs" | "log") =>
-        {
-            "Read ComfyUI logs".to_owned()
-        }
-        [command, subcommand]
-            if command.eq_ignore_ascii_case("config")
-                && subcommand.eq_ignore_ascii_case("show") =>
-        {
-            "Checked ROCm config".to_owned()
-        }
-        _ => "rocm command".to_owned(),
     }
 }
 
@@ -8913,9 +8550,9 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 "install".to_owned(),
                 "sdk".to_owned(),
                 "--channel".to_owned(),
-                json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
+                chat::json_string(object, "channel").unwrap_or_else(|| "release".to_owned()),
                 "--format".to_owned(),
-                json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
+                chat::json_string(object, "format").unwrap_or_else(|| "wheel".to_owned()),
                 // The MCP surface runs `rocm` with null stdin, so the consent
                 // prompt would refuse. This keeps the tool non-interactive,
                 // matching the chat `install sdk` arm. Deliberately not `--yes`:
@@ -8923,28 +8560,28 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
                 // install this spawn has no terminal to answer.
                 "--approve-replacing-active-default".to_owned(),
             ];
-            if let Some(prefix) = json_string(object, "prefix") {
+            if let Some(prefix) = chat::json_string(object, "prefix") {
                 args.push("--prefix".to_owned());
                 args.push(prefix);
             }
-            if let Some(version) = json_string(object, "version") {
+            if let Some(version) = chat::json_string(object, "version") {
                 args.push("--version".to_owned());
                 args.push(version);
             }
-            if let Some(build_date) = json_string(object, "build_date") {
+            if let Some(build_date) = chat::json_string(object, "build_date") {
                 args.push("--build-date".to_owned());
                 args.push(build_date);
             }
             Some(args)
         }
         "install_engine" => {
-            let engine = json_string(object, "engine")?;
+            let engine = chat::json_string(object, "engine")?;
             let mut args = vec!["engines".to_owned(), "install".to_owned(), engine];
-            if let Some(runtime_id) = json_string(object, "runtime_id") {
+            if let Some(runtime_id) = chat::json_string(object, "runtime_id") {
                 args.push("--runtime-id".to_owned());
                 args.push(runtime_id);
             }
-            if let Some(python_version) = json_string(object, "python_version") {
+            if let Some(python_version) = chat::json_string(object, "python_version") {
                 args.push("--python-version".to_owned());
                 args.push(python_version);
             }
@@ -8958,13 +8595,13 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
             Some(args)
         }
         "launch_server" => {
-            let model = json_string(object, "model")?;
+            let model = chat::json_string(object, "model")?;
             let mut args = vec!["serve".to_owned(), model, "--managed".to_owned()];
-            push_optional_json_cli_arg(&mut args, object, "--engine", "engine");
-            push_optional_json_cli_arg(&mut args, object, "--device", "device");
-            push_optional_json_cli_arg(&mut args, object, "--runtime-id", "runtime_id");
-            push_optional_json_cli_arg(&mut args, object, "--env-id", "env_id");
-            push_optional_json_cli_arg(&mut args, object, "--host", "host");
+            chat::push_optional_json_cli_arg(&mut args, object, "--engine", "engine");
+            chat::push_optional_json_cli_arg(&mut args, object, "--device", "device");
+            chat::push_optional_json_cli_arg(&mut args, object, "--runtime-id", "runtime_id");
+            chat::push_optional_json_cli_arg(&mut args, object, "--env-id", "env_id");
+            chat::push_optional_json_cli_arg(&mut args, object, "--host", "host");
             if let Some(port) = object.get("port").and_then(serde_json::Value::as_u64) {
                 args.push("--port".to_owned());
                 args.push(port.to_string());
@@ -8972,7 +8609,7 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
             Some(args)
         }
         "stop_server" => {
-            let service_id = json_string(object, "service_id")?;
+            let service_id = chat::json_string(object, "service_id")?;
             Some(vec![
                 "services".to_owned(),
                 "stop".to_owned(),
@@ -8981,13 +8618,13 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
             ])
         }
         "watcher_enable" => {
-            let watcher = json_string(object, "watcher")?;
+            let watcher = chat::json_string(object, "watcher")?;
             let mut args = vec!["automations".to_owned(), "enable".to_owned(), watcher];
-            push_optional_json_cli_arg(&mut args, object, "--mode", "mode");
+            chat::push_optional_json_cli_arg(&mut args, object, "--mode", "mode");
             Some(args)
         }
         "watcher_disable" => {
-            let watcher = json_string(object, "watcher")?;
+            let watcher = chat::json_string(object, "watcher")?;
             Some(vec![
                 "automations".to_owned(),
                 "disable".to_owned(),
@@ -8995,32 +8632,13 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
             ])
         }
         "rocm_command" => match chat_rocm_command_action(call).ok()? {
-            ChatRocmCommandAction::Approval { args, .. }
-            | ChatRocmCommandAction::ReadOnly(args) => Some(args),
+            chat::ChatRocmCommandAction::Approval { args, .. }
+            | chat::ChatRocmCommandAction::ReadOnly(args) => Some(args),
         },
         _ => None,
     }
 }
 
-fn push_optional_json_cli_arg(
-    args: &mut Vec<String>,
-    object: &serde_json::Map<String, serde_json::Value>,
-    flag: &str,
-    key: &str,
-) {
-    if let Some(value) = json_string(object, key) {
-        args.push(flag.to_owned());
-        args.push(value);
-    }
-}
-
-fn json_string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
-    object
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .filter(|value| !value.trim().is_empty())
-}
 
 pub(crate) fn render_examine_text() -> Result<String> {
     let paths = AppPaths::discover()?;
@@ -12099,7 +11717,7 @@ fn existing_live_managed_service(
         })
 }
 
-fn managed_service_running_state(status: &str) -> &'static str {
+pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
     match status {
         "ready" | "running" => "running",
         "starting" | "recovering" => "starting",
@@ -16128,7 +15746,7 @@ pub(crate) mod tests {
             "some-runtime-key".to_owned(),
         ])
         .expect("a mutating runtimes command classifies");
-        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+        let chat::ChatRocmCommandAction::Approval { pending_title, .. } = action else {
             panic!("`rocm runtimes activate` must require approval, got {action:?}");
         };
         assert!(
@@ -18515,7 +18133,7 @@ pub(crate) mod tests {
                 args.iter().copied().map(str::to_owned).collect(),
             )
             .expect("install sdk should classify");
-            let ChatRocmCommandAction::Approval { args, .. } = action else {
+            let chat::ChatRocmCommandAction::Approval { args, .. } = action else {
                 panic!("install sdk is a mutating command");
             };
             args
@@ -18580,7 +18198,7 @@ pub(crate) mod tests {
                 args.iter().copied().map(str::to_owned).collect(),
             )
             .expect("install sdk should classify");
-            let ChatRocmCommandAction::Approval { args, .. } = action else {
+            let chat::ChatRocmCommandAction::Approval { args, .. } = action else {
                 panic!("install sdk is a mutating command");
             };
             args
@@ -19331,7 +18949,7 @@ model recipes
             let action =
                 chat_rocm_command_action_from_args(args.clone()).expect("setup status classifies");
             assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                matches!(action, chat::ChatRocmCommandAction::ReadOnly(_)),
                 "setup {args:?} should be read-only, got {action:?}"
             );
         }
@@ -19346,7 +18964,7 @@ model recipes
             let action = chat_rocm_command_action_from_args(args.clone())
                 .expect("storage report classifies");
             assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                matches!(action, chat::ChatRocmCommandAction::ReadOnly(_)),
                 "storage {args:?} only measures folders, so it should be read-only, got {action:?}"
             );
         }
@@ -19356,13 +18974,13 @@ model recipes
                 chat_rocm_command_action_from_args(vec!["storage".to_owned(), verb.to_owned()])
                     .expect("storage removal classifies");
             match action {
-                ChatRocmCommandAction::Approval { args, .. } => {
+                chat::ChatRocmCommandAction::Approval { args, .. } => {
                     assert!(
                         args.iter().any(|arg| arg == "--yes"),
                         "approved removal runs non-interactively: {args:?}"
                     );
                 }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                other @ chat::ChatRocmCommandAction::ReadOnly(_) => {
                     panic!("storage {verb} must require approval, got {other:?}")
                 }
             }
@@ -19486,7 +19104,7 @@ model recipes
             chat_rocm_command_action_from_args(vec!["setup".to_owned(), "reset".to_owned()])
                 .expect("setup reset classifies");
         match action {
-            ChatRocmCommandAction::Approval {
+            chat::ChatRocmCommandAction::Approval {
                 pending_title,
                 command_title,
                 ..
@@ -19494,7 +19112,7 @@ model recipes
                 assert_eq!(pending_title, "Reset first-time setup");
                 assert_eq!(command_title, "Setup");
             }
-            other @ ChatRocmCommandAction::ReadOnly(_) => {
+            other @ chat::ChatRocmCommandAction::ReadOnly(_) => {
                 panic!("setup reset should require approval, got {other:?}")
             }
         }
@@ -19675,10 +19293,10 @@ model recipes
             ])
             .expect("config set-permissions classifies");
             match action {
-                ChatRocmCommandAction::Approval { command_title, .. } => {
+                chat::ChatRocmCommandAction::Approval { command_title, .. } => {
                     assert_eq!(command_title, "Config");
                 }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                other @ chat::ChatRocmCommandAction::ReadOnly(_) => {
                     panic!("config set-permissions {mode} must need approval, got {other:?}")
                 }
             }
@@ -19786,7 +19404,7 @@ model recipes
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
             assert!(
-                matches!(action, ChatRocmCommandAction::ReadOnly(_)),
+                matches!(action, chat::ChatRocmCommandAction::ReadOnly(_)),
                 "{args:?} should be read-only, got {action:?}"
             );
         }
@@ -19846,7 +19464,7 @@ model recipes
             let action = chat_rocm_command_action_from_args(args.clone())
                 .unwrap_or_else(|err| panic!("{args:?} should classify: {err}"));
             match &action {
-                ChatRocmCommandAction::Approval { args, .. } => {
+                chat::ChatRocmCommandAction::Approval { args, .. } => {
                     assert_eq!(
                         args.iter().any(|arg| arg == "--yes"),
                         expects_yes,
@@ -19854,7 +19472,7 @@ model recipes
                          carry --yes"
                     );
                 }
-                other @ ChatRocmCommandAction::ReadOnly(_) => {
+                other @ chat::ChatRocmCommandAction::ReadOnly(_) => {
                     panic!("{args:?} should require approval, got {other:?}")
                 }
             }
@@ -19880,8 +19498,8 @@ model recipes
         ])
         .expect("install sdk classifies");
         let chat_args = match action {
-            ChatRocmCommandAction::Approval { args, .. } => args,
-            other @ ChatRocmCommandAction::ReadOnly(_) => {
+            chat::ChatRocmCommandAction::Approval { args, .. } => args,
+            other @ chat::ChatRocmCommandAction::ReadOnly(_) => {
                 panic!("install sdk must require approval, got {other:?}")
             }
         };
@@ -20018,7 +19636,7 @@ model recipes
                 .and_then(serde_json::Value::as_str),
             Some("rocm")
         );
-        assert!(mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
+        assert!(chat::mcp_tool_result_text(&result).contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
@@ -20779,7 +20397,7 @@ install therock";
             arguments: serde_json::json!({ "host": "localhost", "port": 18188 }),
         };
         let result = run_chat_port_status_tool(&paths, &call)?;
-        let text = mcp_tool_result_text(&result);
+        let text = chat::mcp_tool_result_text(&result);
         let managed_service_count = result
             .get("structuredContent")
             .and_then(|content| content.get("managed_services"))
@@ -20961,19 +20579,19 @@ install therock";
     fn chat_tool_result_errors_use_plain_failure_wording() {
         assert_eq!(chat_read_only_tool_status_label(false), "done");
         assert_eq!(chat_read_only_tool_status_label(true), "reported an error");
-        assert_eq!(chat_tool_display_label("examine"), "Checked this computer");
+        assert_eq!(chat::chat_tool_display_label("examine"), "Checked this computer");
         assert_eq!(
-            chat_tool_display_label("gpu_snapshot"),
+            chat::chat_tool_display_label("gpu_snapshot"),
             "Checked GPU status"
         );
-        assert_eq!(chat_tool_display_label("install_sdk"), "Install ROCm");
-        assert!(mcp_tool_result_is_error(&serde_json::json!({
+        assert_eq!(chat::chat_tool_display_label("install_sdk"), "Install ROCm");
+        assert!(chat::mcp_tool_result_is_error(&serde_json::json!({
             "isError": true
         })));
-        assert!(!mcp_tool_result_is_error(&serde_json::json!({
+        assert!(!chat::mcp_tool_result_is_error(&serde_json::json!({
             "isError": false
         })));
-        assert!(!mcp_tool_result_is_error(&serde_json::json!({})));
+        assert!(!chat::mcp_tool_result_is_error(&serde_json::json!({})));
     }
 
     #[test]
