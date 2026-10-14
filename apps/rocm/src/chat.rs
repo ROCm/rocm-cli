@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Phase 6d (ROCMAI-88) of the `main.rs` modularization, part 1 of 3 (see
-//! `docs/architecture.md`). This PR moves the chat/MCP-bridge cluster's
+//! Chat/assistant tool-call support: the chat/MCP-bridge cluster's
 //! `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`,
 //! `DeterministicModelRecipe`, `DeterministicServiceRow`,
 //! `DeterministicEngineRow`) and its leaf helpers — tool-call argument
@@ -11,13 +10,15 @@
 //! the MCP-result/loopback-port/service-running-state helpers. Each is
 //! `pub(crate)` and called from `main.rs` via qualified `chat::` paths,
 //! except for a handful of private parsing internals used only within this
-//! file.
+//! file; nothing here calls back into `main.rs`.
 //!
-//! The cluster's orchestration bodies (`run_internal_mcp_call`, the
-//! `validate_chat_*` family, `deterministic_rocm_tool_summary`) and the
-//! `dispatch()`/`dash_seam.rs` call-site qualification still live in
-//! `main.rs`; it calls into this module via `chat::`, and nothing here calls
-//! back into `main.rs`. The remaining bodies move here in the next two PRs.
+//! Full domain extraction, mirroring `providers.rs`. Phase 6d (ROCMAI-88) of
+//! the `main.rs` modularization (see `docs/architecture.md`), split across
+//! three PRs given the cluster's size: this module's current contents are
+//! part 1's slice. The cluster's orchestration bodies
+//! (`run_internal_mcp_call`, the `validate_chat_*` family,
+//! `deterministic_rocm_tool_summary`) and the `dispatch()`/`dash_seam.rs`
+//! call-site qualification are still at the crate root.
 
 use crate::providers;
 use anyhow::{Context, Result, bail};
