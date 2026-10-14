@@ -22,9 +22,10 @@ Write, in markdown:
    a doc nit, a cosmetic issue, or otherwise non-blocking for a user. If
    nothing in the list qualifies, say so in one line — do not pad the
    section with borderline issues to have something to show.
-3. A short "Considerations for Next Release" paragraph highlighting anything
-   a release manager should weigh: failing gates, breaking changes, or the
-   end-user-relevant known issues from (2).
+3. A short "Considerations for Next Release" paragraph describing anything a
+   release manager should weigh: the evidence behind each gate, breaking
+   changes, or the end-user-relevant known issues from (2). Describe what the
+   evidence shows, not whether it clears the bar.
 
 Hard rules:
 
