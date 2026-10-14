@@ -1472,19 +1472,32 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let sdk_path = &e.hip_sdk_path;
 
     // A missing or broken HIP SDK is only evidence of a fault when something on
-    // this host actually calls into HIP: an ambient PyTorch HIP build, or a
-    // llama.cpp binary built with GGML_HIP=ON. The CLI's own default --
-    // Lemonade's bundled llama.cpp on Vulkan -- never touches the system HIP
-    // SDK, and a managed-runtime PyTorch wheel brings its own runtime too.
-    // Scoring the SDK's absence unconditionally used to rank this fix first on
-    // exactly those hosts: the ones least likely to need it.
+    // this host actually calls into HIP: an ambient PyTorch HIP build, a
+    // llama.cpp binary built with GGML_HIP=ON, or -- scored first below -- the
+    // user's own pasted error. The CLI's own default (Lemonade's bundled
+    // llama.cpp on Vulkan) never touches the system HIP SDK, and a
+    // managed-runtime PyTorch wheel brings its own runtime too. Scoring the
+    // SDK's absence unconditionally used to rank this fix first on exactly
+    // those hosts: the ones least likely to need it.
+    //
+    // The pasted error is the strongest of the three signals, not the weakest.
+    // `amdhip64.dll was not found` or `'hipInfo' is not recognized` is a
+    // *running* process failing to load HIP, which is a fact about this host
+    // that no probe can contradict -- the framework probe answering "nothing
+    // detected" means it did not find a framework it knows, not that nothing
+    // here calls into HIP. Gating the SDK evidence on the detected framework
+    // alone dropped the +35 from the textbook case this entry exists for: a
+    // Windows host with no SDK, pasting precisely that error.
+    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_HIP_SDK_MISSING);
     let pytorch_is_ambient_hip_build = e.has_amd_gpu
         && e.framework == "pytorch"
         && e.framework_rocm_version.starts_with("hip=")
         && e.framework_source != "managed-runtime";
     let llama_cpp_is_hip_build =
         e.has_amd_gpu && e.framework == "llama-cpp" && e.framework_rocm_version == "GGML_HIP=ON";
-    let needs_hip = pytorch_is_ambient_hip_build || llama_cpp_is_hip_build;
+    let symptom_names_hip_loading = kw_score > 0;
+    let needs_hip =
+        pytorch_is_ambient_hip_build || llama_cpp_is_hip_build || symptom_names_hip_loading;
 
     if needs_hip {
         if sdk_path.is_empty() {
@@ -1498,13 +1511,19 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
         }
         if pytorch_is_ambient_hip_build {
             score += 25;
-            evidence.push(
-                "PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned(),
-            );
+            // Two wordings, because this clause is about PyTorch needing a
+            // system HIP SDK and the arm above already said what is wrong with
+            // the one here. Saying "the HIP SDK is not present" beside "HIP SDK
+            // at C:\... but hipInfo.exe is missing" put two contradictory lines
+            // in one finding, and the user had no way to tell which was true.
+            evidence.push(if sdk_path.is_empty() {
+                "PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned()
+            } else {
+                "PyTorch is a HIP build, so it needs a working system HIP SDK".to_owned()
+            });
         }
     }
 
-    let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_HIP_SDK_MISSING);
     score += kw_score;
     evidence.extend(kw_ev);
 
@@ -3276,6 +3295,94 @@ mod tests {
                 .iter()
                 .map(|d| (&d.id, d.score))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The textbook fix-13 host: Windows, an AMD GPU, no HIP SDK, no framework
+    /// the probe recognises — and a pasted error that is HIP failing to load.
+    ///
+    /// The gate that stops fix-13 top-ranking a Vulkan host must not also stop
+    /// it on this one. The error text *is* the HIP-use evidence: something on
+    /// the machine tried to load HIP and could not, which no framework probe
+    /// can contradict — "no framework detected" means none that `examine`
+    /// knows, not that nothing here calls into HIP. Gating on the detected
+    /// framework alone dropped the +35 from exactly the case the entry exists
+    /// for, taking `'hipInfo' is not recognized` from 80 to 45 and
+    /// `could not find HIP` from 75 to 40 — both below `MIN_SCORE_FOR_MATCH`,
+    /// so `has_match` went false and the user was routed upstream for a
+    /// problem the catalog has a fix for.
+    ///
+    /// Measured, not reasoned: these three numbers were read off a run on the
+    /// base branch before the gate existed.
+    #[test]
+    fn fix_13_scores_a_pasted_hip_load_failure_with_no_framework_detected() {
+        let windows_no_sdk = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            // No framework, and no HIP SDK: `hip_sdk_path` empty is the +35 arm.
+            ..Examination::default()
+        };
+
+        for (symptom, expected) in [
+            (
+                "'hipInfo' is not recognized as an internal or external command",
+                80,
+            ),
+            ("could not find HIP", 75),
+            ("amdhip64.dll was not found", 85),
+        ] {
+            let finding = check_13_hip_sdk_missing(&windows_no_sdk, symptom);
+            assert_eq!(
+                finding.score, expected,
+                "the pasted error is what establishes that this host loads HIP, so the \
+                 SDK-absent 35 belongs on top of the keyword score for {symptom:?}: {finding:?}"
+            );
+            assert!(
+                finding
+                    .evidence
+                    .iter()
+                    .any(|ev| ev.contains("No HIP SDK install found")),
+                "and the finding has to say the SDK is missing, which is the thing to \
+                 fix, not only quote the error back: {finding:?}"
+            );
+            let report = diagnose(&windows_no_sdk, symptom);
+            assert!(
+                report.has_match,
+                "{symptom:?} must establish a cause rather than routing the user \
+                 upstream: {:?}",
+                report
+                    .matched
+                    .iter()
+                    .map(|d| (&d.id, d.score))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The gate still holds on the host it was built for: a pasted error that
+    /// says nothing about HIP opens nothing.
+    ///
+    /// Without this, "let a keyword count as HIP use" could be read as "let any
+    /// symptom count", which would put the entry back where it started.
+    #[test]
+    fn fix_13_stays_silent_for_a_symptom_that_does_not_name_hip() {
+        let finding = check_13_hip_sdk_missing(
+            &Examination {
+                os_family: "windows".to_owned(),
+                has_amd_gpu: true,
+                ..Examination::default()
+            },
+            "the server exits with code 3221225781 on startup",
+        );
+        assert_eq!(
+            finding.score, 0,
+            "an unrelated paste on a Vulkan host is not evidence the HIP SDK is \
+             missing: {finding:?}"
         );
     }
 
