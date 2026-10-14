@@ -699,12 +699,12 @@ vllm: not_installed
             "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
         );
         assert_eq!(rows.len(), 1);
-        // Pre-existing behavior, not introduced by this move: the leading
-        // "- service_id=" prefix strip consumes the `service_id` key before
-        // the per-token `key=value` loop runs, so the bare id token that's
-        // left (`svc-1`) has no `=` and is silently dropped — service_id ends
-        // up empty for this inline form. Fixing the parser is out of scope
-        // for this no-behavior-change extraction.
+        // Known bug, pinned rather than fixed: the leading "- service_id="
+        // prefix strip consumes the `service_id` key before the per-token
+        // `key=value` loop runs, so the bare id token that's left (`svc-1`)
+        // has no `=` and is silently dropped — service_id ends up empty for
+        // this inline form. Nothing downstream reads `row.service_id` today,
+        // so the field is latent dead data rather than an observed failure.
         assert_eq!(rows[0].service_id, "");
         assert_eq!(rows[0].engine, "vllm");
         assert_eq!(rows[0].status, "ready");
@@ -761,12 +761,28 @@ endpoint: 127.0.0.1:8001
         assert!(normalized_chat_rocm_command_args(&rocm_command_call(&[])).is_err());
         assert!(normalized_chat_rocm_command_args(&rocm_command_call(&["rocm"])).is_err());
 
-        let with_control_char = providers::ChatToolCall {
+        for control_arg in ["engines\nlist", "engines\rlist", "engines\0list"] {
+            let call = providers::ChatToolCall {
+                id: None,
+                name: "rocm_command".to_owned(),
+                arguments: serde_json::json!({"args": [control_arg]}),
+            };
+            assert!(normalized_chat_rocm_command_args(&call).is_err());
+        }
+    }
+
+    #[test]
+    fn normalized_chat_rocm_command_args_rejects_over_limit_count_and_length() {
+        let too_many_args = vec!["engines"; 65];
+        assert!(normalized_chat_rocm_command_args(&rocm_command_call(&too_many_args)).is_err());
+
+        let too_long_arg = "a".repeat(513);
+        let call = providers::ChatToolCall {
             id: None,
             name: "rocm_command".to_owned(),
-            arguments: serde_json::json!({"args": ["engines\nlist"]}),
+            arguments: serde_json::json!({"args": [too_long_arg]}),
         };
-        assert!(normalized_chat_rocm_command_args(&with_control_char).is_err());
+        assert!(normalized_chat_rocm_command_args(&call).is_err());
     }
 
     #[test]
