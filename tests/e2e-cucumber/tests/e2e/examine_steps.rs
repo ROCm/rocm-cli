@@ -1406,7 +1406,7 @@ async fn stub_amd_smi_that_stalls_only_on_monitor(world: &mut E2eWorld) {
 
 #[when("the daemon gathers a bridge snapshot")]
 async fn daemon_gathers_bridge_snapshot(world: &mut E2eWorld) {
-    let rocmd = crate::e2e::artifact_steps::rocmd_binary();
+    let rocmd = crate::rocmd_binary();
 
     let mut command = std::process::Command::new(rocmd);
     command.arg("bridge-snapshot");
