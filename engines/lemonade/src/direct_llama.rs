@@ -378,7 +378,13 @@ where
 /// Render the cache directories `hf_cache_roots` searches, for use in an error message
 /// when none of them held the expected file.
 fn describe_hf_cache_roots(paths: &AppPaths) -> String {
-    let roots = hf_cache_roots(paths);
+    render_hf_cache_roots(&hf_cache_roots(paths))
+}
+
+/// The rendering half of [`describe_hf_cache_roots`], split out so the error text can be
+/// asserted against the same root list `hf_cache_roots_from` produces, without depending
+/// on the host's real environment.
+fn render_hf_cache_roots(roots: &[PathBuf]) -> String {
     if roots.is_empty() {
         return "no Hugging Face cache directories could be determined".to_owned();
     }
@@ -835,6 +841,45 @@ mod tests {
         assert_eq!(
             roots,
             vec![PathBuf::from("rocm-cache").join("huggingface").join("hub")]
+        );
+    }
+
+    /// The "did not download" errors claim they searched a specific set of directories.
+    /// Assert that claim against the roots `hf_cache_roots_from` actually returns, so the
+    /// message cannot drift from the lookup it describes — in particular, that the
+    /// Windows `USERPROFILE` fallback this fix adds is named in the text a user sees.
+    #[test]
+    fn hf_cache_root_description_names_every_searched_root() {
+        let paths = AppPaths {
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("rocm-cache"),
+        };
+        let roots = hf_cache_roots_from(
+            &paths,
+            |_name| None,
+            || Some(PathBuf::from(r"C:\Users\dev")),
+        );
+        let described = render_hf_cache_roots(&roots);
+
+        for root in &roots {
+            assert!(
+                described.contains(&root.display().to_string()),
+                "error text {described:?} omits searched root {}",
+                root.display()
+            );
+        }
+        assert!(
+            described.contains(&PathBuf::from(r"C:\Users\dev").display().to_string()),
+            "error text {described:?} must name the platform-home fallback root"
+        );
+    }
+
+    #[test]
+    fn hf_cache_root_description_reports_when_no_roots_resolve() {
+        assert_eq!(
+            render_hf_cache_roots(&[]),
+            "no Hugging Face cache directories could be determined"
         );
     }
 }
