@@ -788,7 +788,9 @@ rocm install sdk --devel")]
         #[arg(long)]
         approve_replacing_active_default: bool,
     },
-    /// Preview or install Linux AMD driver support.
+    /// Preview or install Linux AMD driver support. On Windows it installs
+    /// nothing: it reports the AMD display driver version and date and whether
+    /// the driver is old.
     Driver {
         /// Use the DKMS driver wrapper flow.
         #[arg(long)]
@@ -8542,6 +8544,68 @@ fn host_default_engine(paths: Option<&AppPaths>) -> &'static str {
     rocm_core::default_engine_for_host(&rocm_core::detect_host_gpu_summary(paths))
 }
 
+/// The plan for a driver request. `only_reports` is the same platform decision
+/// `rocm install driver` makes (see `driver_install::install_driver_only_reports_on`):
+/// where it holds the command changes nothing, so the plan is read-only, carries
+/// no `--yes` and does not call the change privileged or disruptive.
+fn plan_driver_request(trimmed: &str, lower: &str, only_reports: bool) -> StructuredRequestPlan {
+    let mut args = vec!["install".to_owned(), "driver".to_owned()];
+    if lower.contains("dkms") {
+        args.push("--dkms".to_owned());
+    }
+    let (approval, install_action, notes) = if only_reports {
+        (
+            "not required: on Windows this only reports",
+            PlannedToolCall::read_only(
+                "Check driver (report only)",
+                args,
+                "on Windows the driver command reports and installs nothing",
+            ),
+            vec![
+                "On Windows `rocm install driver` reports the driver state and never changes it."
+                    .to_owned(),
+            ],
+        )
+    } else {
+        args.push("--yes".to_owned());
+        (
+            "required before driver changes",
+            PlannedToolCall::approval_required(
+                "Install driver",
+                args,
+                "driver changes are privileged or disruptive",
+            ),
+            vec!["Driver changes are always explicit and never silent.".to_owned()],
+        )
+    };
+    StructuredRequestPlan {
+        request: trimmed.to_owned(),
+        planner: "hybrid-parser-v1".to_owned(),
+        provider_assisted: false,
+        intent: PlannerIntent::InstallDriver,
+        confidence: "high",
+        approval,
+        parsed: vec![(
+            "driver_flow".to_owned(),
+            if lower.contains("dkms") {
+                "dkms"
+            } else {
+                "platform default"
+            }
+            .to_owned(),
+        )],
+        actions: vec![
+            PlannedToolCall::read_only(
+                "Inspect host/driver state",
+                vec!["examine".to_owned()],
+                "read-only inspection",
+            ),
+            install_action,
+        ],
+        notes,
+    }
+}
+
 /// `host_default_engine` is the engine this GPU serves on, resolved by the
 /// caller. It is the last resort: an engine named in the request wins, then the
 /// configured default, then the matched recipe's preference.
@@ -8556,6 +8620,24 @@ fn build_freeform_plan_with_recipes(
     config: &RocmCliConfig,
     recipes: Option<&[ModelRecipeRecord]>,
     host_default_engine: &str,
+) -> StructuredRequestPlan {
+    build_freeform_plan_on(
+        request,
+        config,
+        recipes,
+        host_default_engine,
+        driver_install::host_install_driver_only_reports(),
+    )
+}
+
+/// [`build_freeform_plan_with_recipes`] with the platform decision for
+/// `rocm install driver` passed in, so a test can plan for either platform.
+fn build_freeform_plan_on(
+    request: &str,
+    config: &RocmCliConfig,
+    recipes: Option<&[ModelRecipeRecord]>,
+    host_default_engine: &str,
+    driver_only_reports: bool,
 ) -> StructuredRequestPlan {
     let trimmed = request.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -8693,41 +8775,7 @@ fn build_freeform_plan_with_recipes(
     }
 
     if lower.contains("driver") {
-        let mut args = vec!["install".to_owned(), "driver".to_owned()];
-        if lower.contains("dkms") {
-            args.push("--dkms".to_owned());
-        }
-        args.push("--yes".to_owned());
-        return StructuredRequestPlan {
-            request: trimmed.to_owned(),
-            planner: "hybrid-parser-v1".to_owned(),
-            provider_assisted: false,
-            intent: PlannerIntent::InstallDriver,
-            confidence: "high",
-            approval: "required before driver changes",
-            parsed: vec![(
-                "driver_flow".to_owned(),
-                if lower.contains("dkms") {
-                    "dkms"
-                } else {
-                    "platform default"
-                }
-                .to_owned(),
-            )],
-            actions: vec![
-                PlannedToolCall::read_only(
-                    "Inspect host/driver state",
-                    vec!["examine".to_owned()],
-                    "read-only inspection",
-                ),
-                PlannedToolCall::approval_required(
-                    "Install driver",
-                    args,
-                    "driver changes are privileged or disruptive",
-                ),
-            ],
-            notes: vec!["Driver changes are always explicit and never silent.".to_owned()],
-        };
+        return plan_driver_request(trimmed, &lower, driver_only_reports);
     }
 
     if planner_mentions_comfyui(&lower) {
@@ -9320,6 +9368,14 @@ fn planner_intent_from_args(args: &[String]) -> Result<PlannerIntent> {
 }
 
 fn provider_planner_args_require_approval(args: &[String]) -> bool {
+    // Where `install driver` only reports, a provider-proposed call changes
+    // nothing, so it is read-only like the deterministic planners' plan.
+    if matches!(args, [first, second, ..] if first == "install" && second == "driver")
+        && driver_install::host_install_driver_only_reports()
+        && !args.iter().any(|arg| arg == "--apply")
+    {
+        return false;
+    }
     matches!(
         args.first().map(String::as_str),
         Some("install" | "serve" | "uninstall")
@@ -12369,6 +12425,7 @@ pub(crate) mod tests {
                 policy: "linux_official_amd_dkms_wrapper".to_owned(),
                 status: "amdgpu_available".to_owned(),
                 detail: None,
+                windows: None,
             },
             legacy_rocm: rocm_core::LegacyRocmSummary {
                 status: legacy_status.to_owned(),
@@ -14318,11 +14375,58 @@ pub(crate) mod tests {
         );
     }
 
+    /// A provider-proposed `install driver` needs approval exactly where the
+    /// command installs; the other install, serve and uninstall calls always do.
+    #[test]
+    fn provider_plans_ask_approval_for_install_driver_only_where_it_installs() {
+        let driver = vec!["install".to_owned(), "driver".to_owned()];
+        assert_eq!(
+            provider_planner_args_require_approval(&driver),
+            !driver_install::host_install_driver_only_reports()
+        );
+        assert!(provider_planner_args_require_approval(&[
+            "install".to_owned(),
+            "sdk".to_owned()
+        ]));
+        assert!(provider_planner_args_require_approval(&[
+            "serve".to_owned(),
+            "qwen".to_owned()
+        ]));
+    }
+
+    /// The production planner passes this host's decision to the platform-aware
+    /// core, so hard-coding either value in the wrapper fails on one of the two
+    /// platforms the suite runs on.
+    #[test]
+    fn the_production_planner_follows_the_hosts_install_driver_decision() {
+        assert_eq!(
+            driver_install::host_install_driver_only_reports(),
+            std::env::consts::OS == "windows"
+        );
+        let plan = build_freeform_plan("install the driver", &RocmCliConfig::default());
+        let action = plan.actions.last().expect("a driver action");
+        let has_yes = action.args.iter().any(|arg| arg == "--yes");
+        assert_eq!(
+            has_yes,
+            std::env::consts::OS != "windows",
+            "the planner carries --yes exactly where the command installs: {action:?}"
+        );
+        assert_eq!(
+            plan.approval.starts_with("required"),
+            std::env::consts::OS != "windows"
+        );
+    }
+
     #[test]
     fn hybrid_planner_driver_action_includes_yes_for_approved_execution() {
-        let plan = build_freeform_plan(
+        // Pinned to the platforms where the command mutates; on Windows the
+        // plan is read-only (see `planners_describe_install_driver_as_the_command_behaves_on_each_platform`).
+        let plan = build_freeform_plan_on(
             "install the linux driver with dkms",
             &RocmCliConfig::default(),
+            None,
+            host_default_engine(None),
+            false,
         );
         let action = plan
             .actions

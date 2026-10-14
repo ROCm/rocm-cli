@@ -2419,6 +2419,26 @@ pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
     }
 }
 
+/// The chat action for `rocm install driver`. Where the command only reports
+/// (`only_reports`, the same decision the command itself makes) it is a
+/// read-only call with no `--yes`; elsewhere it needs approval and carries
+/// `--yes`.
+pub(crate) fn chat_install_driver_action(
+    mut args: Vec<String>,
+    only_reports: bool,
+) -> ChatRocmCommandAction {
+    if only_reports {
+        args.retain(|arg| arg != "--yes");
+        return ChatRocmCommandAction::ReadOnly(args);
+    }
+    ensure_flag(&mut args, "--yes");
+    ChatRocmCommandAction::Approval {
+        args,
+        pending_title: "Install driver".to_owned(),
+        command_title: "Install".to_owned(),
+    }
+}
+
 pub(crate) fn chat_rocm_command_action_from_args(
     mut args: Vec<String>,
 ) -> Result<ChatRocmCommandAction> {
@@ -2502,14 +2522,10 @@ pub(crate) fn chat_rocm_command_action_from_args(
                 command_title: "Install".to_owned(),
             })
         }
-        Some("install") if second.as_deref() == Some("driver") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install driver".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
+        Some("install") if second.as_deref() == Some("driver") => Ok(chat_install_driver_action(
+            args,
+            crate::driver_install::host_install_driver_only_reports(),
+        )),
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
