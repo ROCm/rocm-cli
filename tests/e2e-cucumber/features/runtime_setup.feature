@@ -333,7 +333,7 @@ Feature: Runtime configuration
   # environment and has no llama.cpp backend to align; `@nightly` for the same
   # reason as the vLLM torch-alignment scenarios above -- a real managed SDK
   # and a real backend download, not something to repeat on every PR.
-  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-engine:lemonade @nightly
+  @id:runtime-lemonade-backend-alignment-reported @requires-gpu @requires-os:windows @requires-engine:lemonade @nightly
   Scenario: runtime-16 - Reinstalling Lemonade reports whether its ROCm backend was aligned
     Given a managed runtime is active
     When the user reinstalls the lemonade engine
