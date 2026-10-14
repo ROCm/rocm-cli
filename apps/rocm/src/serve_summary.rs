@@ -55,6 +55,10 @@ pub(crate) struct DeploymentSummary {
     pub service_id: String,
     /// `"ready"`, `"starting"`, or an existing service's status.
     pub status: String,
+    /// The backend/device the engine actually selected (e.g. `"vulkan gpu 0"`,
+    /// `"rocm gpu 0"`), read from the engine's own `Healthcheck` response.
+    /// `None` when the query failed or the service was not ready to ask.
+    pub device: Option<String>,
     /// True when an equivalent server was already running and nothing was spawned.
     pub already_running: bool,
     pub metrics: SmokeMetrics,
@@ -121,11 +125,17 @@ pub(crate) fn render_summary(summary: &DeploymentSummary) -> String {
         ]
     };
 
+    let device_row = summary
+        .device
+        .as_deref()
+        .map(|device| ("device", device.to_owned()));
+
     let rows: Vec<(&str, String)> = [
         vec![
             ("status", summary.status.clone()),
             ("engine", summary.engine.clone()),
         ],
+        device_row.into_iter().collect(),
         model_rows,
         vec![
             ("endpoint", summary.chat_endpoint.clone()),
@@ -265,6 +275,7 @@ mod tests {
             chat_endpoint: "http://127.0.0.1:1337/v1/chat/completions".to_owned(),
             service_id: "vllm-qwen-1720000000".to_owned(),
             status: "ready".to_owned(),
+            device: None,
             already_running: false,
             metrics: SmokeMetrics {
                 ttft: Some(Duration::from_millis(180)),
@@ -433,6 +444,23 @@ mod tests {
         let mut summary = base_summary();
         summary.notes = vec!["selected GPU 0 has low free VRAM".to_owned()];
         assert!(render_summary(&summary).contains("note: selected GPU 0 has low free VRAM"));
+    }
+
+    #[test]
+    fn device_row_shown_only_when_known() {
+        let without_device = render_summary(&base_summary());
+        assert!(!without_device.contains("device"), "{without_device}");
+
+        let mut summary = base_summary();
+        summary.device = Some("vulkan gpu 0".to_owned());
+        let rendered = render_summary(&summary);
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line.trim_start().starts_with("device")
+                    && line.trim_end().ends_with("vulkan gpu 0")),
+            "{rendered}"
+        );
     }
 
     #[test]

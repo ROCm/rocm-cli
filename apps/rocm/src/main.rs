@@ -109,7 +109,8 @@ use rocm_core::{
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
     ENGINE_RECIPE_CONTRACT_VERSION, EngineMethod, EnginePluginDescriptor, EngineRecipeHint,
-    EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, StopRequest, StopResponse,
+    EngineRequestEnvelope, EngineResponseEnvelope, GpuSelection, HealthcheckRequest,
+    HealthcheckResponse, StopRequest, StopResponse,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -2738,6 +2739,21 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
             binary_path: binary_path.clone(),
         })
         .collect()
+}
+
+/// The lemonade engine note shown in `rocm examine` and `rocm engines`, adjusted
+/// for whether this host's detected GPU can actually use the ROCm llama.cpp
+/// backend. Both call sites have a live `GpuSupportLevel` in scope; other
+/// places that print this note statically (the dashboard TUI, `rocmd`'s own
+/// catalog) have no host probe in front of them and keep the unconditional
+/// ROCm wording, since they describe the engine in the abstract.
+const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
+    match level {
+        rocm_core::GpuSupportLevel::VulkanOnly => {
+            "default embedded Lemonade server; this GPU has no ROCm/HIP support, so it runs on the Vulkan llama.cpp backend"
+        }
+        _ => "default embedded Lemonade server with ROCm llama.cpp backend",
+    }
 }
 
 const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
@@ -9066,7 +9082,17 @@ fn examine_human_report(
     let mut output = render_examine_plain_header(&summary);
     output.push_str(&summary.render_text());
     append_examine_runtime_state(&mut output, paths, config)?;
-    append_examine_engine_inventory(&mut output, paths, config, &summary.default_engine);
+    let gpu_support_level = rocm_core::gpu_support_level(
+        summary.detected_gfx_target.as_deref(),
+        summary.compatible_therock_family.as_deref(),
+    );
+    append_examine_engine_inventory(
+        &mut output,
+        paths,
+        config,
+        &summary.default_engine,
+        gpu_support_level,
+    );
     Ok((output, summary))
 }
 
@@ -9124,6 +9150,10 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
     // constant put the `*` on Lemonade even on Instinct, where `serve` picks vLLM.
     let host_gpu = rocm_core::detect_host_gpu_summary(paths);
     let host_default_engine = rocm_core::default_engine_for_host(&host_gpu);
+    let gpu_support_level = rocm_core::gpu_support_level(
+        host_gpu.gfx_target.as_deref(),
+        host_gpu.therock_family.as_deref(),
+    );
     // A configured `default_engine` still wins over the host preference, mirroring
     // `select_serve_engine` (and `append_examine_engine_inventory`). Without this,
     // the legend could mark an engine `serve` will not actually default to.
@@ -9169,6 +9199,11 @@ fn render_engine_inventory_text_with_paths(paths: Option<&AppPaths>) -> String {
             DEFAULT_ENGINE_MARKER
         } else {
             " "
+        };
+        let note = if *name == "lemonade" {
+            lemonade_engine_note(gpu_support_level)
+        } else {
+            *note
         };
         let _ = writeln!(output, "{marker} {name:10} {note}");
         append_engine_detect_summary(&mut output, name, paths);
@@ -9294,6 +9329,7 @@ fn append_examine_engine_inventory(
     paths: &AppPaths,
     config: &RocmCliConfig,
     host_default_engine: &str,
+    gpu_support_level: rocm_core::GpuSupportLevel,
 ) {
     // Mirrors `select_serve_engine`'s guard: a blank configured value must not
     // out-rank the host preference, or `effective_default` below would become
@@ -9380,6 +9416,11 @@ fn append_examine_engine_inventory(
                     .or(entry.last_installed_env_id.as_deref())
             })
             .unwrap_or("<unset>");
+        let note = if *engine == "lemonade" {
+            lemonade_engine_note(gpu_support_level)
+        } else {
+            *note
+        };
         let _ = writeln!(
             output,
             "  {marker} {engine} adapter={adapter} runtime_pref={runtime_pref} note={note}"
@@ -10708,6 +10749,16 @@ pub(crate) fn render_services_text(paths: &AppPaths, all: bool) -> Result<String
         let _ = writeln!(output, "- {}", record.service_id);
         let _ = writeln!(output, "  status: {}", record.status);
         let _ = writeln!(output, "  engine: {}", record.engine);
+        // Queried live from the engine's `Healthcheck` RPC, not persisted on the
+        // record: a persisted value would go stale across a restart or backend
+        // realignment, and the whole point is that this matches what the server
+        // actually reports right now. Only meaningful once the engine is ready
+        // to answer, same gate `rocm serve`'s summary uses.
+        if record.status == "ready"
+            && let Some(device) = fetch_service_device(paths, &record.engine, &record.service_id)
+        {
+            let _ = writeln!(output, "  device: {device}");
+        }
         let _ = writeln!(output, "  model: {}", record.model_ref);
         let _ = writeln!(output, "  endpoint: {}", record.endpoint_url);
         let _ = writeln!(output, "  logs: rocm services logs {}", record.service_id);
@@ -14198,6 +14249,31 @@ where
         }
     })?;
     decode_engine_response(envelope)
+}
+
+/// Best-effort query of the backend/device a running managed service actually
+/// selected (e.g. `"vulkan gpu 0"` / `"rocm gpu 0"`), via the same
+/// `Healthcheck` RPC every engine plugin already answers
+/// (`engines/lemonade` reads it back from its own `backend_requested` state;
+/// `engines/vllm` always reports its fixed ROCm device). Read from the
+/// engine, never guessed from the launch-time GPU selection, so it reflects
+/// what the server is actually running on. `None` on any failure — this is
+/// informational text, not worth failing `serve`/`services list` over.
+fn fetch_service_device(paths: &AppPaths, engine: &str, service_id: &str) -> Option<String> {
+    let response: HealthcheckResponse = engine_request(
+        Some(paths),
+        engine,
+        EngineMethod::Healthcheck,
+        &HealthcheckRequest {
+            service_id: service_id.to_owned(),
+        },
+    )
+    .ok()?;
+    // `"unknown"` is the engines' own device value when no state is on disk for
+    // this service id yet (see `engines/vllm/src/state.rs` and
+    // `engines/lemonade/src/lib.rs`), which is not more informative than
+    // showing nothing.
+    (!response.device.is_empty() && response.device != "unknown").then_some(response.device)
 }
 
 fn decode_engine_response<R>(envelope: EngineResponseEnvelope) -> Result<R>
@@ -21605,6 +21681,10 @@ install therock";
         );
         assert!(rendered.contains("- svc-ready"));
         assert!(rendered.contains("  stop: rocm services stop svc-ready --yes"));
+        // No real engine state file backs this record, so the engine's own
+        // Healthcheck reports `device: "unknown"` — not more informative than
+        // omitting the line, so it must not appear.
+        assert!(!rendered.contains("device:"), "{rendered}");
         assert!(!rendered.contains("- svc-failed"));
         assert!(all.contains("- svc-failed"));
         assert!(all.contains("  restart: rocm services restart svc-failed --yes"));
@@ -25829,7 +25909,13 @@ install therock";
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("configured_default_engine: <platform default>"),
@@ -26559,7 +26645,13 @@ install therock";
 
         // Host default deliberately disagrees with the configured value: an
         // engine the user chose must outrank whatever the GPU would prefer.
-        append_examine_engine_inventory(&mut output, &paths, &config, "lemonade");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(output.contains("engine_inventory:"));
         assert!(output.contains("configured_default_engine: vllm"));
@@ -26576,7 +26668,13 @@ install therock";
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         let legend = format!("legend: {DEFAULT_ENGINE_MARKER} = default engine");
@@ -26602,7 +26700,13 @@ install therock";
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
         let _ = fs::remove_dir_all(root);
 
         assert!(
@@ -26622,7 +26726,13 @@ install therock";
         let config = RocmCliConfig::default();
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         // The configured line still reads as unset — the host default must not be
         // mistaken for something the user chose.
@@ -26654,7 +26764,13 @@ install therock";
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             output.contains("effective_default_engine: lemonade"),
@@ -26680,6 +26796,55 @@ install therock";
     }
 
     #[test]
+    fn examine_engine_inventory_names_vulkan_for_a_gpu_with_no_rocm_support() {
+        // A gfx90c host (or any confirmed-no-ROCm-build GPU) actually runs
+        // Lemonade's Vulkan backend, not the ROCm one the static catalog text
+        // always claimed.
+        let (root, paths) = test_paths("examine-engine-inventory-vulkan-only");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::VulkanOnly,
+        );
+
+        assert!(
+            output.contains("no ROCm/HIP support") && output.contains("Vulkan llama.cpp backend"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("note=default embedded Lemonade server with ROCm"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn examine_engine_inventory_keeps_rocm_note_for_a_rocm_capable_gpu() {
+        let (root, paths) = test_paths("examine-engine-inventory-rocm-capable");
+        let config = RocmCliConfig::default();
+        let mut output = String::new();
+
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "lemonade",
+            rocm_core::GpuSupportLevel::RocmHip,
+        );
+
+        assert!(
+            output.contains("note=default embedded Lemonade server with ROCm llama.cpp backend"),
+            "{output}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn examine_is_silent_when_the_configured_engine_agrees_with_the_host() {
         let (root, paths) = test_paths("examine-engine-inventory-agrees");
         let config = RocmCliConfig {
@@ -26688,7 +26853,13 @@ install therock";
         };
         let mut output = String::new();
 
-        append_examine_engine_inventory(&mut output, &paths, &config, "vllm");
+        append_examine_engine_inventory(
+            &mut output,
+            &paths,
+            &config,
+            "vllm",
+            rocm_core::GpuSupportLevel::Unknown,
+        );
 
         assert!(
             !output.contains("configured_default_note"),
