@@ -15,7 +15,9 @@
 //! - `procfs`: `/proc/version`, `/proc/cpuinfo`, `/proc/meminfo`,
 //!   `/proc/cmdline`, `/proc/modules` (the fallback when `lsmod` cannot run)
 //!   and `/proc/1/cgroup`;
-//! - the `/etc/os-release` behind the distro name `rocm examine` reports;
+//! - the `/etc/os-release` behind the distro fields and name `rocm examine`
+//!   reports, falling back to `/usr/lib/os-release` when the former is absent,
+//!   per `os-release(5)`;
 //! - the modprobe configuration directories `/etc/modprobe.d`,
 //!   `/usr/lib/modprobe.d` and `/run/modprobe.d`;
 //! - the WSL plumbing: the `/usr/lib/wsl/lib` directory check and
@@ -33,9 +35,10 @@
 //! `LD_LIBRARY_PATH`; re-rooting it would put the simulated directory in front
 //! of a real loader. Programs the probes execute, such as `ldconfig`, stay on
 //! the real host too: a simulated root holds no binary to run. Every
-//! package-manager plan reads the real `/etc/os-release` — the install hints in
-//! `openmpi.rs`, and the driver, OpenMPI and runtime-library installs in the
-//! `rocm` binary — because the commands it builds run against the real
+//! package-manager plan reads the real `/etc/os-release` (with the same
+//! `/usr/lib/os-release` fallback) — the OpenMPI, libatomic and libnuma install
+//! hints in `openmpi.rs`, and the driver, OpenMPI and runtime-library installs
+//! in the `rocm` binary — because the commands it builds run against the real
 //! machine. Process liveness under `/proc/<pid>` and `/dev/shm` sizing are
 //! about this process's environment, not the hardware.
 //!
@@ -110,6 +113,19 @@ fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
+/// Reads `/etc/os-release`, falling back to `/usr/lib/os-release` per
+/// `os-release(5)` when the former is absent.
+///
+/// `resolve` maps each candidate to where it should actually be read from —
+/// [`host_path`] for a probe that must honour a simulated test root, or the
+/// identity for one that must always read the real machine (see the module
+/// doc above).
+pub fn read_os_release(resolve: impl Fn(&str) -> PathBuf) -> Option<String> {
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .into_iter()
+        .find_map(|candidate| std::fs::read_to_string(resolve(candidate)).ok())
+}
+
 /// Serialises every test that sets [`TEST_HOST_ROOT_ENV`], including the
 /// downstream probe test in `examine.rs`, so two of them never see each other's
 /// simulated root.
@@ -181,5 +197,43 @@ mod tests {
         }
         let _empty = crate::test_env::RestoredEnvVar::set(TEST_HOST_ROOT_ENV, Path::new(""));
         assert_eq!(host_path("/dev/kfd"), PathBuf::from("/dev/kfd"));
+    }
+
+    /// Maps `/etc/os-release` to `primary` and `/usr/lib/os-release` to
+    /// `fallback` under `dir`, so [`read_os_release`]'s fallback can be tested
+    /// without touching the real host's files.
+    fn candidate(dir: &Path, name: &str) -> PathBuf {
+        match name {
+            "/etc/os-release" => dir.join("primary"),
+            "/usr/lib/os-release" => dir.join("fallback"),
+            other => panic!("unexpected os-release candidate: {other}"),
+        }
+    }
+
+    #[test]
+    fn read_os_release_prefers_the_primary_candidate() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("primary"), "ID=primary\n").expect("write primary");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
+        assert_eq!(
+            read_os_release(|name| candidate(dir.path(), name)),
+            Some("ID=primary\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn read_os_release_falls_back_when_the_primary_is_absent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
+        assert_eq!(
+            read_os_release(|name| candidate(dir.path(), name)),
+            Some("ID=fallback\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn read_os_release_is_none_when_neither_candidate_exists() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(read_os_release(|name| candidate(dir.path(), name)), None);
     }
 }

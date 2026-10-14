@@ -1576,6 +1576,18 @@ and the distro name it prints
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 
+Every one of those readers goes through
+[`hardware_root::read_os_release`](../crates/rocm-core/src/hardware_root.rs),
+which reads `/etc/os-release` and, if that file does not exist, falls back to
+`/usr/lib/os-release` per `os-release(5)` — a file present but unreadable (the
+line-reporting cases below) does not fall back, since the fix there is to
+correct the line, not to read a second file. The two reads this covers are
+`os_release.rs`'s own: a probe routed through a simulated test root
+(`rocm examine`'s distro fields and distro name) resolves both candidates
+through `host_path`; a package-manager plan (the driver install, and the
+OpenMPI/libatomic/libnuma installs and hints) always resolves both against the
+real machine, for the same reason it never follows a simulated root at all.
+
 A line that is not a plain assignment makes the whole file unreadable, and
 each reader names that line instead of reporting an unknown distro. Where the
 message asks for a fix, it also says what to change on the line: LF line
@@ -1602,28 +1614,38 @@ cargo test -p rocm-core --lib os_release
 cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
 cargo test -p rocm-core --lib openmpi::tests
 cargo test -p rocm --bin rocm os_release
-cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root
+cargo test -p rocm-core --lib hardware_root::tests::read_os_release
+cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root os_release_reads_fall_back_to_usr_lib_when_etc_is_absent
 ```
 
-The parser tests that compare against `/bin/sh` itself are Linux-only. The last
-command plants a file under the simulated host root and checks that both
-`rocm examine` reads answer from it through the shared parser; the feature it
-needs is enabled only by its own CI step.
+The parser tests that compare against `/bin/sh` itself are Linux-only. The
+`hardware_root::tests::read_os_release*` tests check the fallback itself
+(primary found, primary absent, neither found) against an injected temp
+directory rather than the real host. The two `--features e2e-test-hooks`
+tests plant a file under the simulated host root and check that both
+`rocm examine` reads answer from it through the shared parser: the first at
+`/etc/os-release`, the second with only `/usr/lib/os-release` present, so the
+fallback is exercised through the real `host_path`-routed call sites, not just
+the helper in isolation; the feature they need is enabled only by its own CI
+step.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios
-`examine-20` to `examine-23` in
+`examine-20` to `examine-24` in
 [examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
 `examine-23` also plants a GPU in the kernel topology and puts an `lspci`
 listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
-lane, with or without a GPU:
+lane, with or without a GPU. `examine-24` plants only `/usr/lib/os-release`,
+with no `/etc/os-release` present, to check the `os-release(5)` fallback:
 
 ```bash
-RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-4] '
 ```
 
 The install plans deliberately read the real file, so no scenario plants one
-for them; their parsing is covered by the unit tests above.
+for them, including for the fallback; their parsing is covered by the unit
+tests above, and the fallback itself by `hardware_root`'s own unit tests,
+since both now read through the same helper with an identity resolver.
 
 ## Model Fit Preflight
 

@@ -728,7 +728,10 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
-        record_distro(e, &read_host_text("/etc/os-release"));
+        record_distro(
+            e,
+            &crate::hardware_root::read_os_release(|p| crate::host_path(p)).unwrap_or_default(),
+        );
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
@@ -5672,6 +5675,48 @@ mod tests {
             ("planted", "0.1")
         );
         assert_eq!(name.as_deref(), Some("Planted 0.1"));
+    }
+
+    /// `os-release(5)` falls back to `/usr/lib/os-release` when `/etc/os-release`
+    /// is absent. Both `rocm examine` reads must still answer from a host that
+    /// ships only the fallback path — a probe that stopped after the first
+    /// candidate would read as an unknown distro instead.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn os_release_reads_fall_back_to_usr_lib_when_etc_is_absent() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-os-release-fallback-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("usr/lib")).expect("create planted /usr/lib");
+        std::fs::write(
+            root.join("usr/lib/os-release"),
+            "ID='fallback'\nVERSION_ID='1.2'\nPRETTY_NAME='Fallback 1.2'\n",
+        )
+        .expect("write planted os-release");
+
+        let (examined, name) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut examined = Examination::default();
+            probe_os(&mut examined);
+            (examined, crate::host_gpu::detect_distro_name())
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            (
+                examined.distro_id.as_str(),
+                examined.distro_version.as_str()
+            ),
+            ("fallback", "1.2")
+        );
+        assert_eq!(name.as_deref(), Some("Fallback 1.2"));
     }
 }
 

@@ -1296,6 +1296,32 @@ fn plant_os_release(world: &mut E2eWorld, body: &str) {
         .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
 }
 
+/// Plant `body` as `/usr/lib/os-release` under a simulated host root, with no
+/// `/etc/os-release` present — the fallback `os-release(5)` defines, and the
+/// one `plant_os_release` above does not exercise.
+fn plant_os_release_fallback_only(world: &mut E2eWorld, body: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(root.join("usr/lib")).expect("failed to create planted /usr/lib");
+    std::fs::write(root.join("usr/lib").join("os-release"), body)
+        .expect("failed to write planted os-release");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
+#[given("a machine whose release file exists only at /usr/lib/os-release")]
+async fn os_release_only_at_usr_lib(world: &mut E2eWorld) {
+    plant_os_release_fallback_only(
+        world,
+        "NAME=\"Ubuntu\"\nID=ubuntu\nVERSION_ID=\"24.04\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n",
+    );
+}
+
 #[given("a machine whose release file quotes every value in single quotes")]
 async fn os_release_single_quoted(world: &mut E2eWorld) {
     plant_os_release(

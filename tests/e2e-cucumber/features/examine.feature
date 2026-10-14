@@ -325,3 +325,14 @@ Feature: GPU detection and system inspection
     Given a GPU machine whose release file runs a command on line 3
     When the user inspects that machine in machine-readable form
     Then the inspection's verdict is degraded, and its only failure is line 3 of the release file
+
+  # `os-release(5)` says to read `/etc/os-release` and, if it does not exist,
+  # fall back to `/usr/lib/os-release`. This plants a simulated host root with
+  # only the fallback path populated, so a reader that stopped after the first
+  # candidate would see no file at all and report an unknown distribution.
+  @id:examine-falls-back-to-usr-lib-os-release @requires-os:linux
+  Scenario: examine-24 - The inspection falls back to /usr/lib/os-release when /etc/os-release is absent
+    Given a machine whose release file exists only at /usr/lib/os-release
+    When the user inspects that machine in machine-readable form
+    Then the inspection reports the distribution "ubuntu" version "24.04" named "Ubuntu 24.04 LTS"
+    And the inspection reports no trouble reading the release file

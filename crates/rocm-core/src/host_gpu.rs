@@ -18,7 +18,7 @@
 
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
-    detect_managed_therock_family, discover_rocm_installs, examine, host_path,
+    detect_managed_therock_family, discover_rocm_installs, examine, hardware_root, host_path,
     managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
 use anyhow::Result;
@@ -1969,7 +1969,7 @@ pub(crate) fn detect_distro_name() -> Option<String> {
 
     if runtime_is_linux() {
         return Some(distro_name_from_os_release(
-            &fs::read_to_string(host_path("/etc/os-release")).ok()?,
+            &hardware_root::read_os_release(|p| host_path(p))?,
         ));
     }
 

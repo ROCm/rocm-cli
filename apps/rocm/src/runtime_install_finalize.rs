@@ -14,7 +14,6 @@
 //! and read from `engines_cmd.rs`.
 
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -149,7 +148,8 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
     if value.is_empty() { "<unknown>" } else { value }
 }
 
-/// The real host's `/etc/os-release`.
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`).
 ///
 /// Deliberately not routed through `rocm_core::host_path`: every caller builds
 /// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
@@ -157,7 +157,8 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
 /// distro. The descriptive distro name `examine` reports comes from
 /// `rocm_core::detect_distro_name`, which does follow a simulated root.
 pub(crate) fn read_os_release() -> Result<String> {
-    fs::read_to_string("/etc/os-release").context("failed to read /etc/os-release")
+    rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p))
+        .context("failed to read /etc/os-release or /usr/lib/os-release")
 }
 
 /// Run a command given as an argv vector directly, without going through a shell.
@@ -1970,6 +1971,8 @@ pub(crate) fn finalize_successful_sdk_install(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::fs;
+
     use super::*;
     use crate::test_support::write_test_pip_runtime;
     use crate::tests::{

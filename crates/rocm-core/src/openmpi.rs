@@ -939,14 +939,16 @@ fn libnuma_install_hint_for(text: &str) -> InstallHint {
     install_hint_for(text, build_libnuma_install_plan, LIBNUMA_MANUAL_HINT)
 }
 
-/// The real host's `/etc/os-release`, empty when it cannot be read.
+/// The real host's `/etc/os-release`, falling back to `/usr/lib/os-release`
+/// when the former is absent (per `os-release(5)`), empty when neither can be
+/// read.
 ///
 /// Not routed through [`crate::host_path`]: the hints name package-manager
 /// commands for the real machine, so a simulated host root must not choose
 /// their distribution.
 #[cfg(target_os = "linux")]
 fn real_os_release() -> String {
-    std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+    crate::hardware_root::read_os_release(|p| std::path::PathBuf::from(p)).unwrap_or_default()
 }
 
 const OPENMPI_MANUAL_HINT: &str = "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)";
