@@ -1409,7 +1409,8 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        write_fake_executable(&stub, SMI_STUB).expect("write rocm-smi stub");
+        write_fake_executable(&stub, SMI_STUB)
+            .expect("plant the fake rocm-smi for the bash/sh preflight");
         // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
         // run from a directory that has one.
         std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
@@ -1503,7 +1504,8 @@ esac
         let stub = dir.path().join("rocm-smi");
         std::fs::write(&fixture_path, fixture).expect("write fixture");
         std::fs::write(&script_path, script).expect("write script");
-        write_fake_executable(&stub, SMI_STUB).expect("write rocm-smi stub");
+        write_fake_executable(&stub, SMI_STUB)
+            .expect("plant the fake rocm-smi for the pwsh preflight");
 
         let path = format!(
             "{}:{}",

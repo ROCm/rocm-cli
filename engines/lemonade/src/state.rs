@@ -9,10 +9,9 @@ use rocm_engine_protocol::{
     GpuSelection,
 };
 use serde_json::{Value, json};
-use std::collections::{VecDeque, hash_map::DefaultHasher};
+use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, Seek};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
@@ -24,7 +23,7 @@ use crate::{DEFAULT_HOST, DEFAULT_MODEL, ENGINE_NAME, ServeHttpRequest, current_
 
 /// Maximum bytes to read from the end of a log file when extracting tail lines.
 /// Prevents reading entire gigabyte-sized logs on startup timeout.
-const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
+pub(crate) const MAX_TAIL_READ: u64 = 4 * 1024 * 1024; // 4MB
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceFiles {
@@ -263,56 +262,6 @@ pub(crate) fn identity_from_state(state: &Value) -> Option<rocm_core::ProcessIde
     let pid = value_u32(state, "pid")?;
     let start_ticks = state.get("start_ticks").and_then(Value::as_u64);
     Some(rocm_core::ProcessIdentity::new(pid, start_ticks))
-}
-
-pub(crate) fn tail_lines(path: &Path, limit: usize) -> Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("failed to stat {}", path.display()))?;
-    let file_size = metadata.len();
-
-    // For small files, read normally to preserve exact line count.
-    if file_size <= MAX_TAIL_READ {
-        let reader = std::io::BufReader::new(file);
-        let mut lines = VecDeque::with_capacity(limit);
-        for line in reader.lines() {
-            let line = line.with_context(|| format!("failed to read {}", path.display()))?;
-            if lines.len() == limit {
-                lines.pop_front();
-            }
-            lines.push_back(line);
-        }
-        return Ok(lines.into_iter().collect());
-    }
-
-    // For large files, seek near the end and read only the final chunk.
-    // This prevents reading multi-gigabyte logs during timeout errors.
-    let mut file = file;
-    let seek_pos = file_size.saturating_sub(MAX_TAIL_READ);
-    file.seek(std::io::SeekFrom::Start(seek_pos))
-        .with_context(|| format!("failed to seek in {}", path.display()))?;
-
-    let reader = std::io::BufReader::new(file);
-    let mut lines = VecDeque::with_capacity(limit);
-    let mut skipped_first = seek_pos == 0;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
-        // Skip the first line after seeking, as it may be partial.
-        if !skipped_first {
-            skipped_first = true;
-            continue;
-        }
-        if lines.len() == limit {
-            lines.pop_front();
-        }
-        lines.push_back(line);
-    }
-    Ok(lines.into_iter().collect())
 }
 
 pub(crate) fn terminate_pid(pid: u32, _force: bool) -> bool {
