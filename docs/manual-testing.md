@@ -637,3 +637,5 @@ Expected result:
   change.
 - If another program lives in the install folder, the review instead says
   `PATH change left in place` and names it, and the `PATH` change stays.
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
+  stays too, and it does.

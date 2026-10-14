@@ -13613,48 +13613,12 @@ struct UninstallPlan {
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
-    if options.keep_binaries {
-        plan.skipped
-            .push("binary removal disabled by --keep-binaries".to_owned());
-    } else {
-        let current_exe =
-            daemon_binary_path().context("failed to discover current rocm executable")?;
-        if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
-            plan.skipped.push(format!(
-                "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
-                current_exe.display()
-            ));
-        } else {
-            let binaries = collect_installed_binary_candidates(&current_exe)?;
-            for path in &binaries {
-                // Windows will not unlink a running image; it is deleted as
-                // the command exits instead.
-                if cfg!(windows) && *path == current_exe {
-                    plan.self_delete = Some(path.clone());
-                    continue;
-                }
-                // The PATH record goes only once its change is undone; see
-                // `uninstall::plan_path_edits`.
-                if path.file_name().and_then(|name| name.to_str())
-                    == Some(uninstall::PATH_EDIT_RECORD)
-                {
-                    continue;
-                }
-                plan.actions.push(UninstallPlanEntry {
-                    kind: "binary",
-                    path: path.clone(),
-                });
-            }
-            if let Some(bin_dir) = current_exe.parent() {
-                uninstall::plan_path_edits(
-                    &mut plan,
-                    bin_dir,
-                    &binaries,
-                    rocm_core::runtime_home_dir().as_deref(),
-                );
-            }
-        }
-    }
+    plan_installed_binaries(
+        &mut plan,
+        options,
+        || daemon_binary_path().context("failed to discover current rocm executable"),
+        rocm_core::runtime_home_dir().as_deref(),
+    )?;
 
     for (keep, kind, path) in [
         (options.keep_config, "config", paths.config_dir.clone()),
@@ -13739,6 +13703,76 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
         .sort_by(|left, right| left.path.cmp(&right.path));
     plan.actions.dedup_by(|left, right| left.path == right.path);
     Ok(plan)
+}
+
+/// Plan removing the installed binaries beside the running one, which
+/// `current_exe` names, and undoing the installer's PATH change for their
+/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
+fn plan_installed_binaries(
+    plan: &mut UninstallPlan,
+    options: &UninstallOptions,
+    current_exe: impl FnOnce() -> Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<()> {
+    if options.keep_binaries {
+        // The PATH change only serves the binaries, so it stays with them.
+        plan.skipped.push(
+            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
+             stays too"
+                .to_owned(),
+        );
+        return Ok(());
+    }
+    let current_exe = current_exe()?;
+    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+        plan.skipped.push(format!(
+            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+            current_exe.display()
+        ));
+        return Ok(());
+    }
+    let binaries = collect_installed_binary_candidates(&current_exe)?;
+    for path in &binaries {
+        // Windows will not unlink a running image; it is deleted as the
+        // command exits instead.
+        if is_running_executable(path, &current_exe, cfg!(windows)) {
+            plan.self_delete = Some(path.clone());
+            continue;
+        }
+        // The PATH record goes only once its change is undone; see
+        // `uninstall::plan_path_edits`.
+        if path.file_name().and_then(|name| name.to_str()) == Some(uninstall::PATH_EDIT_RECORD) {
+            continue;
+        }
+        plan.actions.push(UninstallPlanEntry {
+            kind: "binary",
+            path: path.clone(),
+        });
+    }
+    if let Some(bin_dir) = current_exe.parent() {
+        uninstall::plan_path_edits(plan, bin_dir, &binaries, home);
+    }
+    Ok(())
+}
+
+/// Whether `path`, an entry of the running executable's folder, is the running
+/// executable itself, which only Windows has to treat specially. Windows names
+/// are case-insensitive, and the running image may report its own name in
+/// another case, or in its 8.3 short form (`ROCM.EXE`), than the folder listing
+/// does; missing it would plan an ordinary removal that Windows refuses.
+fn is_running_executable(path: &Path, current_exe: &Path, windows: bool) -> bool {
+    if !windows {
+        return false;
+    }
+    path == current_exe
+        || (path.parent() == current_exe.parent()
+            && path
+                .file_name()
+                .zip(current_exe.file_name())
+                .is_some_and(|(name, exe)| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(&exe.to_string_lossy())
+                }))
 }
 
 pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {

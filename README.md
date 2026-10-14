@@ -958,8 +958,10 @@ Windows. It also undoes the `PATH` change the installer made: the marked block
 in your shell profile, or the user `PATH` entry the Windows installer recorded
 adding. That change stays when other programs live in the same folder, since
 they may rely on it (the review names them), and with `--keep-binaries`. A
-`PATH` line you wrote yourself is never touched. If the `PATH` change cannot be
-undone, the binaries are left in place so you can run `rocm uninstall` again.
+`PATH` line you wrote yourself is never touched. The `PATH` change is undone
+first: if it cannot be, nothing is removed, so you can fix the cause and run
+`rocm uninstall` again. Each step is reported as it finishes, so if a later
+step fails, the output still shows what was already removed.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and
