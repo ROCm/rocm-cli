@@ -1388,12 +1388,19 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
 
     /// The `name:` of `step`, a block as `step_block` returns it (its first
     /// line is the step's `- ` item line); empty when the step has none.
-    ///
-    /// `name:` is either the item's own first key (`- name: …`) or one of its
-    /// sibling keys, two columns in from the dash. Keys any deeper — a `with:`
-    /// input called `name`, a `name:` line inside the step's script — are not
-    /// the step's name.
     fn step_name(step: &str) -> String {
+        step_key(step, "name")
+    }
+
+    /// The one-line value of `step`'s own `{key}:`, unquoted and without a
+    /// trailing comment; empty when the step has no such key.
+    ///
+    /// The key is either the item's own first key (`- name: …`) or one of
+    /// its sibling keys, two columns in from the dash. Keys any deeper — a
+    /// `with:` input called `name`, a `name:` line inside the step's script —
+    /// are not the step's.
+    fn step_key(step: &str, key: &str) -> String {
+        let marker = format!("{key}:");
         let item_indent = step.lines().next().map_or(0, indent_of);
         step.lines()
             .find_map(|l| {
@@ -1404,7 +1411,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 } else {
                     return None;
                 };
-                key_line.strip_prefix("name:")
+                key_line.strip_prefix(&marker)
             })
             .map(|value| strip_quotes(strip_comment(value).trim()))
             .unwrap_or_default()
@@ -4903,7 +4910,7 @@ permissions:
         "catch", "finally", "throw", "exit", "return",
     ];
 
-    /// Whether a dedented, comment-free pwsh statement line runs an external
+    /// Whether a trimmed, comment-free pwsh statement runs an external
     /// program: `python …`, `cargo …`, `gh …`, `.\tool.exe`, `& $exe …`.
     ///
     /// Deliberately rough, and erring towards "native": assignments and
@@ -4926,39 +4933,116 @@ permissions:
             && !PWSH_KEYWORDS.contains(&first.to_ascii_lowercase().as_str())
     }
 
-    /// The statement lines of a pwsh `run: |` body, dedented, in order.
+    /// The statements of a pwsh `run: |` body, in order.
     ///
-    /// Comments, blank lines, here-string bodies (`@'`/`@"` … `'@`/`"@`) and
-    /// backtick continuation lines are dropped: none of them starts a
-    /// statement.
-    fn pwsh_statement_lines(body: &[&str]) -> Vec<String> {
+    /// A line is split at its top-level `;`s (see
+    /// [`split_top_level_statements`]), so `Write-Output 'ok'; sccache
+    /// --start-server` is two statements. A backtick continuation is joined
+    /// onto the line it continues. A here-string (`@'`/`@"` … `'@`/`"@`)
+    /// stands in as `@'…'@` for the statement it opens, and whatever follows
+    /// the closing marker on its line is analysed as the rest of that
+    /// statement: `'@ | Out-File x; cargo build` still yields `cargo build`.
+    /// Comments and blank lines are dropped.
+    fn pwsh_statements(body: &[&str]) -> Vec<String> {
         let mut statements = Vec::new();
-        let mut in_here_string = false;
-        let mut continued = false;
+        // The logical line built so far: a line plus any continuation and
+        // here-string it carries on into.
+        let mut pending = String::new();
+        let mut here_string_close: Option<&str> = None;
         for raw in body {
             let line = raw.trim();
-            if in_here_string {
-                in_here_string = !(line.starts_with("'@") || line.starts_with("\"@"));
+            if let Some(close) = here_string_close {
+                // Only a line that starts with the opener's own closing
+                // marker ends a here-string; anything else is its text.
+                let Some(rest) = line.strip_prefix(close) else {
+                    continue;
+                };
+                here_string_close = None;
+                pending.push('…');
+                pending.push_str(close);
+                pending.push_str(rest);
+            } else {
+                if pending.is_empty() && (line.is_empty() || line.starts_with('#')) {
+                    continue;
+                }
+                if !pending.is_empty() {
+                    pending.push(' ');
+                }
+                pending.push_str(line);
+            }
+            if let Some(continued) = pending.strip_suffix('`') {
+                pending = continued.trim_end().to_owned();
                 continue;
             }
-            let was_continued = continued;
-            continued = line.ends_with('`');
-            if was_continued || line.is_empty() || line.starts_with('#') {
+            if pending.ends_with("@'") {
+                here_string_close = Some("'@");
                 continue;
             }
-            if line.ends_with("@'") || line.ends_with("@\"") {
-                in_here_string = true;
+            if pending.ends_with("@\"") {
+                here_string_close = Some("\"@");
+                continue;
             }
-            statements.push(line.to_string());
+            statements.extend(split_top_level_statements(&pending));
+            pending.clear();
         }
+        statements.extend(split_top_level_statements(&pending));
         statements
     }
 
-    /// The native-command lines in a pwsh body whose exit status nothing
-    /// reads: not the body's last statement, and not followed by a statement
-    /// that inspects `$LASTEXITCODE`.
+    /// One logical pwsh line split at each `;` that ends a statement: those
+    /// outside quotes, outside `(…)`/`{…}` (script blocks, hashtables,
+    /// subexpressions — `@{ a = 1; b = 2 }` is one statement), not escaped
+    /// with a backtick, and before any `#` comment, which is dropped. Each
+    /// statement comes back trimmed; empty ones are skipped.
+    fn split_top_level_statements(line: &str) -> Vec<String> {
+        let mut statements = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        let mut quote: Option<char> = None;
+        // A `#` opens a comment only where a token can start.
+        let mut at_token_start = true;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match (quote, c) {
+                // Inside '…' nothing is special; `''` is two adjacent strings
+                // as far as splitting is concerned, which is the same thing.
+                (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+                (Some('"') | None, '`') => {
+                    current.push(c);
+                    if let Some(escaped) = chars.next() {
+                        current.push(escaped);
+                    }
+                    at_token_start = false;
+                    continue;
+                }
+                (Some(_), _) => {}
+                (None, '\'' | '"') => quote = Some(c),
+                (None, '#') if at_token_start => break,
+                (None, '(' | '{') => depth += 1,
+                (None, ')' | '}') => depth = depth.saturating_sub(1),
+                (None, ';') if depth == 0 => {
+                    statements.push(std::mem::take(&mut current));
+                    at_token_start = true;
+                    continue;
+                }
+                (None, _) => {}
+            }
+            current.push(c);
+            at_token_start = quote.is_none() && (c.is_whitespace() || "({;|".contains(c));
+        }
+        statements.push(current);
+        statements
+            .into_iter()
+            .map(|statement| statement.trim().to_owned())
+            .filter(|statement| !statement.is_empty())
+            .collect()
+    }
+
+    /// The native-command statements in a pwsh body whose exit status
+    /// nothing reads: not the body's last statement, and not followed by a
+    /// statement that inspects `$LASTEXITCODE`.
     fn unchecked_native_commands(body: &[&str]) -> Vec<String> {
-        let statements = pwsh_statement_lines(body);
+        let statements = pwsh_statements(body);
         statements
             .iter()
             .enumerate()
@@ -4970,6 +5054,16 @@ permissions:
             })
             .map(|(_, line)| line.clone())
             .collect()
+    }
+
+    /// [`unchecked_native_commands`] over a pwsh step's script: its `run: |`
+    /// block, or its one-line `run:` value, which can chain statements with
+    /// `;` just the same.
+    fn unchecked_native_commands_in_step(step: &str) -> Vec<String> {
+        match run_block(step) {
+            Some(body) => unchecked_native_commands(&body),
+            None => unchecked_native_commands(&[step_key(step, "run").as_str()]),
+        }
     }
 
     /// pwsh steps allowed to run a native command whose status is unread,
@@ -5036,10 +5130,7 @@ permissions:
         for workflow in &workflows {
             let text = read_workflow(workflow);
             for (name, step) in pwsh_steps(&text) {
-                let Some(body) = run_block(&step) else {
-                    continue; // a one-line `run:` is one command
-                };
-                let unchecked = unchecked_native_commands(&body);
+                let unchecked = unchecked_native_commands_in_step(&step);
                 if unchecked.is_empty() {
                     continue;
                 }
@@ -5103,6 +5194,108 @@ permissions:
             unchecked_native_commands(&checked).is_empty(),
             "{:?}",
             unchecked_native_commands(&checked)
+        );
+    }
+
+    /// A `;` ends a statement, so a native command chained before another
+    /// statement on one line is checked like one on a line of its own — but
+    /// only a top-level `;`: not one in a string, a hashtable or script
+    /// block, a comment, or escaped with a backtick.
+    #[test]
+    fn unchecked_native_commands_splits_statements_at_top_level_semicolons() {
+        let chained = [
+            "Write-Output 'ok'; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            unchecked_native_commands(&chained),
+            ["sccache --start-server"]
+        );
+        assert_eq!(
+            unchecked_native_commands(&["cargo build; cargo test"]),
+            ["cargo build"]
+        );
+        assert!(
+            unchecked_native_commands(&["cargo build; if ($LASTEXITCODE -ne 0) { exit 1 }"])
+                .is_empty()
+        );
+
+        // Each of these is ONE statement; splitting it would leave a
+        // lower-case fragment (`cargo`, `b`, `then`) that reads as a native
+        // command and, followed by `cargo xtask e2e`, as an unchecked one.
+        for line in [
+            "Write-Output \"done; cargo is next\"",
+            "Write-Output 'done; cargo is next'",
+            "Write-Output \"it`\"s done; cargo is next\"",
+            "$h = @{ a = 1; b = 2 }",
+            "$v = $(Get-Date; Get-Location)",
+            "Write-Output done # then; cargo",
+            "Write-Output done`; then",
+        ] {
+            let body = [line, "cargo xtask e2e"];
+            assert!(
+                unchecked_native_commands(&body).is_empty(),
+                "{line:?} split into {:?}",
+                pwsh_statements(&body)
+            );
+        }
+
+        // A one-line `run:` chains statements just the same.
+        let step = "      - name: Lint\n        shell: pwsh\n        \
+                    run: cargo fmt --check; cargo clippy  # both\n";
+        assert_eq!(
+            unchecked_native_commands_in_step(step),
+            ["cargo fmt --check"]
+        );
+    }
+
+    /// Only the closing marker of a here-string is skipped: the rest of its
+    /// line is the tail of the statement the here-string opened, and any
+    /// statement chained after it is checked.
+    #[test]
+    fn unchecked_native_commands_reads_on_past_a_here_string_close() {
+        let body = [
+            "@'",
+            "## Summary",
+            "'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY; sccache --start-server",
+            "cargo xtask e2e",
+        ];
+        assert_eq!(
+            pwsh_statements(&body),
+            [
+                "@'…'@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY",
+                "sccache --start-server",
+                "cargo xtask e2e",
+            ]
+        );
+        assert_eq!(unchecked_native_commands(&body), ["sccache --start-server"]);
+
+        // A here-string inside the statement that reads the status leaves
+        // that statement whole: `if ($LASTEXITCODE …) { throw @"…"@ }`.
+        let checked = [
+            "cargo build",
+            "if ($LASTEXITCODE -ne 0) { throw @\"",
+            "build failed",
+            "\"@ }",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&checked).is_empty(),
+            "{:?}",
+            pwsh_statements(&checked)
+        );
+
+        // `"@` does not close a `@'` here-string: its text runs on to `'@`.
+        let mismatched = [
+            "@'",
+            "\"@; cargo inside the text",
+            "'@ | Out-File x",
+            "cargo xtask e2e",
+        ];
+        assert!(
+            unchecked_native_commands(&mismatched).is_empty(),
+            "{:?}",
+            pwsh_statements(&mismatched)
         );
     }
 }
