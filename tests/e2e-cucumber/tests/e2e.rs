@@ -299,6 +299,23 @@ impl Default for E2eWorld {
 }
 
 impl E2eWorld {
+    /// The `AppPaths` the CLI under test resolves for this scenario: the same
+    /// roots [`isolate_env`] hands it as `ROCM_CLI_*_DIR`. Shared by any step
+    /// that needs to read or write fixtures exactly where the spawned `rocm`
+    /// process will look for them.
+    pub fn app_paths(&self) -> rocm_core::AppPaths {
+        let root = self
+            .isolated_root
+            .as_ref()
+            .expect("scenario has no isolated root")
+            .path();
+        rocm_core::AppPaths {
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+            cache_dir: root.join("cache"),
+        }
+    }
+
     /// The isolation/behaviour environment every spawned `rocm` gets, as owned
     /// `(key, value)` pairs. Shared by the piped `std::process::Command` path and
     /// the pseudo-terminal path; PTY-only isolation is added by [`pty_env`].

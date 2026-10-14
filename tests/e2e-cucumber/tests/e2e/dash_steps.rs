@@ -1329,22 +1329,7 @@ async fn dashboard_observation_time_is_deterministic(world: &mut E2eWorld) {
 /// dashboard looks for it cannot drift apart. Only the data root is the harness's
 /// own: it is the directory this suite hands the CLI as `ROCM_CLI_DATA_DIR`.
 fn dash_clock_path(world: &E2eWorld) -> std::path::PathBuf {
-    isolated_app_paths(world).dash_test_clock_file()
-}
-
-/// The `AppPaths` the CLI under test resolves for this scenario: the same roots
-/// [`crate::E2eWorld::isolate_env`] hands it as `ROCM_CLI_*_DIR`.
-fn isolated_app_paths(world: &E2eWorld) -> rocm_core::AppPaths {
-    let root = world
-        .isolated_root
-        .as_ref()
-        .expect("scenario has no isolated root")
-        .path();
-    rocm_core::AppPaths {
-        config_dir: root.join("config"),
-        data_dir: root.join("data"),
-        cache_dir: root.join("cache"),
-    }
+    world.app_paths().dash_test_clock_file()
 }
 
 /// Wait until `rocm dash`'s own client log records that it found the planted
@@ -1455,7 +1440,7 @@ async fn positive_gen_tps_displayed(world: &mut E2eWorld) {
 #[when("dashboard observation time is held")]
 async fn dashboard_observation_time_is_held(world: &mut E2eWorld) {
     // Holding a clock the dashboard never picked up would do nothing, silently.
-    assert_dashboard_reads_the_planted_clock(isolated_app_paths(world)).await;
+    assert_dashboard_reads_the_planted_clock(world.app_paths()).await;
     write_dash_clock(&dash_clock_path(world), "hold");
 }
 
