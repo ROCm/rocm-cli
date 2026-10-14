@@ -27,10 +27,11 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 
 ### `apps/rocm` — main CLI binary
 
-[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
+[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters, Phase 6d (ROCMAI-88) extracted the chat/assistant and MCP tool-bridge cluster below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
 
 - [`automations.rs`](../apps/rocm/src/automations.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`bootstrap.rs`](../apps/rocm/src/bootstrap.rs) — a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in [`main.rs`](../apps/rocm/src/main.rs).
+- [`chat.rs`](../apps/rocm/src/chat.rs) — full domain extraction (Phase 6d, ROCMAI-88), mirroring [`providers.rs`](../apps/rocm/src/providers.rs): chat/assistant CLI rendering, local-tool-calling heuristics and validation, deterministic tool-output summarization, and the MCP tool-bridge (`run_internal_mcp_call`). No dedicated command enum; reached from [`main.rs`](../apps/rocm/src/main.rs)'s `dispatch()` (`Command::Chat`/`Command::McpCall` arms) and from [`dash_seam.rs`](../apps/rocm/src/dash_seam.rs)/[`dash.rs`](../apps/rocm/src/dash.rs)/[`comfyui.rs`](../apps/rocm/src/comfyui.rs)/[`runtime_install_finalize.rs`](../apps/rocm/src/runtime_install_finalize.rs).
 - [`chat_host_facts.rs`](../apps/rocm/src/chat_host_facts.rs) — full domain extraction.
 - [`cli_progress.rs`](../apps/rocm/src/cli_progress.rs) — shared CLI-output component (`Spinner`, `AnimatedSpinner`).
 - [`cli_report.rs`](../apps/rocm/src/cli_report.rs) — shared CLI-output component (`ActionReport`).
