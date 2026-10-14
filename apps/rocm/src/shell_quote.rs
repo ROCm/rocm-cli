@@ -21,6 +21,8 @@
 //!   `rocm services logs <id>` and `rocm runtimes activate <key> …` lines a
 //!   user is told to run next. A service id is not limited to inert
 //!   characters, so a bare one could split into several words on paste.
+//! * [`crate::comfyui`] builds the `rocm comfyui install --runtime-id <key>`
+//!   line a user is told to run to finish an interrupted or failed reinstall.
 //!
 //! All of them want the same guarantee — *this value is one word and nothing
 //! else* — so they share one implementation. Keeping them apart is how two of
