@@ -122,7 +122,7 @@ fn prepare_socket_dir(parent: &std::path::Path) -> anyhow::Result<()> {
         } else {
             return Err(e).with_context(|| {
                 format!(
-                    "restricting socket directory {} to mode 0700 — it is owned by \
+                    "restricting socket directory {} to mode 0700 - it is owned by \
                      another user, so a local user could replace the telemetry \
                      socket. Point the socket at a directory you own, for example \
                      under $XDG_RUNTIME_DIR or $HOME",

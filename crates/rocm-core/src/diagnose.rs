@@ -1182,7 +1182,7 @@ fn check_9_igpu_dgpu_collision(e: &Examination, symptom: &str) -> Diagnosis {
         )
     } else {
         format!(
-            "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU — do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
+            "Detected gfx targets: {gfx_targets:?}. Discrete GPU(s): {discrete_targets:?}; integrated APU(s): {apu_targets:?}. Pin HIP_VISIBLE_DEVICES to the discrete GPU - do not assume the higher-numbered gfx target is the dGPU (on RDNA3 the APU can be higher)."
         )
     };
     // The catalog classes this NEEDS-ARG, which is what the marker now says:
@@ -1679,7 +1679,7 @@ fn check_16_vllm_oom(_e: &Examination, symptom: &str) -> Diagnosis {
     // that case.
     let summary = format!(
         "{} If instead the model genuinely does not fit in this GPU's VRAM, lowering the \
-         reservation will not help — use a smaller or quantized model (rocm-cli serves one \
+         reservation will not help - use a smaller or quantized model (rocm-cli serves one \
          model on a single GPU; it does not shard a model across GPUs).",
         crate::VLLM_GPU_MEMORY_UTILIZATION_HINT
     );

@@ -176,7 +176,7 @@ pub(crate) fn describe_refusal(
              What was found:\n{}\n\n\
              These are the situations the setup wizard exists to walk a person through, \
              and it cannot do that over a connection with nobody watching. Resolve them \
-             first — the suggested fixes are below — then run this again.\n\n{}",
+             first - the suggested fixes are below - then run this again.\n\n{}",
             findings
                 .iter()
                 .map(|finding| format!("  - {finding}"))
@@ -186,7 +186,7 @@ pub(crate) fn describe_refusal(
         ),
         Refusal::NeedsPasswordlessSudo => format!(
             "installing ROCm on {target} needs administrator rights, and this connection \
-             cannot answer a password prompt — it would hang rather than fail.\n\n\
+             cannot answer a password prompt - it would hang rather than fail.\n\n\
              Either set up passwordless sudo there, or install it yourself:\n  \
              ssh {target} -- rocm bootstrap setup"
         ),

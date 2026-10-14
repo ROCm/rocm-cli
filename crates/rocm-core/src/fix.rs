@@ -1328,7 +1328,7 @@ pub fn apply(fix_id: &str, opts: &FixOptions) -> i32 {
             // bare "unknown id" left them with nothing to correct.
             fail!("`{fix_id}` looks like a position in a `rocm diagnose` report, not a fix-id.");
             fail!(
-                "Use the `id:` shown against that cause — `rocm diagnose` prints an `apply with:` line you can copy."
+                "Use the `id:` shown against that cause - `rocm diagnose` prints an `apply with:` line you can copy."
             );
         } else {
             fail!("Run `rocm diagnose` to see which fix-id applies.");

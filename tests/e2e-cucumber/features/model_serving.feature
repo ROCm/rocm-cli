@@ -321,3 +321,15 @@ Feature: Model serving
     When the user serves that same model again with --require-api-key
     Then the CLI refuses and names the exact command to stop the existing service
     And running that command actually stops the service
+
+  # ROCMAI-543: a Windows console on the OEM code page (437) renders a UTF-8 em
+  # dash, and other non-ASCII punctuation, as mojibake (e.g. "ΓÇö") instead of
+  # transliterating it. `rocm model` is the flagship instance of that bug class;
+  # this pins the fix at the CLI-output level (not just the internal renderer
+  # unit tests in apps/rocm/src/main.rs) so a future catalog label or hint line
+  # cannot reintroduce it unnoticed. No GPU needed: the command only reads the
+  # built-in catalog.
+  @id:serve-model-list-output-is-ascii
+  Scenario: serve-25 - The recommended model list prints ASCII-only text
+    When the user lists recommended models
+    Then the model list output contains no non-ASCII punctuation

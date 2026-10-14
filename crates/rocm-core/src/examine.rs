@@ -1664,7 +1664,7 @@ fn apply_kernel_gpu_membership(e: &mut Examination, nodes: &[crate::KfdGpuNode])
         // because "the bus has it and the kernel does not" is a diagnosis.
         e.notes.push(format!(
             "{} AMD PCI device(s) are on the bus but not exposed by the kernel here, so they \
-             are not listed as GPUs: {}. In a container this is expected — only the \
+             are not listed as GPUs: {}. In a container this is expected - only the \
              passed-through GPUs are usable.",
             unexposed.len(),
             unexposed.join(", ")

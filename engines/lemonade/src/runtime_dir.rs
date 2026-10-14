@@ -465,7 +465,7 @@ fn create_private_runtime_dir(dir: &Path) -> Result<()> {
         }
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).with_context(|| {
             format!(
-                "restricting {} to mode 0700 — it is most likely owned by another user",
+                "restricting {} to mode 0700 - it is most likely owned by another user",
                 dir.display()
             )
         })?;
