@@ -1785,6 +1785,24 @@ fi
                 advisory: (1, &["VRAM never dropped below the floor"]),
                 windows: None,
             },
+            // The simplification #446's extraction rests on: ONE script serves
+            // both the discrete and the APU lanes because the APU body is a
+            // strict superset — a discrete card's VRAM total is far above any
+            // floor, so the carveout branch is never entered, and the two-pool
+            // query it opens with degrades to the single-pool call the discrete
+            // lanes always made. The two cases above cover a rocm-smi that
+            // ACCEPTS the two-pool form on a discrete card; this covers one that
+            // rejects it, which is the arm that has to fall back. Without it,
+            // the degradation is only ever exercised on a carveout fixture and
+            // an fallback that mishandled a full-size pool would ship green.
+            GateCase {
+                label: "discrete card where rocm-smi rejects the two-pool query",
+                fixture: smi_fixture(192 * GIB, 10 * GIB, None),
+                env: vec![("REJECT_COMBINED", "1")],
+                native: (0, &["GPU ready: 182 GiB VRAM free"]),
+                advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+                windows: None,
+            },
             // A wedged driver must not be read as "this is an APU" and waved
             // through on whatever the other pool reports.
             GateCase {
