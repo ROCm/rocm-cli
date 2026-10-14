@@ -2070,12 +2070,28 @@ fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosi
     const ID: &str = "info-20-gpu-no-rocm-support";
     const TITLE: &str = "GPU has no ROCm/HIP support (Vulkan backend still works)";
 
-    let Some(gfx) = amd_gfx_targets(e)
-        .into_iter()
-        .find(|gfx| GFX_TARGETS_WITHOUT_ROCM_SUPPORT.contains(&gfx.as_str()))
-    else {
+    // "This host has no ROCm/HIP support" is a claim about the whole machine,
+    // so one unsupported GPU is not enough to make it: an APU+dGPU laptop with
+    // a gfx90c iGPU next to a supported discrete card does have ROCm support,
+    // via the dGPU. Firing there would top-rank "GPU has no ROCm/HIP support"
+    // ahead of `fix-9-igpu-dgpu` (40, below MIN_SCORE_FOR_MATCH) -- which is
+    // the entry that actually addresses that pairing -- and tell a user with
+    // working hardware the opposite of the truth. That is the same misleading
+    // top-ranked diagnosis this ticket exists to remove, on another host shape.
+    //
+    // An AMD GPU whose gfx target is empty is *undetected*, not supported, and
+    // it blocks the claim too: we cannot say the host has no ROCm support while
+    // a card we failed to identify is sitting in it.
+    let targets = amd_gfx_targets(e);
+    let all_unsupported = !targets.is_empty()
+        && targets.len() == amd_gpu_count(e)
+        && targets
+            .iter()
+            .all(|gfx| GFX_TARGETS_WITHOUT_ROCM_SUPPORT.contains(&gfx.as_str()));
+    if !all_unsupported {
         return zero(ID, TITLE);
-    };
+    }
+    let gfx = targets.join(", ");
 
     finalize_informational(
         ID,
@@ -2850,6 +2866,16 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
                 "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
                 best.id
             );
+        } else if report.matched.iter().any(|d| d.fix.is_some()) {
+            // The top match has no fix, but something below it does. Dropping
+            // the `apply with:` pointer here would strand the user: the report
+            // lists runnable causes and the closing line says nothing is
+            // runnable.
+            let _ = writeln!(
+                out,
+                "`{}` (the highest-scoring match) has no automated fix; see its evidence above, or use the `apply with:` line of whichever cause below it fits.",
+                best.id
+            );
         } else {
             let _ = writeln!(
                 out,
@@ -3036,6 +3062,50 @@ mod tests {
     }
 
     #[test]
+    fn fix_13_scores_an_sdk_whose_hipinfo_is_missing_only_when_something_needs_hip() {
+        // The `else if !hipinfo_present` arm: an SDK directory is present but
+        // its bin/hipInfo.exe is gone -- a half-installed or hand-pruned SDK.
+        // This PR moved that arm inside the `needs_hip` gate, so it now has to
+        // be read as two cases, not one: the same broken SDK is evidence on a
+        // host that calls into HIP, and silence on one that does not.
+        let host = |framework: &str, rocm_version: &str| Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            hip_sdk_path: "C:\\Program Files\\AMD\\ROCm\\6.4".to_owned(),
+            hipinfo_present: false,
+            framework: framework.to_owned(),
+            framework_rocm_version: rocm_version.to_owned(),
+            framework_source: "path".to_owned(),
+            ..Examination::default()
+        };
+
+        let needs_hip = check_13_hip_sdk_missing(&host("pytorch", "hip=7.14.60850"), "");
+        assert_eq!(
+            needs_hip.score, 55,
+            "a broken SDK under an ambient HIP torch scores the missing-hipInfo \
+             evidence (30) plus the HIP-build clause (25), and NOT the \
+             SDK-absent 35 -- the SDK directory is present: {needs_hip:?}"
+        );
+        assert!(
+            needs_hip
+                .evidence
+                .iter()
+                .any(|ev| ev.contains("hipInfo.exe is missing")),
+            "the missing-hipInfo evidence must name what is broken: {needs_hip:?}"
+        );
+
+        // Same half-installed SDK, nothing on the host built against HIP: the
+        // Lemonade/Vulkan shape of ROCMAI-546. A broken SDK nobody calls into
+        // is not a fault worth ranking.
+        let no_hip = check_13_hip_sdk_missing(&host("llama-cpp", ""), "");
+        assert_eq!(
+            no_hip.score, 0,
+            "with no HIP-based setup the SDK's state is not evidence of \
+             anything: {no_hip:?}"
+        );
+    }
+
+    #[test]
     fn fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence() {
         // ROCMAI-546: the laptop that opened this ticket. A GPU with no ROCm/HIP
         // support (gfx90c) served over Lemonade's bundled, Vulkan-built
@@ -3092,11 +3162,19 @@ mod tests {
     }
 
     #[test]
-    fn fix_13_still_fires_for_a_native_rocm_llama_cpp_build() {
+    fn fix_13_keeps_its_weak_signal_for_a_native_rocm_llama_cpp_build() {
         // Regression guard for the other half of the acceptance criteria: a host
         // that genuinely runs a HIP-built llama.cpp (e.g. a manual/vLLM build,
-        // as opposed to Lemonade's Vulkan one) with no system HIP SDK still gets
-        // fix-13.
+        // as opposed to Lemonade's Vulkan one) with no system HIP SDK keeps the
+        // base SDK-missing evidence rather than being gated to silence.
+        //
+        // "Keeps", not "still fires": 35 is below MIN_SCORE_FOR_MATCH, so this
+        // is a WEAK entry that does not set `has_match`. The name used to say
+        // "still fires", which claimed more than the assertion pins -- the score
+        // is the same 35 the pre-gate code produced, so the number alone cannot
+        // tell the two versions apart. What this test actually guards is the
+        // `llama_cpp_is_hip_build` arm of `needs_hip`: drop that arm and the
+        // score falls to 0.
         let e = Examination {
             os_family: "windows".to_owned(),
             has_amd_gpu: true,
@@ -3110,6 +3188,10 @@ mod tests {
             finding.score, 35,
             "a HIP-built llama.cpp with no system HIP SDK must still score the base \
              SDK-missing evidence: {finding:?}"
+        );
+        assert!(
+            finding.score > 0 && finding.score < MIN_SCORE_FOR_MATCH,
+            "and it stays a weak signal, not a match: {finding:?}"
         );
     }
 
@@ -3192,6 +3274,145 @@ mod tests {
             0,
             "a gfx target ROCm supports must not match: {:?}",
             check_20_gpu_unsupported_by_rocm(&supported, "")
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_when_a_supported_gpu_sits_beside_the_unsupported_one() {
+        // An APU+dGPU laptop: a gfx90c iGPU next to a supported discrete card.
+        // This host *does* have ROCm support, through the dGPU, so the
+        // whole-machine claim must not be made -- and in particular must not
+        // out-rank `fix-9-igpu-dgpu`, which is the entry for this pairing.
+        let apu_plus_dgpu = Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            has_apu: true,
+            has_discrete_amd: true,
+            gpus: vec![
+                Gpu {
+                    name: "AMD Radeon Vega 7".to_owned(),
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(true),
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "AMD Radeon RX 7900 XTX".to_owned(),
+                    gfx_target: "gfx1100".to_owned(),
+                    is_amd: true,
+                    is_apu: Some(false),
+                    ..Gpu::default()
+                },
+            ],
+            env: std::collections::BTreeMap::from([(
+                "HIP_VISIBLE_DEVICES".to_owned(),
+                "1".to_owned(),
+            )]),
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&apu_plus_dgpu, "").score,
+            0,
+            "a supported dGPU beside the unsupported iGPU means the host is not \
+             without ROCm support: {:?}",
+            check_20_gpu_unsupported_by_rocm(&apu_plus_dgpu, "")
+        );
+
+        let report = diagnose(&apu_plus_dgpu, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "info-20-gpu-no-rocm-support"),
+            "and it must not reach the report at all, where its flat 60 would \
+             rank above fix-9-igpu-dgpu's 40: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_while_another_amd_gpu_is_still_unidentified() {
+        // An AMD GPU with an empty gfx target is undetected, not supported.
+        // Claiming the host has no ROCm support while a card we could not
+        // identify is in it would turn a detection gap into a false claim --
+        // the same trap GFX_TARGETS_WITHOUT_ROCM_SUPPORT's doc comment avoids.
+        let e = Examination {
+            has_amd_gpu: true,
+            gpus: vec![
+                Gpu {
+                    gfx_target: "gfx90c".to_owned(),
+                    is_amd: true,
+                    ..Gpu::default()
+                },
+                Gpu {
+                    name: "AMD unknown device".to_owned(),
+                    gfx_target: String::new(),
+                    is_amd: true,
+                    ..Gpu::default()
+                },
+            ],
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&e, "").score,
+            0,
+            "an unidentified AMD GPU blocks the whole-machine claim: {:?}",
+            check_20_gpu_unsupported_by_rocm(&e, "")
+        );
+    }
+
+    #[test]
+    fn rendering_keeps_the_apply_with_pointer_when_a_fixless_cause_ranks_first() {
+        // A fixless top match above a cause that *does* have a fix: the closing
+        // line must not tell the user nothing is runnable while `apply with:`
+        // lines sit in the report above it.
+        let report = DiagnoseReport {
+            matched: vec![
+                Diagnosis {
+                    id: "info-20-gpu-no-rocm-support".to_owned(),
+                    title: "GPU has no ROCm/HIP support".to_owned(),
+                    score: 60,
+                    evidence: vec!["gfx90c has no ROCm/HIP runtime build".to_owned()],
+                    fix: None,
+                },
+                Diagnosis {
+                    id: "fix-9-igpu-dgpu".to_owned(),
+                    title: "iGPU+dGPU collision".to_owned(),
+                    score: 55,
+                    evidence: vec!["both an AMD APU and an AMD discrete GPU".to_owned()],
+                    fix: Some(Fix {
+                        fix_id: "fix-9-igpu-dgpu".to_owned(),
+                        summary: "Pin HIP_VISIBLE_DEVICES.".to_owned(),
+                        ..Fix::default()
+                    }),
+                },
+            ],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: Route {
+                target: "github".to_owned(),
+                url: "https://example.invalid".to_owned(),
+            },
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 5);
+        assert!(
+            out.contains("has no automated fix"),
+            "the fixless top match must still be named as fixless:\n{out}"
+        );
+        assert!(
+            out.contains("`apply with:` line"),
+            "and the pointer to the runnable causes below it must survive:\n{out}"
+        );
+        assert!(
+            !out.contains("rocm fix info-20-gpu-no-rocm-support"),
+            "no command must be offered for the fixless cause itself:\n{out}"
         );
     }
 

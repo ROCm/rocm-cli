@@ -502,13 +502,29 @@ async fn assert_reports_cause_and_fix(world: &mut E2eWorld) {
     );
 }
 
+/// Count the causes in a `rocm diagnose` report that carry a `Fix`.
+///
+/// A cause renders as `#1 (<id>) [TIER score=NN/100] <title>`, so the id sits on
+/// the same line as the score. Causes with an `info-` id are informational:
+/// their catalog entry has `fix: None`, so by construction they have no `plan:`,
+/// `flags:` or `apply with:` line (`info-20-gpu-no-rocm-support` is the first
+/// one). Counting them among the causes that must be actionable would assert
+/// the opposite of what the catalog says, so the two per-fix invariants below
+/// are stated over the fixful causes only.
+fn causes_with_a_fix(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|l| l.contains("score=") && !l.contains("(info-"))
+        .count()
+}
+
 #[then("every reported cause comes with a command that applies it")]
 async fn assert_every_cause_has_a_command(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     // A plan alone is not actionable: the report used to name a `rocm fix`
     // command only when some match cleared the confidence threshold, so a report
     // of low-confidence causes left the user with nothing to run.
-    let causes = output.lines().filter(|l| l.contains("score=")).count();
+    let causes = causes_with_a_fix(output);
     let commands = output
         .lines()
         .filter(|l| l.trim().starts_with("apply with: rocm fix "))
@@ -535,7 +551,7 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // underlying values for a given fix-id -- unit tests in diagnose.rs call
     // fix.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
-    let causes = output.lines().filter(|l| l.contains("score=")).count();
+    let causes = causes_with_a_fix(output);
     assert!(causes > 0, "no scored causes to check:\n{output}");
     let flag_lines: Vec<&str> = output
         .lines()

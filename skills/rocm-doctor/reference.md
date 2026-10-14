@@ -23,6 +23,12 @@ the result from `--json`:
 
 - `matched[]` — ranked `{ id, title, score, evidence[], fix }`. Tiers:
   `>= 75` high confidence, `50–74` likely, `< 50` weak.
+  **`fix` can be `null`.** An id outside the `fix-N` / `fix-wsl-N` series —
+  prefix `info-`, currently only `info-20-gpu-no-rocm-support` — is
+  informational: it explains the host's state and has no remediation, so it
+  carries no `fix`, appears in no catalog table below, and **`rocm fix
+  info-…` exits 2 with `Unknown fix-id`**. Never run `rocm fix` on an `info-`
+  id; report its `evidence` and move to the next cause that has a `fix`.
 - `has_match` — whether any entry cleared `min_score_for_match`. **This is the
   gate, not whether `matched` is empty.** Several checkers open with a nonzero
   base score for a merely *potentially* relevant situation (running in a
@@ -115,7 +121,7 @@ reporting confident nonsense.
 | `fix-10-container` | linux | Container can't see `/dev/kfd` or `/dev/dri/renderD*` | running in docker/podman, kfd/render devices missing | print-only |
 | `fix-11-iommu` | linux | Multi-GPU hang with IOMMU enabled | ≥2 AMD GPUs, `iommu=` not `pt`, hang/deadlock/timeout | print-only |
 | `fix-12-installer` | linux | `amdgpu-install` left a broken DKMS / repo state | dpkg half-configured, DKMS failed, `--accept-eula` | print-only |
-| `fix-13-hip-sdk-missing` | windows | HIP SDK not installed | no HIP SDK under Program Files, `hipInfo` not recognized | print-only |
+| `fix-13-hip-sdk-missing` | windows | HIP SDK not installed | **something on the host actually calls into HIP** — an ambient (non-managed-runtime) PyTorch HIP build, or a `GGML_HIP=ON` llama.cpp, either way with a detected AMD GPU — **and** no HIP SDK under Program Files, or `hipInfo.exe` missing from its `bin`. A pasted `hipInfo` not recognized still scores on its own. A Vulkan-backed engine (the Lemonade default) or a managed-runtime wheel needs no system SDK, so its absence is not evidence there | print-only |
 | `fix-14-adrenalin-too-old` | windows | Adrenalin / kernel-mode driver too old for the HIP SDK | `hipInfo` can't enumerate, "driver too old", HSA "no agents found" | print-only |
 | `fix-15-msvc-redist` | windows | MSVC runtime missing (HIP DLLs can't load) | `vcruntime140.dll` / `vcruntime140_1.dll` missing | print-only |
 | `fix-16-vllm-oom` | linux/wsl | vLLM reserved ~90% of the GPU's TOTAL VRAM for its KV cache and ran out at startup | vLLM engine start fails with an out-of-memory error; the GPU is shared/busy, or the model does not fit | print-only |
