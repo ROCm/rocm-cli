@@ -1962,27 +1962,35 @@ fn detect_kernel_version() -> Option<String> {
     }
 }
 
-fn detect_distro_name() -> Option<String> {
+pub(crate) fn detect_distro_name() -> Option<String> {
     if runtime_is_windows() {
         return Some("Windows".to_owned());
     }
 
     if runtime_is_linux() {
-        return parse_os_release_pretty_name(
+        return Some(distro_name_from_os_release(
             &fs::read_to_string(host_path("/etc/os-release")).ok()?,
-        )
-        .or_else(|| Some("Linux".to_owned()));
+        ));
     }
 
     None
 }
 
-fn parse_os_release_pretty_name(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let value = line.strip_prefix("PRETTY_NAME=")?.trim();
-        let value = value.trim_matches('"').trim_matches('\'').trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
+/// The distribution name `rocm examine` prints, from os-release `text`:
+/// `PRETTY_NAME` as `sh` reads it, else `Linux`.
+///
+/// An unreadable file says which line made it so, on the line a person reads
+/// — `rocm examine`'s `probe_failures`, which carries the same reason, is only
+/// in the `--json` form. A blank `PRETTY_NAME` also falls back to `Linux`.
+fn distro_name_from_os_release(text: &str) -> String {
+    match crate::os_release::parse(text) {
+        Ok(mut fields) => fields
+            .remove("PRETTY_NAME")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Linux".to_owned()),
+        Err(unreadable) => format!("Linux (/etc/os-release {unreadable})"),
+    }
 }
 
 fn detect_cpu_model_with_windows_inventory(
@@ -4779,9 +4787,30 @@ Class Name:                Display
     #[test]
     fn parses_os_release_pretty_name() {
         assert_eq!(
-            parse_os_release_pretty_name("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
-            Some("Ubuntu 24.04.2 LTS".to_owned())
+            distro_name_from_os_release("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
+            "Ubuntu 24.04.2 LTS"
         );
+    }
+
+    /// The distro name is read through the shared `os_release` parser, so it
+    /// names the distro `sh` would: the last assignment wins and a trailing
+    /// comment is not part of the value. A file with no usable `PRETTY_NAME`
+    /// is plain `Linux`; an unreadable one says which line, rather than
+    /// letting `Linux` read as a description of the machine.
+    #[test]
+    fn pretty_name_reads_as_sh_reads_it() {
+        assert_eq!(
+            distro_name_from_os_release(
+                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
+            ),
+            "Ubuntu 24.04 LTS"
+        );
+        assert_eq!(
+            distro_name_from_os_release("PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"),
+            "Linux (/etc/os-release line 2 is not a plain assignment: \"unset ID\")"
+        );
+        assert_eq!(distro_name_from_os_release("PRETTY_NAME=\"  \"\n"), "Linux");
+        assert_eq!(distro_name_from_os_release("ID=ubuntu\n"), "Linux");
     }
 
     #[test]

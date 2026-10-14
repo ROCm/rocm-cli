@@ -27,6 +27,7 @@ pub mod model_catalog;
 pub mod model_readiness;
 pub mod net;
 pub mod openmpi;
+pub mod os_release;
 pub mod paths;
 pub mod proc_lifecycle;
 pub mod process;

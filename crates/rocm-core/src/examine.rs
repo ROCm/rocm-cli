@@ -728,18 +728,7 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
-        let osr = read_host_text("/etc/os-release");
-        for line in osr.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let value = value.trim().trim_matches('"');
-            match key {
-                "ID" => e.distro_id = value.to_owned(),
-                "VERSION_ID" => e.distro_version = value.to_owned(),
-                _ => {}
-            }
-        }
+        record_distro(e, &read_host_text("/etc/os-release"));
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
@@ -751,6 +740,25 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "windows".to_owned();
     } else {
         e.os_family = "other".to_owned();
+    }
+}
+
+/// Fill the distro fields from os-release `text`, through the same parser the
+/// driver plan uses, so the two report the same distro.
+///
+/// An unreadable file leaves both fields empty and says why in
+/// `probe_failures`, naming the line — an empty distro with no explanation
+/// would read as "nothing to report" rather than "something to fix". A missing
+/// file reads as empty text, which is not a failure.
+fn record_distro(e: &mut Examination, text: &str) {
+    match crate::os_release::parse(text) {
+        Ok(mut fields) => {
+            e.distro_id = fields.remove("ID").unwrap_or_default();
+            e.distro_version = fields.remove("VERSION_ID").unwrap_or_default();
+        }
+        Err(unreadable) => e.probe_failures.push(format!(
+            "/etc/os-release {unreadable}; the distro is not reported."
+        )),
     }
 }
 
@@ -3065,6 +3073,53 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Linux host with an AMD GPU, so `compute_status` turns on the probe
+    /// failures alone.
+    fn linux_host_with_a_gpu() -> Examination {
+        Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        }
+    }
+
+    /// The message and the state it describes, asserted together: an
+    /// unreadable os-release names its line in `probe_failures`, leaves the
+    /// distro unreported, and makes the examination `degraded` — and a readable
+    /// one reports the distro with no failure recorded and stays `ok`.
+    #[test]
+    fn an_unreadable_os_release_names_its_line_instead_of_a_distro() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/etc/os-release line 3 is not a plain assignment: \"export ID=debian\"; \
+                 the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
+
+        let mut e = linux_host_with_a_gpu();
+        record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+        assert_eq!(
+            (e.distro_id.as_str(), e.distro_version.as_str()),
+            ("ubuntu", "24.04")
+        );
+        assert_eq!(e.compute_status(), "ok");
+
+        // No file at all is not a failure: there is nothing to fix.
+        let mut e = Examination::default();
+        record_distro(&mut e, "");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+    }
 
     /// Serialises the tests that read or replace the process-global
     /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
@@ -5571,6 +5626,52 @@ mod tests {
         assert_eq!(podman.container_kind, "podman");
         assert!(cgroup_only.in_container);
         assert_eq!(cgroup_only.container_kind, "container");
+    }
+
+    /// Both `/etc/os-release` reads `rocm examine` makes — the distro fields
+    /// and the distro name — answer from a simulated host root, and through the
+    /// shared parser: a planted file naming a distro no runner has reads as
+    /// that distro, as `sh` reads it. A read that bypassed the root would
+    /// report the runner's distro. One that bypassed the parser would read the
+    /// file as the old per-reader parsers did: the distro fields with their
+    /// single quotes kept, and the name from the first of two `PRETTY_NAME`s
+    /// rather than the last, which is the one `sh` assigns.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn os_release_reads_follow_the_simulated_host_root() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-os-release-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        std::fs::write(
+            root.join("etc/os-release"),
+            "ID='planted'\nVERSION_ID='0.1'\nPRETTY_NAME='Stale 0.0'\nPRETTY_NAME='Planted 0.1'\n",
+        )
+        .expect("write planted os-release");
+
+        let (examined, name) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut examined = Examination::default();
+            probe_os(&mut examined);
+            (examined, crate::host_gpu::detect_distro_name())
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            (
+                examined.distro_id.as_str(),
+                examined.distro_version.as_str()
+            ),
+            ("planted", "0.1")
+        );
+        assert_eq!(name.as_deref(), Some("Planted 0.1"));
     }
 }
 
