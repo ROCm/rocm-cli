@@ -27315,7 +27315,7 @@ install therock";
             "only the live service is stopped and reported: {report:?}"
         );
         let mut live = live;
-        let _ = live.wait();
+        assert_stopped_within_grace(&mut live, "the live service must really have been stopped");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -27398,8 +27398,12 @@ install therock";
         let report =
             stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
 
+        let mut stranger = stranger;
         assert!(
-            rocm_core::process_is_running(pid),
+            stranger
+                .try_wait()
+                .expect("poll the unrelated process")
+                .is_none(),
             "an unverifiable pid must never be signalled: uninstall killed an unrelated process"
         );
         assert!(
@@ -27412,7 +27416,6 @@ install therock";
                 && failure.service_id.contains(&pid.to_string())),
             "an unverifiable helper must abort the uninstall and name its pid: {report:?}"
         );
-        let mut stranger = stranger;
         let _ = stranger.kill();
         let _ = stranger.wait();
         let _ = fs::remove_dir_all(root);
@@ -27490,9 +27493,19 @@ install therock";
         let report =
             stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
 
+        // `try_wait` on our own child, not `process_is_running`: a killed but
+        // unreaped child is a zombie, which a pid probe still calls running.
+        let mut stranger = stranger;
         assert!(
-            rocm_core::process_is_running(pid),
+            stranger
+                .try_wait()
+                .expect("poll the unrelated process")
+                .is_none(),
             "a recycled pid must never be signalled: uninstall killed an unrelated process"
+        );
+        assert!(
+            !report.helper_stopped,
+            "a recycled pid is not a helper this pass stopped: {report:?}"
         );
         assert!(
             report.stopped.is_empty(),
@@ -27502,7 +27515,6 @@ install therock";
             report.failed.is_empty(),
             "a recycled pid means the daemon is already gone, not that it is stuck: {report:?}"
         );
-        let mut stranger = stranger;
         let _ = stranger.kill();
         let _ = stranger.wait();
         let _ = fs::remove_dir_all(root);
@@ -27671,6 +27683,11 @@ install therock";
                     remedy: StopFailureRemedy::RemoveTheStoppedRecord,
                 },
                 FailedManagedServiceStop {
+                    service_id: "svc-tickless".to_owned(),
+                    reason: "no start time".to_owned(),
+                    remedy: StopFailureRemedy::ConfirmTheServicePid,
+                },
+                FailedManagedServiceStop {
                     service_id: "rocmd (pid 4321; state file /x/runtime-state.json)".to_owned(),
                     reason: "identity unverified".to_owned(),
                     remedy: StopFailureRemedy::ConfirmTheDaemonPid,
@@ -27692,6 +27709,7 @@ install therock";
             "cannot tell whether the helper is running",
             "No `rocm` command can act on an unparseable record",
             "rocm services remove <id> --yes",
+            "No start time was recorded for a live pid",
             "delete the runtime state file named there",
         ] {
             assert!(
@@ -27707,6 +27725,7 @@ install therock";
             "runtime.json",
             "svc-corrupt.json",
             "svc-oldport",
+            "svc-tickless",
             "/x/runtime-state.json",
         ] {
             assert!(
@@ -27717,16 +27736,26 @@ install therock";
         // Most actionable first, hand-repair last: a dead-end-avoidance
         // ordering, not cosmetics.
         let position = |needle: &str| error.find(needle).expect("asserted present above");
-        assert!(
-            position("rocm services stop <id> --yes") < position("Find what holds that port")
-                && position("Find what holds that port")
-                    < position("restarts managed services on its own")
-                && position("restarts managed services on its own")
-                    < position("cannot tell whether the helper is running")
-                && position("cannot tell whether the helper is running")
-                    < position("No `rocm` command can act on an unparseable record"),
-            "remedies must stay ordered most-actionable-first: {error}"
-        );
+        // The whole `advice_rank` chain, one phrase per class: moving any one
+        // class out of its place breaks a neighbouring comparison.
+        let in_rank_order = [
+            "rocm services stop <id> --yes",
+            "Find what holds that port",
+            "rocm services remove <id> --yes",
+            "No start time was recorded for a live pid",
+            "restarts managed services on its own",
+            "delete the runtime state file named there",
+            "cannot tell whether the helper is running",
+            "No `rocm` command can act on an unparseable record",
+        ];
+        for pair in in_rank_order.windows(2) {
+            assert!(
+                position(pair[0]) < position(pair[1]),
+                "remedies must stay ordered most-actionable-first ({:?} before {:?}): {error}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -27769,7 +27798,11 @@ install therock";
             stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
 
         let mut supervisor = supervisor;
-        let _ = supervisor.wait();
+        assert_stopped_within_grace(
+            &mut supervisor,
+            "the recorded process must really have been stopped, so only the port probe \
+             can catch the survivor",
+        );
         assert!(
             !rocm_core::process_is_running(supervisor_pid),
             "the recorded process must really have been stopped, so only the \
@@ -28625,10 +28658,80 @@ install therock";
             Ok(serde_json::json!({ "status": "stopped" }))
         })
         .expect("the pass succeeds");
+        // Only the stopped record is judged here, as in the sibling test above.
+        // The live record's own post-stop probe asks whether the freed port is
+        // quiet, and a concurrent test binding an ephemeral port can answer it,
+        // which says nothing about the host spelling this test pins.
         assert!(
-            report.failed.is_empty(),
+            !report.failed.iter().any(|f| f.service_id == "svc-a"),
             "a differently spelled host for the same listener must not doom the run: {report:?}"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deferred_stopped_record_is_judged_once_its_live_partner_has_stopped() {
+        // The stopped record shares `::1` with the live one, so it waits for the
+        // live stop. The live record's own probe looks at `::1` and finds
+        // nothing, so it is confirmed stopped; but the stopped record's wildcard
+        // host also answers on IPv4 loopback, where a survivor still serves its
+        // model. Only the post-stop judgement of the deferred record can see it,
+        // so dropping that judgement lets the removal through.
+        let endpoint = ServingEndpoint::serving("amd/reused-model");
+        let port = endpoint.port;
+        let (root, paths) = test_paths("uninstall-deferred-survivor");
+        // The live record is held live by a real process, not by an answering
+        // endpoint: nothing answers on `::1`, and a record whose process is gone
+        // and whose endpoint is silent is demoted to stopped on load.
+        let supervisor = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn the live record's supervisor"),
+        );
+        let supervisor_pid = supervisor.0.id();
+        let make = |id: &str, host: &str, status: &str, pid: u32| {
+            let mut record = ManagedServiceRecord::new(
+                &paths,
+                id,
+                "vllm",
+                "amd/reused-model",
+                "amd/reused-model",
+                host,
+                port,
+                "managed",
+                pid,
+                None,
+                None,
+                None,
+            );
+            if pid != 0 {
+                record.supervisor_start_ticks = rocm_core::process_start_ticks(pid);
+            }
+            record.status = status.to_owned();
+            record.write().expect("write record");
+        };
+        make("svc-a", "::", "stopped", 0);
+        make("svc-b", "::1", "ready", supervisor_pid);
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            Ok(serde_json::json!({ "status": "stopped" }))
+        })
+        .expect("the pass succeeds");
+
+        let ids: Vec<&str> = report
+            .failed
+            .iter()
+            .map(|f| f.service_id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["svc-a"], "{report:?}");
+        assert_eq!(
+            report.failed[0].remedy,
+            StopFailureRemedy::StopWhatHoldsThePort
+        );
+        assert_eq!(report.stopped, vec!["svc-b".to_owned()], "{report:?}");
+        drop(endpoint);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -29627,6 +29730,33 @@ install therock";
 
     #[cfg(unix)]
     #[test]
+    fn a_stop_result_without_a_status_is_not_a_confirmed_stop() {
+        // A missing `status` has to read as "unknown", never as "stopped": the
+        // stop result is the only evidence this gate has that the stop happened.
+        let (root, paths) = test_paths("uninstall-stop-no-status");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn a live managed server"),
+        );
+        let pid = child.0.id();
+        let mut record = managed_record_for_pid(&paths, pid, rocm_core::process_start_ticks(pid));
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let report = stop_managed_services_with(&paths, |_, _| Ok(serde_json::json!({})))
+            .expect("the pass itself succeeds");
+
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(report.failed[0].remedy, StopFailureRemedy::StopTheService);
+        assert!(report.failed[0].reason.contains("unknown"), "{report:?}");
+        assert!(report.stopped.is_empty(), "{report:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_stop_that_returns_ok_but_not_stopped_is_a_failure() {
         let (root, paths) = test_paths("uninstall-stop-ok-not-stopped");
         let child = KillOnDrop(
@@ -29749,6 +29879,42 @@ install therock";
         );
     }
 
+    #[test]
+    fn each_advice_names_only_the_ids_of_its_own_failure_class() {
+        // Advice that names every failed id sends the operator to hunt a port
+        // holder for a service whose real problem is a stale record, so the ids
+        // are asserted under the sentence that carries them, not just somewhere.
+        let failure = |id: &str, remedy| FailedManagedServiceStop {
+            service_id: id.to_owned(),
+            reason: "r".to_owned(),
+            remedy,
+        };
+        let report = ManagedServiceStopReport {
+            stopped: Vec::new(),
+            failed: vec![
+                failure("svc-port", StopFailureRemedy::StopWhatHoldsThePort),
+                failure("svc-old", StopFailureRemedy::RemoveTheStoppedRecord),
+                failure("svc-pid", StopFailureRemedy::ConfirmTheServicePid),
+                failure("svc-port-two", StopFailureRemedy::StopWhatHoldsThePort),
+            ],
+            warnings: Vec::new(),
+            helper_stopped: false,
+        };
+        let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert!(
+            message.contains("Every process recorded for svc-port, svc-port-two is gone"),
+            "{message}"
+        );
+        assert!(
+            message.contains("if it is, stop it first: svc-old."),
+            "{message}"
+        );
+        assert!(
+            message.contains("it was left alone: svc-pid."),
+            "{message}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_live_record_without_start_ticks_is_refused_not_killed() {
@@ -29756,8 +29922,9 @@ install therock";
             .arg("60")
             .spawn()
             .expect("spawn child");
+        let child_pid = child.id();
         let (root, paths) = test_paths("tickless-live-record");
-        let record = managed_record_for_pid(&paths, child.id(), None);
+        let record = managed_record_for_pid(&paths, child_pid, None);
         fs::create_dir_all(paths.services_dir()).unwrap();
         fs::write(
             paths.services_dir().join("svc-managed-stop.json"),
@@ -29778,6 +29945,12 @@ install therock";
             report.failed[0].remedy,
             StopFailureRemedy::ConfirmTheServicePid
         );
+        // The advice tells the operator to "check what those pids are", so the
+        // refusal has to show them.
+        assert!(
+            report.failed[0].reason.contains(&child_pid.to_string()),
+            "the refusal must name the pid it left alone: {report:?}"
+        );
     }
 
     #[test]
@@ -29793,6 +29966,11 @@ install therock";
             helper_stopped: false,
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
+        assert!(
+            message.contains("it was left alone: svc-tickless."),
+            "{message}"
+        );
+        assert!(message.contains("kill <pid>"), "{message}");
         assert!(message.contains("Stop-Process -Id <pid>"), "{message}");
         assert!(!message.contains("services remove"), "{message}");
     }
