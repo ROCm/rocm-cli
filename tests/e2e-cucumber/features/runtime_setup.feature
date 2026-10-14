@@ -410,8 +410,16 @@ Feature: Runtime configuration
   # build" is absent however the run then ends. The second guards the weaker
   # failure where a refusal is printed but still dangles a family name in front
   # of the user.
+  #
+  # ROCMAI-550 added a third Then. Having taken every package family away, the
+  # refusal now has to leave the user somewhere to go, and it says `rocm serve
+  # <model>` on the Vulkan backend. That is a remediation line naming a command,
+  # so AGENTS.md §3 wants it asserted where the refusal is actually produced
+  # rather than only against the formatter -- this is the one door of the two
+  # that a lane can open, so it is asserted here.
   @id:runtime-install-sdk-refuses-unsupported-gpu-target
   Scenario: runtime-19 - Asking for a GPU target ROCm does not build is refused outright
     When the user dry-runs an SDK install for the gfx90c Vega iGPU
     Then the install is refused as having no ROCm build for that GPU
     And the refusal offers no package family to install instead
+    And the refusal points at serving on the Vulkan backend instead

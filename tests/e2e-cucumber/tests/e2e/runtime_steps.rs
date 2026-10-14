@@ -1457,3 +1457,29 @@ async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
         );
     }
 }
+
+/// Having removed every `--family` the user could try, the refusal has to say
+/// what *will* work. ROCMAI-550 added that sentence, and this pins it where the
+/// refusal is really produced rather than against the formatter alone.
+///
+/// Only the wording is checked here, because this lane cannot check the rest of
+/// it: proving that `rocm serve` then reaches a GPU with no ROCm build needs a
+/// Vega APU, and no runner has one (same gap as the detected-host door, above).
+/// The two halves the advice rests on are proven elsewhere —
+/// `rocm_core::gfx_target_has_no_rocm_build` is what put the user here, and
+/// `selects_vulkan_when_rocm_unsupported` in `engines/lemonade`'s
+/// `backend_alignment` is what makes llama.cpp pick `vulkan` once `rocm` comes
+/// back unsupported, which is the claim the sentence makes.
+#[then("the refusal points at serving on the Vulkan backend instead")]
+async fn assert_unsupported_family_points_at_vulkan_serving(world: &mut E2eWorld) {
+    let output = unsupported_family_attempt(world);
+    assert!(
+        output.contains("rocm serve <model>"),
+        "the refusal took every package family away, so it must name what does \
+         work instead:\n{output}"
+    );
+    assert!(
+        output.contains("Vulkan"),
+        "the refusal should say the fallback is the Vulkan backend:\n{output}"
+    );
+}

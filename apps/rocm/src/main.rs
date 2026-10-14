@@ -2724,6 +2724,19 @@ fn build_codex_bridge_gpu_snapshot(config: &RocmCliConfig) -> CodexBridgeGpuSnap
     }
 }
 
+/// The engine catalogue in the codex-bridge snapshot, taken verbatim from
+/// [`builtin_engine_inventory`] — including lemonade's unconditional "with ROCm
+/// llama.cpp backend", which ROCMAI-550 replaced in `rocm examine` and
+/// `rocm engines` but deliberately left alone here.
+///
+/// It is left alone because this list is the static catalogue, in the same
+/// shape as the unconditional `installed_binary: true` beside it: every field
+/// but `default_for_platform` describes the engine, not this host. A consumer
+/// that wants the host's real support level reads it off the `examine` block
+/// in the same snapshot, which carries `detected_gfx_target` and
+/// `compatible_therock_family` — the two inputs `rocm_core::gpu_support_level`
+/// takes. Making this row host-aware would change the bridge's JSON contract
+/// and is worth its own change, not a rider on this one.
 fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
     let default_engine = default_engine_for_platform();
     let binary_path = daemon_binary_path()
@@ -2743,10 +2756,11 @@ fn builtin_codex_bridge_engine_inventory() -> Vec<CodexBridgeEngine> {
 
 /// The lemonade engine note shown in `rocm examine` and `rocm engines`, adjusted
 /// for whether this host's detected GPU can actually use the ROCm llama.cpp
-/// backend. Both call sites have a live `GpuSupportLevel` in scope; other
-/// places that print this note statically (the dashboard TUI, `rocmd`'s own
-/// catalog) have no host probe in front of them and keep the unconditional
-/// ROCm wording, since they describe the engine in the abstract.
+/// backend. Both call sites have a live `GpuSupportLevel` in scope; the places
+/// that print this note statically — the dashboard TUI, `rocmd`'s own catalog,
+/// and [`builtin_codex_bridge_engine_inventory`]'s copy of
+/// [`builtin_engine_inventory`] — keep the unconditional ROCm wording, since
+/// they describe the engine in the abstract rather than this host.
 const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str {
     match level {
         rocm_core::GpuSupportLevel::VulkanOnly => {
@@ -2756,6 +2770,15 @@ const fn lemonade_engine_note(level: rocm_core::GpuSupportLevel) -> &'static str
     }
 }
 
+/// The static engine catalogue: what each engine is, independent of any host.
+///
+/// Lemonade's entry says "with ROCm llama.cpp backend" unconditionally, which
+/// is only true of a host whose GPU has a ROCm build. Callers with a live
+/// [`rocm_core::GpuSupportLevel`] must not print this row for lemonade — they
+/// substitute [`lemonade_engine_note`], as `rocm examine` and `rocm engines`
+/// do. This row is what the remaining host-blind consumers get; see
+/// [`builtin_codex_bridge_engine_inventory`] for why that is the right answer
+/// for them.
 const fn builtin_engine_inventory() -> &'static [(&'static str, &'static str)] {
     &[
         (
