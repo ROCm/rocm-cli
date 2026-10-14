@@ -167,6 +167,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
+    ///
+    /// A GPU that is recognized but has no ROCm build at all — `gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs — is reported on
+    /// a `rocm_support` line saying so, so that an empty
+    /// `compatible_therock_family` does not read as a failed probe. Such a GPU
+    /// still works through the Vulkan backend.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -736,6 +742,12 @@ rocm install sdk --devel")]
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
         /// TheRock GPU package family to install, such as gfx110X-all.
+        ///
+        /// A GPU target ROCm publishes no build for is refused rather than
+        /// mapped to a near neighbour: `--family gfx90c` — the Vega iGPU in
+        /// Renoir, Lucienne, Cezanne and Barcelo APUs — fails and installs
+        /// nothing, instead of substituting another family. A plain `rocm
+        /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
