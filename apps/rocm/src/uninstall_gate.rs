@@ -164,6 +164,45 @@ impl StopFailureRemedy {
     }
 }
 
+/// The processes a stop of `record` would signal, each paired with the start
+/// time recorded for it, de-duplicated on pid and preferring a known token.
+///
+/// Shared by the stop itself and by this gate's pre-check, so the two cannot
+/// disagree about which pid still needs a start time.
+pub(crate) fn recorded_pid_identities(record: &ManagedServiceRecord) -> Vec<(u32, Option<u64>)> {
+    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
+    for (pid, ticks) in [
+        (Some(record.supervisor_pid), record.supervisor_start_ticks),
+        (record.engine_pid, record.engine_start_ticks),
+    ] {
+        let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
+            continue;
+        };
+        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
+            if existing.1.is_none() {
+                existing.1 = ticks;
+            }
+        } else {
+            entries.push((pid, ticks));
+        }
+    }
+    entries
+}
+
+/// The live pids of `record` that carry no start time, and so cannot be told
+/// apart from a reused pid. The stop refuses a record that has any, rather than
+/// force-killing a tree it cannot prove is ours; the plan reads the same answer
+/// so it never promises a stop this refuses.
+pub(crate) fn unprovable_live_pids(record: &ManagedServiceRecord) -> Vec<u32> {
+    recorded_pid_identities(record)
+        .into_iter()
+        .filter(|(pid, ticks)| {
+            record_predates_start_ticks(*ticks) && rocm_core::process_is_running(*pid)
+        })
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
 /// How long the gate waits for a still-listening endpoint to say what it serves.
 ///
 /// Only reached when something already answered a TCP connect, and only for
@@ -197,6 +236,71 @@ pub(crate) struct ManagedServiceStopReport {
     /// consequence of its being down is that nothing supervises or recovers
     /// services until it is restarted.
     pub(crate) helper_stopped: bool,
+}
+
+/// What the plan should tell the operator about the background helper, derived
+/// from the same state file and identity decision the stop pass acts on, so the
+/// line cannot promise a stop that pass then refuses.
+///
+/// `None` when there is nothing to say: no state file, a helper that is not
+/// running, or a recorded pid that is free or belongs to someone else.
+pub(crate) fn background_helper_plan_note(
+    paths: &AppPaths,
+    removes_recovery_tooling: bool,
+) -> Option<String> {
+    let state_file = paths.automation_state_path();
+    let state = match AutomationRuntimeState::load(paths) {
+        Ok(Some(state)) => state,
+        Ok(None) => return None,
+        Err(error) => {
+            return Some(if removes_recovery_tooling {
+                format!(
+                    "could not read the background helper's runtime state {}: {error:#}. \
+                     Uninstall will refuse to remove anything until it can be read",
+                    state_file.display()
+                )
+            } else {
+                format!(
+                    "could not read the background helper's runtime state {}: {error:#}. \
+                     This run keeps the tooling, so it does not check it",
+                    state_file.display()
+                )
+            });
+        }
+    };
+    if !state.running
+        || state.daemon_pid == 0
+        || state.daemon_pid == std::process::id()
+        || !rocm_core::process_is_running(state.daemon_pid)
+    {
+        return None;
+    }
+    let identity = rocm_core::ProcessIdentity::new(state.daemon_pid, state.daemon_start_ticks);
+    let outcome = daemon_identity_outcome(
+        rocm_core::identity_state_with_observed(
+            &identity,
+            rocm_core::process_start_ticks(state.daemon_pid),
+        ),
+        record_predates_start_ticks(state.daemon_start_ticks),
+    );
+    let pid = state.daemon_pid;
+    match (outcome, removes_recovery_tooling) {
+        (DaemonIdentityOutcome::NothingOfOurs, _) => None,
+        (DaemonIdentityOutcome::Stop, true) => Some(format!(
+            "the background helper (rocmd, pid {pid}) is running; it will be stopped, with its \
+             whole process tree, before removal"
+        )),
+        (DaemonIdentityOutcome::Unverifiable, true) => Some(format!(
+            "the background helper (rocmd, pid {pid}) is running but cannot be verified as \
+             rocmd (no start time was recorded for it), so uninstall will refuse to remove \
+             anything until you stop it or delete {}",
+            state_file.display()
+        )),
+        (_, false) => Some(format!(
+            "the background helper (rocmd, pid {pid}) is running; this removal keeps the \
+             tooling, so it is left running"
+        )),
+    }
 }
 
 /// The failure recorded when the background helper is live but cannot be proven
@@ -275,13 +379,13 @@ pub(crate) const fn daemon_identity_outcome(
 /// shutdown writes that flag, on its way out, so the pid in such a record names
 /// a process that has already exited and anything live under that number
 /// inherited it. This is the same inactive contract `background_helper_already_running`
-/// spawns on, and off Linux it is the only one that applies.
+/// spawns on.
 ///
 /// Linux (`/proc`) and Windows (`GetProcessTimes` creation time) can record and
 /// compare a start-time, so a recycled pid is told apart there.
 ///
-/// Two residual gaps, and the list above is otherwise the complete set of
-/// inputs. First, a *missing* `runtime-state.json` is taken at face value as "no
+/// One residual gap, and the list above is otherwise the complete set of
+/// inputs: a *missing* `runtime-state.json` is taken at face value as "no
 /// daemon". Deleting that file by hand while `rocmd` is live therefore skips the
 /// daemon stop silently. This is deliberate — a missing file is the ordinary
 /// never-started case, and there is no pid to verify or signal without it — but
@@ -360,15 +464,11 @@ pub(crate) fn stop_background_helper_with(
     // treat it as unverifiable, leave the process alone, and abort. Being told
     // to kill a PID is recoverable; killing an unrelated process tree is not.
     //
-    // Which platform this is gets answered by a process that is definitely
-    // alive — this one — rather than by whether the daemon's own reading
-    // happened to succeed. Asking the daemon's PID cannot tell "no `/proc` on
-    // this OS" from "that one read just failed", and those must not be
-    // conflated: on Linux a legacy record whose PID was momentarily unreadable
-    // would otherwise answer `None` to both, land in the best-effort `Matches`
-    // arm meant for Windows, and force-kill a tree on a record it never
-    // verified. Reading our own PID has no such window — if the platform can
-    // report a start-time at all, it reports ours.
+    // The decision no longer asks the platform whether a start-time could have
+    // been recorded: both supported platforms can, so an absent one is
+    // `record_predates_start_ticks`, unverifiable on its own. That also closes
+    // the case where a legacy record's pid was momentarily unreadable and would
+    // have landed in the best-effort `Matches` arm.
     //
     // One reading of the *daemon's* start-time then serves the identity question
     // below. Reading it twice let two answers come from different observations,
@@ -481,27 +581,7 @@ pub(crate) fn stop_managed_services_with(
         .iter()
         .filter(|record| managed_service_is_live(record))
     {
-        let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
-        for (pid, ticks) in [
-            (Some(record.supervisor_pid), record.supervisor_start_ticks),
-            (record.engine_pid, record.engine_start_ticks),
-        ] {
-            let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
-                continue;
-            };
-            if let Some(seen) = entries.iter_mut().find(|(p, _)| *p == pid) {
-                seen.1 = seen.1.or(ticks);
-            } else {
-                entries.push((pid, ticks));
-            }
-        }
-        let unprovable: Vec<u32> = entries
-            .into_iter()
-            .filter(|(pid, ticks)| {
-                record_predates_start_ticks(*ticks) && rocm_core::process_is_running(*pid)
-            })
-            .map(|(pid, _)| pid)
-            .collect();
+        let unprovable = unprovable_live_pids(record);
         if !unprovable.is_empty() {
             report.failed.push(FailedManagedServiceStop {
                 service_id: record.service_id.clone(),
@@ -801,6 +881,16 @@ fn probe_records_for_survivors(
     }
 }
 
+/// Whether two probe addresses can reach the same listener on one port.
+///
+/// `localhost` names whichever loopback family the resolver puts first — `::1`
+/// on many Windows hosts — so it can reach a listener on either, and is never
+/// told apart from one.
+pub(crate) fn hosts_name_one_listener(a: &str, b: &str) -> bool {
+    let is_loopback = |h: &str| matches!(h, "127.0.0.1" | "::1");
+    a == b || (a == "localhost" && is_loopback(b)) || (b == "localhost" && is_loopback(a))
+}
+
 /// The addresses to probe for a service recorded on `host`, in order.
 ///
 /// A service bound to a wildcard address is reachable on loopback; connecting to
@@ -819,15 +909,6 @@ fn probe_records_for_survivors(
 /// direction for a check whose whole job is to catch a surviving engine
 /// grandchild. Records do carry bracketed spellings (`loopback_host_key`
 /// normalizes them too) because `--host` is free-form.
-/// Whether two probe addresses can reach the same listener on one port.
-pub(crate) fn hosts_name_one_listener(a: &str, b: &str) -> bool {
-    let canonical = |h: &str| match h {
-        "localhost" => "127.0.0.1".to_owned(),
-        other => other.to_owned(),
-    };
-    canonical(a) == canonical(b)
-}
-
 pub(crate) fn probe_hosts(host: &str) -> Vec<String> {
     // Trimmed and case-folded so the spellings a record can carry — `0.0.0.0`,
     // `::`, `[::]`, `0:0:0:0:0:0:0:0`, `*`, or empty — all resolve to loopback

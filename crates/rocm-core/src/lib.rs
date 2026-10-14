@@ -1005,11 +1005,11 @@ pub struct AutomationRuntimeState {
     /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
     /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm
     /// — so **no recycling check happens at all** and a caller that signals on
-    /// that verdict is killing on a bare pid. Tell the two apart by asking the
-    /// platform: if [`process_start_ticks`] returns `Some` for a live pid while
-    /// this is `None`, the record predates the field and the pid is unverifiable;
-    /// if it returns `None`, no identity is obtainable here and best-effort is
-    /// the only option (platforms with neither `/proc` nor `GetProcessTimes`, i.e. macOS).
+    /// that verdict is killing on a bare pid. Both supported platforms (Linux
+    /// `/proc`, Windows `GetProcessTimes`) can record a start-time, so there an
+    /// absent value means the record predates the field or its writer never
+    /// stamped it, and the pid is unverifiable. Only an unsupported platform
+    /// (neither source, i.e. macOS) can never produce one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_start_ticks: Option<u64>,
     pub started_at_unix_ms: u128,
@@ -2498,6 +2498,27 @@ mod tests {
             "a failed publish must remove its scratch file, got {:?} ({error:#})",
             leftover_scratch_files(&root)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn write_file_atomically_refuses_a_path_with_no_parent_or_an_unusable_parent() {
+        let error = write_file_atomically(Path::new("/"), b"x")
+            .expect_err("a root path has no directory to stage in");
+        assert!(format!("{error:#}").contains("no parent"), "{error:#}");
+
+        // A regular file where the parent directory should be: the directory
+        // cannot be created, and nothing may be left behind.
+        let root = atomic_write_root("parent-is-a-file");
+        let blocker = root.join("blocker");
+        fs::write(&blocker, b"x").expect("seed the blocking file");
+        let error = write_file_atomically(&blocker.join("record.json"), b"x")
+            .expect_err("a file cannot be a parent directory");
+        assert!(
+            format!("{error:#}").contains("failed to create"),
+            "{error:#}"
+        );
+        assert!(leftover_scratch_files(&root).is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

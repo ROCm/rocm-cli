@@ -644,9 +644,13 @@ rocm logs --search error timeout")]
     },
     /// Remove ROCm CLI-managed files from this computer.
     ///
-    /// Managed model servers that are still running are stopped first. If one
-    /// cannot be stopped, nothing is removed, the command exits non-zero, and
-    /// it names what to repair or stop by hand. A run that keeps the binaries
+    /// Managed model servers that are still running are stopped first, and so
+    /// is the background helper (`rocmd`), whose whole process tree is
+    /// force-stopped because it would otherwise restart them. If one cannot be
+    /// stopped, nothing is removed, the command exits non-zero, and it names
+    /// what to repair or stop by hand. A server or helper that was recorded by
+    /// an older version, with no start time to prove its pid, is refused rather
+    /// than killed: stop it yourself and re-run. A run that keeps the binaries
     /// and data (`--keep-binaries --keep-data`) leaves running servers alone.
     Uninstall {
         /// Do not ask for interactive confirmation.
@@ -10991,24 +10995,8 @@ const MANAGED_STOP_GRACE: Duration = Duration::from_secs(10);
 /// known token. Returns the PIDs actually signalled and whether every recorded
 /// process is confirmed no longer running.
 fn terminate_recorded_service_pids(record: &ManagedServiceRecord) -> (Vec<u32>, bool) {
-    // Build the (pid, own-token) work list, de-duplicating on PID and preferring
-    // an entry that carries a verifiable start-time.
-    let mut entries: Vec<(u32, Option<u64>)> = Vec::new();
-    for (pid, ticks) in [
-        (Some(record.supervisor_pid), record.supervisor_start_ticks),
-        (record.engine_pid, record.engine_start_ticks),
-    ] {
-        let Some(pid) = pid.filter(|pid| *pid != 0 && *pid != std::process::id()) else {
-            continue;
-        };
-        if let Some(existing) = entries.iter_mut().find(|(seen, _)| *seen == pid) {
-            if existing.1.is_none() {
-                existing.1 = ticks;
-            }
-        } else {
-            entries.push((pid, ticks));
-        }
-    }
+    // The same (pid, own-token) list the uninstall gate pre-checks.
+    let entries = uninstall_gate::recorded_pid_identities(record);
 
     let mut signaled_pids = Vec::new();
     let mut all_stopped = true;
@@ -13744,6 +13732,12 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
             .count();
         let services_dir = paths.services_dir().display().to_string();
         let total = managed_services.len();
+        let refused: Vec<String> = managed_services
+            .iter()
+            .filter(|record| managed_service_is_live(record))
+            .filter(|record| !uninstall_gate::unprovable_live_pids(record).is_empty())
+            .map(|record| record.service_id.clone())
+            .collect();
         plan.warnings.push(if live == 0 {
             // "none is recorded as running", not "none has a running server":
             // this counts statuses, and a record reads "stopped" the moment its
@@ -13752,6 +13746,20 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
             // promise it away — this line is the last thing read before
             // confirming.
             format!("{total} managed service record(s) exist under {services_dir}; none is recorded as running")
+        } else if plan_removes_recovery_tooling(&plan, paths) && !refused.is_empty() {
+            // The stop pass refuses a live record whose pid has no recorded start
+            // time, so promising "will be stopped" for it would describe a run
+            // that aborts. Same decision, read from the same function.
+            format!(
+                "{live} of {total} managed service record(s) under {services_dir} are recorded as running; {} of them ({}) have a live pid with no recorded start time, so uninstall will refuse to remove anything until you stop them yourself{}",
+                refused.len(),
+                refused.join(", "),
+                if refused.len() < live {
+                    "; the others will be stopped before removal"
+                } else {
+                    ""
+                }
+            )
         } else if plan_removes_recovery_tooling(&plan, paths) {
             format!(
                 "{live} of {total} managed service record(s) under {services_dir} are recorded as running; those servers will be stopped before removal"
@@ -13763,6 +13771,15 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
                 "{live} of {total} managed service record(s) under {services_dir} are recorded as running; this removal keeps `rocm services stop` and the service records, so those servers are left running"
             )
         });
+    }
+
+    // The helper is reported whether or not any service record exists: a live
+    // `rocmd` with an empty services directory still gets force-stopped.
+    if let Some(note) = uninstall_gate::background_helper_plan_note(
+        paths,
+        plan_removes_recovery_tooling(&plan, paths),
+    ) {
+        plan.warnings.push(note);
     }
 
     Ok(plan)
@@ -28242,11 +28259,9 @@ install therock";
         // block.
         //
         // What keeps this a tradeoff rather than a silent removal is the
-        // warning on stderr, and that warning is pinned by nothing — no test
-        // here reads stderr, so emptying its body while leaving the `continue`
-        // would stay green. What is pinned is only that `ListsNoModels` reaches
-        // a verdict distinct from the silent one, which is the precondition for
-        // the warning rather than the warning itself.
+        // warning, a value on the report that this test asserts below. The
+        // verdict mapping is pinned separately, so emptying the warning body or
+        // flipping the verdict each turn a test red.
         let endpoint = ServingEndpoint::listing_nothing();
         let (root, paths) = test_paths("uninstall-endpoint-listing-nothing");
         let mut record = ManagedServiceRecord::new(
@@ -28466,13 +28481,9 @@ install therock";
         // A server that answers 403 is as much a live, guarded HTTP server as one
         // that answers 401; narrowing the refusal check to 401 alone would wave
         // it through as an unrelated listener.
-        let endpoint = ServingEndpoint::bind_refusing_with(
-            "amd/guarded-model",
-            "127.0.0.1",
-            true,
-            403,
-        )
-        .expect("bind the forbidding engine");
+        let endpoint =
+            ServingEndpoint::bind_refusing_with("amd/guarded-model", "127.0.0.1", true, 403)
+                .expect("bind the forbidding engine");
         let (root, paths) = test_paths("uninstall-forbidden-survivor");
         let mut record = ManagedServiceRecord::new(
             &paths,
@@ -28921,8 +28932,13 @@ install therock";
     fn localhost_and_loopback_name_one_listener_but_other_hosts_do_not() {
         assert!(hosts_name_one_listener("localhost", "127.0.0.1"));
         assert!(hosts_name_one_listener("127.0.0.1", "127.0.0.1"));
-        assert!(!hosts_name_one_listener("localhost", "::1"));
+        // `localhost` resolves to `::1` on many hosts (typically Windows), so it
+        // can name a listener on either family.
+        assert!(hosts_name_one_listener("localhost", "::1"));
+        assert!(hosts_name_one_listener("::1", "localhost"));
+        assert!(!hosts_name_one_listener("127.0.0.1", "::1"));
         assert!(!hosts_name_one_listener("10.0.0.5", "127.0.0.1"));
+        assert!(!hosts_name_one_listener("localhost", "10.0.0.5"));
     }
 
     #[test]
@@ -29354,6 +29370,243 @@ install therock";
             plan_removes_recovery_tooling(&with_data, &paths),
             "removing the data dir takes away the service records"
         );
+
+        // The other direction: an entry INSIDE the services directory removes
+        // service records without being (or containing) the data dir itself.
+        let inside_services = UninstallPlan {
+            actions: vec![UninstallPlanEntry {
+                kind: "data",
+                path: paths.services_dir().join("svc-a.json"),
+            }],
+            ..UninstallPlan::default()
+        };
+        assert!(
+            plan_removes_recovery_tooling(&inside_services, &paths),
+            "removing a service record takes away what stops its server"
+        );
+        let elsewhere = UninstallPlan {
+            actions: vec![UninstallPlanEntry {
+                kind: "cache",
+                path: paths.data_dir.join("unrelated").join("file"),
+            }],
+            ..UninstallPlan::default()
+        };
+        assert!(
+            !plan_removes_recovery_tooling(&elsewhere, &paths),
+            "a path beside the services directory leaves it alone"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plan_does_not_promise_a_stop_for_a_live_record_the_gate_refuses() {
+        // A live record whose pid has no recorded start time is refused, not
+        // stopped. The plan is the last thing read before confirming, so it
+        // must say that — and the claim is only worth anything next to the
+        // outcome it describes, so both come from the one run.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a live managed server");
+        let pid = child.id();
+        let (root, paths) = test_paths("uninstall-plan-tickless");
+        let mut record = managed_record_for_pid(&paths, pid, None);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let plan = build_uninstall_plan(
+            &paths,
+            &UninstallOptions {
+                yes: true,
+                force_dev_binaries: true,
+                ..UninstallOptions::default()
+            },
+        )
+        .expect("build the plan");
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("managed service record"))
+            .expect("the plan warns about managed services");
+        assert!(
+            warning.contains("no recorded start time")
+                && warning.contains("will refuse to remove anything")
+                && warning.contains("svc-managed-stop"),
+            "the plan must say the stop will be refused and for which record: {warning}"
+        );
+        assert!(
+            !warning.contains("those servers will be stopped before removal"),
+            "the plan must not promise the stop the gate refuses: {warning}"
+        );
+
+        let report = stop_managed_services_with(&paths, |_, _| {
+            panic!("the record the plan said would be refused must not be stopped")
+        })
+        .expect("stop pass");
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "the gate refuses exactly what the plan said it would: {report:?}"
+        );
+        assert_eq!(
+            report.failed[0].remedy,
+            StopFailureRemedy::ConfirmTheServicePid
+        );
+        assert!(child.try_wait().expect("poll").is_none(), "left alive");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plan_reports_a_live_helper_even_when_no_service_record_exists() {
+        // A live `rocmd` is force-stopped whether or not any service record
+        // exists, so the plan cannot stay silent just because there are none.
+        let helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let pid = helper.id();
+        let (root, paths) = test_paths("uninstall-plan-helper-only");
+        let mut state = runtime_state(true, pid);
+        state.daemon_start_ticks = rocm_core::process_start_ticks(pid);
+        state.write(&paths).expect("write runtime state");
+        let full = UninstallOptions {
+            yes: true,
+            force_dev_binaries: true,
+            ..UninstallOptions::default()
+        };
+        let cache_only = UninstallOptions {
+            yes: true,
+            keep_binaries: true,
+            keep_config: true,
+            keep_data: true,
+            ..UninstallOptions::default()
+        };
+
+        let plan = build_uninstall_plan(&paths, &full).expect("build the full plan");
+        let note = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("background helper"))
+            .expect("the plan names the live helper");
+        assert!(
+            note.contains(&format!("pid {pid}")) && note.contains("will be stopped"),
+            "{note}"
+        );
+        let cache_plan = build_uninstall_plan(&paths, &cache_only).expect("build the cache plan");
+        let cache_note = cache_plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("background helper"))
+            .expect("the cache-only plan names the live helper");
+        assert!(
+            cache_note.contains("left running") && !cache_note.contains("will be stopped"),
+            "{cache_note}"
+        );
+
+        // The outcome the full plan promised.
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert!(report.helper_stopped, "{report:?}");
+        let mut helper = helper;
+        assert_stopped_within_grace(&mut helper, "the helper the plan named must be stopped");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plan_says_an_unverifiable_helper_will_block_the_uninstall() {
+        // A helper whose state file carries no start time cannot be proven to be
+        // rocmd, so the gate refuses rather than kill it; the plan says so.
+        let helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let pid = helper.id();
+        let (root, paths) = test_paths("uninstall-plan-helper-unverifiable");
+        runtime_state(true, pid)
+            .write(&paths)
+            .expect("write runtime state");
+        let plan = build_uninstall_plan(
+            &paths,
+            &UninstallOptions {
+                yes: true,
+                force_dev_binaries: true,
+                ..UninstallOptions::default()
+            },
+        )
+        .expect("build the plan");
+        let note = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("background helper"))
+            .expect("the plan names the unverifiable helper");
+        assert!(
+            note.contains("cannot be verified") && note.contains("will refuse to remove anything"),
+            "{note}"
+        );
+        let report = stop_managed_services_before_uninstall(&paths).expect("stop pass");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|f| f.remedy == StopFailureRemedy::ConfirmTheDaemonPid),
+            "the gate refuses exactly what the plan said it would: {report:?}"
+        );
+        let mut helper = helper;
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removing_the_stopped_record_as_advised_lets_the_retry_proceed() {
+        // The advice for an authenticated stranger on a stopped record's old
+        // port is `rocm services remove <id> --yes`. Following it has to clear
+        // the refusal; advice that left the next run aborting would be a dead
+        // end. The record is removed the way that command does, by deleting its
+        // manifest, and the same pass is run again.
+        let endpoint = ServingEndpoint::serving_with_authorization("amd/guarded-model");
+        let (root, paths) = test_paths("uninstall-advice-then-proceed");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-stranger-port",
+            "vllm",
+            "amd/guarded-model",
+            "amd/guarded-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let first = stop_managed_services_before_uninstall(&paths).expect("first pass");
+        assert!(
+            first
+                .failed
+                .iter()
+                .any(|f| f.remedy == StopFailureRemedy::RemoveTheStoppedRecord),
+            "{first:?}"
+        );
+
+        remove_managed_service_record(&paths, "svc-stranger-port", true)
+            .expect("the advised command must succeed");
+
+        let second = stop_managed_services_before_uninstall(&paths).expect("second pass");
+        assert!(
+            second.failed.is_empty(),
+            "once the record is removed the retry must proceed: {second:?}"
+        );
+        assert!(uninstall_removal_gate(&second).is_ok());
+        drop(endpoint);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -30030,10 +30283,7 @@ install therock";
             message.contains("if it is, stop it first: svc-old."),
             "{message}"
         );
-        assert!(
-            message.contains("it was left alone: svc-pid."),
-            "{message}"
-        );
+        assert!(message.contains("it was left alone: svc-pid."), "{message}");
     }
 
     #[cfg(unix)]

@@ -4,13 +4,14 @@
 
 //! `rocm uninstall` command handler.
 //!
-//! Mechanically relocated from `main.rs` with no behavior change — the
-//! `dispatch()` call site stays `uninstall(UninstallOptions { .. })` (re-imported
-//! via `use crate::uninstall::uninstall;`). The `UninstallOptions`/`UninstallPlan`
+//! Home of the stop-before-remove ordering and the partial-removal report; the
+//! rest was relocated from `main.rs`. The `dispatch()` call site stays
+//! `uninstall(UninstallOptions { .. })` (re-imported via
+//! `use crate::uninstall::uninstall;`). The `UninstallOptions`/`UninstallPlan`
 //! types and the plan/render/remove helpers remain in the crate root and are
 //! reached through `crate::` (root items are visible to this descendant module).
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use rocm_core::{AppPaths, interactive_terminal};
 
 use crate::uninstall_gate::{
@@ -79,25 +80,71 @@ fn stop_managed_services_then_remove(
     plan: &UninstallPlan,
     stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
 ) -> Result<()> {
+    stop_then_remove_with(plan, stop_managed_services, remove_path)
+}
+
+/// [`stop_managed_services_then_remove`] with the removal of one path supplied,
+/// so a test can make it fail partway, which a real filesystem does not do on
+/// demand.
+fn stop_then_remove_with(
+    plan: &UninstallPlan,
+    stop_managed_services: impl FnOnce() -> Result<ManagedServiceStopReport>,
+    remove: impl Fn(&std::path::Path) -> Result<()>,
+) -> Result<()> {
     let stop_report = stop_managed_services()?;
     // Every fail-open the stop pass took, on stderr rather than stdout: these
     // are the places uninstall proceeded without proving the port was free, so
     // they have to survive the operator piping its output somewhere. Printed
     // before the gate, so they are on screen whether or not it aborts.
-    for warning in &stop_report.warnings {
-        eprintln!("warning: {warning}");
-    }
+    write_stop_warnings(&mut std::io::stderr(), &stop_report);
     if let Some(line) = uninstall_removal_gate(&stop_report)? {
         println!("{line}");
     }
 
-    for entry in &plan.actions {
-        remove_path(&entry.path)
-            .with_context(|| format!("failed to remove {}", entry.path.display()))?;
+    // The removal itself is not transactional: entries go in plan order (binaries
+    // before config, data and cache) with no rollback. A failure partway can
+    // therefore leave the binaries and service records gone while a server the
+    // gate judged stopped is not, so say exactly what is and is not removed
+    // instead of a bare "failed to remove".
+    let mut removed: Vec<String> = Vec::new();
+    for (index, entry) in plan.actions.iter().enumerate() {
+        if let Err(error) = remove(&entry.path) {
+            let remaining: Vec<String> = plan.actions[index..]
+                .iter()
+                .map(|entry| format!("{} {}", entry.kind, entry.path.display()))
+                .collect();
+            return Err(error
+                .context(format!("failed to remove {}", entry.path.display()))
+                .context(partial_removal_note(&removed, &remaining)));
+        }
         println!("removed {} {}", entry.kind, entry.path.display());
+        removed.push(format!("{} {}", entry.kind, entry.path.display()));
     }
     println!("uninstall complete");
     Ok(())
+}
+
+/// One `warning:` line per fail-open the stop pass took, on `out`.
+fn write_stop_warnings(out: &mut impl std::io::Write, report: &ManagedServiceStopReport) {
+    for warning in &report.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
+}
+
+/// What a removal that stopped partway has to tell its operator.
+fn partial_removal_note(removed: &[String], remaining: &[String]) -> String {
+    if removed.is_empty() {
+        return "uninstall stopped on its first removal; nothing was removed".to_owned();
+    }
+    format!(
+        "uninstall stopped partway. Already removed: {}. Still present: {}. What was already \
+         removed can include the `rocm`/`rocmd` binaries and the service records, so `rocm \
+         services stop` may no longer work; if a managed server may still be running, find \
+         and stop it by hand, then re-run uninstall (or delete what is left) once the cause \
+         is fixed",
+        removed.join(", "),
+        remaining.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -107,7 +154,7 @@ mod tests {
 
     use anyhow::bail;
 
-    use super::stop_managed_services_then_remove;
+    use super::{stop_managed_services_then_remove, stop_then_remove_with, write_stop_warnings};
     use crate::uninstall_gate::{
         FailedManagedServiceStop, ManagedServiceStopReport, StopFailureRemedy,
     };
@@ -154,6 +201,108 @@ mod tests {
                 warnings: Vec::new(),
             },
         )
+    }
+
+    #[test]
+    fn a_removal_that_fails_partway_says_what_is_gone_and_what_is_left() {
+        // The removal is not transactional, so a failure after the first entry
+        // leaves the binaries gone and the data behind. The error has to say so,
+        // and the report must match what is actually on disk.
+        let root = std::env::temp_dir().join(format!(
+            "rocm-cli-uninstall-test-partial-{}-{}",
+            std::process::id(),
+            rocm_core::unix_time_millis()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create the test root");
+        let binary = root.join("rocm");
+        let data = root.join("data");
+        fs::write(&binary, b"binary").expect("seed binary");
+        fs::create_dir_all(&data).expect("seed data");
+        let plan = UninstallPlan {
+            actions: vec![
+                UninstallPlanEntry {
+                    kind: "binary",
+                    path: binary.clone(),
+                },
+                UninstallPlanEntry {
+                    kind: "data",
+                    path: data.clone(),
+                },
+            ],
+            skipped: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |path| {
+                if path == data {
+                    bail!("directory not empty")
+                }
+                fs::remove_file(path)?;
+                Ok(())
+            },
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("Already removed: binary {}", binary.display())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("Still present: data {}", data.display())),
+            "{message}"
+        );
+        assert!(message.contains("directory not empty"), "{message}");
+        assert!(
+            message.contains("`rocm services stop` may no longer work"),
+            "{message}"
+        );
+        // The text above is only true if the disk agrees with it.
+        assert!(
+            !binary.exists(),
+            "the binary the note calls removed is gone"
+        );
+        assert!(
+            data.exists(),
+            "the data the note calls present is still there"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_removal_that_fails_first_says_nothing_was_removed() {
+        let (root, plan) = plan_removing_one_file("fails-first");
+        let doomed = plan.actions[0].path.clone();
+
+        let error = stop_then_remove_with(
+            &plan,
+            || Ok(ManagedServiceStopReport::default()),
+            |_| bail!("permission denied"),
+        )
+        .expect_err("a failing removal must fail the uninstall");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("nothing was removed"), "{message}");
+        assert!(doomed.is_file(), "nothing was removed, as the note says");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_fail_open_the_stop_pass_took_is_written_as_a_warning_line() {
+        let report = ManagedServiceStopReport {
+            warnings: vec!["first fail-open".to_owned(), "second fail-open".to_owned()],
+            ..ManagedServiceStopReport::default()
+        };
+        let mut out = Vec::new();
+        write_stop_warnings(&mut out, &report);
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "warning: first fail-open\nwarning: second fail-open\n"
+        );
     }
 
     #[test]
