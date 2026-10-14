@@ -730,7 +730,7 @@ fn probe_os(e: &mut Examination) {
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
         record_distro(
             e,
-            &crate::hardware_root::read_os_release(|p| crate::host_path(p)).unwrap_or_default(),
+            &crate::hardware_root::read_os_release(|p| crate::host_path(p)),
         );
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
@@ -746,21 +746,30 @@ fn probe_os(e: &mut Examination) {
     }
 }
 
-/// Fill the distro fields from os-release `text`, through the same parser the
-/// driver plan uses, so the two report the same distro.
+/// Fill the distro fields from `read`, through the same parser the driver
+/// plan uses, so the two report the same distro.
 ///
-/// An unreadable file leaves both fields empty and says why in
-/// `probe_failures`, naming the line — an empty distro with no explanation
-/// would read as "nothing to report" rather than "something to fix". A missing
-/// file reads as empty text, which is not a failure.
-fn record_distro(e: &mut Examination, text: &str) {
-    match crate::os_release::parse(text) {
+/// An unreadable line leaves both fields empty and says why in
+/// `probe_failures`, naming the file actually read and the line — an empty
+/// distro with no explanation would read as "nothing to report" rather than
+/// "something to fix". A missing file reads as empty text, which is not a
+/// failure; a file that exists but could not be read is, and is reported as
+/// itself rather than as an unreadable line it never reached.
+fn record_distro(e: &mut Examination, read: &crate::hardware_root::OsRelease) {
+    if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
+        e.probe_failures.push(format!(
+            "{path} could not be read: {error}; the distro is not reported."
+        ));
+        return;
+    }
+    match crate::os_release::parse(read.text()) {
         Ok(mut fields) => {
             e.distro_id = fields.remove("ID").unwrap_or_default();
             e.distro_version = fields.remove("VERSION_ID").unwrap_or_default();
         }
         Err(unreadable) => e.probe_failures.push(format!(
-            "/etc/os-release {unreadable}; the distro is not reported."
+            "{} {unreadable}; the distro is not reported.",
+            read.path()
         )),
     }
 }
@@ -3119,7 +3128,9 @@ mod tests {
         let mut e = linux_host_with_a_gpu();
         record_distro(
             &mut e,
-            "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+            &crate::hardware_root::OsRelease::found(
+                "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+            ),
         );
         assert_eq!(
             e.probe_failures,
@@ -3133,7 +3144,10 @@ mod tests {
         assert_eq!(e.compute_status(), "degraded");
 
         let mut e = linux_host_with_a_gpu();
-        record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::found("ID='ubuntu'\nVERSION_ID='24.04' # LTS\n"),
+        );
         assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
         assert_eq!(
             (e.distro_id.as_str(), e.distro_version.as_str()),
@@ -3143,8 +3157,30 @@ mod tests {
 
         // No file at all is not a failure: there is nothing to fix.
         let mut e = Examination::default();
-        record_distro(&mut e, "");
+        record_distro(&mut e, &crate::hardware_root::OsRelease::Absent);
         assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+    }
+
+    /// A file that exists but could not be read is reported as itself — not
+    /// folded into an empty, unreported distro the way `Absent` is, and not
+    /// pointing at the wrong candidate when the fallback was the one that
+    /// failed.
+    #[test]
+    fn an_unreadable_file_names_itself_instead_of_a_distro() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            &crate::hardware_root::OsRelease::Unreadable {
+                path: "/usr/lib/os-release",
+                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            },
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec!["/usr/lib/os-release could not be read: denied; the distro is not reported.".to_owned()]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
     }
 
     /// Serialises the tests that read or replace the process-global
@@ -5794,6 +5830,39 @@ mod tests {
             "id=primary",
             "stderr: {}",
             String::from_utf8_lossy(&after.stderr)
+        );
+    }
+
+    /// `[ -e "$1" ]` is an existence check, not a readability one: a primary
+    /// that exists but cannot be sourced (here, a directory in its place, the
+    /// same portable non-readable fixture the Rust-side test above uses)
+    /// must not fall through to the `elif` and source the fallback — that
+    /// would silently read a file that may not describe this host, matching
+    /// `hardware_root::read_os_release`'s own non-absence rule.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_os_release_does_not_source_the_fallback_when_the_primary_exists_but_errors() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let primary = dir.path().join("primary");
+        let fallback = dir.path().join("fallback");
+        std::fs::create_dir(&primary).expect("create primary as a directory");
+        std::fs::write(&fallback, "ID=fallback\n").expect("write fallback");
+
+        let script = format!("{TRY_OS_RELEASE_FN}\ntry_os_release \"$1\" \"$2\"\necho \"id=$ID\"");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("sh")
+            .arg(&primary)
+            .arg(&fallback)
+            .output()
+            .expect("run sh");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "id=",
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

@@ -1968,28 +1968,38 @@ pub(crate) fn detect_distro_name() -> Option<String> {
     }
 
     if runtime_is_linux() {
-        return Some(distro_name_from_os_release(
-            &hardware_root::read_os_release(|p| host_path(p))?,
-        ));
+        return match hardware_root::read_os_release(|p| host_path(p)) {
+            // Absent matches the pre-fallback behaviour this function has
+            // always had: no file at all leaves the distro name unknown
+            // entirely, rather than reporting "Linux" for a machine that
+            // might not even be running a standard distro.
+            hardware_root::OsRelease::Absent => None,
+            read => Some(distro_name_from_os_release(&read)),
+        };
     }
 
     None
 }
 
-/// The distribution name `rocm examine` prints, from os-release `text`:
-/// `PRETTY_NAME` as `sh` reads it, else `Linux`.
+/// The distribution name `rocm examine` prints, from `read`: `PRETTY_NAME` as
+/// `sh` reads it, else `Linux`.
 ///
-/// An unreadable file says which line made it so, on the line a person reads
-/// — `rocm examine`'s `probe_failures`, which carries the same reason, is only
-/// in the `--json` form. A blank `PRETTY_NAME` also falls back to `Linux`.
-fn distro_name_from_os_release(text: &str) -> String {
-    match crate::os_release::parse(text) {
+/// An unreadable line says which file and line made it so, on the line a
+/// person reads — `rocm examine`'s `probe_failures`, which carries the same
+/// reason, is only in the `--json` form. A blank `PRETTY_NAME` also falls
+/// back to `Linux`. A file that exists but could not be read at all is
+/// reported as itself, distinctly from a bad line it never reached.
+fn distro_name_from_os_release(read: &hardware_root::OsRelease) -> String {
+    if let hardware_root::OsRelease::Unreadable { path, error } = read {
+        return format!("Linux ({path} could not be read: {error})");
+    }
+    match crate::os_release::parse(read.text()) {
         Ok(mut fields) => fields
             .remove("PRETTY_NAME")
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "Linux".to_owned()),
-        Err(unreadable) => format!("Linux (/etc/os-release {unreadable})"),
+        Err(unreadable) => format!("Linux ({} {unreadable})", read.path()),
     }
 }
 
@@ -4787,7 +4797,9 @@ Class Name:                Display
     #[test]
     fn parses_os_release_pretty_name() {
         assert_eq!(
-            distro_name_from_os_release("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
+            distro_name_from_os_release(&hardware_root::OsRelease::found(
+                "NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"
+            )),
             "Ubuntu 24.04.2 LTS"
         );
     }
@@ -4800,17 +4812,40 @@ Class Name:                Display
     #[test]
     fn pretty_name_reads_as_sh_reads_it() {
         assert_eq!(
-            distro_name_from_os_release(
+            distro_name_from_os_release(&hardware_root::OsRelease::found(
                 "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
-            ),
+            )),
             "Ubuntu 24.04 LTS"
         );
         assert_eq!(
-            distro_name_from_os_release("PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"),
+            distro_name_from_os_release(&hardware_root::OsRelease::found(
+                "PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"
+            )),
             "Linux (/etc/os-release line 2 is not a plain assignment: \"unset ID\")"
         );
-        assert_eq!(distro_name_from_os_release("PRETTY_NAME=\"  \"\n"), "Linux");
-        assert_eq!(distro_name_from_os_release("ID=ubuntu\n"), "Linux");
+        assert_eq!(
+            distro_name_from_os_release(&hardware_root::OsRelease::found("PRETTY_NAME=\"  \"\n")),
+            "Linux"
+        );
+        assert_eq!(
+            distro_name_from_os_release(&hardware_root::OsRelease::found("ID=ubuntu\n")),
+            "Linux"
+        );
+    }
+
+    /// A file that exists but could not be read names itself and the error,
+    /// distinctly from a bad line it never reached and from "no file at all"
+    /// — which `detect_distro_name` keeps reporting as unknown, unchanged by
+    /// this PR (see its own doc comment).
+    #[test]
+    fn distro_name_names_an_unreadable_file_instead_of_guessing_linux() {
+        assert_eq!(
+            distro_name_from_os_release(&hardware_root::OsRelease::Unreadable {
+                path: "/usr/lib/os-release",
+                error: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+            }),
+            "Linux (/usr/lib/os-release could not be read: denied)"
+        );
     }
 
     #[test]

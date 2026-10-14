@@ -113,6 +113,65 @@ fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
     }
 }
 
+/// What reading `/etc/os-release` (falling back to `/usr/lib/os-release` per
+/// `os-release(5)`) produced.
+///
+/// Kept as three states, not collapsed to `Option<String>`, so a caller can
+/// name the file it actually read in a parse-error message (`Found`'s `path`)
+/// and can tell "nothing to report" (`Absent`, the documented fallback
+/// contract: a missing file is not a failure) apart from "something is
+/// wrong" (`Unreadable`: a candidate exists but could not be read). Before
+/// this distinction existed, every caller folded both into the same empty
+/// text and reported a host with a merely-unreadable file as an unsupported
+/// distribution.
+#[derive(Debug)]
+pub enum OsRelease {
+    /// Read from `path` (`/etc/os-release` or `/usr/lib/os-release`).
+    Found { path: &'static str, text: String },
+    /// Neither candidate exists.
+    Absent,
+    /// `path` exists but could not be read, for a reason other than absence
+    /// (permission denied, a directory in its place, ...).
+    Unreadable {
+        path: &'static str,
+        error: std::io::Error,
+    },
+}
+
+impl OsRelease {
+    /// The text to parse: the file's contents when one was read, empty for
+    /// [`Self::Absent`] or [`Self::Unreadable`] — an absent file declares
+    /// nothing, and an unreadable one must be reported as itself by the
+    /// caller rather than parsed as an empty, unknown distribution.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Found { text, .. } => text,
+            Self::Absent | Self::Unreadable { .. } => "",
+        }
+    }
+
+    /// The path a parse-error message should name: the one actually read, or
+    /// `/etc/os-release` for [`Self::Absent`] — which never reaches such a
+    /// message, since empty text never fails to parse.
+    #[must_use]
+    pub const fn path(&self) -> &'static str {
+        match self {
+            Self::Found { path, .. } | Self::Unreadable { path, .. } => path,
+            Self::Absent => "/etc/os-release",
+        }
+    }
+
+    /// For tests: a [`Self::Found`] at the default `/etc/os-release` path.
+    #[cfg(test)]
+    pub(crate) fn found(text: impl Into<String>) -> Self {
+        Self::Found {
+            path: "/etc/os-release",
+            text: text.into(),
+        }
+    }
+}
+
 /// Reads `/etc/os-release`, falling back to `/usr/lib/os-release` per
 /// `os-release(5)` when the former is absent.
 ///
@@ -127,13 +186,29 @@ fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
 /// way would silently build commands for the wrong distro from a stale
 /// `/usr/lib/os-release` on a host where `/etc/os-release` exists but is
 /// merely unreadable.
-pub fn read_os_release(resolve: impl Fn(&str) -> PathBuf) -> Option<String> {
+pub fn read_os_release(resolve: impl Fn(&str) -> PathBuf) -> OsRelease {
     match std::fs::read_to_string(resolve("/etc/os-release")) {
-        Ok(text) => Some(text),
+        Ok(text) => OsRelease::Found {
+            path: "/etc/os-release",
+            text,
+        },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::read_to_string(resolve("/usr/lib/os-release")).ok()
+            match std::fs::read_to_string(resolve("/usr/lib/os-release")) {
+                Ok(text) => OsRelease::Found {
+                    path: "/usr/lib/os-release",
+                    text,
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => OsRelease::Absent,
+                Err(error) => OsRelease::Unreadable {
+                    path: "/usr/lib/os-release",
+                    error,
+                },
+            }
         }
-        Err(_) => None,
+        Err(error) => OsRelease::Unreadable {
+            path: "/etc/os-release",
+            error,
+        },
     }
 }
 
@@ -221,14 +296,24 @@ mod tests {
         }
     }
 
+    /// Extracts `(path, text)` from a [`OsRelease::Found`], panicking on any
+    /// other variant — the shape every "a candidate was read" assertion below
+    /// wants, written once so each test states only what differs.
+    fn found(read: OsRelease) -> (&'static str, String) {
+        match read {
+            OsRelease::Found { path, text } => (path, text),
+            other => panic!("expected OsRelease::Found, got {other:?}"),
+        }
+    }
+
     #[test]
     fn read_os_release_prefers_the_primary_candidate() {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(dir.path().join("primary"), "ID=primary\n").expect("write primary");
         std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
         assert_eq!(
-            read_os_release(|name| candidate(dir.path(), name)),
-            Some("ID=primary\n".to_owned())
+            found(read_os_release(|name| candidate(dir.path(), name))),
+            ("/etc/os-release", "ID=primary\n".to_owned())
         );
     }
 
@@ -237,15 +322,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
         assert_eq!(
-            read_os_release(|name| candidate(dir.path(), name)),
-            Some("ID=fallback\n".to_owned())
+            found(read_os_release(|name| candidate(dir.path(), name))),
+            ("/usr/lib/os-release", "ID=fallback\n".to_owned())
         );
     }
 
     #[test]
-    fn read_os_release_is_none_when_neither_candidate_exists() {
+    fn read_os_release_is_absent_when_neither_candidate_exists() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        assert_eq!(read_os_release(|name| candidate(dir.path(), name)), None);
+        assert!(matches!(
+            read_os_release(|name| candidate(dir.path(), name)),
+            OsRelease::Absent
+        ));
     }
 
     /// A primary that exists but fails to read for a reason other than
@@ -253,11 +341,29 @@ mod tests {
     /// would silently build commands for the wrong distro from a fallback
     /// file that may not describe this host at all. A directory read as a
     /// file is a portable, root-free way to get a non-`NotFound` `io::Error`.
+    /// It must also be reported as itself, not folded into `Absent`: an
+    /// unreadable file is not "nothing to report".
     #[test]
     fn read_os_release_does_not_fall_back_when_the_primary_errors_for_another_reason() {
         let dir = tempfile::tempdir().expect("create temp dir");
         std::fs::create_dir(dir.path().join("primary")).expect("create primary as a directory");
         std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
-        assert_eq!(read_os_release(|name| candidate(dir.path(), name)), None);
+        match read_os_release(|name| candidate(dir.path(), name)) {
+            OsRelease::Unreadable { path, .. } => assert_eq!(path, "/etc/os-release"),
+            other => panic!("expected OsRelease::Unreadable, got {other:?}"),
+        }
+    }
+
+    /// The same non-absence distinction, but on the fallback candidate: a
+    /// primary that is genuinely absent and a fallback that exists but
+    /// cannot be read must not read as `Absent` either.
+    #[test]
+    fn read_os_release_reports_the_fallback_as_unreadable_when_it_errors_for_another_reason() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("fallback")).expect("create fallback as a directory");
+        match read_os_release(|name| candidate(dir.path(), name)) {
+            OsRelease::Unreadable { path, .. } => assert_eq!(path, "/usr/lib/os-release"),
+            other => panic!("expected OsRelease::Unreadable, got {other:?}"),
+        }
     }
 }

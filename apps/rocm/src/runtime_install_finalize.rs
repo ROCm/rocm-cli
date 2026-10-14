@@ -155,10 +155,10 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
 /// a package-manager plan (`apt`, `dnf`, `amdgpu-install`) that then runs
 /// against the real machine, so a simulated host root must not choose its
 /// distro. The descriptive distro name `examine` reports comes from
-/// `rocm_core::detect_distro_name`, which does follow a simulated root.
-pub(crate) fn read_os_release() -> Result<String> {
+/// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
+/// root.
+pub(crate) fn read_os_release() -> rocm_core::hardware_root::OsRelease {
     rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p))
-        .context("failed to read /etc/os-release or /usr/lib/os-release")
 }
 
 /// Run a command given as an argv vector directly, without going through a shell.
@@ -203,8 +203,8 @@ pub(crate) fn ensure_openmpi_for_vllm(approved: bool) -> Result<()> {
         return Ok(());
     }
 
-    let plan = rocm_core::openmpi::plan_for_os_release(
-        &read_os_release().unwrap_or_default(),
+    let plan = rocm_core::openmpi::plan_for_os_release_read(
+        &read_os_release(),
         rocm_core::openmpi::build_openmpi_install_plan,
     );
 
@@ -378,10 +378,7 @@ fn ensure_torch_runtime_dep(approved: bool, dep: &TorchRuntimeDep) {
         return;
     }
 
-    let plan = rocm_core::openmpi::plan_for_os_release(
-        &read_os_release().unwrap_or_default(),
-        dep.build_plan,
-    );
+    let plan = rocm_core::openmpi::plan_for_os_release_read(&read_os_release(), dep.build_plan);
 
     println!("{} setup", dep.name);
     println!("  reason: {}", dep.reason);
@@ -2112,23 +2109,26 @@ pub(crate) mod tests {
                 rocm_core::hardware_root::TEST_HOST_ROOT_ENV,
                 &root.to_string_lossy(),
             );
-            read_os_release().unwrap_or_default()
+            read_os_release()
         };
         fs::remove_dir_all(&root).ok();
 
         assert!(
-            !read.contains("planted-distro"),
-            "read the simulated root's os-release: {read:?}"
+            !read.text().contains("planted-distro"),
+            "read the simulated root's os-release: {:?}",
+            read.text()
         );
         // Not `fs::read_to_string("/etc/os-release")` directly: on a host that
         // is itself one of the `/usr/lib/os-release`-only machines this fix
         // supports, that would compare against an empty string while `read`
         // correctly holds the real fallback file's contents, failing the
         // assertion on exactly the configuration this test means to allow.
-        assert_eq!(
-            read,
-            rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p)).unwrap_or_default()
-        );
+        // Compared by `(path, text)` rather than `OsRelease` itself: an
+        // `Unreadable` variant carries an `io::Error`, which has no
+        // `PartialEq`, and the path/text pair is what this test means to pin
+        // regardless.
+        let real = rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p));
+        assert_eq!((read.path(), read.text()), (real.path(), real.text()));
     }
 
     // The install report is only as honest as the reconciliation that reaches
