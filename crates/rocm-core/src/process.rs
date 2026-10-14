@@ -861,10 +861,17 @@ fn wait_bounded<C: Waitable>(
 ) -> Result<(ExitStatus, bool)> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to poll {label}"))?
-        {
+        let polled = child.try_wait();
+        if polled.is_err() {
+            // The only exit from this function that is not already followed by
+            // a kill. Whatever stopped us polling, we are about to stop
+            // waiting, and the caller drops the child without ever reaping it;
+            // leaving it running would hand back a process nobody is watching.
+            // `let _` to match the timeout branch: the kill is best-effort, and
+            // the poll error is the one worth reporting.
+            let _ = child.kill();
+        }
+        if let Some(status) = polled.with_context(|| format!("failed to poll {label}"))? {
             return Ok((status, false));
         }
         if Instant::now() >= deadline {
@@ -1354,6 +1361,10 @@ mod tests {
         /// the loop's first `?` fires. `false`: it stays running until the
         /// deadline, and the post-kill `wait` is what fails.
         fail_poll: bool,
+        /// Raised by `kill`, so the test can tell a wait loop that leaves the
+        /// child running from one that does not. This is the whole reason
+        /// `kill` is on the trait rather than called on a concrete `Child`.
+        killed: Arc<AtomicBool>,
     }
 
     impl Waitable for FailingChild {
@@ -1365,6 +1376,7 @@ mod tests {
         }
 
         fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.store(true, Ordering::Release);
             Ok(())
         }
 
@@ -1374,13 +1386,20 @@ mod tests {
     }
 
     /// Drive `run_captured` with a child that fails one of the wait loop's two
-    /// calls, and assert the error is reported *and* both readers are left
-    /// abandoned.
+    /// calls, and assert the error is reported, both readers are left
+    /// abandoned, *and* the child was killed on the way out.
+    ///
+    /// `fail_poll` picks which call fails; see [`FailingChild`].
     fn assert_wait_failure_abandons_both_readers(
-        child: FailingChild,
+        fail_poll: bool,
         timeout: Duration,
         expected: &str,
     ) {
+        let killed = Arc::new(AtomicBool::new(false));
+        let child = FailingChild {
+            fail_poll,
+            killed: Arc::clone(&killed),
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let out_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let err_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1430,13 +1449,22 @@ mod tests {
             );
         }
 
+        // Abandoning the readers is only half of it: the caller drops the child
+        // on this path without reaping it, so a wait loop that returns without
+        // killing leaves a process running that nobody will ever wait on again.
+        assert!(
+            killed.load(Ordering::Acquire),
+            "every exit from the wait loop must kill the child first; this one returned the \
+             error with the child still running"
+        );
+
         stop.store(true, Ordering::Release);
     }
 
     #[test]
     fn a_failure_to_poll_the_child_still_abandons_both_readers() {
         assert_wait_failure_abandons_both_readers(
-            FailingChild { fail_poll: true },
+            true,
             Duration::from_secs(30),
             "failed to poll process",
         );
@@ -1447,7 +1475,7 @@ mod tests {
         // Zero timeout so the loop reaches the post-kill reap — the other `?` —
         // on its first pass.
         assert_wait_failure_abandons_both_readers(
-            FailingChild { fail_poll: false },
+            false,
             Duration::ZERO,
             "failed to reap timed-out process",
         );

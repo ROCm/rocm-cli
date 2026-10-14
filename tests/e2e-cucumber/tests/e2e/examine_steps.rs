@@ -1571,16 +1571,16 @@ fn write_stub_payload(world: &E2eWorld) -> PathBuf {
 /// matter to a test about output size. The exception is the scenario that needs
 /// the two probes to differ, which branches on `$1` — the subcommand, and the
 /// first argument at both call sites in `gather_gpu_snapshot`.
+///
+/// Written via [`rocm_core::fake_executable::write_fake_executable`], not
+/// `std::fs::write`: these scenarios need only Linux, not a GPU, so they run on
+/// the lane that executes up to 64 of them at once, and a plain write leaks a
+/// write fd into another thread's child, making the first run of this stub fail
+/// intermittently with `ETXTBSY`. See that module's docs for the race.
 fn write_amd_smi_stub(world: &E2eWorld, body: &str) {
     let stub = stub_bin_dir(world).join("amd-smi");
-    std::fs::write(&stub, format!("#!/bin/sh\n{body}\n"))
+    rocm_core::fake_executable::write_fake_executable(&stub, format!("#!/bin/sh\n{body}\n"))
         .expect("failed to write the amd-smi stub");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
-            .expect("failed to make the amd-smi stub executable");
-    }
 }
 
 #[given("amd-smi reports more output than a pipe buffer holds")]
