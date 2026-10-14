@@ -59,6 +59,10 @@ pub struct E2eWorld {
     /// scenario. Kept on the World so it remains alive while the real `rocm`
     /// subprocess downloads.
     pub paced_download_server: Option<PacedDownloadServer>,
+    /// The port a stand-in for a running ComfyUI answers on. Held on the World
+    /// so the port keeps answering, as a started ComfyUI's does, for the rest
+    /// of the scenario.
+    pub comfyui_port_listener: Option<std::net::TcpListener>,
     /// Cache-marker destination discovered from `rocmd`'s own JSON report.
     pub artifact_marker_path: Option<PathBuf>,
     pub endpoint: Option<String>,
@@ -150,6 +154,11 @@ pub struct E2eWorld {
     /// field rather than borrowing `model_name`, which means a served model and
     /// has nothing to do with a user's error report.
     pub skill_symptom: Option<String>,
+    /// A live process a scenario recorded as a managed server's own, so a stop
+    /// has something real to terminate. Held here so `Drop` can kill and reap
+    /// it whatever the scenario's outcome, and so the stop's effect on it can
+    /// be observed through the handle rather than by PID alone.
+    pub recorded_process: Option<std::process::Child>,
 }
 
 /// One scenario's resolved expectation plus the identity needed to report it.
@@ -265,6 +274,7 @@ impl Default for E2eWorld {
             mock: None,
             artifact_server: None,
             paced_download_server: None,
+            comfyui_port_listener: None,
             artifact_marker_path: None,
             endpoint: None,
             model_name: None,
@@ -289,6 +299,7 @@ impl Default for E2eWorld {
             lifecycle: None,
             skill_reference: None,
             skill_symptom: None,
+            recorded_process: None,
         }
     }
 }
@@ -598,6 +609,12 @@ impl Drop for E2eWorld {
         if let Some(stage) = self.launch_stage.take() {
             let _ = stage.join();
         }
+        // A no-op when the scenario's stop already took it; otherwise it would
+        // outlive the harness, since nothing else knows its PID.
+        if let Some(mut process) = self.recorded_process.take() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
         if let Some(mock) = self.mock.take() {
             mock.stop();
         }
@@ -714,6 +731,27 @@ pub fn results_path() -> PathBuf {
 
 pub fn rocm_binary() -> String {
     std::env::var("ROCM_CLI_BINARY").unwrap_or_else(|_| "rocm".to_string())
+}
+
+/// The `rocmd` a rocmd-backed scenario drives.
+///
+/// Unlike [`rocm_binary`] there is no fallback to `PATH`: the harness must be
+/// told which build to pair with the `rocm` under test, or it could silently
+/// test a different `rocmd`.
+pub fn rocmd_binary() -> PathBuf {
+    let configured = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
+        panic!(
+            "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \
+             ROCM_CLI_BINARY, provide the matching prebuilt rocmd path explicitly"
+        )
+    });
+    let configured = PathBuf::from(configured);
+    configured.canonicalize().unwrap_or_else(|error| {
+        panic!(
+            "failed to resolve ROCM_CLI_ROCMD_BINARY {}: {error}",
+            configured.display()
+        )
+    })
 }
 
 /// Spawn the real `rocm` binary with the scenario's isolated env.

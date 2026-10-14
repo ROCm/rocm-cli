@@ -494,6 +494,70 @@ python3 scripts/comfyui_therock_gpu_test.py \
   --generate-cat
 ```
 
+## ComfyUI Reinstall
+
+`rocm comfyui install --reinstall` deletes only the top-level entries the
+installed ComfyUI release shipped in its `source/` folder (as recorded when it
+was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
+`input/`, `custom_nodes/`, `datasets/`, `extra_model_paths.yaml`), renames an
+entry of the user's that the new release starts shipping (`set aside:`) and
+leaves anything else in place. An install from before that record replaces
+the entries named like the new release's code and lists them (`replaced:`).
+It leaves the install untouched when the new source cannot be obtained or is
+not a ComfyUI release, or when ComfyUI is found running just before the swap;
+`start` refuses a folder whose swap was interrupted or stopped part-way, and
+the command it names finishes it. The swap is unit-tested directly, without a
+fake Python. Most of those tests also run on Windows: stopping the swap before
+each filesystem change in turn and checking that a re-run converges (with and
+without an entry to set aside), unknown entries and `datasets/` left in place,
+an unreadable or malformed release record or swap marker, an entry that
+cannot be removed, the copy taken when the release cannot be renamed into
+place across filesystems, `main.py` removed first and moved in last, a
+release without `main.py` refused before an existing install changes, and the
+`replaced:` list of an install with no record staying complete when its swap
+is interrupted at any step. The symlink tests (symlinked model folders, links
+inside them, loops, dangling links, copying links without following them), the
+inode/ctime test and a copy that fails part-way are Unix-only; the retry while
+another program holds a file and names that differ only in case are
+Windows-only:
+
+```bash
+cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::tests
+```
+
+The second filter covers the install-level tests: `reinstall_*`,
+`install_after_an_interrupted_reinstall_finishes_it`,
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
+`a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
+`a_failure_after_the_swap_names_what_it_replaced`,
+`only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it`,
+`swap_changes_summary_names_what_was_replaced_and_set_aside`,
+`a_plain_install_is_not_refused_while_comfyui_runs`,
+`plain_install_dry_run_previews_no_reinstall`,
+`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`.
+The running guard is tested against a ComfyUI answering on its port
+(`running`) and one whose process is up but whose port is not answering yet
+(`starting`).
+
+The e2e scenarios `comfyui-05` to `comfyui-13`
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
+GPU) cover the same through the built binary: what is kept, replaced and left
+in place (also when the saved run state is unreadable), a failed download, the
+dry run, a reinstall refused while ComfyUI runs (which the dry run says
+first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
+run, the answer to a plain-words status question
+(`rocm "what is the comfyui status"`) while ComfyUI starts and while a
+reinstall is unfinished, a folder of the user's set aside when the new release
+ships one of the same name, a reinstall that fails after the swap naming
+what it replaced and the command that finishes it, a ComfyUI started while
+the reinstall downloads, which the check just before the swap refuses, and a
+download that is not a ComfyUI release, which is neither installed nor kept:
+
+```bash
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
+```
+
 ## Runtime Selection And Activation
 
 List registered managed or read-only runtimes and their exact side-by-side keys:
@@ -893,6 +957,12 @@ cargo test -p rocmd sandbox_tool_restart_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_requires_service_id_for_stop
 cargo test -p rocmd sandbox_tool_stop_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_stop_server_updates_manifest_and_skips_current_pid
+cargo test -p rocmd sandbox_tool_stop_server_reports_an_unconfirmed_stop
+cargo test -p rocmd mcp_stop_server_reports_an_unconfirmed_stop_as_an_error
+cargo test -p rocmd mcp_stop_server_reports_a_confirmed_stop_as_success
+cargo test -p rocmd the_stop_request_is_recorded_before_any_process_is_signalled
+cargo test -p rocmd a_stop_keeps_what_another_writer_persisted_while_it_ran
+cargo test -p rocmd a_stop_does_not_clear_processes_recorded_while_it_ran
 cargo test -p rocmd sandbox_tool_notify_user_is_read_only
 cargo test -p rocmd sandbox_runner_native_fallback_records_audit
 ```
@@ -904,7 +974,21 @@ read-only extension. Read-only tools must report `mutating: false`;
 `notify_user` must record a local notification audit event; server restart/stop
 must require an explicit service id; sandbox-run native fallback or Linux
 bubblewrap isolation must still execute only this internal tool API and record
-a sandbox audit event.
+a sandbox audit event. `stop_server` — the sandbox tool and the MCP tool alike —
+reports a stop only once every recorded process is confirmed gone: otherwise
+the sandbox tool reports `status: stop_unconfirmed`, the MCP tool answers with
+`isError: true`, and the manifest keeps its PIDs and endpoint key. The stop
+records the request in the manifest before it signals anything, and applies its
+result to the manifest as it is once the stop ends, so a write made meanwhile is
+kept — and a restart that recorded new processes meanwhile makes the stop
+unconfirmed rather than having its PIDs cleared.
+
+`features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
+drives the real `rocmd sandbox-tool stop_server` against a live recorded
+process and checks the confirmed report against the process, the record and
+the endpoint key file. Run it with
+`ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
+cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
 
 Manual restricted-tool smoke:
 
@@ -1212,7 +1296,38 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_collector_emits_endpoint_recoverable_service_event
 cargo test -p rocmd server_recover_local_webhook_does_not_restart_healthy_service
 cargo test -p rocmd recovery_reason_display_avoids_raw_status_tokens
+cargo test -p rocmd recovery_does_not_restart_a_service_whose_stop_is_unconfirmed
+cargo test -p rocmd recovery_skips_a_failed_service_only_while_its_stop_request_stands
+cargo test -p rocmd restart_managed_service_drops_the_replaced_runs_engine_pid
+cargo test -p rocmd supervisor_exit_write_keeps_a_standing_stop_marker
+cargo test -p rocmd supervisor_exit_write_leaves_a_record_it_no_longer_owns
+cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
+cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
+cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
+cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
+cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
+cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
+cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
+cargo test -p rocm --bin rocm restart_does_not_start_an_engine_over_an_unconfirmed_stop
+cargo test -p rocm --bin rocm restart_readiness_write_keeps_a_stop_asked_for_while_it_waited
+cargo test -p rocm --bin rocm restart_readiness_write_leaves_a_stop_that_finished_meanwhile
+cargo test -p rocm --bin rocm restart_reports_a_child_it_could_not_record_and_writes_nothing
+cargo test -p rocm --bin rocm restarted_child_record_names_the_runtime_the_restart_was_pinned_to
 ```
+
+Server recovery never restarts a service with a standing stop request
+(`stop_requested_unix_ms`): one whose stop is in flight, or could not be
+confirmed. Without that, an unconfirmed stop — which leaves the status at
+`ready` — would be undone by the `server-recover` watcher. So both stops
+(`rocmd`'s and `rocm services stop`) persist the marker before signalling
+anything, and the supervisor's and a restart's later writes re-read the
+record and never clear it. Each stop also re-reads the record before its own
+final write, and confirms the stop only if that record still names the
+processes it handled. `rocm services restart` (and the `restart_server`
+sandbox tool) starts a new engine only after its stop is confirmed; otherwise
+it reports the unconfirmed stop and starts nothing. Its own later writes are
+applied to the record as it is on disk, and only while it still reads as the
+restart left it, so a stop asked for during the restart keeps its marker.
 
 Automation GPU-metrics event tests:
 
