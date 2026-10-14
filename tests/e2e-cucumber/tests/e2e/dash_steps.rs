@@ -476,26 +476,47 @@ async fn choose_current_folder(world: &mut E2eWorld) {
 async fn close_onboarding_setup(world: &mut E2eWorld) {
     // Two `Esc`: the first backs out of whichever sub-view currently has
     // focus — the SDK Configure channel/pin sub-view (reached via Install
-    // SDK; its own folder browser, opened with `Tab`, is already closed by
-    // the time this step runs) or the Adopt-path's own folder browser — the
-    // second closes the wizard entirely; it owns every key while open (see
-    // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
-    // until it is gone. Each sub-view leaves its own marker on screen (the
-    // Configure sub-view's "Tab browse folder" footer hint, or the Adopt
-    // browser's own popup title); wait for that marker to clear before the
-    // second `Esc`, or the two `Esc` bytes can land in the same PTY read and
-    // coalesce into one `KeyCode::Esc` (crossterm reads back-to-back ESC
-    // bytes as a single Esc key), which only backs out of the sub-view and
-    // leaves the wizard open. If neither marker is on screen there is
-    // nothing open to close — panic rather than risk that coalescing
-    // silently.
+    // SDK; its own folder browser, opened with `Tab`, is always closed by
+    // the time this step runs, as in dash-23) or the Adopt-path's own folder
+    // browser — the second closes the wizard entirely; it owns every key
+    // while open (see `draw_onboarding`'s doc comment), so `q` cannot reach
+    // the dashboard until it is gone. Each sub-view leaves its own marker on
+    // screen (the Configure sub-view's "Tab browse folder" footer hint, or
+    // the Adopt browser's own popup title); wait for one of them to actually
+    // render — a single snapshot can race a step immediately before this
+    // one that is still mid-repaint — then wait for that marker to clear
+    // before the second `Esc`, or the two `Esc` bytes can land in the same
+    // PTY read and coalesce into one `KeyCode::Esc` (crossterm reads
+    // back-to-back ESC bytes as a single Esc key), which only backs out of
+    // the sub-view and leaves the wizard open. Configure's own folder
+    // browser ("Pick an install folder") is rejected outright rather than
+    // silently waited past: closing it is the caller's job, not this
+    // step's, so seeing it here means a scenario called this step too
+    // early.
+    const CONFIGURE_FOOTER: &str = "Tab browse folder";
+    const ADOPT_BROWSER_TITLE: &str = "Pick an existing ROCm folder";
+    const CONFIGURE_BROWSER_TITLE: &str = "Pick an install folder";
     let tui = session(world);
-    let open_sub_view_marker = ["Tab browse folder", "Pick an existing ROCm folder"]
-        .into_iter()
-        .find(|marker| tui.screen_text().contains(marker))
-        .unwrap_or_else(|| {
-            panic!("no sub-view is open, so there is nothing to close before the wizard itself")
-        });
+    tui.wait_for_screen_where(
+        &format!("{CONFIGURE_FOOTER:?} or {ADOPT_BROWSER_TITLE:?} to appear"),
+        |screen| {
+            assert!(
+                !screen.contains(CONFIGURE_BROWSER_TITLE),
+                "the install-folder browser is still open; close it before calling this step:\n{screen}"
+            );
+            screen.contains(CONFIGURE_FOOTER) || screen.contains(ADOPT_BROWSER_TITLE)
+        },
+        default_timeout(),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("no sub-view is open, so there is nothing to close before the wizard itself: {e}")
+    });
+    let open_sub_view_marker = if tui.screen_text().contains(ADOPT_BROWSER_TITLE) {
+        ADOPT_BROWSER_TITLE
+    } else {
+        CONFIGURE_FOOTER
+    };
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to leave the open sub-view: {e}"));
     tui.wait_until_gone(open_sub_view_marker, default_timeout())
