@@ -27,10 +27,11 @@ Each per-crate module inventory lists one file per line. Flat inventories (every
 
 ### `apps/rocm` — main CLI binary
 
-[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters below; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
+[`main.rs`](../apps/rocm/src/main.rs) itself is **partially modularized** — Phase 6a (ROCMAI-82) extracted the driver-install/engines/serve clusters, Phase 6b (ROCMAI-91) extracted the managed-process-launch cluster, Phase 6c (ROCMAI-89) extracted the `runtimes` command/uninstall/rollback/SDK-install-finalization clusters, Phase 6d (ROCMAI-88, in progress) is extracting the chat/assistant + MCP tool-bridge cluster below across three PRs; the rest of the split is planned across several more PRs, one cluster at a time (see EAI-7768).
 
 - [`automations.rs`](../apps/rocm/src/automations.rs) — mechanical relocation, dispatch-adjacent, no owned types.
 - [`bootstrap.rs`](../apps/rocm/src/bootstrap.rs) — a further-extracted variant of full domain extraction: it owns its clap command enum (`BootstrapCommand`) and dispatch function too, rather than leaving them in [`main.rs`](../apps/rocm/src/main.rs).
+- [`chat.rs`](../apps/rocm/src/chat.rs) — full domain extraction (Phase 6d, ROCMAI-88, part 1 of 3), mirrors [`providers.rs`](../apps/rocm/src/providers.rs). So far owns the chat/MCP-bridge cluster's `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`, `DeterministicModelRecipe`, `DeterministicServiceRow`, `DeterministicEngineRow`) and its bottom-of-call-graph helpers, plus `normalized_chat_rocm_command_args`/`managed_service_running_state` (also `pub(crate)`), all read from `main.rs`. The cluster's orchestration bodies — `run_internal_mcp_call`, the `validate_chat_*` family, `deterministic_rocm_tool_summary` — and the `dispatch()`/[`dash_seam.rs`](../apps/rocm/src/dash_seam.rs) call-site qualification are still in [`main.rs`](../apps/rocm/src/main.rs), landing here in the next two PRs.
 - [`chat_host_facts.rs`](../apps/rocm/src/chat_host_facts.rs) — full domain extraction.
 - [`cli_progress.rs`](../apps/rocm/src/cli_progress.rs) — shared CLI-output component (`Spinner`, `AnimatedSpinner`).
 - [`cli_report.rs`](../apps/rocm/src/cli_report.rs) — shared CLI-output component (`ActionReport`).

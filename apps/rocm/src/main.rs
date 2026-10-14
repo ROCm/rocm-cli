@@ -5477,8 +5477,8 @@ fn chat_tool_calls_include_equivalent(
             return false;
         }
         if required.name == "rocm_command" {
-            return normalized_chat_rocm_command_args(existing).ok()
-                == normalized_chat_rocm_command_args(required).ok();
+            return chat::normalized_chat_rocm_command_args(existing).ok()
+                == chat::normalized_chat_rocm_command_args(required).ok();
         }
         if required.name == "port_status" {
             return chat_port_status_tool_calls_equivalent(existing, required);
@@ -6863,54 +6863,8 @@ fn validate_chat_rocm_command_tool_call(call: &providers::ChatToolCall) -> Resul
 }
 
 fn chat_rocm_command_action(call: &providers::ChatToolCall) -> Result<chat::ChatRocmCommandAction> {
-    let args = normalized_chat_rocm_command_args(call)?;
+    let args = chat::normalized_chat_rocm_command_args(call)?;
     chat_rocm_command_action_from_args(args)
-}
-
-pub(crate) fn normalized_chat_rocm_command_args(
-    call: &providers::ChatToolCall,
-) -> Result<Vec<String>> {
-    let object = call
-        .arguments
-        .as_object()
-        .context("rocm_command arguments must be a JSON object")?;
-    let values = object
-        .get("args")
-        .and_then(serde_json::Value::as_array)
-        .context("rocm_command requires `args`")?;
-    if values.is_empty() || values.len() > 64 {
-        bail!("rocm_command `args` must contain 1 to 64 strings");
-    }
-    let mut args = Vec::with_capacity(values.len());
-    for value in values {
-        let arg = value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context("rocm_command `args` entries must be non-empty strings")?;
-        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
-            bail!("rocm_command arguments must not contain control characters");
-        }
-        if arg.len() > 512 {
-            bail!("rocm_command argument is too long");
-        }
-        args.push(arg.to_owned());
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg.eq_ignore_ascii_case("rocm"))
-    {
-        args.remove(0);
-    }
-    if args.is_empty() {
-        bail!("rocm_command args should omit the leading `rocm` program name");
-    }
-    if let Some(reason) = object.get("reason")
-        && !reason.is_string()
-    {
-        bail!("rocm_command `reason` must be a string when present");
-    }
-    Ok(args)
 }
 
 fn chat_rocm_command_action_from_args(
@@ -8513,7 +8467,7 @@ fn run_chat_port_status_tool(
                 service.engine,
                 service.model_ref,
                 service.status,
-                managed_service_running_state(&service.status),
+                chat::managed_service_running_state(&service.status),
                 service.endpoint_url
             );
         }
@@ -10379,7 +10333,7 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
             record.model_ref,
             record.canonical_model_id,
             record.status,
-            managed_service_running_state(&record.status),
+            chat::managed_service_running_state(&record.status),
             record.endpoint_url
         );
     }
@@ -11719,15 +11673,6 @@ fn existing_live_managed_service(
                 && record.canonical_model_id == canonical_model_id
                 && managed_service_is_live(record)
         })
-}
-
-pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
-    match status {
-        "ready" | "running" => "running",
-        "starting" | "recovering" => "starting",
-        "failed" | "stopped" => "not_running",
-        _ => "unknown",
-    }
 }
 
 const SERVICE_LIVENESS_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
@@ -19938,7 +19883,7 @@ model recipes
             fallback_rocm_tool_call_for_prompt("Which LLMs can this machine support?").unwrap();
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec!["model".to_owned()]
         );
 
@@ -19960,7 +19905,7 @@ model recipes
         let comfy = fallback_rocm_tool_call_for_prompt("Is ComfyUI running?").unwrap();
         assert_eq!(comfy.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&comfy).unwrap(),
+            chat::normalized_chat_rocm_command_args(&comfy).unwrap(),
             vec!["comfyui".to_owned(), "status".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&comfy));
@@ -19969,7 +19914,7 @@ model recipes
             fallback_rocm_tool_call_for_prompt("Is ComfyUI running on port 8188?").unwrap();
         assert_eq!(comfy_port.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&comfy_port).unwrap(),
+            chat::normalized_chat_rocm_command_args(&comfy_port).unwrap(),
             vec!["comfyui".to_owned(), "status".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&comfy_port));
@@ -19983,7 +19928,7 @@ model recipes
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command", "{prompt}");
             assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
+                chat::normalized_chat_rocm_command_args(&call).unwrap(),
                 vec!["services".to_owned(), "list".to_owned(), "--all".to_owned(),],
                 "{prompt}"
             );
@@ -20005,7 +19950,7 @@ model recipes
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command", "{prompt}");
             assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
+                chat::normalized_chat_rocm_command_args(&call).unwrap(),
                 vec!["engines".to_owned(), "list".to_owned()],
                 "{prompt}"
             );
@@ -20027,7 +19972,7 @@ model recipes
 
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec!["comfyui".to_owned(), "status".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&call));
@@ -20048,7 +19993,7 @@ model recipes
         let engine_inventory =
             fallback_rocm_tool_call_for_prompt("Is vLLM installed and is it running?").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&engine_inventory).unwrap(),
+            chat::normalized_chat_rocm_command_args(&engine_inventory).unwrap(),
             vec!["engines".to_owned(), "list".to_owned()]
         );
 
@@ -20060,7 +20005,7 @@ model recipes
 
         assert_eq!(services.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&services).unwrap(),
+            chat::normalized_chat_rocm_command_args(&services).unwrap(),
             vec!["services".to_owned(), "list".to_owned(), "--all".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&services));
@@ -20101,7 +20046,7 @@ model recipes
         let call = fallback_rocm_tool_call_for_prompt("How do I setup TheRock?").unwrap();
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec![
                 "install".to_owned(),
                 "sdk".to_owned(),
@@ -20126,7 +20071,7 @@ model recipes
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command");
             assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
+                chat::normalized_chat_rocm_command_args(&call).unwrap(),
                 vec![
                     "install".to_owned(),
                     "sdk".to_owned(),
@@ -20157,7 +20102,7 @@ model recipes
             let call = fallback_rocm_tool_call_for_prompt(prompt).unwrap();
             assert_eq!(call.name, "rocm_command");
             assert_eq!(
-                normalized_chat_rocm_command_args(&call).unwrap(),
+                chat::normalized_chat_rocm_command_args(&call).unwrap(),
                 vec![
                     "install".to_owned(),
                     "sdk".to_owned(),
@@ -20184,7 +20129,7 @@ model recipes
         .unwrap();
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec![
                 "install".to_owned(),
                 "sdk".to_owned(),
@@ -20325,7 +20270,7 @@ install therock";
         .unwrap();
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec![
                 "install".to_owned(),
                 "sdk".to_owned(),
@@ -20420,14 +20365,14 @@ install therock";
     fn fallback_tool_call_routes_simple_config_changes() {
         let show = fallback_rocm_tool_call_for_prompt("Show current ROCm CLI config").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&show).unwrap(),
+            chat::normalized_chat_rocm_command_args(&show).unwrap(),
             vec!["config".to_owned(), "show".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&show));
 
         let engine = fallback_rocm_tool_call_for_prompt("Set the default engine to vllm").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&engine).unwrap(),
+            chat::normalized_chat_rocm_command_args(&engine).unwrap(),
             vec![
                 "config".to_owned(),
                 "set-default-engine".to_owned(),
@@ -20439,7 +20384,7 @@ install therock";
         let telemetry =
             fallback_rocm_tool_call_for_prompt("Disable telemetry in settings").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&telemetry).unwrap(),
+            chat::normalized_chat_rocm_command_args(&telemetry).unwrap(),
             vec![
                 "config".to_owned(),
                 "set-telemetry".to_owned(),
@@ -20454,14 +20399,14 @@ install therock";
         let status = fallback_rocm_tool_call_for_prompt("How do I setup ComfyUI?").unwrap();
         assert_eq!(status.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&status).unwrap(),
+            chat::normalized_chat_rocm_command_args(&status).unwrap(),
             vec!["comfyui".to_owned(), "status".to_owned()]
         );
         assert!(chat_tool_call_is_read_only(&status));
 
         let install = fallback_rocm_tool_call_for_prompt("Can you setup ComfyUI for me?").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&install).unwrap(),
+            chat::normalized_chat_rocm_command_args(&install).unwrap(),
             vec!["comfyui".to_owned(), "install".to_owned()]
         );
         assert!(!chat_tool_call_is_read_only(&install));
@@ -20471,7 +20416,7 @@ install therock";
 
         let start = fallback_rocm_tool_call_for_prompt("Can you start ComfyUI?").unwrap();
         assert_eq!(
-            normalized_chat_rocm_command_args(&start).unwrap(),
+            chat::normalized_chat_rocm_command_args(&start).unwrap(),
             vec!["comfyui".to_owned(), "start".to_owned()]
         );
         assert!(!chat_tool_call_is_read_only(&start));
@@ -20486,7 +20431,7 @@ install therock";
             fallback_rocm_tool_call_for_prompt("Can you setup and serve an LLM for me?").unwrap();
         assert_eq!(call.name, "rocm_command");
         assert_eq!(
-            normalized_chat_rocm_command_args(&call).unwrap(),
+            chat::normalized_chat_rocm_command_args(&call).unwrap(),
             vec![
                 "serve".to_owned(),
                 "qwen".to_owned(),

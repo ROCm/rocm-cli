@@ -2,20 +2,25 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Chat/assistant CLI rendering, local-tool-calling heuristics and
-//! validation, deterministic tool-output summarization, and the MCP
-//! tool-bridge (`run_internal_mcp_call`), reached from `dispatch()`'s
-//! `Command::Chat`/`Command::McpCall` arms and from `dash_seam.rs`.
+//! Phase 6d (ROCMAI-88) of the `main.rs` modularization, part 1 of 3 (see
+//! `docs/architecture.md`). This PR moves the chat/MCP-bridge cluster's
+//! `pub(crate)` types (`ChatRocmCommandAction`, `CommandCapture`,
+//! `DeterministicModelRecipe`, `DeterministicServiceRow`,
+//! `DeterministicEngineRow`) and its leaf helpers — tool-call argument
+//! normalization and display labels, deterministic tool-output parsing, and
+//! the MCP-result/loopback-port/service-running-state helpers. Each is
+//! `pub(crate)` and called from `main.rs` via qualified `chat::` paths,
+//! except for a handful of private parsing internals used only within this
+//! file.
 //!
-//! Phase 6d (ROCMAI-88) of the `main.rs` modularization (see
-//! `docs/architecture.md`). This first PR moves the cluster's private types
-//! and the bottom-of-call-graph pure helpers that have no callers inside the
-//! still-to-move remainder of the cluster; the chat/MCP-bridge function
-//! bodies and the `dispatch()`/`dash_seam.rs` call-site updates land in a
-//! follow-up PR.
+//! The cluster's orchestration bodies (`run_internal_mcp_call`, the
+//! `validate_chat_*` family, `deterministic_rocm_tool_summary`) and the
+//! `dispatch()`/`dash_seam.rs` call-site qualification still live in
+//! `main.rs`; it calls into this module via `chat::`, and nothing here calls
+//! back into `main.rs`. The remaining bodies move here in the next two PRs.
 
 use crate::providers;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rocm_engine_protocol::DEFAULT_LOG_TAIL_LINES;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -106,7 +111,7 @@ pub(crate) fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> St
     if call.name != "rocm_command" {
         return chat_tool_display_label(&call.name);
     }
-    let Some(args) = crate::normalized_chat_rocm_command_args(call).ok() else {
+    let Some(args) = normalized_chat_rocm_command_args(call).ok() else {
         return "rocm command".to_owned();
     };
     match args.as_slice() {
@@ -153,6 +158,52 @@ pub(crate) fn chat_tool_call_display_label(call: &providers::ChatToolCall) -> St
         }
         _ => "rocm command".to_owned(),
     }
+}
+
+pub(crate) fn normalized_chat_rocm_command_args(
+    call: &providers::ChatToolCall,
+) -> Result<Vec<String>> {
+    let object = call
+        .arguments
+        .as_object()
+        .context("rocm_command arguments must be a JSON object")?;
+    let values = object
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .context("rocm_command requires `args`")?;
+    if values.is_empty() || values.len() > 64 {
+        bail!("rocm_command `args` must contain 1 to 64 strings");
+    }
+    let mut args = Vec::with_capacity(values.len());
+    for value in values {
+        let arg = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("rocm_command `args` entries must be non-empty strings")?;
+        if arg.contains('\0') || arg.contains('\n') || arg.contains('\r') {
+            bail!("rocm_command arguments must not contain control characters");
+        }
+        if arg.len() > 512 {
+            bail!("rocm_command argument is too long");
+        }
+        args.push(arg.to_owned());
+    }
+    if args
+        .first()
+        .is_some_and(|arg| arg.eq_ignore_ascii_case("rocm"))
+    {
+        args.remove(0);
+    }
+    if args.is_empty() {
+        bail!("rocm_command args should omit the leading `rocm` program name");
+    }
+    if let Some(reason) = object.get("reason")
+        && !reason.is_string()
+    {
+        bail!("rocm_command `reason` must be a string when present");
+    }
+    Ok(args)
 }
 
 pub(crate) fn loopback_tcp_port_is_reachable(host: &str, port: u16) -> bool {
@@ -304,6 +355,15 @@ pub(crate) struct DeterministicServiceRow {
     pub(crate) endpoint: String,
 }
 
+pub(crate) fn managed_service_running_state(status: &str) -> &'static str {
+    match status {
+        "ready" | "running" => "running",
+        "starting" | "recovering" => "starting",
+        "failed" | "stopped" => "not_running",
+        _ => "unknown",
+    }
+}
+
 pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<DeterministicServiceRow> {
     let mut rows = Vec::new();
     let mut current: Option<DeterministicServiceRow> = None;
@@ -328,7 +388,7 @@ pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<Determini
                 }
             }
             if row.running_state.is_empty() {
-                row.running_state = crate::managed_service_running_state(&row.status).to_owned();
+                row.running_state = managed_service_running_state(&row.status).to_owned();
             }
             current = Some(row);
             continue;
@@ -348,7 +408,7 @@ pub(crate) fn parse_deterministic_service_rows(tool_text: &str) -> Vec<Determini
         };
         if let Some(value) = trimmed.strip_prefix("status:") {
             row.status = value.trim().to_owned();
-            row.running_state = crate::managed_service_running_state(&row.status).to_owned();
+            row.running_state = managed_service_running_state(&row.status).to_owned();
         } else if let Some(value) = trimmed.strip_prefix("engine:") {
             row.engine = value.trim().to_owned();
         } else if let Some(value) = trimmed.strip_prefix("model:") {
@@ -408,3 +468,4 @@ fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
                 .is_some_and(|rest| rest.starts_with(char::is_whitespace))
     })
 }
+
