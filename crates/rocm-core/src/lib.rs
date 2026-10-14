@@ -2817,9 +2817,22 @@ mod tests {
         }
 
         let probe_timeout = Duration::from_millis(300);
-        let started = Instant::now();
-        let blocked = device_readable_within(&fifo, probe_timeout);
-        let elapsed = started.elapsed();
+        // The probe runs on a thread the test watches with its own, much looser
+        // deadline, rather than being called inline. A mutant that drops the
+        // bound from `device_readable_within` would block forever on this FIFO;
+        // called inline that would hang the whole test binary, and a hang is a
+        // CI timeout rather than a readable failure. Watched, it fails here with
+        // a message naming the cause.
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+        let probe_fifo = fifo.clone();
+        thread::Builder::new()
+            .name("kfd-open-probe-test".to_owned())
+            .spawn(move || {
+                let _ = verdict_tx.send(device_readable_within(&probe_fifo, probe_timeout));
+            })
+            .context("could not start the watched probe thread")?;
+        let watchdog = probe_timeout * 20;
+        let blocked = verdict_rx.recv_timeout(watchdog);
 
         let readable = temp_root.join("ordinary-kfd");
         fs::write(&readable, b"")?;
@@ -2830,14 +2843,13 @@ mod tests {
         // release it, and nothing here needs it released.
         let _ = fs::remove_dir_all(&temp_root);
 
-        assert!(
-            !blocked,
-            "a device whose open never returns must read as not readable, so the gate declines"
-        );
-        assert!(
-            elapsed < probe_timeout * 10,
-            "the probe returned after {elapsed:?}, so it is not bounded by its {probe_timeout:?} \
-             timeout — an unbounded open relocates the D-state hang into the gate itself"
+        assert_eq!(
+            blocked,
+            Ok(false),
+            "a device whose open never returns must read as not readable within its \
+             {probe_timeout:?} bound, so the gate declines; `Err` here means the probe had still \
+             not returned after {watchdog:?} — an unbounded open relocates the D-state hang into \
+             the gate itself"
         );
         assert!(
             allowed,
