@@ -400,10 +400,12 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
+    use super::super::test_support::st;
+
     #[test]
     fn body_clicks_are_swallowed_while_a_manager_is_open() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         let click = MouseEvent {
@@ -422,7 +424,7 @@ mod tests {
     #[test]
     fn body_clicks_are_swallowed_while_an_approval_is_pending() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         let click = MouseEvent {
@@ -475,7 +477,7 @@ mod tests {
 
     #[test]
     fn scrollbar_click_grabs_drag_scrolls_then_releases() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -512,7 +514,7 @@ mod tests {
 
     #[test]
     fn scrollbar_hit_is_swallowed_while_an_approval_is_pending() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -549,7 +551,7 @@ mod tests {
         // updating the scroll position once that happens — "a pending
         // approval owns the body with no exception" applies to an in-flight
         // drag, not just to input that starts fresh.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -584,7 +586,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         for horizontal in [false, true] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
+            let mut s = st();
             let area = if horizontal {
                 Rect::new(0, 0, 4, 2)
             } else {
@@ -665,7 +667,7 @@ mod tests {
     #[test]
     fn stationary_thumb_drag_preserves_logical_position() {
         for target in [ScrollTarget::Console, ScrollTarget::DockLogs] {
-            let mut s = AppState::new("t".into(), "default-dark".into());
+            let mut s = st();
             s.console_scroll = 5;
             s.dock_logs_scroll = 5;
             s.scrollbars.borrow_mut().push(ScrollbarHandle {
@@ -697,7 +699,7 @@ mod tests {
 
     #[test]
     fn horizontal_thumb_drag_tracks_pointer_column() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.console_hscroll = 20;
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(10, 20, 20, 1),
@@ -716,7 +718,7 @@ mod tests {
 
     #[test]
     fn dock_scrollbar_grab_inverts_tail_anchored_offset() {
-        let s = AppState::new("t".into(), "default-dark".into());
+        let s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(0, 0, 1, 10),
             horizontal: false,
@@ -734,7 +736,7 @@ mod tests {
 
     #[test]
     fn wheel_over_actions_list_moves_selection_by_one() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // Left column (Actions) is the first ~46% — a low column is over the list.
@@ -746,7 +748,7 @@ mod tests {
 
     #[test]
     fn wheel_over_details_pane_does_not_move_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // A high column lands in the Details pane (right ~54%) → no list move.
@@ -756,7 +758,7 @@ mod tests {
 
     #[test]
     fn wheel_over_open_console_pans_the_log_not_the_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         s.logs_view = Some(crate::ui::logs_view::LogsViewState {
@@ -777,7 +779,7 @@ mod tests {
 
     #[test]
     fn wheel_over_logs_dock_scrolls_the_dock() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         // A recorded dock rect off to the right of the body.
         s.last_dock_area = Some(Rect::new(160, 4, 52, 30));
@@ -797,7 +799,7 @@ mod tests {
         // `ScrollTarget::InstanceDetail` wiring added for mouse-drag support
         // actually moves `instance_detail_scroll`, not just that the bar
         // renders.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.scrollbars.borrow_mut().push(ScrollbarHandle {
             track: Rect::new(60, 0, 1, 10),
             horizontal: false,
@@ -827,7 +829,7 @@ mod tests {
 
     #[test]
     fn wheel_over_form_screen_overlay_is_swallowed() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         // Overlay open but on its form (no active_job) → nothing to pan, and the
@@ -841,7 +843,7 @@ mod tests {
 
     #[test]
     fn wheel_is_swallowed_while_an_approval_is_pending() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.last_body_area = Some(Rect::new(2, 4, 150, 30));
         s.open_approval(crate::tool_exec::ApprovalIntent {
@@ -889,7 +891,7 @@ mod tests {
 
     #[test]
     fn chat_scrollbar_grab_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_max_scroll = 20;
         s.chat_scroll = 20;
 
