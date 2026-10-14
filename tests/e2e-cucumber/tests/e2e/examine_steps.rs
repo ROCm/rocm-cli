@@ -16,16 +16,29 @@ use crate::E2eWorld;
 /// against the defect.
 const STUB_GPU_COUNT: usize = 1200;
 
-/// A field value from the *first* GPU the stub describes, used by examine-21
-/// and examine-22 to prove the bounded note still quotes the child's output.
+/// The market name every GPU *after* the first carries. Deliberately not what
+/// the assertions look for: see [`STUB_FIRST_GPU_MARKET_NAME`].
+const STUB_MARKET_NAME: &str = "stub-accelerator";
+
+/// The market name only GPU 0 carries, used by examine-21 and examine-22 to
+/// prove the bounded note still quotes the *head* of what the probe printed.
 ///
 /// Shared with the payload rather than written out again in the assertions: a
 /// second copy would be free to stop matching the payload, and the check would
-/// then pass on a note that kept nothing. It has to come from the head of the
-/// payload, because the quote is the first `MAX_QUOTED_OUTPUT_CHARS` (2000)
-/// characters of what the child printed; the first GPU object is ~150
-/// characters, so this sits well inside it.
-const STUB_MARKET_NAME: &str = "stub-accelerator";
+/// then pass on a note that kept nothing.
+///
+/// Unique to the first GPU, and that is what makes the assertion mean "head"
+/// rather than merely "non-empty". The quote keeps the leading
+/// `MAX_QUOTED_OUTPUT_CHARS` of the text, and GPU 0's object is far shorter
+/// than that window. Were this value repeated across all `STUB_GPU_COUNT`
+/// objects — as it was until this was measured — a quote that kept the tail,
+/// or any middle window, would contain a copy too and satisfy the check just
+/// as well, so the test would not distinguish the truncation it pins from one
+/// that drops exactly the part a reader needs first.
+///
+/// "What the probe printed" is stderr when stderr is non-empty and stdout
+/// otherwise, per `command_failure_detail` — not stdout unconditionally.
+const STUB_FIRST_GPU_MARKET_NAME: &str = "stub-accelerator-gpu0";
 
 /// Where the `amd-smi` stub and its payload live inside the isolated root.
 ///
@@ -1323,7 +1336,13 @@ fn write_stub_payload(world: &E2eWorld) -> PathBuf {
             serde_json::json!({
                 "gpu": index,
                 "asic": {
-                    "market_name": STUB_MARKET_NAME,
+                    // Only GPU 0 gets the name the assertions look for, so a
+                    // quote that kept the tail instead of the head fails them.
+                    "market_name": if index == 0 {
+                        STUB_FIRST_GPU_MARKET_NAME
+                    } else {
+                        STUB_MARKET_NAME
+                    },
                     "vendor_id": "0x1002",
                     "device_id": format!("0x{index:04x}"),
                     // amd-smi's real `static -a` output per GPU is far wider
@@ -1544,7 +1563,7 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
     // bound of zero would satisfy the marker and the size without keeping a
     // byte of what amd-smi said.
     assert!(
-        note.contains(STUB_MARKET_NAME),
+        note.contains(STUB_FIRST_GPU_MARKET_NAME),
         "the note must keep the head of what amd-smi printed, not just say that it was \
          shortened: {note:?}"
     );
@@ -1614,7 +1633,7 @@ async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eW
     // size are both satisfied by a note that quotes nothing, so the quote is
     // asserted too.
     assert!(
-        note.contains(STUB_MARKET_NAME),
+        note.contains(STUB_FIRST_GPU_MARKET_NAME),
         "the note must keep the head of what the monitor probe printed, not just say that it \
          was shortened: {note:?}"
     );
