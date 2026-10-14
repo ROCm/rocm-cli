@@ -1381,6 +1381,30 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             "{SHARED_PREFLIGHT} no longer applies a free-memory floor; the process \
              assertion cannot see a non-E2E tenant exhausting a shared host (#446)"
         );
+        // The gate must be BOUNDED, like every rocm-smi call in this script. Its
+        // scan reads /proc/<pid>/cmdline for every process, and a holder wedged
+        // in uninterruptible sleep can block that read — the same condition the
+        // gate fires on, so the hang risk is correlated with the detection.
+        // Unbounded, the one step added to stop a job hanging to its cap is the
+        // step that hangs to it. `preflight_bounds_the_leaked_process_scan`
+        // drives this for real; this names the loss immediately rather than by
+        // a case that takes a minute to go red.
+        assert!(
+            code.contains(r#"timeout 15 bash "${RECLAIM_SCRIPT}" --assert-clear"#),
+            "{SHARED_PREFLIGHT} runs `reclaim-gpu.sh --assert-clear` without a `timeout` \
+             bound; a stalled /proc scan then rides to the job's own cap instead of \
+             failing fast, which is what the rest of this script exists to prevent"
+        );
+        // …and the bound must FAIL the gate. `timeout` reports expiry as 124,
+        // and a scan that could not finish is not evidence of a clear host.
+        // Without this, `|| true`-ing the call away would still satisfy the
+        // check above while turning every hang into a silent pass.
+        assert!(
+            code.contains(r#""${assert_rc}" -eq 124"#),
+            "{SHARED_PREFLIGHT} bounds the leaked-process scan but does not handle \
+             `timeout`'s expiry code (124) distinctly; a scan that never finished must \
+             fail the gate with its own reason, not pass or be reported as a survivor"
+        );
     }
 
     /// Both WSL2 lanes must settle the clock before anything times a scenario.
@@ -1562,9 +1586,23 @@ esac
     /// A gate that cannot be driven into its failing state is not tested by any
     /// number of passing cases: without this the preflight's process assertion
     /// could be deleted outright with every case below still green.
+    ///
+    /// `RECLAIM_ASSERT_HANGS` makes the scan never return, which is the case the
+    /// `timeout` bound on that call exists for: `select_leaked` reads
+    /// /proc/<pid>/cmdline for every process, and a holder wedged in
+    /// uninterruptible sleep can block that read — the very state this gate
+    /// fires on.
+    ///
+    /// `exec`, not a plain `sleep`: the bound's SIGTERM must land on the sleep
+    /// itself. Forked, it would be orphaned still holding the captured stdout
+    /// pipe, and the harness would block reading it for the full 60s no matter
+    /// when the preflight exited — timing the stub instead of the bound.
     #[cfg(unix)]
     const RECLAIM_STUB: &str = r#"#!/bin/sh
 echo "reclaim-gpu.sh stub called: $*"
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_HANGS:-0}" = 1 ]; then
+  exec sleep 60
+fi
 if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
   echo "assert-clear: leaked E2E engine process(es) still holding the GPU:" >&2
   echo "  pid=4242 cmd=/e2e-prewarm/bin/llama-server" >&2
@@ -2058,6 +2096,72 @@ fi
                 }
             }
         });
+    }
+
+    /// A scan that never finishes must fail the gate AT THE BOUND.
+    ///
+    /// The shape test pins that the `timeout` and its 124 branch are present;
+    /// only running it shows the bound actually fires, with the reason it is
+    /// supposed to give. A timeout nobody has exercised is a timeout nobody
+    /// knows works — and this one can never be exercised on live hardware from
+    /// per-PR CI, since the lanes that run `--assert-clear` for real are
+    /// self-hosted and nightly.
+    ///
+    /// The stub sleeps 60s against a 15s bound, so the elapsed time separates
+    /// "the bound cut it short" from "the scan happened to return": unbounded,
+    /// this case takes a full minute AND passes the gate, because the stub then
+    /// exits 0. Both halves are asserted.
+    ///
+    /// Only the native lane is driven. The advisory WSL body and the Windows
+    /// block have no process assertion to bound — a gap
+    /// `apu_preflight_gates_on_the_pool_the_engine_uses` already pins.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_the_leaked_process_scan() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        // A healthy, nearly-empty aperture: the memory floor passes on the
+        // first poll, so the only thing that can decide this run is the gate.
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let started = std::time::Instant::now();
+        let (code, log) = run_preflight(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &[("RECLAIM_ASSERT_HANGS", "1")],
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(
+            code, 1,
+            "a leaked-process scan that never returned must FAIL the preflight: it is not \
+             evidence the host is clear. Logged:\n{log}"
+        );
+        assert!(
+            log.contains("GPU ready: 61 GiB GTT free"),
+            "the memory floor should have passed before the gate ran, so this failure \
+             cannot be confused with the floor firing; logged:\n{log}"
+        );
+        assert!(
+            log.contains("did not finish within 15s"),
+            "the preflight failed on a stalled scan but did not say so — a timeout \
+             reported as a survivor, or as a generic failure, sends the next reader \
+             hunting for a process that was never named. Logged:\n{log}"
+        );
+        assert!(
+            log.contains(REPORTED_HOLDERS),
+            "a bounded-out scan still has to name what it could see holding the card; \
+             logged:\n{log}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(45),
+            "the preflight took {elapsed:?} against a 15s bound and a stub that sleeps \
+             60s: the bound did not cut the scan short"
+        );
     }
 
     #[cfg(unix)]
