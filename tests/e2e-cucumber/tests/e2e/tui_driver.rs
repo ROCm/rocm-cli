@@ -194,10 +194,10 @@ impl TuiSession {
     /// `lpCurrentDirectory` to `CreateProcessW`) when `%USERPROFILE%` is
     /// unset or not a directory. `spawn_in` makes the cwd an arbitrary,
     /// explicit choice — independent of `HOME`/`USERPROFILE` overrides, and
-    /// the only reliable control on Windows — for driving UI flows
-    /// (onboarding's adopt/install-folder browsers, install-manager,
-    /// runtime-manager, serve-wizard) that resolve an initial path via
-    /// `std::env::current_dir()` when nothing is already staged.
+    /// the only reliable control on Windows — for driving a UI flow that
+    /// resolves its initial path via `std::env::current_dir()` when nothing
+    /// is already staged (currently used by onboarding's Adopt-existing
+    /// folder browser; see dash-25).
     pub fn spawn_in(world: &E2eWorld, args: &[&str], dir: &Path) -> Result<Self, String> {
         Self::spawn_binary_with_env(world, crate::rocm_binary(), args, &[], Some(dir))
     }

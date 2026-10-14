@@ -329,23 +329,14 @@ Feature: Interactive dashboard
     When the user quits the dashboard
     Then the dashboard exits successfully
 
-  # #501: TuiSession previously had no explicit way to control the spawned
-  # dash process's working directory. That is not an inherited-cwd bug to
-  # fix: without `dir`, portable-pty falls back to `$HOME`/`%USERPROFILE%`,
-  # not the harness's own cwd, and on Unix that fallback was already this
-  # scenario's own isolated HOME. `spawn_in` makes the cwd an arbitrary,
-  # explicit choice instead — independent of HOME overrides, and the only
-  # control at all on Windows — so a scenario can drive a folder-browser flow
-  # (here, onboarding's Adopt existing) into a path it picks. This proves
-  # `spawn_in` actually threads that cwd into the live child: it spawns into
-  # a scenario-owned folder, plants a child directory with a space in its
-  # name inside it, and asserts the real folder browser lists that child — a
-  # fixed-length entry label, not the host-length-dependent full path the
-  # browser's header would otherwise show (and could silently clip). The
-  # space in the child's name exercises how the browser renders an entry
-  # with whitespace in it; it does not exercise a whitespace path through
-  # `spawn_in` itself (the scenario's cwd has no space) — that remains
-  # explicit follow-up work for #500.
+  # #501: proves TuiSession::spawn_in (see its doc comment) threads the
+  # given directory into the live child. Spawns into a scenario-owned
+  # folder, plants a child directory with a space in its name, and asserts
+  # the real folder browser lists that child by its fixed-length entry
+  # label rather than the host-length-dependent header path (see
+  # ADOPT_SCENARIO_CHILD's doc comment). The space is in the child's name,
+  # not the scenario's own cwd; a whitespace path through spawn_in itself
+  # remains follow-up work for #500.
   @id:dash-onboarding-adopt-honors-spawn-cwd @requires-os:linux
   Scenario: dash-25 - Adopt existing opens the folder browser rooted at the session's own working directory
     When the user opens the dashboard in a scenario-owned folder
@@ -355,7 +346,7 @@ Feature: Interactive dashboard
     When the user continues past the onboarding welcome screen
     Then the onboarding setup choices are displayed
     When the user chooses to adopt an existing folder
-    Then the existing-folder browser shows the scenario-owned folder
+    Then the existing-folder browser lists the scenario folder's contents
     When the user closes onboarding setup
     And the user quits the dashboard
     Then the dashboard exits successfully

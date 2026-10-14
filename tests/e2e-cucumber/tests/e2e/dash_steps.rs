@@ -134,21 +134,15 @@ async fn open_dashboard_demo(world: &mut E2eWorld) {
     world.tui = Some(session);
 }
 
-/// The name of a child directory `dash-25` plants under the scenario's cwd,
-/// and later asserts the folder browser lists. The space in the name
-/// exercises how the browser renders an entry with whitespace in it; it
-/// does not exercise a whitespace path through `spawn_in` itself (the cwd
-/// passed to `spawn_in` is the scenario root, which has no space) — that
-/// remains explicit follow-up work for #500. The browser's entry list
-/// labels children by `file_name()` alone (`build_entries` in
-/// `folder_browser.rs`), not their full path, so asserting on this fixed,
-/// short label stays robust however long the host's own temp directory is —
-/// unlike the folder browser's *header* line, which renders `current_dir`
-/// verbatim in an unwrapped `Paragraph` and would silently clip (and falsely
-/// fail this scenario) on a long enough temp path. The header's actual width
-/// varies with the PTY geometry in effect when the browser opens (this
-/// scenario's own `open_observe_view` step resizes it before onboarding
-/// starts), so no single column count is safe to assume here.
+/// The name of a child directory `dash-25` plants under the scenario's cwd;
+/// `existing_folder_browser_shows_scenario_folder` asserts the browser lists
+/// it by this fixed, short label rather than its full path — the browser's
+/// entry list labels children by `file_name()` alone (`build_entries` in
+/// `folder_browser.rs`), so this stays robust however long the host's own
+/// temp directory is, unlike the browser's *header* line, which renders
+/// `current_dir` verbatim in an unwrapped `Paragraph` and would silently
+/// clip (and falsely fail this scenario) on a long enough temp path. The
+/// space in the name is explained in dash-25's scenario comment.
 const ADOPT_SCENARIO_CHILD: &str = "adopt me";
 
 #[when("the user opens the dashboard in a scenario-owned folder")]
@@ -1185,7 +1179,7 @@ async fn install_folder_browser_displayed(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("the install-folder browser did not appear: {e}"));
 }
 
-#[then("the existing-folder browser shows the scenario-owned folder")]
+#[then("the existing-folder browser lists the scenario folder's contents")]
 async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
     // The browser lists `ADOPT_SCENARIO_CHILD` as a child entry only if it's
     // browsing our scenario's own cwd (seeded from `std::env::current_dir()`
