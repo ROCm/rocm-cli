@@ -16,6 +16,17 @@ use crate::E2eWorld;
 /// against the defect.
 const STUB_GPU_COUNT: usize = 1200;
 
+/// A field value from the *first* GPU the stub describes, used by examine-21
+/// and examine-22 to prove the bounded note still quotes the child's output.
+///
+/// Shared with the payload rather than written out again in the assertions: a
+/// second copy would be free to stop matching the payload, and the check would
+/// then pass on a note that kept nothing. It has to come from the head of the
+/// payload, because the quote is the first `MAX_QUOTED_OUTPUT_CHARS` (2000)
+/// characters of what the child printed; the first GPU object is ~150
+/// characters, so this sits well inside it.
+const STUB_MARKET_NAME: &str = "stub-accelerator";
+
 /// Where the `amd-smi` stub and its payload live inside the isolated root.
 ///
 /// Derived rather than carried on the World so the Given and the When agree on
@@ -1312,7 +1323,7 @@ fn write_stub_payload(world: &E2eWorld) -> PathBuf {
             serde_json::json!({
                 "gpu": index,
                 "asic": {
-                    "market_name": "stub-accelerator",
+                    "market_name": STUB_MARKET_NAME,
                     "vendor_id": "0x1002",
                     "device_id": format!("0x{index:04x}"),
                     // amd-smi's real `static -a` output per GPU is far wider
@@ -1527,7 +1538,16 @@ async fn assert_stalled_probe_note_is_bounded(world: &mut E2eWorld) {
     // And the bound, checked on the same note, because the two pull against
     // each other: dropping the child's output entirely would satisfy the size
     // check while losing the diagnostic, and keeping all of it costs the
-    // automation and audit logs the payload's size every 60s.
+    // automation and audit logs the payload's size every 60s. Both sides are
+    // asserted, and the quote assertion is what holds up the first half:
+    // `truncate_to_chars(output, 0)` is exactly `"...[truncated]"`, so a quote
+    // bound of zero would satisfy the marker and the size without keeping a
+    // byte of what amd-smi said.
+    assert!(
+        note.contains(STUB_MARKET_NAME),
+        "the note must keep the head of what amd-smi printed, not just say that it was \
+         shortened: {note:?}"
+    );
     assert!(
         note.contains("...[truncated]"),
         "a shortened note must say so, or a reader takes the head for the whole: {note:?}"
@@ -1589,6 +1609,14 @@ async fn assert_partial_snapshot_note_names_the_monitor_timeout(world: &mut E2eW
     assert!(
         note.contains("exceeded 2s timeout"),
         "the note must name the timeout rather than blaming the launch: {note:?}"
+    );
+    // The same pair as examine-21, for the same reason: the marker and the
+    // size are both satisfied by a note that quotes nothing, so the quote is
+    // asserted too.
+    assert!(
+        note.contains(STUB_MARKET_NAME),
+        "the note must keep the head of what the monitor probe printed, not just say that it \
+         was shortened: {note:?}"
     );
     assert!(
         note.contains("...[truncated]"),
