@@ -754,7 +754,17 @@ fn startup_log_context(log_path: Option<&Path>) -> String {
         .flat_map(rocm_core::terminal::rendered_lines)
         .collect::<Vec<_>>()
         .join("\n");
-    format!("\n\nLast {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:\n{summary}{hint}")
+    // The count is the *read* budget — how many physical lines of the log were
+    // taken — not how many rows are printed below. Those differ, and can differ
+    // a lot: each `\r` repaint of a progress bar expands into its own rendered
+    // row, so three physical lines carrying 300 repaints are echoed as 300-odd
+    // rows. Saying "last N lines" and then printing more of them is the kind of
+    // small lie that costs a reader their trust in the rest of the message, so
+    // the sentence says which N it means.
+    format!(
+        "\n\nStartup log, last {STARTUP_FAILURE_LOG_TAIL_LINES} lines as the terminal drew \
+         them:\n{summary}{hint}"
+    )
 }
 
 /// Appends [`rocm_core::VLLM_GPU_MEMORY_UTILIZATION_HINT`] when the startup-log
@@ -1351,8 +1361,12 @@ mod tests {
         let log_tail = "\u{1b}[31mRuntimeError: HIP out of memory\u{1b}[0m\u{7}";
         let hint = oom_utilization_hint(log_tail);
         assert!(
-            !hint.chars().any(|c| c.is_control() && c != '\n'),
-            "no control byte may survive into the printed hint: {hint:?}"
+            !hint
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed hint — `\\t` is \
+             exempt because `rendered_lines` keeps it deliberately, as intra-line \
+             whitespace that moves along the row it is already on: {hint:?}"
         );
         // Pin the exact rendering rather than the absence of a few fragments.
         // Absence checks cannot fail for the defect they name: a stripper that
@@ -1399,8 +1413,11 @@ mod tests {
         fs::remove_file(&path).ok();
 
         assert!(
-            !context.chars().any(|c| c.is_control() && c != '\n'),
-            "no control byte may survive into the printed failure message: {context:?}"
+            !context
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed failure message — \
+             `\\t` is exempt, see the hint assertion above: {context:?}"
         );
         assert!(
             !context.contains("pwned"),
@@ -1408,7 +1425,7 @@ mod tests {
         );
         assert_eq!(
             context
-                .split("startup log:\n")
+                .split("as the terminal drew them:\n")
                 .nth(1)
                 .and_then(|rest| rest.split("\n\nDetected").next()),
             Some("INFO starting\nRuntimeError: HIP out of memory"),
@@ -1460,8 +1477,11 @@ mod tests {
             "the hint must name the exception row alone: {context:?}"
         );
         assert!(
-            !context.chars().any(|c| c.is_control() && c != '\n'),
-            "no control byte may survive into the printed failure message: {context:?}"
+            !context
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "no cursor-moving control byte may survive into the printed failure message — \
+             `\\t` is exempt, see the hint assertion above: {context:?}"
         );
 
         // Now the second read: rebuild the shared log exactly as the supervisor
@@ -1611,10 +1631,12 @@ mod tests {
 
         // And the half that forecloses the tightening. The echo is a full tail
         // window plus the hint, so by the time the CLI reads, the window has
-        // scrolled past the `lines of startup log:` header entirely: it holds
+        // scrolled past the `Startup log, last N lines` header entirely: it holds
         // echoed rows and rocm-cli's own hint, and nothing the engine wrote
         // directly. A filter anchored on that header therefore never fires.
-        let header = format!("Last {STARTUP_FAILURE_LOG_TAIL_LINES} lines of startup log:");
+        let header = format!(
+            "Startup log, last {STARTUP_FAILURE_LOG_TAIL_LINES} lines as the terminal drew them:"
+        );
         assert!(
             !tail.contains(header.as_str()),
             "the echo header must have scrolled out, or the window still holds raw engine output"

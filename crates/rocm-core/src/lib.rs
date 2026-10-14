@@ -4361,7 +4361,7 @@ last_installed_runtime_id = "therock-release"
             "{real_line}\n\
              Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
              \n\
-             Last 50 lines of startup log:\n\
+             Startup log, last 50 lines as the terminal drew them:\n\
              {real_line}\n\
              \n\
              {VLLM_OOM_DETECTED_PREFIX}{real_line}). {VLLM_GPU_MEMORY_UTILIZATION_HINT}\n\

@@ -692,7 +692,7 @@ fn simulate_oom_managed_launch(
             "{real_line}\n\
              Error: vLLM server process exited before becoming ready (status: exit status: 1)\n\
              \n\
-             Last {} lines of startup log:\n\
+             Startup log, last {} lines as the terminal drew them:\n\
              {real_line}\n\
              \n\
              {}{real_line}). {}\n\
