@@ -278,6 +278,13 @@ the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position.
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
+  only whether it is there. The runtime in `System32` must be 14.40 or newer
+  (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
+  as the llama.cpp server that Lemonade installs, crash with an access
+  violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
+  version it read as `msvc_redist_version`. `rocm fix` only prints the update
+  plan, including a `winget install` line; it never runs the install.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5) — `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of

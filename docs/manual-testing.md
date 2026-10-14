@@ -247,6 +247,12 @@ Expected result:
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
+If the llama.cpp server exits at start with an access violation (`0xC0000005`
+in `MSVCP140.dll`), the Visual C++ runtime on the machine is probably older than
+14.40. Run `rocm diagnose` and expect `fix-21-msvc-redist-outdated`. `rocm fix
+fix-21-msvc-redist-outdated` prints the update plan and changes nothing. After
+the update, restart Lemonade and repeat the serve command above.
+
 While the log stream is attached, verify detach and stop behave differently:
 
 - Press `Ctrl+D`. The stream ends and the shell prompt returns, printing a
