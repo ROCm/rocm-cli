@@ -865,8 +865,8 @@ fn managed_model_is_listed_as_running(world: &E2eWorld) -> (bool, String) {
     (found, stdout)
 }
 
-/// Proves the prompt's own claim ("it keeps running in the background after
-/// you quit") against actual state, not just its wording (AGENTS.md §3) — a
+/// Proves the prompt's own claim ("it may still be running in the background
+/// after you quit") against actual state, not just its wording (AGENTS.md §3) — a
 /// plain CLI check against the managed-service registry, run after the TUI
 /// process has already exited (or, for the declined-prompt assertion earlier
 /// in the same scenario, while it's still open).
@@ -998,6 +998,58 @@ async fn quit_back_to_launcher(world: &mut E2eWorld) {
                  if a quit-confirm prompt is still showing instead, \
                  `AppState::launcher_hosted` failed to suppress this \
                  session's own gate (issue #145's double-prompt fix): {e}"
+            )
+        });
+}
+
+#[when("the user opens chat from the launcher")]
+async fn open_chat_from_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Sync on the launcher front door before sending keys, same rationale as
+    // `open_dashboard_from_launcher`.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("the launcher front door never appeared: {e}"));
+    // Chat has no single-key shortcut like `d` (`OpenDashboard`'s) — it's the
+    // 4th row (`LauncherChoice::Chat`, after Set up/Serve/Diagnose), reached
+    // by moving down three times from the default (Set up) selection, then
+    // `Enter` (`choice_for(sel)`).
+    tui.send("jjj")
+        .unwrap_or_else(|e| panic!("failed to select Chat in the launcher: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to open chat from the launcher: {e}"));
+    tui.wait_for_screen("No messages yet.", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat did not open from the launcher: {e}"));
+}
+
+#[when("the user quits chat back to the launcher")]
+async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
+    let tui = session(world);
+    // Same `/quit` route `try_quit_chat` uses (`handle_slash_command` routes
+    // it to the shared `request_quit` gate), but unlike that step this one
+    // resolves straight through: a launcher-hosted chat session
+    // (`run_chat`'s own `launcher_hosted`, round-5 review on PR #595) must
+    // exit this inner loop unconditionally rather than open a quit-confirm
+    // prompt of its own — see `request_quit`'s doc comment.
+    tui.send("i")
+        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    tui.send("/quit")
+        .unwrap_or_else(|e| panic!("failed to type /quit: {e}"));
+    tui.send("\r")
+        .unwrap_or_else(|e| panic!("failed to submit /quit: {e}"));
+    // Same failure-mode framing as `quit_back_to_launcher`: if `run_chat`
+    // failed to propagate `launcher_hosted` into `AppState`, this session
+    // would open its own quit-confirm prompt instead of exiting, and the
+    // launcher front door below would never come back.
+    tui.wait_for_screen("Set up this system", default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the launcher front door did not return after the chat session — \
+                 if a quit-confirm prompt is still showing instead, `run_chat` \
+                 failed to propagate `launcher_hosted` into this session's \
+                 `AppState` (issue #145's double-prompt fix): {e}"
             )
         });
 }

@@ -30,7 +30,7 @@ mod scrollbar;
 mod slash;
 mod summary;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod types;
 
 // Re-exports restoring the pre-split `crate::app::*` public surface. A
@@ -199,7 +199,7 @@ pub struct AppState {
     /// Rendered by the services overlay so failed servers are not invisible.
     pub services_past_attempts: usize,
     /// Set from `ResolvedArgs::managed_registry_probe`: the bin-injected live
-    /// registry-read seam `has_live_instance` / `has_stoppable_managed_instance`
+    /// registry-read seam `has_live_instance` / `has_stoppable_managed_instance_with`
     /// / `quit_confirm_open_services_key` consult, rather than a snapshot
     /// frozen at launch (issue #145). `Some` on every bin path — this is
     /// never `None`, including under `--demo`/`--replay`/`--chat-mock`.
@@ -640,7 +640,8 @@ impl AppState {
     /// synthesizes `Instance { status: Running, .. }` entries so the Serving
     /// tab has something to show, but nothing is actually running, so warning
     /// before quitting would print a false claim (AGENTS.md §3, issue #145's
-    /// own prompt text: "it keeps running in the background after you quit").
+    /// own prompt text: "it may still be running in the background after you
+    /// quit").
     ///
     /// Otherwise ORs in a *live* registry read (`live_registry_snapshot`)
     /// until the daemon's first instance snapshot lands
@@ -655,11 +656,14 @@ impl AppState {
     /// startup window — the registry read is cheap and re-run every time this
     /// is called, so there is no staleness to outlive. Once a snapshot lands
     /// on a host where the daemon does connect, `instances` is authoritative
-    /// and the registry read is no longer consulted for THIS question (a
+    /// and the read's *result* is no longer consulted for THIS question (a
     /// model that legitimately stops later in the session is still reflected
-    /// correctly) — but `has_stoppable_managed_instance_with` below still
-    /// reads the registry live for a different question (which ids are
-    /// reachable), unconditionally.
+    /// correctly) — the read itself still runs unconditionally every call (it
+    /// is cheap, per above), its answer is just ignored here once
+    /// `has_received_snapshot` is `true`. `has_stoppable_managed_instance_with`
+    /// below, in contrast, both reads the registry live AND consults that
+    /// result unconditionally, for a different question (which ids are
+    /// reachable).
     pub(crate) fn has_live_instance(&self) -> bool {
         self.has_live_instance_with(&self.live_registry_snapshot())
     }
@@ -800,7 +804,7 @@ impl AppState {
     /// The row-finding `position` closure below necessarily re-checks
     /// `is_serving() && managed_ids.contains(..)` per row (it needs to know
     /// WHICH row, not just whether one exists), but the short-circuit above
-    /// it calls [`has_stoppable_managed_instance`](Self::has_stoppable_managed_instance)
+    /// it calls [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with)
     /// for real, so the two can't drift on the top-level "is there anything
     /// to jump to at all" decision — only on the mechanical per-row lookup
     /// that decision alone can't answer.
@@ -1524,7 +1528,7 @@ mod tests {
     use super::actions::run_approved;
     use super::chat::build_chat_agent;
     use super::summary::summarize_slash_tool;
-    use super::test_support::st;
+    use super::test_support::{st, with_registry_probe};
     use super::types::NO_CHAT_BACKEND_MSG;
 
     #[test]
@@ -2167,20 +2171,6 @@ mod tests {
     }
 
     // --- Slash-command dispatch (Phase 3 nav/session + read-only) ---
-
-    /// Install a static live-registry probe (the test-only stand-in for the
-    /// bin-injected seam — see `registry_probe::StaticManagedRegistrySnapshot`)
-    /// on `state`, so a test can exercise the live-read gates without a real
-    /// registry on disk.
-    fn with_registry_probe(state: &mut AppState, has_live_service: bool, managed_ids: &[&str]) {
-        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
-        state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
-            ManagedRegistrySnapshot {
-                has_live_service,
-                managed_ids: managed_ids.iter().map(|s| (*s).to_string()).collect(),
-            },
-        )));
-    }
 
     // --- Focused host (Phase 2): default-off focus flag hosts one overlay ---
 
@@ -3405,9 +3395,9 @@ mod tests {
     fn has_live_instance_stops_trusting_the_registry_read_once_a_real_snapshot_lands() {
         // The registry read must not outrank a real daemon snapshot once one
         // has arrived: with an empty (nothing-serving) snapshot, `instances`
-        // is authoritative and the registry read is no longer consulted for
-        // this question — even though the probe would still say something
-        // is live if asked.
+        // is authoritative and the read's result is no longer consulted for
+        // this question — even though the read itself still runs and would
+        // still say something is live if its answer were asked for.
         let mut s = st();
         with_registry_probe(&mut s, true, &[]);
         assert!(s.has_live_instance());
@@ -3424,8 +3414,8 @@ mod tests {
         // `--demo`/`--replay` synthesize `Instance { status: Running, .. }`
         // entries (the Serving tab needs something to show), but nothing is
         // actually running, so the quit-confirm gate must never trust them —
-        // otherwise it prints "it keeps running in the background" when
-        // nothing does (AGENTS.md §3, issue #145).
+        // otherwise it prints "it may still be running in the background"
+        // when nothing does (AGENTS.md §3, issue #145).
         let mut s = st();
         s.simulated = true;
         s.instances.insert(

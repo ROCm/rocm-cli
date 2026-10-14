@@ -188,10 +188,11 @@ pub fn draw(f: &mut Frame, state: &mut AppState) {
 /// also shared to avoid.
 ///
 /// The title is derived from the same decision as the body
-/// (`nothing_is_currently_being_served`) rather than hardcoded, so the two
+/// (`nothing_is_currently_being_served_with`) rather than hardcoded, so the two
 /// can't contradict each other the way they used to when a model stopped
-/// (or was never confirmed live) while the prompt sat open: "Still serving"
-/// above a body that says "Nothing is being served anymore." underneath it.
+/// (or was never confirmed live) while the prompt sat open: "May still be
+/// serving" above a body that says "Nothing is being served anymore."
+/// underneath it.
 ///
 /// `offer_stop_action` gates the trailing "press s" hint (issue #145): `true`
 /// from the dashboard's own render arm, which can actually act on `s`
@@ -206,17 +207,17 @@ pub(crate) fn quit_confirm_request(
     // One snapshot for the whole decision: the title, the body, and the
     // stop-hint below all read it instead of each doing their own
     // `live_registry_snapshot()` call, so a registry write mid-render can no
-    // longer make them disagree the way "Still serving" over a body that says
-    // "Nothing is being served anymore." used to be possible (the doc comment
+    // longer make them disagree the way "May still be serving" over a body
+    // that says "Nothing is being served anymore." used to be possible (the doc comment
     // on `nothing_is_currently_being_served_with` below is only true because
     // of this single read).
     let snapshot = state.live_registry_snapshot();
     let title = if nothing_is_currently_being_served_with(state, &snapshot) {
         "Nothing to confirm — quit?"
     } else {
-        "Still serving — quit anyway?"
+        "May still be serving — quit anyway?"
     };
-    let mut body = quit_confirm_body_with(state, &snapshot, offer_stop_action);
+    let mut body = quit_confirm_body_with(state, &snapshot);
     if offer_stop_action && state.has_stoppable_managed_instance_with(&snapshot) {
         body.push(String::new());
         body.push("Press s to open Services and stop it.".to_string());
@@ -251,7 +252,7 @@ fn nothing_is_currently_being_served_with(
 #[cfg(test)]
 fn quit_confirm_body(state: &AppState) -> Vec<String> {
     let snapshot = state.live_registry_snapshot();
-    quit_confirm_body_with(state, &snapshot, true)
+    quit_confirm_body_with(state, &snapshot)
 }
 
 /// Body text for the quit-confirm prompt: name the models still serving
@@ -263,17 +264,18 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
 /// not a blanket command, since a Docker- or Lemonade-discovered instance
 /// from an external daemon cannot be stopped that way.
 ///
-/// `offer_stop_action` also picks which trailer the `total > 0` branch below
-/// uses: `true` only from the dashboard's own render arm, where `instances`
-/// is either still empty (handled by the `total == 0` branch instead) or
-/// populated from a real, daemon-verified snapshot once one has landed —
-/// trustworthy enough to claim present-tense that a model "keeps running".
-/// `false` only from the pre-dashboard launcher, whose `instances` come from
-/// a raw on-disk registry read with no liveness check at all (see
-/// `ui::launcher::launcher_state`) — the same kind of unverified read the
-/// `total == 0` branch below already hedges for, so a crashed-but-still-
-/// `ready` launcher record gets the same hedge instead of an unhedged claim
-/// the underlying data can't actually back up.
+/// The trailer is hedged ("may still be running") rather than asserted
+/// present-tense ("keeps running"), for every caller — not only the
+/// pre-dashboard launcher. `state.instances` (the dashboard's own render arm)
+/// looks daemon-verified but isn't: `rocm-dash-daemon`'s registry discovery
+/// (`runner.rs`) promotes a record from `Starting` to `Ready` on a successful
+/// scrape, but a *failed* scrape only logs and leaves the prior status in
+/// place, and nothing on the `rocm dash` path calls the CLI's own liveness
+/// reconcile (`refresh_managed_service_runtime_liveness`, wired only into
+/// `load_managed_services`) — so a service that crashed since its last
+/// successful scrape still reads `is_serving() == true` here, the same gap
+/// the launcher's raw on-disk read already has. Both are now the identical
+/// hedge instead of two different claims over equally-unverified data.
 ///
 /// Iterates `state.instances.values()` more than once (via the `running`
 /// closure below, and again inside `nothing_is_currently_being_served_with`)
@@ -286,7 +288,6 @@ fn quit_confirm_body(state: &AppState) -> Vec<String> {
 fn quit_confirm_body_with(
     state: &AppState,
     snapshot: &crate::registry_probe::ManagedRegistrySnapshot,
-    offer_stop_action: bool,
 ) -> Vec<String> {
     let running = || state.instances.values().filter(|i| i.status.is_serving());
     let total = running().count();
@@ -303,8 +304,8 @@ fn quit_confirm_body_with(
         return vec!["Nothing is being served anymore.".to_string()];
     }
     let mut body = Vec::new();
-    let trailer = if total == 0 {
-        // `total == 0` here only because `nothing_is_currently_being_served`
+    if total == 0 {
+        // `total == 0` here only because `nothing_is_currently_being_served_with`
         // returned `false` above: either the startup-race fallback (issue
         // #145) is active — the daemon's first snapshot hasn't landed yet —
         // or the connection never will succeed at all (Windows: the
@@ -332,7 +333,6 @@ fn quit_confirm_body_with(
                 body.push(line);
             }
         }
-        "It may still be running in the background after you quit."
     } else {
         // Sorted by `container_id` — the same key `services_manager::service_rows`
         // sorts by for `AppState::quit_confirm_open_services_key`'s own row
@@ -374,19 +374,9 @@ fn quit_confirm_body_with(
         if let Some(line) = format::overflow_line(total, 5) {
             body.push(line);
         }
-        if offer_stop_action {
-            "It keeps running in the background after you quit."
-        } else {
-            // The launcher's `instances` (see this fn's own doc comment) carry
-            // no liveness check, the same gap the `total == 0` branch above
-            // already hedges for — so a crashed-but-still-`ready` launcher
-            // record gets the identical hedge instead of a present-tense claim
-            // the underlying read can't actually back up.
-            "It may still be running in the background after you quit."
-        }
-    };
+    }
     body.push(String::new());
-    body.push(trailer.to_string());
+    body.push("It may still be running in the background after you quit.".to_string());
     body
 }
 
@@ -406,6 +396,16 @@ fn quit_confirm_body_with(
 /// reverting to plain theme bg, exactly like `draw`'s footer. Falls back to a
 /// centered "closing…" note when no overlay is open — defensive; the event
 /// loop breaks at that point and hands control back to the launcher.
+///
+/// Also renders the quit-confirm prompt (issue #145) when open, same as
+/// `draw`'s own arm — dead last, "owns the screen" the same way. No focused
+/// path actually opens it today (`actions::request_quit`'s own doc comment:
+/// unreachable in practice), but round-5 review on PR #595 found this arm
+/// missing was a latent trap for the day one does: `request_quit` has no
+/// focus guard of its own, so a future focused path reaching it would
+/// otherwise open an invisible, key-eating prompt instead of a visible one.
+/// `offer_stop_action: false` — same reasoning as the launcher's own copy:
+/// a focused host has no live Services overlay of its own to jump to.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
     let theme = state.theme;
     state.scrollbars.borrow_mut().clear();
@@ -448,6 +448,11 @@ pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
         ))),
         footer_area,
     );
+
+    if let Some(choice) = state.quit_confirm {
+        modal::grey_overlay(f);
+        approval::draw_approval(f, body, &quit_confirm_request(state, false), choice, &theme);
+    }
 }
 
 /// Draw whichever operational manager is open into `rect`. The managers are
@@ -926,20 +931,9 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Install a static live-registry probe on `state` (the test-only stand-in
-    /// for the bin-injected seam — see `registry_probe::StaticManagedRegistrySnapshot`),
-    /// so a test can exercise the live-read gates without a real registry on
-    /// disk.
-    fn with_registry_probe(state: &mut AppState, has_live_service: bool, managed_ids: &[&str]) {
-        use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
-        state.managed_registry_probe = Some(std::sync::Arc::new(StaticManagedRegistrySnapshot(
-            ManagedRegistrySnapshot {
-                has_live_service,
-                managed_ids: managed_ids.iter().map(|s| (*s).to_string()).collect(),
-            },
-        )));
-    }
+    // Shared with `app`'s own test module (round-5 review on PR #595: the two
+    // carried byte-identical copies) — see its doc comment.
+    use crate::app::test_support::with_registry_probe;
 
     #[test]
     fn wide_triptych_aligns_tabs_with_center_not_far_left() {
@@ -1235,6 +1229,60 @@ mod tests {
     }
 
     #[test]
+    fn quit_confirm_request_title_and_trailer_are_hedged_once_a_real_snapshot_has_landed() {
+        // Round-5 review (PR #595): `state.instances` looks daemon-verified
+        // once a real snapshot has landed, but isn't — a failed scrape in
+        // `rocm-dash-daemon`'s `runner.rs` only logs and leaves the prior
+        // status in place, with nothing on this path calling the CLI's own
+        // liveness reconcile (`refresh_managed_service_runtime_liveness`,
+        // wired only into `load_managed_services`). A crashed-but-still-
+        // `ready` record therefore still reads `is_serving() == true` here,
+        // so both the title and the trailer must stay hedged for the
+        // dashboard's own render arm — not just for the pre-dashboard
+        // launcher, which already got this hedge before this round.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.instances.insert(
+            "svc-managed".to_string(),
+            Instance {
+                container_id: "svc-managed".to_string(),
+                status: InstanceStatus::Running,
+                ..Default::default()
+            },
+        );
+        state.has_received_snapshot = true;
+        with_registry_probe(&mut state, true, &["svc-managed"]);
+
+        let dashboard = quit_confirm_request(&state, true);
+        assert_eq!(
+            dashboard.title, "May still be serving — quit anyway?",
+            "the dashboard's own title must hedge the same way the launcher's does: {:?}",
+            dashboard.title
+        );
+        assert!(
+            !dashboard
+                .body
+                .iter()
+                .any(|line| line.contains("It keeps running")),
+            "must not assert present-tense liveness the daemon never actually verified: {:?}",
+            dashboard.body
+        );
+        assert!(
+            dashboard
+                .body
+                .iter()
+                .any(|line| line.contains("may still be running")),
+            "must hedge the trailer the same way the launcher's copy does: {:?}",
+            dashboard.body
+        );
+
+        // The launcher's copy (`offer_stop_action: false`) must match: same
+        // title, same hedge, derived from the exact same shared function.
+        let launcher = quit_confirm_request(&state, false);
+        assert_eq!(launcher.title, dashboard.title);
+    }
+
+    #[test]
     fn quit_confirm_request_offers_the_stop_hint_only_for_the_dashboard_with_something_stoppable() {
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
         let mut state = AppState::new("t".into(), "default-dark".into());
@@ -1498,6 +1546,44 @@ mod tests {
         assert!(
             body.iter().any(|line| line.contains("…and 1 more")),
             "the sixth instance must be summarized by the overflow line: {body:?}"
+        );
+    }
+
+    #[test]
+    fn quit_confirm_body_lists_services_sorted_by_container_id() {
+        // Round-5 review (PR #595): the body sorts by `container_id` — the
+        // same key `services_manager::service_rows` sorts by — so the Nth
+        // bullet is provably the instance `s`
+        // (`AppState::quit_confirm_open_services_key`) focuses in the
+        // Services overlay, not merely whichever order a `HashMap`'s
+        // `values()` happens to yield. `quit_confirm_body_caps_the_listing_at_five_with_an_overflow_line`
+        // inserts ids (`svc-0`..`svc-5`) that already sort the same way
+        // whether by id or insertion order, so it can't catch a regression
+        // here — these ids are deliberately inserted out of sorted order.
+        use rocm_dash_core::metrics::{Instance, InstanceStatus};
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        for id in ["svc-zeta", "svc-alpha", "svc-mu"] {
+            state.instances.insert(
+                id.to_string(),
+                Instance {
+                    container_id: id.to_string(),
+                    model_name: format!("model-{id}"),
+                    status: InstanceStatus::Running,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let body = quit_confirm_body(&state);
+        let bullets: Vec<&str> = body
+            .iter()
+            .filter(|line| line.starts_with('•'))
+            .map(std::string::String::as_str)
+            .collect();
+        assert_eq!(
+            bullets,
+            vec!["• model-svc-alpha", "• model-svc-mu", "• model-svc-zeta"],
+            "bullets must be sorted by container_id, not insertion/HashMap order: {body:?}"
         );
     }
 
@@ -2193,6 +2279,35 @@ mod tests {
             corner.style().bg,
             Some(OVERLAY_WASH),
             "corner cell must carry grey_overlay's wash bg in the focused-host renderer too"
+        );
+    }
+
+    #[test]
+    fn draw_focused_renders_the_quit_confirm_prompt_when_open() {
+        // Round-5 review (PR #595): no focused path opens `quit_confirm`
+        // today (`actions::request_quit`'s own doc comment), but
+        // `draw_focused` must still render it if one ever does — otherwise a
+        // future focused path would open an invisible, key-eating prompt
+        // instead of a visible one. Mirrors `launcher_renders_the_quit_confirm_prompt_when_open`
+        // in `ui::launcher`, the same regression for that renderer.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new("t".into(), "default-dark".into());
+        state.open_quit_confirm();
+
+        let mut term = Terminal::new(TestBackend::new(160, 48)).unwrap();
+        term.draw(|f| draw_focused(f, &mut state)).unwrap();
+        let painted: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            painted.contains("quit"),
+            "the focused-host renderer must render the quit-confirm prompt: {painted:?}"
         );
     }
 }

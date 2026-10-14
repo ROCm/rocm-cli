@@ -120,13 +120,20 @@ pub struct ResolvedArgs {
     /// Bin-injected live registry-read seam (issue #145): whether anything is
     /// currently serving, and which ids a `rocm services stop <id> --yes` can
     /// actually reach. Read live, at the moment `AppState::has_live_instance`
-    /// / `has_stoppable_managed_instance` / `ui::quit_confirm_body` actually
-    /// need an answer — never a one-shot snapshot frozen at launch the way
-    /// `services_past_attempts` is, so a model started mid-session (e.g. via
-    /// the Serve wizard) is reflected the next time any of those are
-    /// consulted, and a host whose dashboard-embedded daemon client never
-    /// connects at all (Windows) still gets a correct answer for the entire
-    /// session rather than only a launch-time guess. Injected `Some` on
+    /// / `has_stoppable_managed_instance_with` / `ui::quit_confirm_body_with`
+    /// actually need an answer — never a one-shot snapshot frozen at launch
+    /// the way `services_past_attempts` is. A host whose dashboard-embedded
+    /// daemon client never connects at all (Windows) gets a correct "is
+    /// anything live" answer from this for the entire session rather than
+    /// only a launch-time guess (`has_live_instance`'s own doc comment). On a
+    /// host where the daemon does connect, a model started mid-session (e.g.
+    /// via the Serve wizard) is reflected the next time the *stop-command* or
+    /// `s`-gating questions are consulted — `has_stoppable_managed_instance_with`
+    /// and `quit_confirm_open_services_key` always read this live — but NOT
+    /// the next time "is anything serving" itself is asked: once a real
+    /// daemon snapshot has landed, `has_live_instance_with` stops consulting
+    /// this field for that question and trusts `instances` alone (its own doc
+    /// comment explains why). Injected `Some` on
     /// every bin path, including `--demo`/`--replay`/`--chat-mock` — this is
     /// never `None`. `--demo`/`--replay` are made safe by
     /// `AppState::simulated` short-circuiting `has_live_instance` before

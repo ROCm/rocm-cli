@@ -560,7 +560,7 @@ Expected result:
 
 - No prompt appears here — this inner session's own `q` returns straight to
   the launcher's front-door menu. The launcher's own `q` (pressed again, at
-  that menu) is what asks "Still serving — quit anyway?", with a fresh,
+  that menu) is what asks "May still be serving — quit anyway?", with a fresh,
   on-disk read of the registry backing that decision. Approving it there is
   what actually exits the process. Seeing the prompt twice for one quit
   decision — once inside the dashboard, once more at the launcher, with the

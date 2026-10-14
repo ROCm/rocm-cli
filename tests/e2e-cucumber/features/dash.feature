@@ -438,7 +438,7 @@ Feature: Interactive dashboard
 
   # #145: the launcher is a persistent hub — escalating into the full
   # dashboard ("Open full dashboard") and quitting FROM THERE used to ask
-  # "Still serving — quit anyway?" a second time, and approving it only
+  # "May still be serving — quit anyway?" a second time, and approving it only
   # returned to the launcher menu, which then immediately asked the identical
   # question again on its own next `q` — a prompt whose "yes" didn't actually
   # exit the process at all. Only the launcher's own copy of the prompt may
@@ -451,6 +451,26 @@ Feature: Interactive dashboard
     Then the launcher shows the model serving
     When the user opens the dashboard from the launcher
     And the user quits back to the launcher
+    Then the launcher shows the model serving
+    When the user tries to quit the launcher
+    Then the launcher asks whether to quit while a model is still being served
+    When the user quits the launcher
+    Then the launcher exits successfully
+    And the managed model is still listed as running
+
+  # #145: `run_chat`'s own `launcher_hosted` flag must get the exact same
+  # double-prompt suppression `run`'s does (dash-29) — escalating into Chat
+  # from the launcher (the other hosted route, `launcher_route_hosts_session`)
+  # and quitting FROM THERE must return straight to the launcher menu with no
+  # quit-confirm prompt of its own; only the launcher's own copy may ever
+  # govern the real exit.
+  @id:dash-launcher-hosted-chat-quit-is-not-asked-twice @requires-os:linux
+  Scenario: dash-30 - Quitting chat opened from the launcher does not ask twice
+    Given a running managed model is available locally
+    When the user opens the launcher
+    Then the launcher shows the model serving
+    When the user opens chat from the launcher
+    And the user quits chat back to the launcher
     Then the launcher shows the model serving
     When the user tries to quit the launcher
     Then the launcher asks whether to quit while a model is still being served

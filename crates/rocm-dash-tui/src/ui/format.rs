@@ -341,9 +341,12 @@ pub fn gen_tps_aggregate(tps: Option<f64>, any_held: bool) -> String {
 /// items, or `None` when `len` doesn't exceed `cap`.
 ///
 /// Shared by every capped list (`tabs::pane::live_lines`'s
-/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm_body`) so a cap
-/// bump in one place can't quietly leave another's overflow arithmetic
-/// behind.
+/// `OpenServeWizard`/`OpenServices` arms, `ui::quit_confirm_body_with`) so
+/// the overflow wording and arithmetic stay identical across them. Each call
+/// site still passes its own `cap` literal alongside its own separate
+/// `.take(N)` — this does not keep the two in sync if one changes without
+/// the other; it only keeps what "N more" means, and how it's phrased, from
+/// drifting between call sites.
 pub fn overflow_line(len: usize, cap: usize) -> Option<String> {
     (len > cap).then(|| format!("  …and {} more", len - cap))
 }

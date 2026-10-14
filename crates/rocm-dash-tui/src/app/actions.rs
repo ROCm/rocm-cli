@@ -72,11 +72,17 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 /// actually governs process exit, backed by a registry read taken fresh at
 /// the top of that menu pass rather than this session's launch-time state
 /// (issue #145's launcher/Windows fix). Asking here too would open a
-/// "Still serving — quit anyway?" whose "yes" doesn't exit the process at all
+/// "May still be serving — quit anyway?" whose "yes" doesn't exit the process at all
 /// — it only returns to the launcher loop, which then immediately asks the
 /// identical question again on its own next `q`. So a launcher-hosted session
 /// exits this inner loop unconditionally; only the launcher's copy of this
 /// same function ever opens the prompt for that model.
+///
+/// No focused-host entry point (Set up/Serve/Diagnose) calls this today —
+/// unreachable in practice — but if one ever did, the prompt this opens is
+/// rendered regardless: see `ui::draw_focused`'s own `quit_confirm` arm
+/// (round-5 review on PR #595, which found `draw_focused` not rendering it a
+/// latent trap for exactly that case).
 pub(crate) fn request_quit(state: &mut AppState) -> bool {
     if state.launcher_hosted {
         return true;

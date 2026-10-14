@@ -304,12 +304,17 @@ fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
     use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
 
     let mut state = AppState::new(String::new(), theme_name.to_string());
-    // `serving` (despite the name) is every managed-service record regardless
-    // of status, so `has_live_service` must apply the same `is_serving()`
-    // filter the live probe (`LiveManagedRegistryProbe::snapshot`) applies —
-    // otherwise a `starting`/`recovering`-only registry would trip the
-    // "Still serving" quit-confirm prompt here but not on the dashboard,
-    // which reads the exact same registry through the live probe instead.
+    // This test-only helper accepts whatever `serving` a caller passes, with
+    // no status filter of its own — unlike the real production caller
+    // (`apps/rocm::dash::launcher_serving_instances`), which already drops a
+    // failed/stopped/unbound-port record via `discover_managed_services`
+    // (see `launcher_state_does_not_warn_on_a_starting_only_registry` below).
+    // So `has_live_service` must still apply the same `is_serving()` filter
+    // the live probe (`LiveManagedRegistryProbe::snapshot`) applies, rather
+    // than trust every status this test can construct — otherwise a
+    // `starting`/`recovering`-only registry would trip the "May still be
+    // serving" quit-confirm prompt here but not on the dashboard, which
+    // reads the exact same registry through the live probe instead.
     let has_live_service = serving.iter().any(|inst| inst.status.is_serving());
     let managed_ids: std::collections::HashSet<String> = serving
         .iter()
@@ -795,9 +800,9 @@ mod tests {
         // it. The quit-confirm gate (`AppState::has_live_instance`) must apply the
         // same `is_serving()` filter here that the dashboard's live probe
         // (`LiveManagedRegistryProbe::snapshot`) applies, or a
-        // starting-only registry would trip "Still serving — quit anyway?"
-        // on the launcher but not on the dashboard reading the identical
-        // registry.
+        // starting-only registry would trip "May still be serving — quit
+        // anyway?" on the launcher but not on the dashboard reading the
+        // identical registry.
         let serving = vec![Instance {
             container_id: "vllm-starting".into(),
             status: InstanceStatus::Starting { phase: None },
@@ -864,7 +869,7 @@ mod tests {
         //
         // Seeds a serving instance: the title is derived from the same
         // "is anything still serving" decision as the body
-        // (`nothing_is_currently_being_served`), so an unseeded `base()`
+        // (`nothing_is_currently_being_served_with`), so an unseeded `base()`
         // would render the other title ("Nothing to confirm — quit?") here.
         use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
@@ -878,7 +883,7 @@ mod tests {
             },
         );
         // Seed a registry probe reporting `vllm-1` as managed and stoppable —
-        // exactly the data that would make `has_stoppable_managed_instance()`
+        // exactly the data that would make `has_stoppable_managed_instance_with()`
         // true. If `draw`'s own `quit_confirm_request(state, false)` call ever
         // regressed to `true`, this is what would make the "Press s" hint
         // wrongly appear below.
@@ -891,7 +896,7 @@ mod tests {
         s.open_quit_confirm();
         let out = render(&s, 0, 100, 24);
         assert!(
-            out.contains("Still serving"),
+            out.contains("May still be serving"),
             "quit-confirm prompt must render: {out:?}"
         );
         assert!(
