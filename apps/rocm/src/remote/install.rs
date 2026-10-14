@@ -45,8 +45,28 @@ pub(crate) enum Refusal {
     /// The catalog has no entries for this platform, so it scored nothing.
     /// Carries the catalog's own explanation.
     NotEvaluated { reason: String },
-    /// The catalog recognised something needing a person.
-    NeedsAHuman { findings: Vec<String> },
+    /// The catalog recognised something needing a person, and at least one of
+    /// those things is something a person can act on.
+    ///
+    /// `without_a_fix` is carried beside `findings` rather than folded into it
+    /// because the message tells the user to resolve what it lists, and an
+    /// entry the catalog has no remedy for cannot be resolved. Naming those
+    /// apart is what keeps that instruction true of everything it is said
+    /// about.
+    NeedsAHuman {
+        findings: Vec<String>,
+        without_a_fix: Vec<String>,
+    },
+    /// Everything the catalog recognised is a `DIAGNOSE-ONLY` statement about
+    /// the machine, with no remedy for any of it.
+    ///
+    /// Still a refusal — the install would be proceeding on a machine the
+    /// catalog has already said something about — but a different one. There
+    /// is nothing to resolve and running it again reaches the same answer, so
+    /// "resolve them first, then run this again" would be an instruction with
+    /// no way to carry it out. AGENTS.md §3: remediation text has to be able to
+    /// clear the condition that printed it.
+    NothingToInstall { findings: Vec<String> },
     /// Privileged commands would block on a password prompt.
     NeedsPasswordlessSudo,
 }
@@ -69,9 +89,17 @@ pub(crate) fn assess(report: &DiagnoseReport, passwordless_sudo: bool) -> Option
             reason: reason.clone(),
         });
     }
-    let findings = recognised_problems(report);
+    let (findings, without_a_fix) = recognised_problems(report);
+    if findings.is_empty() && !without_a_fix.is_empty() {
+        return Some(Refusal::NothingToInstall {
+            findings: without_a_fix,
+        });
+    }
     if !findings.is_empty() {
-        return Some(Refusal::NeedsAHuman { findings });
+        return Some(Refusal::NeedsAHuman {
+            findings,
+            without_a_fix,
+        });
     }
     if !passwordless_sudo {
         return Some(Refusal::NeedsPasswordlessSudo);
@@ -79,19 +107,36 @@ pub(crate) fn assess(report: &DiagnoseReport, passwordless_sudo: bool) -> Option
     None
 }
 
-/// Catalog findings strong enough to be treated as real.
+/// Catalog findings strong enough to be treated as real, split by whether
+/// anything can be done about them: `(actionable, without_a_fix)`.
 ///
 /// Weak signals are excluded deliberately: several checks open with a low score
 /// for a situation that is merely *potentially* relevant, and treating those as
 /// blockers would refuse installs on healthy machines until nobody trusted the
 /// refusal.
-fn recognised_problems(report: &DiagnoseReport) -> Vec<String> {
-    report
-        .matched
-        .iter()
-        .filter(|diagnosis| diagnosis.score >= rocm_core::diagnose::MIN_SCORE_FOR_MATCH)
-        .map(|diagnosis| diagnosis.title.clone())
-        .collect()
+///
+/// The split is by [`FixClass::DiagnoseOnly`], not by `fix.is_none()`: every
+/// catalog entry carries a `Fix`, and the class is where "detected, explained,
+/// no remedy" is recorded. Both halves still refuse the install; they differ
+/// only in what the refusal can honestly ask the user to do next.
+fn recognised_problems(report: &DiagnoseReport) -> (Vec<String>, Vec<String>) {
+    let mut actionable = Vec::new();
+    let mut without_a_fix = Vec::new();
+    for diagnosis in &report.matched {
+        if diagnosis.score < rocm_core::diagnose::MIN_SCORE_FOR_MATCH {
+            continue;
+        }
+        let fixless = diagnosis
+            .fix
+            .as_ref()
+            .is_none_or(|fix| fix.class == rocm_core::fix::FixClass::DiagnoseOnly);
+        if fixless {
+            without_a_fix.push(diagnosis.title.clone());
+        } else {
+            actionable.push(diagnosis.title.clone());
+        }
+    }
+    (actionable, without_a_fix)
 }
 
 /// Can privileged commands run without a prompt nobody will answer?
@@ -150,6 +195,15 @@ fn print_indented(output: &str) {
     }
 }
 
+/// One finding per line, bulleted.
+fn bullets(findings: &[String]) -> String {
+    findings
+        .iter()
+        .map(|finding| format!("  - {finding}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Explain a refusal, including what to run instead.
 pub(crate) fn describe_refusal(
     refusal: &Refusal,
@@ -171,17 +225,38 @@ pub(crate) fn describe_refusal(
              different thing. Set it up yourself if you are sure it is supported:\n  \
              ssh {target} -- rocm bootstrap setup"
         ),
-        Refusal::NeedsAHuman { findings } => format!(
+        Refusal::NeedsAHuman {
+            findings,
+            without_a_fix,
+        } => format!(
             "{target} is not in a state that can be set up unattended.\n\n\
              What was found:\n{}\n\n\
              These are the situations the setup wizard exists to walk a person through, \
              and it cannot do that over a connection with nobody watching. Resolve them \
-             first — the suggested fixes are below — then run this again.\n\n{}",
-            findings
-                .iter()
-                .map(|finding| format!("  - {finding}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+             first — the suggested fixes are below — then run this again.{}\n\n{}",
+            bullets(findings),
+            if without_a_fix.is_empty() {
+                String::new()
+            } else {
+                // Kept out of the list above on purpose: "resolve them first"
+                // is addressed to that list, and these cannot be resolved.
+                format!(
+                    "\n\nAlso reported, with no fix to apply — these describe the machine \
+                     rather than something to put right, and will still be true afterwards:\n{}",
+                    bullets(without_a_fix)
+                )
+            },
+            doctor::render_report(target, report, top)
+        ),
+        Refusal::NothingToInstall { findings } => format!(
+            "{target} has nothing an unattended ROCm install would put right.\n\n\
+             What was found:\n{}\n\n\
+             The catalog has no fix for any of this: it describes what the machine is, not \
+             something that went wrong, so there is nothing to resolve and running this \
+             again reaches the same answer. If you want ROCm installed there regardless, \
+             do it yourself and decide what to do about the above:\n  \
+             ssh {target} -- rocm bootstrap setup\n\n{}",
+            bullets(findings),
             doctor::render_report(target, report, top)
         ),
         Refusal::NeedsPasswordlessSudo => format!(
@@ -208,12 +283,33 @@ mod tests {
         report
     }
 
+    /// A finding with something to apply, which is what most of the catalog is.
     fn finding(title: &str, score: i32) -> Diagnosis {
         Diagnosis {
             id: "x".to_owned(),
             title: title.to_owned(),
             score,
+            fix: Some(rocm_core::diagnose::Fix {
+                fix_id: "x".to_owned(),
+                class: rocm_core::fix::FixClass::PrintOnly,
+                ..rocm_core::diagnose::Fix::default()
+            }),
             ..Diagnosis::default()
+        }
+    }
+
+    /// A finding the catalog classes `DIAGNOSE-ONLY`: real, scored, and with
+    /// nothing a person could do about it. `info-20-gpu-no-rocm-support` is the
+    /// first one, at a flat 60 — above `MIN_SCORE_FOR_MATCH`, so it reaches
+    /// this module as a refusal and not as a weak signal.
+    fn finding_without_a_fix(title: &str, score: i32) -> Diagnosis {
+        Diagnosis {
+            fix: Some(rocm_core::diagnose::Fix {
+                fix_id: "info-20-gpu-no-rocm-support".to_owned(),
+                class: rocm_core::fix::FixClass::DiagnoseOnly,
+                ..rocm_core::diagnose::Fix::default()
+            }),
+            ..finding(title, score)
         }
     }
 
@@ -307,8 +403,101 @@ mod tests {
         assert_eq!(
             assess(&report, true),
             Some(Refusal::NeedsAHuman {
-                findings: vec!["DKMS built against another kernel".to_owned()]
+                findings: vec!["DKMS built against another kernel".to_owned()],
+                without_a_fix: vec![],
             })
+        );
+    }
+
+    /// A machine whose only finding has no fix is refused, and told so in words
+    /// it can act on.
+    ///
+    /// `info-20-gpu-no-rocm-support` is a flat 60, so it clears
+    /// `MIN_SCORE_FOR_MATCH` on its own and reaches this module as a refusal.
+    /// Sending "Resolve them first — the suggested fixes are below — then run
+    /// this again" for it would be an instruction with no way to carry it out:
+    /// the catalog has no fix, and the second run reaches the same answer.
+    #[test]
+    fn a_finding_with_no_fix_is_refused_without_being_called_resolvable() {
+        let report = report_with(vec![finding_without_a_fix(
+            "GPU has no ROCm/HIP support (Vulkan backend still works)",
+            60,
+        )]);
+        assert_eq!(
+            assess(&report, true),
+            Some(Refusal::NothingToInstall {
+                findings: vec![
+                    "GPU has no ROCm/HIP support (Vulkan backend still works)".to_owned()
+                ],
+            }),
+            "a fixless finding is its own refusal, not one that asks for it to be resolved"
+        );
+
+        let message = describe_refusal(
+            &assess(&report, true).expect("refused"),
+            "lemonade-laptop",
+            &report,
+            5,
+        );
+        assert!(
+            message.contains("GPU has no ROCm/HIP support"),
+            "the refusal must still name what it found: {message}"
+        );
+        assert!(
+            !message.contains("Resolve them first"),
+            "nothing here can be resolved, so the message must not ask for it: {message}"
+        );
+        assert!(
+            message.contains("no fix for any of this"),
+            "and it must say why there is nothing to do: {message}"
+        );
+    }
+
+    /// A fixable finding beside a fixless one keeps "resolve them first" true
+    /// of the list it is said about.
+    ///
+    /// The mixed case is the one a single list gets wrong: naming both under
+    /// "Resolve them first" makes the instruction false for one of them, and
+    /// dropping the fixless one hides a fact about the machine that is still
+    /// going to be true afterwards.
+    #[test]
+    fn a_fixless_finding_beside_a_fixable_one_is_listed_apart_from_it() {
+        let report = report_with(vec![
+            finding("DKMS built against another kernel", 90),
+            finding_without_a_fix(
+                "GPU has no ROCm/HIP support (Vulkan backend still works)",
+                60,
+            ),
+        ]);
+        assert_eq!(
+            assess(&report, true),
+            Some(Refusal::NeedsAHuman {
+                findings: vec!["DKMS built against another kernel".to_owned()],
+                without_a_fix: vec![
+                    "GPU has no ROCm/HIP support (Vulkan backend still works)".to_owned()
+                ],
+            })
+        );
+
+        let message = describe_refusal(
+            &assess(&report, true).expect("refused"),
+            "gpu-box",
+            &report,
+            5,
+        );
+        let resolve = message
+            .find("Resolve them first")
+            .expect("the actionable half still says to resolve what it listed");
+        let aside = message
+            .find("with no fix to apply")
+            .expect("the fixless half is called out separately");
+        assert!(
+            message[..resolve].contains("DKMS built against another kernel"),
+            "the resolvable finding belongs above the instruction to resolve it: {message}"
+        );
+        assert!(
+            resolve < aside && message[aside..].contains("GPU has no ROCm/HIP support"),
+            "the fixless finding belongs after it, not inside the list it addresses: {message}"
         );
     }
 
