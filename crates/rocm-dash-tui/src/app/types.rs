@@ -479,6 +479,20 @@ pub enum ScrollTarget {
     InstanceDetail,
 }
 
+impl ScrollTarget {
+    /// Whether this target's displayed position is tail-anchored (its track
+    /// position is the inverse of its stored offset — see `DockLogs`'s doc
+    /// comment). An exhaustive `match`, not an equality check against a
+    /// single variant: the latter would let a future tail-anchored variant
+    /// fall through to the non-inverted branch with no compiler signal.
+    pub(crate) const fn is_tail_anchored(self) -> bool {
+        match self {
+            Self::DockLogs => true,
+            Self::Console | Self::ConsoleH | Self::Chat | Self::InstanceDetail => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
