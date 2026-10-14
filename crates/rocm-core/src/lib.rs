@@ -2037,6 +2037,7 @@ pub fn publish_temp_file(tmp: &Path, path: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 #[allow(unsafe_code)] // Win32 FFI
 fn replace_file_windows(path: &Path, replacement: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

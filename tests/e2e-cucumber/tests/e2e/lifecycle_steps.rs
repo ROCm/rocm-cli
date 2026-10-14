@@ -69,11 +69,12 @@ impl Drop for LifecycleState {
     fn drop(&mut self) {
         // Never leak the managed-server stand-in, even when a scenario fails
         // before uninstall would have stopped it.
-        for child in [self.managed_server.take(), self.background_helper.take()] {
-            if let Some(mut child) = child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        for mut child in [self.managed_server.take(), self.background_helper.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
         // Restore the machine user PATH if a scenario mutated it, even on panic.
         #[cfg(windows)]
