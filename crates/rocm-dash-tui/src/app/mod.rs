@@ -1328,7 +1328,7 @@ mod tests {
 
     #[test]
     fn back_out_requires_an_open_manager_on_any_tab() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // No manager open → never backs out, even on a domain tab.
         s.active_tab = ActiveTab::Rocm;
         assert!(!s.should_pane_back_out(crossterm::event::KeyCode::Esc));
@@ -1349,7 +1349,7 @@ mod tests {
         // With a job console (or sub-popup / approval) open inside an inline
         // manager, Esc must reach the manager (cancel the inner layer / be
         // ignored while running), NOT eject the whole manager.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.install_manager = Some(crate::ui::install_manager::InstallManagerState {
             active_job: Some("install-job".into()), // a console is up
@@ -1371,7 +1371,7 @@ mod tests {
         // onboarding wizard's Configure sub-view is a nested sub-view just
         // like a manager's job console, so root Esc must defer to it instead
         // of ejecting the whole wizard.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.onboarding = Some(crate::ui::onboarding::OnboardingState {
             install_config: Some(crate::ui::onboarding::InstallConfig::default()),
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn scroll_dock_clamps_against_buffer() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // Dock 10 rows tall → ~7 visible lines after border/padding.
         s.last_dock_area = Some(Rect::new(0, 0, 52, 10));
         s.jobs.apply(rocm_dash_core::state::StateEvent::StartJob {
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[test]
     fn scroll_instance_detail_clamps_to_measured_max() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.instance_detail_max_scroll = 9;
         // i16::MAX is the jump-to-end gesture; it must land on the measured
         // max, not overflow past it.
@@ -1426,7 +1426,7 @@ mod tests {
 
     #[test]
     fn scroll_console_clamps_and_tracks_output() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // No console → both axes clamp to 0 (no content to pan over).
         s.scroll_console(5, 5);
         assert_eq!(s.console_scroll, 0);
@@ -1463,7 +1463,7 @@ mod tests {
 
     #[test]
     fn t13_bench_run_in_has_open_overlay() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         assert!(!s.has_open_overlay(), "no overlay initially");
         s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
         assert!(
@@ -1474,7 +1474,7 @@ mod tests {
 
     #[test]
     fn t13_bench_run_cleared_by_close_overlays() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
         s.close_overlays();
         assert!(s.bench_run.is_none(), "close_overlays must clear bench_run");
@@ -1482,7 +1482,7 @@ mod tests {
 
     #[test]
     fn t13_bench_run_at_root() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         assert!(s.active_overlay_at_root(), "nothing open → at root");
         s.bench_run = Some(crate::ui::bench_run::BenchRunState::new(None));
         assert!(
@@ -1741,7 +1741,7 @@ mod tests {
 
     #[test]
     fn reset_for_seek_clears_event_derived_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.history
             .push_back(rocm_dash_core::metrics::Snapshot::default());
         s.latest = Some(rocm_dash_core::metrics::Snapshot::default());
@@ -1787,7 +1787,7 @@ mod tests {
 
     #[test]
     fn detect_none_sets_message() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.request_detect();
         s.set_detect_result(None);
         assert!(!s.chat_detecting);
@@ -1804,7 +1804,7 @@ mod tests {
     /// result is echoed into the transcript instead.
     #[test]
     fn slash_detect_probes_and_echoes_result_while_accepted() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.set_chat_config(
             Some(crate::llm::LlmConfig {
                 base_url: "http://localhost:8000/v1".into(),
@@ -1837,7 +1837,7 @@ mod tests {
     /// live agent silently keeps talking to the stale endpoint.
     #[test]
     fn slash_detect_accept_raises_endpoint_rebuild_like_initial_accept() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.set_chat_config(
             Some(crate::llm::LlmConfig {
                 base_url: "http://localhost:8000/v1".into(),
@@ -1866,7 +1866,7 @@ mod tests {
 
     #[test]
     fn slash_detect_dismiss_and_unknown_subcommand() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.set_detect_result(Some(crate::llm::detected_llm_config(
             "http://localhost:8000/v1",
             "m",
@@ -1888,7 +1888,7 @@ mod tests {
     /// Sub-commands are case-insensitive, matching `/permissions` / `/provider`.
     #[test]
     fn slash_detect_subcommand_is_case_insensitive() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.set_detect_result(Some(crate::llm::detected_llm_config(
             "http://localhost:8000/v1",
             "m",
@@ -1908,7 +1908,7 @@ mod tests {
     /// turn rather than a silent no-op.
     #[test]
     fn slash_detect_accept_without_offer_emits_hint() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         assert!(s.chat_detect_offer.is_none());
         assert_eq!(
             s.handle_slash_command("/detect accept"),
@@ -2291,7 +2291,7 @@ mod tests {
         // routed through `on_chat_error` as an error turn — not an error dump,
         // not a panic. This mirrors the event-loop None-agent branch, which
         // emits exactly `NO_CHAT_BACKEND_MSG`.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.set_chat_config(None, false);
         assert_eq!(s.chat_consent, ChatConsent::Unavailable);
         // Drive the same surface the event loop uses for the None-agent case.

@@ -14,6 +14,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # REQUIRED, not dormant: every readiness step below runs --require-signatures,
+  # which now means signatures must actually verify, so this is the public key
+  # the release is verified against. Removing or blanking the secret fails every
+  # release run — GitHub expands an unset secret to the empty string, which the
+  # gate treats as "no key" and rejects. It is the public half only; the private
+  # signing key stays step-scoped.
+  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   # Production trust gate — dormant until the owner sets the repository variable
   # ROCM_CLI_REQUIRE_PRODUCTION_TRUST (e.g. "1") and provides the trust inputs
   # below. While the variable is unset/falsy, release_readiness.py skips
@@ -22,7 +29,6 @@ env:
   # enabling the gate, the recipe-index inputs also require a step that
   # materializes the hosted index + its .sig into the workspace.
   ROCM_CLI_REQUIRE_PRODUCTION_TRUST: ${{ vars.ROCM_CLI_REQUIRE_PRODUCTION_TRUST }}
-  ROCM_CLI_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_SIGNING_PUBLIC_KEY_PEM }}
   ROCM_CLI_METADATA_PUBLIC_KEY_PEM: ${{ secrets.ROCM_CLI_METADATA_PUBLIC_KEY_PEM }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PATH }}
   ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH: ${{ vars.ROCM_CLI_MODEL_RECIPE_INDEX_PUBLIC_KEY_PATH }}

@@ -10,7 +10,7 @@
 //! be applied without asking. These steps stand in for the package manager so a
 //! scenario can present that exact solution and assert the CLI refuses it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cucumber::{given, then, when};
 
@@ -35,16 +35,11 @@ fn shim_dir(world: &E2eWorld) -> PathBuf {
     root.path().join("guard-bin")
 }
 
-/// Write `body` to `path` and mark it executable.
-fn write_shim(path: &PathBuf, body: &str) {
-    std::fs::write(path, body)
+/// Write `body` to `path` and mark it executable, without the `Text file busy`
+/// race a plain write has against concurrent scenarios' spawns.
+fn write_shim(path: &Path, body: &str) {
+    rocm_core::fake_executable::write_fake_executable(path, body)
         .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("failed to mark {} executable: {e}", path.display()));
-    }
 }
 
 #[given("a machine with a registered ROCm runtime")]

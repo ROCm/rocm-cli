@@ -322,14 +322,8 @@ async fn user_approved_fix_that_will_fail(world: &mut E2eWorld) {
     // through one of these two scripts either way, and both fail unconditionally.
     for name in ["usermod", "sudo"] {
         let script = bin_dir.join(name);
-        std::fs::write(&script, "#!/bin/sh\nexit 1\n")
+        rocm_core::fake_executable::write_fake_executable(&script, "#!/bin/sh\nexit 1\n")
             .unwrap_or_else(|e| panic!("failed to write fake {name}: {e}"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .unwrap_or_else(|e| panic!("failed to chmod fake {name}: {e}"));
-        }
     }
     // Restricting `$PATH` to only the fakes above also makes the recipe's
     // root-detection deterministic: it shells out to `id -u`, which is not on

@@ -97,7 +97,7 @@ pub(crate) fn logs_response(request: LogsRequest) -> Result<LogsResponse> {
     Ok(LogsResponse {
         log_path: files.log_path.display().to_string(),
         recent_lines: if files.log_path.is_file() {
-            crate::process::tail_lines(&files.log_path, limit)?
+            rocm_core::tail_lines(&files.log_path, limit, crate::process::MAX_TAIL_READ)?
         } else {
             Vec::new()
         },
@@ -121,6 +121,10 @@ pub(crate) fn write_running_state(
     runtime: &VllmRuntime,
     pid: u32,
 ) -> Result<()> {
+    // Kernel start-time of the launcher PID, captured while it is alive. Paired
+    // with `pid`, it identifies this exact process across PID recycling so a
+    // later stop never signals a reused PID.
+    let start_ticks = rocm_core::process_start_ticks(pid);
     write_state(
         &request.state_path,
         &json!({
@@ -142,10 +146,11 @@ pub(crate) fn write_running_state(
             "engine_recipe_required_flags": crate::process::engine_recipe_launch_args(request.engine_recipe.as_ref()),
             "therock_runtime_env": therock_runtime_env_state(runtime),
             "started_at_unix_ms": current_unix_millis(),
-            // Kernel start-time of the launcher PID, captured while it is alive.
-            // Paired with `pid`, it identifies this exact process across PID
-            // recycling so a later stop never signals a reused PID.
-            "start_ticks": rocm_core::process_start_ticks(pid)
+            "start_ticks": start_ticks,
+            // `server_pid` is the same process, so the same token. `rocm-core`
+            // pairs `server_pid` with this key, so it must be written too —
+            // without it the server PID is adopted with no token at all.
+            "server_start_ticks": start_ticks
         }),
     )
 }
@@ -345,17 +350,40 @@ mod tests {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
-    #[test]
-    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
-        // Many calls rather than two: without a counter the names differ only
-        // when the clock ticks between calls, so a pair can pass by luck.
-        let paths: Vec<PathBuf> = (0..64).map(|_| probe_state_path("same-tag")).collect();
+    /// Call `make_path` from many threads at once and assert no two calls
+    /// returned the same path.
+    ///
+    /// Concurrent rather than sequential, because that is how tests call these
+    /// helpers: calls made one after another let the clock tick between them
+    /// and can pass by luck, while threads released together all read the same
+    /// millisecond, so a name keyed on pid and time alone repeats.
+    fn assert_each_call_gets_its_own_path(make_path: impl Fn() -> PathBuf + Sync) {
+        const CALLERS: usize = 16;
+        let start = std::sync::Barrier::new(CALLERS);
+        let paths: Vec<PathBuf> = std::thread::scope(|scope| {
+            let callers: Vec<_> = (0..CALLERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        make_path()
+                    })
+                })
+                .collect();
+            callers
+                .into_iter()
+                .map(|caller| caller.join().expect("a caller panicked"))
+                .collect()
+        });
         let distinct: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(
             distinct.len(),
-            paths.len(),
-            "two calls with one tag shared a path"
+            CALLERS,
+            "two calls with one tag must not share a path"
         );
+    }
+    #[test]
+    fn probe_state_path_gives_each_call_its_own_file_even_for_one_tag() {
+        assert_each_call_gets_its_own_path(|| probe_state_path("same-tag"));
     }
     #[test]
     fn inference_verification_latches_into_the_state_file() -> Result<()> {
@@ -505,11 +533,16 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        write_running_state(&request, &runtime, 12345)?;
+        // A live PID, so the identity tokens below are real values on Linux.
+        let pid = std::process::id();
+        write_running_state(&request, &runtime, pid)?;
         let state = read_service_state(&state_path)?;
         fs::remove_file(&state_path).ok();
 
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(pid))
+        );
         assert_eq!(
             state.get("runtime_id").and_then(Value::as_str),
             Some("therock-release:gfx120X-all")
@@ -543,8 +576,20 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
-        // The identity token must be recorded so a later stop can verify it.
+        // The identity token must be recorded so a later stop can verify it —
+        // under both PID keys, since `server_pid` is the same process and is
+        // the one `rocm-core` adopts, together with `server_start_ticks`.
         assert!(state.get("start_ticks").is_some());
+        assert!(state.get("server_start_ticks").is_some());
+        assert_eq!(state.get("server_start_ticks"), state.get("start_ticks"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            state
+                .get("server_start_ticks")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a live PID has a token on Linux"
+        );
         Ok(())
     }
     #[test]

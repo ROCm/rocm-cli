@@ -193,6 +193,44 @@ Use `--family` only when a test needs a fixed package family. Do not use it for
 normal user setup. The script checks the default install; add `--devel` to check
 the opt-in compiler toolchain path instead.
 
+### 2a. A GPU target with no ROCm build
+
+Any machine can run this one; it needs no particular GPU. `gfx90c` is the Vega
+iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs, and ROCm publishes no build
+for it:
+
+```powershell
+rocm install sdk --family gfx90c --dry-run
+```
+
+Expected result:
+
+- The command fails. It says no ROCm SDK build exists for `gfx90c`, names
+  `--family` as where the target came from, and states that nothing was
+  installed and no other family was substituted.
+- It offers **no** package family to try instead. A message listing
+  `gfx110X-all`, `gfx90X-dcgpu` or any other family here is a regression: it
+  invites installing a build for different silicon. In particular
+  `gfx90X-dcgpu` appearing means the data-center catch-all has been reopened.
+- It does not fall back to this machine's own GPU. On a host with a supported
+  card, a run that succeeds and installs for that card is a regression — the
+  named target must not be silently replaced.
+
+On a Ryzen 4000 or 5000 machine whose Vega iGPU is the only GPU, two further
+checks, which cannot be made anywhere else:
+
+- `rocm examine` shows `detected_gfx_target: gfx90c` with an empty
+  `compatible_therock_family`, plus a `rocm_support` line saying the GPU is
+  detected but not supported by ROCm and that the Vulkan backend can still be
+  used. A `<unknown>` target, or a missing `rocm_support` line, means detection
+  regressed.
+- A plain `rocm install sdk`, with no `--family`, gives the same refusal with
+  the wording for a *detected* GPU rather than a requested one.
+
+On Windows, a hybrid laptop with both the Vega iGPU and a discrete card must
+still report the discrete card from `rocm examine`; the iGPU is listed first by
+WMI and must not hide it.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant
@@ -253,6 +291,9 @@ Expected result:
 rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
+
+`restart` starts the server again only once its stop has confirmed every
+recorded process gone; otherwise it reports that and starts nothing.
 
 The rest of this section needs a **vLLM** server running, on Linux or WSL, and
 two runtimes to move it between. Nothing earlier in this document sets either
@@ -465,6 +506,57 @@ Expected result:
 - The server starts on `http://127.0.0.1:18188`.
 - Status shows the local URL and current state.
 - Stop shuts down the saved process.
+
+Reinstall over a used install. Put a file in the folder `rocm comfyui
+models-path` prints, save a workflow in the UI, generate one image, stop
+ComfyUI, then:
+
+```powershell
+rocm comfyui install --reinstall --dry-run
+rocm comfyui install --reinstall
+```
+
+Expected result:
+
+- The dry run prints `reinstall: replaces the ComfyUI code in <folder>`,
+  `keeps:` naming the preserved folders the install has (from `models, user,
+  output, input, custom_nodes, datasets, extra_model_paths.yaml`),
+  `leaves in place:`, and either `sets aside:` or, for an install made before
+  rocm-cli recorded what its release shipped, `replaces:`. Its
+  `install command:` ends in `--reinstall`. The ComfyUI folder is not changed.
+- The reinstall prints `kept:` naming the folders the install already had,
+  and the model file, the saved workflow and the image are all still there
+  afterwards, unchanged. Put a file such as `styles.csv` at the top of that
+  folder first: it is listed under `left in place:` and still there after.
+  For an install made before the record, the reinstall also prints
+  `replaced:` naming the code entries it deleted.
+- With the network disconnected (and no archive cached under the ComfyUI
+  folder's `downloads/`), the reinstall fails and the existing install and
+  your files are untouched.
+- With ComfyUI started (`rocm comfyui start`), the dry run prints a `note:`
+  that the reinstall is refused until `rocm comfyui stop`. The reinstall is
+  then refused and names `rocm comfyui stop`; after running that, the
+  reinstall goes ahead.
+- With no archive cached, start ComfyUI (`rocm comfyui start`) from another
+  terminal while the reinstall is still downloading: once the download
+  finishes, the reinstall is refused before it replaces any code, names
+  `rocm comfyui stop`, and the ComfyUI folder is unchanged.
+- A download that is not a ComfyUI release (no `main.py` in its top folder)
+  is hard to produce by hand; `comfyui-13` serves one and checks that the
+  reinstall fails saying so, leaves the install as it was and does not keep
+  the download.
+- With ComfyUI stopped (which removes rocm-cli's saved record of it), create
+  `apps/comfyui/state/running.json` under rocm-cli's data folder containing
+  only `{`: the reinstall prints a `Note:` that it cannot tell whether ComfyUI
+  is running, and goes ahead.
+- If the reinstall fails after the new code is in place (on a host where the
+  AMD GPU check fails, say), the error names what was replaced or set aside
+  and `rocm comfyui install --runtime-id <key>`; once the cause is fixed, that
+  command finishes the install and `rocm comfyui status` shows
+  `installed: yes`.
+
+Interrupting the code swap itself is hard to time by hand; the unit test
+`interrupted_swap_converges_when_run_again` stops it at every step instead.
 
 For the stricter developer GPU test:
 

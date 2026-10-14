@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT
 
 pub mod capability;
+pub mod chat_request;
 pub mod expectation;
 pub mod harness_diagnostics;
 pub mod http_server;

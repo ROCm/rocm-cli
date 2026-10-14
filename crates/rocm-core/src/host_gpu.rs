@@ -18,7 +18,7 @@
 
 use crate::{
     AppPaths, LegacyRocmSummary, TheRockFamilyManifest, detect_legacy_rocm_summary,
-    detect_managed_therock_family, discover_rocm_installs, env_flag, examine, host_path,
+    detect_managed_therock_family, discover_rocm_installs, examine, host_path,
     managed_sdk_tool_path, runtime_is_linux, runtime_is_windows, runtime_os_name, unix_time_millis,
 };
 use anyhow::Result;
@@ -104,6 +104,30 @@ pub fn extract_first_gfx_token(text: &str) -> Option<String> {
         })
 }
 
+/// Whether `gfx` is a GPU target that is known to have no ROCm build.
+///
+/// This is the case when the CLI recognizes the target but no TheRock package
+/// family covers it, so `normalize_therock_family` returns `None` for it on
+/// purpose rather than because the target is unknown.
+///
+/// Today that is gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
+/// APUs. Callers use it to say "detected, but not supported by ROCm" instead of
+/// treating the GPU as undetected or suggesting a package family for it.
+///
+/// The `normalize_therock_family` half of that sentence is a real conjunct, not
+/// a restatement: if the gfx90c arm there were ever removed and the target fell
+/// back into the loose `gfx90` catch-all, this would answer `false` and every
+/// caller would go back to the old data-center behaviour together. Naming the
+/// target on its own would instead leave the two halves free to disagree — the
+/// install path would keep refusing gfx90c through this predicate while
+/// `normalize_therock_family` quietly resolved `gfx90X-dcgpu` for it, and the
+/// refusal would be certifying a mapping that no longer existed. Tests that
+/// drive the refusal are only evidence about the mapping because of this.
+pub fn gfx_target_has_no_rocm_build(gfx: &str) -> bool {
+    extract_first_gfx_token(gfx).is_some_and(|target| target.starts_with("gfx90c"))
+        && normalize_therock_family(gfx).is_none()
+}
+
 pub fn normalize_therock_family(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -140,6 +164,10 @@ pub fn normalize_therock_family(value: &str) -> Option<String> {
         {
             Some("gfx94X-dcgpu".to_owned())
         }
+        // gfx90c is the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo
+        // APUs. TheRock publishes no build for it, so it must not fall into the
+        // data-center `gfx90X-dcgpu` catch-all below.
+        value if value.starts_with("gfx90c") => None,
         value if value.starts_with("gfx90") => Some("gfx90X-dcgpu".to_owned()),
         _ => None,
     }
@@ -263,7 +291,7 @@ fn capture_optional_command_candidate_with_timeout(
 }
 
 fn debug_command_capture_failure(program: &Path, stage: &str, detail: &str) {
-    if !env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
+    if !crate::runtime::env_flag("ROCM_CLI_DEBUG_COMMAND_CAPTURE") {
         return;
     }
     eprintln!(
@@ -581,18 +609,26 @@ const fn detect_linux_primary_gpu_name() -> Option<String> {
 
 fn parse_windows_display_gfx_target(text: &str) -> Option<String> {
     let mut name_fallback = None;
+    let mut unsupported_match = None;
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let (name, pnp_id) = line.split_once('\t').unwrap_or((line, ""));
         if let Some(device_id) = amd_pci_device_id_from_pnp_id(pnp_id)
             && let Some(target) = gfx_target_from_amd_pci_device_id(&device_id)
         {
+            if gfx_target_has_no_rocm_build(target) {
+                // A Vega iGPU listed ahead of a discrete card must not hide it:
+                // keep looking, and fall back to this target only if nothing
+                // else on the host is recognized.
+                unsupported_match = unsupported_match.or(Some(target));
+                continue;
+            }
             return Some(target.to_owned());
         }
         if name_fallback.is_none() {
             name_fallback = gfx_target_from_amd_marketing_name(name).map(str::to_owned);
         }
     }
-    name_fallback
+    name_fallback.or_else(|| unsupported_match.map(str::to_owned))
 }
 
 fn parse_windows_display_name(text: &str) -> Option<String> {
@@ -633,6 +669,20 @@ fn gfx_target_from_amd_pci_device_id(device_id: &str) -> Option<&'static str> {
         "73e0" | "73e1" | "73e2" | "73e3" | "73e8" | "73e9" | "73ea" | "73eb" | "73ec" | "73ed"
         | "73ef" => Some("gfx1032"),
         "7420" | "7421" | "7422" | "7423" | "7424" | "743f" => Some("gfx1034"),
+        // Vega-based APUs (Renoir / Lucienne / Cezanne / Barcelo): all gfx90c.
+        // Radeon Vega 6/7/8 iGPUs in Ryzen 4000/5000/7020 mobile and desktop parts.
+        //
+        // All four are the `/* Renoir */` block of the upstream kernel's
+        // `drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c`, where they share
+        // `CHIP_RENOIR | AMD_IS_APU`. coreboot's `pci_ids.h` and OpenBSD's
+        // `amdgpu_devlist.h` carry the identical four. Per ID:
+        //   1636  Renoir    (CPU family 17h model 60h)
+        //   164c  Lucienne  (CPU family 17h model 68h)
+        //   1638  Cezanne   (CPU family 19h model 51h)
+        //   15e7  Barcelo   (CPU family 19h model 51h)
+        // Note 164c, not 164d: 164d is Yellow Carp / Rembrandt, a different
+        // ASIC, and is mapped to gfx1035 below.
+        "1636" | "1638" | "164c" | "15e7" => Some("gfx90c"),
         // RDNA2 APUs.
         "163f" => Some("gfx1033"),
         "164d" | "1681" => Some("gfx1035"),
@@ -1631,20 +1681,27 @@ impl WindowsExamineInventory {
     }
 
     fn preferred_amd_display(&self) -> Option<&WindowsDisplayAdapter> {
+        let pci_target = |display: &WindowsDisplayAdapter| {
+            display
+                .pnp_device_id
+                .as_deref()
+                .and_then(amd_pci_device_id_from_pnp_id)
+                .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id))
+        };
         self.displays
             .iter()
-            .find(|display| {
-                display
-                    .pnp_device_id
-                    .as_deref()
-                    .and_then(amd_pci_device_id_from_pnp_id)
-                    .and_then(|device_id| gfx_target_from_amd_pci_device_id(&device_id))
-                    .is_some()
-            })
+            .find(|display| pci_target(display).is_some_and(|t| !gfx_target_has_no_rocm_build(t)))
             .or_else(|| {
                 self.displays
                     .iter()
                     .find(|display| gfx_target_from_amd_marketing_name(&display.name).is_some())
+            })
+            // A recognized-but-unsupported iGPU (gfx90c) ranks below every
+            // other recognized adapter, so it cannot hide a discrete card.
+            .or_else(|| {
+                self.displays
+                    .iter()
+                    .find(|display| pci_target(display).is_some())
             })
             .or_else(|| {
                 self.displays
@@ -1724,6 +1781,25 @@ impl ExamineSummary {
         })
     }
 
+    /// The `rocm_support` line of the examine text, or an empty string.
+    ///
+    /// Present only when a GPU was detected but no ROCm package family covers
+    /// it (for example the gfx90c Vega iGPU in Renoir / Cezanne APUs). Without
+    /// it `compatible_therock_family: <unknown>` reads like a probe failure, when
+    /// the GPU was in fact recognized and simply has no ROCm build.
+    fn rocm_support_line(&self) -> String {
+        match (
+            self.detected_gfx_target.as_deref(),
+            self.compatible_therock_family.as_deref(),
+        ) {
+            (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => format!(
+                "  rocm_support: GPU detected ({gfx}) but not supported by ROCm; \
+                 the Vulkan backend can still be used\n"
+            ),
+            _ => String::new(),
+        }
+    }
+
     pub fn render_text(&self) -> String {
         let legacy_paths = if self.legacy_rocm.paths.is_empty() {
             "<none>".to_owned()
@@ -1746,7 +1822,7 @@ impl ExamineSummary {
             "false (this run's output is captured, so the CLI will not prompt)"
         };
         format!(
-            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
+            "rocm examine\n  os: {}\n  arch: {}\n  kernel: {}\n  distro: {}\n  cpu: {}\n  system_ram: {}\n  interactive_terminal: {}\n  default_engine: {}\n  detected_gfx_target: {}\n  compatible_therock_family: {}\n{}  detected_therock_family: {}\n  driver_policy: {}\n  driver_status: {}\n  driver_detail: {}\n  legacy_rocm_status: {}\n  legacy_rocm_paths: {}\n  legacy_rocm_version: {}\n  legacy_rocm_detail: {}\n  legacy_rocm_guidance: {}\n  wsl: {}\n  wsl_dxg_device: {}\n  wsl_dxcore: {}\n  wsl_librocdxg: {}\n  wsl_rocdxg_dids: {}\n  wsl_ldconfig_librocdxg: {}\n  wsl_global_rocminfo: {}\n  wsl_cargo: {}\n  wsl_detail: {}\n  managed_runtimes: {}\n  managed_services: {}\n  model_cache_entries: {}\n  config_dir: {}\n  data_dir: {}\n  cache_dir: {}\n",
             self.os,
             self.arch,
             self.kernel.as_deref().unwrap_or("<unknown>"),
@@ -1760,6 +1836,7 @@ impl ExamineSummary {
             self.compatible_therock_family
                 .as_deref()
                 .unwrap_or("<unknown>"),
+            self.rocm_support_line(),
             self.detected_therock_family
                 .as_deref()
                 .unwrap_or("<not detected>"),
@@ -1885,27 +1962,35 @@ fn detect_kernel_version() -> Option<String> {
     }
 }
 
-fn detect_distro_name() -> Option<String> {
+pub(crate) fn detect_distro_name() -> Option<String> {
     if runtime_is_windows() {
         return Some("Windows".to_owned());
     }
 
     if runtime_is_linux() {
-        return parse_os_release_pretty_name(
+        return Some(distro_name_from_os_release(
             &fs::read_to_string(host_path("/etc/os-release")).ok()?,
-        )
-        .or_else(|| Some("Linux".to_owned()));
+        ));
     }
 
     None
 }
 
-fn parse_os_release_pretty_name(text: &str) -> Option<String> {
-    text.lines().find_map(|line| {
-        let value = line.strip_prefix("PRETTY_NAME=")?.trim();
-        let value = value.trim_matches('"').trim_matches('\'').trim();
-        (!value.is_empty()).then(|| value.to_owned())
-    })
+/// The distribution name `rocm examine` prints, from os-release `text`:
+/// `PRETTY_NAME` as `sh` reads it, else `Linux`.
+///
+/// An unreadable file says which line made it so, on the line a person reads
+/// — `rocm examine`'s `probe_failures`, which carries the same reason, is only
+/// in the `--json` form. A blank `PRETTY_NAME` also falls back to `Linux`.
+fn distro_name_from_os_release(text: &str) -> String {
+    match crate::os_release::parse(text) {
+        Ok(mut fields) => fields
+            .remove("PRETTY_NAME")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Linux".to_owned()),
+        Err(unreadable) => format!("Linux (/etc/os-release {unreadable})"),
+    }
 }
 
 fn detect_cpu_model_with_windows_inventory(
@@ -3165,12 +3250,10 @@ mod tests {
             fs::write(path, format!("@echo off\r\necho {target}\r\n"))?;
         } else {
             let path = bin_dir.join("rocm_agent_enumerator");
-            fs::write(&path, format!("#!/bin/sh\necho {target}\n"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
-            }
+            crate::fake_executable::write_fake_executable(
+                &path,
+                format!("#!/bin/sh\necho {target}\n"),
+            )?;
         }
         Ok(())
     }
@@ -3339,6 +3422,111 @@ mod tests {
         );
     }
 
+    /// gfx90c (Renoir / Lucienne / Cezanne / Barcelo Vega iGPUs) has no TheRock
+    /// build. It used to fall into the loose `gfx90` arm and come back as the
+    /// data-center family `gfx90X-dcgpu`, which `rocm install sdk` then offered.
+    #[test]
+    fn normalize_therock_family_has_no_family_for_gfx90c() {
+        assert_eq!(normalize_therock_family("gfx90c"), None);
+        assert_eq!(normalize_therock_family("GFX90C"), None);
+        // A feature-suffixed spelling, as KFD / rocminfo can report it.
+        assert_eq!(normalize_therock_family("gfx90c:xnack-"), None);
+        // The neighbouring Vega parts keep their families.
+        assert_eq!(
+            normalize_therock_family("gfx900"),
+            Some("gfx900".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx906"),
+            Some("gfx906".to_owned())
+        );
+        assert_eq!(
+            normalize_therock_family("gfx90a"),
+            Some("gfx90a".to_owned())
+        );
+    }
+
+    #[test]
+    fn gfx_target_has_no_rocm_build_names_only_gfx90c() {
+        assert!(gfx_target_has_no_rocm_build("gfx90c"));
+        assert!(gfx_target_has_no_rocm_build("GFX90C"));
+        assert!(gfx_target_has_no_rocm_build("gfx90c:xnack-"));
+        assert!(!gfx_target_has_no_rocm_build("gfx90a"));
+        assert!(!gfx_target_has_no_rocm_build("gfx906"));
+        assert!(!gfx_target_has_no_rocm_build("gfx1103"));
+        assert!(!gfx_target_has_no_rocm_build(""));
+    }
+
+    /// The predicate must agree with `normalize_therock_family`, not merely
+    /// happen to.
+    ///
+    /// "Has no ROCm build" and "normalizes to no family" are two statements
+    /// about the same fact, written in two places. Today they cannot drift,
+    /// because the predicate is conjoined with the mapping rather than carrying
+    /// its own copy of the target name. Were that conjunct dropped, they could:
+    /// the install path would refuse a target the resolver happily maps, and —
+    /// worse for the test suite — every test that drives the refusal through
+    /// `--family gfx90c` would keep passing after the gfx90c arm in
+    /// `normalize_therock_family` was deleted, because the refusal would
+    /// short-circuit before the mapping was ever consulted. That is the
+    /// counterfactual, not a description of the current code; drop both and
+    /// `runtime-19` goes green through the regression it exists to catch, which
+    /// is the one mutant this test fires against. Measured — see the mutant
+    /// list under "GPU targets with no ROCm build" in `docs/testing.md`.
+    ///
+    /// Note this is an implication, so it holds vacuously when the predicate
+    /// answers `false`: it pins the two together but is not on its own the
+    /// evidence that gfx90c has no family. `normalize_therock_family_has_no_family_for_gfx90c`
+    /// is.
+    #[test]
+    fn no_rocm_build_implies_no_therock_family() {
+        for target in [
+            "gfx90c",
+            "gfx90c:xnack-",
+            "gfx900",
+            "gfx906",
+            "gfx908",
+            "gfx90a",
+            "gfx1030",
+            "gfx1103",
+            "gfx1201",
+        ] {
+            if gfx_target_has_no_rocm_build(target) {
+                assert_eq!(
+                    normalize_therock_family(target),
+                    None,
+                    "`{target}` is reported as having no ROCm build, so it must \
+                     not normalize to a package family"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_display_parser_prefers_a_supported_gpu_over_a_vega_igpu() {
+        // Ryzen 4000/5000 laptop with a discrete card: the iGPU is listed first
+        // and has a mapped PCI ID, but it must not hide the discrete GPU.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
+                    AMD Radeon RX 6600\tPCI\\VEN_1002&DEV_73E0";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1032".to_owned())
+        );
+        // The name fallback also outranks the unsupported iGPU.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636\n\
+                    AMD Radeon RX 6800M\tPCI\\VEN_1002&DEV_9999";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx1031".to_owned())
+        );
+        // Alone, the iGPU is still reported as gfx90c.
+        let text = "AMD Radeon(TM) Graphics\tPCI\\VEN_1002&DEV_1636";
+        assert_eq!(
+            parse_windows_display_gfx_target(text),
+            Some("gfx90c".to_owned())
+        );
+    }
+
     #[test]
     fn known_therock_families_all_round_trip() {
         for family in known_therock_families() {
@@ -3378,6 +3566,11 @@ mod tests {
             ("164F", "gfx1103"),
             ("1900", "gfx1103"),
             ("1114", "gfx1152"),
+            // Vega APUs: Renoir, Cezanne, Lucienne, Barcelo.
+            ("1636", "gfx90c"),
+            ("1638", "gfx90c"),
+            ("164C", "gfx90c"),
+            ("15E7", "gfx90c"),
         ] {
             assert_eq!(
                 parse_windows_display_gfx_target(&format!(
@@ -4391,6 +4584,81 @@ Class Name:                Display
         assert!(rendered.contains("model_cache_entries: 3"));
     }
 
+    fn examine_summary_with_gpu(
+        detected_gfx_target: Option<&str>,
+        compatible_therock_family: Option<&str>,
+    ) -> ExamineSummary {
+        ExamineSummary {
+            os: "windows".to_owned(),
+            arch: "x86_64".to_owned(),
+            kernel: None,
+            distro: None,
+            cpu: None,
+            system_ram_gib: None,
+            interactive_terminal: false,
+            default_engine: "lemonade".to_owned(),
+            detected_gfx_target: detected_gfx_target.map(str::to_owned),
+            compatible_therock_family: compatible_therock_family.map(str::to_owned),
+            detected_therock_family: None,
+            driver: DriverSummary {
+                policy: "windows_validate_only".to_owned(),
+                status: "amd_display_driver_detected".to_owned(),
+                detail: None,
+            },
+            legacy_rocm: LegacyRocmSummary {
+                status: "not_detected".to_owned(),
+                paths: Vec::new(),
+                detail: None,
+                version: None,
+            },
+            wsl: None,
+            managed_runtime_count: 0,
+            managed_service_count: 0,
+            model_cache_entries: 0,
+            config_dir: PathBuf::from("config"),
+            data_dir: PathBuf::from("data"),
+            cache_dir: PathBuf::from("cache"),
+        }
+    }
+
+    #[test]
+    fn examine_render_says_a_gpu_without_a_rocm_family_is_unsupported() {
+        // gfx90c is detected from its PCI ID but has no ROCm package family.
+        let family = normalize_therock_family("gfx90c");
+        let summary = examine_summary_with_gpu(Some("gfx90c"), family.as_deref());
+        let rendered = summary.render_text();
+        assert!(
+            rendered.contains("detected_gfx_target: gfx90c"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("rocm_support: GPU detected (gfx90c) but not supported by ROCm"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("the Vulkan backend can still be used"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn examine_render_omits_the_support_note_for_supported_or_missing_gpus() {
+        let family = normalize_therock_family("gfx1103");
+        let supported = examine_summary_with_gpu(Some("gfx1103"), family.as_deref());
+        let rendered = supported.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
+
+        let missing = examine_summary_with_gpu(None, None);
+        let rendered = missing.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
+
+        // An unmapped target the CLI knows nothing about is not claimed to be
+        // unsupported; only targets known to have no ROCm build are.
+        let unknown = examine_summary_with_gpu(Some("gfx803"), None);
+        let rendered = unknown.render_text();
+        assert!(!rendered.contains("rocm_support"), "{rendered}");
+    }
+
     #[test]
     fn examine_render_explains_what_interactive_terminal_means() {
         // The same machine reports `true` from a shell and `false` under the
@@ -4519,9 +4787,30 @@ Class Name:                Display
     #[test]
     fn parses_os_release_pretty_name() {
         assert_eq!(
-            parse_os_release_pretty_name("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
-            Some("Ubuntu 24.04.2 LTS".to_owned())
+            distro_name_from_os_release("NAME=Ubuntu\nPRETTY_NAME=\"Ubuntu 24.04.2 LTS\"\n"),
+            "Ubuntu 24.04.2 LTS"
         );
+    }
+
+    /// The distro name is read through the shared `os_release` parser, so it
+    /// names the distro `sh` would: the last assignment wins and a trailing
+    /// comment is not part of the value. A file with no usable `PRETTY_NAME`
+    /// is plain `Linux`; an unreadable one says which line, rather than
+    /// letting `Linux` read as a description of the machine.
+    #[test]
+    fn pretty_name_reads_as_sh_reads_it() {
+        assert_eq!(
+            distro_name_from_os_release(
+                "PRETTY_NAME=\"Debian GNU/Linux 12\"\nPRETTY_NAME='Ubuntu 24.04 LTS' # LTS\n"
+            ),
+            "Ubuntu 24.04 LTS"
+        );
+        assert_eq!(
+            distro_name_from_os_release("PRETTY_NAME=\"Ubuntu 24.04 LTS\"\nunset ID\n"),
+            "Linux (/etc/os-release line 2 is not a plain assignment: \"unset ID\")"
+        );
+        assert_eq!(distro_name_from_os_release("PRETTY_NAME=\"  \"\n"), "Linux");
+        assert_eq!(distro_name_from_os_release("ID=ubuntu\n"), "Linux");
     }
 
     #[test]

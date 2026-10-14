@@ -952,21 +952,10 @@ fn copy_tree_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scratch_dir;
     use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::time::Duration;
-
-    /// A fresh scratch directory under the crate's `target/`. The base is
-    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
-    /// runtime environment read.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn embeddable_package_matches_runtime_os() {
@@ -1713,7 +1702,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn extract_archive_does_not_execute_a_path_supplied_tar() {
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let dir = scratch_dir("path-supplied-tar");
         let archive = dir.join("archive.tar.gz");
@@ -1724,12 +1713,11 @@ mod tests {
         fs::create_dir_all(&fake_bin).unwrap();
         let marker = dir.join("impostor-ran");
         let fake_tar = fake_bin.join("tar");
-        fs::write(
+        write_fake_executable(
             &fake_tar,
             format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
         )
         .unwrap();
-        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut entries = vec![fake_bin];
         entries.extend(std::env::split_paths(
