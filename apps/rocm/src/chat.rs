@@ -469,3 +469,323 @@ fn engine_name_from_inventory_line(line: &str) -> Option<&'static str> {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn rocm_command_call(args: &[&str]) -> providers::ChatToolCall {
+        providers::ChatToolCall {
+            id: Some("test".to_owned()),
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({ "args": args }),
+        }
+    }
+
+    #[test]
+    fn command_capture_text_prefers_stdout_only_when_stderr_is_blank() {
+        let output = CommandCapture {
+            argv: vec!["rocm".to_owned()],
+            exit_status: 0,
+            stdout: "  all good  \n".to_owned(),
+            stderr: "  \n".to_owned(),
+        };
+        assert_eq!(command_capture_text(&output), "all good");
+    }
+
+    #[test]
+    fn command_capture_text_falls_back_to_stderr_when_stdout_is_blank() {
+        let output = CommandCapture {
+            argv: vec!["rocm".to_owned()],
+            exit_status: 1,
+            stdout: "   ".to_owned(),
+            stderr: "boom".to_owned(),
+        };
+        assert_eq!(command_capture_text(&output), "stderr:\nboom");
+    }
+
+    #[test]
+    fn command_capture_text_joins_both_streams_when_present() {
+        let output = CommandCapture {
+            argv: vec!["rocm".to_owned()],
+            exit_status: 1,
+            stdout: "out".to_owned(),
+            stderr: "err".to_owned(),
+        };
+        assert_eq!(
+            command_capture_text(&output),
+            "stdout:\nout\n\nstderr:\nerr"
+        );
+    }
+
+    #[test]
+    fn mcp_tool_result_text_joins_text_content_items() {
+        let value = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "line one"},
+                {"type": "image", "text": "ignored"},
+                {"type": "text", "text": "line two"},
+            ]
+        });
+        assert_eq!(mcp_tool_result_text(&value), "line one\nline two");
+    }
+
+    #[test]
+    fn mcp_tool_result_text_falls_back_to_raw_value_without_text_content() {
+        let value = serde_json::json!({"content": []});
+        assert_eq!(mcp_tool_result_text(&value), value.to_string());
+    }
+
+    #[test]
+    fn mcp_tool_result_is_error_reads_the_is_error_flag() {
+        assert!(mcp_tool_result_is_error(
+            &serde_json::json!({"isError": true})
+        ));
+        assert!(!mcp_tool_result_is_error(
+            &serde_json::json!({"isError": false})
+        ));
+        assert!(!mcp_tool_result_is_error(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn chat_tool_display_label_maps_known_tools_and_humanizes_others() {
+        assert_eq!(chat_tool_display_label("examine"), "Checked this computer");
+        assert_eq!(chat_tool_display_label("install_sdk"), "Install ROCm");
+        assert_eq!(
+            chat_tool_display_label("some_unmapped_tool"),
+            "some unmapped tool"
+        );
+    }
+
+    #[test]
+    fn chat_tool_call_display_label_delegates_for_non_rocm_command_tools() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "examine".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        assert_eq!(chat_tool_call_display_label(&call), "Checked this computer");
+    }
+
+    #[test]
+    fn chat_tool_call_display_label_recognizes_rocm_command_shapes() {
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["examine"])),
+            "Checked this computer"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["models"])),
+            "Checked model recipes"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["engines", "list"])),
+            "Checked local engines"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["comfyui", "logs", "-n", "50"])),
+            "Read ComfyUI logs"
+        );
+    }
+
+    #[test]
+    fn chat_tool_call_display_label_falls_back_for_unparseable_args() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({"args": []}),
+        };
+        assert_eq!(chat_tool_call_display_label(&call), "rocm command");
+    }
+
+    #[test]
+    fn loopback_tcp_port_is_reachable_detects_listening_and_closed_ports() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(loopback_tcp_port_is_reachable("127.0.0.1", port));
+        drop(listener);
+
+        // Port 0 can never be connected to; stands in for "closed" without
+        // depending on a specific unused port staying unused.
+        assert!(!loopback_tcp_port_is_reachable("127.0.0.1", 0));
+    }
+
+    #[test]
+    fn parse_optional_query_reads_flag_and_positional_forms() {
+        assert_eq!(
+            parse_optional_query(&["--query".to_owned(), "gpu".to_owned()]).unwrap(),
+            Some("gpu".to_owned())
+        );
+        assert_eq!(
+            parse_optional_query(&["-q".to_owned(), "gpu".to_owned()]).unwrap(),
+            Some("gpu".to_owned())
+        );
+        assert_eq!(
+            parse_optional_query(&["gpu".to_owned()]).unwrap(),
+            Some("gpu".to_owned())
+        );
+        assert_eq!(parse_optional_query(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_optional_query_rejects_a_dangling_flag() {
+        assert!(parse_optional_query(&["--query".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_optional_lines_reads_flag_or_defaults() {
+        assert_eq!(
+            parse_optional_lines(&["--lines".to_owned(), "25".to_owned()]).unwrap(),
+            25
+        );
+        assert_eq!(
+            parse_optional_lines(&["-n".to_owned(), "25".to_owned()]).unwrap(),
+            25
+        );
+        assert_eq!(parse_optional_lines(&[]).unwrap(), DEFAULT_LOG_TAIL_LINES);
+    }
+
+    #[test]
+    fn parse_optional_lines_rejects_a_non_numeric_value() {
+        assert!(parse_optional_lines(&["--lines".to_owned(), "nope".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn push_optional_json_cli_arg_pushes_present_values_only() {
+        let object = serde_json::json!({"reason": "because"});
+        let object = object.as_object().unwrap();
+        let mut args = Vec::new();
+        push_optional_json_cli_arg(&mut args, object, "--reason", "reason");
+        push_optional_json_cli_arg(&mut args, object, "--missing", "missing");
+        assert_eq!(args, vec!["--reason".to_owned(), "because".to_owned()]);
+    }
+
+    #[test]
+    fn json_string_filters_missing_and_blank_values() {
+        let object = serde_json::json!({"reason": "  ", "note": "ok"});
+        let object = object.as_object().unwrap();
+        assert_eq!(json_string(object, "note"), Some("ok".to_owned()));
+        assert_eq!(json_string(object, "reason"), None);
+        assert_eq!(json_string(object, "missing"), None);
+    }
+
+    #[test]
+    fn parse_deterministic_model_recipes_reads_header_fields_and_notes() {
+        let recipes = parse_deterministic_model_recipes(
+            "\
+  Qwen3-4B-Instruct-2507-GGUF aliases=[qwen, lemonade-qwen] task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
+lemonade: ready
+warning: slow on this GPU
+  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
+vllm: not_installed
+",
+        );
+        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes[0].canonical_id, "Qwen3-4B-Instruct-2507-GGUF");
+        assert_eq!(recipes[0].min_gpu_mem_gib, Some(4));
+        assert_eq!(recipes[0].engines, vec!["lemonade".to_owned()]);
+        assert_eq!(
+            recipes[0].engine_statuses,
+            vec!["lemonade: ready".to_owned()]
+        );
+        assert_eq!(recipes[0].warnings, vec!["slow on this GPU".to_owned()]);
+        assert_eq!(recipes[1].canonical_id, "Qwen/Qwen3.5-4B");
+        assert_eq!(recipes[1].min_gpu_mem_gib, Some(12));
+    }
+
+    #[test]
+    fn parse_deterministic_service_rows_reads_inline_key_value_form() {
+        let rows = parse_deterministic_service_rows(
+            "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
+        );
+        assert_eq!(rows.len(), 1);
+        // Pre-existing behavior, not introduced by this move: the leading
+        // "- service_id=" prefix strip consumes the `service_id` key before
+        // the per-token `key=value` loop runs, so the bare id token that's
+        // left (`svc-1`) has no `=` and is silently dropped — service_id ends
+        // up empty for this inline form. Fixing the parser is out of scope
+        // for this no-behavior-change extraction.
+        assert_eq!(rows[0].service_id, "");
+        assert_eq!(rows[0].engine, "vllm");
+        assert_eq!(rows[0].status, "ready");
+        assert_eq!(rows[0].running_state, "running");
+        assert_eq!(rows[0].endpoint, "127.0.0.1:8000");
+    }
+
+    #[test]
+    fn parse_deterministic_service_rows_derives_running_state_when_absent() {
+        let rows = parse_deterministic_service_rows(
+            "\
+- svc-2
+status: starting
+engine: lemonade
+model: qwen
+endpoint: 127.0.0.1:8001
+",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].service_id, "svc-2");
+        assert_eq!(rows[0].running_state, "starting");
+    }
+
+    #[test]
+    fn parse_deterministic_engine_rows_reads_runtime_and_note() {
+        let rows = parse_deterministic_engine_rows(
+            "\
+* lemonade
+  runtime: gfx120X-all
+  note: default engine
+* vllm
+  runtime: gfx110X-all
+",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].engine, "lemonade");
+        assert_eq!(rows[0].runtime, "gfx120X-all");
+        assert_eq!(rows[0].note, "default engine");
+        assert_eq!(rows[1].engine, "vllm");
+        assert_eq!(rows[1].note, "");
+    }
+
+    #[test]
+    fn normalized_chat_rocm_command_args_strips_leading_program_name() {
+        let call = rocm_command_call(&["rocm", "engines", "list"]);
+        assert_eq!(
+            normalized_chat_rocm_command_args(&call).unwrap(),
+            vec!["engines".to_owned(), "list".to_owned()]
+        );
+    }
+
+    #[test]
+    fn normalized_chat_rocm_command_args_rejects_empty_and_control_characters() {
+        assert!(normalized_chat_rocm_command_args(&rocm_command_call(&[])).is_err());
+        assert!(normalized_chat_rocm_command_args(&rocm_command_call(&["rocm"])).is_err());
+
+        let with_control_char = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({"args": ["engines\nlist"]}),
+        };
+        assert!(normalized_chat_rocm_command_args(&with_control_char).is_err());
+    }
+
+    #[test]
+    fn normalized_chat_rocm_command_args_rejects_a_non_string_reason() {
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({"args": ["engines", "list"], "reason": 42}),
+        };
+        assert!(normalized_chat_rocm_command_args(&call).is_err());
+    }
+
+    #[test]
+    fn managed_service_running_state_maps_every_known_status() {
+        assert_eq!(managed_service_running_state("ready"), "running");
+        assert_eq!(managed_service_running_state("running"), "running");
+        assert_eq!(managed_service_running_state("starting"), "starting");
+        assert_eq!(managed_service_running_state("recovering"), "starting");
+        assert_eq!(managed_service_running_state("failed"), "not_running");
+        assert_eq!(managed_service_running_state("stopped"), "not_running");
+        assert_eq!(managed_service_running_state("anything-else"), "unknown");
+    }
+}
