@@ -556,3 +556,22 @@ Feature: Diagnosing failures and listing fixes
     Given a user who pasted a capture naming vLLM and another engine's OOM on separate rendered lines
     When the user asks the CLI to diagnose that symptom in machine-readable form
     Then no vLLM startup OOM is reported
+
+  # The ticket's host: a laptop whose only AMD GPU is a Vega iGPU ROCm has never
+  # shipped a runtime build for. The point of the whole change is what such a
+  # machine is told, and before it the top-ranked answer was "install the HIP
+  # SDK" -- a download that would not have helped, on a host whose default
+  # engine does not use HIP at all.
+  #
+  # The host is simulated rather than required: a KFD node planted under the
+  # scenario's own root reports gfx_target_version 90012 (gfx90c), and a
+  # stand-in `lspci` lists an empty bus so the runner's real cards are not
+  # described. The same mechanism `examine-23` uses, so this runs on every Linux
+  # lane, GPU or not.
+  @id:diagnose-unsupported-gpu-is-explained-not-fixed @requires-os:linux
+  Scenario: diagnose-38 - A GPU with no ROCm build is explained, and nothing is offered to install
+    Given a machine whose only GPU is one ROCm has no build for
+    When the user asks the CLI to diagnose that machine's state
+    Then the diagnosis names the architecture and says Vulkan still works
+    And that cause offers no fix to apply, and says so
+    And no cause tells this user to install the HIP SDK

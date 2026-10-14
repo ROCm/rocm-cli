@@ -90,6 +90,12 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
     "fix-21-msvc-redist-outdated",
+    // The catalog's one DIAGNOSE-ONLY entry, carrying an `info-` id because it
+    // has no fix to offer. It is in the catalog all the same: `rocm diagnose`
+    // prints `apply with: rocm fix info-20-gpu-no-rocm-support` for it, so
+    // `rocm fix` has to resolve that id -- by naming the problem and changing
+    // nothing. Leaving it out here would let the two published forms drift.
+    "info-20-gpu-no-rocm-support",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.
@@ -503,29 +509,13 @@ async fn assert_reports_cause_and_fix(world: &mut E2eWorld) {
     );
 }
 
-/// Count the causes in a `rocm diagnose` report that carry a `Fix`.
-///
-/// A cause renders as `#1 (<id>) [TIER score=NN/100] <title>`, so the id sits on
-/// the same line as the score. Causes with an `info-` id are informational:
-/// their catalog entry has `fix: None`, so by construction they have no `plan:`,
-/// `flags:` or `apply with:` line (`info-20-gpu-no-rocm-support` is the first
-/// one). Counting them among the causes that must be actionable would assert
-/// the opposite of what the catalog says, so the two per-fix invariants below
-/// are stated over the fixful causes only.
-fn causes_with_a_fix(output: &str) -> usize {
-    output
-        .lines()
-        .filter(|l| l.contains("score=") && !l.contains("(info-"))
-        .count()
-}
-
 #[then("every reported cause comes with a command that applies it")]
 async fn assert_every_cause_has_a_command(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no diagnose output");
     // A plan alone is not actionable: the report used to name a `rocm fix`
     // command only when some match cleared the confidence threshold, so a report
     // of low-confidence causes left the user with nothing to run.
-    let causes = causes_with_a_fix(output);
+    let causes = output.lines().filter(|l| l.contains("score=")).count();
     let commands = output
         .lines()
         .filter(|l| l.trim().starts_with("apply with: rocm fix "))
@@ -552,7 +542,7 @@ async fn assert_every_cause_has_flags(world: &mut E2eWorld) {
     // underlying values for a given fix-id -- unit tests in diagnose.rs call
     // fix.rs's `assert_needs_reboot_matches_the_catalog` to pin per-fix-id
     // values against the catalog for that.
-    let causes = causes_with_a_fix(output);
+    let causes = output.lines().filter(|l| l.contains("score=")).count();
     assert!(causes > 0, "no scored causes to check:\n{output}");
     let flag_lines: Vec<&str> = output
         .lines()
@@ -2449,5 +2439,128 @@ async fn assert_json_with_fix_id_refused(world: &mut E2eWorld) {
     assert!(
         serde_json::from_str::<serde_json::Value>(stdout).is_err(),
         "a refused request still produced machine-readable output:\n{stdout}"
+    );
+}
+
+// ── A GPU ROCm has no build for ────────────────────────────────────
+
+#[given("a machine whose only GPU is one ROCm has no build for")]
+async fn machine_with_an_unsupported_gpu(world: &mut E2eWorld) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology, reporting gfx_target_version 90012.
+    // That decodes to gfx90c -- the Vega iGPU in Renoir / Lucienne / Cezanne /
+    // Barcelo, and the one architecture the catalog says has no ROCm build.
+    // `cpu_cores_count 0` with a nonzero `simd_count` is what makes the node a
+    // GPU rather than a CPU node.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 56\ngfx_target_version 90012\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.join("host-root").into()));
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards --
+    // a second, supported GPU would make the whole-machine claim false and the
+    // cause would correctly not fire.
+    let bin = root.join("unsupported-gpu-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user asks the CLI to diagnose that machine's state")]
+async fn user_diagnoses_planted_machine(world: &mut E2eWorld) {
+    // No `--symptom`: the finding is about the hardware, and the user on this
+    // host has no error to paste -- Vulkan inference works. `--top 20` so the
+    // assertions below read the whole ranking rather than the default five.
+    // Where the cause ranks is a separate question from whether it is reported
+    // at all, and the runner's own state can add causes above it.
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["diagnose", "--top", "20"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// The reported cause block for `info-20-gpu-no-rocm-support`: the `#N (id)`
+/// header line and everything under it up to the blank line that ends it.
+fn unsupported_gpu_cause(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .skip_while(|line| !line.contains("(info-20-gpu-no-rocm-support)"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect()
+}
+
+#[then("the diagnosis names the architecture and says Vulkan still works")]
+async fn assert_unsupported_gpu_named(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm diagnose` always exits 0");
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let cause = unsupported_gpu_cause(output);
+    assert!(
+        !cause.is_empty(),
+        "the planted gfx90c host must be told why ROCm will not work on it:\n{output}"
+    );
+    let text = cause.join("\n");
+    assert!(
+        text.contains("gfx90c"),
+        "naming the architecture is the acceptance criterion; a bare \"unsupported\" \
+         leaves the user unable to check it:\n{text}"
+    );
+    assert!(
+        text.contains("Vulkan"),
+        "and the usable path has to be named, or the report reads as \"this machine \
+         cannot do inference\":\n{text}"
+    );
+}
+
+#[then("that cause offers no fix to apply, and says so")]
+async fn assert_unsupported_gpu_has_no_fix(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    let text = unsupported_gpu_cause(output).join("\n");
+    assert!(
+        text.contains("no reliable fix"),
+        "the flags line has to say there is nothing to apply, or `apply with:` below it \
+         reads as a repair:\n{text}"
+    );
+    // The `apply with:` line is still printed, and still works: the id is a
+    // DIAGNOSE-ONLY catalog entry, so `rocm fix` answers for it by naming the
+    // problem and changing nothing. Dropping the line for this one id would
+    // have made README and `--help` false for it.
+    assert!(
+        text.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+        "every cause carries the command that acts on it, this one included:\n{text}"
+    );
+    let (_, _, rc) = crate::run_rocm(world, &["fix", "info-20-gpu-no-rocm-support", "--yes"]);
+    assert_eq!(
+        rc, 0,
+        "the id the report told the user to run must be one `rocm fix` accepts"
+    );
+}
+
+#[then("no cause tells this user to install the HIP SDK")]
+async fn assert_no_hip_sdk_advice(world: &mut E2eWorld) {
+    // The regression this change exists for. `fix-13-hip-sdk-missing` is
+    // Windows-only, so on this Linux lane the general form is the one worth
+    // pinning: nothing on a host with no HIP-based setup may propose an SDK
+    // install as the way forward.
+    let output = world.cli_output.as_ref().expect("no diagnose output");
+    assert!(
+        !output.contains("fix-13-hip-sdk-missing"),
+        "a host whose only engine is Vulkan has nothing to gain from a HIP SDK:\n{output}"
     );
 }
