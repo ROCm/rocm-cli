@@ -3408,6 +3408,77 @@ fi
         );
     }
 
+    /// Mirrors `wiki_publish_guard_stops_on_the_generators_empty_output`, but
+    /// for the release-readiness wiki job: runs its real status-table guard
+    /// against `render_table`'s actual output, both for unreadable E2E
+    /// evidence (`e2e_fail_total: None`) and a well-formed table, so a
+    /// regression in either the guard or the renderer's degenerate case is
+    /// caught by behavior rather than a pinned string.
+    #[cfg(unix)]
+    #[test]
+    fn release_readiness_wiki_publish_guard_stops_on_unreadable_e2e_evidence() {
+        use crate::release_readiness::{CommitBuckets, Facts, Verdict, render_table};
+
+        let nightly = read_workflow("nightly.yml");
+        let publish = job_block(&nightly, "publish-release-readiness-wiki");
+        let lines: Vec<&str> = publish.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("if ! grep -q '^| Area | Evidence | Status |'")
+            })
+            .expect("publish job has the status-table guard");
+        let end = start
+            + lines[start..]
+                .iter()
+                .position(|l| l.trim() == "fi")
+                .expect("guard is closed by fi");
+        let guard = lines[start..=end].join("\n");
+
+        let run = |table: &str| -> String {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            std::fs::create_dir_all(dir.join("release-readiness")).unwrap();
+            std::fs::write(dir.join("release-readiness/table.md"), table).unwrap();
+            let script = format!("set -euo pipefail\n{guard}\necho REACHED_PUBLISH\n");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir)
+                .output()
+                .expect("run bash");
+            assert!(out.status.success(), "guard script failed: {out:?}");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        let unreadable = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::NoGo,
+            failing_gates: vec!["E2E (report unreadable)".to_string()],
+            e2e_fail_total: None,
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        assert!(
+            !run(&unreadable).contains("REACHED_PUBLISH"),
+            "unreadable E2E evidence must stop the release-readiness wiki publish"
+        );
+
+        let well_formed = render_table(&Facts {
+            since_tag: "v1.0.0".to_string(),
+            verdict: Verdict::Go,
+            failing_gates: vec![],
+            e2e_fail_total: Some(0),
+            commits: CommitBuckets::default(),
+            known_issues: vec![],
+        });
+        assert!(
+            run(&well_formed).contains("REACHED_PUBLISH"),
+            "a well-formed table must reach the publish step"
+        );
+    }
+
     #[test]
     fn dispatchable_wsl_nightly_run_has_the_full_nightly_job_budget() {
         let self_hosted = read_workflow("e2e-selfhosted.yml");

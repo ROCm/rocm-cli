@@ -61,9 +61,14 @@ pub struct Facts {
     pub since_tag: String,
     pub verdict: Verdict,
     /// Named gates that did not pass (build/windows-build job results, or
-    /// "E2E" if any platform reported a failure). Empty iff `verdict` is `Go`.
+    /// "E2E" if any platform reported a failure or the report couldn't be
+    /// read). Empty iff `verdict` is `Go`.
     pub failing_gates: Vec<String>,
-    pub e2e_fail_total: u64,
+    /// `None` when the E2E report's `**Total**` row couldn't be found or
+    /// parsed — treated as a failing gate rather than silently reading as
+    /// zero failures, since a missing row more often means the report is
+    /// broken than that E2E had a perfect run.
+    pub e2e_fail_total: Option<u64>,
     pub commits: CommitBuckets,
     pub known_issues: Vec<KnownIssue>,
 }
@@ -84,15 +89,44 @@ pub fn run(
         .with_context(|| format!("reading e2e report {}", e2e_report.display()))?;
     let e2e_fail_total = total_e2e_failures(&e2e_text);
 
+    let facts = assemble_facts(
+        since_tag,
+        commits,
+        known_issues,
+        e2e_fail_total,
+        nightly_result,
+        windows_result,
+    );
+
+    write_parented(out, &serde_json::to_string_pretty(&facts)?)?;
+    write_parented(table_out, &render_table(&facts))?;
+    Ok(())
+}
+
+/// Pure assembly of [`Facts`] from already-collected inputs: no I/O, so the
+/// GO/NO-GO logic can be unit-tested without shelling out to `git`/`gh` or
+/// touching the filesystem.
+fn assemble_facts(
+    since_tag: &str,
+    commits: CommitBuckets,
+    known_issues: Vec<KnownIssue>,
+    e2e_fail_total: Option<u64>,
+    nightly_result: &str,
+    windows_result: &str,
+) -> Facts {
     let mut failing_gates = Vec::new();
-    if nightly_result != "success" {
+    // `skipped` is a legitimate outcome on a no-op night (e.g.
+    // windows-nightly's own skip flag), not a failure to gate on.
+    if !matches!(nightly_result, "success" | "skipped") {
         failing_gates.push(format!("nightly build ({nightly_result})"));
     }
-    if windows_result != "success" {
+    if !matches!(windows_result, "success" | "skipped") {
         failing_gates.push(format!("windows build ({windows_result})"));
     }
-    if e2e_fail_total > 0 {
-        failing_gates.push(format!("E2E ({e2e_fail_total} failure(s))"));
+    match e2e_fail_total {
+        None => failing_gates.push("E2E (report unreadable)".to_string()),
+        Some(n) if n > 0 => failing_gates.push(format!("E2E ({n} failure(s))")),
+        Some(_) => {}
     }
 
     let verdict = if failing_gates.is_empty() {
@@ -101,18 +135,14 @@ pub fn run(
         Verdict::NoGo
     };
 
-    let facts = Facts {
+    Facts {
         since_tag: since_tag.to_string(),
         verdict,
         failing_gates,
         e2e_fail_total,
         commits,
         known_issues,
-    };
-
-    write_parented(out, &serde_json::to_string_pretty(&facts)?)?;
-    write_parented(table_out, &render_table(&facts))?;
-    Ok(())
+    }
 }
 
 fn write_parented(path: &Path, contents: &str) -> Result<()> {
@@ -217,11 +247,16 @@ pub fn categorize(subjects: &[String]) -> CommitBuckets {
 }
 
 /// Extract a trailing `(#NNN)` GitHub squash-merge PR reference, if present.
+/// Only matches when `(#NNN)` is the very end of the subject (after
+/// trimming trailing whitespace) — `(#NNN)` appearing mid-sentence (e.g.
+/// `"fix: handle (#12) refs"`) is not a PR reference.
 fn extract_pr_number(subject: &str) -> Option<u64> {
-    let start = subject.rfind("(#")?;
-    let tail = &subject[start + 2..];
-    let end = tail.find(')')?;
-    tail[..end].parse().ok()
+    let trimmed = subject.trim_end();
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let start = trimmed.rfind("(#")?;
+    trimmed[start + 2..trimmed.len() - 1].parse().ok()
 }
 
 #[derive(serde::Deserialize)]
@@ -309,16 +344,28 @@ fn excerpt(text: &str, max_chars: usize) -> String {
 /// the already-rendered totals row, rather than re-deriving per-platform
 /// pass/fail here, keeps this in lockstep with that crate's known-bugs/xfail
 /// handling instead of duplicating it.
-fn total_e2e_failures(markdown: &str) -> u64 {
+fn total_e2e_failures(markdown: &str) -> Option<u64> {
     markdown
         .lines()
         .find(|l| l.trim_start().starts_with("| **Total**"))
         .and_then(|line| line.split('|').nth(5))
         .and_then(|cell| cell.trim().parse().ok())
-        .unwrap_or(0)
 }
 
-fn render_table(facts: &Facts) -> String {
+/// Neutralize markdown syntax in untrusted text (GitHub issue titles) before
+/// it's embedded in the generated wiki page. Newlines are collapsed to a
+/// space since each issue renders as a single bullet line.
+fn escape_markdown(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| match c {
+            '\n' | '\r' => vec![' '],
+            '|' | '[' | ']' | '*' | '_' | '`' | '<' | '>' => vec!['\\', c],
+            _ => vec![c],
+        })
+        .collect()
+}
+
+pub(crate) fn render_table(facts: &Facts) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
@@ -332,6 +379,17 @@ fn render_table(facts: &Facts) -> String {
     );
     let _ = writeln!(out, "Commits considered: since `{}`\n", facts.since_tag);
 
+    // Unreadable E2E evidence means the gate table itself can't be trusted;
+    // render a short warning instead of a table carrying a bogus "0
+    // failures" row. `publish-release-readiness-wiki`'s guard greps for the
+    // table header below, so omitting it here also makes that guard trip.
+    let Some(e2e_fail_total) = facts.e2e_fail_total else {
+        out.push_str(
+            "⚠️ E2E evidence was unreadable; the gate table could not be rendered. See `failing_gates` in `facts.json`.\n",
+        );
+        return out;
+    };
+
     out.push_str("| Area | Evidence | Status |\n|---|---|:--:|\n");
     let _ = writeln!(
         out,
@@ -344,13 +402,8 @@ fn render_table(facts: &Facts) -> String {
     );
     let _ = writeln!(
         out,
-        "| E2E | {} failure(s) across all platforms | {} |",
-        facts.e2e_fail_total,
-        if facts.e2e_fail_total > 0 {
-            "❌"
-        } else {
-            "✅"
-        }
+        "| E2E | {e2e_fail_total} failure(s) across all platforms | {} |",
+        if e2e_fail_total > 0 { "❌" } else { "✅" }
     );
     out.push('\n');
 
@@ -391,7 +444,9 @@ fn render_table(facts: &Facts) -> String {
             let _ = writeln!(
                 out,
                 "- #{} {} (👍 {})",
-                issue.number, issue.title, issue.reactions
+                issue.number,
+                escape_markdown(&issue.title),
+                issue.reactions
             );
         }
     }
@@ -474,6 +529,11 @@ mod tests {
     }
 
     #[test]
+    fn extract_pr_number_ignores_a_parenthetical_mid_sentence() {
+        assert_eq!(extract_pr_number("fix: handle (#12) refs"), None);
+    }
+
+    #[test]
     fn excerpt_collapses_whitespace_and_truncates_with_ellipsis() {
         assert_eq!(excerpt("short text", 240), "short text");
         assert_eq!(
@@ -489,11 +549,102 @@ mod tests {
                    |---|---|--:|--:|--:|--:|--:|:--|\n\
                    | Mock | Linux | 10 | 9 | 1 | 0 | n/a | FAIL |\n\
                    | **Total** | | 10 | 9 | 1 | 0 | 0 | |\n";
-        assert_eq!(total_e2e_failures(md), 1);
+        assert_eq!(total_e2e_failures(md), Some(1));
     }
 
     #[test]
-    fn total_e2e_failures_defaults_to_zero_without_a_totals_row() {
-        assert_eq!(total_e2e_failures("no table here"), 0);
+    fn total_e2e_failures_returns_none_without_a_totals_row() {
+        assert_eq!(total_e2e_failures("no table here"), None);
+    }
+
+    #[test]
+    fn assemble_facts_is_go_when_everything_succeeds() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::Go);
+        assert!(facts.failing_gates.is_empty());
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_e2e_evidence_is_unreadable() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            None,
+            "success",
+            "success",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["E2E (report unreadable)"]);
+    }
+
+    #[test]
+    fn assemble_facts_treats_a_skipped_windows_build_as_passing() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "skipped",
+        );
+        assert_eq!(facts.verdict, Verdict::Go);
+        assert!(facts.failing_gates.is_empty());
+    }
+
+    #[test]
+    fn assemble_facts_is_no_go_when_windows_build_fails() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            Some(0),
+            "success",
+            "failure",
+        );
+        assert_eq!(facts.verdict, Verdict::NoGo);
+        assert_eq!(facts.failing_gates, vec!["windows build (failure)"]);
+    }
+
+    #[test]
+    fn render_table_omits_the_header_when_e2e_evidence_is_unreadable() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![],
+            None,
+            "success",
+            "success",
+        );
+        let table = render_table(&facts);
+        assert!(!table.contains("| Area | Evidence | Status |"));
+    }
+
+    #[test]
+    fn render_table_escapes_markdown_in_known_issue_titles() {
+        let facts = assemble_facts(
+            "v1.0.0",
+            CommitBuckets::default(),
+            vec![KnownIssue {
+                number: 1,
+                title: "![x](evil) | injected row".to_string(),
+                reactions: 0,
+                body_excerpt: String::new(),
+            }],
+            Some(0),
+            "success",
+            "success",
+        );
+        let table = render_table(&facts);
+        assert!(table.contains("| Area | Evidence | Status |"));
+        assert!(table.contains(r"!\[x\](evil) \| injected row"));
+        assert!(!table.contains("![x](evil) | injected row"));
     }
 }
