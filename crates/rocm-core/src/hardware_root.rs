@@ -120,10 +120,21 @@ fn host_path_under(root: Option<&Path>, path: &Path) -> PathBuf {
 /// [`host_path`] for a probe that must honour a simulated test root, or the
 /// identity for one that must always read the real machine (see the module
 /// doc above).
+///
+/// Falls back only when `/etc/os-release` does not exist, never for another
+/// read error (permission denied, a directory in its place, ...): `os-release(5)`
+/// defines the fallback as existence-based, and treating any error the same
+/// way would silently build commands for the wrong distro from a stale
+/// `/usr/lib/os-release` on a host where `/etc/os-release` exists but is
+/// merely unreadable.
 pub fn read_os_release(resolve: impl Fn(&str) -> PathBuf) -> Option<String> {
-    ["/etc/os-release", "/usr/lib/os-release"]
-        .into_iter()
-        .find_map(|candidate| std::fs::read_to_string(resolve(candidate)).ok())
+    match std::fs::read_to_string(resolve("/etc/os-release")) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string(resolve("/usr/lib/os-release")).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 /// Serialises every test that sets [`TEST_HOST_ROOT_ENV`], including the
@@ -234,6 +245,19 @@ mod tests {
     #[test]
     fn read_os_release_is_none_when_neither_candidate_exists() {
         let dir = tempfile::tempdir().expect("create temp dir");
+        assert_eq!(read_os_release(|name| candidate(dir.path(), name)), None);
+    }
+
+    /// A primary that exists but fails to read for a reason other than
+    /// absence (here, a directory in its place) must not fall back: that
+    /// would silently build commands for the wrong distro from a fallback
+    /// file that may not describe this host at all. A directory read as a
+    /// file is a portable, root-free way to get a non-`NotFound` `io::Error`.
+    #[test]
+    fn read_os_release_does_not_fall_back_when_the_primary_errors_for_another_reason() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(dir.path().join("primary")).expect("create primary as a directory");
+        std::fs::write(dir.path().join("fallback"), "ID=fallback\n").expect("write fallback");
         assert_eq!(read_os_release(|name| candidate(dir.path(), name)), None);
     }
 }

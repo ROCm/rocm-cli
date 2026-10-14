@@ -2120,9 +2120,14 @@ pub(crate) mod tests {
             !read.contains("planted-distro"),
             "read the simulated root's os-release: {read:?}"
         );
+        // Not `fs::read_to_string("/etc/os-release")` directly: on a host that
+        // is itself one of the `/usr/lib/os-release`-only machines this fix
+        // supports, that would compare against an empty string while `read`
+        // correctly holds the real fallback file's contents, failing the
+        // assertion on exactly the configuration this test means to allow.
         assert_eq!(
             read,
-            fs::read_to_string("/etc/os-release").unwrap_or_default()
+            rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p)).unwrap_or_default()
         );
     }
 

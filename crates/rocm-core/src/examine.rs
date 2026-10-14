@@ -822,6 +822,12 @@ fn host_driver_fields(probe: crate::WslHostDriverProbe) -> (bool, Option<String>
 ///
 /// `librocdxg` is globbed across `/opt/rocm*` for the same reason the in-guest
 /// probe resolves it across installs: a versioned root must not read as missing.
+///
+/// The distro's `id`/`version` fields fall back from `/etc/os-release` to
+/// `/usr/lib/os-release` per `os-release(5)`, matching every other reader in
+/// this crate — this is the one that runs inside the distro over `wsl.exe`
+/// rather than through [`crate::host_path`], so it needs its own copy of the
+/// fallback rather than sharing `hardware_root::read_os_release`.
 const WSL_REMOTE_PROBE: &str = r#"
 echo "kernel=$(uname -r 2>/dev/null)"
 if [ -e /dev/dxg ]; then echo dxg=1; else echo dxg=0; fi
@@ -843,10 +849,27 @@ if command -v rocminfo >/dev/null 2>&1; then
 else
   echo rocminfo=0
 fi
-. /etc/os-release 2>/dev/null
+try_os_release() {
+  if [ -e "$1" ]; then . "$1" 2>/dev/null
+  elif [ -e "$2" ]; then . "$2" 2>/dev/null
+  fi
+}
+try_os_release /etc/os-release /usr/lib/os-release
 echo "id=${ID}"
 echo "version=${VERSION_ID}"
 "#;
+
+/// The `try_os_release` shell function embedded in [`WSL_REMOTE_PROBE`]: sources
+/// `$1`, falling back to `$2` per `os-release(5)` when `$1` does not exist — an
+/// existence check (`[ -e ... ]`), not a readability one, so a permission-denied
+/// primary is not silently replaced by a possibly stale fallback.
+///
+/// Duplicated as its own constant, with the paths left as parameters, so the
+/// test below can run this exact function body against temp-directory paths
+/// instead of the real `/etc`; [`try_os_release_fn_is_embedded_in_the_wsl_remote_probe`]
+/// guards against the two drifting apart.
+#[cfg(test)]
+const TRY_OS_RELEASE_FN: &str = "try_os_release() {\n  if [ -e \"$1\" ]; then . \"$1\" 2>/dev/null\n  elif [ -e \"$2\" ]; then . \"$2\" 2>/dev/null\n  fi\n}";
 
 /// Parse `wsl.exe -l -q` into distribution names.
 ///
@@ -5717,6 +5740,61 @@ mod tests {
             ("fallback", "1.2")
         );
         assert_eq!(name.as_deref(), Some("Fallback 1.2"));
+    }
+
+    /// Guards [`TRY_OS_RELEASE_FN`] against drifting from the copy embedded in
+    /// [`WSL_REMOTE_PROBE`]: the test below exercises the standalone constant,
+    /// so if a future edit touches one and not the other, this catches it
+    /// rather than the test silently proving the wrong logic.
+    #[test]
+    fn try_os_release_fn_is_embedded_in_the_wsl_remote_probe() {
+        assert!(
+            WSL_REMOTE_PROBE.contains(TRY_OS_RELEASE_FN),
+            "WSL_REMOTE_PROBE's os-release handling has drifted from the tested function"
+        );
+    }
+
+    /// The WSL remote probe's `try_os_release` shell function, run for real
+    /// under `/bin/sh` against temp-directory paths rather than the real
+    /// `/etc`: it sources the first path that exists, falling back to the
+    /// second only when the first is absent, matching `os-release(5)` and the
+    /// Rust-side `hardware_root::read_os_release`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn try_os_release_sources_the_fallback_only_when_the_primary_is_absent() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let primary = dir.path().join("primary");
+        let fallback = dir.path().join("fallback");
+        std::fs::write(&fallback, "ID=fallback\n").expect("write fallback");
+
+        let script = format!("{TRY_OS_RELEASE_FN}\ntry_os_release \"$1\" \"$2\"\necho \"id=$ID\"");
+        let run = || {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .arg("sh")
+                .arg(&primary)
+                .arg(&fallback)
+                .output()
+                .expect("run sh")
+        };
+
+        let before = run();
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            "id=fallback",
+            "stderr: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+
+        std::fs::write(&primary, "ID=primary\n").expect("write primary");
+        let after = run();
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            "id=primary",
+            "stderr: {}",
+            String::from_utf8_lossy(&after.stderr)
+        );
     }
 }
 
