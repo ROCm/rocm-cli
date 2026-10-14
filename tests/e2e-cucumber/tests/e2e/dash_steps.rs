@@ -488,23 +488,25 @@ async fn close_onboarding_setup(world: &mut E2eWorld) {
     // `draw_onboarding`'s doc comment), so `q` cannot reach the dashboard
     // until it is gone. Each sub-view leaves its own marker on screen (the
     // Configure sub-view's "Tab browse folder" footer hint, or the Adopt
-    // browser's own popup title), so pick whichever is actually showing and
-    // wait for *that* one to clear before the second `Esc`. Waiting on a
-    // marker that was never shown is a no-op wait: the two `Esc` bytes can
-    // then land in the same PTY read and coalesce into one `KeyCode::Esc`
-    // (crossterm reads back-to-back ESC bytes as a single Esc key), which
-    // only backs out of the sub-view and leaves the wizard open.
+    // browser's own popup title); wait for that marker to clear before the
+    // second `Esc`, or the two `Esc` bytes can land in the same PTY read and
+    // coalesce into one `KeyCode::Esc` (crossterm reads back-to-back ESC
+    // bytes as a single Esc key), which only backs out of the sub-view and
+    // leaves the wizard open. If neither marker is on screen there is
+    // nothing open to close — panic rather than risk that coalescing
+    // silently.
     let tui = session(world);
     let open_sub_view_marker = ["Tab browse folder", "Pick an existing ROCm folder"]
         .into_iter()
-        .find(|marker| tui.screen_text().contains(marker));
+        .find(|marker| tui.screen_text().contains(marker))
+        .unwrap_or_else(|| {
+            panic!("no sub-view is open, so there is nothing to close before the wizard itself")
+        });
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to leave the open sub-view: {e}"));
-    if let Some(marker) = open_sub_view_marker {
-        tui.wait_until_gone(marker, default_timeout())
-            .await
-            .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
-    }
+    tui.wait_until_gone(open_sub_view_marker, default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("sub-view did not close: {e}"));
     tui.send("\u{1b}")
         .unwrap_or_else(|e| panic!("failed to close onboarding: {e}"));
     tui.wait_until_gone("Welcome to ROCm — first-run setup", default_timeout())
