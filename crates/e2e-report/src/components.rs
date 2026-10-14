@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Shared maud HTML fragment rendering, plus the CSS and timestamp helpers used
-//! by both the single-platform and consolidated report generators. Depends only
-//! on [`crate::parse`] types so both generators can use it without a cycle.
+//! Shared maud HTML fragment rendering — the whole-page shell, fragments, and
+//! the CSS and timestamp helpers — used by both the single-platform and
+//! consolidated report generators. Depends only on [`crate::parse`] types so
+//! both generators can use it without a cycle.
 
 use std::time::SystemTime;
 

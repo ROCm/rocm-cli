@@ -742,6 +742,16 @@ fn reconciled_tally(json_path: &Path) -> Option<ReconciledTally> {
     Some(t)
 }
 
+/// The channel that governs a platform's rendering: the manifest's
+/// `versions.channel` when known, falling back to the channel captured
+/// from the artifact name for the errored-run case where no
+/// `platform.json` was ever written. Shared by [`PlatformReport::load`] and
+/// [`PlatformReport::effective_channel`] so the fallback rule can't drift
+/// between the two.
+fn resolve_channel<'a>(versions: &'a PlatformVersions, desc: &'a Descriptor) -> Option<&'a str> {
+    versions.channel.as_deref().or(desc.channel_from_name)
+}
+
 impl PlatformReport {
     fn load(artifact: String, json_path: &Path) -> Self {
         let features = parse_features(json_path);
@@ -757,9 +767,7 @@ impl PlatformReport {
         let versions = parse_platform_manifest(json_path)
             .map(|m| m.versions)
             .unwrap_or_default();
-        // Manifest channel wins when known; the artifact-name channel is only a
-        // fallback for the errored-run case where no `platform.json` was written.
-        let effective_channel = versions.channel.as_deref().or(desc.channel_from_name);
+        let effective_channel = resolve_channel(&versions, &desc);
         let label =
             with_channel_suffix(&format!("{} {}", desc.platform, desc.os), effective_channel);
         Self {
@@ -775,15 +783,10 @@ impl PlatformReport {
         }
     }
 
-    /// The channel that governs this platform's rendering: the manifest's
-    /// `versions.channel` when known, falling back to the channel captured
-    /// from the artifact name for the errored-run case where no
-    /// `platform.json` was ever written.
+    /// The channel that governs this platform's rendering. See
+    /// [`resolve_channel`].
     fn effective_channel(&self) -> Option<&str> {
-        self.versions
-            .channel
-            .as_deref()
-            .or(self.desc.channel_from_name)
+        resolve_channel(&self.versions, &self.desc)
     }
 
     /// Map each scenario name → whether it passed. Uses the canonical
@@ -2121,6 +2124,10 @@ mod tests {
         generate_consolidated(&inputs, out.path(), &RunMeta::default()).expect("generate");
         let html = std::fs::read_to_string(out.path()).expect("read");
         assert!(html.contains("Consolidated E2E Report"));
+        assert!(
+            html.contains("<title>Consolidated E2E Report</title>"),
+            "the page_shell title argument must reach the <title> tag, not just the <h1>"
+        );
         assert!(html.contains("Platforms"));
         assert!(html.contains("Legend"));
         assert!(
