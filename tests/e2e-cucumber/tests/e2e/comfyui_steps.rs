@@ -727,6 +727,16 @@ async fn used_comfyui_install(world: &mut E2eWorld) {
     {
         write_fixture(&source.join(relative), contents);
     }
+    // With a runtime installed, a scenario's first `rocm` call otherwise runs
+    // the CLI's startup update check for this planted runtime: a real `uv`
+    // download, a managed-Python setup and a package-index query, 10-15s on a
+    // hosted runner. Nothing here is about updates, and while that call runs
+    // it blocks the thread cucumber polls every other scenario from (#661).
+    // Every command these scenarios run goes through
+    // `run_keeping_scenario_env`, so this reaches all of them.
+    world
+        .command_env
+        .push(("ROCM_CLI_DISABLE_STARTUP_UPDATE_CHECK", "1".into()));
 }
 
 /// Serves a small release archive. Its `requirements.txt` names only the
