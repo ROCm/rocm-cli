@@ -292,7 +292,9 @@ pub fn resolved_args(
         // pretraining ("ROCm is not compatible with Windows"). Compose the real
         // assistant prompt plus this host's facts here — the bin is the only
         // side with both — and hand the TUI a plain String.
-        chat_system_prompt: Some(crate::rocm_chat_tool_system_prompt_for_host(Some(paths))),
+        chat_system_prompt: Some(crate::chat::rocm_chat_tool_system_prompt_for_host(Some(
+            paths,
+        ))),
         // The real executor is injected in `run_async` for a live dash; None
         // here keeps demo/replay/mock behaving exactly as today.
         tool_executor: None,
