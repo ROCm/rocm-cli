@@ -898,9 +898,11 @@ pub fn load_platform_reports(inputs: &[(String, PathBuf)]) -> Vec<PlatformReport
 /// for every caller, including one that only needs the HTML output — call
 /// [`load_platform_reports`] once and [`generate_consolidated_from_reports`]
 /// directly instead.
-#[deprecated(note = "re-parses `inputs` on every call; call load_platform_reports \
+#[deprecated(
+    note = "rebuilds the PlatformReport set on every call; call load_platform_reports \
             once and use generate_consolidated_from_reports/\
-            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
+            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)"
+)]
 pub fn generate_consolidated(
     inputs: &[(String, PathBuf)],
     html_out: &Path,
@@ -989,9 +991,11 @@ pub fn generate_consolidated_from_reports(
 /// **Deprecated** for every caller, including one that only needs the
 /// markdown output — call [`load_platform_reports`] once and
 /// [`consolidated_summary_markdown_from_reports`] directly instead.
-#[deprecated(note = "re-parses `inputs` on every call; call load_platform_reports \
+#[deprecated(
+    note = "rebuilds the PlatformReport set on every call; call load_platform_reports \
             once and use generate_consolidated_from_reports/\
-            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)")]
+            consolidated_summary_markdown_from_reports instead (see ROCm/rocm-cli#640)"
+)]
 pub fn consolidated_summary_markdown(inputs: &[(String, PathBuf)]) -> String {
     consolidated_summary_markdown_from_reports(&load_platform_reports(inputs), inputs)
 }
@@ -1766,6 +1770,37 @@ mod tests {
         assert_eq!(
             strip_generated_timestamp(&html_via_wrapper),
             strip_generated_timestamp(&html_via_reports)
+        );
+    }
+
+    #[test]
+    fn generate_consolidated_from_reports_still_renders_the_expectation_grid_from_inputs() {
+        // Review finding (6f130efe round): passing `&[]` instead of `inputs` to
+        // the `expectation_grid_html(inputs)` call inside
+        // generate_consolidated_from_reports passed every existing test,
+        // because wrapper_and_from_reports_outputs_agree's fixture has no
+        // platform.json, so its grid is empty on both sides of that comparison
+        // either way. Give this one a platform.json via write_platform and
+        // assert the grid heading actually renders.
+        let report = feature_json(&[(&["id:serve-a"], &["passed"])]);
+        let platform = r#"{
+            "platform_slug": "mock",
+            "capability": {"effective_serve_engine": "none"},
+            "expectations": [
+                {"id":"serve-a","feature":"Serving","scenario":"serve-01 - first","expected":"pass"}
+            ]
+        }"#;
+        let (_d, path) = write_platform(&report, platform);
+        let inputs = vec![("mock".to_string(), path)];
+        let reports = load_platform_reports(&inputs);
+
+        let out = tempfile::NamedTempFile::new().expect("temp");
+        generate_consolidated_from_reports(&reports, &inputs, out.path(), &RunMeta::default())
+            .expect("generate");
+        let html = std::fs::read_to_string(out.path()).expect("read");
+        assert!(
+            html.contains("Expectation grid (scenario × platform)"),
+            "grid heading missing from output:\n{html}"
         );
     }
 
