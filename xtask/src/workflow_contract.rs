@@ -1161,10 +1161,27 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         WslBareBash,
     }
 
+    /// The shared bash preflight every native Linux lane delegates to (#446,
+    /// #294), as the workflows name it.
+    const SHARED_PREFLIGHT: &str = ".github/scripts/gpu-preflight.sh";
+
+    /// That script's source.
+    fn shared_preflight_script() -> String {
+        let p = repo_root().join(SHARED_PREFLIGHT);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
+    }
+
     /// Whether this preflight guards an APU lane (the 8 GiB floor) rather than a
     /// discrete card (16 GiB).
+    ///
+    /// Three spellings, because the floor reaches the three surviving block
+    /// shapes differently: a step-level `env:` key on the lanes that delegate to
+    /// the shared script, a `${…:-8}` default in the WSL advisory bodies, and a
+    /// PowerShell `else { 8 }` on the Windows-native ones.
     fn is_apu_preflight(step: &str) -> bool {
-        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || step.contains("else { 8 }")
+        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB: 8")
+            || step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8")
+            || step.contains("else { 8 }")
     }
 
     #[test]
@@ -1175,24 +1192,117 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // lane fails on every healthy host. Six blocks guard that hardware class
         // and one was missed when the other five were converted; this is what
         // makes the next copy-paste fail loudly rather than months later.
+        //
+        // A block satisfies this either by querying both pools itself or by
+        // delegating to the shared script, which is then asserted to query them.
+        // Delegation is accepted rather than waived: the one-line lanes carry no
+        // query to inspect, and demanding the literal there would have forced
+        // the shared script's extraction to leave the text behind as a comment —
+        // a string this test would then happily match in a lane that does
+        // nothing.
         let mut checked = 0;
+        let mut delegating = 0;
         for (workflow, text) in self_hosted_workflows() {
             for step in gpu_preflight_steps(&text)
                 .iter()
                 .filter(|s| is_apu_preflight(s))
             {
-                assert!(
-                    step.contains("showmeminfo vram gtt"),
-                    "{workflow}: an APU-class GPU preflight still queries VRAM only; on a \
-                     small-carveout gfx1151 host it can never clear its own floor"
-                );
+                if step.contains(SHARED_PREFLIGHT) {
+                    delegating += 1;
+                } else {
+                    assert!(
+                        step.contains("showmeminfo vram gtt"),
+                        "{workflow}: an APU-class GPU preflight neither queries both pools \
+                         nor delegates to {SHARED_PREFLIGHT}; on a small-carveout gfx1151 \
+                         host it can never clear its own floor"
+                    );
+                }
                 checked += 1;
             }
         }
         assert!(
+            delegating >= 2,
+            "no APU lane delegates to {SHARED_PREFLIGHT} any more ({delegating} found) — if \
+             that was deliberate this test is now checking a shape nothing uses"
+        );
+        assert!(
+            shared_preflight_script().contains("showmeminfo vram gtt"),
+            "{SHARED_PREFLIGHT} no longer queries the GTT pool, so every lane delegating to \
+             it fails on a small-carveout gfx1151 host"
+        );
+        assert!(
             checked >= 6,
             "expected at least six APU-class preflight blocks, found {checked} — if a lane \
              was removed update this floor, otherwise the extractor has stopped matching"
+        );
+    }
+
+    #[test]
+    fn every_native_linux_preflight_delegates_to_the_shared_script() {
+        // What the deduplication (#294) actually bought, and the only thing
+        // keeping the next #446 from landing six times: the six native Linux
+        // preflights are now one script plus a floor. The drift test below can no
+        // longer catch a block left behind, because a block left behind would
+        // carry its own body and simply not be compared against anything.
+        //
+        // Derived from the lanes rather than listed, so a new one is covered the
+        // day it lands. The two WSL advisory bodies are excluded by name: they
+        // warn where these fail, which is a different contract, not a copy. The
+        // two Windows-native blocks are PowerShell and have no bash to run.
+        let mut delegating = 0;
+        for (workflow, text) in self_hosted_workflows() {
+            for step in gpu_preflight_steps(&text) {
+                if preflight_powershell_script(&step).is_some() || step.contains("-Script @'") {
+                    continue;
+                }
+                assert!(
+                    step.contains(SHARED_PREFLIGHT),
+                    "{workflow} has a native Linux GPU preflight with its own inline body \
+                     instead of delegating to {SHARED_PREFLIGHT}; that is the duplication \
+                     #294 removed, and a fix to the gate will now miss this lane"
+                );
+                assert!(
+                    is_apu_preflight(&step) || step.contains("GPU_PREFLIGHT_MIN_FREE_GIB: 16"),
+                    "{workflow} delegates to {SHARED_PREFLIGHT} without naming its own \
+                     floor; the lane would then silently inherit the script's default \
+                     rather than the value its hardware was sized for"
+                );
+                delegating += 1;
+            }
+        }
+        assert_eq!(
+            delegating, 6,
+            "expected the six native Linux preflight lanes to delegate to \
+             {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
+        );
+    }
+
+    #[test]
+    fn the_shared_preflight_asserts_no_leaked_engine_process_survives() {
+        // #446: the free-memory floor is a fixed 8/16 GiB against pools of ~62
+        // and 192 GiB, so it only trips near exhaustion — a leftover
+        // llama-server holding 10-20 GiB clears every lane. The process
+        // assertion is what actually catches that, and it is one line in one
+        // file: deleting it leaves every other test here green, because they all
+        // drive memory readings.
+        //
+        // The shape is pinned here; `apu_preflight_gates_on_the_pool_the_engine
+        // _uses` drives it against a reclaim stub that reports survivors, which
+        // is what proves it can fail.
+        let script = shared_preflight_script();
+        assert!(
+            script.contains("--assert-clear"),
+            "{SHARED_PREFLIGHT} no longer runs `reclaim-gpu.sh --assert-clear`; the gate is \
+             back to a fixed free-memory floor, which on these pools only trips near \
+             exhaustion (#446)"
+        );
+        // The floor is a BACKSTOP, not a thing the process check replaced: it is
+        // the only one of the two that can see a non-E2E tenant exhausting a
+        // shared host. Losing it silently would be the opposite half of #446.
+        assert!(
+            script.contains("never dropped below the floor"),
+            "{SHARED_PREFLIGHT} no longer applies a free-memory floor; the process \
+             assertion cannot see a non-E2E tenant exhausting a shared host (#446)"
         );
     }
 
@@ -1274,6 +1384,15 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // pre-GTT script while the other five were converted and nothing failed,
         // because every contract test here asserts step names, env keys and
         // labels — never the script body.
+        //
+        // What this still buys after #446 extracted the native bodies into
+        // `.github/scripts/gpu-preflight.sh`: the PowerShell pair, which is
+        // genuinely two hand-maintained copies, and the WSL advisory pair, which
+        // is another. The native pair now compares two identical one-line
+        // delegations, so equality there is trivially true and proves nothing —
+        // `every_native_linux_preflight_delegates_to_the_shared_script` is what
+        // carries that case, by asserting the delegation rather than the
+        // agreement.
         type Extract = fn(&str) -> Option<String>;
         let scripts = |name: &str, extract: Extract| -> Vec<String> {
             gpu_preflight_steps(&read_workflow(name))
@@ -1357,11 +1476,24 @@ esac
 "#;
 
     /// Stands in for `scripts/reclaim-gpu.sh`, which a native lane runs with
-    /// `--report-holders` when it gives up, and says so in the log. Without it
-    /// the call resolves against whatever directory the test runs from, fails,
-    /// and the holder-reporting path is never exercised at all.
+    /// `--report-holders` when it gives up, and with `--assert-clear` when the
+    /// memory floor is satisfied. Without it the call resolves against whatever
+    /// directory the test runs from, fails, and neither path is exercised.
+    ///
+    /// `RECLAIM_ASSERT_FAILS` makes `--assert-clear` report a survivor, the way
+    /// the real script does when a leaked engine process outlived the reclaim.
+    /// A gate that cannot be driven into its failing state is not tested by any
+    /// number of passing cases: without this the preflight's process assertion
+    /// could be deleted outright with every case below still green.
     #[cfg(unix)]
-    const RECLAIM_STUB: &str = "#!/bin/sh\necho \"reclaim-gpu.sh stub called: $*\"\n";
+    const RECLAIM_STUB: &str = r#"#!/bin/sh
+echo "reclaim-gpu.sh stub called: $*"
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
+  echo "assert-clear: leaked E2E engine process(es) still holding the GPU:" >&2
+  echo "  pid=4242 cmd=/e2e-prewarm/bin/llama-server" >&2
+  exit 1
+fi
+"#;
 
     /// What a lane logs when it reached the step that names what holds the GPU.
     #[cfg(unix)]
@@ -1428,6 +1560,12 @@ esac
             // One poll, then the script's own 5s backoff ends the loop. Cases
             // that need a second poll raise this.
             .env("GPU_PREFLIGHT_CEILING_SECS", "1")
+            // The APU floor, which the two advisory bodies default to and the
+            // shared script does not: it defaults to the discrete 16 and the APU
+            // lanes set this. Supplied here so all three are driven at the same
+            // floor and a case's expectations mean one thing; a case needing the
+            // discrete floor overrides it through `env`.
+            .env("GPU_PREFLIGHT_MIN_FREE_GIB", "8")
             .envs(env.iter().copied())
             .output()
             .expect("running the preflight script");
@@ -1436,15 +1574,20 @@ esac
         (exit_code(out.status, "preflight"), log)
     }
 
-    /// The two APU lanes of `e2e-selfhosted.yml`, with the shell each runs under.
+    /// The two hard-failing shell bodies an APU lane can run: the shared script
+    /// every native Linux lane delegates to, and `e2e-selfhosted.yml`'s advisory
+    /// WSL body.
+    ///
+    /// The native side is read from the FILE rather than extracted from the
+    /// workflow, because since #446 the step's own body is one line that runs
+    /// it. Driving that line from a scratch tree would test the delegation and
+    /// nothing else;
+    /// `every_native_linux_preflight_delegates_to_the_shared_script` pins the
+    /// delegation, and this pins what it delegates to.
     #[cfg(unix)]
     fn apu_lanes() -> (String, String) {
         let steps = gpu_preflight_steps(&read_workflow("e2e-selfhosted.yml"));
-        let native = steps
-            .iter()
-            .filter(|s| is_apu_preflight(s) && !s.contains("advisory"))
-            .find_map(|s| preflight_shell_script(s))
-            .expect("native APU preflight shell script");
+        let native = shared_preflight_script();
         let advisory = steps
             .iter()
             .filter(|s| s.contains("advisory"))
@@ -1530,6 +1673,15 @@ esac
         native: (i32, &'static [&'static str]),
         /// …and for the advisory one.
         advisory: (i32, &'static [&'static str]),
+        /// The Windows-native block's verdict, when it differs from `native`.
+        ///
+        /// `None` means "the same as `native`", which is the usual case: it
+        /// guards the same hardware class with the same floor. It is set only
+        /// where the two blocks genuinely diverge — the process assertion #446
+        /// added, which the PowerShell copy has no bash to run. Stated as an
+        /// expectation rather than skipped, so the gap is pinned: if that block
+        /// ever grows an equivalent, this case fails and names the reason.
+        windows: Option<(i32, &'static [&'static str])>,
     }
 
     #[cfg(unix)]
@@ -1580,6 +1732,7 @@ esac
                 env: vec![],
                 native: (0, &["GPU ready: 61 GiB GTT free"]),
                 advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+                windows: None,
             },
             // An older rocm-smi rejects `--showmeminfo vram gtt` outright. The
             // single-pool fallback carries no GTT rows, so without a dedicated
@@ -1606,6 +1759,7 @@ esac
                         "GPU ready: 61 GiB GTT free",
                     ],
                 ),
+                windows: None,
             },
             GateCase {
                 label: "carveout with the aperture pinned by a leftover serve",
@@ -1613,6 +1767,7 @@ esac
                 env: vec![],
                 native: (1, &["GTT never dropped below the floor"]),
                 advisory: (1, &["GTT never dropped below the floor"]),
+                windows: None,
             },
             GateCase {
                 label: "discrete card with VRAM free",
@@ -1620,6 +1775,7 @@ esac
                 env: vec![],
                 native: (0, &["GPU ready: 182 GiB VRAM free"]),
                 advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+                windows: None,
             },
             GateCase {
                 label: "discrete card with VRAM held",
@@ -1627,6 +1783,7 @@ esac
                 env: vec![],
                 native: (1, &["VRAM never dropped below the floor"]),
                 advisory: (1, &["VRAM never dropped below the floor"]),
+                windows: None,
             },
             // A wedged driver must not be read as "this is an APU" and waved
             // through on whatever the other pool reports.
@@ -1636,6 +1793,7 @@ esac
                 env: vec![],
                 native: (1, &["reported a VRAM total of 0"]),
                 advisory: (0, &["no VRAM figures under WSL"]),
+                windows: None,
             },
             // The same defect one pool over: a GTT total that parses as zero is
             // a failed reading, not an exhausted aperture. Unguarded it produced
@@ -1648,6 +1806,7 @@ esac
                 env: vec![],
                 native: (1, &["reported a GTT total of 0"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
             },
             // Nothing measurable: the native lane fails, the advisory lane warns.
             GateCase {
@@ -1656,6 +1815,7 @@ esac
                 env: vec![],
                 native: (1, &["reported no GTT pool"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
             },
             // A query that failed is not a host without the pool. The aperture
             // is right there in the fixture; only the call for it broke, and
@@ -1666,6 +1826,39 @@ esac
                 env: vec![("REJECT_COMBINED", "1"), ("FAIL_GTT", "1")],
                 native: (1, &["the GTT query itself failed"]),
                 advisory: (0, &["no usable GTT pool"]),
+                windows: None,
+            },
+            // #446. A healthy, nearly-empty aperture — every memory reading in
+            // this case says the GPU is free, and the floor passes on the first
+            // poll. What is NOT free is the card: a leftover llama-server
+            // survived the reclaim step. A fixed 8 GiB floor against 62 GiB
+            // cannot express that, and a 10-20 GiB serve clears it on every
+            // lane; the process assertion is the only thing here that fails,
+            // which is the whole point of adding it.
+            //
+            // This is also the only case that drives the reclaim stub into its
+            // failing state. Delete the `--assert-clear` call from the shared
+            // script and every other case below stays green.
+            GateCase {
+                label: "free aperture but a leaked engine process survived the reclaim",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![("RECLAIM_ASSERT_FAILS", "1")],
+                native: (
+                    1,
+                    &[
+                        // The floor WAS satisfied, so this failure cannot be
+                        // mistaken for the memory gate firing.
+                        "GPU ready: 61 GiB GTT free",
+                        "a leaked E2E engine process is still holding it",
+                        "pid=4242",
+                    ],
+                ),
+                // The advisory WSL body has no process assertion either, and is
+                // specified never to hard-fail; it passes on the reading.
+                advisory: (0, &["GPU ready: 61 GiB GTT free"]),
+                // The documented Windows gap: memory-only, so it clears a card
+                // that is still held. Pinned, not hidden — see the field's doc.
+                windows: Some((0, &["GPU ready: 61 GiB GTT free"])),
             },
         ];
 
@@ -1713,9 +1906,15 @@ esac
                 assert_gate("native", case.label, native, case.native);
                 assert_gate("advisory", case.label, advisory, case.advisory);
                 // The Windows block guards the same hardware class with the
-                // same floor, so it owes the same verdicts as the native lane.
+                // same floor, so it owes the same verdicts as the native lane —
+                // except where it has been stated not to.
                 if let Some(windows) = windows {
-                    assert_gate("Windows", case.label, windows, case.native);
+                    assert_gate(
+                        "Windows",
+                        case.label,
+                        windows,
+                        case.windows.unwrap_or(case.native),
+                    );
                 }
             }
         });
@@ -1801,11 +2000,21 @@ esac
         let bash_env = bash_env.to_str().expect("utf-8 temp path");
 
         let mut lanes = Vec::new();
+        let mut delegating = 0;
         for (workflow, text) in self_hosted_workflows() {
             for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
                 let Some(script) = preflight_shell_script(step) else {
                     continue;
                 };
+                // A lane that delegates carries one line that runs the shared
+                // script; the loop is in the script, so driving the line would
+                // assert nothing. Counted rather than skipped, so a lane whose
+                // body quietly came BACK is not silently exempted from the
+                // check below by never being driven.
+                if script.contains(SHARED_PREFLIGHT) {
+                    delegating += 1;
+                    continue;
+                }
                 let shell = if step.contains("-Script @'") {
                     PreflightShell::WslBareBash
                 } else {
@@ -1815,11 +2024,24 @@ esac
             }
         }
         assert_eq!(
-            lanes.len(),
-            8,
-            "expected 8 shell GPU preflight blocks across both workflows — if a \
-             lane was added or removed, update this count"
+            delegating, 6,
+            "expected the 6 native Linux preflight lanes to delegate to \
+             {SHARED_PREFLIGHT} — if a lane was added or removed, update this count"
         );
+        assert_eq!(
+            lanes.len(),
+            2,
+            "expected the 2 WSL advisory preflight bodies to be the only shell blocks \
+             left inline across both workflows — if a lane was added or removed, update \
+             this count"
+        );
+        // The shared script once, standing in for all six delegating lanes: they
+        // run the same bytes, and its loop is the one that has to poll.
+        lanes.push((
+            format!("shared {SHARED_PREFLIGHT}"),
+            shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+        ));
 
         // A card held by a leftover serve: every lane, native or advisory,
         // discrete or APU, must take a reading and fail on it.
