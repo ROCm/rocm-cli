@@ -27918,6 +27918,17 @@ install therock";
         /// family is unavailable (IPv6 is absent in some containers, and a test
         /// that needs it has to skip rather than fail).
         fn bind(model_id: &str, bind_host: &'static str, require_auth: bool) -> Option<Self> {
+            Self::bind_refusing_with(model_id, bind_host, require_auth, 401)
+        }
+
+        /// As [`Self::bind`], answering `refusal_status` to a request the
+        /// authorization requirement rejects (401 and 403 are both "guarded").
+        fn bind_refusing_with(
+            model_id: &str,
+            bind_host: &'static str,
+            require_auth: bool,
+            refusal_status: u16,
+        ) -> Option<Self> {
             use std::sync::atomic::Ordering;
 
             let listener = std::net::TcpListener::bind((bind_host, 0)).ok()?;
@@ -27956,7 +27967,7 @@ install therock";
                     } else {
                         let _ = write!(
                             stream,
-                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                            "HTTP/1.1 {refusal_status} Refused\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
                         );
                     }
                 }
@@ -28446,6 +28457,116 @@ install therock";
             "the gate must refuse to remove anything"
         );
         drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forbidden_answer_on_a_stopped_records_port_blocks_like_an_unauthorized_one() {
+        // A server that answers 403 is as much a live, guarded HTTP server as one
+        // that answers 401; narrowing the refusal check to 401 alone would wave
+        // it through as an unrelated listener.
+        let endpoint = ServingEndpoint::bind_refusing_with(
+            "amd/guarded-model",
+            "127.0.0.1",
+            true,
+            403,
+        )
+        .expect("bind the forbidding engine");
+        let (root, paths) = test_paths("uninstall-forbidden-survivor");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-forbidden-engine",
+            "vllm",
+            "amd/guarded-model",
+            "amd/guarded-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-forbidden-engine")
+            .unwrap_or_else(|| panic!("a 403 survivor must fail the gate: {report:?}"));
+        assert_eq!(failure.remedy, StopFailureRemedy::RemoveTheStoppedRecord);
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stored_endpoint_key_reaches_the_identity_probe() {
+        // A keyed server answers 401 without its key and lists its model with it.
+        // The record's key, when one is still stored, has to be what the probe
+        // sends: passing no key reads the server as a stranger-or-refusal, and
+        // here that changes the outcome from "serving our model" to "auth refused".
+        let endpoint = ServingEndpoint::serving_with_authorization("amd/keyed-model");
+        let (root, paths) = test_paths("uninstall-stored-key-probe");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-keyed-engine",
+            "vllm",
+            "amd/keyed-model",
+            "amd/keyed-model",
+            "127.0.0.1",
+            endpoint.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+        endpoint_keys::store_endpoint_api_key(&paths, "svc-keyed-engine", "sekret")
+            .expect("store the endpoint key");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        let failure = report
+            .failed
+            .iter()
+            .find(|failure| failure.service_id == "svc-keyed-engine")
+            .unwrap_or_else(|| panic!("a keyed survivor must fail the gate: {report:?}"));
+        assert_eq!(
+            failure.remedy,
+            StopFailureRemedy::StopWhatHoldsThePort,
+            "with its key the probe sees the record's own model, not a refusal: {report:?}"
+        );
+        drop(endpoint);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_json_files_in_the_services_dir_are_service_manifests() {
+        // The directory also holds non-record files (editor backups, logs); a
+        // non-.json file that does not parse must not read as a corrupt record.
+        let (root, paths) = test_paths("uninstall-non-json-manifest");
+        fs::create_dir_all(paths.services_dir()).expect("create services dir");
+        fs::write(paths.services_dir().join("svc-x.txt"), b"{ not json").expect("seed");
+        fs::write(paths.services_dir().join("svc-y.json.bak"), b"{ not json").expect("seed");
+        assert!(
+            unreadable_service_manifests(&paths)
+                .expect("scan")
+                .is_empty()
+        );
+        fs::write(paths.services_dir().join("svc-z.json"), b"{ not json").expect("seed");
+        assert_eq!(
+            unreadable_service_manifests(&paths).expect("scan"),
+            vec![paths.services_dir().join("svc-z.json")]
+        );
         let _ = fs::remove_dir_all(root);
     }
 
