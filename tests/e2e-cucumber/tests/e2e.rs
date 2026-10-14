@@ -204,6 +204,17 @@ fn shared_cache_dir() -> Option<PathBuf> {
     validated_shared_dir("E2E_SHARED_CACHE_DIR")
 }
 
+/// The `ROCM_CLI_CACHE_DIR` a scenario rooted at `root` resolves to: the shared
+/// dir when CI provides one, else the scenario-local `<root>/cache`. The one
+/// definition both [`E2eWorld::isolate_env`] (which hands this to the spawned
+/// process as an env var) and [`E2eWorld::app_paths`] (which a step reads or
+/// writes fixtures through directly) call, so the two cannot drift apart the
+/// way they once did: a fixture written through `app_paths()` must land where
+/// the CLI's own `ROCM_CLI_CACHE_DIR` actually points, shared cache or not.
+fn cache_dir_for(root: &Path) -> PathBuf {
+    shared_cache_dir().map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"))
+}
+
 /// A persistent `uv` download/build cache shared across scenarios (`UV_CACHE_DIR`).
 ///
 /// `rocm install sdk` fetches TheRock runtime wheels with `uv`, which are large
@@ -312,7 +323,7 @@ impl E2eWorld {
         rocm_core::AppPaths {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
-            cache_dir: root.join("cache"),
+            cache_dir: cache_dir_for(root),
         }
     }
 
@@ -345,9 +356,7 @@ impl E2eWorld {
             // `write_cached_http_entry`), so concurrent scenarios sharing this
             // dir can't tear either into a state `load_startup_update_check`
             // would hard-error on.
-            let cache_dir = shared_cache_dir()
-                .map_or_else(|| root.join("cache"), |shared| shared.join("rocm-cli"));
-            env.push(("ROCM_CLI_CACHE_DIR", cache_dir.into_os_string()));
+            env.push(("ROCM_CLI_CACHE_DIR", cache_dir_for(root).into_os_string()));
         }
         // Share only STATE-FREE, content-addressed caches across scenarios when
         // CI provides a persistent shared dir (see shared_cache_dir): HF model
