@@ -168,6 +168,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
+    ///
+    /// A GPU that is recognized but has no ROCm build at all — `gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs — is reported on
+    /// a `rocm_support` line saying so, so that an empty
+    /// `compatible_therock_family` does not read as a failed probe. Such a GPU
+    /// still works through the Vulkan backend.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -746,6 +752,12 @@ rocm install sdk --devel")]
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
         /// TheRock GPU package family to install, such as gfx110X-all.
+        ///
+        /// A GPU target ROCm publishes no build for is refused rather than
+        /// mapped to a near neighbour: `--family gfx90c` — the Vega iGPU in
+        /// Renoir, Lucienne, Cezanne and Barcelo APUs — fails and installs
+        /// nothing, instead of substituting another family. A plain `rocm
+        /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
@@ -6574,6 +6586,10 @@ pub(crate) fn chat_tool_approval_request(
         else {
             bail!("ROCm command tool is read-only and does not need approval");
         };
+        // `pending_title` is deliberately short (e.g. "Install driver"); don't
+        // read that as all the approver sees. The full `rocm` argv rides
+        // along via `display_command` below and is what the approval body
+        // actually renders (see `dash_seam.rs`'s `RocmToolExecutor::execute`).
         return Ok(ChatToolApprovalRequest {
             pending_title,
             command_title,
@@ -6624,6 +6640,9 @@ pub(crate) fn chat_tool_approval_request(
         "watcher_disable" => ("Disable automation", "Automations"),
         other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
     };
+    // Same as the `rocm_command` arm above: `pending_title` is short by
+    // design — the full command line rides along in `display_command` and
+    // is what the approval body renders, not just this title.
     Ok(ChatToolApprovalRequest {
         pending_title: pending_title.to_owned(),
         command_title: command_title.to_owned(),

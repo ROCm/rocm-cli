@@ -354,6 +354,20 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli.
 
+#### GPUs with no ROCm build
+
+Some AMD GPUs are detected but have no ROCm SDK build at all. The Vega iGPU in
+Renoir, Lucienne, Cezanne and Barcelo APUs — the Radeon Vega graphics in Ryzen
+4000 and 5000 mobile and desktop parts, reported as `gfx90c` — is one of them.
+
+For these, `install sdk` stops and says no ROCm SDK build exists for that GPU,
+instead of listing package families to try. It does the same when you name such
+a target yourself with `--family gfx90c`: the request is refused, and no other
+family is substituted for it. `rocm examine` reports the same conclusion on a
+`rocm_support` line (see [Examine](#examine)).
+
+These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
+
 #### Compiler toolchain (--devel)
 
 Pass `--devel` to also install the compiler and headers needed to build GPU

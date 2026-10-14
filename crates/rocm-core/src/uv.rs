@@ -1331,7 +1331,7 @@ mod archive_properties {
 
     use super::{extract_archive, find_binary_in, make_executable, uv_binary_name};
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
+        ESCAPES_ONLY, Entry, Expect, Kind, Layout, Modes, OUTSIDE_TOKEN, concretize, entries,
         naive_sanitizing_unpack, naive_unpack, note_mode_scope, run_case, run_property,
         run_round_trip, tar_gz_bytes,
     };
@@ -1354,11 +1354,6 @@ mod archive_properties {
             .judge(expect)
         })
     }
-
-    const ESCAPES_ONLY: Expect = Expect {
-        modes: Modes::Unchecked,
-        no_outward_links: false,
-    };
 
     #[test]
     fn uv_archive_extraction_never_writes_outside_the_staging_dir() {

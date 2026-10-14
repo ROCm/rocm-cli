@@ -728,18 +728,7 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "linux".to_owned();
         e.kernel_release = run("uname", &["-r"], SHORT).1.trim().to_owned();
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
-        let osr = read_host_text("/etc/os-release");
-        for line in osr.lines() {
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            let value = value.trim().trim_matches('"');
-            match key {
-                "ID" => e.distro_id = value.to_owned(),
-                "VERSION_ID" => e.distro_version = value.to_owned(),
-                _ => {}
-            }
-        }
+        record_distro(e, &read_host_text("/etc/os-release"));
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;
         }
@@ -751,6 +740,25 @@ fn probe_os(e: &mut Examination) {
         e.os_family = "windows".to_owned();
     } else {
         e.os_family = "other".to_owned();
+    }
+}
+
+/// Fill the distro fields from os-release `text`, through the same parser the
+/// driver plan uses, so the two report the same distro.
+///
+/// An unreadable file leaves both fields empty and says why in
+/// `probe_failures`, naming the line — an empty distro with no explanation
+/// would read as "nothing to report" rather than "something to fix". A missing
+/// file reads as empty text, which is not a failure.
+fn record_distro(e: &mut Examination, text: &str) {
+    match crate::os_release::parse(text) {
+        Ok(mut fields) => {
+            e.distro_id = fields.remove("ID").unwrap_or_default();
+            e.distro_version = fields.remove("VERSION_ID").unwrap_or_default();
+        }
+        Err(unreadable) => e.probe_failures.push(format!(
+            "/etc/os-release {unreadable}; the distro is not reported."
+        )),
     }
 }
 
@@ -1146,12 +1154,12 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 
 /// Whether a gfx target belongs to an AMD APU family.
 ///
-/// APUs: gfx1103 (Phoenix / Hawk Point) and the gfx115x parts (Strix Point /
-/// Strix Halo). Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33)
-/// share the gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not
-/// match — otherwise they inflate `has_apu` and suppress `has_discrete_amd`,
-/// which gates the iGPU+dGPU collision fix. (Target -> product per LLVM
-/// AMDGPUUsage.)
+/// APUs: gfx90c (Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo), gfx1103
+/// (Phoenix / Hawk Point) and the gfx115x parts (Strix Point / Strix Halo).
+/// Their neighbors gfx1100 / gfx1101 / gfx1102 (Navi 31 / 32 / 33) share the
+/// gfx110x prefix but are *discrete* RDNA3 GPUs, so they must not match —
+/// otherwise they inflate `has_apu` and suppress `has_discrete_amd`, which gates
+/// the iGPU+dGPU collision fix. (Target -> product per LLVM AMDGPUUsage.)
 ///
 /// Two consumers rely on this, for different reasons:
 ///
@@ -1165,6 +1173,12 @@ fn classify_amd_marketing_name(name: &str) -> (String, bool) {
 /// GPU on the host is integrated.
 pub fn gfx_is_apu_family(gfx: &str) -> bool {
     let g = gfx.to_lowercase();
+    // gfx90c: the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo. Compared
+    // whole (up to a feature suffix) so other gfx90x data-center parts such as
+    // gfx90a stay discrete.
+    if g == "gfx90c" || g.starts_with("gfx90c:") {
+        return true;
+    }
     // gfx115x: every Strix part is an APU.
     if gfx_model_digit(&g, "gfx115").is_some() {
         return true;
@@ -3059,6 +3073,53 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Linux host with an AMD GPU, so `compute_status` turns on the probe
+    /// failures alone.
+    fn linux_host_with_a_gpu() -> Examination {
+        Examination {
+            os_family: "linux".to_owned(),
+            has_amd_gpu: true,
+            ..Examination::default()
+        }
+    }
+
+    /// The message and the state it describes, asserted together: an
+    /// unreadable os-release names its line in `probe_failures`, leaves the
+    /// distro unreported, and makes the examination `degraded` — and a readable
+    /// one reports the distro with no failure recorded and stays `ok`.
+    #[test]
+    fn an_unreadable_os_release_names_its_line_instead_of_a_distro() {
+        let mut e = linux_host_with_a_gpu();
+        record_distro(
+            &mut e,
+            "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\n",
+        );
+        assert_eq!(
+            e.probe_failures,
+            vec![
+                "/etc/os-release line 3 is not a plain assignment: \"export ID=debian\"; \
+                 the distro is not reported."
+                    .to_owned()
+            ]
+        );
+        assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
+        assert_eq!(e.compute_status(), "degraded");
+
+        let mut e = linux_host_with_a_gpu();
+        record_distro(&mut e, "ID='ubuntu'\nVERSION_ID='24.04' # LTS\n");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+        assert_eq!(
+            (e.distro_id.as_str(), e.distro_version.as_str()),
+            ("ubuntu", "24.04")
+        );
+        assert_eq!(e.compute_status(), "ok");
+
+        // No file at all is not a failure: there is nothing to fix.
+        let mut e = Examination::default();
+        record_distro(&mut e, "");
+        assert!(e.probe_failures.is_empty(), "{:?}", e.probe_failures);
+    }
 
     /// Serialises the tests that read or replace the process-global
     /// `RUNTIME_LIBRARY_PATH_ENV` while they run. Env is shared by every test
@@ -5345,6 +5406,16 @@ mod tests {
         assert!(!gfx_is_apu_family("gfx1100:xnack-"));
         // Degenerate inputs never match.
         assert!(!gfx_is_apu_family("gfx110"));
+
+        // Vega iGPU (Renoir / Lucienne / Cezanne / Barcelo) is an APU; the other
+        // gfx90x parts are not.
+        assert!(gfx_is_apu_family("gfx90c"));
+        assert!(gfx_is_apu_family("GFX90C"));
+        assert!(gfx_is_apu_family("gfx90c:xnack-"));
+        assert!(!gfx_is_apu_family("gfx90a"));
+        assert!(!gfx_is_apu_family("gfx908"));
+        assert!(!gfx_is_apu_family("gfx906"));
+        assert!(!gfx_is_apu_family("gfx90"));
         assert!(!gfx_is_apu_family(""));
     }
 
@@ -5555,6 +5626,52 @@ mod tests {
         assert_eq!(podman.container_kind, "podman");
         assert!(cgroup_only.in_container);
         assert_eq!(cgroup_only.container_kind, "container");
+    }
+
+    /// Both `/etc/os-release` reads `rocm examine` makes — the distro fields
+    /// and the distro name — answer from a simulated host root, and through the
+    /// shared parser: a planted file naming a distro no runner has reads as
+    /// that distro, as `sh` reads it. A read that bypassed the root would
+    /// report the runner's distro. One that bypassed the parser would read the
+    /// file as the old per-reader parsers did: the distro fields with their
+    /// single quotes kept, and the name from the first of two `PRETTY_NAME`s
+    /// rather than the last, which is the one `sh` assigns.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn os_release_reads_follow_the_simulated_host_root() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-os-release-root-{}",
+            crate::test_support::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("etc")).expect("create planted /etc");
+        std::fs::write(
+            root.join("etc/os-release"),
+            "ID='planted'\nVERSION_ID='0.1'\nPRETTY_NAME='Stale 0.0'\nPRETTY_NAME='Planted 0.1'\n",
+        )
+        .expect("write planted os-release");
+
+        let (examined, name) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let mut examined = Examination::default();
+            probe_os(&mut examined);
+            (examined, crate::host_gpu::detect_distro_name())
+        };
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            (
+                examined.distro_id.as_str(),
+                examined.distro_version.as_str()
+            ),
+            ("planted", "0.1")
+        );
+        assert_eq!(name.as_deref(), Some("Planted 0.1"));
     }
 }
 
