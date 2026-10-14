@@ -4119,7 +4119,7 @@ mod tests {
     use crate::runtime_install_finalize::tests::consents_for_install_sdk_argv;
     use crate::tests::test_paths;
     use crate::{Cli, Command, InstallTarget};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use rocm_core::ManagedServiceRecord;
     use std::fs;
     use std::net::TcpListener;
@@ -4165,6 +4165,46 @@ mod tests {
         assert_eq!(
             command_capture_text(&output),
             "stdout:\nout\n\nstderr:\nerr"
+        );
+    }
+
+    #[test]
+    fn runtimes_help_uses_the_runtime_noun_throughout() {
+        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
+        // and say "ROCm runtime". The help for the command they land on must use
+        // the same noun — including its own about line, which `rocm runtimes
+        // --help` prints above the subcommand list and which the rename missed
+        // while every subcommand below it already said "runtime".
+        let help = Cli::command()
+            .find_subcommand_mut("runtimes")
+            .expect("runtimes subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("ROCm runtimes"),
+            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
+        );
+        assert!(
+            !help.contains("ROCm install"),
+            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
+        );
+
+        // The help is not the only `runtimes` string a user reads: running a
+        // mutating `rocm runtimes …` from chat raises an approval modal whose
+        // title is written here, not by clap, so the help assertions above
+        // cannot reach it. It said "Change ROCm install" until this rename.
+        let action = chat_rocm_command_action_from_args(vec![
+            "runtimes".to_owned(),
+            "activate".to_owned(),
+            "some-runtime-key".to_owned(),
+        ])
+        .expect("a mutating runtimes command classifies");
+        let ChatRocmCommandAction::Approval { pending_title, .. } = action else {
+            panic!("`rocm runtimes activate` must require approval, got {action:?}");
+        };
+        assert!(
+            pending_title.contains("runtime") && !pending_title.contains("install"),
+            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
         );
     }
 

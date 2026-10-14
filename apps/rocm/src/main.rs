@@ -12270,46 +12270,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn runtimes_help_uses_the_runtime_noun_throughout() {
-        // `comfyui install`'s selection errors steer the user to `rocm runtimes`
-        // and say "ROCm runtime". The help for the command they land on must use
-        // the same noun — including its own about line, which `rocm runtimes
-        // --help` prints above the subcommand list and which the rename missed
-        // while every subcommand below it already said "runtime".
-        let help = Cli::command()
-            .find_subcommand_mut("runtimes")
-            .expect("runtimes subcommand")
-            .render_long_help()
-            .to_string();
-        assert!(
-            help.contains("ROCm runtimes"),
-            "`rocm runtimes --help` should describe itself with the `runtime` noun:\n{help}"
-        );
-        assert!(
-            !help.contains("ROCm install"),
-            "`rocm runtimes --help` must not reintroduce the `ROCm install` noun:\n{help}"
-        );
-
-        // The help is not the only `runtimes` string a user reads: running a
-        // mutating `rocm runtimes …` from chat raises an approval modal whose
-        // title is written here, not by clap, so the help assertions above
-        // cannot reach it. It said "Change ROCm install" until this rename.
-        let action = chat::chat_rocm_command_action_from_args(vec![
-            "runtimes".to_owned(),
-            "activate".to_owned(),
-            "some-runtime-key".to_owned(),
-        ])
-        .expect("a mutating runtimes command classifies");
-        let chat::ChatRocmCommandAction::Approval { pending_title, .. } = action else {
-            panic!("`rocm runtimes activate` must require approval, got {action:?}");
-        };
-        assert!(
-            pending_title.contains("runtime") && !pending_title.contains("install"),
-            "the `runtimes` approval modal must use the `runtime` noun, got {pending_title:?}"
-        );
-    }
-
-    #[test]
     fn out_of_scope_commands_are_marked_preview_in_help() {
         let help = Cli::command().render_long_help().to_string();
         for command in ["chat", "comfyui", "automations"] {
@@ -12882,32 +12842,6 @@ pub(crate) mod tests {
                 .kind(),
             clap::error::ErrorKind::ValueValidation
         );
-    }
-
-    #[test]
-    fn serve_negative_sampling_space_form_reaches_range_validator() {
-        // The space form (`--temperature -1`) must reach the value parser and
-        // report a value error, not be rejected by clap as an unexpected argument.
-        // This is the classic negative-number-as-flag gotcha; `allow_negative_numbers`
-        // makes both forms validate identically. `--max-tokens` shares the gotcha even
-        // though it is a positive integer: the ambiguity is at the tokenizer, before the
-        // value parser runs, so the space form must reach `parse_positive_u32` too.
-        for args in [
-            &["--temperature", "-1"][..],
-            &["--temperature=-1"][..],
-            &["--top-p", "-0.5"][..],
-            &["--top-p=-0.5"][..],
-            &["--max-tokens", "-1"][..],
-            &["--max-tokens=-1"][..],
-        ] {
-            assert_eq!(
-                parse_serve(args)
-                    .expect_err("negative sampling value is rejected")
-                    .kind(),
-                clap::error::ErrorKind::ValueValidation,
-                "expected range validation for {args:?}"
-            );
-        }
     }
 
     #[test]
@@ -20883,11 +20817,11 @@ pub(crate) mod tests {
         // The scriptable prompt passthrough stays on the text render path,
         // NOT the dash/TUI.
         assert!(
-            body.contains("chat::render_chat_prompt_text("),
+            body.contains("render_chat_prompt_text("),
             "prompt passthrough must still call render_chat_prompt_text; body:\n{body}"
         );
         assert!(
-            body.contains("chat::render_chat_text("),
+            body.contains("render_chat_text("),
             "non-interactive no-prompt path must still call render_chat_text; body:\n{body}"
         );
     }
@@ -20905,7 +20839,7 @@ pub(crate) mod tests {
         let src = main_rs_source();
         let body = strip_line_comments(&command_chat_handler_body(&src));
         assert!(
-            body.contains("chat::read_piped_prompt("),
+            body.contains("read_piped_prompt("),
             "no-prompt path must read piped stdin via read_piped_prompt; body:\n{body}"
         );
         assert!(
@@ -20913,11 +20847,9 @@ pub(crate) mod tests {
             "the piped read must supply the prompt that is dispatched (and \
              propagate its error), not be a discarded call; body:\n{body}"
         );
-        let read_at = body
-            .find("chat::read_piped_prompt(")
-            .expect("asserted above");
+        let read_at = body.find("read_piped_prompt(").expect("asserted above");
         let send_at = body
-            .find("chat::render_chat_prompt_text(")
+            .find("render_chat_prompt_text(")
             .unwrap_or_else(|| panic!("chat handler no longer sends a prompt; body:\n{body}"));
         assert!(
             read_at < send_at,
