@@ -1420,6 +1420,46 @@ mod tests {
     fn stop_scope_includes_vllm_workers() {
         assert_eq!(STOP_SCOPE, rocm_core::KillScope::Tree);
     }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_actually_runs_the_compat_shim_step() -> Result<()> {
+        // A mutation that deletes the `ensure_therock_compat_shims` call in
+        // `apply_therock_env` is otherwise invisible to this module's tests:
+        // the mpi_cxx stub it can write depends on build-host and
+        // target-host state (a real `libmpi_cxx.so*` present, or a stub
+        // embedded at compile time), neither of which this test controls.
+        // The stale-numa-shim removal it also performs does not — it always
+        // removes a `libnuma.so.1` symlink it finds — so assert on that
+        // instead, as proof the call actually happened.
+        let env = tempfile::tempdir()?;
+        let compat_dir = env.path().join("rocm-cli-lib-compat");
+        fs::create_dir_all(&compat_dir)?;
+        let stale_shim = compat_dir.join("libnuma.so.1");
+        std::os::unix::fs::symlink("/does/not/exist", &stale_shim)?;
+
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        assert!(
+            stale_shim.symlink_metadata().is_err(),
+            "ensure_therock_compat_shims must have removed the stale numa shim"
+        );
+        Ok(())
+    }
     fn test_vllm_runtime(
         python_executable: Option<PathBuf>,
         rocm_sdk_version: Option<String>,

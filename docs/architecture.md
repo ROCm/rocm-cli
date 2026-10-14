@@ -139,7 +139,7 @@ These modules are private `mod` declarations — [`lib.rs`](../crates/e2e-report
 
 - [`install.rs`](../engines/vllm/src/install.rs) — ROCm/vLLM build-variant discovery, install execution, and runtime-repair assessment.
 - [`process.rs`](../engines/vllm/src/process.rs) — spawn/env/path setup and readiness polling.
-- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution and TheRock library/bin path derivation, which is pure; on Linux, launch calls the separate `ensure_therock_compat_shims` first to write a `libmpi_cxx` compat stub and remove a stale numa shim in a runtime-owned `rocm-cli-lib-compat` directory, so the paths the derivation always includes for that directory actually resolve to something.
+- [`runtime.rs`](../engines/vllm/src/runtime.rs) — TheRock/managed-runtime resolution and TheRock library/bin path derivation, which performs no filesystem writes; on Linux, the derivation includes a runtime-owned `rocm-cli-lib-compat` directory only when it already holds something, so launch calls the separate `ensure_therock_compat_shims` first to write a `libmpi_cxx` compat stub and remove a stale numa shim there, before the derivation sees it on the loader path.
 - [`state.rs`](../engines/vllm/src/state.rs) — service state file I/O, log tailing, and health/inference probing.
 
 [`lib.rs`](../engines/vllm/src/lib.rs) keeps only CLI/envelope dispatch and the few items shared across those modules.

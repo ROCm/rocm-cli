@@ -575,7 +575,18 @@ mod tests {
         // The identity token must be recorded so a later stop can verify it
         // against the live process, not merely be present in the JSON — under
         // both PID keys, since `server_pid` is the same process and is the
-        // one `rocm-core` adopts, together with `server_start_ticks`.
+        // one `rocm-core` adopts, together with `server_start_ticks`. The
+        // equality checks alone are a `None == None` trap if
+        // `process_start_ticks` ever regressed to always returning `None` on
+        // Linux, so also pin that a live PID actually has a token there.
+        #[cfg(target_os = "linux")]
+        assert!(
+            state
+                .get("server_start_ticks")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a live PID has a token on Linux"
+        );
         assert_eq!(
             state.get("start_ticks").and_then(Value::as_u64),
             rocm_core::process_start_ticks(own_pid)
@@ -592,6 +603,11 @@ mod tests {
         // on.
         let identity = identity_from_state(&state).expect("identity");
         assert_eq!(identity.pid, own_pid);
+        #[cfg(target_os = "linux")]
+        assert!(
+            identity.start_ticks.is_some(),
+            "a live PID has a token on Linux"
+        );
         assert_eq!(
             identity.start_ticks,
             rocm_core::process_start_ticks(own_pid)
@@ -602,12 +618,11 @@ mod tests {
     fn write_running_state_forwards_engine_recipe_required_flags() -> Result<()> {
         // The sibling therock-env test above always passes `engine_recipe: None`,
         // so its `engine_recipe_required_flags` assertion (`is_some_and(Vec::is_empty)`)
-        // holds whether or not `write_running_state` actually forwards the recipe's
-        // flags — it would pass even if the forwarding call were deleted. This test
-        // uses a recipe with a non-empty `required_flags` so the assertion can only
-        // pass if the flags genuinely reach the state file; `engine_recipe_required_flags`
-        // is user-observable (printed by `rocm services list`), so this is the
-        // user-facing contract, not an implementation detail.
+        // can't tell "the forwarding call was deleted" apart from "the forwarding
+        // call is present but handed an empty list" — both leave the key
+        // `Some([])`. This test uses a recipe with a non-empty `required_flags`
+        // so the assertion can only pass if the flags genuinely reach the state
+        // file.
         let state_path = probe_state_path("recipe-flags");
         let recipe = EngineRecipeHint {
             contract_version: "1".to_owned(),
