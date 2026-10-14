@@ -1991,7 +1991,8 @@ pub(crate) mod tests {
     use clap::Parser as _;
     use rocm_core::load_recent_audit_events;
 
-    use crate::{Cli, Command, InstallTarget, providers, rocm_chat_tool_requested_args};
+    use crate::chat::rocm_chat_tool_requested_args;
+    use crate::{Cli, Command, InstallTarget, providers};
 
     /// Resolve the argv a non-interactive surface produces the way `install()`
     /// does, so a test can assert what that argv actually consents to rather
