@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use cucumber::{given, then, when};
+use e2e_cucumber::fixture_binary::fixture_target_name;
 
 use crate::E2eWorld;
 
@@ -55,20 +56,8 @@ fn plant_tailscale(world: &E2eWorld, status: Option<&str>) -> Vec<(String, Strin
         .path()
         .to_path_buf();
     let bin_dir = root.join("fake-bin");
-    std::fs::create_dir_all(&bin_dir).expect("create fake bin dir");
-
-    let built = fake_tailscale_binary();
-    let installed = bin_dir.join(if cfg!(windows) {
-        "tailscale.exe"
-    } else {
-        "tailscale"
-    });
-    std::fs::copy(&built, &installed).unwrap_or_else(|error| {
-        panic!(
-            "failed to install the tailscale stand-in from {}: {error}",
-            built.display()
-        )
-    });
+    let installed = bin_dir.join(fixture_target_name("tailscale"));
+    crate::install_fixture_binary("fake-tailscale", &installed);
 
     let mut env = vec![(
         "PATH".to_owned(),
@@ -88,27 +77,6 @@ fn plant_tailscale(world: &E2eWorld, status: Option<&str>) -> Vec<(String, Strin
         ));
     }
     env
-}
-
-/// The stand-in is a bin target of this crate, so cargo has already built it
-/// next to the test binary.
-fn fake_tailscale_binary() -> PathBuf {
-    let mut dir = std::env::current_exe().expect("test binary path");
-    dir.pop();
-    if dir.ends_with("deps") {
-        dir.pop();
-    }
-    let candidate = dir.join(if cfg!(windows) {
-        "fake-tailscale.exe"
-    } else {
-        "fake-tailscale"
-    });
-    assert!(
-        candidate.exists(),
-        "the tailscale stand-in was not built at {}; it is a [[bin]] of this crate",
-        candidate.display()
-    );
-    candidate
 }
 
 fn run_remote(world: &mut E2eWorld, args: &[&str], env: &[(String, String)]) {

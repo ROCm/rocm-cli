@@ -7,12 +7,12 @@
 //! `comfyui-01` and `comfyui-02` drive a dependency install against an entirely
 //! planted runtime: a `wheel` manifest with a satisfying `rocm_sdk` probe, a
 //! pre-existing source checkout (so the CLI never attempts the real network
-//! download of ComfyUI's source archive) and a fake Python interpreter that
-//! answers the torch-stack version probe with valid, empty JSON. `comfyui-01`
-//! covers what happens when the `uv` dependency install that follows all of
-//! that fails; `comfyui-02` covers a `uv` install that succeeds, which runs on
-//! into the post-install GPU check and needs the fake Python to also answer
-//! that second probe.
+//! download of ComfyUI's source archive) and a `fake-python` stand-in
+//! (`src/bin/fake-python.rs`) that answers both the pre-install torch-stack
+//! version probe and the post-install GPU check. `comfyui-01` covers what
+//! happens when the `uv` dependency install that follows all of that fails;
+//! `comfyui-02` covers a `uv` install that succeeds, which runs on into the
+//! post-install GPU check that `fake-python` also answers.
 //!
 //! `comfyui-03` covers runtime *selection* rather than the install that follows
 //! it: `rocm comfyui install` refuses when more than one managed ROCm runtime is
@@ -74,6 +74,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use cucumber::{given, then, when};
+use e2e_cucumber::fixture_binary::fixture_target_name;
 use e2e_cucumber::paced_download::{
     PacedDownloadServer, build_gzip_tarball, deterministic_payload,
 };
@@ -116,12 +117,17 @@ fn write_fixture(path: &Path, contents: &str) {
 }
 
 /// Writes an executable POSIX shell script, standing in for a real binary the
-/// CLI shells out to (`uv`, the runtime's Python).
+/// CLI shells out to.
 ///
 /// Written via [`rocm_core::fake_executable::write_fake_executable`], not
 /// `std::fs::write`: scenarios run concurrently, and a write fd another
 /// scenario's spawn inherits makes the CLI's first run of the shim fail with
 /// `Text file busy`.
+///
+/// comfyui-11 is the only remaining caller (its GPU-check failing transition,
+/// via `gpu_check_fails`): every other scenario's runtime Python is the
+/// Windows-portable `fake-python` `[[bin]]` planted by `install_fake_python`,
+/// including comfyui-11's own passing-again half (`gpu_check_passes_again`).
 fn write_shim(path: &Path, body: &str) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("failed to create fixture directory");
@@ -130,22 +136,43 @@ fn write_shim(path: &Path, body: &str) {
         .unwrap_or_else(|e| panic!("failed to write fake {}: {e}", path.display()));
 }
 
-/// Writes a fake runtime Python that answers both forms `probe_comfyui`'s
-/// post-install GPU check shells out to: `-c <script>` (the pre-install
-/// torch-stack probe) and `<script-path> <result-path>` (the post-install
-/// check, which writes its JSON result to the given path instead of stdout).
-fn write_gpu_probe_shim(path: &Path) {
-    write_shim(
-        path,
-        "#!/bin/sh\n\
-         if [ \"$1\" = \"-c\" ]; then\n\
-         \tprintf '{}'\n\
-         \texit 0\n\
-         fi\n\
-         cat > \"$2\" <<'JSON'\n\
-         {\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}\n\
-         JSON\n",
-    );
+/// Installs the `fake-uv` stand-in at `path`, configured via env vars it
+/// reads (see `src/bin/fake-uv.rs`). Returns the env additions the invoking
+/// `rocm` process needs so its own child `uv` process — which inherits
+/// `rocm`'s environment — picks them up.
+fn install_fake_uv(
+    path: &Path,
+    exit_code: i32,
+    stdout_line: Option<&str>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    crate::install_fixture_binary("fake-uv", path);
+    let mut env = vec![("FAKE_UV_EXIT_CODE", exit_code.to_string().into())];
+    if let Some(line) = stdout_line {
+        env.push(("FAKE_UV_STDOUT", line.into()));
+    }
+    env
+}
+
+/// Installs the `fake-python` stand-in at `path` (see `src/bin/fake-python.rs`).
+/// It always answers both of the runtime Python's invocation forms
+/// (`probe_torch_stack_versions`'s `-c`, `probe_comfyui`'s script form), so
+/// one install serves every scenario regardless of how far `install()` runs.
+fn install_fake_python(path: &Path) {
+    crate::install_fixture_binary("fake-python", path);
+}
+
+// A simplified stand-in for `rocm_core::runtime_rocm_library_filename` rather
+// than imported: only the filename's look matters here, since readiness only
+// checks `path.is_file()` on whatever the manifest lists (see
+// `probe_has_resolved_library` in `apps/rocm/src/therock.rs`) — never the
+// filename itself. Importing the product crate for that would buy nothing,
+// so it stays a local stand-in.
+fn rocm_library_filename(shortname: &str) -> String {
+    if cfg!(windows) {
+        format!("{shortname}.dll")
+    } else {
+        format!("lib{shortname}.so")
+    }
 }
 
 /// Plant one ready wheel runtime: the on-disk stubs the CLI's readiness check
@@ -165,12 +192,14 @@ fn plant_ready_runtime(data: &Path, key: &str) {
     let install_root = data.join("runtimes").join("roots").join(key);
     let sdk_root = install_root.join("sdk");
     let sdk_bin = sdk_root.join("bin");
-    let python = install_root.join("bin").join("python3");
-    let amdhip = sdk_bin.join("libamdhip64.so");
-    let hipblas = sdk_bin.join("libhipblas.so");
+    let python = install_root
+        .join("bin")
+        .join(fixture_target_name("python3"));
+    let amdhip = sdk_bin.join(rocm_library_filename("amdhip64"));
+    let hipblas = sdk_bin.join(rocm_library_filename("hipblas"));
 
     write_fixture(&install_root.join(".rocm-cli-runtime.json"), "{}");
-    write_fixture(&python, "#!/bin/sh\nexit 0\n");
+    install_fake_python(&python);
     write_fixture(&amdhip, "stub");
     write_fixture(&hipblas, "stub");
 
@@ -231,13 +260,15 @@ async fn ready_install_pending_dependencies(world: &mut E2eWorld) {
     let source_dir = install_root.join("apps").join("comfyui").join("source");
     write_fixture(&source_dir.join("requirements.txt"), "numpy==1.26.0\n");
 
-    // Fake Python interpreter: succeeds and prints valid (empty) JSON, so the
-    // torch-stack constraint probe that runs before `uv` passes cleanly.
+    // `install_fake_python` answers both of the runtime Python's invocation
+    // forms, but this scenario only reaches the torch-stack constraint probe
+    // (`-c`) before `uv`; the empty JSON it prints is what makes that probe
+    // pass cleanly.
     let python = root(world)
         .join("comfyui-fixture")
         .join("python")
-        .join("rocm-python");
-    write_shim(&python, "#!/bin/sh\nprintf '{}'\n");
+        .join(fixture_target_name("rocm-python"));
+    install_fake_python(&python);
 
     // A `rocm_sdk` probe that satisfies `validate_rocm_sdk_runtime_probe`:
     // importable, with an existing root/bin dir and resolved amdhip64/hipblas
@@ -246,8 +277,8 @@ async fn ready_install_pending_dependencies(world: &mut E2eWorld) {
     let sdk_bin = install_root.join("rocm_sdk").join("bin");
     std::fs::create_dir_all(&sdk_root).expect("failed to create fake rocm_sdk root dir");
     std::fs::create_dir_all(&sdk_bin).expect("failed to create fake rocm_sdk bin dir");
-    let amdhip64 = sdk_root.join("libamdhip64.so");
-    let hipblas = sdk_root.join("libhipblas.so");
+    let amdhip64 = sdk_root.join(rocm_library_filename("amdhip64"));
+    let hipblas = sdk_root.join(rocm_library_filename("hipblas"));
     write_fixture(&amdhip64, "");
     write_fixture(&hipblas, "");
 
@@ -283,8 +314,8 @@ async fn uv_install_fails(world: &mut E2eWorld) {
     let uv = root(world)
         .join("comfyui-fixture")
         .join("uv-bin")
-        .join("uv");
-    write_shim(&uv, "#!/bin/sh\nexit 7\n");
+        .join(fixture_target_name("uv"));
+    world.command_env.extend(install_fake_uv(&uv, 7, None));
     world
         .command_env
         .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
@@ -295,8 +326,10 @@ async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
     let uv = root(world)
         .join("comfyui-fixture")
         .join("uv-bin")
-        .join("uv");
-    write_shim(&uv, "#!/bin/sh\necho 'Resolved 3 packages'\nexit 0\n");
+        .join(fixture_target_name("uv"));
+    world
+        .command_env
+        .extend(install_fake_uv(&uv, 0, Some("Resolved 3 packages")));
     world
         .command_env
         .push(("ROCM_CLI_UV_BINARY", uv.into_os_string()));
@@ -305,15 +338,9 @@ async fn uv_install_prints_progress_and_succeeds(world: &mut E2eWorld) {
     // check, which shells out to the runtime's Python a second time with two
     // path arguments (a generated probe script, then where to write its JSON
     // result) rather than `-c <script>` like the pre-install torch-stack probe.
-    // The fixture Python from the `Given` above only answers the `-c` form, so
-    // it must be replaced here with one that answers both: unlike
-    // `comfyui-01`, this scenario runs `install()` far enough to reach that
-    // second call.
-    let python = root(world)
-        .join("comfyui-fixture")
-        .join("python")
-        .join("rocm-python");
-    write_gpu_probe_shim(&python);
+    // The fixture Python the `Given` above installed already answers both
+    // forms, so nothing more is needed here for `install()` to reach that
+    // second call, unlike `comfyui-01`, which fails before reaching it.
 }
 
 #[when("the user installs ComfyUI")]
@@ -520,21 +547,14 @@ const PTY_SCREEN_TIMEOUT: Duration = Duration::from_secs(30);
 #[given("a paced ComfyUI source archive fixture")]
 async fn paced_comfyui_source_archive_fixture(world: &mut E2eWorld) {
     let data = data_dir(world);
-    plant_ready_runtime(&data, RUNTIME_KEY);
-
     // `probe_comfyui`'s post-install GPU check runs unconditionally in
     // `install()`, regardless of whether the `uv` block ran, so the runtime's
-    // stub Python must answer it — `plant_ready_runtime`'s default (`exit 0`,
-    // no output) is not enough. This scenario's requirements.txt (torch-stack
-    // only, below) empties the dependency list and skips the `-c` probe, but
-    // the shim answers both forms anyway for parity with the other fixtures.
-    let python = data
-        .join("runtimes")
-        .join("roots")
-        .join(RUNTIME_KEY)
-        .join("bin")
-        .join("python3");
-    write_gpu_probe_shim(&python);
+    // stub Python must answer it — `plant_ready_runtime`'s `fake-python`
+    // stand-in already does, answering both invocation forms. This scenario's
+    // requirements.txt (torch-stack only, below) empties the dependency list
+    // and skips the `-c` probe, but the stand-in answers it anyway for parity
+    // with the other fixtures.
+    plant_ready_runtime(&data, RUNTIME_KEY);
 
     // Build a real `.tar.gz`: one top-level directory holding a
     // `requirements.txt` naming only the torch stack, so `install()`'s
@@ -710,15 +730,6 @@ fn run_comfyui_reinstall(world: &mut E2eWorld, extra: &[&str]) {
 async fn used_comfyui_install(world: &mut E2eWorld) {
     let data = data_dir(world);
     plant_ready_runtime(&data, RUNTIME_KEY);
-    // Answers the post-install GPU check `install()` runs after the swap.
-    write_gpu_probe_shim(
-        &data
-            .join("runtimes")
-            .join("roots")
-            .join(RUNTIME_KEY)
-            .join("bin")
-            .join("python3"),
-    );
     let source = comfyui_source_dir(world);
     for (relative, contents) in [
         ("main.py", "old release"),
@@ -1496,7 +1507,7 @@ async fn gpu_check_fails(world: &mut E2eWorld) {
 
 #[given("the runtime's AMD GPU check passes again")]
 async fn gpu_check_passes_again(world: &mut E2eWorld) {
-    write_gpu_probe_shim(&runtime_python(world));
+    install_fake_python(&runtime_python(world));
 }
 
 fn runtime_python(world: &E2eWorld) -> PathBuf {
@@ -1505,7 +1516,7 @@ fn runtime_python(world: &E2eWorld) -> PathBuf {
         .join("roots")
         .join(RUNTIME_KEY)
         .join("bin")
-        .join("python3")
+        .join(fixture_target_name("python3"))
 }
 
 #[then("the reinstall fails and names what it replaced and the command that finishes the install")]
