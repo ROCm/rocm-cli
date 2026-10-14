@@ -5,8 +5,13 @@
 //! Automation-daemon runtime state and its on-disk records.
 //!
 //! The running daemon's live snapshot (`AutomationRuntimeState`), the
-//! append-only JSONL stores for watcher trigger events, review proposals,
-//! and audit log entries, and the accessors used to read them back.
+//! append-only JSONL stores for watcher action events (`AutomationEventRecord`)
+//! and audit log entries, the review-proposal store (append-only on write,
+//! but rewritten in full on status update or replace), and the accessors
+//! used to read them back. `AutomationTriggerEvent` is also defined here as
+//! the shared wire type for a watcher trigger, but this module persists
+//! none of it — it is produced and consumed in-memory by `rocmd`'s
+//! watcher/webhook plumbing.
 //!
 //! ROCMAI-151 (Phase 7d). `generate_endpoint_api_key`/
 //! `endpoint_api_key_has_forbidden_chars` sit in the same pre-split stretch

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Locating sibling CLI binaries (`rocm-engine-<name>`, `rocmd`) next to the
+//! Locating sibling CLI binaries (`rocm-engine-<name>`, `rocm`) next to the
 //! currently running executable.
 //!
 //! ROCMAI-151 (Phase 7d). `resolve_amd_smi_binary*` and the
