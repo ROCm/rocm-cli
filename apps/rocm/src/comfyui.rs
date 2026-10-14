@@ -4285,7 +4285,7 @@ mod tests {
         // The summary the assistant answers with after a status tool call
         // passes the note on too.
         // Another tool's output ahead of it in the same text keeps its notes.
-        let summary = crate::deterministic_comfyui_tool_summary(&format!(
+        let summary = crate::chat::deterministic_comfyui_tool_summary(&format!(
             "Engines\n  note: another tool's note\n\n{status}"
         ))
         .context("a status summary")?;
@@ -4308,8 +4308,9 @@ mod tests {
         let answer = render_chat_status_answer(&paths)?;
         assert!(!answer.contains("interrupted"), "{answer}");
         assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
-        let summary = crate::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
-            .context("a status summary")?;
+        let summary =
+            crate::chat::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
+                .context("a status summary")?;
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
         ensure_source_is_startable(&load_manifest(&paths)?.context("manifest")?)?;
@@ -4663,7 +4664,7 @@ mod tests {
         // sums that up as its running state, not as a note.
         assert!(status.contains("  note: starting\n"), "{status}");
         let summary =
-            crate::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+            crate::chat::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
         assert!(summary.contains("  Running: starting."), "{summary}");
         assert!(!summary.contains("Note:"), "{summary}");
         assert!(!answer.contains("URL:"), "{answer}");
