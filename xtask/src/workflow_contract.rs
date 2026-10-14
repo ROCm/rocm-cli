@@ -1070,6 +1070,144 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         Some(body)
     }
 
+    /// The non-comment lines of a step's `run: |` block, joined.
+    ///
+    /// A preflight step's body is the only place a lane can still spell its own
+    /// floor (the WSL `${…:-8}` default, the PowerShell `else { 8 }`), and a
+    /// substring search over the raw body matches those spellings inside a
+    /// comment that merely discusses them. `#` opens a comment in both bash and
+    /// PowerShell, so one filter serves every shape here.
+    fn preflight_body_code(step: &str) -> String {
+        run_block(step)
+            .map(|body| {
+                body.iter()
+                    .filter(|l| !l.trim_start().starts_with('#'))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    /// A step's `env:` mapping, parsed as KEY AND VALUE rather than searched
+    /// for as a substring.
+    ///
+    /// Both halves matter and both were wrong when this was a `contains`:
+    /// `GPU_PREFLIGHT_MIN_FREE_GIB: 16` is a substring of `…: 160`, so a floor
+    /// ten times too high satisfied a test asserting the floor; and the search
+    /// ran over the whole step, so commenting the key out — `# GPU_PREFLIGHT_
+    /// MIN_FREE_GIB: 8`, which leaves the lane running at the script's 16 GiB
+    /// default — satisfied it too. That default on an APU lane is verbatim the
+    /// thing the assertion message says it prevents.
+    ///
+    /// Comment and blank lines are skipped, and only scalar `key: value`
+    /// entries are returned; our workflows spell step `env:` no other way.
+    fn step_env(step: &str) -> BTreeMap<String, String> {
+        let lines: Vec<&str> = step.lines().collect();
+        let mut env = BTreeMap::new();
+        let Some(env_at) = lines.iter().position(|l| l.trim() == "env:") else {
+            return env;
+        };
+        let env_indent = indent_of(lines[env_at]);
+        for line in &lines[env_at + 1..] {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if indent_of(line) <= env_indent {
+                break;
+            }
+            let entry = line.trim_start();
+            if entry.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = entry.split_once(':') else {
+                continue;
+            };
+            env.insert(
+                key.trim().to_string(),
+                strip_quotes(strip_comment(value).trim()),
+            );
+        }
+        env
+    }
+
+    /// The floor a step sets through its `env:` mapping, if it sets one.
+    fn preflight_floor(step: &str) -> Option<String> {
+        step_env(step).get("GPU_PREFLIGHT_MIN_FREE_GIB").cloned()
+    }
+
+    /// A step's top-level keys, in file order — `name`, `env`, `run` and
+    /// anything a lane has grown beyond them.
+    ///
+    /// `continue-on-error: true` on one preflight turns a required gate into an
+    /// advisory one; `if: false` removes it outright. Neither touches the `run:`
+    /// body, so neither is visible to a test that compares bodies.
+    fn step_keys(step: &str) -> Vec<String> {
+        let lines: Vec<&str> = step.lines().collect();
+        let Some(first) = lines.first() else {
+            return Vec::new();
+        };
+        // Past the `- ` that opens the list item: the step's keys all sit at
+        // that column, including the `name:` sharing the first line.
+        let key_indent = indent_of(first) + 2;
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                let entry = if i == 0 {
+                    line.trim_start().strip_prefix("- ")?
+                } else if indent_of(line) == key_indent && !line.trim_start().starts_with('#') {
+                    line.trim_start()
+                } else {
+                    return None;
+                };
+                entry.split_once(':').map(|(key, _)| key.trim().to_string())
+            })
+            .collect()
+    }
+
+    /// Everything in a step EXCEPT its `run:` body: the shape the body travels
+    /// in, dedented so two lanes in differently-indented files compare.
+    ///
+    /// The per-lane floor's VALUE is replaced rather than dropped, because 8 and
+    /// 16 are the one difference between these steps that is intended — while
+    /// losing the key altogether is not, and still shows up as a difference.
+    fn preflight_step_shape(step: &str) -> String {
+        let lines: Vec<&str> = step.lines().collect();
+        let Some(first) = lines.first() else {
+            return String::new();
+        };
+        let pad = indent_of(first);
+        let run_at = lines.iter().position(|l| l.trim() == "run: |");
+        let run_indent = run_at.map(|at| indent_of(lines[at]));
+        let mut shape = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
+                continue;
+            }
+            // Drop the body, keep the `run: |` key that introduces it: the
+            // bodies are compared to each other separately.
+            if let (Some(at), Some(run_indent)) = (run_at, run_indent)
+                && i > at
+                && indent_of(line) > run_indent
+            {
+                continue;
+            }
+            let line = if line.len() > pad {
+                &line[pad..]
+            } else {
+                line.trim_start()
+            };
+            match line.split_once(':') {
+                Some((key, _)) if key.trim() == "GPU_PREFLIGHT_MIN_FREE_GIB" => {
+                    shape.push(format!("{key}: <per-lane floor>"));
+                }
+                _ => shape.push(line.to_string()),
+            }
+        }
+        shape.join("\n")
+    }
+
     /// Where two line-oriented texts first differ, phrased for a failure
     /// message and naming which file each side came from; `None` when they
     /// are equal.
@@ -1178,10 +1316,18 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     /// shapes differently: a step-level `env:` key on the lanes that delegate to
     /// the shared script, a `${…:-8}` default in the WSL advisory bodies, and a
     /// PowerShell `else { 8 }` on the Windows-native ones.
+    ///
+    /// None of the three is a substring search over the raw step any more. The
+    /// `env:` one is a parsed lookup compared EXACTLY, and the other two run
+    /// over the body with comments stripped — a step whose floor is commented
+    /// out is not an APU lane that set 8, it is a lane running the script's
+    /// discrete 16 GiB default on hardware that can never clear it.
     fn is_apu_preflight(step: &str) -> bool {
-        step.contains("GPU_PREFLIGHT_MIN_FREE_GIB: 8")
-            || step.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8")
-            || step.contains("else { 8 }")
+        if let Some(floor) = preflight_floor(step) {
+            return floor == "8";
+        }
+        let body = preflight_body_code(step);
+        body.contains("GPU_PREFLIGHT_MIN_FREE_GIB:-8") || body.contains("else { 8 }")
     }
 
     #[test]
@@ -1261,11 +1407,19 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                      instead of delegating to {SHARED_PREFLIGHT}; that is the duplication \
                      #294 removed, and a fix to the gate will now miss this lane"
                 );
+                // Compared as a PARSED VALUE, not found as a substring. `16` is
+                // a substring of `160`, and a search over the whole step is
+                // satisfied by `# GPU_PREFLIGHT_MIN_FREE_GIB: 8` — a commented
+                // key, which leaves the lane on the script's 16 GiB default.
+                // Both mutations passed this assertion while producing exactly
+                // the state its message says cannot happen.
+                let floor = preflight_floor(&step);
                 assert!(
-                    is_apu_preflight(&step) || step.contains("GPU_PREFLIGHT_MIN_FREE_GIB: 16"),
+                    matches!(floor.as_deref(), Some("8" | "16")),
                     "{workflow} delegates to {SHARED_PREFLIGHT} without naming its own \
-                     floor; the lane would then silently inherit the script's default \
-                     rather than the value its hardware was sized for"
+                     floor in `env:` (found {floor:?}, expected the APU's 8 or a \
+                     discrete card's 16); the lane would then silently inherit the \
+                     script's default rather than the value its hardware was sized for"
                 );
                 delegating += 1;
             }
@@ -1296,19 +1450,46 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // satisfied by six identically re-inlined copies; the shape assertion
         // alone would not notice five of six.
         //
-        // The per-lane floor is deliberately NOT part of this comparison. It
-        // travels in the step's `env:` mapping, not its `run:` body, precisely
-        // so the bodies can be identical — that is the property being pinned.
+        // The per-lane floor's VALUE is deliberately not part of this
+        // comparison — 8 and 16 are the one intended difference — but
+        // everything else outside the body IS. Comparing only the `run:` body
+        // leaves the whole rest of the step free to drift, and the drift that
+        // fits there is worse than the drift that fits in the body: measured,
+        // each of `continue-on-error: true`, `if: false` and a second
+        // `GPU_PREFLIGHT_CEILING_SECS: 1` env key on ONE lane left the
+        // body-only comparison green. The first turns a required gate into an
+        // advisory one — the gate still runs, still goes red, and the job
+        // carries on — which is indistinguishable from deleting it.
         let mut bodies: Vec<(String, String)> = Vec::new();
+        let mut shapes: Vec<(String, String)> = Vec::new();
         for (workflow, text) in self_hosted_workflows() {
             for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
                 if preflight_powershell_script(step).is_some() || step.contains("-Script @'") {
                     continue;
                 }
-                let body = preflight_shell_script(step).unwrap_or_else(|| {
-                    panic!("{workflow} GPU preflight #{i} carries no `run: |` body")
-                });
-                bodies.push((format!("{workflow} GPU preflight #{i}"), body));
+                let name = format!("{workflow} GPU preflight #{i}");
+                let body = preflight_shell_script(step)
+                    .unwrap_or_else(|| panic!("{name} carries no `run: |` body"));
+                // Pinned per lane as well as compared across them: six lanes
+                // that ALL grew `continue-on-error: true` would still agree
+                // with each other.
+                assert_eq!(
+                    step_keys(step),
+                    ["name", "env", "run"],
+                    "{name} is no longer just a named, floor-carrying delegation: a \
+                     preflight that also sets `if:` or `continue-on-error:` is a gate \
+                     the job can skip or survive, which is the one failure mode a \
+                     required gate has"
+                );
+                assert_eq!(
+                    step_env(step).keys().collect::<Vec<_>>(),
+                    ["GPU_PREFLIGHT_MIN_FREE_GIB"],
+                    "{name} sets step environment beyond its floor; a lane-local \
+                     ceiling or marker is a second gate configured where the shared \
+                     script cannot see it, and the next fix to it lands six times again"
+                );
+                shapes.push((name.clone(), preflight_step_shape(step)));
+                bodies.push((name, body));
             }
         }
         assert_eq!(
@@ -1340,6 +1521,20 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
              do is a second gate living in the workflows, where the next fix to it \
              has to land six times again"
         );
+        let (first_name, first) = shapes
+            .first()
+            .expect("at least one native preflight")
+            .clone();
+        for (name, shape) in &shapes[1..] {
+            if let Some(diff) = first_line_difference(&first_name, &first, name, shape) {
+                panic!(
+                    "the native Linux GPU preflights agree on their bodies but no longer \
+                     on the step AROUND the body — one lane runs {SHARED_PREFLIGHT} under \
+                     conditions, error handling or environment the other five do not, so \
+                     the six are one gate in name only; {diff}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1355,24 +1550,32 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // _uses` drives it against a reclaim stub that reports survivors, which
         // is what proves it can fail.
         //
-        // COMMENTS ARE EXCLUDED, and that is not fastidiousness: the script's
-        // header explains the mode by name and its error message quotes it, so
-        // a whole-file substring match stays satisfied after the call itself is
-        // gone. Measured — replacing the `if bash … --assert-clear; then`
-        // condition with `if true; then` left this test green until the lines
-        // were filtered.
+        // MATCHED ON THE CALL, not on the flag's name anywhere in the file, and
+        // this is the second time round on exactly that distinction. Filtering
+        // comments was the first fix: the script's header explains the mode by
+        // name, so a whole-file `contains("--assert-clear")` stayed satisfied
+        // after the call was gone. Then the timeout fix added a NON-comment
+        // `echo "::error::… (reclaim-gpu.sh --assert-clear) did not finish…"`,
+        // which contains the flag too — and the filtered search could not fail
+        // again. Prose about a call is not a call; the only thing worth
+        // asserting is the invocation, so that is what is matched.
         let script = shared_preflight_script();
-        let code: String = script
+        let code_lines: Vec<&str> = script
             .lines()
             .filter(|l| !l.trim_start().starts_with('#'))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+        let calls: Vec<&str> = code_lines
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| l.contains(r#"bash "${RECLAIM_SCRIPT}" --assert-clear"#))
+            .collect();
         assert!(
-            code.contains("--assert-clear"),
+            !calls.is_empty(),
             "{SHARED_PREFLIGHT} no longer RUNS `reclaim-gpu.sh --assert-clear` (it may still \
-             describe it); the gate is back to a fixed free-memory floor, which on these \
-             pools only trips near exhaustion (#446)"
+             describe it, and its own error message quotes the flag); the gate is back to a \
+             fixed free-memory floor, which on these pools only trips near exhaustion (#446)"
         );
+        let code: String = code_lines.join("\n");
         // The floor is a BACKSTOP, not a thing the process check replaced: it is
         // the only one of the two that can see a non-E2E tenant exhausting a
         // shared host. Losing it silently would be the opposite half of #446.
@@ -1390,10 +1593,11 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // drives this for real; this names the loss immediately rather than by
         // a case that takes a minute to go red.
         assert!(
-            code.contains(r#"timeout 15 bash "${RECLAIM_SCRIPT}" --assert-clear"#),
-            "{SHARED_PREFLIGHT} runs `reclaim-gpu.sh --assert-clear` without a `timeout` \
-             bound; a stalled /proc scan then rides to the job's own cap instead of \
-             failing fast, which is what the rest of this script exists to prevent"
+            calls.iter().all(|l| l.starts_with("timeout 15 bash")),
+            "{SHARED_PREFLIGHT} does not invoke `reclaim-gpu.sh --assert-clear` as a plain, \
+             `timeout 15`-bounded command — it is either unbounded, in which case a stalled \
+             /proc scan rides to the job's own cap instead of failing fast, or guarded by \
+             something that can skip it. Found: {calls:?}"
         );
         // …and the bound must FAIL the gate. `timeout` reports expiry as 124,
         // and a scan that could not finish is not evidence of a clear host.
@@ -1404,6 +1608,19 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             "{SHARED_PREFLIGHT} bounds the leaked-process scan but does not handle \
              `timeout`'s expiry code (124) distinctly; a scan that never finished must \
              fail the gate with its own reason, not pass or be reported as a survivor"
+        );
+        // …and so must every OTHER non-zero code. 1 is the only one that means
+        // the scan ran and named somebody; 127 (no such script) and 2 (a flag
+        // reclaim-gpu.sh does not dispatch — what deleting its `--assert-clear`
+        // arm produces) are not survivors and must not be reported as one.
+        // `preflight_distinguishes_a_scan_that_never_ran_from_a_survivor` drives
+        // both for real.
+        assert!(
+            code.contains(r#""${assert_rc}" -eq 1"#),
+            "{SHARED_PREFLIGHT} treats every non-124 failure of the leaked-process scan as \
+             a surviving process; a missing script or an undispatched flag then fails the \
+             lane with 'a leaked E2E engine process is still holding it (listed above)' \
+             and nothing listed above"
         );
     }
 
@@ -1600,8 +1817,14 @@ esac
     #[cfg(unix)]
     const RECLAIM_STUB: &str = r#"#!/bin/sh
 echo "reclaim-gpu.sh stub called: $*"
+if [ "$1" = "--report-holders" ] && [ "${RECLAIM_HOLDERS_HANGS:-0}" = 1 ]; then
+  exec sleep 60
+fi
 if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_HANGS:-0}" = 1 ]; then
   exec sleep 60
+fi
+if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_RC:-0}" != 0 ]; then
+  exit "${RECLAIM_ASSERT_RC}"
 fi
 if [ "$1" = "--assert-clear" ] && [ "${RECLAIM_ASSERT_FAILS:-0}" = 1 ]; then
   echo "assert-clear: leaked E2E engine process(es) still holding the GPU:" >&2
@@ -1641,6 +1864,25 @@ fi
         fixture: &str,
         env: &[(&str, &str)],
     ) -> (i32, String) {
+        run_preflight_with_reclaim(script, shell, fixture, env, RECLAIM_STUB)
+    }
+
+    /// As `run_preflight`, but with the `scripts/reclaim-gpu.sh` the preflight
+    /// finds supplied by the caller.
+    ///
+    /// Every case but one plants `RECLAIM_STUB`, which is what makes the gate's
+    /// outcomes drivable. `preflight_runs_the_real_reclaim_assert_clear` plants
+    /// the REAL script instead, because a stub cannot show that the two agree
+    /// about how the mode is spelled, what it exits, or that the dispatch arm
+    /// for it exists at all.
+    #[cfg(unix)]
+    fn run_preflight_with_reclaim(
+        script: &str,
+        shell: PreflightShell,
+        fixture: &str,
+        env: &[(&str, &str)],
+        reclaim: &str,
+    ) -> (i32, String) {
         use rocm_core::fake_executable::write_fake_executable;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1654,8 +1896,8 @@ fi
         // The lanes name `scripts/reclaim-gpu.sh` relative to the checkout, so
         // run from a directory that has one.
         std::fs::create_dir(dir.path().join("scripts")).expect("scripts dir");
-        std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), RECLAIM_STUB)
-            .expect("write reclaim-gpu.sh stub");
+        std::fs::write(dir.path().join("scripts/reclaim-gpu.sh"), reclaim)
+            .expect("write reclaim-gpu.sh");
 
         let path = format!(
             "{}:{}",
@@ -2162,6 +2404,273 @@ fi
             "the preflight took {elapsed:?} against a 15s bound and a stub that sleeps \
              60s: the bound did not cut the scan short"
         );
+    }
+
+    /// Whether this host has the procfs `--assert-clear` walks.
+    ///
+    /// macOS is a `cfg(unix)` target with no `/proc`, where the scan's glob
+    /// expands to nothing and every host looks clear. A case driving the real
+    /// script has to know the difference between "found no survivor" and "could
+    /// not have found one".
+    #[cfg(unix)]
+    fn has_procfs() -> bool {
+        Path::new("/proc/self/cmdline").exists()
+    }
+
+    /// The preflight must run the REAL `reclaim-gpu.sh --assert-clear`, the way
+    /// it runs it in CI, in both directions.
+    ///
+    /// Everything else here plants a stub, and the script's own self-test calls
+    /// `assert_clear` as a bash function — so between them nothing crossed the
+    /// process boundary the lane actually crosses. Measured: with the
+    /// `--assert-clear` arm DELETED from `reclaim-gpu.sh`'s `main`, the entire
+    /// suite and the whole self-test stayed green. The script then falls through
+    /// to its `unknown argument` arm and exits 2, which the preflight reported
+    /// as "a leaked E2E engine process is still holding it (listed above)" with
+    /// nothing listed above — a gate that fails every lane, for a reason that is
+    /// not true, naming a process that does not exist.
+    ///
+    /// `RECLAIM_SELFTEST_SCOPE` confines the scan to a decoy under a temp dir,
+    /// exactly as the script's own self-test confines its decoys, so this can
+    /// run on a shared machine without seeing anybody else's processes — and,
+    /// in the clear direction, cannot be satisfied by a host that merely has no
+    /// engine running.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_runs_the_real_reclaim_assert_clear() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        if !has_procfs() {
+            eprintln!("skipping: no /proc, so `--assert-clear` cannot see any process here");
+            return;
+        }
+        let reclaim_path = repo_root().join("scripts/reclaim-gpu.sh");
+        let reclaim = std::fs::read_to_string(&reclaim_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", reclaim_path.display()));
+        // A healthy, nearly-empty aperture: the floor passes on the first poll,
+        // so the gate is the only thing that can decide either run.
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        let scope = tempfile::tempdir().expect("decoy scope dir");
+        let scope_arg = scope.path().to_str().expect("utf-8 temp path").to_owned();
+        let env = [("RECLAIM_SELFTEST_SCOPE", scope_arg.as_str())];
+
+        let (code, log) = run_preflight_with_reclaim(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &env,
+            &reclaim,
+        );
+        // The scan forks once per /proc entry, so a heavily loaded host can
+        // genuinely exceed the 15s bound (measured: ~4s at 2400 pids). That is
+        // the bound doing its job, not this contract failing; say so and stop
+        // rather than report a slow machine as a broken gate.
+        if log.contains("did not finish within 15s") {
+            eprintln!("skipping: the real /proc scan did not finish inside the gate's 15s bound");
+            return;
+        }
+        assert_eq!(
+            code, 0,
+            "the preflight ran the real `reclaim-gpu.sh --assert-clear` against a scope \
+             holding nothing and still failed; logged:\n{log}"
+        );
+        assert!(
+            log.contains("assert-clear: no leaked E2E engine processes are running"),
+            "the preflight passed without the real script reporting a clear scan — the \
+             two disagree about how this mode is spelled or what it prints; logged:\n{log}"
+        );
+
+        // argv[0] names an E2E root and an engine marker, which is what the
+        // rule matches, and sits under the scope so nothing else can.
+        let decoy_dir = scope.path().join("e2e-prewarm/bin");
+        std::fs::create_dir_all(&decoy_dir).expect("decoy dir");
+        let decoy = decoy_dir.join("llama-server");
+        std::fs::copy("/bin/sleep", &decoy).expect("copy /bin/sleep as the decoy");
+        let mut child = std::process::Command::new(&decoy)
+            .arg("300")
+            .spawn()
+            .expect("spawn the decoy engine process");
+        let decoy_pid = child.id();
+        let got = run_preflight_with_reclaim(
+            &shared_preflight_script(),
+            PreflightShell::DefaultRunStep,
+            &fixture,
+            &env,
+            &reclaim,
+        );
+        // Reaped before any assertion: a panic here must not leave a `sleep
+        // 300` behind on a self-hosted runner, of all things.
+        let _ = child.kill();
+        let _ = child.wait();
+        let (code, log) = got;
+        if log.contains("did not finish within 15s") {
+            eprintln!("skipping: the real /proc scan did not finish inside the gate's 15s bound");
+            return;
+        }
+        assert_eq!(
+            code, 1,
+            "a real leaked engine process was running and the preflight passed; logged:\n{log}"
+        );
+        assert!(
+            log.contains("a leaked E2E engine process is still holding it"),
+            "the preflight failed with a survivor present but did not report it as one — \
+             which is what any non-zero exit from a script that never ran this mode looks \
+             like; logged:\n{log}"
+        );
+        assert!(
+            log.contains(&format!("pid={decoy_pid} ")),
+            "the preflight did not name the surviving process (pid={decoy_pid}); an \
+             unnamed survivor is the report this gate exists to replace; logged:\n{log}"
+        );
+    }
+
+    /// An `--assert-clear` that never ran must not be reported as one that
+    /// found somebody.
+    ///
+    /// `timeout` passes the command's own status through, so the preflight sees
+    /// 127 for a missing or unreadable `reclaim-gpu.sh` and 2 for a flag the two
+    /// scripts disagree about — both of which it used to report as "a leaked
+    /// E2E engine process is still holding it (listed above)", with nothing
+    /// listed above. Deleting the `--assert-clear` arm from `reclaim-gpu.sh`
+    /// produces exactly the 2.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_distinguishes_a_scan_that_never_ran_from_a_survivor() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        let fixture = smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB)));
+        for rc in ["2", "127"] {
+            let (code, log) = run_preflight(
+                &shared_preflight_script(),
+                PreflightShell::DefaultRunStep,
+                &fixture,
+                &[("RECLAIM_ASSERT_RC", rc)],
+            );
+            assert_eq!(
+                code, 1,
+                "a scan that could not be run is not evidence of a clear host, so the \
+                 preflight must fail (reclaim exited {rc}); logged:\n{log}"
+            );
+            assert!(
+                log.contains("could not be run") && log.contains(&format!("exited {rc}")),
+                "reclaim exited {rc} — neither clear, nor a survivor, nor the bound — and \
+                 the preflight did not say so; logged:\n{log}"
+            );
+            assert!(
+                !log.contains("is still holding it"),
+                "reclaim exited {rc} without naming anybody, and the preflight claimed a \
+                 leaked process was holding the GPU and 'listed above'; nothing is listed \
+                 above, so the lane fails pointing at a process that was never found. \
+                 Logged:\n{log}"
+            );
+        }
+    }
+
+    /// One path into a holder report, and the reason the preflight still owes
+    /// after that report has been bounded out.
+    #[cfg(unix)]
+    struct HolderCase {
+        label: &'static str,
+        fixture: String,
+        env: Vec<(&'static str, &'static str)>,
+        phrase: &'static str,
+    }
+
+    /// The holder report is a DIAGNOSTIC, and must not outlive the failure it
+    /// is explaining.
+    ///
+    /// Both `--report-holders` calls were bounded by the same commit that
+    /// bounded the gate, and the comments at both call sites argue the bound is
+    /// load-bearing — but every other case here stubs reclaim to return
+    /// instantly, so removing either `timeout 15` left the whole suite green.
+    /// `--report-holders` walks /proc too, and it is reached precisely when
+    /// something is wedged, so the hang risk is the same one the gate's bound
+    /// exists for: an unbounded diagnostic spends the ceiling the fast failure
+    /// just saved.
+    ///
+    /// Both call sites are driven, because they are separate lines reached by
+    /// separate paths: the gate's failure, and the ceiling expiring.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_bounds_the_holder_report() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        if !has_timeout() {
+            eprintln!("skipping: no `timeout` on PATH (GNU coreutils)");
+            return;
+        }
+        // First: the gate fires with a survivor, which reports holders and then
+        // exits 1. Second: the floor is never met, so the ceiling expires and
+        // the report at the end of the script runs instead.
+        let paths = [
+            HolderCase {
+                label: "after the leaked-process gate fails",
+                fixture: smi_fixture(512 * MIB, 200 * MIB, Some((62 * GIB, GIB))),
+                env: vec![
+                    ("RECLAIM_ASSERT_FAILS", "1"),
+                    ("RECLAIM_HOLDERS_HANGS", "1"),
+                ],
+                phrase: "a leaked E2E engine process is still holding it",
+            },
+            HolderCase {
+                label: "after the ceiling expires",
+                fixture: smi_fixture(192 * GIB, 191 * GIB, None),
+                env: vec![
+                    ("GPU_PREFLIGHT_MIN_FREE_GIB", "16"),
+                    ("RECLAIM_HOLDERS_HANGS", "1"),
+                ],
+                phrase: "never dropped below the floor",
+            },
+        ];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = paths
+                .iter()
+                .map(|case| {
+                    scope.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let got = run_preflight(
+                            &shared_preflight_script(),
+                            PreflightShell::DefaultRunStep,
+                            &case.fixture,
+                            &case.env,
+                        );
+                        (case, got, started.elapsed())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let (case, (code, log), elapsed) =
+                    handle.join().expect("holder-report case thread");
+                let label = case.label;
+                assert_eq!(
+                    code, 1,
+                    "{label}: a hanging holder report must not change the verdict; \
+                     logged:\n{log}"
+                );
+                assert!(
+                    log.contains(case.phrase),
+                    "{label}: the preflight lost its own reason while reporting holders; \
+                     logged:\n{log}"
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(45),
+                    "{label}: the preflight took {elapsed:?} against a 15s bound and a \
+                     holder report that sleeps 60s — the report is unbounded, so a wedged \
+                     host pays for the diagnostic with the fast failure it was printing"
+                );
+            }
+        });
     }
 
     #[cfg(unix)]
