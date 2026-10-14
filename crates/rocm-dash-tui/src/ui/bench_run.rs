@@ -327,7 +327,7 @@ pub fn draw_bench_run(f: &mut Frame, area: Rect, state: &BenchRunState, theme: &
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "note: local saturation smoke-test - client-measured throughput, not an official ROCm/AMD benchmark.",
+            "note: local saturation smoke-test — client-measured throughput, not an official ROCm/AMD benchmark.",
             Style::default().fg(theme.muted),
         ))),
         rows[7],

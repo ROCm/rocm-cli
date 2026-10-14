@@ -26138,6 +26138,50 @@ install therock";
         Ok(())
     }
 
+    /// ROCMAI-543: the clap doc comments are the largest single surface of
+    /// user-facing text this fix rewrote, and nothing exercised them — no test
+    /// renders `--help` at all. Walking the whole command tree, rather than
+    /// only the top-level `--help`, is what makes this cover the edits that
+    /// were actually made: every one of them sits on a nested subcommand's
+    /// field or variant (`rocm runtime install --family`, `rocm services
+    /// prune --older-than-hours`, `rocm runtime rollback`'s `after_help`,
+    /// ...), none of which the top-level help renders. Asserting on the
+    /// rendered help rather than on individual strings means a future option
+    /// added anywhere in the tree is covered the day it lands.
+    #[test]
+    fn every_help_text_in_the_command_tree_is_ascii() {
+        fn assert_ascii_help(cmd: &mut clap::Command, path: &str) {
+            // Both renderings: `-h` and `--help` draw from different fields
+            // (`about` vs `long_about`, and clap truncates the short form at
+            // the first paragraph), so a non-ASCII character in a later
+            // paragraph is only visible in the long form.
+            for rendered in [cmd.render_help(), cmd.render_long_help()] {
+                let rendered = rendered.to_string();
+                assert!(
+                    rendered.is_ascii(),
+                    "`{path} --help` must be ASCII-only; non-ASCII punctuation renders as \
+                     mojibake on a Windows console using the OEM code page (ROCMAI-543): \
+                     {rendered}"
+                );
+            }
+            // Collect first: `find_subcommand_mut` needs a mutable borrow that
+            // cannot overlap the iterator borrowing `cmd`.
+            let names: Vec<String> = cmd
+                .get_subcommands()
+                .map(|sub| sub.get_name().to_owned())
+                .collect();
+            for name in names {
+                let child_path = format!("{path} {name}");
+                let child = cmd
+                    .find_subcommand_mut(&name)
+                    .expect("subcommand name was just enumerated from this command");
+                assert_ascii_help(child, &child_path);
+            }
+        }
+
+        assert_ascii_help(&mut Cli::command(), "rocm");
+    }
+
     #[test]
     fn render_model_registry_text_lists_builtin_recipes() {
         let rendered = render_model_registry_text_with_context_and_host(None, None, None);
