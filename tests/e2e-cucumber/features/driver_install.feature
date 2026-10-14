@@ -29,3 +29,23 @@ Feature: Driver installation planning
   Scenario: driver-install-03 - Installing a ROCDXG release with no known digest is refused
     When the user previews driver installation for a ROCDXG release with no known digest
     Then the driver plan refuses rather than installing an unverified package
+
+  # Windows has no driver install: the command reports the AMD display driver it
+  # finds and promises to change nothing. The promise is checked as state, not
+  # only as text: the plan lists no command and no installer state is written.
+  # Nothing here names a driver. The report is held to what `rocm examine
+  # --json` reads on the same machine, so it holds on a machine with an old
+  # driver and on one with a current driver. An old driver's `outdated: yes`
+  # branch needs such a machine and is not exercised here.
+  @id:driver-install-windows-reports-and-changes-nothing @requires-os:windows
+  Scenario: driver-install-04 - On Windows the driver install reports the display driver and changes nothing
+    When the user asks to install the driver on this Windows host
+    Then the CLI says that no driver is installed or changed
+    And no driver command is shown or run, and no installer state is written
+    And it describes the display driver the inspection reports
+
+  @id:driver-install-windows-approval-changes-nothing @requires-os:windows
+  Scenario: driver-install-05 - On Windows approving the driver install still changes nothing
+    When the user approves the driver install on this Windows host
+    Then the CLI says that no driver is installed or changed
+    And no driver command is shown or run, and no installer state is written
