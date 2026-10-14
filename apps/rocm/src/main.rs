@@ -482,11 +482,13 @@ rocm model --verbose"
     /// launches nothing, so it is allowed through. The exception applies only when the
     /// server would actually be reused — same engine and model, matching recipe settings,
     /// a key already present if --require-api-key is asked for, and a device policy at
-    /// least as strong as this one. A live server for a different engine, for a model
-    /// whose name does not overlap, or for one this run could not reuse anyway, does
-    /// not soften the refusal, and nothing is prepared before it. Model names are matched
-    /// leniently, so a live server whose name overlaps the one you asked for (`qwen` for a
-    /// running `qwen3-8b-instruct`) does let engine preparation run before the refusal.
+    /// least as strong as this one. A live server for a different engine, or for a model
+    /// whose name does not overlap, does not soften the refusal, and nothing is prepared
+    /// before it. A same-model server this run turns out not to be able to reuse does not
+    /// soften it either, but engine preparation has already run by the time that is known.
+    /// Model names are matched leniently, so a live server whose name overlaps the one you
+    /// asked for (`qwen` for a running `qwen3-8b-instruct`) does let engine preparation run
+    /// before the refusal.
     /// With an explicit --gpu the index is still validated after the exception, so a
     /// pinned GPU that is not visible is refused even when a reusable server exists.
     #[command(after_help = "EXAMPLES:\n  \

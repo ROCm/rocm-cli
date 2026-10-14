@@ -499,6 +499,38 @@ fn engine_recipe_enables_tool_choice(hint: Option<&EngineRecipeHint>) -> bool {
     })
 }
 
+/// Whether the reuse pre-gate may run its engine/runtime probe.
+///
+/// The pre-gate exists for exactly one purpose: to answer the no-usable-GPU
+/// bail in `serve()`. Everything it does has a side effect that must not
+/// precede that bail — a runtime-registry write, a self-managed engine install,
+/// a `ResolveModel` round-trip — and the only consumer of its answer
+/// (`reuse_existing`) is a term of that bail's condition. So it must open
+/// exactly when the bail is in play: under a GPU-required policy, on a host the
+/// probe *authoritatively* reports as having no usable AMD GPU.
+///
+/// `host_has_no_usable_gpu` is therefore the bail's own predicate, computed once
+/// by the caller and handed to both, so the two cannot drift apart. They did:
+/// keying the gate on the live-service check alone pulled all of that work ahead
+/// of `validate_pinned_gpu_index` on every host where a live service's model
+/// name happened to overlap — including hosts with a perfectly good GPU, where
+/// the bail can never fire and reuse therefore buys nothing. #267 (`945d81b`)
+/// put `--gpu` validation first deliberately, so an out-of-range ordinal gets a
+/// GPU-specific refusal rather than whatever unrelated runtime error the
+/// resolution happens to raise first.
+///
+/// `live_service_matches` is taken as a closure, not a `bool`, because it is not
+/// free either: it goes through `load_managed_services`, which refreshes
+/// liveness and can cost a probe and a `record.write()` per live record. On a
+/// host with a GPU that cost is not paid at all.
+fn reuse_pregate_opens(
+    cpu_only: bool,
+    host_has_no_usable_gpu: bool,
+    live_service_matches: impl FnOnce() -> bool,
+) -> bool {
+    !cpu_only && host_has_no_usable_gpu && live_service_matches()
+}
+
 /// Parsed `rocm serve` arguments. Grouped into a struct to keep the dispatcher
 /// and `serve()` readable now that the verb carries verbose/smoke-test controls.
 pub(crate) struct ServeArgs {
@@ -669,6 +701,14 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     } else {
         rocm_core::usable_amd_gpu_indices()
     };
+    // The no-usable-GPU bail's host predicate, computed once here because two
+    // things depend on it and they must not disagree: the bail itself, and the
+    // reuse pre-gate below whose only product is a term of that bail. `None` is
+    // "could not probe on this platform", not "no GPU", so it does not open
+    // either one.
+    let host_has_no_usable_gpu = visible_gpu_indices
+        .as_deref()
+        .is_some_and(<[u32]>::is_empty);
     // Reusing an already-running managed service launches nothing and pins no
     // GPU, so it must bypass the GPU-required pre-flight below — the reused
     // service was already vetted at its own launch, and this invocation does no
@@ -678,15 +718,17 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // Without a runtime we cannot resolve, so we fall through and the pre-flight
     // refuses the no-GPU / no-runtime case with its usual message.
     //
-    // The outermost condition is `any_live_managed_service_for_model`, and it is
-    // first for a reason: it is decided from the managed-service records alone,
-    // with no engine round-trip and no install, so it is the only thing this
-    // block costs on the ordinary launch. It is not literally record reads and
-    // nothing else — `load_managed_services` refreshes liveness first, so each
-    // live record can cost a probe and a `record.write()`. The bail below is
-    // where that full cost is stated, and it is the qualified claim, not this
-    // one. Everything this condition guards has side effects that must not
-    // precede the bail —
+    // The whole block is gated on `host_has_no_usable_gpu` — the bail's own
+    // predicate, computed once above and handed to `reuse_pregate_opens` — so on
+    // a host that has a GPU nothing here runs at all and `--gpu` validation
+    // keeps the position #267 gave it. The live-service check is passed as a
+    // closure for the same reason: it is decided from the managed-service
+    // records alone, with no engine round-trip and no install, but it is not
+    // literally record reads and nothing else — `load_managed_services`
+    // refreshes liveness first, so each live record can cost a probe and a
+    // `record.write()`. The bail below is where that full cost is stated, and it
+    // is the qualified claim, not this one. Everything these conditions guard
+    // has side effects that must not precede the bail —
     //
     //   - the pre-gate matches on the model, not just the engine, because the
     //     probe body is real engine work (a `ResolveModel` round-trip, and for a
@@ -707,8 +749,9 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     let mut resolved_selection: Option<EngineSelection> = None;
     let mut resolved_model: Option<ResolveModelResponse> = None;
     let mut reuse_existing = false;
-    if !cpu_only && any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
-    {
+    if reuse_pregate_opens(cpu_only, host_has_no_usable_gpu, || {
+        any_live_managed_service_for_model(&paths, &selected_engine, &engine_model_ref)
+    }) {
         let selection = validate_engine_selection_runtime(
             &paths,
             resolve_engine_selection(
@@ -777,13 +820,16 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // The precise contract, since the reuse detection above is the one thing that
     // can precede this bail: everything with a side effect — the runtime-selection
     // resolution (which can write a runtime registry manifest), the `ResolveModel`
-    // round-trip, and any self-managed engine install — runs first only when a
-    // live managed service already matches this engine and model, i.e. only when
-    // this invocation is about to reuse it and legitimately skip the bail. When no
-    // such service exists (the ordinary launch, and every no-GPU refusal path)
-    // that block's body is skipped and this is the first thing that runs.
+    // round-trip, and any self-managed engine install — runs first only when
+    // this bail's own host predicate already holds *and* a live managed service
+    // already matches this engine and model, i.e. only when this invocation is
+    // about to reuse it and legitimately skip the bail. On a host with a usable
+    // GPU, and whenever no such service exists (the ordinary launch, and every
+    // no-GPU refusal path), that block's body is skipped and this is the first
+    // thing that runs.
     //
-    // Its *condition* is not free, though: `any_live_managed_service_for_model`
+    // Its *condition* is not free either, though it is paid only on a host this
+    // bail already applies to: `any_live_managed_service_for_model`
     // goes through `load_managed_services`, which refreshes every service record —
     // including records for unrelated models, since the model filter is applied
     // afterwards — so a stale `ready`/`running` record costs an endpoint listing
@@ -804,8 +850,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         && !scripted_backend_failure
         && !reuse_existing
         && !e2e_simulate_oom_launch()
-        && let Some(usable) = visible_gpu_indices.as_deref()
-        && usable.is_empty()
+        && host_has_no_usable_gpu
     {
         bail!(
             "no usable AMD GPU detected; `rocm serve` requires a GPU under the {policy} \
@@ -835,6 +880,12 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     // user sees a generic runtime error for what is really a bad `--gpu` value.
     // This is pure validation (no service-state read), so it needs no lock;
     // `--gpu auto` reads live busy-GPU state and stays under `launch_lock` below.
+    //
+    // "Up front" is exact on every host with a usable GPU: `reuse_pregate_opens`
+    // is false there, so nothing above has touched the engine or the registry.
+    // The single exception is the reuse exemption, which by construction only
+    // runs on a host the bail above already applies to — where `visible_gpu_indices`
+    // is `Some([])` and so *every* `--gpu <index>` is out of range anyway.
     let pinned_gpu_indices = if !cpu_only && let GpuSelection::Index(index) = &gpu_selection {
         Some(validate_pinned_gpu_index(
             *index,
@@ -846,7 +897,8 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         None
     };
     // Resolve which runtime/env this serve will use, now that the host GPU
-    // pre-condition and `--gpu` have both been checked. This must not move back
+    // pre-condition and `--gpu` have both been checked (or, on the reuse path,
+    // the pre-gate already resolved it under the exemption). This must not move back
     // above the bail: `validate_engine_selection_runtime` reaches
     // `recover_setup_runtime_registration` on the default (no `--runtime-id` /
     // `--env-id`) path, which writes a runtime registry manifest and can fail
@@ -1153,6 +1205,69 @@ mod tests {
 
     use super::*;
     use rocm_core::resolve_builtin_model_recipe;
+
+    /// Regression coverage for the pre-gate's ordering (ROCMAI-419 review).
+    ///
+    /// The gate used to be `!cpu_only && any_live_managed_service_for_model(..)`,
+    /// with no reference to the host's GPU at all. On any host where a live
+    /// service's model name overlapped the one asked for — including a host with
+    /// a perfectly usable GPU, where the no-usable-GPU bail can never fire and
+    /// reuse therefore buys nothing — that pulled `validate_engine_selection_runtime`
+    /// (which can write the runtime registry), `ensure_self_managed_engine_ready`
+    /// (which can install Lemonade) and the `ResolveModel` round-trip in front of
+    /// `validate_pinned_gpu_index`, so a `?` from any of them pre-empted the
+    /// GPU-specific refusal #267 (`945d81b`) deliberately put first.
+    ///
+    /// Both halves are asserted, because the probe is a cost as well as a term:
+    /// on a host with a GPU the gate must be shut *without* consulting the
+    /// managed-service records at all.
+    #[test]
+    fn the_reuse_pregate_stays_shut_on_a_host_that_has_a_usable_gpu() {
+        let host_has_no_usable_gpu =
+            |visible: Option<&[u32]>| visible.is_some_and(<[u32]>::is_empty);
+
+        let mut probed = false;
+        assert!(
+            !reuse_pregate_opens(false, host_has_no_usable_gpu(Some(&[0])), || {
+                probed = true;
+                true
+            }),
+            "a host with a usable GPU must not open the reuse pre-gate: the bail \
+             it answers cannot fire there, so its engine and registry work would \
+             run ahead of `--gpu` validation for nothing"
+        );
+        assert!(
+            !probed,
+            "the managed-service probe must not even be consulted on a host with \
+             a GPU — `load_managed_services` refreshes liveness and can cost a \
+             probe and a `record.write()` per live record"
+        );
+
+        // An unprobeable platform is "unknown", not "no GPU". The bail stays
+        // permissive there, so the pre-gate must too.
+        let mut probed_unknown = false;
+        assert!(
+            !reuse_pregate_opens(false, host_has_no_usable_gpu(None), || {
+                probed_unknown = true;
+                true
+            }),
+            "an unprobeable host must not open the pre-gate either"
+        );
+        assert!(!probed_unknown);
+
+        // The exemption itself still works: authoritative empty set, live match.
+        assert!(
+            reuse_pregate_opens(false, host_has_no_usable_gpu(Some(&[])), || true),
+            "a host with no usable GPU and a matching live service must still \
+             reach the reuse probe, or the exemption serve-25 covers is gone"
+        );
+        // ...and `--device cpu_only` never had a GPU bail to exempt.
+        assert!(!reuse_pregate_opens(
+            true,
+            host_has_no_usable_gpu(Some(&[])),
+            || true
+        ));
+    }
 
     #[test]
     fn serve_engine_selection_uses_shared_recipe_when_no_override_exists() {

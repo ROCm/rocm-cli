@@ -478,9 +478,18 @@ Expected result:
   unchanged: it must run and report the vLLM out-of-memory cause, not "no known
   cause".
 - The `--symptom` value is one balanced single-quoted argument. If your failing
-  log line carried an apostrophe or terminal colour codes, the command falls
-  back to the canonical `vllm: …` symptom rather than your line — that is
-  correct, and your real line is still in `rocm services logs <service-id>`.
+  log line carried an apostrophe, the command falls back to the canonical
+  `vllm: …` symptom rather than your line — that is correct, and your real line
+  is still in `rocm services logs <service-id>`.
+- If your failing line carried terminal **colour codes**, expect the *rendered
+  row* — the line as the terminal drew it, escapes gone — not the canonical
+  symptom. The note reads the log after the engine has echoed its tail back into
+  it as rendered rows, so that row is what it quotes. Do not mark this a failure:
+  the engine's own failure message *does* fall back to the canonical symptom for
+  the same line, so the two surfaces can print different `--symptom` arguments
+  for one failure and both are correct (README, "A line carrying terminal control
+  bytes"; pinned by
+  `the_colourised_round_trip_quotes_the_row_the_terminal_drew`).
 - If the pre-launch low-VRAM warning already printed the
   `--gpu-memory-utilization` advice for this GPU, the OOM note does not repeat
   that sentence, but still carries the confirmation, the model-too-large caveat,
