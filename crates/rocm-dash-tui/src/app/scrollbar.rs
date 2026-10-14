@@ -461,6 +461,24 @@ mod tests {
         }
     }
 
+    /// The one `AppState` field each `ScrollTarget` variant owns, read
+    /// directly (no inversion) — the canonical oracle every test that needs
+    /// "whatever field this target writes/reads" should call, instead of
+    /// re-deriving it with an ad hoc `if target == ScrollTarget::Foo` that
+    /// only distinguishes the couple of variants that one test happens to
+    /// exercise. An exhaustive `match`, no wildcard arm: see
+    /// `scroll_target_variants_round_trip_through_dispatch`'s doc comment for
+    /// why that matters.
+    fn canonical_field(state: &AppState, target: ScrollTarget) -> usize {
+        match target {
+            ScrollTarget::Console => usize::from(state.console_scroll),
+            ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
+            ScrollTarget::Chat => usize::from(state.chat_scroll),
+            ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
+            ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
+        }
+    }
+
     #[test]
     fn scrollbar_position_maps_proportionally() {
         let h = ScrollbarHandle {
@@ -681,19 +699,11 @@ mod tests {
             let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 4);
             let action = resolve_mouse(down, &s);
             apply_action(&mut s, action);
-            let before = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let before = canonical_field(&s, target);
             let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 60, 4);
             let action = resolve_mouse(drag, &s);
             apply_action(&mut s, action);
-            let after = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let after = canonical_field(&s, target);
             assert_eq!(after, before, "stationary {target:?} drag moved");
         }
     }
@@ -912,13 +922,14 @@ mod tests {
     /// added. That proves nothing about whether the two arms *agree* — a
     /// typo'd field in one arm still compiles as long as its own match is
     /// exhaustive. This test binds both sides to the one canonical
-    /// field-per-variant table below (`canonical_field`), which is itself an
-    /// exhaustive `match` with no wildcard arm: adding a `ScrollTarget`
-    /// variant without adding a case there fails to compile. That forces the
-    /// contributor into this function, where the `for target in [...]` list
-    /// a few lines below sits right alongside it — but the list itself is a
-    /// plain array, not exhaustiveness-checked, so it's a practical nudge to
-    /// add the variant there too, not a second compiler guarantee.
+    /// field-per-variant table, `canonical_field` (above, shared with
+    /// `stationary_thumb_drag_preserves_logical_position`), which is itself
+    /// an exhaustive `match` with no wildcard arm: adding a `ScrollTarget`
+    /// variant without adding a case there fails to compile. Iterates
+    /// `ScrollTarget::ALL` rather than its own copy of the variant list — see
+    /// that const's doc comment for why it's a convention, not a second
+    /// compiler guarantee, and why having one shared list beats each call
+    /// site re-typing (and risking drifting) its own.
     #[test]
     fn scroll_target_variants_round_trip_through_dispatch() {
         const POS: usize = 7;
@@ -928,23 +939,7 @@ mod tests {
         const CONTENT_LEN: usize = 100;
         const VIEWPORT_LEN: usize = 10;
 
-        fn canonical_field(state: &AppState, target: ScrollTarget) -> usize {
-            match target {
-                ScrollTarget::Console => usize::from(state.console_scroll),
-                ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
-                ScrollTarget::Chat => usize::from(state.chat_scroll),
-                ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
-                ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
-            }
-        }
-
-        for target in [
-            ScrollTarget::Console,
-            ScrollTarget::ConsoleH,
-            ScrollTarget::Chat,
-            ScrollTarget::DockLogs,
-            ScrollTarget::InstanceDetail,
-        ] {
+        for target in ScrollTarget::ALL {
             let mut s = AppState::new("t".into(), "default-dark".into());
             // Chat's write is clamped to `chat_max_scroll` (default 0); every
             // other target's field is an unclamped raw offset.

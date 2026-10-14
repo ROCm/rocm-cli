@@ -491,6 +491,24 @@ impl ScrollTarget {
             Self::Console | Self::ConsoleH | Self::Chat | Self::InstanceDetail => false,
         }
     }
+
+    /// Every variant, in declaration order — the one list a test iterates to
+    /// mean "every `ScrollTarget`" (e.g. `scrollbar.rs`'s
+    /// `scroll_target_variants_round_trip_through_dispatch`), instead of each
+    /// call site re-typing its own copy that can silently drift from this
+    /// enum. Not itself exhaustiveness-checked against the variant list —
+    /// stable Rust has no mechanism for that without a derive macro this
+    /// crate doesn't depend on — so a new variant still needs a manual
+    /// addition here, same as any other list of all variants would.
+    /// `cfg(test)`: no non-test code needs "every target" today.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Console,
+        Self::ConsoleH,
+        Self::DockLogs,
+        Self::Chat,
+        Self::InstanceDetail,
+    ];
 }
 
 #[cfg(test)]
