@@ -2980,12 +2980,32 @@ fn probe_gpus_windows(e: &mut Examination) {
         if !is_amd {
             continue;
         }
-        let (gfx_guess, is_apu_guess) = classify_amd_marketing_name(&name);
+        // The PNP id first, the marketing name only as a fallback.
+        //
+        // `Win32_VideoController` hands us `PCI\VEN_1002&DEV_1636&...` in the
+        // same row as the name, and `host_gpu`'s PCI-id table answers for parts
+        // the name table has no arm for -- every Vega iGPU among them. This
+        // probe used to drop the id and ask the name alone, so a Renoir /
+        // Lucienne / Cezanne / Barcelo laptop reported an empty `gfx_target`
+        // unless a HIP SDK was installed for `hipInfo` to fill it in: exactly
+        // the host that has no HIP SDK to ask. A device id is also the stronger
+        // answer where both have one, being the ASIC rather than the brand.
+        let (name_gfx, name_is_apu) = classify_amd_marketing_name(&name);
+        let gfx_target = crate::host_gpu::gfx_target_from_pnp_device_id(&pnp)
+            .map_or(name_gfx, ToOwned::to_owned);
+        // `gfx_is_apu_family` knows the answer whenever the target is known;
+        // the name heuristic only gets the question when nothing identified the
+        // part.
+        let is_apu = if gfx_target.is_empty() {
+            name_is_apu
+        } else {
+            gfx_is_apu_family(&gfx_target)
+        };
         e.gpus.push(Gpu {
             name,
-            gfx_target: gfx_guess,
+            gfx_target,
             pci_id: pnp,
-            is_apu: Some(is_apu_guess),
+            is_apu: Some(is_apu),
             is_amd: true,
         });
     }
