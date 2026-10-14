@@ -1042,10 +1042,17 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
         Fix {
             summary: format!("Add {bin_dir} to your User PATH and reopen the shell."),
             commands: vec![
-                format!("setx PATH \"%PATH%;{bin_dir}\""),
+                // Not `setx PATH "%PATH%;..."`: PowerShell does not expand
+                // `%PATH%`, and in cmd it copies the machine Path into the
+                // User one. The folder goes first, as `rocm fix fix-6-path`
+                // puts it. A `'` in the folder is doubled for the quoted text.
+                format!(
+                    "powershell -NoProfile -Command \"[Environment]::SetEnvironmentVariable('Path', '{};' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')\"",
+                    bin_dir.replace('\'', "''")
+                ),
                 "# Or: System Properties -> Environment Variables -> Path -> Edit -> New."
                     .to_owned(),
-                "# `setx` only affects NEW shells; close and reopen this terminal afterwards."
+                "# This only affects NEW shells; close and reopen this terminal afterwards."
                     .to_owned(),
             ],
             fix_id: "fix-6-path".to_owned(),
@@ -1062,7 +1069,7 @@ fn check_6_path_missing(e: &Examination, symptom: &str) -> Diagnosis {
                 format!("echo 'export PATH={bin_dir}:$PATH' >> ~/.bashrc   # or ~/.zshrc"),
             ],
             fix_id: "fix-6-path".to_owned(),
-            verify: "rocminfo | head -n 5 && hipcc --version".to_owned(),
+            verify: "hipcc --version".to_owned(),
             ..Fix::default()
         }
     };
@@ -1619,7 +1626,7 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
             "# After the install, reopen the shell and re-run your import / hipInfo check.".to_owned(),
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
-        verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\vcruntime140.dll,$env:SystemRoot\\System32\\vcruntime140_1.dll).VersionInfo | Select-Object FileName,FileVersion\"".to_owned(),
         notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.".to_owned()],
         ..Fix::default()
     };
@@ -6803,6 +6810,117 @@ mod tests {
         let fix = hit.fix.as_ref().expect("fix");
         assert!(fix.summary.contains("llama.cpp"), "{}", fix.summary);
         assert!(!hit.title.contains("HIP DLLs cannot load"), "{}", hit.title);
+    }
+
+    /// The `Fix` that each checker builds for itself is shown to users of
+    /// Windows PowerShell 5.1 as well as cmd, just like the `rocm fix` catalog.
+    /// This runs every checker that answers on Windows and applies the same
+    /// rule as the catalog test in `fix.rs` (`fails_in_windows_powershell`), so a
+    /// hand-built verify string or command cannot regress unseen.
+    ///
+    /// Like that test it pins the text only. Nothing here runs a command in a
+    /// shell; `the_msvc_verify_runs_in_cmd_and_powershell` in `fix.rs` runs
+    /// the fix-15 line, on Windows.
+    #[test]
+    fn windows_diagnosis_remediation_passes_the_powershell_text_rule() {
+        // Host state that wakes the checkers which answer from the machine and
+        // not from the symptom: an override set, a HIP SDK with no `hipInfo`,
+        // an APU beside a discrete GPU, and a runtime that is missing.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            msvc_redist_present: Some(false),
+            hip_sdk_path: r"C:\Program Files\AMD\ROCm\6.4".to_owned(),
+            hipinfo_present: false,
+            has_apu: true,
+            has_discrete_amd: true,
+            env: [
+                ("HSA_OVERRIDE_GFX_VERSION".to_owned(), "11.0.0".to_owned()),
+                ("PATH".to_owned(), r"C:\Windows".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            ..Examination::default()
+        };
+        // Wide enough to wake the keyword-driven checkers, so the test sees
+        // the Fix they build rather than an empty answer. fix-13 only scores
+        // when the paste names HIP failing to load, hence `was not found`.
+        let symptom = "hipErrorNoBinaryForGpu HSA_STATUS_ERROR_INVALID_ISA invalid device function \
+                       HSA_OVERRIDE_GFX_VERSION vcruntime140_1.dll amdhip64_6.dll was not found \
+                       hipblas.dll driver too old";
+        let mut seen: Vec<String> = Vec::new();
+        for (check, families) in CHECKERS {
+            if !families.contains(&"windows") {
+                continue;
+            }
+            let Some(fix) = check(&e, symptom).fix else {
+                continue;
+            };
+            let printed = fix
+                .commands
+                .iter()
+                .map(String::as_str)
+                .filter(|c| !c.trim_start().starts_with('#'))
+                .chain(std::iter::once(fix.verify.as_str()));
+            for line in printed {
+                if let Some(why) = crate::fix::fails_in_windows_powershell(line) {
+                    panic!("{}: `{line}` uses {why}", fix.fix_id);
+                }
+            }
+            seen.push(fix.fix_id);
+        }
+        // Guard the test itself: it must have looked at the Windows checkers.
+        for expected in [
+            "fix-2-unset-override",
+            "fix-6-path",
+            "fix-9-igpu-dgpu",
+            "fix-13-hip-sdk-missing",
+            "fix-14-adrenalin-too-old",
+            "fix-15-msvc-redist",
+        ] {
+            assert!(
+                seen.iter().any(|id| id == expected),
+                "the sweep never saw {expected}; it saw {seen:?}"
+            );
+        }
+    }
+
+    /// fix-6's verify line lives in the `rocm fix` catalog and in the Fix that
+    /// `check_6_path_missing` builds. The shared-id guard above covers fix-15
+    /// and fix-16; this one keeps fix-6's two copies from drifting.
+    ///
+    /// The Windows arm of the checker is not compared with the catalog on
+    /// purpose. It names the SDK's own `hipInfo.exe` in a PowerShell command,
+    /// which the single catalog line cannot do, so it is checked for being a
+    /// PowerShell command instead. Its text is also covered by the Windows sweep
+    /// above.
+    #[test]
+    fn the_path_fix_verify_matches_the_catalog_copy() {
+        let (verify, _, _) = crate::fix::recipe_verify_notes_and_run_commands("fix-6-path")
+            .expect("fix-6-path is in the recipe catalog");
+        // A ROCm install whose bin directory has no `rocminfo` or `hipInfo`.
+        let host = |os_family: &str| Examination {
+            os_family: os_family.to_owned(),
+            rocm_path: "/opt/rocm".to_owned(),
+            hip_sdk_path: r"C:\Program Files\AMD\ROCm\6.4".to_owned(),
+            ..Examination::default()
+        };
+        let linux = check_6_path_missing(&host("linux"), "hipcc: command not found")
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+        assert_eq!(
+            linux.verify, verify,
+            "the verify line for fix-6-path diverged between `diagnose` and `rocm fix`"
+        );
+        let windows = check_6_path_missing(&host("windows"), "hipcc: command not found")
+            .fix
+            .expect("check 6 builds a Fix for its own symptom");
+        assert!(
+            windows
+                .verify
+                .starts_with("powershell -NoProfile -Command "),
+            "the Windows verify line must run in PowerShell: {}",
+            windows.verify
+        );
     }
 
     #[test]

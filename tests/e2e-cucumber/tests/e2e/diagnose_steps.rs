@@ -315,6 +315,76 @@ async fn user_chose_engine_import_fix(world: &mut E2eWorld) {
     world.model_name = Some(ENGINE_IMPORT_FIX_ID.to_string());
 }
 
+#[given("a user who has chosen the fix for the missing MSVC runtime")]
+async fn user_chose_msvc_runtime_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-15-msvc-redist".to_string());
+}
+
+#[given("a user who has chosen the fix for the GPU override")]
+async fn user_chose_override_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-2-unset-override".to_string());
+}
+
+#[given("a user who has chosen the fix for ROCm missing from PATH")]
+async fn user_chose_path_fix(world: &mut E2eWorld) {
+    world.model_name = Some("fix-6-path".to_string());
+}
+
+#[then("the printed commands and verify line use no syntax that Windows PowerShell rejects")]
+async fn assert_printed_lines_avoid_powershell_hostile_syntax(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let mut lines: Vec<&str> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("  $ "))
+        .filter(|c| !c.trim_start().starts_with('#'))
+        .collect();
+    lines.push(printed_verify_line(output));
+    // The same rule as `fails_in_windows_powershell` in the rocm-core tests.
+    for line in lines {
+        assert!(
+            !line.contains("&&") && !line.contains("||"),
+            "`&&` and `||` are syntax errors in Windows PowerShell 5.1: {line}"
+        );
+        assert!(
+            !line
+                .split(['|', ';'])
+                .any(|part| part.split_whitespace().next() == Some("where")),
+            "a bare `where` is `Where-Object` in PowerShell: {line}"
+        );
+        let pieces: Vec<&str> = line.split('%').collect();
+        assert!(
+            !pieces
+                .get(1..pieces.len().saturating_sub(1))
+                .unwrap_or_default()
+                .iter()
+                .any(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
+            "PowerShell does not expand a `%NAME%` reference: {line}"
+        );
+    }
+}
+
+#[then("the printed verify command is a PowerShell command that selects FileVersion")]
+async fn assert_verify_is_powershell_selecting_version(world: &mut E2eWorld) {
+    let output = world.cli_output.as_ref().expect("no fix preview output");
+    let verify = printed_verify_line(output);
+    // Text only. `the_msvc_verify_runs_in_cmd_and_powershell` (rocm-core,
+    // Windows only) runs the line.
+    assert!(
+        verify.starts_with("powershell -NoProfile -Command ") && verify.contains("FileVersion"),
+        "expected a PowerShell command that prints FileVersion: {verify}"
+    );
+}
+
+fn printed_verify_line(output: &str) -> &str {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix("Verify:"))
+        .map_or_else(
+            || panic!("the preview printed no Verify: line:\n{output}"),
+            str::trim,
+        )
+}
+
 #[given("a user who has chosen a known fix")]
 async fn user_chose_known_fix(world: &mut E2eWorld) {
     world.model_name = Some(PREVIEW_FIX_ID.to_string());
