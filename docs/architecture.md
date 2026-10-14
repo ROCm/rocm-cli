@@ -74,7 +74,7 @@ Modularized (ROCMAI-83, Phase 5 of EAI-7768's sequencing):
 Already-extracted subsystem modules, following the same full-domain-extraction pattern (and several further siblings beyond these):
 
 - [`automation.rs`](../crates/rocm-core/src/automation.rs) — (ROCMAI-151, Phase 7d) automation-daemon runtime state and its on-disk event/proposal/audit records — see the module's own doc comment for what it owns.
-- [`binary_paths.rs`](../crates/rocm-core/src/binary_paths.rs) — (ROCMAI-151, Phase 7d) locating sibling CLI binaries (`rocm-engine-<name>`, `rocm`) next to the currently running executable.
+- [`binary_paths.rs`](../crates/rocm-core/src/binary_paths.rs) — (ROCMAI-151, Phase 7d) locating `rocm-engine-<name>` siblings, and the CLI binary itself (a sibling `rocm` only when running from a cargo `deps/` directory).
 - [`config.rs`](../crates/rocm-core/src/config.rs) — (ROCMAI-151, Phase 7d) the unified `RocmCliConfig` and its nested sections, including the built-in automation-watcher catalog and the rocm-dash dashboard sub-config — see the module's own doc comment for what it owns.
 - [`crypto.rs`](../crates/rocm-core/src/crypto.rs) — (ROCMAI-152, Phase 7c) RSASSA-PKCS#1 v1.5/SHA-256 sign/verify, generic — not model-catalog-specific.
 - [`diagnose.rs`](../crates/rocm-core/src/diagnose.rs)

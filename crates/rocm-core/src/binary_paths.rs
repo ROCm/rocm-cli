@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Locating sibling CLI binaries (`rocm-engine-<name>`, `rocm`) next to the
-//! currently running executable.
+//! Locating `rocm-engine-<name>` siblings, and the CLI binary itself (a
+//! sibling `rocm` only when running from a cargo `deps/` directory).
 //!
 //! ROCMAI-151 (Phase 7d). `resolve_amd_smi_binary*` and the
 //! `CodexBridgeSnapshot`/`CodexBridgeGpuSnapshot`/`CodexBridgeEngine` bridge

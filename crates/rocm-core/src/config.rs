@@ -800,6 +800,9 @@ mod tests {
     use super::*;
     use crate::test_support::temp_app_paths;
 
+    // The socket-path precedence is mirrored in `rocm-dash-core`; these tests
+    // mirror the ones there so a divergence in either crate is caught.
+
     #[test]
     fn dashboard_socket_path_prefers_xdg_runtime_dir() {
         // Tier 1: $XDG_RUNTIME_DIR is already mode 0700 on systemd systems, so it
