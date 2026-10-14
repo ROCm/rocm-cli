@@ -146,22 +146,32 @@ pub fn decide(update_report: &str, channel: &str, pin: Option<&str>) -> Decision
             })
             .find(|line| key_matches_pin(&line.runtime_key, pin))
         {
+            // A pin never follows `target=` (the channel's latest), but a
+            // `repair_available` line for the pin's OWN key still means its
+            // on-disk composition is stale for the SAME version — the same
+            // gap the unpinned `repair_available` branch below closes.
+            // Falling through to plain `Reuse` here would serve a
+            // composition-drifted install of the pinned version forever, with
+            // no self-heal path. `update_available` is NOT included: it means
+            // a newer version exists in the index, which a pin deliberately
+            // opts out of chasing.
+            Some(pinned) if pinned.status.as_deref() == Some("repair_available") => {
+                Decision::Repair {
+                    runtime_key: pinned.runtime_key.clone(),
+                }
+            }
             Some(pinned) => Decision::Reuse {
                 reason: format!("runtime already matches the pinned version {pin}"),
-                // Same rule as the unpinned up-to-date branch below: only an
-                // `up_to_date` line's `target=` names a composition-migrated
-                // replacement for the SAME version. Any other status (e.g.
-                // `update_available`) means `target=` names the channel's
-                // newer latest instead, which a pin must not follow.
+                // Only an `up_to_date` line's `target=` names a
+                // composition-migrated replacement for the SAME version.
                 activate: Some(if pinned.status.as_deref() == Some("up_to_date") {
                     pinned.serving_runtime_key().to_owned()
                 } else {
                     pinned.runtime_key.clone()
                 }),
             },
-            // `update`/`repair` only ever apply the report's `target=` key, which
-            // is the index's latest — never this pin — so a miss means a fresh
-            // side-by-side `install sdk --version/--build-date`, not an update.
+            // A miss means a fresh side-by-side `install sdk --version/--build-date`,
+            // not an update.
             None => Decision::Install,
         };
     }
@@ -487,6 +497,23 @@ impl RuntimeLine {
     }
 }
 
+/// Normalizes a `--version`/`--build-date` pin the same way `slugify` in
+/// `apps/rocm/src/therock.rs` normalizes every runtime key: lowercase
+/// alphanumerics kept as-is, every other byte (not just `.`) collapsed to
+/// `-`. A pin carrying a `+`-style local-version suffix (e.g.
+/// `7.13.0+rocm7.13`, the shape `decode_simple_index_version` decodes for
+/// the `rocm` package) must be normalized identically to the key it's being
+/// compared against, or the `+` survives in the pin but not in the key and
+/// the two never match.
+fn slugify_like_runtime_key(pin: &str) -> String {
+    pin.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
 /// Whether `runtime_key` names the exact pin the caller asked for.
 ///
 /// Runtime keys are slugified (`runtime_key`/`wheel_runtime_key` in
@@ -512,23 +539,6 @@ impl RuntimeLine {
 /// itself is delimiter-bounded for the same reason: an unanchored `contains`
 /// would let a short pin (`7.1` -> `7-1`) match as a sub-span of a longer
 /// version (`7-13-0`), or a bare `7` match almost any key.
-/// Normalizes a `--version`/`--build-date` pin the same way `slugify` in
-/// `apps/rocm/src/therock.rs` normalizes every runtime key: lowercase
-/// alphanumerics kept as-is, every other byte (not just `.`) collapsed to
-/// `-`. A pin carrying a `+`-style local-version suffix (e.g.
-/// `7.13.0+rocm7.13`, the shape `decode_simple_index_version` decodes for
-/// the `rocm` package) must be normalized identically to the key it's being
-/// compared against, or the `+` survives in the pin but not in the key and
-/// the two never match.
-fn slugify_like_runtime_key(pin: &str) -> String {
-    pin.chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
-            _ => '-',
-        })
-        .collect()
-}
-
 fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
     let pin_is_all_digits = !pin.is_empty() && pin.bytes().all(|b| b.is_ascii_digit());
     if !pin_is_all_digits
@@ -637,15 +647,55 @@ pub fn run(
             // when the registry is genuinely absent, otherwise serve against what
             // is there. Preserves the old floor rather than failing the lane.
             let registry = prewarm_dir.join("data").join("runtimes").join("registry");
-            if registry.is_dir() {
+            if !registry.is_dir() {
+                println!("pre-warm: `rocm update` failed ({error:#}); no registry yet, installing");
+                Decision::Install
+            } else if let Some(pin) = pin {
+                // The blind "reuse whatever is already there" floor below is
+                // exactly the "n-1 lane gets n latest" bug this module exists to
+                // fix, reached through a different path: a pin asking for an
+                // OLDER version must not silently serve a newer one just because
+                // `rocm update` (not `rocm runtimes list`, a different command)
+                // had a transient failure. Check the registry directly instead.
+                match list_runtimes(&rocm, prewarm_dir) {
+                    Ok(listing) => {
+                        if let Some(entry) = listing
+                            .lines()
+                            .filter_map(RuntimeEntry::parse)
+                            .find(|entry| key_matches_pin(&entry.runtime_key, pin))
+                        {
+                            println!(
+                                "pre-warm: `rocm update` failed ({error:#}); pinned runtime {} is already installed, reusing it",
+                                entry.runtime_key
+                            );
+                            Decision::Reuse {
+                                reason: "update probe failed; pinned runtime already installed"
+                                    .to_owned(),
+                                activate: Some(entry.runtime_key),
+                            }
+                        } else {
+                            println!(
+                                "pre-warm: `rocm update` failed ({error:#}); pinned version {pin} not found in the tree, installing"
+                            );
+                            Decision::Install
+                        }
+                    }
+                    Err(list_error) => {
+                        println!(
+                            "pre-warm: `rocm update` failed ({error:#}) and could not list runtimes ({list_error:#}); reusing the existing tree"
+                        );
+                        Decision::Reuse {
+                            reason: "update probe failed".to_owned(),
+                            activate: None,
+                        }
+                    }
+                }
+            } else {
                 println!("pre-warm: `rocm update` failed ({error:#}); reusing the existing tree");
                 Decision::Reuse {
                     reason: "update probe failed".to_owned(),
                     activate: None,
                 }
-            } else {
-                println!("pre-warm: `rocm update` failed ({error:#}); no registry yet, installing");
-                Decision::Install
             }
         }
     };
@@ -1611,6 +1661,67 @@ runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release st
             "release-wheel-gfx94x-dcgpu-7-13-0-rocm7-13",
             "7.13.0+rocm7.13"
         ));
+    }
+
+    #[test]
+    fn short_all_digit_pin_does_not_match_a_delimited_span_of_that_value() {
+        // "911" is bare digits, so it must be forced through the 8-digit
+        // build-date path (and fail there) rather than the plain
+        // delimiter-bounded substring fast path, which would otherwise find
+        // it as a clean "-911-" span and wrongly match.
+        assert!(!key_matches_pin(
+            "release-wheel-multi-arch-911-0123456789abcdef",
+            "911"
+        ));
+    }
+
+    #[test]
+    fn pin_does_not_match_a_same_version_runtime_in_a_different_channel() {
+        // Same version as the pin, but tagged with an explicit, different
+        // channel. The earlier unattributed-error-line test used a key whose
+        // version already differed from the pin, so it passed even with the
+        // channel-prefix guard deleted; this one isolates the guard itself.
+        let text = "update\n  runtime nightly-wheel-gfx94x-dcgpu-7-13-0 format=wheel \
+channel=nightly status=up_to_date\n";
+        assert_eq!(decide(text, "release", Some("7.13.0")), Decision::Install);
+    }
+
+    #[test]
+    fn pinned_runtime_with_a_stale_composition_is_repaired_not_reused() {
+        // A `repair_available` line for the pin's OWN key still means its
+        // on-disk composition is stale for the same version -- the same gap
+        // the unpinned `repair_available` branch closes. Falling through to
+        // plain `Reuse` here would serve a composition-drifted install of
+        // the pinned version forever, with no self-heal path.
+        assert_eq!(
+            decide(
+                &report("repair_available", "release"),
+                "release",
+                Some("7.13.0")
+            ),
+            Decision::Repair {
+                runtime_key: "release-wheel-gfx94x-dcgpu-7-13-0".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_runtime_with_a_newer_index_version_is_still_reused_not_repaired() {
+        // `update_available` on the pin's own key means a newer version
+        // exists in the index -- exactly what a pin deliberately opts out of
+        // chasing. Only `repair_available` (same version, stale
+        // composition) should trigger a repair.
+        let Decision::Reuse { activate, .. } = decide(
+            &report("update_available", "release"),
+            "release",
+            Some("7.13.0"),
+        ) else {
+            panic!("an update-available status on the pin's own key must not force a repair");
+        };
+        assert_eq!(
+            activate.as_deref(),
+            Some("release-wheel-gfx94x-dcgpu-7-13-0")
+        );
     }
 
     #[test]
