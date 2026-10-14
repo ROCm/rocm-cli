@@ -4,11 +4,6 @@
 
 //! Locating `rocm-engine-<name>` siblings, and the CLI binary itself (a
 //! sibling `rocm` only when running from a cargo `deps/` directory).
-//!
-//! ROCMAI-151 (Phase 7d). `resolve_amd_smi_binary*` and the
-//! `CodexBridgeSnapshot`/`CodexBridgeGpuSnapshot`/`CodexBridgeEngine` bridge
-//! DTOs sit in the same pre-split stretch of `lib.rs` but are not part of
-//! this cluster — see `docs/architecture.md` and ROCMAI-200.
 
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};

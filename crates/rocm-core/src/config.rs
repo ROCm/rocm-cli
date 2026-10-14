@@ -8,9 +8,6 @@
 //! knobs, the built-in automation-watcher catalog
 //! (`WatcherMode`/`BuiltinWatcherSpec`), and the rocm-dash dashboard
 //! sub-config (daemon + TUI), including its one-shot legacy-TOML migration.
-//!
-//! ROCMAI-151 (Phase 7d). See `docs/architecture.md` for what stays in
-//! `lib.rs` rather than here on physical-proximity grounds alone.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

@@ -12,11 +12,6 @@
 //! the shared wire type for a watcher trigger, but this module persists
 //! none of it — it is produced and consumed in-memory by `rocmd`'s
 //! watcher/webhook plumbing.
-//!
-//! ROCMAI-151 (Phase 7d). `generate_endpoint_api_key`/
-//! `endpoint_api_key_has_forbidden_chars` sit in the same pre-split stretch
-//! of `lib.rs` but are bearer-token helpers, not automation records — they
-//! stay in `lib.rs` (see ROCMAI-200).
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};

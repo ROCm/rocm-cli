@@ -7,16 +7,11 @@
 //! Identity, endpoint, process-identity (PID + start-ticks for restart
 //! safety), and inference-readiness bookkeeping.
 //!
-//! ROCMAI-151 (Phase 7d). Used by `apps/rocm` and `apps/rocmd`; `rocm-dash-daemon`
-//! also depends on it, but only in a single cross-crate serde test, and
+//! Used by `apps/rocm` and `apps/rocmd`; `rocm-dash-daemon` also depends on
+//! it, but only in a single cross-crate serde test, and
 //! `rocm-engine-protocol` mentions it solely in a doc comment —
-//! `rocm-dash-core` and `rocm-dash-collectors` do not depend on `rocm-core`
-//! at all. `ServiceId`/
-//! `generate_service_id`/`sanitize_component`/`unix_time_millis` sit
-//! immediately adjacent in the pre-split `lib.rs` but are not folded in here
-//! — see ROCMAI-200 (none of the four are named in this phase's scope, and
-//! `unix_time_millis` in particular is a crate-wide generic utility, not
-//! service-record-specific).
+//! `rocm-dash-core` and `rocm-dash-collectors` do not depend on
+//! `rocm-core` at all.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
