@@ -1289,18 +1289,30 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
         // The shape is pinned here; `apu_preflight_gates_on_the_pool_the_engine
         // _uses` drives it against a reclaim stub that reports survivors, which
         // is what proves it can fail.
+        //
+        // COMMENTS ARE EXCLUDED, and that is not fastidiousness: the script's
+        // header explains the mode by name and its error message quotes it, so
+        // a whole-file substring match stays satisfied after the call itself is
+        // gone. Measured — replacing the `if bash … --assert-clear; then`
+        // condition with `if true; then` left this test green until the lines
+        // were filtered.
         let script = shared_preflight_script();
+        let code: String = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            script.contains("--assert-clear"),
-            "{SHARED_PREFLIGHT} no longer runs `reclaim-gpu.sh --assert-clear`; the gate is \
-             back to a fixed free-memory floor, which on these pools only trips near \
-             exhaustion (#446)"
+            code.contains("--assert-clear"),
+            "{SHARED_PREFLIGHT} no longer RUNS `reclaim-gpu.sh --assert-clear` (it may still \
+             describe it); the gate is back to a fixed free-memory floor, which on these \
+             pools only trips near exhaustion (#446)"
         );
         // The floor is a BACKSTOP, not a thing the process check replaced: it is
         // the only one of the two that can see a non-E2E tenant exhausting a
         // shared host. Losing it silently would be the opposite half of #446.
         assert!(
-            script.contains("never dropped below the floor"),
+            code.contains("never dropped below the floor"),
             "{SHARED_PREFLIGHT} no longer applies a free-memory floor; the process \
              assertion cannot see a non-E2E tenant exhausting a shared host (#446)"
         );
