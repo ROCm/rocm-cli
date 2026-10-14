@@ -32,12 +32,12 @@ fn cases(default: u32) -> u32 {
 
 /// gfx targets a real host reports, as `examine` and the install probes see
 /// them. At least one per raw-target arm of `normalize_therock_family`, so the
-/// family property reaches every arm.
+/// family property reaches every arm. gfx90c is absent on purpose: it is a real
+/// reported target but has no TheRock family, so it cannot satisfy that property.
 const GFX_TARGETS: &[&str] = &[
-    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx90c", "gfx942", "gfx950", "gfx1010", "gfx1030",
-    "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101",
-    "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201",
-    "gfx1250",
+    "gfx900", "gfx906", "gfx908", "gfx90a", "gfx942", "gfx950", "gfx1010", "gfx1030", "gfx1031",
+    "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1100", "gfx1101", "gfx1102",
+    "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153", "gfx1200", "gfx1201", "gfx1250",
 ];
 
 fn ubuntu_release() -> impl Strategy<Value = (u32, u32)> {

@@ -70,7 +70,7 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
                 // snapshot and the automation watcher, so it carries the causes
                 // too -- bounded, because it is persisted; see
                 // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`. Pinned by
-                // `examine-21`.
+                // `examine-25`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,

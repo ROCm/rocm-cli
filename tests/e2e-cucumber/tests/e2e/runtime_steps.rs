@@ -1391,3 +1391,69 @@ async fn assert_freeform_execution_discloses_consent(world: &mut E2eWorld) {
          nothing saying where it came from:\n{execution}"
     );
 }
+
+/// Ask to install for gfx90c by name, and keep stdout, stderr and the exit code.
+///
+/// `--dry-run` is deliberate: the refusal has to come from family resolution,
+/// before anything is downloaded or written, so the scenario needs no network
+/// and leaves nothing behind. All three streams are kept because the claim
+/// under test is split across them — the message goes to stderr, while a
+/// *resolved* plan (the old behaviour) would go to stdout.
+#[when("the user dry-runs an SDK install for the gfx90c Vega iGPU")]
+async fn user_dry_runs_unsupported_family(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(
+        world,
+        &["install", "sdk", "--family", "gfx90c", "--dry-run"],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+/// Everything the previous step captured, as one string to search.
+fn unsupported_family_attempt(world: &E2eWorld) -> String {
+    format!(
+        "{}\n{}",
+        world.cli_output.as_deref().unwrap_or_default(),
+        world.cli_stderr.as_deref().unwrap_or_default()
+    )
+}
+
+#[then("the install is refused as having no ROCm build for that GPU")]
+async fn assert_unsupported_family_refused(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no SDK install attempt was recorded");
+    let output = unsupported_family_attempt(world);
+    assert!(rc != 0, "the install should have failed:\n{output}");
+    assert!(
+        output.contains("no ROCm SDK build"),
+        "the refusal should say no ROCm SDK build exists:\n{output}"
+    );
+    assert!(
+        output.contains("gfx90c"),
+        "the refusal should name the GPU target that was asked for:\n{output}"
+    );
+}
+
+/// The refusal must not name a package family.
+///
+/// The weaker of the two halves, and worth keeping for the case the stronger
+/// one misses: the generic "unable to resolve a supported family" error lists
+/// every recognized family as a `--family` suggestion, and the old mapping
+/// printed a plan naming `gfx90X-dcgpu`. Either way a family name reaches the
+/// user and invites installing a build for different silicon. Only the
+/// dedicated refusal names none.
+///
+/// A regression in the gfx90c mapping itself is caught by the step above, whose
+/// "no ROCm SDK build" cannot appear once `normalize_therock_family` maps the
+/// target again — see `gfx_target_has_no_rocm_build`, which is conjoined with
+/// that mapping precisely so this scenario cannot pass without it.
+#[then("the refusal offers no package family to install instead")]
+async fn assert_unsupported_family_offers_nothing(world: &mut E2eWorld) {
+    let output = unsupported_family_attempt(world);
+    for family in rocm_core::known_therock_families() {
+        assert!(
+            !output.contains(family),
+            "the refusal must not offer `{family}` for a GPU with no ROCm build:\n{output}"
+        );
+    }
+}
