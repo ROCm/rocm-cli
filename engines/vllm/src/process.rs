@@ -426,6 +426,7 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
         );
     }
     if !cfg!(windows) {
+        crate::runtime::ensure_therock_compat_shims(runtime);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(

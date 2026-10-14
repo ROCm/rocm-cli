@@ -604,10 +604,9 @@ print(json.dumps({"present": spec is not None, "version": version}))
 
 /// Describes a resolved runtime's TheRock SDK layout for the running-state
 /// payload, or `None` when the runtime is not backed by a TheRock SDK root.
-/// Not pure: via `therock_library_path_entries`, this can write a
-/// `libmpi_cxx` compat stub and delete a stale numa shim in a runtime-owned
-/// `rocm-cli-lib-compat` directory under the managed Python env root (or the
-/// SDK root as a fallback).
+/// Pure: `therock_library_path_entries` only derives paths here, it never
+/// writes the compat shims a launch needs those paths to contain — see
+/// [`ensure_therock_compat_shims`].
 pub(crate) fn therock_runtime_env_payload(runtime: &VllmRuntime) -> Option<Value> {
     let root = runtime.sdk_root.as_ref()?;
     Some(json!({
@@ -656,33 +655,53 @@ pub(crate) fn therock_library_path_entries(runtime: &VllmRuntime) -> Vec<PathBuf
         // load libmpi.so at launch when it lives there.
         entries.extend(rocm_core::openmpi::openmpi_library_dirs());
 
+        // The compat shims this directory may hold (see
+        // `ensure_therock_compat_shims`) are not ensured here — this function
+        // only derives the path, so a caller that has not called that function
+        // first simply gets an entry pointing at a directory with nothing (or
+        // stale contents) in it. Always including the candidate, rather than
+        // checking whether it currently holds a shim, keeps this derivation
+        // free of filesystem writes while still describing the launch path's
+        // actual loader path once that function has run.
         if let Some(compat_dir) = runtime_compat_dir(runtime) {
-            // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
-            // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings,
-            // so `import torch` aborts with `libmpi_cxx.so.40: cannot open shared
-            // object file`. When no real `libmpi_cxx.so*` exists, materialize an
-            // embedded `libmpi_cxx.so.40` stub (built at compile time, see
-            // rocm-core's build.rs) into a runtime-owned directory and add it to
-            // the loader path. The stub only *defines* the legacy C++ binding
-            // symbols torch needs; they are never called in single-node serving,
-            // so this is safe.
-            if let Some(dir) = rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir) {
-                entries.push(dir);
-            }
-            // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with
-            // the upstream `libnuma_1.2` symbol version. TheRock bundles numa only
-            // under the renamed soname `librocm_sysdeps_numa.so.1` whose versions
-            // are rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot
-            // satisfy that binding. An older rocm-cli release symlinked
-            // `libnuma.so.1` to that bundled library; on the loader path it
-            // shadowed any real system libnuma and broke `import torch` with
-            // `version 'libnuma_1.2' not found`. Remove that stale shim here so
-            // the real numactl runtime (installed via the package manager) wins;
-            // `libnuma_present()`/`spawn_vllm_server` handle the install/preflight.
-            remove_stale_numa_shim(&compat_dir);
+            entries.push(compat_dir);
         }
     }
     dedupe_paths(entries)
+}
+/// Materializes the runtime-owned OpenMPI compatibility shims that
+/// `therock_library_path_entries`' `compat_dir` entry depends on. Call once
+/// from the launch path, before building the environment a server is spawned
+/// with — never from running-state payload assembly, which only needs the
+/// path list `therock_library_path_entries` derives, not the shims
+/// themselves.
+pub(crate) fn ensure_therock_compat_shims(runtime: &VllmRuntime) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(compat_dir) = runtime_compat_dir(runtime) else {
+        return;
+    };
+    // PyTorch's `libtorch_global_deps.so` lists `libmpi_cxx.so.40` as a
+    // NEEDED dependency, but OpenMPI 5.x removed the legacy C++ bindings, so
+    // `import torch` aborts with `libmpi_cxx.so.40: cannot open shared object
+    // file`. When no real `libmpi_cxx.so*` exists, materialize an embedded
+    // `libmpi_cxx.so.40` stub (built at compile time, see rocm-core's
+    // build.rs) into this directory. The stub only *defines* the legacy C++
+    // binding symbols torch needs; they are never called in single-node
+    // serving, so this is safe.
+    rocm_core::openmpi::ensure_mpi_cxx_compat(&compat_dir);
+    // PyTorch's `libc10.so` NEEDS the standard `libnuma.so.1` soname with the
+    // upstream `libnuma_1.2` symbol version. TheRock bundles numa only under
+    // the renamed soname `librocm_sysdeps_numa.so.1` whose versions are
+    // rewritten to `AMDROCM_SYSDEPS_1.0_libnuma_*`, which cannot satisfy that
+    // binding. An older rocm-cli release symlinked `libnuma.so.1` to that
+    // bundled library; on the loader path it shadowed any real system libnuma
+    // and broke `import torch` with `version 'libnuma_1.2' not found`. Remove
+    // that stale shim here so the real numactl runtime (installed via the
+    // package manager) wins; `libnuma_present()`/`spawn_vllm_server` handle
+    // the install/preflight.
+    remove_stale_numa_shim(&compat_dir);
 }
 /// Remove a stale `libnuma.so.1` compatibility symlink left by older rocm-cli
 /// versions in `compat_dir`. That shim pointed at the ROCm SDK's bundled
@@ -909,12 +928,10 @@ mod tests {
     }
     #[test]
     fn therock_library_path_entries_include_sysdeps_for_hip_apps() {
-        // `sdk_root` must be a real, scratch directory: on Linux this function
-        // can materialize a `libmpi_cxx.so.40` compat stub under it (see
-        // `ensure_mpi_cxx_compat`), and a fixed `/tmp/rocm-sdk` would leave that
-        // file behind after the test runs.
-        let scratch = tempfile::tempdir().expect("tempdir");
-        let root = scratch.path().to_path_buf();
+        // A fixed path is safe here: this function only derives candidate
+        // paths and never writes to disk (see `ensure_therock_compat_shims`
+        // for the step that does).
+        let root = PathBuf::from("/tmp/rocm-sdk");
         let runtime = VllmRuntime {
             runtime_id: "therock-release:gfx120X-all".to_owned(),
             env_id: "external-vllm-therock".to_owned(),

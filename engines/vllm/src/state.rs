@@ -305,7 +305,7 @@ pub(crate) fn current_unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rocm_engine_protocol::DevicePolicy;
+    use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint};
     use std::io::Read;
     use std::io::Write;
 
@@ -460,19 +460,12 @@ mod tests {
     fn write_running_state_records_managed_therock_env_for_gpu_verification() -> Result<()> {
         // Uses the test's own live PID rather than a fixed placeholder so that,
         // on Linux, the `start_ticks` assertion below exercises the real
-        // `rocm_core::process_start_ticks` lookup instead of a value `json!`
-        // would write regardless (a prior version of this test asserted only
-        // `is_some()`, which `Some(Value::Null)` also satisfies). On other
-        // platforms `process_start_ticks` is a stub that always returns
-        // `None`, so there the assertion only checks `None == None`.
+        // `rocm_core::process_start_ticks` lookup rather than only checking
+        // the field is present. On other platforms `process_start_ticks` is a
+        // stub that always returns `None`, so there the assertion only checks
+        // `None == None`.
         let own_pid = std::process::id();
         let state_path = probe_state_path("therock-env");
-        // `sdk_root` must be a real, scratch directory on Linux: this payload can
-        // materialize a `libmpi_cxx.so.40` compat stub under it (see
-        // `ensure_mpi_cxx_compat`), and a fixed `/home/user/...` path would leave
-        // that file behind after the test runs wherever it happens to be writable
-        // (for example, in root containers).
-        let scratch = tempfile::tempdir().expect("tempdir");
         let request = ServeHttpRequest {
             service_id: "svc-vllm".to_owned(),
             model_ref: "facebook/opt-125m".to_owned(),
@@ -497,11 +490,11 @@ mod tests {
             python_executable: None,
             version: Some("test".to_owned()),
             source: "managed_runtime_manifest:test".to_owned(),
-            sdk_root: Some(if cfg!(windows) {
-                PathBuf::from(r"C:\rocm-sdk")
+            sdk_root: Some(PathBuf::from(if cfg!(windows) {
+                r"C:\rocm-sdk"
             } else {
-                scratch.path().join("rocm_sdk")
-            }),
+                "/home/user/.venv/lib/python/site-packages/rocm_sdk"
+            })),
             sdk_bin: Some(PathBuf::from(if cfg!(windows) {
                 r"C:\rocm-sdk\bin"
             } else {
@@ -602,6 +595,65 @@ mod tests {
         assert_eq!(
             identity.start_ticks,
             rocm_core::process_start_ticks(own_pid)
+        );
+        Ok(())
+    }
+    #[test]
+    fn write_running_state_forwards_engine_recipe_required_flags() -> Result<()> {
+        // The sibling therock-env test above always passes `engine_recipe: None`,
+        // so its `engine_recipe_required_flags` assertion (`is_some_and(Vec::is_empty)`)
+        // holds whether or not `write_running_state` actually forwards the recipe's
+        // flags — it would pass even if the forwarding call were deleted. This test
+        // uses a recipe with a non-empty `required_flags` so the assertion can only
+        // pass if the flags genuinely reach the state file; `engine_recipe_required_flags`
+        // is user-observable (printed by `rocm services list`), so this is the
+        // user-facing contract, not an implementation detail.
+        let state_path = probe_state_path("recipe-flags");
+        let recipe = EngineRecipeHint {
+            contract_version: "1".to_owned(),
+            engine: crate::ENGINE_NAME.to_owned(),
+            required_flags: vec!["--enable-auto-tool-choice".to_owned()],
+            parser_settings: std::collections::BTreeMap::default(),
+            preferred_endpoint: None,
+            unsupported_combinations: Vec::new(),
+            notes: Vec::new(),
+        };
+        let request = ServeHttpRequest {
+            service_id: "svc-vllm-recipe".to_owned(),
+            model_ref: "facebook/opt-125m".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: 11440,
+            device_policy: DevicePolicy::GpuRequired,
+            gpu_indices: Vec::new(),
+            runtime_id: Some("runtime-key-gfx120x".to_owned()),
+            env_id: None,
+            state_path: state_path.clone(),
+            log_path: None,
+            engine_recipe: Some(recipe),
+        };
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: None,
+            version: Some("test".to_owned()),
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: None,
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+
+        write_running_state(&request, &runtime, std::process::id())?;
+        let state = read_service_state(&state_path)?;
+        fs::remove_file(&state_path).ok();
+
+        assert_eq!(
+            state
+                .get("engine_recipe_required_flags")
+                .and_then(Value::as_array),
+            Some(&vec![Value::String("--enable-auto-tool-choice".to_owned())])
         );
         Ok(())
     }
