@@ -242,8 +242,12 @@ rocm serve qwen --engine lemonade --device gpu_required --foreground --port 1143
 
 Expected result:
 
-- The engine uses ROCm GPU execution.
-- The run does not fall back to CPU or Vulkan.
+- The engine uses ROCm GPU execution. The deployment summary's `device:` row
+  reports what the engine actually selected, so check it by reading that row
+  rather than inferring it from the absence of a fallback warning: expect
+  `rocm gpu <n>`. `rocm services` shows the same `device` while it runs.
+- The run does not fall back to CPU or Vulkan — a `device:` of `vulkan gpu <n>`
+  fails this check even though the serve itself succeeds.
 - If the GPU cannot be used, the command fails with a clear error.
 - The OpenAI-compatible endpoint answers a simple chat request.
 
