@@ -195,9 +195,10 @@ impl TuiSession {
     /// unset or not a directory. `spawn_in` makes the cwd an arbitrary,
     /// explicit choice — independent of `HOME`/`USERPROFILE` overrides, and
     /// the only reliable control on Windows — for driving a UI flow that
-    /// resolves its initial path via `std::env::current_dir()` when nothing
-    /// is already staged (currently used by onboarding's Adopt-existing
-    /// folder browser; see dash-25).
+    /// resolves its initial path via `std::env::current_dir()`: onboarding's
+    /// Adopt-existing folder browser does this unconditionally (see
+    /// dash-25); its Configure-path sibling does the same only when nothing
+    /// is already staged.
     pub fn spawn_in(world: &E2eWorld, args: &[&str], dir: &Path) -> Result<Self, String> {
         Self::spawn_binary_with_env(world, crate::rocm_binary(), args, &[], Some(dir))
     }
@@ -237,7 +238,7 @@ impl TuiSession {
         }
         if let Some(dir) = cwd {
             // portable-pty 0.9.0 silently filters a non-directory cwd and
-            // falls back to `$HOME`/`%USERPROFILE%` with no error, so check
+            // falls back per the doc comment above, with no error, so check
             // it ourselves rather than let a typo'd or not-yet-created
             // target spawn somewhere else without saying so.
             if !dir.is_dir() {
