@@ -14586,6 +14586,28 @@ fn select_auto_gpu_index(
 /// alone without them — so a stalled `amd-smi` must not hold up a launch. This
 /// bounds the ordinary stalls only; the unkillable one is prevented by the
 /// pre-flight inside [`rocm_core::amd_smi_json`], not by any timeout.
+///
+/// Used by `serve` only — [`gpu_vram_usage_amd_smi`] and [`detect_gpu_count`]
+/// are its two consumers and both are reached solely from `serve_cmd::serve`.
+/// `rocmd`'s watcher has its own, shorter `AMD_SMI_PROBE_TIMEOUT` (2s) for the
+/// same helper: that one fires on a polling cadence where a stalled probe costs
+/// a missed telemetry tick and nothing else, so it can afford to give up early,
+/// while a serve launch gets exactly one chance to learn the GPU layout and
+/// giving up early there degrades the placement decision itself.
+///
+/// Worst-case latency, deliberately accepted rather than parallelised: `serve`
+/// runs the two probes sequentially — `gpu_vram_usage` before the launch lock,
+/// `detect_gpu_count` either in the `--gpu <index>` validation or inside the
+/// lock for `--gpu auto` — so a host where `amd-smi` passes the KFD gate and
+/// then stalls both times adds up to ~20s to an interactive launch. Before this
+/// bound existed both probes called `.output()` with no timeout at all, so that
+/// same host hung indefinitely; 20s is the ceiling replacing "forever", not a
+/// new cost. Running them concurrently is not free: `detect_gpu_count` is
+/// invoked inside [`select_gpu_indices_under_launch_lock`] precisely so the
+/// cpu-only and pinned paths never pay for the subprocess, and hoisting it out
+/// to overlap with the VRAM probe would make every `rocm serve --cpu-only` spawn
+/// an `amd-smi` it has no use for. The stall is rare, the extra spawn would be
+/// unconditional.
 const AMD_SMI_SERVE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Best-effort per-GPU VRAM occupancy. Prefers `amd-smi metric --json`; when

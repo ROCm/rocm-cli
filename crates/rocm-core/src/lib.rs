@@ -199,6 +199,22 @@ pub fn require_nonempty(value: &str, field_name: &str) -> Result<()> {
 /// captured output: stderr if non-blank after trimming, else stdout, else a
 /// literal "no output"; the result is trimmed.
 pub fn command_failure_detail(output: &std::process::Output) -> String {
+    command_failure_detail_or_else(output, || "no output".to_owned())
+}
+
+/// The stderr-then-stdout precedence behind [`command_failure_detail`], with the
+/// both-blank fallback left to the caller.
+///
+/// Exists so the precedence rule lives in exactly one place. [`amd_smi_json`]
+/// needs the same ordering but a different last resort — `exit status <code>`
+/// rather than `no output`, because a silent amd-smi's exit code is the only
+/// diagnostic left — and inlining the two `is_empty` checks there to get it put
+/// the same rule in two places. `fallback` is a closure because formatting an
+/// `ExitStatus` is wasted work on the overwhelmingly common non-blank path.
+pub fn command_failure_detail_or_else(
+    output: &std::process::Output,
+    fallback: impl FnOnce() -> String,
+) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !stderr.is_empty() {
         return stderr;
@@ -207,7 +223,7 @@ pub fn command_failure_detail(output: &std::process::Output) -> String {
     if !stdout.is_empty() {
         return stdout;
     }
-    "no output".to_owned()
+    fallback()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -1867,6 +1883,12 @@ const KFD_DEVICE: &str = "/dev/kfd";
 /// rescues it, because killing a D-state child is a no-op. This gate removes
 /// the reachable half of that hazard; it does not claim to see the rest.
 ///
+/// The probe does not assume `kfd_open` returns promptly. An `open` that blocks
+/// — whatever the reason, including a state this gate has not anticipated —
+/// is bounded by [`KFD_OPEN_TIMEOUT`] and read as "not readable", so the gate
+/// declines rather than inheriting the stall it exists to prevent. See
+/// [`device_readable_within`].
+///
 /// Off Linux there is no such device and no such kernel state, so the check is
 /// `true` without probing anything. That wave-through is load-bearing rather
 /// than pedantic: `amd-smi.exe` is a supported Windows binary (see
@@ -1917,9 +1939,69 @@ fn kfd_readable_with(wsl_gpu_reachable: bool, real_device: &Path, host_device: &
             && (host_device == real_device || device_readable(host_device)))
 }
 
+/// How long the pre-flight waits for the device `open` itself before giving up
+/// on it and declining the launch.
+///
+/// The gate exists to avoid spawning `amd-smi` against a device that can park a
+/// process in uninterruptible sleep. Performing the probe with a plain blocking
+/// `open` would make the gate's own safety rest on an *assumption* — that
+/// `kfd_open` always returns promptly, and that only amd-smi's later ioctls can
+/// enter D-state — and that assumption cannot be verified against a
+/// reset-in-progress device from any test. If it were ever wrong, the gate
+/// would have relocated the hazard into a synchronous call with *less*
+/// protection than the spawn it replaced, since there is no child to kill.
+///
+/// Bounding the open removes the need to be right about that: a `/dev/kfd` open
+/// that has not returned in this long is treated as "not readable", which is the
+/// declining answer, so the unverifiable case fails in the safe direction. Short
+/// because a healthy `kfd_open` is a handful of microseconds and the only thing
+/// a longer wait buys is a longer stall on a host that is already unhealthy.
+#[cfg(target_os = "linux")]
+const KFD_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether `device` can be opened for reading, giving up after
+/// [`KFD_OPEN_TIMEOUT`].
 #[cfg(target_os = "linux")]
 fn device_readable(device: &Path) -> bool {
-    fs::OpenOptions::new().read(true).open(device).is_ok()
+    device_readable_within(device, KFD_OPEN_TIMEOUT)
+}
+
+/// [`device_readable`] with the bound injected, so a test can pin the timeout
+/// path against a device that really does block in `open` (a FIFO with no
+/// writer) without stalling the suite for the production bound.
+///
+/// The `open` runs on its own thread and the caller waits on a channel, because
+/// there is no portable way to interrupt a blocking `open` once it has entered
+/// the kernel. A probe that overruns leaves that thread parked — the same
+/// trade-off [`reap_in_background`] documents, and for the same reason: one
+/// leaked thread is strictly cheaper than a blocked caller, and a device that
+/// can park a thread forever is exactly the device this whole gate exists to
+/// refuse. The opened handle is dropped on the probe thread, so a late success
+/// closes its own descriptor rather than leaking one.
+///
+/// If no thread can be spawned the probe falls back to a direct blocking open:
+/// that is the pre-existing behaviour, and refusing every launch because the
+/// process is out of threads would be a worse failure than the one being
+/// guarded against.
+#[cfg(target_os = "linux")]
+fn device_readable_within(device: &Path, timeout: Duration) -> bool {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let probe_path = device.to_path_buf();
+    let spawned = thread::Builder::new()
+        .name("rocm-kfd-open-probe".to_owned())
+        .spawn(move || {
+            let readable = fs::OpenOptions::new().read(true).open(&probe_path).is_ok();
+            // The receiver is gone whenever the probe overran; dropping the
+            // send result is the whole handling.
+            let _ = sender.send(readable);
+        })
+        .is_ok();
+    if !spawned {
+        return fs::OpenOptions::new().read(true).open(device).is_ok();
+    }
+    // Both error arms — timeout and a probe thread that died without sending —
+    // mean "no readable answer", which the gate must read as not readable.
+    receiver.recv_timeout(timeout).unwrap_or(false)
 }
 
 /// Off-Linux counterpart of [`kfd_readable`]: see that function's docs for why
@@ -2002,26 +2084,24 @@ fn amd_smi_json_with(
         .with_context(|| format!("failed to launch amd-smi {}", args.join(" ")))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         // Truncated, not dropped. This message reaches `rocmd`'s snapshot note
         // and from there the JSONL logs, so the quote has to be bounded at the
         // point that knows these characters are raw child output — see
         // [`MAX_QUOTED_OUTPUT_CHARS`]. The head is where a failing `amd-smi`
         // says what went wrong, and the command is named before it either way.
+        //
+        // The stderr-then-stdout precedence is `command_failure_detail`'s, taken
+        // from the shared helper rather than re-spelled here; only the
+        // both-blank fallback differs, naming the exit status instead of the
+        // generic "no output".
         bail!(
             "amd-smi {} failed: {}",
             args.join(" "),
             crate::examine::truncate_to_chars(
-                if stderr.is_empty() {
-                    if stdout.is_empty() {
-                        format!("exit status {}", output.status)
-                    } else {
-                        stdout
-                    }
-                } else {
-                    stderr
-                },
+                command_failure_detail_or_else(&output, || format!(
+                    "exit status {}",
+                    output.status
+                )),
                 MAX_QUOTED_OUTPUT_CHARS,
             )
         );
@@ -2691,6 +2771,72 @@ mod tests {
         assert!(
             both_present,
             "the ordinary case must still pass, or the two above prove nothing"
+        );
+        Ok(())
+    }
+
+    /// The gate's own probe must not be able to hang.
+    ///
+    /// `kfd_readable` was reviewed as resting on an unverified assumption: that
+    /// `open("/dev/kfd")` always returns promptly, so that only amd-smi's later
+    /// ioctls can enter uninterruptible sleep. If that were ever wrong the gate
+    /// would have moved the hazard into a synchronous call with *less*
+    /// protection than the spawn it replaced — no child to kill, no timeout.
+    /// Rather than assert the assumption, the probe is bounded; this pins that.
+    ///
+    /// A FIFO is the fixture that makes the blocking case real rather than
+    /// simulated: `open(O_RDONLY)` on a FIFO with no writer blocks in the kernel
+    /// indefinitely, which is the observable shape of the hazard. The deadline
+    /// assertion is what distinguishes a bounded probe from an unbounded one —
+    /// without it, deleting the timeout would hang the suite rather than fail
+    /// this test, and a hang is not a readable failure. The readable control in
+    /// the same test stops the whole thing passing vacuously, e.g. if
+    /// `device_readable_within` were mutated to return `false` unconditionally.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_kfd_probe_declines_a_device_whose_open_blocks_instead_of_hanging() -> Result<()> {
+        let temp_root =
+            std::env::temp_dir().join(format!("rocm-cli-kfd-open-{}", unix_time_millis()));
+        fs::create_dir_all(&temp_root)?;
+        let fifo = temp_root.join("blocking-kfd");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes())
+            .context("fifo path contained an interior NUL")?;
+        // SAFETY: `fifo_c` is a NUL-terminated path that lives across the call,
+        // and `mkfifo` only creates a node at it.
+        let made = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "could not create the FIFO fixture: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let probe_timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let blocked = device_readable_within(&fifo, probe_timeout);
+        let elapsed = started.elapsed();
+
+        let readable = temp_root.join("ordinary-kfd");
+        fs::write(&readable, b"")?;
+        let allowed = device_readable_within(&readable, probe_timeout);
+        // The overrun probe's thread is still parked in `open` and stays that
+        // way until this test binary exits — deliberately, and the same leak
+        // `device_readable_within` documents. Unlinking the FIFO does not
+        // release it, and nothing here needs it released.
+        let _ = fs::remove_dir_all(&temp_root);
+
+        assert!(
+            !blocked,
+            "a device whose open never returns must read as not readable, so the gate declines"
+        );
+        assert!(
+            elapsed < probe_timeout * 10,
+            "the probe returned after {elapsed:?}, so it is not bounded by its {probe_timeout:?} \
+             timeout — an unbounded open relocates the D-state hang into the gate itself"
+        );
+        assert!(
+            allowed,
+            "an ordinary readable device must still pass, or the blocked case proves nothing"
         );
         Ok(())
     }

@@ -9,8 +9,6 @@ use crate::persistence::load_managed_services;
 use crate::service::stop_managed_service;
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
-#[cfg(target_os = "linux")]
-use rocm_core::command_failure_detail;
 use rocm_core::{
     AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
     model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
@@ -943,41 +941,37 @@ fn append_sandbox_tool_command_args(
     }
 }
 
+/// Run the bubblewrap child under a timeout, via the one shared helper.
+///
+/// This used to be a third hand-rolled copy of the same poll-and-kill loop, from
+/// the same split (`e760d9a5`) that produced the amd-smi ones — and it carried
+/// the same defect: it polled `try_wait` while both pipes stayed undrained, so a
+/// sandbox child that filled the 64 KiB pipe buffer blocked mid-write and was
+/// then reported as having exceeded its timeout. A verbose child, misdiagnosed
+/// as a hang. `rocm_core::run_command_with_timeout` drains both pipes on their
+/// own threads and hands the `wait` of a killed child to a detached reaper, so
+/// routing through it fixes that here too and leaves one implementation to
+/// maintain.
+///
+/// The stdio setup stays at this call site because the helper does not impose
+/// one: [`rocm_core::amd_smi_json`] configures its own the same way.
+///
+/// Two deliberate message changes come with the move. The helper's timeout error
+/// is the generic `process exceeded <n>s timeout`, so the "sandbox process"
+/// framing is restored as context rather than baked into the bail. And it no
+/// longer quotes the timed-out child's partial output: the helper refuses to
+/// join the reader threads on the timeout path precisely because an unkillable
+/// child would block them, which is the hang the timeout exists to bound.
 #[cfg(target_os = "linux")]
 fn run_process_with_timeout(
     mut command: ProcessCommand,
     timeout: Duration,
 ) -> Result<std::process::Output> {
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn sandbox process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll sandbox process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect sandbox process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out sandbox process output")?;
-            bail!(
-                "sandbox process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
+        .stderr(Stdio::piped());
+    rocm_core::run_command_with_timeout(command, timeout).context("sandbox process failed")
 }
 
 #[cfg(target_os = "linux")]

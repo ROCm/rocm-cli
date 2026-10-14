@@ -25,6 +25,16 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::Duration;
 
+/// How long `rocmd` waits on an `amd-smi` probe before giving up on it.
+///
+/// Deliberately 5x shorter than `serve`'s `AMD_SMI_SERVE_PROBE_TIMEOUT` (10s),
+/// even though both now reach the same `rocm_core::amd_smi_json`. The two pay
+/// different prices for giving up early. This one runs on the GPU-telemetry
+/// watcher's polling cadence, where a probe that is abandoned costs one stale
+/// tick and the next poll retries moments later — so a long wait buys nothing
+/// and keeps a watcher thread parked on an unhealthy host. `serve` gets exactly
+/// one shot at learning the GPU layout before placing a model, and abandoning
+/// it degrades the placement decision for the whole lifetime of that service.
 const AMD_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn build_bridge_snapshot(paths: &AppPaths) -> Result<CodexBridgeSnapshot> {
