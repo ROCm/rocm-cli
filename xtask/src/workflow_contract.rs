@@ -1278,6 +1278,71 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
     }
 
     #[test]
+    fn every_native_linux_preflight_delegates_in_the_same_shape() {
+        // The test above asks whether each lane MENTIONS the shared script; this
+        // asks whether that is all it does. The gap between the two is exactly
+        // where re-inlining drift grows back: a lane that keeps the delegation
+        // and adds a line of its own above it — one more `pkill -f`, a lane-local
+        // retry, a second floor — satisfies `step.contains(SHARED_PREFLIGHT)`
+        // and the floor check and leaves that test green, while the six bodies
+        // are no longer one body. That is how the original six inline copies
+        // diverged from their PowerShell mirrors: nothing compared them to each
+        // other, only to a substring.
+        //
+        // So compare the bodies to EACH OTHER, the way `apu_preflight_twins_do_
+        // not_drift` and `both_wsl_lanes_settle_the_clock_before_running_the_
+        // suite` pin their pairs, and then pin the shape they agree on: a single
+        // `bash <script>` line and nothing else. Equality alone would be
+        // satisfied by six identically re-inlined copies; the shape assertion
+        // alone would not notice five of six.
+        //
+        // The per-lane floor is deliberately NOT part of this comparison. It
+        // travels in the step's `env:` mapping, not its `run:` body, precisely
+        // so the bodies can be identical — that is the property being pinned.
+        let mut bodies: Vec<(String, String)> = Vec::new();
+        for (workflow, text) in self_hosted_workflows() {
+            for (i, step) in gpu_preflight_steps(&text).iter().enumerate() {
+                if preflight_powershell_script(step).is_some() || step.contains("-Script @'") {
+                    continue;
+                }
+                let body = preflight_shell_script(step).unwrap_or_else(|| {
+                    panic!("{workflow} GPU preflight #{i} carries no `run: |` body")
+                });
+                bodies.push((format!("{workflow} GPU preflight #{i}"), body));
+            }
+        }
+        assert_eq!(
+            bodies.len(),
+            6,
+            "expected six native Linux preflight bodies to compare, found {} — \
+             if a lane was added or removed, update this count",
+            bodies.len()
+        );
+        let (first_name, first) = bodies
+            .first()
+            .expect("at least one native preflight")
+            .clone();
+        for (name, body) in &bodies[1..] {
+            if let Some(diff) = first_line_difference(&first_name, &first, name, body) {
+                panic!(
+                    "the native Linux GPU preflights no longer invoke \
+                     {SHARED_PREFLIGHT} identically — a lane has grown a body of its \
+                     own again, which is the duplication #294 removed and the drift \
+                     #446 was caused by; {diff}"
+                );
+            }
+        }
+        assert_eq!(
+            first.trim_end(),
+            format!("bash {SHARED_PREFLIGHT}"),
+            "the native Linux GPU preflight bodies agree with each other but are no \
+             longer a lone delegation to {SHARED_PREFLIGHT}; whatever they now also \
+             do is a second gate living in the workflows, where the next fix to it \
+             has to land six times again"
+        );
+    }
+
+    #[test]
     fn the_shared_preflight_asserts_no_leaked_engine_process_survives() {
         // #446: the free-memory floor is a fixed 8/16 GiB against pools of ~62
         // and 192 GiB, so it only trips near exhaustion — a leftover
@@ -1813,6 +1878,51 @@ fi
                 env: vec![("REJECT_COMBINED", "1")],
                 native: (0, &["GPU ready: 182 GiB VRAM free"]),
                 advisory: (0, &["GPU ready: 182 GiB VRAM free"]),
+                windows: None,
+            },
+            // The discrete lanes' 16 GiB floor, driven across its own boundary
+            // rather than only asserted as a string in the workflow YAML.
+            //
+            // Every other discrete fixture here clears or misses the floor by
+            // well over a hundred GiB, so the NUMBER never decides anything:
+            // change the lanes' `GPU_PREFLIGHT_MIN_FREE_GIB: 16` to 8, or to 64,
+            // and all of them keep their verdicts. This pair is the only place
+            // the value is load-bearing — at 15 GiB free the lane must fail and
+            // at 8 it would pass, so a floor that quietly shrank is caught here
+            // and nowhere else.
+            //
+            // Run at the DISCRETE floor, which `run_preflight` does not default
+            // to: it supplies the APU's 8 so the three lanes are driven alike,
+            // and a case wanting 16 overrides it, as here.
+            GateCase {
+                label: "discrete card one GiB under the 16 GiB floor",
+                fixture: smi_fixture(192 * GIB, 177 * GIB, None),
+                env: vec![("GPU_PREFLIGHT_MIN_FREE_GIB", "16")],
+                native: (
+                    1,
+                    &["VRAM never dropped below the floor: only 15 GiB free (< 16 GiB)"],
+                ),
+                advisory: (
+                    1,
+                    &[
+                        "waiting: 15 GiB VRAM free (< 16 GiB)",
+                        "VRAM never dropped below the floor",
+                    ],
+                ),
+                windows: None,
+            },
+            // The other side of the same boundary, one GiB up. Pins the
+            // comparison as `>=` rather than `>`: a card holding exactly the
+            // floor satisfies it. Off by that one step the lanes would burn the
+            // full ceiling and fail a GPU that is, by their own stated rule,
+            // ready — and no fixture above would notice, because none of them
+            // land on the number.
+            GateCase {
+                label: "discrete card exactly at the 16 GiB floor",
+                fixture: smi_fixture(192 * GIB, 176 * GIB, None),
+                env: vec![("GPU_PREFLIGHT_MIN_FREE_GIB", "16")],
+                native: (0, &["GPU ready: 16 GiB VRAM free (>= 16 GiB)"]),
+                advisory: (0, &["GPU ready: 16 GiB VRAM free (>= 16 GiB)"]),
                 windows: None,
             },
             // A wedged driver must not be read as "this is an APU" and waved
