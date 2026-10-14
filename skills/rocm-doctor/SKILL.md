@@ -120,10 +120,11 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
      `notes`, and the `needs_sudo` / `needs_reboot` / `needs_relogin` /
      `auto_applicable` flags). `score >= 75` = high confidence; `50–74` = likely
      (confirm one more piece of evidence with the user first).
-     **`fix` may be `null`.** Causes with an `info-` id (outside the `fix-N` /
-     `fix-wsl-N` series — currently only `info-20-gpu-no-rocm-support`) are
-     informational: they explain the host's state and have no remediation. Read
-     `fix` before you reach for `fix.fix_id`.
+     **Read `fix.class` before you propose anything.** `diagnose-only` means
+     the cause is real and explained but has no remedy — currently only
+     `info-20-gpu-no-rocm-support`, which carries an `info-` id rather than a
+     `fix-N` / `fix-wsl-N` one for that reason. `rocm fix` still takes that id
+     and answers for it, by naming the problem and changing nothing.
    - `out_of_scope` — set only when the host's platform family has no catalog
      entries at all. Linux, Windows and WSL2 are all covered, so this does
      **not** fire for WSL2. When it is set, nothing was checked — say so rather
@@ -141,11 +142,12 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
 2. **Propose the fix.** Show the top match's `title`, `evidence`, plan, and
    `verify` command. Only propose applying it when the user is on board.
 
-   If the top match's `fix` is `null` (an `info-` id), there is nothing to
-   propose: relay its `title` and `evidence` as an explanation of the host, then
-   move down `matched[]` to the highest-scoring cause that *does* carry a `fix`
-   and propose that one instead. If none does, treat it as `has_match` false and
-   route upstream per `route_when_no_match`.
+   If the top match's `fix.class` is `diagnose-only`, there is no fix to
+   propose: relay its `title` and `evidence` as an explanation of the host and
+   **stop there**. You may mention a lower cause only if it *also* clears
+   `min_score_for_match` — below that threshold nothing was established, which
+   is the same bar the `has_match` paragraph above sets, and a `diagnose-only`
+   top match does not lower it.
 
 3. **Apply with consent.** For an auto-applicable fix:
 
@@ -155,14 +157,14 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    rocm fix <fix-id> --yes      # required to apply in a non-interactive shell
    ```
 
-   **Only ever pass a `fix.fix_id` here**, never a bare `matched[].id`. They are
-   the same string for every `fix-…` entry, but an `info-…` id has no catalog
-   recipe and `rocm fix info-…` exits 2 with `Unknown fix-id`.
-
    Only the four auto-applicable fixes are ones the CLI runs itself. The other 23
    are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
    fix <id>` just prints the plan for the user to run themselves — no prompt, and
    the CLI never performs those.
+
+   One entry is in neither group. `info-20-gpu-no-rocm-support` is
+   **diagnose-only**: `rocm fix` takes the id, names the problem, says there is
+   no reliable fix, and exits 0 having changed nothing.
 
    Of the four, two do not always mutate:
 

@@ -644,19 +644,6 @@ fn finalize(id: &str, title: &str, score: i32, evidence: Vec<String>, fix: Fix) 
     }
 }
 
-/// Like [`finalize`], for a diagnosis that explains a cause but has no
-/// automated remediation to offer -- `rocm fix` has nothing to run for it, so
-/// `render_report_text` skips the `apply with:` line for it accordingly.
-fn finalize_informational(id: &str, title: &str, score: i32, evidence: Vec<String>) -> Diagnosis {
-    Diagnosis {
-        id: id.to_owned(),
-        title: title.to_owned(),
-        score: score.min(100),
-        evidence,
-        fix: None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-misconfiguration checkers (1:1 with diagnose.py)
 //
@@ -2134,24 +2121,6 @@ fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
-/// GPU architectures confirmed to have no ROCm/HIP runtime build at all -- not
-/// "not yet detected", but parts ROCm has never shipped support for.
-///
-/// Kept short and explicit rather than inferred from
-/// `host_gpu::normalize_therock_family` returning `None`, because that also
-/// returns `None` for a gfx target this catalog simply doesn't recognize yet.
-/// Conflating "confirmed unsupported" with "unrecognized" would turn a
-/// detection gap into a false claim about the hardware.
-///
-/// This check only sees `gfx90c` at all once `host_gpu`'s PCI-id-to-gfx-target
-/// table maps the Renoir/Lucienne/Cezanne/Barcelo iGPU ids to it (ROCMAI-542);
-/// until then a real one of these hosts reports an empty `gfx_target` and this
-/// check stays silent on it, same as any other undetected GPU.
-const GFX_TARGETS_WITHOUT_ROCM_SUPPORT: &[&str] = &[
-    // Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo (Ryzen 4000-5000 APUs).
-    "gfx90c",
-];
-
 fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosis {
     const ID: &str = "info-20-gpu-no-rocm-support";
     const TITLE: &str = "GPU has no ROCm/HIP support (Vulkan backend still works)";
@@ -2168,18 +2137,47 @@ fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosi
     // An AMD GPU whose gfx target is empty is *undetected*, not supported, and
     // it blocks the claim too: we cannot say the host has no ROCm support while
     // a card we failed to identify is sitting in it.
+    //
+    // "Unsupported" is `host_gpu::gfx_target_has_no_rocm_build`, not a second
+    // list of target names here. That predicate is the one the install path
+    // already refuses on, it is token-normalised (so `gfx90c:xnack-` and
+    // uppercase answer the same), and it is deliberately narrower than
+    // `normalize_therock_family` returning `None` -- which also answers `None`
+    // for a target this catalog simply does not recognise yet. Conflating
+    // "confirmed unsupported" with "unrecognised" would turn a detection gap
+    // into a false claim about the hardware; keeping a bare copy of the target
+    // names here would let the two drift into disagreeing about the same card.
     let targets = amd_gfx_targets(e);
     let all_unsupported = !targets.is_empty()
         && targets.len() == amd_gpu_count(e)
         && targets
             .iter()
-            .all(|gfx| GFX_TARGETS_WITHOUT_ROCM_SUPPORT.contains(&gfx.as_str()));
+            .all(|gfx| crate::host_gpu::gfx_target_has_no_rocm_build(gfx));
     if !all_unsupported {
         return zero(ID, TITLE);
     }
     let gfx = targets.join(", ");
 
-    finalize_informational(
+    // A real `Fix`, classed `DIAGNOSE-ONLY` in the catalog, rather than
+    // `fix: None`. The class exists to say "detected, explained, no remedy",
+    // and routing through it keeps one promise true across every surface:
+    // `rocm diagnose` prints `apply with: rocm fix <id>` for every cause,
+    // README and `--help` say `rocm fix` takes that id, and `rocm fix
+    // info-20-gpu-no-rocm-support` answers -- by naming the problem and exiting
+    // 0 without touching the machine. A `None` here would have made the printed
+    // command a lie for this one id and left `--json` consumers a null to learn
+    // about.
+    let fix = Fix {
+        summary: "No ROCm/HIP runtime build exists for this architecture, so there is nothing to install or configure. Use a Vulkan-based engine, which is what `rocm serve` already picks here.".to_owned(),
+        fix_id: ID.to_owned(),
+        notes: vec![
+            "HSA_OVERRIDE_GFX_VERSION is NOT a workaround here: it makes the runtime load kernels built for another architecture, which faults at runtime rather than adding support.".to_owned(),
+            "`rocm serve` already picks a Vulkan engine on this host, so nothing has to change to use the GPU for inference.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+
+    finalize(
         ID,
         TITLE,
         60,
@@ -2187,6 +2185,7 @@ fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosi
             "Detected GPU architecture {gfx} has no ROCm/HIP runtime build. \
              Vulkan-based engines (the default Lemonade backend) still work on it."
         )],
+        fix,
     )
 }
 
@@ -2955,15 +2954,18 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             if !fix.verify.is_empty() {
                 let _ = writeln!(out, "   verify after fix: {}", fix.verify);
             }
-            // Every finding with a fix carries the command that acts on it.
-            // Previously only the summary at the end named one, and only when
-            // some match cleared HIGH_CONFIDENCE -- so a report of
-            // low-confidence matches showed ids but never said what to run,
-            // which is what sent users guessing at the ordinal. A finding with
-            // no fix (see `finalize_informational`) has nothing to apply, so
-            // it prints evidence only.
-            let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         }
+        // Every finding carries the command that acts on it. Previously only the
+        // summary at the end named one, and only when some match cleared
+        // HIGH_CONFIDENCE -- so a report of low-confidence matches showed ids but
+        // never said what to run, which is what sent users guessing at the
+        // ordinal.
+        //
+        // Unconditional, including for a `DIAGNOSE-ONLY` cause: `rocm fix` has
+        // an answer for every id in the catalog, and for that class the answer
+        // is to name the problem and change nothing. The `flags:` line above
+        // already said so, so the command is not a promise of a repair.
+        let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         out.push('\n');
     }
 
@@ -2980,15 +2982,7 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
     }
 
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
-        if high.fix.is_some() {
-            let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
-        } else {
-            let _ = writeln!(
-                out,
-                "Next step: `{}` has no automated fix; see its evidence above.",
-                high.id
-            );
-        }
+        let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
     } else if let Some(best) = report.matched.first() {
         // Below the threshold the caution still stands, but it is advice about
         // confidence -- not a reason to withhold the command. Ending here was the
@@ -2997,29 +2991,11 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push_str(
             "Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n",
         );
-        if best.fix.is_some() {
-            let _ = writeln!(
-                out,
-                "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
-                best.id
-            );
-        } else if report.matched.iter().any(|d| d.fix.is_some()) {
-            // The top match has no fix, but something below it does. Dropping
-            // the `apply with:` pointer here would strand the user: the report
-            // lists runnable causes and the closing line says nothing is
-            // runnable.
-            let _ = writeln!(
-                out,
-                "`{}` (the highest-scoring match) has no automated fix; see its evidence above, or use the `apply with:` line of whichever cause below it fits.",
-                best.id
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "`{}` has no automated fix; see its evidence above.",
-                best.id
-            );
-        }
+        let _ = writeln!(
+            out,
+            "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
+            best.id
+        );
     }
     out
 }
@@ -3285,7 +3261,20 @@ mod tests {
             info.evidence.iter().any(|ev| ev.contains("gfx90c")),
             "the diagnosis must name the detected GPU architecture: {info:?}"
         );
-        assert!(info.fix.is_none(), "this diagnosis offers no fix: {info:?}");
+        let fix = info
+            .fix
+            .as_ref()
+            .expect("every catalog entry carries a Fix, including the fixless one");
+        assert_eq!(
+            fix.class,
+            crate::fix::FixClass::DiagnoseOnly,
+            "the class is where \"detected, explained, no remedy\" is recorded, and it is \
+             what every consumer reads to tell this entry from a repair: {info:?}"
+        );
+        assert!(
+            !fix.auto_applicable && fix.commands.is_empty() && fix.verify.is_empty(),
+            "nothing to run, nothing to copy, nothing to verify: {info:?}"
+        );
         assert_eq!(
             report.matched.first().map(|d| d.id.as_str()),
             Some("info-20-gpu-no-rocm-support"),
@@ -3442,43 +3431,6 @@ mod tests {
     }
 
     #[test]
-    fn rendering_names_a_high_confidence_cause_with_no_automated_fix() {
-        // The HIGH_CONFIDENCE branch has its own fixless arm, distinct from the
-        // below-threshold one `rendering_skips_apply_with_for_a_diagnosis_with_no_fix`
-        // covers -- no catalog entry reaches HIGH_CONFIDENCE without a fix today,
-        // so this pins that arm with a synthetic one rather than leaving it
-        // unexercised.
-        let report = DiagnoseReport {
-            matched: vec![Diagnosis {
-                id: "info-fixture-high-confidence-no-fix".to_owned(),
-                title: "synthetic high-confidence, fixless cause".to_owned(),
-                score: HIGH_CONFIDENCE,
-                evidence: vec!["synthetic evidence".to_owned()],
-                fix: None,
-            }],
-            has_match: true,
-            min_score_for_match: MIN_SCORE_FOR_MATCH,
-            high_confidence_threshold: HIGH_CONFIDENCE,
-            route_when_no_match: Route {
-                target: "github".to_owned(),
-                url: "https://example.invalid".to_owned(),
-            },
-            out_of_scope: None,
-            model: None,
-        };
-        let out = render_report_text(&report, 5);
-        assert!(
-            out.contains("Next step:") && out.contains("has no automated fix"),
-            "a high-confidence cause with no fix must say so instead of naming a \
-             `rocm fix` command:\n{out}"
-        );
-        assert!(
-            !out.contains("apply with:") && !out.contains("rocm fix info-fixture"),
-            "no command must be offered for a cause with no fix:\n{out}"
-        );
-    }
-
-    #[test]
     fn check_20_is_silent_without_a_confirmed_unsupported_gpu() {
         assert_eq!(
             check_20_gpu_unsupported_by_rocm(&Examination::default(), "").score,
@@ -3591,10 +3543,12 @@ mod tests {
     }
 
     #[test]
-    fn rendering_keeps_the_apply_with_pointer_when_a_fixless_cause_ranks_first() {
-        // A fixless top match above a cause that *does* have a fix: the closing
-        // line must not tell the user nothing is runnable while `apply with:`
-        // lines sit in the report above it.
+    fn rendering_offers_a_command_for_a_diagnose_only_cause_that_ranks_first() {
+        // The reason this entry is a `DIAGNOSE-ONLY` catalog member rather than
+        // a `fix: None`: the report promises an `apply with:` line for every
+        // cause, README and `--help` repeat that promise, and `rocm fix` has to
+        // keep it for this id too. What marks it as unfixable is the flags
+        // line, not a missing command.
         let report = DiagnoseReport {
             matched: vec![
                 Diagnosis {
@@ -3602,7 +3556,13 @@ mod tests {
                     title: "GPU has no ROCm/HIP support".to_owned(),
                     score: 60,
                     evidence: vec!["gfx90c has no ROCm/HIP runtime build".to_owned()],
-                    fix: None,
+                    fix: Some(Fix {
+                        fix_id: "info-20-gpu-no-rocm-support".to_owned(),
+                        summary: "No ROCm/HIP runtime build exists for this architecture."
+                            .to_owned(),
+                        class: crate::fix::FixClass::DiagnoseOnly,
+                        ..Fix::default()
+                    }),
                 },
                 Diagnosis {
                     id: "fix-9-igpu-dgpu".to_owned(),
@@ -3628,21 +3588,21 @@ mod tests {
         };
         let out = render_report_text(&report, 5);
         assert!(
-            out.contains("has no automated fix"),
-            "the fixless top match must still be named as fixless:\n{out}"
+            out.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+            "every cause carries the command that acts on it, this one included:\n{out}"
+        );
+        assert!(
+            out.contains("no reliable fix (`rocm fix` will NOT change anything)"),
+            "and the flags line is what says the command will not repair anything:\n{out}"
         );
         assert!(
             out.contains("`apply with:` line"),
-            "and the pointer to the runnable causes below it must survive:\n{out}"
-        );
-        assert!(
-            !out.contains("rocm fix info-20-gpu-no-rocm-support"),
-            "no command must be offered for the fixless cause itself:\n{out}"
+            "the closing pointer to the runnable causes survives unchanged:\n{out}"
         );
     }
 
     #[test]
-    fn check_20_names_the_detected_architecture_and_offers_no_fix() {
+    fn check_20_names_the_detected_architecture_and_carries_no_commands() {
         let e = Examination {
             gpus: vec![Gpu {
                 gfx_target: "gfx90c".to_owned(),
@@ -3656,9 +3616,17 @@ mod tests {
             finding.score >= MIN_SCORE_FOR_MATCH,
             "a confirmed-unsupported GPU is a real finding: {finding:?}"
         );
+        let fix = finding
+            .fix
+            .as_ref()
+            .expect("the catalog entry is carried even though it has no remedy");
+        assert_eq!(
+            fix.fix_id, "info-20-gpu-no-rocm-support",
+            "the embedded fix-id has to be the catalog id `rocm fix` resolves: {finding:?}"
+        );
         assert!(
-            finding.fix.is_none(),
-            "there is no fix to offer: {finding:?}"
+            fix.commands.is_empty() && fix.verify.is_empty(),
+            "there is nothing to run and nothing to verify: {finding:?}"
         );
         assert!(
             finding.evidence.iter().any(|ev| ev.contains("gfx90c")),
@@ -3667,7 +3635,7 @@ mod tests {
     }
 
     #[test]
-    fn rendering_skips_apply_with_for_a_diagnosis_with_no_fix() {
+    fn rendering_keeps_the_apply_with_line_for_a_cause_with_nothing_to_run() {
         let report = DiagnoseReport {
             matched: vec![check_20_gpu_unsupported_by_rocm(
                 &Examination {
@@ -3692,16 +3660,25 @@ mod tests {
         };
         let out = render_report_text(&report, 5);
         assert!(
-            !out.contains("apply with:"),
-            "a fixless diagnosis must not claim a `rocm fix` command exists:\n{out}"
-        );
-        assert!(
-            out.contains("has no automated fix"),
-            "the summary must say so instead of naming a command:\n{out}"
+            out.contains("apply with: rocm fix info-20-gpu-no-rocm-support"),
+            "the id the report prints has to be one `rocm fix` accepts:\n{out}"
         );
         assert!(
             out.contains("gfx90c"),
             "the evidence must still render:\n{out}"
+        );
+        // Not rendered from the checker's own `class` -- `check_20` returns the
+        // `Fix::default()` PRINT-ONLY until `attach_catalog_classes` fills it
+        // from the catalog, which is what the full `diagnose()` path does and
+        // what `fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence`
+        // asserts. This one pins the lines that do not depend on it.
+        assert!(
+            !out.contains("   $ "),
+            "a cause with no commands must not print an empty command block:\n{out}"
+        );
+        assert!(
+            !out.contains("verify after fix:"),
+            "and nothing to verify means no verify line:\n{out}"
         );
     }
 
@@ -4682,12 +4659,10 @@ mod tests {
                 "{os}: expected at least one diagnosis to compare against the catalog"
             );
             for d in &report.matched {
-                // An informational diagnosis (see `finalize_informational`)
-                // carries no fix to compare against the catalog; this loop
-                // only checks the ones that do.
-                let Some(fix) = d.fix.as_ref() else {
-                    continue;
-                };
+                let fix = d
+                    .fix
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
                 let catalog = crate::fix::class_on(&fix.fix_id, os)
                     .unwrap_or_else(|| {
                         panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
@@ -6284,16 +6259,12 @@ mod tests {
         // directly, without a diagnosis), so this asserts containment rather
         // than equality.
         //
-        // Checkers that never carry a `Fix` (see `finalize_informational`) are
-        // exempt: `render_report_text` never prints an `apply with:` line for
-        // them, so there is no dead command to guard against, and no recipe for
-        // `rocm fix` to apply.
-        const INFORMATIONAL_ONLY_CHECKER_IDS: &[&str] = &["info-20-gpu-no-rocm-support"];
+        // No exemptions, including for the informational `info-20` entry: it is
+        // a `DIAGNOSE-ONLY` member of the same catalog, so `rocm fix` answers
+        // for it on both platforms its checker is registered for, and the
+        // `apply with:` line diagnose prints for it is live like every other.
         for (check, families) in CHECKERS {
             let id = check(&Examination::default(), "").id;
-            if INFORMATIONAL_ONLY_CHECKER_IDS.contains(&id.as_str()) {
-                continue;
-            }
             let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
                 panic!(
                     "checker id `{id}` has no recipe in the fix catalog, so the \

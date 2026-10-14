@@ -162,7 +162,12 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
             continue;
         }
         let id = cells[0].trim_matches('`');
-        if !id.starts_with("fix-") {
+        // `info-` as well as `fix-`: the catalog's DIAGNOSE-ONLY entries carry
+        // an `info-` id precisely because they have no fix to offer, and they
+        // are rows in this table like any other. Matching `fix-` alone dropped
+        // them silently, so the table could disagree with the CLI about them
+        // and nothing would say so.
+        if !id.starts_with("fix-") && !id.starts_with("info-") {
             continue;
         }
         // Taken verbatim, never normalised. A shorthand like `both` used to be
@@ -254,7 +259,11 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
             continue;
         };
         let id = rest.split_whitespace().next().unwrap_or_default();
-        if !id.starts_with("fix-") {
+        // `info-` too, matching `parse_reference_catalog`: the DIAGNOSE-ONLY
+        // entry is listed by `rocm fix` like any other, and dropping it from
+        // one side of this comparison and not the other would report it as an
+        // id the CLI no longer offers.
+        if !id.starts_with("fix-") && !id.starts_with("info-") {
             continue;
         }
         out.insert(

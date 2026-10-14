@@ -23,12 +23,13 @@ the result from `--json`:
 
 - `matched[]` — ranked `{ id, title, score, evidence[], fix }`. Tiers:
   `>= 75` high confidence, `50–74` likely, `< 50` weak.
-  **`fix` can be `null`.** An id outside the `fix-N` / `fix-wsl-N` series —
-  prefix `info-`, currently only `info-20-gpu-no-rocm-support` — is
-  informational: it explains the host's state and has no remediation, so it
-  carries no `fix`, appears in no catalog table below, and **`rocm fix
-  info-…` exits 2 with `Unknown fix-id`**. Never run `rocm fix` on an `info-`
-  id; report its `evidence` and move to the next cause that has a `fix`.
+  **Check `fix.class` before proposing anything.** `diagnose-only` means the
+  cause is explained and has no remedy — currently only
+  `info-20-gpu-no-rocm-support`, which carries an `info-` id rather than a
+  `fix-N` / `fix-wsl-N` one for that reason. It is a catalog entry like any
+  other: `rocm fix info-20-gpu-no-rocm-support` names the problem, says there
+  is no reliable fix and exits 0 without touching the machine. Report its
+  `evidence`; do not go looking for something to apply instead.
 - `has_match` — whether any entry cleared `min_score_for_match`. **This is the
   gate, not whether `matched` is empty.** Several checkers open with a nonzero
   base score for a merely *potentially* relevant situation (running in a
@@ -99,7 +100,7 @@ non-interactive shell without `--yes`, and confirm first. **Two exceptions:**
   pinned. Run `rocm fix fix-9-igpu-dgpu --device-index N` (not the bare id)
   once you know N.
 
-## Closed catalog (27 failure modes)
+## Closed catalog (28 failure modes)
 
 The OS column is the platform family the CLI scopes an entry to, and WSL2 is a
 family of its own — not a flavour of `linux`. An entry reaches a WSL host only
@@ -128,6 +129,7 @@ reporting confident nonsense.
 | `fix-17-torch-dlpack` | linux | `torch-c-dlpack-ext` loads its CUDA prebuilt on a ROCm torch, aborting vLLM's engine start at import time | vLLM engine start fails on import; error names `torch_c_dlpack_ext` or tvm_ffi's `_optional_torch_c_dlpack` | print-only |
 | `fix-18-comgr-conflict` | linux/wsl | The code object manager library (`libamd_comgr`) that would load belongs to a different installation than the HIP runtime that would load, so device code compilation fails with an error naming neither | compilation error naming neither library; `rocm examine --json`'s `comgr_selected`/`hip_selected` resolve to two different `install_root`s | print-only |
 | `fix-19-shm-too-small` | linux/wsl | `/dev/shm` too small for a serving workload, which needs gigabytes where a container and WSL2 both default to 64 MB | reported under 1 GiB; a data-loader worker killed by a bus error, or a failed write to a temporary file, with nothing naming shared memory | print-only |
+| `info-20-gpu-no-rocm-support` | linux/windows | Every AMD GPU on the host is a part ROCm has never shipped a runtime build for (today: gfx90c, the Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo). Vulkan-based engines still work | every detected AMD GPU identifies as an unsupported target, and none is unidentified; scores a flat 60 | diagnose-only |
 | `fix-21-msvc-redist-outdated` | windows | MSVC runtime present but older than 14.40, so programs built with a recent toolset (such as the llama.cpp server that Lemonade installs) crash | `rocm examine --json` shows `msvc_redist_version` below 14.40; an access violation (`0xC0000005`, `-1073741819`) with `msvcp140.dll` as the faulting module | print-only |
 | `fix-wsl-1-gpu-not-exposed` | wsl | `/dev/dxg` absent, so the distro cannot reach the GPU at all | no `/dev/dxg`; in a container, the device was never passed through | print-only |
 | `fix-wsl-2-dxcore-missing` | wsl | `/usr/lib/wsl/lib` DXCore shims missing, so the runtime cannot reach the host driver | `/usr/lib/wsl/lib/libdxcore.so` missing (or the directory absent entirely) | print-only |
@@ -141,12 +143,13 @@ One thing the numbering does not tell you: the `fix-wsl-N` entries are a paralle
 series, not a continuation of the numeric one, because they answer for a
 different platform family. The numeric series itself runs `fix-1` through
 `fix-19`, then `fix-21`. The ids are stable handles rather than positions, so
-the number `fix-20` is simply not used here: slot 20 belongs to the
-informational `info-20-gpu-no-rocm-support`, which carries no fix and so has no
-row in the table above. A gap is not an error, and a retired entry would leave a
-hole rather than renumber the ones after it.
+the number `fix-20` is simply not used here: slot 20 belongs to
+`info-20-gpu-no-rocm-support`, which is in the table above but under an `info-`
+prefix because it has no fix to offer. A gap is not an error, and a retired
+entry would leave a hole rather than renumber the ones after it.
 
 Linux-only: fix-3, -4, -5, -7, -10, -11, -12, -17. Windows-only: fix-13, -14, -15, -21.
+Linux + Windows: info-20 (diagnose-only).
 WSL-only: fix-wsl-1 through fix-wsl-7. Linux + Windows: fix-9.
 Linux + WSL: fix-16, -18, -19. Linux + Windows + WSL: fix-1, -2, -6, -8.
 
