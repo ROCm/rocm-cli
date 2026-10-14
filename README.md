@@ -935,11 +935,17 @@ rocm uninstall [--yes] [--dry-run]
 ```
 
 `rocm uninstall` stops any managed model server that is still running before it
-removes anything. If a server cannot be stopped (or its service record cannot
-be read), the command exits non-zero, leaves every file in place, and says what
-to repair or stop by hand, so the tooling needed to stop it is never deleted
-out from under a running server. A run that keeps the binaries and data
-(`--keep-binaries --keep-data`) leaves running servers alone.
+removes anything, and also stops the background helper (`rocmd`), whose whole
+process tree is force-stopped because it would otherwise restart the servers.
+If a server cannot be stopped (or its service record cannot be read), the
+command exits non-zero, leaves every file in place, and says what to repair or
+stop by hand, so the tooling needed to stop it is never deleted out from under
+a running server. A live server or helper recorded without a start time (written
+by an older version) cannot be proven to be ours, so it is refused rather than
+killed: stop it yourself, then re-run. A run that keeps the binaries and data
+(`--keep-binaries --keep-data`) leaves running servers and the helper alone.
+If a removal fails partway, the error lists what was removed and what is left,
+because the binaries and service records may already be gone.
 
 On Linux, if a config, data, or cache folder is a link to somewhere else (for
 example a cache moved to a bigger disk), `rocm uninstall` removes the link and

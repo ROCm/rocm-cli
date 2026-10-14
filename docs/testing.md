@@ -1274,9 +1274,11 @@ generated public-key PEM installer verification; verify first-install PATH setup
 Linux writes the shell profile); reinstall stale-manifest purge and config
 preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
-config/data/cache, never the real user `.rocm` state); full-purge uninstall; uninstall stopping the local server it manages (Linux and
-Windows); and uninstall refusing to remove anything while a managed
-service record cannot be read.
+config/data/cache, never the real user `.rocm` state); full-purge uninstall; uninstall stopping the local server it manages
+(lifecycle-10 and lifecycle-24, Linux and Windows); uninstall stopping the
+background helper (lifecycle-26); a cache-only uninstall leaving the server
+running and its record in place (lifecycle-27); and uninstall refusing to
+remove anything while a managed service record cannot be read (lifecycle-25).
 Each scenario generates its own local keys, package, and install root under a
 per-scenario temp directory, so they are independent and use generated local
 keys only — project-owned production signing keys remain an owner-controlled

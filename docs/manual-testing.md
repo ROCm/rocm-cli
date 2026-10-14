@@ -588,10 +588,24 @@ rocm uninstall --yes
 
 Expected result:
 
-- The plan warns the server will be stopped before removal.
-- The server is stopped, then the files are removed and the command exits 0.
+- The plan warns the server will be stopped before removal. If the background
+  helper (`rocmd`) is running, the plan says it will be force-stopped too.
+- The server (and helper) are stopped, then the files are removed and the
+  command exits 0.
 
-To check the refusal path, corrupt a file under the `services` directory
-(for example write `{` into `services/bad.json`) and run `rocm uninstall --yes`
-again. It must exit non-zero, name the file, advise repairing or deleting it,
-and leave the install, config, and data directories in place.
+The refusal paths each need a fresh install and a fresh managed server, because
+a successful `uninstall --yes` above removes the install. Reinstall, start a
+managed server again, then:
+
+- **Unreadable record.** Write `{` into `<data dir>/services/bad.json`, where
+  the data directory is the one `rocm examine` reports, and run
+  `rocm uninstall --yes`. It must exit non-zero, name that file's full path,
+  advise repairing or deleting it, and leave the install, config, and data
+  directories in place.
+- **No recorded start time.** Edit the server's record under the same
+  `services` folder and delete its `supervisor_start_ticks` field (a record
+  written by an older version looks like this). The plan must say the stop
+  will be refused, and `rocm uninstall --yes` must exit non-zero naming the
+  pid, leave the server running, and remove nothing.
+- **Cache only.** `rocm uninstall --yes --keep-binaries --keep-data` must leave
+  the server and the helper running and say so in the plan.

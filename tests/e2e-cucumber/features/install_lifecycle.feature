@@ -144,6 +144,8 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
     And the local server this machine manages is no longer running
+    And the installed rocm and rocmd binaries are gone
+    And the isolated config, data, and cache folders are gone
 
   # ── Windows user-PATH restoration, loopback HTTP install, isolated smoke ─
 
@@ -308,6 +310,8 @@ Feature: Release install lifecycle
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
     And the local server this machine manages is no longer running
+    And the non-running installed rocmd binary is gone
+    And the isolated config, data, and cache folders are gone
 
   # EAI-8014: when a managed service record cannot be read, uninstall cannot tell
   # whether a server is still running, so it must refuse rather than delete the
@@ -336,7 +340,9 @@ Feature: Release install lifecycle
     And the background helper is running
     When the user uninstalls from the installed binary
     Then the removal is reported as complete
+    And the uninstall plan says the background helper will be stopped
     And the background helper is no longer running
+    And the isolated config, data, and cache folders are gone
 
   # EAI-8014: a run that removes only the cache keeps `rocm services stop` and the
   # service records, so it must not force-stop a server it leaves stoppable.
@@ -352,3 +358,5 @@ Feature: Release install lifecycle
     And the cache-only run says the server is left running
     And the local server this machine manages is still running
     And the managed service record is still present
+    And only the isolated cache folder is gone
+    And the installed rocm and rocmd binaries are still present

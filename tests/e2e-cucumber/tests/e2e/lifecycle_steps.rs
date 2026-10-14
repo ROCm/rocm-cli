@@ -1444,6 +1444,17 @@ async fn then_background_helper_stopped(world: &mut E2eWorld) {
     );
 }
 
+#[then("the uninstall plan says the background helper will be stopped")]
+async fn then_plan_names_helper(world: &mut E2eWorld) {
+    // Asserted next to the outcome scenario 26 checks in its following steps:
+    // the plan is only worth reading if the stop it promises happens.
+    let out = &state(world).last_output;
+    assert!(
+        out.contains("the background helper (rocmd, pid") && out.contains("will be stopped"),
+        "the plan did not say the helper will be stopped:\n{out}"
+    );
+}
+
 #[then("the local server this machine manages is still running")]
 async fn then_managed_server_still_running(world: &mut E2eWorld) {
     let server = state_mut(world)
@@ -1538,6 +1549,39 @@ async fn then_rocmd_gone(world: &mut E2eWorld) {
     // must still remove the non-running rocmd binary (old acceptance-script check).
     let st = state(world);
     assert_missing(&installed_binary(&st.install_dir, "rocmd"));
+}
+
+/// The isolated folders are the CLI's own roots (the `ROCM_CLI_*_DIR` values),
+/// so a purge removes the folder itself, not a `rocm-cli` subfolder of it.
+#[then("the isolated config, data, and cache folders are gone")]
+async fn then_isolated_folders_gone(world: &mut E2eWorld) {
+    let st = state(world);
+    for dir in [&st.smoke_config, &st.smoke_data, &st.smoke_cache]
+        .into_iter()
+        .flatten()
+    {
+        assert_missing(dir);
+    }
+}
+
+#[then("only the isolated cache folder is gone")]
+async fn then_only_cache_gone(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_missing(st.smoke_cache.as_ref().expect("no isolated cache dir"));
+    for dir in [&st.smoke_config, &st.smoke_data].into_iter().flatten() {
+        assert!(
+            dir.exists(),
+            "a cache-only uninstall removed {}",
+            dir.display()
+        );
+    }
+}
+
+#[then("the installed rocm and rocmd binaries are still present")]
+async fn then_binaries_still_present(world: &mut E2eWorld) {
+    let st = state(world);
+    assert_exists(&installed_binary(&st.install_dir, "rocm"));
+    assert_exists(&installed_binary(&st.install_dir, "rocmd"));
 }
 
 #[then("the isolated XDG config, data, and cache state is gone")]
