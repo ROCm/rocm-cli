@@ -520,11 +520,13 @@ fn spawn_managed_engine_child(
         }
         child_pid
     };
-    record.supervisor_pid = child_pid;
-    record.engine_pid = Some(child_pid);
-    // Capture the identity token while the child is alive, so a later stop
-    // verifies this exact process rather than a recycled PID.
-    record.supervisor_start_ticks = rocm_core::process_start_ticks(child_pid);
+    // The child is both roles until the engine state file names a separate
+    // server process. Each role gets its own token, captured while the child is
+    // alive: a stop pairs every recorded PID with its own token, and the two
+    // PIDs diverge as soon as `rocmd` restarts the service — at which point an
+    // engine PID recorded without one could only be signalled blind.
+    record.record_supervisor_identity(child_pid);
+    record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
     record.write()?;
 

@@ -6,7 +6,7 @@ use crate::ARTIFACT_PREFETCH_TIMEOUT;
 use crate::cli::{SandboxToolArg, SandboxToolPolicy};
 use crate::common::{self, CommandCapture};
 use crate::persistence::load_managed_services;
-use crate::service::stop_managed_service;
+use crate::service::{sandbox_stop_server_value, stop_managed_service};
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
@@ -223,12 +223,7 @@ pub(crate) fn run_sandbox_tool(
         SandboxToolArg::StopServer => {
             let service_id = service_id.context("stop_server requires `--service-id`")?;
             let stopped = stop_managed_service(paths, &service_id)?;
-            Ok(json!({
-                "tool": tool.as_cli_value(),
-                "status": "stopped",
-                "mutating": true,
-                "result": stopped,
-            }))
+            Ok(sandbox_stop_server_value(stopped))
         }
         SandboxToolArg::PrefetchArtifact => {
             let artifact_ref =
