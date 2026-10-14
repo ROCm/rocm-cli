@@ -580,6 +580,19 @@ fn sha256_digest_is_well_formed(digest: &str) -> bool {
     digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Whether a string is safe to interpolate into the driver-install plan's
+/// shell commands: these values (the `ROCM_CLI_AMDGPU_DRIVER_VERSION`
+/// override, and `VERSION_ID`/`VERSION_CODENAME`/`UBUNTU_CODENAME` read from
+/// `/etc/os-release`) end up both inside single-quoted `printf` arguments and,
+/// for `VERSION_ID` in the SUSEConnect commands, directly unquoted on the
+/// command line -- so only letters, digits, and `. _ -` are accepted, the
+/// same charset a real amdgpu/distro version or codename is made of.
+fn is_safe_shell_token(v: &str) -> bool {
+    !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
 /// How the downloaded ROCDXG package will be authenticated before it is
 /// installed as root.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -804,6 +817,28 @@ fn build_driver_install_plan(
     dkms: bool,
     escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
+    if examine.os == "windows" {
+        return DriverInstallPlan {
+            supported: false,
+            mutating: false,
+            policy: "windows_validate_only".to_owned(),
+            os_id: "windows".to_owned(),
+            version_id: String::new(),
+            codename: String::new(),
+            // Not interpolated into any command on this no-op plan (there are
+            // none), so an override is not validated before this early return.
+            repo_version_expr: "latest".to_owned(),
+            reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
+            preflight_checks: Vec::new(),
+            commands: Vec::new(),
+            checks: vec!["rocm examine".to_owned()],
+            reboot_required: true,
+        };
+    }
+    if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
+        return wsl_rocdxg_driver_plan(escalation);
+    }
+
     // Resolved here rather than left as a shell `${VAR:-default}` expression:
     // these commands are built with `printf '%s\n' '...'` (single-quoted) so the
     // written repo file has a working baseurl regardless of shell. The value is
@@ -817,13 +852,7 @@ fn build_driver_install_plan(
     // unexplained `latest`.
     let repo_version_expr = match std::env::var("ROCM_CLI_AMDGPU_DRIVER_VERSION") {
         Err(_) => "latest".to_owned(),
-        Ok(v)
-            if !v.is_empty()
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) =>
-        {
-            v
-        }
+        Ok(v) if is_safe_shell_token(&v) => v,
         Ok(v) => {
             return DriverInstallPlan {
                 supported: false,
@@ -841,28 +870,19 @@ fn build_driver_install_plan(
             };
         }
     };
-    if examine.os == "windows" {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "windows_validate_only".to_owned(),
-            os_id: "windows".to_owned(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version_expr,
-            reason: "Windows driver install is validate-only in rocm-cli; use `rocm examine` to inspect the AMD display driver.".to_owned(),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
-            reboot_required: true,
-        };
-    }
-    if examine.wsl.as_ref().is_some_and(|wsl| wsl.is_wsl) {
-        return wsl_rocdxg_driver_plan(escalation);
-    }
 
     let os_id = parse_os_release_field(os_release_text, "ID").unwrap_or_default();
-    let version_id = parse_os_release_field(os_release_text, "VERSION_ID").unwrap_or_default();
+    // `version_id` is interpolated unsanitized both into the same
+    // single-quoted `printf '...' | tee` commands as `repo_version_expr`
+    // above and, on SLES, directly unquoted on the SUSEConnect command line --
+    // so it gets the same char allow-list as that override. A value that
+    // fails it is treated as absent (empty), which cannot match any
+    // `(os_id, version_id)` arm below and falls through to the safe,
+    // non-mutating "unsupported" plan, the same way a hostile codename falls
+    // through to the static mapping rather than being used verbatim.
+    let version_id = parse_os_release_field(os_release_text, "VERSION_ID")
+        .filter(|v| is_safe_shell_token(v))
+        .unwrap_or_default();
     // `codename` is interpolated unsanitized into the same single-quoted
     // `printf '...' | tee` command as `repo_version_expr` above, so an
     // os-release-sourced value gets the same char allow-list: a crafted
@@ -872,11 +892,7 @@ fn build_driver_install_plan(
     // `codename_for_version` mapping rather than being used verbatim.
     let codename = parse_os_release_field(os_release_text, "VERSION_CODENAME")
         .or_else(|| parse_os_release_field(os_release_text, "UBUNTU_CODENAME"))
-        .filter(|v| {
-            !v.is_empty()
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-        })
+        .filter(|v| is_safe_shell_token(v))
         .or_else(|| codename_for_version(&os_id, &version_id).map(str::to_owned))
         .unwrap_or_default();
     let id_like = parse_os_release_field(os_release_text, "ID_LIKE").unwrap_or_default();
@@ -2859,12 +2875,12 @@ VERSION_ID="41"
         // `dkms: true` is passed deliberately: WSL2 has no kernel module to
         // build, so the flag must not pull in the bare-metal path.
         //
-        // `build_driver_install_plan` reads `ROCM_CLI_AMDGPU_DRIVER_VERSION`
-        // from process env before it reaches the WSL branch, and the WSL branch
-        // then reads the three ROCDXG vars — an exported
+        // The WSL branch reads the three ROCDXG vars — an exported
         // `ROCM_CLI_ROCDXG_VERSION` would steer this plan into a refusal and
-        // fail the `plan.supported` assertion below. So this reader takes the
-        // guard that clears both sets.
+        // fail the `plan.supported` assertion below. `ROCM_CLI_AMDGPU_DRIVER_VERSION`
+        // is never consulted on this path (the WSL dispatch happens before that
+        // var is read), but this reader still takes the combined guard so it
+        // isn't the one test that has to remember which half it needs.
         let _env = scoped_rocdxg_env();
         let plan = build_driver_install_plan(
             &test_examine("linux", true),
@@ -2978,10 +2994,10 @@ VERSION_ID="41"
     /// that is asserting on the default.
     ///
     /// Builds on [`ScopedTestEnv::with_amd_overrides_cleared`] rather than
-    /// `new` because a WSL plan reached through `build_driver_install_plan`
-    /// resolves the bare-metal AMDGPU overrides before it dispatches to the WSL
-    /// branch: a caller needing one of these two guards needs both, and one
-    /// helper spares every test from picking the wrong half.
+    /// `new` so a caller that also exercises the bare-metal AMDGPU override
+    /// through the same `build_driver_install_plan` call doesn't need a
+    /// second guard: one helper covers both input sets regardless of which
+    /// branch actually reads them.
     fn scoped_rocdxg_env() -> ScopedTestEnv {
         let mut env = ScopedTestEnv::with_amd_overrides_cleared();
         env.clear("ROCM_CLI_ROCDXG_VERSION");

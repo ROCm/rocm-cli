@@ -1367,8 +1367,9 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
     // remediation (this check has no pacman-based repo-native ROCm install to
     // recover, unlike `openmpi`'s library installers) -- filter the resolver's
     // fourth possible answer out here, rather than let it silently fall
-    // through both matches' `_` arms and print an apt command on a pacman
-    // host.
+    // through to a wrong default and print an apt command on a pacman host.
+    // Both `match family` arms below treat this `"unknown"` sentinel the same
+    // as their other unhandled cases: no package-manager-specific command.
     crate::openmpi::resolve_package_manager(
         &e.distro_id.to_ascii_lowercase(),
         &e.distro_id_like.to_ascii_lowercase(),
@@ -1381,7 +1382,7 @@ fn repo_pkg_family(e: &Examination) -> &'static str {
                 | crate::openmpi::PackageManager::Zypper
         )
     })
-    .map_or("apt", crate::openmpi::PackageManager::as_str)
+    .map_or("unknown", crate::openmpi::PackageManager::as_str)
 }
 
 /// Whether `rocm_install_method` indicates a package-manager-driven install,
@@ -1438,14 +1439,12 @@ fn check_12_repo_native_broken(e: &Examination, symptom: &str) -> Diagnosis {
             ));
         }
     }
-    commands.push(
-        match family {
-            "dnf" => "sudo dnf clean all",
-            "zypper" => "sudo zypper refresh",
-            _ => "sudo apt update",
-        }
-        .to_owned(),
-    );
+    match family {
+        "apt" => commands.push("sudo apt update".to_owned()),
+        "dnf" => commands.push("sudo dnf clean all".to_owned()),
+        "zypper" => commands.push("sudo zypper refresh".to_owned()),
+        _ => {}
+    }
     commands.push("# Reinstall via rocm-cli's repo-native flow:".to_owned());
     commands.push("rocm install driver --dkms --yes".to_owned());
 
@@ -5754,15 +5753,52 @@ mod tests {
     }
 
     #[test]
-    fn repo_pkg_family_falls_back_to_apt_on_pacman_hosts() {
+    fn repo_pkg_family_degrades_to_unknown_on_pacman_hosts() {
         // openmpi's resolver can answer "pacman" (it has its own, unrelated
         // library installers for Arch et al.), but this check has no pacman
-        // remediation -- it must degrade to the same "apt" default as any
-        // other unhandled family, not surface "pacman" and hit both match
-        // arms' silently-wrong `_` cases downstream in check_12.
+        // remediation -- it must not surface "pacman" verbatim, nor coerce to
+        // "apt" (which would make check_12 print apt/dpkg commands on an Arch
+        // host); both `match family` arms in check_12 treat "unknown" as "no
+        // package-manager-specific command".
         let mut e = linux_base();
         e.distro_id = "arch".to_owned();
-        assert_eq!(repo_pkg_family(&e), "apt");
+        assert_eq!(repo_pkg_family(&e), "unknown");
+    }
+
+    #[test]
+    fn repo_native_broken_emits_no_package_manager_commands_on_pacman_hosts() {
+        let mut e = linux_base();
+        e.distro_id = "arch".to_owned();
+        e.rocm_install_method = "repo-native".to_owned();
+        let report = diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        // Only real (non-comment) commands are package-manager-specific here;
+        // the commented-out quarantine example always names the apt path as a
+        // generic illustration ("or the yum/zypp equivalent"), unrelated to
+        // `family` and out of scope for this check.
+        let commands: Vec<&str> = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .collect();
+        assert!(
+            commands.iter().all(|c| !c.contains("apt")
+                && !c.contains("dpkg")
+                && !c.contains("dnf")
+                && !c.contains("zypper")),
+            "must not print a foreign package manager's commands on an unresolved/pacman host: {commands:?}"
+        );
     }
 
     #[test]
