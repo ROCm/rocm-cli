@@ -1018,6 +1018,19 @@ async fn open_chat_from_launcher(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to select Chat in the launcher: {e}"));
     tui.send("\r")
         .unwrap_or_else(|e| panic!("failed to open chat from the launcher: {e}"));
+    // Unlike every other chat-opening step in this file, this one can't pass
+    // `--chat-mock`: the bare launcher's own top-level dispatch hardcodes
+    // `run_launcher(false)` (`main.rs`), so there is no flag to carry it
+    // through to the `Chat` escalation. The fixture's mock HTTP endpoint
+    // (`a running managed model is available locally`) is still real enough
+    // for chat's own auto-detection to find, so it always offers the
+    // one-time "use this endpoint?" consent prompt (`ChatConsent::Pending`)
+    // first — accept it before the empty chat surface appears.
+    tui.wait_for_screen("Chat — use this endpoint?", default_timeout())
+        .await
+        .unwrap_or_else(|e| panic!("chat's endpoint-consent prompt never appeared: {e}"));
+    tui.send("y")
+        .unwrap_or_else(|e| panic!("failed to accept the detected chat endpoint: {e}"));
     tui.wait_for_screen("No messages yet.", default_timeout())
         .await
         .unwrap_or_else(|e| panic!("chat did not open from the launcher: {e}"));
@@ -1032,8 +1045,15 @@ async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
     // (`run_chat`'s own `launcher_hosted`, round-5 review on PR #595) must
     // exit this inner loop unconditionally rather than open a quit-confirm
     // prompt of its own — see `request_quit`'s doc comment.
-    tui.send("i")
-        .unwrap_or_else(|e| panic!("failed to focus the chat input: {e}"));
+    //
+    // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
+    // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)
+    // sets `chat_focused = true` as part of accepting the endpoint prompt this
+    // step's caller (`open_chat_from_launcher`) already sent `y` to, so the
+    // input here is already focused. Sending `i` first — as a first attempt
+    // at this step did — typed a literal leading `i` into the box instead of
+    // focusing it, submitting "i/quit" as a chat message rather than running
+    // the slash command at all.
     tui.send("/quit")
         .unwrap_or_else(|e| panic!("failed to type /quit: {e}"));
     tui.send("\r")
