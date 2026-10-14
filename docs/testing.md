@@ -418,6 +418,79 @@ selection:
 python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
 ```
 
+### GPU targets with no ROCm build
+
+Some recognized targets have no TheRock package family at all. Today that is
+`gfx90c`, the Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs. For these
+`rocm install sdk` refuses instead of resolving a family, and `rocm examine`
+adds a `rocm_support` line saying the GPU is detected but unsupported.
+
+Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
+when changing it:
+
+- `gfx_target_has_no_rocm_build` in
+  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  with `normalize_therock_family` returning `None`. Do not simplify it to a bare
+  target-name check. Every test that drives the refusal does so by naming the
+  target explicitly, and the conjunct is the only reason any of them is also
+  evidence about the mapping: it is what makes the refusal stop firing once the
+  mapping comes back. Were the predicate to carry its own copy of the target
+  name alone, the refusal would keep firing from that copy and those tests
+  would stay green across a reopened catch-all.
+  `no_rocm_build_implies_no_therock_family` pins the conjunct.
+- detection itself has no override — `detect_host_gfx_target` reads real sysfs
+  or WMI — so no lane can fake the host half. The end-to-end coverage is
+  `@id:runtime-install-sdk-refuses-unsupported-gpu-target` (`runtime-19` in
+  [runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature)),
+  which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
+  no GPU tag. The detected-GPU wording itself is covered at unit level by
+  `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
+  [therock.rs](../apps/rocm/src/therock.rs).
+
+The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
+end-to-end lane at all, and that gap is stated here rather than papered over.
+`runtime-19` opens the `--family` door. Do not read a green `runtime-19` as
+coverage of host detection.
+
+#### Which mutants each test actually kills
+
+Measured on Linux with `cargo test -p rocm-core -p rocm --all-targets
+--no-fail-fast` followed by `cargo xtask e2e -- -n "runtime-19"`. Re-run them
+rather than trusting this list if you change either function, and confirm the
+edited file really differs first: a mutant that fails to apply is
+indistinguishable from one that survived.
+
+1. **Delete the `gfx90c` arm from `normalize_therock_family`.** `runtime-19`
+   goes **red** — the first `Then` fails because the dry run now succeeds,
+   resolving `gfx90X-dcgpu`. Also red:
+   `gfx_target_has_no_rocm_build_names_only_gfx90c`,
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported`,
+   `windows_display_parser_prefers_a_supported_gpu_over_a_vega_igpu`,
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` and
+   `therock::requesting_gfx90c_by_name_fails_instead_of_installing_another_family`.
+   Note `no_rocm_build_implies_no_therock_family` does *not* fail here: the
+   predicate answers `false`, so the implication it asserts holds vacuously.
+2. **Reduce the predicate to `normalize_therock_family(gfx).is_none()`.**
+   `runtime-19` stays **green** — gfx90c still has no family, so the refusal
+   still fires. Caught at unit level only, by
+   `gfx_target_has_no_rocm_build_names_only_gfx90c` and
+   `examine_render_omits_the_support_note_for_supported_or_missing_gpus`, which
+   pin that the refusal is about gfx90c and not about every unmapped target.
+3. **Reduce the predicate to the bare `starts_with("gfx90c")` check and delete
+   the mapping arm.** `runtime-19` stays **green** through exactly the
+   regression it exists to catch. This is the drift the conjunct forbids, and
+   the only mutant `no_rocm_build_implies_no_therock_family` fires against;
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported` and
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` go red
+   with it.
+
+Read 1 and 3 together. `runtime-19` is evidence about the mapping, but only
+transitively, through the conjunct in the predicate — remove the conjunct and
+the scenario stops being evidence about anything but itself. The direct
+evidence about the mapping is the unit tests.
+
 ## ComfyUI TheRock GPU Acceptance
 
 This opt-in test verifies that rocm-cli can install or reuse its managed
@@ -1488,6 +1561,97 @@ The install is covered by unit tests over the generated plan (`cargo test -p
 rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
+
+## /etc/os-release
+
+Every Rust reader of `/etc/os-release` parses it with
+[`os_release.rs`](../crates/rocm-core/src/os_release.rs), which returns the
+value `sh` would assign or nothing: the driver plan
+([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
+libatomic and libnuma install plans `rocm` runs before serving and the hints
+naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
+examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+and the distro name it prints
+([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+`rocm diagnose --distro` run from Windows, which has the WSL distribution's own
+`sh` source the file and reports what it assigned.
+
+A line that is not a plain assignment makes the whole file unreadable, and
+each reader names that line instead of reporting an unknown distro. Where the
+message asks for a fix, it also says what to change on the line: LF line
+endings, single quotes around the value, or a `NAME=value` line in place of
+anything else.
+
+- `rocm install driver`: policy `unreadable_os_release`, no commands, and a
+  reason naming the line.
+- The OpenMPI, libatomic and libnuma installs: no commands, and the line ahead
+  of the manual-install advice in the plan's reason.
+- The hints naming those installs in vLLM's warnings and errors: the line
+  after the manual-install advice, and no offer of `rocm engines install vllm
+  --yes`, which would plan nothing. That command is offered only when its plan
+  has commands, so it is not offered for an unknown distribution either.
+- `rocm examine`: `distro: Linux (/etc/os-release line N is not a plain
+  assignment: "…")`; with `--json`, also an empty `distro_id` and
+  `distro_version`, the same line in `probe_failures`, and `status: degraded`
+  on an otherwise healthy GPU host.
+
+A CRLF file is unreadable too: `sh` would assign `ubuntu\r`.
+
+```bash
+cargo test -p rocm-core --lib os_release
+cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
+cargo test -p rocm-core --lib openmpi::tests
+cargo test -p rocm --bin rocm os_release
+cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root
+```
+
+The parser tests that compare against `/bin/sh` itself are Linux-only. The last
+command plants a file under the simulated host root and checks that both
+`rocm examine` reads answer from it through the shared parser; the feature it
+needs is enabled only by its own CI step.
+
+`rocm examine` reads the file through the simulated host root (see Simulated
+Host Root in [release-trust.md](release-trust.md)), so scenarios
+`examine-20` to `examine-23` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
+`examine-23` also plants a GPU in the kernel topology and puts an `lspci`
+listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
+lane, with or without a GPU:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
+```
+
+The install plans deliberately read the real file, so no scenario plants one
+for them; their parsing is covered by the unit tests above.
+
+## Windows Runtime Preflight
+
+On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
+with the floor programs built with a recent toolset need, 14.40. The version
+comes from the file version of `msvcp140.dll` and `vcruntime140.dll`, and
+shows in `rocm examine --json` as `msvc_redist_version` (the older of the two,
+empty when neither could be read).
+
+```powershell
+rocm examine --json | ConvertFrom-Json | Select-Object msvc_redist_version
+rocm diagnose
+rocm fix fix-21-msvc-redist-outdated
+```
+
+On a machine whose runtime is older than 14.40, `diagnose` reports
+`fix-21-msvc-redist-outdated` with no symptom text. `rocm fix` prints the plan
+and runs nothing: the update needs the Windows administrator prompt. After the
+update, the plan's verify command prints the new version.
+
+The version comparison and the symptom keywords are covered by unit tests in
+`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+cannot give a Linux host a Windows runtime: the check is gated to Windows. The
+catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
+scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
+compare the new entry on every lane. A
+scenario that runs the check itself would need the Windows lane and a host
+with an old runtime installed.
 
 ## Model Fit Preflight
 

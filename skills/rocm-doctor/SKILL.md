@@ -159,7 +159,7 @@ passes — the GPU is AMD. Linux, Windows and WSL2 all run the same workflow.
    the same string for every `fix-…` entry, but an `info-…` id has no catalog
    recipe and `rocm fix info-…` exits 2 with `Unknown fix-id`.
 
-   Only the four auto-applicable fixes are ones the CLI runs itself. The other 22
+   Only the four auto-applicable fixes are ones the CLI runs itself. The other 23
    are **print-only** (bootloader, kernel, reinstall, Windows driver, …): `rocm
    fix <id>` just prints the plan for the user to run themselves — no prompt, and
    the CLI never performs those.

@@ -44,11 +44,20 @@ pub fn run(artifacts_dir: &Path, html_out: &Path) -> Result<()> {
         event: std::env::var("GITHUB_EVENT_NAME").ok(),
     };
 
-    e2e_report::generate_consolidated(&inputs, html_out, &meta)
+    // Builds the shared `PlatformReport` set once for both outputs below
+    // (ROCMAI-484); see `generate_consolidated_from_reports`'s and
+    // `consolidated_summary_markdown_from_reports`'s docs for what each
+    // output still parses `inputs` for independently of it.
+    let reports = e2e_report::load_platform_reports(&inputs);
+
+    e2e_report::generate_consolidated_from_reports(&reports, &inputs, html_out, &meta)
         .with_context(|| format!("writing consolidated report to {}", html_out.display()))?;
 
     // Printed to stdout so CI can redirect it into $GITHUB_STEP_SUMMARY.
-    print!("{}", e2e_report::consolidated_summary_markdown(&inputs));
+    print!(
+        "{}",
+        e2e_report::consolidated_summary_markdown_from_reports(&reports, &inputs)
+    );
 
     eprintln!(
         "Consolidated {} platform report(s) -> {}",

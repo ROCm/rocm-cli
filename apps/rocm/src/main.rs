@@ -167,6 +167,12 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Check this computer's GPU, ROCm install, engines, and setup folders.
+    ///
+    /// A GPU that is recognized but has no ROCm build at all — `gfx90c`, the
+    /// Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs — is reported on
+    /// a `rocm_support` line saying so, so that an empty
+    /// `compatible_therock_family` does not read as a failed probe. Such a GPU
+    /// still works through the Vulkan backend.
     Examine {
         /// Emit the machine-readable Examination JSON (for diagnosis tooling).
         #[arg(long)]
@@ -736,6 +742,12 @@ rocm install sdk --devel")]
         #[arg(long, value_name = "YYYY-MM-DD", conflicts_with = "version")]
         build_date: Option<String>,
         /// TheRock GPU package family to install, such as gfx110X-all.
+        ///
+        /// A GPU target ROCm publishes no build for is refused rather than
+        /// mapped to a near neighbour: `--family gfx90c` — the Vega iGPU in
+        /// Renoir, Lucienne, Cezanne and Barcelo APUs — fails and installs
+        /// nothing, instead of substituting another family. A plain `rocm
+        /// install sdk` reports the same refusal when it detects such a GPU.
         #[arg(long)]
         family: Option<String>,
         /// Also install the ROCm compiler, headers, and static libraries for
@@ -6564,6 +6576,10 @@ pub(crate) fn chat_tool_approval_request(
         else {
             bail!("ROCm command tool is read-only and does not need approval");
         };
+        // `pending_title` is deliberately short (e.g. "Install driver"); don't
+        // read that as all the approver sees. The full `rocm` argv rides
+        // along via `display_command` below and is what the approval body
+        // actually renders (see `dash_seam.rs`'s `RocmToolExecutor::execute`).
         return Ok(ChatToolApprovalRequest {
             pending_title,
             command_title,
@@ -6614,6 +6630,9 @@ pub(crate) fn chat_tool_approval_request(
         "watcher_disable" => ("Disable automation", "Automations"),
         other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
     };
+    // Same as the `rocm_command` arm above: `pending_title` is short by
+    // design — the full command line rides along in `display_command` and
+    // is what the approval body renders, not just this title.
     Ok(ChatToolApprovalRequest {
         pending_title: pending_title.to_owned(),
         command_title: command_title.to_owned(),
@@ -9785,9 +9804,9 @@ fn artifact_source_policy_label(policy: &str) -> &str {
     }
 }
 
-/// Human-readable size. `rocm storage` reports caches that are routinely tens
-/// of megabytes, so the intermediate tiers matter: a bare byte count is
-/// unreadable at the sizes this reports.
+/// Human-readable size, for `rocm storage`'s cache report and the automations
+/// proposal history. Both report values routinely in the tens of megabytes,
+/// so the intermediate tiers matter: a bare byte count is unreadable there.
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     // `{:.1}` rounds, so from 1023.95 of a unit upwards the text already reads
@@ -11946,7 +11965,7 @@ pub(crate) fn render_automations_text(paths: &AppPaths, config: &RocmCliConfig) 
                     .arguments
                     .get("artifact_max_bytes")
                     .and_then(serde_json::Value::as_u64)
-                    .map_or_else(|| "not set".to_owned(), format_bytes_for_user);
+                    .map_or_else(|| "not set".to_owned(), format_bytes);
                 let _ = writeln!(output, "      download: approved up to {limit}");
             } else if proposal_kind(&proposal) == ProposalKind::PrefetchArtifact {
                 let _ = writeln!(output, "      download: not approved yet");
@@ -12079,26 +12098,6 @@ fn audit_event_plain_summary(event: &AuditEventRecord) -> &'static str {
         "engine" => "Engine activity was recorded.",
         _ => "Background activity was recorded.",
     }
-}
-
-fn format_bytes_for_user(bytes: u64) -> String {
-    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
-    // Below 1 KB the count is printed whole, so no rounding can disagree with
-    // the comparison.
-    if bytes < 1024 {
-        return format!("{bytes} bytes");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    // Promote while the value AS PRINTED would reach 1024, not merely while the
-    // raw value does: 1_048_575 bytes is 1023.999… KB, which `{:.1}` renders as
-    // "1024.0 KB". Comparing the rounded tenths, as `rocm_core::format_bytes`
-    // does, keeps every size in the unit it belongs to.
-    while unit + 1 < UNITS.len() && (value * 10.0).round() >= 10_240.0 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
 }
 
 const fn watcher_mode_plain_label(mode: WatcherMode) -> &'static str {
@@ -19547,47 +19546,37 @@ model recipes
         }
     }
 
-    #[test]
-    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
-        assert_eq!(format_bytes(1023), "1023 bytes");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        // One byte short of the next unit used to round to "1024.0 KiB".
-        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
-        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
-    }
-
     /// Just below a unit boundary the value rounds up to a full 1024 of the
     /// SMALLER unit, which has to be reported as 1.0 of the larger one — the
     /// same defect `rocm_core::format_bytes` had. Each pair is the last input
     /// that still belongs to the smaller unit and the first that `{:.1}` rounds
-    /// up to 1024.0 of it; the second used to print "1024.0 KB" / "1024.0 MB".
+    /// up to 1024.0 of it; the second used to print "1024.0 KiB" / "1024.0 MiB".
     #[test]
-    fn format_bytes_for_user_promotes_a_value_that_rounds_up_to_a_full_unit() {
-        assert_eq!(format_bytes_for_user(1023), "1023 bytes");
-        assert_eq!(format_bytes_for_user(1024), "1.0 KB");
-        assert_eq!(format_bytes_for_user(1_048_524), "1023.9 KB");
-        assert_eq!(format_bytes_for_user(1_048_525), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_575), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_395), "1023.9 MB");
-        assert_eq!(format_bytes_for_user(1_073_689_396), "1.0 GB");
-        assert_eq!(format_bytes_for_user(1_073_741_823), "1.0 GB");
-        // GB is the top unit: nothing to promote to, so 1024 GB stays in it.
-        assert_eq!(format_bytes_for_user(1_099_511_627_776), "1024.0 GB");
+    fn format_bytes_steps_up_instead_of_printing_1024_of_the_smaller_unit() {
+        assert_eq!(format_bytes(1023), "1023 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_575), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_073_689_395), "1023.9 MiB");
+        assert_eq!(format_bytes(1_073_689_396), "1.0 GiB");
+        assert_eq!(format_bytes(1_073_741_823), "1.0 GiB");
+        // GiB is the top unit: nothing to promote to, so 1024 GiB stays in it.
+        assert_eq!(format_bytes(1_099_511_627_776), "1024.0 GiB");
     }
 
-    /// The units `format_bytes_for_user` prints, smallest first.
-    const USER_BYTE_UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    /// The units `format_bytes` prints, smallest first.
+    const BYTE_UNITS: [&str; 4] = ["bytes", "KiB", "MiB", "GiB"];
 
     /// Byte counts that actually visit the unit boundaries. A uniform `u64`
     /// almost always lands far above the top unit, so on its own it never
     /// samples the band where `{:.1}` rounding reaches 1024.0. The other arms
     /// draw uniformly within one unit's range, and from a window just below
-    /// each rounded boundary (KB→MB, MB→GB) that scales with the boundary, as
-    /// the band does — see `rocm_core::disk_space`'s generator for the full
+    /// each rounded boundary (KiB→MiB, MiB→GiB) that scales with the boundary,
+    /// as the band does — see `rocm_core::disk_space`'s generator for the full
     /// reasoning.
-    fn user_byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
+    fn byte_count_strategy() -> impl proptest::strategy::Strategy<Value = u64> {
         use proptest::prelude::*;
         prop_oneof![
             any::<u64>(),
@@ -19619,20 +19608,20 @@ model recipes
         /// Both edges compare the mantissa as printed, in tenths: that is the
         /// quantity a reader sees, so it is the one the scaling has to decide on.
         #[test]
-        fn format_bytes_for_user_renders_a_size_in_its_own_unit(
-            bytes in user_byte_count_strategy(),
+        fn format_bytes_renders_a_size_in_its_own_unit(
+            bytes in byte_count_strategy(),
         ) {
-            let rendered = format_bytes_for_user(bytes);
+            let rendered = format_bytes(bytes);
             let (value, unit) = rendered
                 .split_once(' ')
                 .expect("rendered size is `<number> <unit>`");
             let value: f64 = value.parse().expect("numeric part parses");
             let tenths = (value * 10.0).round();
-            let exponent = USER_BYTE_UNITS
+            let exponent = BYTE_UNITS
                 .iter()
                 .position(|name| *name == unit)
                 .expect("rendered unit is one of the known units");
-            if exponent + 1 < USER_BYTE_UNITS.len() {
+            if exponent + 1 < BYTE_UNITS.len() {
                 proptest::prop_assert!(
                     tenths < 10_240.0,
                     "{bytes} rendered as {rendered}, which should have been \
@@ -19652,7 +19641,7 @@ model recipes
                     (smaller * 10.0).round() >= 10_240.0,
                     "{bytes} rendered as {rendered}, but still fits the smaller \
                      unit as {smaller:.1} {}",
-                    USER_BYTE_UNITS[exponent - 1],
+                    BYTE_UNITS[exponent - 1],
                 );
             }
         }
@@ -25973,8 +25962,9 @@ install therock";
                     "artifact_ref": "tiny/model#gguf",
                     "allow_artifact_download": true,
                     // One byte under 1 MiB: `{:.1}` rounds it up to a full
-                    // 1024 KB, so the approved cap must read as "1.0 MB", not
-                    // "1024.0 KB".
+                    // 1024 KiB, so the approved cap must read as "1.0 MiB",
+                    // not "1024.0 KiB". It must also read as `MiB`, not `MB`
+                    // — this is base-1024 math, not base-1000 (issue #190).
                     "artifact_max_bytes": 1_048_575
                 }),
                 reviewed_at_unix_ms: None,
@@ -26017,7 +26007,7 @@ install therock";
         assert!(rendered.contains("server: svc-plain"));
         assert!(rendered.contains("proposal-file [waiting for review] Prepare a model file"));
         assert!(rendered.contains("model file: tiny/model#gguf"));
-        assert!(rendered.contains("download: approved up to 1.0 MB"));
+        assert!(rendered.contains("download: approved up to 1.0 MiB"));
         assert!(rendered.contains(
             "controls: /automations approve proposal-plain | /automations reject proposal-plain"
         ));

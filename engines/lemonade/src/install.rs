@@ -952,21 +952,10 @@ fn copy_tree_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::scratch_dir;
     use std::io::Write;
     use std::process::{Command as ProcessCommand, Stdio};
     use std::time::Duration;
-
-    /// A fresh scratch directory under the crate's `target/`. The base is
-    /// `CARGO_MANIFEST_DIR`, a compile-time constant, so the path never derives from a
-    /// runtime environment read.
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("lemonade-fs-test-{tag}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     #[test]
     fn embeddable_package_matches_runtime_os() {

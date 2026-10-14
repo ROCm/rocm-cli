@@ -316,6 +316,73 @@ const KEYWORDS_MSVC_REDIST: KeywordTable = &[
     (r"msvcp140\.dll", 30, "error mentions msvcp140.dll"),
 ];
 
+/// The oldest Visual C++ runtime that programs built with a current toolset can
+/// run on, as `major.minor`.
+///
+/// Evidence: Visual Studio 2022 17.10 made the standard library's `mutex`
+/// constructor `constexpr`. A program built that way and run on an older
+/// `msvcp140.dll` reads a null pointer in the mutex code and dies with an access
+/// violation (0xC0000005). Microsoft's STL issue tracker has the report: 14.32
+/// crashed and 14.40.33810 worked, and the maintainers closed it as by design,
+/// because a redistributable must be at least as new as the toolset that built
+/// the program. 17.10 ships runtime 14.40. On the machine this check was written
+/// from, 14.29.30133 crashed the llama.cpp server that Lemonade installs and
+/// 14.51 ran it.
+///
+/// Confidence: high that anything below 14.40 breaks; not confirmed that 14.40
+/// itself is enough for every build. A program built with a newer toolset can
+/// ask for a newer runtime, so 14.40 is a floor and the fix tells the user to
+/// install the latest one. It is a floor on purpose: raising it would flag
+/// runtimes that work.
+const MSVC_REDIST_MIN_VERSION: [u32; 2] = [14, 40];
+
+/// Score for a runtime older than [`MSVC_REDIST_MIN_VERSION`] with no symptom.
+/// Equal to [`HIGH_CONFIDENCE`]: the version is read from the machine and the
+/// threshold is a known break, so no symptom is needed to act on it.
+const MSVC_REDIST_OUTDATED_SCORE: i32 = 75;
+
+/// Symptom text for [`check_21_msvc_redist_outdated`].
+///
+/// An access violation is generic: any native crash prints one. So the code
+/// alone stays under [`MIN_SCORE_FOR_MATCH`] (25), the DLL name alone does too
+/// (30), and the two together (55) reach "likely". A crash report that names
+/// `msvcp140` as the faulting module is specific (55 alone), and with the
+/// exception code it reaches high confidence (80). This table is scored with
+/// overlap collapsing, so the faulting-module line and the DLL name inside it
+/// are one signal, not two.
+const KEYWORDS_MSVC_REDIST_OUTDATED: KeywordTable = &[
+    (
+        r"faulting module (?:name|path)?\s*:?\s*(?:[^\s,]*[\\/])?msvcp140",
+        55,
+        "crash report names msvcp140 as the faulting module",
+    ),
+    (
+        r"0xc0000005|-1073741819|3221225477|access violation",
+        25,
+        "access violation exit or exception code",
+    ),
+    (r"msvcp140\.dll", 30, "error mentions msvcp140.dll"),
+];
+
+/// Whether `version` (for example `14.29.30133.0`) is older than `minimum`.
+///
+/// `false` for an empty or unparsable version: unknown is not old, and a false
+/// match would send a user to reinstall a runtime that is fine. Parts missing on
+/// either side count as zero, so `14.40` equals `14.40.0.0`.
+fn msvc_redist_older_than(version: &str, minimum: &[u32]) -> bool {
+    let Some(found) = crate::examine::parse_dotted_version(version) else {
+        return false;
+    };
+    for i in 0..found.len().max(minimum.len()) {
+        let have = found.get(i).copied().unwrap_or(0);
+        let want = minimum.get(i).copied().unwrap_or(0);
+        if have != want {
+            return have < want;
+        }
+    }
+    false
+}
+
 const KEYWORDS_REPO_BROKEN: KeywordTable = &[
     (r"404.*repo\.radeon\.com", 50, "404 against repo.radeon.com"),
     (
@@ -1539,7 +1606,7 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         return zero("fix-15-msvc-redist", "MSVC runtime missing");
     }
     let fix = Fix {
-        summary: "Install the Microsoft Visual C++ 2015-2022 redistributable so the HIP SDK's amdhip64_*.dll can load.".to_owned(),
+        summary: "Install the Microsoft Visual C++ 2015-2022 redistributable so the programs that link it, such as the HIP SDK's amdhip64_*.dll and the llama.cpp server that Lemonade installs, can load.".to_owned(),
         commands: vec![
             "# Download & install (x64):".to_owned(),
             "#   https://aka.ms/vs/17/release/vc_redist.x64.exe".to_owned(),
@@ -1547,12 +1614,12 @@ fn check_15_msvc_redist(e: &Examination, symptom: &str) -> Diagnosis {
         ],
         fix_id: "fix-15-msvc-redist".to_owned(),
         verify: "where vcruntime140.dll && where vcruntime140_1.dll".to_owned(),
-        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.".to_owned()],
+        notes: vec!["If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.".to_owned()],
         ..Fix::default()
     };
     finalize(
         "fix-15-msvc-redist",
-        "MSVC runtime missing (HIP DLLs cannot load)",
+        "MSVC runtime missing (programs that link it cannot load)",
         score,
         evidence,
         fix,
@@ -2104,6 +2171,54 @@ fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosi
     )
 }
 
+fn check_21_msvc_redist_outdated(e: &Examination, symptom: &str) -> Diagnosis {
+    const ID: &str = "fix-21-msvc-redist-outdated";
+    const TITLE: &str = "MSVC runtime too old (programs built with a recent toolset crash)";
+
+    // Belt and braces with the `windows` tag in `CHECKERS`: a non-Windows host
+    // has no such runtime, so it never matches, whatever it was handed.
+    if e.os_family != "windows" {
+        return zero(ID, TITLE);
+    }
+    let mut score = 0;
+    let mut evidence = Vec::new();
+    if msvc_redist_older_than(&e.msvc_redist_version, &MSVC_REDIST_MIN_VERSION) {
+        score += MSVC_REDIST_OUTDATED_SCORE;
+        evidence.push(format!(
+            "Visual C++ runtime {} in System32 is older than {}.{}",
+            e.msvc_redist_version, MSVC_REDIST_MIN_VERSION[0], MSVC_REDIST_MIN_VERSION[1]
+        ));
+    }
+    let (kw_score, kw_ev) =
+        keyword_score_collapsing_overlaps(symptom, KEYWORDS_MSVC_REDIST_OUTDATED);
+    score += kw_score;
+    evidence.extend(kw_ev);
+
+    if score <= 0 {
+        return zero(ID, TITLE);
+    }
+    let fix = Fix {
+        summary: "Update the Microsoft Visual C++ 2015-2022 redistributable. Programs built with a recent toolset, such as the llama.cpp server that Lemonade installs, crash on a runtime older than 14.40.".to_owned(),
+        commands: vec![
+            "# Update the runtime (x64). This needs the Windows administrator prompt, so".to_owned(),
+            "# the command is shown here and not run for you:".to_owned(),
+            "winget install --id Microsoft.VCRedist.2015+.x64 --exact".to_owned(),
+            "# Or download and run the installer:".to_owned(),
+            "#   https://aka.ms/vs/17/release/vc_redist.x64.exe".to_owned(),
+            "# Then close and restart the program (or Lemonade) so it loads the new runtime.".to_owned(),
+        ],
+        fix_id: ID.to_owned(),
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"".to_owned(),
+        notes: vec![
+            "The verify command prints the runtime version. It should read 14.40 or higher.".to_owned(),
+            "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.".to_owned(),
+            "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.".to_owned(),
+        ],
+        ..Fix::default()
+    };
+    finalize(ID, TITLE, score, evidence, fix)
+}
+
 // ---------------------------------------------------------------------------
 // WSL2 catalog
 //
@@ -2590,6 +2705,9 @@ const CHECKERS: &[Checker] = &[
     // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
     // has nothing to read there and would never fire.
     (check_20_gpu_unsupported_by_rocm, &["linux", "windows"]),
+    // Windows only: the runtime is read from the Windows System32 folder. A WSL
+    // distro is examined as a distro, so it has no such runtime to read.
+    (check_21_msvc_redist_outdated, &["windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -6087,7 +6205,7 @@ mod tests {
 
     #[test]
     fn diagnosis_remediation_matches_the_fix_catalog_for_shared_fix_ids() {
-        // fix-15 and fix-16 live in two places: the `rocm fix` catalog
+        // fix-15, fix-16 and fix-21 live in two places: the `rocm fix` catalog
         // (crate::fix::RECIPES) and the Fix these checks embed in a Diagnosis.
         // The prose *framing* legitimately differs by surface (a catalog
         // rationale vs a diagnosis summary), but the actionable remediation must
@@ -6109,7 +6227,15 @@ mod tests {
             },
             "ImportError: DLL load failed: vcruntime140_1.dll not found",
         );
-        for diag in [vllm_oom, msvc] {
+        let msvc_outdated = check_21_msvc_redist_outdated(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_version: "14.29.30133.0".to_owned(),
+                ..Examination::default()
+            },
+            "",
+        );
+        for diag in [vllm_oom, msvc, msvc_outdated] {
             assert!(
                 diag.score >= MIN_SCORE_FOR_MATCH,
                 "test setup must yield a real match for {}",
@@ -6138,6 +6264,255 @@ mod tests {
                 fix.fix_id
             );
         }
+    }
+
+    /// What the Windows event log and Lemonade print when the llama.cpp server
+    /// dies on a Visual C++ runtime that is too old.
+    const MSVC_OUTDATED_CRASH_TEXT: &str = "llama-server.exe exited with code 3221225477. \
+        Faulting application name: llama-server.exe, version: 0.0.0.0, \
+        Faulting module name: MSVCP140.dll, version: 14.29.30133.0, \
+        Exception code: 0xc0000005 (access violation)";
+
+    /// The same crash as the server's own log shows it, with no event-log line.
+    const MSVC_OUTDATED_CRASH_TEXT_SHORT: &str =
+        "llama-server failed: process exited with 0xC0000005 in MSVCP140.dll";
+
+    fn windows_with_runtime(version: &str) -> Examination {
+        Examination {
+            os_family: "windows".to_owned(),
+            msvc_redist_version: version.to_owned(),
+            ..Examination::default()
+        }
+    }
+
+    fn outdated_runtime_entry(report: &DiagnoseReport) -> Option<&Diagnosis> {
+        report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-21-msvc-redist-outdated")
+    }
+
+    #[test]
+    fn an_outdated_runtime_is_a_high_confidence_match_with_no_symptom() {
+        let report = diagnose(&windows_with_runtime("14.29.30133.0"), "");
+        let hit = outdated_runtime_entry(&report).expect("14.29 is below the minimum");
+        assert!(
+            hit.score >= HIGH_CONFIDENCE,
+            "no symptom needed: score {}",
+            hit.score
+        );
+        assert!(report.has_match);
+        assert!(hit.evidence.iter().any(|ev| ev.contains("14.29.30133.0")));
+    }
+
+    #[test]
+    fn the_minimum_runtime_version_is_14_40() {
+        // Pins the chosen floor. The evidence for it is on the constant.
+        assert_eq!(MSVC_REDIST_MIN_VERSION, [14, 40]);
+    }
+
+    #[test]
+    fn runtime_version_comparison_edge_cases() {
+        let min = &MSVC_REDIST_MIN_VERSION;
+        // Older.
+        assert!(msvc_redist_older_than("14.29.30133.0", min));
+        assert!(msvc_redist_older_than("14.39.99999.0", min));
+        assert!(msvc_redist_older_than("13.99", min));
+        assert!(msvc_redist_older_than("14.32.31326.0", min));
+        // Equal to the minimum is not older, in any spelling.
+        assert!(!msvc_redist_older_than("14.40", min));
+        assert!(!msvc_redist_older_than("14.40.0.0", min));
+        assert!(!msvc_redist_older_than("14.40.33810.0", min));
+        // Newer, including a major version above 14 and a four-part version.
+        assert!(!msvc_redist_older_than("14.51.36231.0", min));
+        assert!(!msvc_redist_older_than("15.0", min));
+        // Compared as numbers, not as text: 14.9 is older than 14.40.
+        assert!(msvc_redist_older_than("14.9.1.0", min));
+        assert!(!msvc_redist_older_than("14.100.0.0", min));
+        // Unknown is never old.
+        for unknown in [
+            "",
+            "   ",
+            "14",
+            "unknown",
+            "14.x.1",
+            "v14.29",
+            "14.29.beta",
+            "-1.2",
+        ] {
+            assert!(
+                !msvc_redist_older_than(unknown, min),
+                "{unknown:?} must not count as old"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_or_unparsable_runtime_version_alone_does_not_match() {
+        for version in ["", "garbage", "14"] {
+            let report = diagnose(&windows_with_runtime(version), "");
+            assert!(
+                outdated_runtime_entry(&report).is_none(),
+                "{version:?} produced a match"
+            );
+        }
+    }
+
+    #[test]
+    fn a_current_runtime_does_not_match_without_a_symptom() {
+        for version in ["14.40.33810.0", "14.51.36231.0"] {
+            let report = diagnose(&windows_with_runtime(version), "");
+            assert!(outdated_runtime_entry(&report).is_none(), "{version}");
+        }
+    }
+
+    #[test]
+    fn an_outdated_runtime_never_matches_off_windows() {
+        for family in ["linux", "unknown", ""] {
+            let exam = Examination {
+                os_family: family.to_owned(),
+                msvc_redist_version: "14.29.30133.0".to_owned(),
+                ..Examination::default()
+            };
+            let direct = check_21_msvc_redist_outdated(&exam, MSVC_OUTDATED_CRASH_TEXT);
+            assert_eq!(direct.score, 0, "{family:?}");
+            let report = diagnose(&exam, MSVC_OUTDATED_CRASH_TEXT);
+            assert!(outdated_runtime_entry(&report).is_none(), "{family:?}");
+        }
+        let mut wsl = linux_base();
+        wsl.is_wsl = true;
+        wsl.msvc_redist_version = "14.29.30133.0".to_owned();
+        let report = diagnose(&wsl, MSVC_OUTDATED_CRASH_TEXT);
+        assert!(outdated_runtime_entry(&report).is_none());
+    }
+
+    #[test]
+    fn the_crash_text_from_an_outdated_runtime_ranks_first() {
+        // With the runtime version known, and with nothing known about it.
+        for exam in [
+            windows_with_runtime("14.29.30133.0"),
+            windows_with_runtime(""),
+        ] {
+            for text in [MSVC_OUTDATED_CRASH_TEXT, MSVC_OUTDATED_CRASH_TEXT_SHORT] {
+                let report = diagnose(&exam, text);
+                let top = &report.matched[0];
+                assert_eq!(
+                    top.id,
+                    "fix-21-msvc-redist-outdated",
+                    "runtime {:?}, text {text:?}: {:?}",
+                    exam.msvc_redist_version,
+                    report
+                        .matched
+                        .iter()
+                        .map(|d| (&d.id, d.score))
+                        .collect::<Vec<_>>()
+                );
+                assert!(top.score >= MIN_SCORE_FOR_MATCH);
+            }
+        }
+        // The full event-log text reaches high confidence from the symptom alone.
+        let report = diagnose(&windows_with_runtime(""), MSVC_OUTDATED_CRASH_TEXT);
+        assert!(report.matched[0].score >= HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn outdated_runtime_symptom_keywords_score_honestly() {
+        let score =
+            |text: &str| keyword_score_collapsing_overlaps(text, KEYWORDS_MSVC_REDIST_OUTDATED).0;
+        // A bare access violation code is generic and stays below the threshold,
+        // whichever way it is spelled.
+        for bare in [
+            "0xC0000005",
+            "exit code -1073741819",
+            "exit code 3221225477",
+        ] {
+            assert!(score(bare) > 0, "{bare} must be recognised");
+            assert!(score(bare) < MIN_SCORE_FOR_MATCH, "{bare} alone is generic");
+        }
+        // So does the DLL name alone.
+        assert!(score("msvcp140.dll") < MIN_SCORE_FOR_MATCH);
+        // The two together are a likely match.
+        let pair = score("crashed with 0xC0000005 in msvcp140.dll");
+        assert!(
+            (MIN_SCORE_FOR_MATCH..HIGH_CONFIDENCE).contains(&pair),
+            "{pair}"
+        );
+        // A faulting-module line is specific on its own, whatever the case, and
+        // with the exception code it is high confidence.
+        for line in [
+            "Faulting module name: MSVCP140.dll",
+            "FAULTING MODULE NAME: msvcp140.dll, version: 14.29.30133.0",
+            r"Faulting module path: C:\Windows\System32\MSVCP140.dll",
+        ] {
+            let s = score(line);
+            assert!(s >= MIN_SCORE_FOR_MATCH, "{line}: {s}");
+            assert!(s < HIGH_CONFIDENCE, "{line}: {s}");
+            assert!(score(&format!("{line} Exception code: 0xc0000005")) >= HIGH_CONFIDENCE);
+        }
+        // Another module faulting is not this failure.
+        assert!(
+            score("Faulting module name: ucrtbase.dll, Exception code: 0xc0000005")
+                < MIN_SCORE_FOR_MATCH
+        );
+    }
+
+    #[test]
+    fn an_access_violation_without_the_runtime_is_not_blamed_on_it() {
+        // A bare crash code on a machine with a current runtime stays unmatched.
+        let report = diagnose(
+            &windows_with_runtime("14.51.36231.0"),
+            "exit code 0xC0000005",
+        );
+        assert!(outdated_runtime_entry(&report).is_none_or(|d| d.score < MIN_SCORE_FOR_MATCH));
+    }
+
+    #[test]
+    fn the_outdated_runtime_remediation_covers_the_llama_server_and_stays_print_only() {
+        let report = diagnose(&windows_with_runtime("14.29.30133.0"), "");
+        let fix = outdated_runtime_entry(&report)
+            .and_then(|d| d.fix.as_ref())
+            .expect("a matched diagnosis carries a fix");
+        assert!(fix.summary.contains("llama.cpp"));
+        assert!(fix.summary.contains("Lemonade"));
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c == "winget install --id Microsoft.VCRedist.2015+.x64 --exact")
+        );
+        assert!(
+            fix.commands
+                .iter()
+                .any(|c| c.contains("aka.ms/vs/17/release/vc_redist.x64.exe"))
+        );
+        assert!(fix.verify.contains("msvcp140.dll") && fix.verify.contains("FileVersion"));
+        // The plan promises it only prints. The class is checked against the
+        // catalog by `the_outdated_runtime_recipe_is_print_only_on_windows` in
+        // fix.rs, which is what makes this sentence true.
+        assert!(
+            fix.notes
+                .iter()
+                .any(|n| n.contains("only prints this plan"))
+        );
+    }
+
+    #[test]
+    fn the_missing_runtime_fix_no_longer_says_only_the_hip_sdk_needs_it() {
+        let report = diagnose(
+            &Examination {
+                os_family: "windows".to_owned(),
+                msvc_redist_present: Some(false),
+                ..Examination::default()
+            },
+            "",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-15-msvc-redist")
+            .expect("a missing runtime still matches");
+        let fix = hit.fix.as_ref().expect("fix");
+        assert!(fix.summary.contains("llama.cpp"), "{}", fix.summary);
+        assert!(!hit.title.contains("HIP DLLs cannot load"), "{}", hit.title);
     }
 
     #[test]

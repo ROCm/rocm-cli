@@ -89,6 +89,7 @@ const CATALOG_FIX_IDS: &[&str] = &[
     "fix-wsl-7-wsl1",
     "fix-18-comgr-conflict",
     "fix-19-shm-too-small",
+    "fix-21-msvc-redist-outdated",
 ];
 
 /// The fixes the CLI carries out itself **on the host running the suite**.

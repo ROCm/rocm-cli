@@ -775,6 +775,42 @@ def _assert_main_refuses_without_a_key(dist: Path) -> None:
         )
 
 
+def _assert_main_rejects_a_named_missing_key(dist: Path, missing: Path) -> None:
+    """A named key file that is not there must stop the run, by name.
+
+    `resolve_signing_key`'s docstring promises a path that does not exist is "an
+    error from `verify_signature`, not a reason to fall through to the next
+    source", and the resolution case above leaves its key absent on purpose to
+    lean on that. Nothing drove it through `main`, so deleting the `is_file`
+    check in `verify_signature` left the whole self-test green: verification
+    would then hand a nonexistent `--public-key` to `cargo xtask verify` and the
+    operator would be told their signatures failed, rather than that the key
+    they named is missing -- or, worse, a future `key_args` change could drop
+    the flag and verify against the inline PEM instead.
+
+    Verification is intercepted so the mutant is caught here rather than by
+    whatever `cargo` happens to say: with the check gone this run *succeeds*,
+    which is precisely the fail-open being pinned.
+    """
+    code, _stdout, stderr, argvs = _run_main_verifying(dist, "--require-signatures")
+    if code is None:
+        raise ReadinessError(
+            "main accepted a --require-signatures run whose signing key path names "
+            f"a file that does not exist ({missing}); a named key that is absent "
+            "must fail the run, not be verified against"
+        )
+    if "public key does not exist" not in stderr:
+        raise ReadinessError(
+            "main failed, but not on the missing key file -- the case no longer "
+            f"pins what it claims. stderr was: {stderr.strip()!r}"
+        )
+    if argvs:
+        raise ReadinessError(
+            "verification was invoked before the named key was checked for "
+            f"existence: {argvs!r}"
+        )
+
+
 def _run_main_verifying(
     dist: Path, *flags: str, verification_fails: bool = False
 ) -> tuple[int | None, str, str, list[list[str]]]:
@@ -1324,6 +1360,28 @@ def run_self_test(root: Path) -> None:
                 f"expected the key path to win over the inline PEM, got {path_source}"
             )
 
+        # A whitespace-only path is blank, not a named key: `env_path` strips the
+        # value, so it falls through to the inline PEM. `verify_pinned_keys.rs`
+        # (`resolve_ci_public_key`) pins the same shapes on the Rust side and its
+        # doc says it matches "the Python gate exactly"; without this case that
+        # claim rests on nothing, and dropping the `.strip()` here would turn a
+        # padded secret into `Path("   ")` and verify the release against a key
+        # that does not exist, while Rust still used the PEM.
+        for blank in ("   ", "\t\n"):
+            blank_key, blank_source = run_with_env(
+                {
+                    SIGNING_PUBLIC_KEY_ENV: inline_pem,
+                    SIGNING_PUBLIC_KEY_PATH_ENV: blank,
+                },
+                lambda: resolve_signing_key(None),
+            )
+            if blank_key is not None or SIGNING_PUBLIC_KEY_ENV not in blank_source:
+                raise ReadinessError(
+                    f"a whitespace-only {SIGNING_PUBLIC_KEY_PATH_ENV} ({blank!r}) must "
+                    "fall through to the inline PEM the way verify_pinned_keys.rs "
+                    f"promises, got {blank_key!r} / {blank_source}"
+                )
+
         explicit = root / "explicit-public-key.pem"
         explicit_key, explicit_source = run_with_env(
             {
@@ -1380,6 +1438,17 @@ def run_self_test(root: Path) -> None:
         }
         run_with_env(no_key_env, lambda: _assert_main_refuses_without_a_key(gate_dist))
         print("release readiness self-test: main refuses without a key ok")
+
+        # Naming a key file that is not there is different from naming none: it
+        # must stop the run by name rather than fall through to another key.
+        # `key_path` is the one the resolution case above deliberately never
+        # created, so this drives the same absent path all the way through `main`.
+        run_with_env(
+            {**no_key_env, SIGNING_PUBLIC_KEY_PATH_ENV: key_path},
+            lambda: _assert_main_rejects_a_named_missing_key(gate_dist, key_path),
+        )
+        print("release readiness self-test: main rejects a named missing key ok")
+
         # A key that exists on disk, because this case lets the real
         # `verify_signature` run and it rejects a named key that is not a file.
         # `key_path` above stays absent on purpose, to pin that a named-but-
