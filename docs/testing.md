@@ -1625,6 +1625,34 @@ RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
 The install plans deliberately read the real file, so no scenario plants one
 for them; their parsing is covered by the unit tests above.
 
+## Windows Runtime Preflight
+
+On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
+with the floor programs built with a recent toolset need, 14.40. The version
+comes from the file version of `msvcp140.dll` and `vcruntime140.dll`, and
+shows in `rocm examine --json` as `msvc_redist_version` (the older of the two,
+empty when neither could be read).
+
+```powershell
+rocm examine --json | ConvertFrom-Json | Select-Object msvc_redist_version
+rocm diagnose
+rocm fix fix-21-msvc-redist-outdated
+```
+
+On a machine whose runtime is older than 14.40, `diagnose` reports
+`fix-21-msvc-redist-outdated` with no symptom text. `rocm fix` prints the plan
+and runs nothing: the update needs the Windows administrator prompt. After the
+update, the plan's verify command prints the new version.
+
+The version comparison and the symptom keywords are covered by unit tests in
+`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+cannot give a Linux host a Windows runtime: the check is gated to Windows. The
+catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
+scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
+compare the new entry on every lane. A
+scenario that runs the check itself would need the Windows lane and a host
+with an old runtime installed.
+
 ## Model Fit Preflight
 
 `rocm diagnose --model <ref>` answers whether a curated model will run on this
