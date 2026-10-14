@@ -119,7 +119,6 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(all(test, not(windows)))]
@@ -6582,8 +6581,8 @@ pub(crate) fn chat_tool_approval_request(
             .context("proposal_action arguments must be a JSON object")?;
         let proposal_id = chat::json_string(object, "proposal_id")
             .context("proposal_action requires non-empty `proposal_id`")?;
-        let action =
-            chat::json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+        let action = chat::json_string(object, "action")
+            .context("proposal_action requires non-empty `action`")?;
         let pending_title = match action.as_str() {
             "approve" => "Approve proposal",
             "reject" => "Reject proposal",
@@ -6684,8 +6683,8 @@ fn validate_chat_proposal_action_tool_call(call: &providers::ChatToolCall) -> Re
     if proposal_id.len() > 128 {
         bail!("proposal_id too long");
     }
-    let action =
-        chat::json_string(object, "action").context("proposal_action requires non-empty `action`")?;
+    let action = chat::json_string(object, "action")
+        .context("proposal_action requires non-empty `action`")?;
     if !matches!(action.as_str(), "show" | "approve" | "reject") {
         bail!("proposal_action `action` must be one of show, approve, reject");
     }
@@ -6784,7 +6783,8 @@ fn validate_chat_watcher_tool_call(call: &providers::ChatToolCall, allow_mode: b
         .arguments
         .as_object()
         .context("watcher tool arguments must be a JSON object")?;
-    let watcher = chat::json_string(object, "watcher").context("watcher tool requires `watcher`")?;
+    let watcher =
+        chat::json_string(object, "watcher").context("watcher tool requires `watcher`")?;
     if watcher.len() > 128 {
         bail!("watcher id too long");
     }
@@ -6913,7 +6913,9 @@ pub(crate) fn normalized_chat_rocm_command_args(
     Ok(args)
 }
 
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<chat::ChatRocmCommandAction> {
+fn chat_rocm_command_action_from_args(
+    mut args: Vec<String>,
+) -> Result<chat::ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
@@ -7567,7 +7569,10 @@ fn deterministic_model_tool_summary(tool_text: &str) -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
-fn deterministic_engine_fit_summary(recipe: &chat::DeterministicModelRecipe, engine: &str) -> String {
+fn deterministic_engine_fit_summary(
+    recipe: &chat::DeterministicModelRecipe,
+    engine: &str,
+) -> String {
     let status = recipe
         .engine_statuses
         .iter()
@@ -7951,8 +7956,8 @@ pub(crate) fn run_internal_mcp_call(
             // subprocess arm.
             let proposal_id = chat::json_string(&arguments, "proposal_id")
                 .context("proposal_action requires `proposal_id`")?;
-            let action =
-                chat::json_string(&arguments, "action").context("proposal_action requires `action`")?;
+            let action = chat::json_string(&arguments, "action")
+                .context("proposal_action requires `action`")?;
             match action.as_str() {
                 "show" => {
                     let proposal = rocm_core::find_automation_proposal(paths, &proposal_id)
@@ -8638,7 +8643,6 @@ fn rocm_chat_tool_requested_args(call: &providers::ChatToolCall) -> Option<Vec<S
         _ => None,
     }
 }
-
 
 pub(crate) fn render_examine_text() -> Result<String> {
     let paths = AppPaths::discover()?;
@@ -20579,7 +20583,10 @@ install therock";
     fn chat_tool_result_errors_use_plain_failure_wording() {
         assert_eq!(chat_read_only_tool_status_label(false), "done");
         assert_eq!(chat_read_only_tool_status_label(true), "reported an error");
-        assert_eq!(chat::chat_tool_display_label("examine"), "Checked this computer");
+        assert_eq!(
+            chat::chat_tool_display_label("examine"),
+            "Checked this computer"
+        );
         assert_eq!(
             chat::chat_tool_display_label("gpu_snapshot"),
             "Checked GPU status"
