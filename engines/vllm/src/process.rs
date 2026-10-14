@@ -927,6 +927,7 @@ mod tests {
     use crate::ENGINE_NAME;
     use crate::runtime::VllmRuntime;
     use crate::state::current_unix_millis;
+    use std::fmt::Write as _;
 
     /// A throwaway directory for the shebang cases. Scoped per test and per
     /// thread so the suite can keep running these concurrently.
@@ -1559,9 +1560,9 @@ mod tests {
         let coloured = format!("\u{1b}[31m{exception}\u{1b}[0m");
         let mut log = String::new();
         for shard in 0..200 {
-            log.push_str(&format!("INFO vllm.engine loading shard {shard}\n"));
+            writeln!(log, "INFO vllm.engine loading shard {shard}").expect("write to String");
         }
-        log.push_str(&format!("{coloured}\n"));
+        writeln!(log, "{coloured}").expect("write to String");
         let path = std::env::temp_dir().join(format!(
             "rocm-vllm-roundtrip-{}-{}.log",
             std::process::id(),
