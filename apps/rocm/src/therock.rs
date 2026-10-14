@@ -3459,7 +3459,8 @@ fn unsupported_host_gpu_message(raw_arch: &str) -> String {
         "no ROCm SDK build exists for the detected GPU target `{raw_arch}`, so \
          `rocm install sdk` has nothing to install for it.\n\
          The GPU is detected but is not supported by ROCm; \
-         the Vulkan backend can still be used."
+         the Vulkan backend can still be used. \
+         Try `rocm serve <model>` — it runs on Lemonade's Vulkan backend instead."
     )
 }
 
@@ -3475,7 +3476,8 @@ fn unsupported_requested_target_message(value: &str, source: &str) -> String {
         "no ROCm SDK build exists for the GPU target `{value}` requested by \
          {source}, so `rocm install sdk` has nothing to install for it.\n\
          That GPU is not supported by ROCm; the Vulkan backend can still be \
-         used. Nothing was installed and no other family was substituted."
+         used. Nothing was installed and no other family was substituted. \
+         Try `rocm serve <model>` — it runs on Lemonade's Vulkan backend instead."
     )
 }
 
@@ -7665,6 +7667,7 @@ mod tests {
         assert!(message.contains("no ROCm SDK build"), "{message}");
         assert!(message.contains("`gfx90c`"), "{message}");
         assert!(message.contains("Vulkan"), "{message}");
+        assert!(message.contains("rocm serve <model>"), "{message}");
         assert!(!message.contains("--family"), "{message}");
         for family in known_therock_families() {
             assert!(
@@ -7746,6 +7749,7 @@ mod tests {
         let message = unsupported_requested_target_message("gfx90c", "--family");
         assert!(message.contains("`gfx90c`"), "{message}");
         assert!(message.contains("--family"), "{message}");
+        assert!(message.contains("rocm serve <model>"), "{message}");
         // The user named it; nothing was detected, so the error must not say so.
         assert!(!message.contains("detected"), "{message}");
 

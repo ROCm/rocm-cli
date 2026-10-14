@@ -128,6 +128,40 @@ pub fn gfx_target_has_no_rocm_build(gfx: &str) -> bool {
         && normalize_therock_family(gfx).is_none()
 }
 
+/// How well this host's GPU is supported, for messages that tell the user what
+/// they can actually do rather than just reporting raw detection fields.
+///
+/// `Unknown` deliberately covers both "nothing detected" and "a gfx target we
+/// don't recognize" rather than being called `Unsupported` — see the doc
+/// comment on [`gfx_target_has_no_rocm_build`] and
+/// `GFX_TARGETS_WITHOUT_ROCM_SUPPORT` in `diagnose.rs` for why conflating
+/// "confirmed no ROCm build" with "unrecognized" would turn a detection gap
+/// into a false claim about the hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuSupportLevel {
+    /// A TheRock package family covers this GPU: full ROCm/HIP support.
+    RocmHip,
+    /// Recognized, confirmed to have no ROCm/HIP build, but Vulkan-based
+    /// engines (the default Lemonade backend) still work on it.
+    VulkanOnly,
+    /// No GPU detected yet, or a gfx target this catalog doesn't recognize.
+    Unknown,
+}
+
+/// Classify the host's GPU support level from the same two facts
+/// `ExamineSummary` and `resolve_family` already compute: the detected gfx
+/// target and whichever TheRock family (if any) covers it.
+pub fn gpu_support_level(
+    detected_gfx_target: Option<&str>,
+    compatible_therock_family: Option<&str>,
+) -> GpuSupportLevel {
+    match (detected_gfx_target, compatible_therock_family) {
+        (_, Some(_)) => GpuSupportLevel::RocmHip,
+        (Some(gfx), None) if gfx_target_has_no_rocm_build(gfx) => GpuSupportLevel::VulkanOnly,
+        _ => GpuSupportLevel::Unknown,
+    }
+}
+
 pub fn normalize_therock_family(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -3455,6 +3489,31 @@ mod tests {
         assert!(!gfx_target_has_no_rocm_build("gfx906"));
         assert!(!gfx_target_has_no_rocm_build("gfx1103"));
         assert!(!gfx_target_has_no_rocm_build(""));
+    }
+
+    #[test]
+    fn gpu_support_level_is_rocm_hip_when_a_family_covers_it() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90a"), Some("gfx90a")),
+            GpuSupportLevel::RocmHip
+        );
+    }
+
+    #[test]
+    fn gpu_support_level_is_vulkan_only_for_gfx90c() {
+        assert_eq!(
+            gpu_support_level(Some("gfx90c"), None),
+            GpuSupportLevel::VulkanOnly
+        );
+    }
+
+    #[test]
+    fn gpu_support_level_is_unknown_without_detection_or_for_an_unrecognized_target() {
+        assert_eq!(gpu_support_level(None, None), GpuSupportLevel::Unknown);
+        assert_eq!(
+            gpu_support_level(Some("gfx_totally_unrecognized"), None),
+            GpuSupportLevel::Unknown
+        );
     }
 
     /// The predicate must agree with `normalize_therock_family`, not merely

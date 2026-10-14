@@ -46,8 +46,8 @@ use crate::service_launch::{
 };
 use crate::{
     cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
-    gpu_vram_usage, parse_device_policy, parse_gpu_selection, resolve_engine_selection,
-    select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
+    fetch_service_device, gpu_vram_usage, parse_device_policy, parse_gpu_selection,
+    resolve_engine_selection, select_gpu_indices_under_launch_lock, serve_gpu_low_memory_warning,
     validate_engine_selection_runtime, validate_pinned_gpu_index,
 };
 
@@ -910,6 +910,15 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             };
             spinner.clear();
 
+            // Read what the engine actually selected rather than guessing from
+            // the pre-launch GPU plan: `gpu_indices` above can be empty for a
+            // Vulkan-only GPU that ROCm/amd-smi never enumerates, even though
+            // the server is running fine on it. Only meaningful once the
+            // server is ready to answer, same gate as the smoke test.
+            let device = (report.status == "ready")
+                .then(|| fetch_service_device(&paths, &selected_engine, &report.service_id))
+                .flatten();
+
             let notes = collect_serve_notes(
                 cpu_only,
                 &gpu_selection,
@@ -927,6 +936,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
                 chat_endpoint: format!("{}/chat/completions", report.endpoint_url),
                 service_id: report.service_id.clone(),
                 status: report.status.clone(),
+                device,
                 already_running: report.already_running,
                 metrics,
                 api_key: launched_key,
