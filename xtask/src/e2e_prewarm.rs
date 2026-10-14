@@ -512,11 +512,28 @@ impl RuntimeLine {
 /// itself is delimiter-bounded for the same reason: an unanchored `contains`
 /// would let a short pin (`7.1` -> `7-1`) match as a sub-span of a longer
 /// version (`7-13-0`), or a bare `7` match almost any key.
+/// Normalizes a `--version`/`--build-date` pin the same way `slugify` in
+/// `apps/rocm/src/therock.rs` normalizes every runtime key: lowercase
+/// alphanumerics kept as-is, every other byte (not just `.`) collapsed to
+/// `-`. A pin carrying a `+`-style local-version suffix (e.g.
+/// `7.13.0+rocm7.13`, the shape `decode_simple_index_version` decodes for
+/// the `rocm` package) must be normalized identically to the key it's being
+/// compared against, or the `+` survives in the pin but not in the key and
+/// the two never match.
+fn slugify_like_runtime_key(pin: &str) -> String {
+    pin.chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
 fn key_matches_pin(runtime_key: &str, pin: &str) -> bool {
     let pin_is_all_digits = !pin.is_empty() && pin.bytes().all(|b| b.is_ascii_digit());
     if !pin_is_all_digits
         && (key_contains_delimited_token(runtime_key, pin)
-            || key_contains_delimited_token(runtime_key, &pin.replace('.', "-")))
+            || key_contains_delimited_token(runtime_key, &slugify_like_runtime_key(pin)))
     {
         return true;
     }
@@ -1578,6 +1595,21 @@ runtime release-wheel-multi-arch-7-13-0a20260605 format=wheel channel=release st
         assert!(!key_matches_pin(
             "release-wheel-multi-arch-9-0-0-aa7130bbccddeeff",
             "7"
+        ));
+    }
+
+    #[test]
+    fn version_pin_with_local_version_suffix_matches_its_slugified_key() {
+        // A pin carrying a `+`-style local-version suffix (the shape
+        // `decode_simple_index_version` decodes for the "rocm" package, e.g.
+        // `7.13.0+rocm7.13`) used to only have its `.` normalized to `-`
+        // before comparison, leaving the `+` in place -- but `slugify`
+        // (which built this runtime key) maps *every* non-alphanumeric byte
+        // to `-`, so the un-normalized `+` never matched and the pin fell
+        // through to Install on every run despite already being satisfied.
+        assert!(key_matches_pin(
+            "release-wheel-gfx94x-dcgpu-7-13-0-rocm7-13",
+            "7.13.0+rocm7.13"
         ));
     }
 
