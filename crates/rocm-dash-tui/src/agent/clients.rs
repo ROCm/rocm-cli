@@ -1356,7 +1356,10 @@ mod tests {
             panic!("expected new_with_env to fall back to USERPROFILE when HOME is unset: {e}");
         }
 
-        let expected_dir = profile_root.join(".rocm").join("data").join("chatgpt-tokens");
+        let expected_dir = profile_root
+            .join(".rocm")
+            .join("data")
+            .join("chatgpt-tokens");
         assert!(
             expected_dir.is_dir(),
             "new_with_env must create the token dir under USERPROFILE when HOME is unset: {}",
@@ -2695,8 +2698,7 @@ mod tests {
     /// only drives the bare helper function and proves nothing about whether
     /// `complete()` actually calls it.
     #[tokio::test]
-    async fn chatgpt_agent_client_complete_rejects_temperature_and_top_p_before_any_wire_request()
-    {
+    async fn chatgpt_agent_client_complete_rejects_temperature_and_top_p_before_any_wire_request() {
         use rig::test_utils::RecordingHttpClient;
 
         let http_client = RecordingHttpClient::new(Vec::new());
