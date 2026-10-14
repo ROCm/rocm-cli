@@ -6576,6 +6576,10 @@ pub(crate) fn chat_tool_approval_request(
         else {
             bail!("ROCm command tool is read-only and does not need approval");
         };
+        // `pending_title` is deliberately short (e.g. "Install driver"); don't
+        // read that as all the approver sees. The full `rocm` argv rides
+        // along via `display_command` below and is what the approval body
+        // actually renders (see `dash_seam.rs`'s `RocmToolExecutor::execute`).
         return Ok(ChatToolApprovalRequest {
             pending_title,
             command_title,
@@ -6626,6 +6630,9 @@ pub(crate) fn chat_tool_approval_request(
         "watcher_disable" => ("Disable automation", "Automations"),
         other => bail!("ROCm tool `{other}` is read-only or unsupported for approval"),
     };
+    // Same as the `rocm_command` arm above: `pending_title` is short by
+    // design — the full command line rides along in `display_command` and
+    // is what the approval body renders, not just this title.
     Ok(ChatToolApprovalRequest {
         pending_title: pending_title.to_owned(),
         command_title: command_title.to_owned(),
