@@ -20,8 +20,8 @@ use super::{ActiveTab, AppState, Modal};
 
 /// Convert a displayed position to the target's own offset units. Dock logs are
 /// tail-anchored, so their displayed top-to-bottom position is inverted.
-fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
-    if h.target == ScrollTarget::DockLogs {
+const fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
+    if h.target.is_tail_anchored() {
         h.max_position().saturating_sub(displayed)
     } else {
         displayed
@@ -29,14 +29,17 @@ fn target_offset(h: &ScrollbarHandle, displayed: usize) -> usize {
 }
 
 fn target_position(state: &AppState, h: &ScrollbarHandle) -> usize {
-    let position = match h.target {
+    let raw = match h.target {
         ScrollTarget::Console => usize::from(state.console_scroll),
         ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
         ScrollTarget::Chat => usize::from(state.chat_scroll),
-        ScrollTarget::DockLogs => h
-            .max_position()
-            .saturating_sub(usize::from(state.dock_logs_scroll)),
+        ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
         ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
+    };
+    let position = if h.target.is_tail_anchored() {
+        h.max_position().saturating_sub(raw)
+    } else {
+        raw
     };
     position.min(h.max_position())
 }
@@ -460,6 +463,24 @@ mod tests {
         }
     }
 
+    /// The one `AppState` field each `ScrollTarget` variant owns, read
+    /// directly (no inversion) — the canonical oracle every test that needs
+    /// "whatever field this target writes/reads" should call, instead of
+    /// re-deriving it with an ad hoc `if target == ScrollTarget::Foo` that
+    /// only distinguishes the couple of variants that one test happens to
+    /// exercise. An exhaustive `match`, no wildcard arm: see
+    /// `scroll_target_variants_round_trip_through_dispatch`'s doc comment for
+    /// why that matters.
+    fn canonical_field(state: &AppState, target: ScrollTarget) -> usize {
+        match target {
+            ScrollTarget::Console => usize::from(state.console_scroll),
+            ScrollTarget::ConsoleH => usize::from(state.console_hscroll),
+            ScrollTarget::Chat => usize::from(state.chat_scroll),
+            ScrollTarget::DockLogs => usize::from(state.dock_logs_scroll),
+            ScrollTarget::InstanceDetail => usize::from(state.instance_detail_scroll),
+        }
+    }
+
     #[test]
     fn scrollbar_position_maps_proportionally() {
         let h = ScrollbarHandle {
@@ -680,19 +701,11 @@ mod tests {
             let down = wheel(MouseEventKind::Down(MouseButton::Left), 60, 4);
             let action = resolve_mouse(down, &s);
             apply_action(&mut s, action);
-            let before = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let before = canonical_field(&s, target);
             let drag = wheel(MouseEventKind::Drag(MouseButton::Left), 60, 4);
             let action = resolve_mouse(drag, &s);
             apply_action(&mut s, action);
-            let after = if target == ScrollTarget::DockLogs {
-                s.dock_logs_scroll
-            } else {
-                s.console_scroll
-            };
+            let after = canonical_field(&s, target);
             assert_eq!(after, before, "stationary {target:?} drag moved");
         }
     }
@@ -902,5 +915,71 @@ mod tests {
         s.apply_scroll_grab(ScrollTarget::Chat, 20, 0);
         assert_eq!(s.chat_scroll, 20);
         assert!(s.chat_follow, "dragging to the bottom restores follow");
+    }
+
+    /// Issue #645 (ROCMAI-483 residual risk): `target_position` (this file,
+    /// reads the current offset) and `apply_scroll_grab` (`mod.rs`, writes a
+    /// new one) each `match` exhaustively over `ScrollTarget`, so the
+    /// compiler already forces a new arm in both the moment a variant is
+    /// added. That proves nothing about whether the two arms *agree* — a
+    /// typo'd field in one arm still compiles as long as its own match is
+    /// exhaustive. This test binds both sides to the one canonical
+    /// field-per-variant table, `canonical_field` (above, shared with
+    /// `stationary_thumb_drag_preserves_logical_position`), which is itself
+    /// an exhaustive `match` with no wildcard arm: adding a `ScrollTarget`
+    /// variant without adding a case there fails to compile. Iterates
+    /// `ScrollTarget::ALL` rather than its own copy of the variant list — see
+    /// that const's doc comment for why it's a convention, not a second
+    /// compiler guarantee, and why having one shared list beats each call
+    /// site re-typing (and risking drifting) its own.
+    #[test]
+    fn scroll_target_variants_round_trip_through_dispatch() {
+        const POS: usize = 7;
+        // Large enough that `max_position()` (`content_len - viewport_len`)
+        // comfortably exceeds `POS`, so `DockLogs`'s inversion in
+        // `target_position` doesn't saturate the subtraction to 0.
+        const CONTENT_LEN: usize = 100;
+        const VIEWPORT_LEN: usize = 10;
+
+        for target in ScrollTarget::ALL {
+            let mut s = AppState::new("t".into(), "default-dark".into());
+            // Chat's write is clamped to `chat_max_scroll` (default 0); every
+            // other target's field is an unclamped raw offset.
+            s.chat_max_scroll = u16::try_from(POS).unwrap();
+
+            // Write side: through the real dispatch path (`actions.rs`'s
+            // `KeyAction::ScrollGrab` arm → `apply_scroll_grab`), not a
+            // direct call — a future special case added only in `actions.rs`
+            // would otherwise go unexercised.
+            apply_action(&mut s, KeyAction::ScrollGrab(target, POS, 0));
+            assert_eq!(
+                canonical_field(&s, target),
+                POS,
+                "ScrollGrab({target:?}, {POS}, _) through apply_action didn't \
+                 reach the field this test treats as canonical for it"
+            );
+
+            // Read side: `target_position` must report back the same
+            // position it was just given, undoing `DockLogs`'s tail-anchored
+            // inversion for everything else and applying it for `DockLogs`.
+            let h = ScrollbarHandle {
+                track: Rect::new(0, 0, 1, 1),
+                horizontal: false,
+                content_len: CONTENT_LEN,
+                viewport_len: VIEWPORT_LEN,
+                target,
+            };
+            let expected_displayed = if target.is_tail_anchored() {
+                h.max_position().saturating_sub(POS)
+            } else {
+                POS
+            };
+            assert_eq!(
+                target_position(&s, &h),
+                expected_displayed,
+                "target_position({target:?}) disagreed with the field \
+                 apply_scroll_grab just wrote for it"
+            );
+        }
     }
 }
