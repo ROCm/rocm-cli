@@ -221,11 +221,37 @@ while [[ "${first_poll}" -eq 1 ]] || [[ "${SECONDS}" -lt "${deadline}" ]]; do
     # mirrors them into the PowerShell reclaims under an xtask contract test,
     # and self-tests them against decoy processes. A second matcher in CI is how
     # the original `pkill -f` patterns drifted.
-    if bash "${RECLAIM_SCRIPT}" --assert-clear; then
+    #
+    # BOUNDED by `timeout`, like every rocm-smi call above and for a sharper
+    # reason. `--assert-clear` walks /proc/[0-9]*/cmdline and READS each entry;
+    # a process wedged in uninterruptible sleep (D-state) can block that read,
+    # and a wedged GPU process is precisely the condition this gate fires on.
+    # The hang risk is CORRELATED with what is being detected, not independent
+    # of it — so the one run that most needs a ceiling is the one that would
+    # otherwise ride to the job's own cap, which is the failure this whole
+    # script exists to replace with a fast, named reason.
+    #
+    # A TIMEOUT FAILS THE GATE. A scan that could not finish is not evidence
+    # the host is clear; passing on it would turn a hang into a silent green on
+    # exactly the hosts #446 is about. `timeout` reports expiry as exit 124,
+    # which is why the status is captured rather than tested with `if`: the
+    # three outcomes — clear, survivor named, never finished — have to be told
+    # apart, and reporting the third as either of the others misdescribes it.
+    assert_rc=0
+    timeout 15 bash "${RECLAIM_SCRIPT}" --assert-clear || assert_rc=$?
+    if [[ "${assert_rc}" -eq 0 ]]; then
       exit 0
     fi
-    echo "::error::GPU preflight failed: the GPU has ${MIN_FREE_GIB}+ GiB free but a leaked E2E engine process is still holding it (listed above). The free-memory floor cannot see this: against this pool it only trips near exhaustion — see #446."
-    bash "${RECLAIM_SCRIPT}" --report-holders || true
+    if [[ "${assert_rc}" -eq 124 ]]; then
+      echo "::error::GPU preflight failed: the leaked-process scan (reclaim-gpu.sh --assert-clear) did not finish within 15s and was timed out — the host could NOT be shown clear. A process stuck in uninterruptible sleep blocks the /proc read this scan makes, which is the state a wedged GPU process is in, so this fails rather than passes."
+    else
+      echo "::error::GPU preflight failed: the GPU has ${MIN_FREE_GIB}+ GiB free but a leaked E2E engine process is still holding it (listed above). The free-memory floor cannot see this: against this pool it only trips near exhaustion — see #446."
+    fi
+    # Bounded for the same reason, and on this path more sharply: having just
+    # learned the scan can stall, an unbounded diagnostic would spend the
+    # ceiling the bound above just saved. The rocm-smi call inside the reclaim
+    # is already bounded there; its own /proc walk is what this bounds.
+    timeout 15 bash "${RECLAIM_SCRIPT}" --report-holders || true
     exit 1
   fi
   reason="${pool} never dropped below the floor: only $((free / 1024 / 1024 / 1024)) GiB free (< ${MIN_FREE_GIB} GiB) — a serve is likely still holding the GPU"
@@ -235,6 +261,8 @@ done
 echo "::error::GPU preflight failed after ${CEILING_SECS}s: ${reason}"
 # Name what is holding the card instead of leaving the next reader to
 # reconstruct it: --report-holders prints per-process VRAM and the engine
-# processes visible here. Never fails the step itself.
-bash "${RECLAIM_SCRIPT}" --report-holders || true
+# processes visible here. Never fails the step itself, and bounded like the
+# gate above: a wedged holder is the likeliest reason this path was reached at
+# all, and a diagnostic that hangs costs the fast failure it was printing for.
+timeout 15 bash "${RECLAIM_SCRIPT}" --report-holders || true
 exit 1
