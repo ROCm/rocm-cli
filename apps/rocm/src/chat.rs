@@ -56,7 +56,7 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-enum ChatRocmCommandAction {
+pub(crate) enum ChatRocmCommandAction {
     ReadOnly(Vec<String>),
     Approval {
         args: Vec<String>,
@@ -2428,7 +2428,29 @@ fn render_services_tool_result_text(records: &[ManagedServiceRecord]) -> String 
     output
 }
 
-fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmCommandAction> {
+/// The chat action for `rocm install driver`. Where the command only reports
+/// (`only_reports`, the same decision the command itself makes) it is a
+/// read-only call with no `--yes`; elsewhere it needs approval and carries
+/// `--yes`.
+pub(crate) fn chat_install_driver_action(
+    mut args: Vec<String>,
+    only_reports: bool,
+) -> ChatRocmCommandAction {
+    if only_reports {
+        args.retain(|arg| arg != "--yes");
+        return ChatRocmCommandAction::ReadOnly(args);
+    }
+    ensure_flag(&mut args, "--yes");
+    ChatRocmCommandAction::Approval {
+        args,
+        pending_title: "Install driver".to_owned(),
+        command_title: "Install".to_owned(),
+    }
+}
+
+pub(crate) fn chat_rocm_command_action_from_args(
+    mut args: Vec<String>,
+) -> Result<ChatRocmCommandAction> {
     canonicalize_chat_rocm_command(&mut args)?;
     validate_chat_rocm_command_safety(&args)?;
     let first = args.first().map(|value| value.to_ascii_lowercase());
@@ -2509,14 +2531,10 @@ fn chat_rocm_command_action_from_args(mut args: Vec<String>) -> Result<ChatRocmC
                 command_title: "Install".to_owned(),
             })
         }
-        Some("install") if second.as_deref() == Some("driver") => {
-            ensure_flag(&mut args, "--yes");
-            Ok(ChatRocmCommandAction::Approval {
-                args,
-                pending_title: "Install driver".to_owned(),
-                command_title: "Install".to_owned(),
-            })
-        }
+        Some("install") if second.as_deref() == Some("driver") => Ok(chat_install_driver_action(
+            args,
+            crate::driver_install::host_install_driver_only_reports(),
+        )),
         Some("update") if args.iter().any(|arg| arg == "--apply") => {
             ensure_flag(&mut args, "--yes");
             Ok(ChatRocmCommandAction::Approval {
@@ -3754,6 +3772,20 @@ fn run_rocm_read_only_in_process(paths: &AppPaths, args: &[String]) -> Result<St
                 && subcommand.eq_ignore_ascii_case("status") =>
         {
             render_setup_status_text(paths, &config)
+        }
+        // `install driver` is a read-only call where the command only reports
+        // (`chat_install_driver_action`). It runs as a dry run that never
+        // executes anything, so a call that reaches it elsewhere cannot change
+        // the host either.
+        [command, subcommand, rest @ ..]
+            if command.eq_ignore_ascii_case("install")
+                && subcommand.eq_ignore_ascii_case("driver")
+                && rest.iter().all(|arg| arg.eq_ignore_ascii_case("--dkms")) =>
+        {
+            let dkms = !rest.is_empty();
+            crate::driver_install::install_driver(paths, dkms, false, true)
+                .map(|result| result.output)
+                .map_err(|error| error.source)
         }
         _ => bail!(
             "unsupported in-process read-only rocm command: {}",
@@ -6103,6 +6135,32 @@ model recipes
                 .pointer("/structuredContent/action/has_placeholders")
                 .and_then(serde_json::Value::as_bool),
             Some(true)
+        );
+    }
+
+    /// On Windows `rocm install driver` only reports, and chat plans it as a
+    /// read-only call. That call must run in process: before this arm existed it
+    /// failed with "unsupported in-process read-only rocm command". It is a dry
+    /// run, so it never executes anything on any platform.
+    #[test]
+    fn install_driver_read_only_call_runs_in_process() {
+        let (_root, paths) = test_paths("install-driver-in-process");
+        let args = vec!["install".to_owned(), "driver".to_owned()];
+        let text = run_rocm_read_only_in_process(&paths, &args)
+            .expect("the read-only install driver call should run in process");
+        assert!(text.contains("approval:"), "{text}");
+        assert!(!text.contains("driver install completed"), "{text}");
+        assert!(
+            run_rocm_read_only_in_process(
+                &paths,
+                &[
+                    "install".to_owned(),
+                    "driver".to_owned(),
+                    "--yes".to_owned()
+                ]
+            )
+            .is_err(),
+            "a flag the read-only path does not know is still refused"
         );
     }
 

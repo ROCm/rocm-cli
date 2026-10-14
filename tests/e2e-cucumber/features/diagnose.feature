@@ -621,3 +621,15 @@ Feature: Diagnosing failures and listing fixes
     Then the diagnosis names the architecture and says Vulkan still works
     And that cause offers no fix to apply, and says so
     And no cause tells this user to install the HIP SDK
+
+  # On Windows an AMD display driver dated before 27 July 2023 gets advice, not a
+  # finding: the entry scores below the match threshold. The scenario names no
+  # driver. It holds `diagnose` to what `rocm examine --json` reports on the same
+  # machine, so it passes with a current driver (no advice) and with an old one
+  # (advice present). The old-driver branch needs such a machine and is not
+  # exercised here.
+  @id:diagnose-windows-display-driver-advice-follows-the-inspection @requires-os:windows @requires-gpu
+  Scenario: diagnose-41 - On Windows the diagnosis agrees with the inspection about the old display driver
+    Given a machine with an AMD GPU
+    When the user diagnoses this machine in machine-readable form, with no symptom
+    Then the diagnosis offers the old display driver advice only when the inspection reports an old driver
