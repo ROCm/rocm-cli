@@ -999,23 +999,7 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
                 continue;
             }
             let step = step_block(&lines, i);
-            // `name:` is either the item's own first key (`- name: …`) or one
-            // of its sibling keys, two columns in from the dash.
-            let name = step
-                .lines()
-                .find_map(|l| {
-                    let key_line = if indent_of(l) == item_indent {
-                        l.trim_start().strip_prefix("- ")?
-                    } else if indent_of(l) == item_indent + 2 {
-                        l.trim_start()
-                    } else {
-                        return None;
-                    };
-                    key_line.strip_prefix("name:")
-                })
-                .map(|value| strip_quotes(strip_comment(value).trim()))
-                .unwrap_or_default();
-            steps.push((name, step));
+            steps.push((step_name(&step), step));
         }
         Some(steps)
     }
@@ -1400,6 +1384,30 @@ trigger-a-workflow#triggering-a-workflow-from-a-workflow"
             log.contains("could not list this run's artifacts"),
             "an API failure must say so rather than fail silently:\n{log}"
         );
+    }
+
+    /// The `name:` of `step`, a block as `step_block` returns it (its first
+    /// line is the step's `- ` item line); empty when the step has none.
+    ///
+    /// `name:` is either the item's own first key (`- name: …`) or one of its
+    /// sibling keys, two columns in from the dash. Keys any deeper — a `with:`
+    /// input called `name`, a `name:` line inside the step's script — are not
+    /// the step's name.
+    fn step_name(step: &str) -> String {
+        let item_indent = step.lines().next().map_or(0, indent_of);
+        step.lines()
+            .find_map(|l| {
+                let key_line = if indent_of(l) == item_indent {
+                    l.trim_start().strip_prefix("- ")?
+                } else if indent_of(l) == item_indent + 2 {
+                    l.trim_start()
+                } else {
+                    return None;
+                };
+                key_line.strip_prefix("name:")
+            })
+            .map(|value| strip_quotes(strip_comment(value).trim()))
+            .unwrap_or_default()
     }
 
     /// Every `GPU preflight` step block in `text`, in file order.
@@ -4884,22 +4892,7 @@ permissions:
                 continue;
             };
             let step = step_block(&lines, start);
-            let item_indent = indent_of(lines[start]);
-            let name = step
-                .lines()
-                .find_map(|l| {
-                    let key_line = if indent_of(l) == item_indent {
-                        l.trim_start().strip_prefix("- ")?
-                    } else if indent_of(l) == item_indent + 2 {
-                        l.trim_start()
-                    } else {
-                        return None;
-                    };
-                    key_line.strip_prefix("name:")
-                })
-                .map(|value| strip_quotes(strip_comment(value).trim()))
-                .unwrap_or_default();
-            steps.push((name, step));
+            steps.push((step_name(&step), step));
         }
         steps
     }
