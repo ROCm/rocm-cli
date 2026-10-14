@@ -9387,6 +9387,22 @@ fn append_examine_engine_inventory(
     }
 }
 
+/// The per-hardware-group heading in `rocm model`, carrying the "this is the
+/// box you are on" marker when the group matches the detected host GPU.
+///
+/// Split out of [`render_model_registry_text_with_context_and_host`] only so
+/// the marked branch is reachable from a test. Taking it in situ needs a host
+/// whose real gfx target matches a catalog platform, which the default no-GPU
+/// CI lane never provides — leaving the marker (`←` before ROCMAI-543) as the
+/// one ASCII conversion on this surface that nothing guards.
+fn model_catalog_platform_heading(label: &str, your_gpu: bool) -> String {
+    if your_gpu {
+        format!("{label} <- your GPU")
+    } else {
+        label.to_owned()
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn render_model_registry_text_with_context_and_host(
     _paths: Option<&AppPaths>,
@@ -9433,11 +9449,7 @@ pub(crate) fn render_model_registry_text_with_context_and_host(
         let your_gpu = host_gfx_family
             .as_deref()
             .is_some_and(|family| platform_matches_gfx_family(platform, family));
-        let heading = if your_gpu {
-            format!("{} <- your GPU", platform.label)
-        } else {
-            platform.label.clone()
-        };
+        let heading = model_catalog_platform_heading(&platform.label, your_gpu);
         let _ = writeln!(output, "\n{heading}");
         for recipe in group {
             // Show the canonical Hugging Face id (the reliable serve target) and
@@ -26136,6 +26148,28 @@ install therock";
         );
         let _ = fs::remove_dir_all(root);
         Ok(())
+    }
+
+    #[test]
+    fn model_catalog_platform_heading_marks_the_host_gpu_in_ascii() {
+        assert_eq!(
+            model_catalog_platform_heading("AMD Instinct - MI300X", false),
+            "AMD Instinct - MI300X",
+            "an unmatched platform heading is the bare label"
+        );
+
+        // ROCMAI-543: this marker was `←` (U+2190), which a Windows console on
+        // the OEM code page renders as mojibake. `render_model_registry_text_*`
+        // only reaches this branch on a host whose real gfx target matches a
+        // catalog platform, so the default no-GPU CI lane never covers it.
+        // Asserting the exact string (not `contains`) is what makes a revert of
+        // the punctuation alone fail, which a substring check would not.
+        let marked = model_catalog_platform_heading("AMD Instinct - MI300X", true);
+        assert_eq!(marked, "AMD Instinct - MI300X <- your GPU");
+        assert!(
+            marked.is_ascii(),
+            "the host-GPU marker must be ASCII (ROCMAI-543): {marked}"
+        );
     }
 
     /// ROCMAI-543: the clap doc comments are the largest single surface of
