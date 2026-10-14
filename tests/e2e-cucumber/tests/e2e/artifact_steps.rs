@@ -42,22 +42,6 @@ fn xtask_command() -> Command {
     }
 }
 
-fn rocmd_binary() -> PathBuf {
-    let configured = std::env::var_os("ROCM_CLI_ROCMD_BINARY").unwrap_or_else(|| {
-        panic!(
-            "this rocmd-backed scenario requires ROCM_CLI_ROCMD_BINARY; when using a prebuilt \
-             ROCM_CLI_BINARY, provide the matching prebuilt rocmd path explicitly"
-        )
-    });
-    let configured = PathBuf::from(configured);
-    configured.canonicalize().unwrap_or_else(|error| {
-        panic!(
-            "failed to resolve ROCM_CLI_ROCMD_BINARY {}: {error}",
-            configured.display()
-        )
-    })
-}
-
 fn signed_index_paths(world: &E2eWorld) -> (PathBuf, PathBuf, PathBuf) {
     let root = root(world);
     (
@@ -71,7 +55,7 @@ fn run_rocmd(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
     let (index, signature, public_key) = signed_index_paths(world);
     let empty_path = root(world).join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("failed to create isolated PATH directory");
-    let mut command = Command::new(rocmd_binary());
+    let mut command = Command::new(crate::rocmd_binary());
     command.args(args);
     world.isolate_cmd(&mut command);
     // Force the documented restricted-native fallback so this scenario has the
@@ -92,7 +76,7 @@ fn run_rocmd(world: &E2eWorld, args: &[&str]) -> (String, String, i32) {
 async fn signed_direct_download_fixture(world: &mut E2eWorld) {
     // Fail before fixture setup when a prebuilt-mode caller selected this
     // rocmd-backed scenario without supplying its explicit harness contract.
-    let _ = rocmd_binary();
+    let _ = crate::rocmd_binary();
     let served = root(world).join("served-artifacts");
     std::fs::create_dir_all(&served).expect("failed to create served artifact directory");
     std::fs::write(served.join("artifact.bin"), ARTIFACT_BYTES)

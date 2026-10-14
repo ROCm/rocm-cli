@@ -248,6 +248,9 @@ rocm services stop <service-id> --yes
 rocm services restart <service-id> --yes
 ```
 
+`restart` starts the server again only once its stop has confirmed every
+recorded process gone; otherwise it reports that and starts nothing.
+
 Then delete a record you no longer want. Removal is destructive and cannot be
 undone, so read the log first:
 

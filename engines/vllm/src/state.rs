@@ -121,6 +121,10 @@ pub(crate) fn write_running_state(
     runtime: &VllmRuntime,
     pid: u32,
 ) -> Result<()> {
+    // Kernel start-time of the launcher PID, captured while it is alive. Paired
+    // with `pid`, it identifies this exact process across PID recycling so a
+    // later stop never signals a reused PID.
+    let start_ticks = rocm_core::process_start_ticks(pid);
     write_state(
         &request.state_path,
         &json!({
@@ -142,10 +146,11 @@ pub(crate) fn write_running_state(
             "engine_recipe_required_flags": crate::process::engine_recipe_launch_args(request.engine_recipe.as_ref()),
             "therock_runtime_env": therock_runtime_env_state(runtime),
             "started_at_unix_ms": current_unix_millis(),
-            // Kernel start-time of the launcher PID, captured while it is alive.
-            // Paired with `pid`, it identifies this exact process across PID
-            // recycling so a later stop never signals a reused PID.
-            "start_ticks": rocm_core::process_start_ticks(pid)
+            "start_ticks": start_ticks,
+            // `server_pid` is the same process, so the same token. `rocm-core`
+            // pairs `server_pid` with this key, so it must be written too —
+            // without it the server PID is adopted with no token at all.
+            "server_start_ticks": start_ticks
         }),
     )
 }
@@ -489,11 +494,16 @@ mod tests {
             rocm_sdk_version: None,
         };
 
-        write_running_state(&request, &runtime, 12345)?;
+        // A live PID, so the identity tokens below are real values on Linux.
+        let pid = std::process::id();
+        write_running_state(&request, &runtime, pid)?;
         let state = read_service_state(&state_path)?;
         fs::remove_file(&state_path).ok();
 
-        assert_eq!(state.get("server_pid").and_then(Value::as_u64), Some(12345));
+        assert_eq!(
+            state.get("server_pid").and_then(Value::as_u64),
+            Some(u64::from(pid))
+        );
         assert_eq!(
             state.get("runtime_id").and_then(Value::as_str),
             Some("therock-release:gfx120X-all")
@@ -527,8 +537,20 @@ mod tests {
                 .and_then(Value::as_array)
                 .is_some_and(|paths| !paths.is_empty())
         );
-        // The identity token must be recorded so a later stop can verify it.
+        // The identity token must be recorded so a later stop can verify it —
+        // under both PID keys, since `server_pid` is the same process and is
+        // the one `rocm-core` adopts, together with `server_start_ticks`.
         assert!(state.get("start_ticks").is_some());
+        assert!(state.get("server_start_ticks").is_some());
+        assert_eq!(state.get("server_start_ticks"), state.get("start_ticks"));
+        #[cfg(target_os = "linux")]
+        assert!(
+            state
+                .get("server_start_ticks")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "a live PID has a token on Linux"
+        );
         Ok(())
     }
     #[test]

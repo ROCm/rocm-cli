@@ -632,6 +632,10 @@ rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
+`restart` starts a server again only once its stop has confirmed that every
+recorded process is gone; if the stop cannot confirm that, it says so, starts
+nothing, and leaves the stop request recorded.
+
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
