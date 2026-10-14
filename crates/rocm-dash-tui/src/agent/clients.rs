@@ -1278,10 +1278,16 @@ mod tests {
 
     /// Pins `new`'s wiring into `token_dir_from_home` deterministically: two
     /// distinct, freshly-generated temp directories stand in for `$HOME` and
-    /// `$USERPROFILE`, so a swap at `new`'s call site (or a typo'd var name)
-    /// is caught on every host, unlike the real-environment test above,
-    /// which can't tell a swap apart from a correct call wherever only one
-    /// of the two is ever set.
+    /// `$USERPROFILE`, so a swap at `new`'s call site is caught on every
+    /// host, unlike the real-environment test above, which can't tell a swap
+    /// apart from a correct call wherever only one of the two is ever set.
+    ///
+    /// This always supplies `HOME`, so it cannot catch a typo'd
+    /// `"USERPROFILE"` lookup key: `token_dir_from_home`'s own precedence
+    /// means the fallback value is never read when `HOME` is set, so the
+    /// wrong key and the right key produce the same directory here. See
+    /// `chatgpt_new_with_env_falls_back_to_userprofile_when_home_is_unset`
+    /// below for that case.
     #[test]
     fn chatgpt_new_with_env_derives_token_dir_from_distinct_home_and_userprofile() {
         let home_root = fresh_token_dir("new-with-env-home");
@@ -1316,6 +1322,45 @@ mod tests {
         assert!(
             !profile_root.join(".rocm").exists(),
             "new_with_env must not have written anything under USERPROFILE when HOME is set"
+        );
+    }
+
+    /// Companion to the test above: that one always supplies `HOME`, so the
+    /// `USERPROFILE` fallback through `new_with_env` is never taken, and a
+    /// typo'd `"USERPROFILE"` lookup key at the call site goes undetected
+    /// (the lookup falls through to `None`, same as the untouched key would
+    /// when `HOME` already satisfies `token_dir_from_home`). This sets
+    /// `HOME` to `None` and `USERPROFILE` to a distinct, freshly-generated
+    /// temp directory, so the fallback path itself — and a typo in the
+    /// `USERPROFILE` lookup key — are both exercised and caught: a typo
+    /// makes the lookup return `None` for both variables, which
+    /// `token_dir_from_home` rejects.
+    #[test]
+    fn chatgpt_new_with_env_falls_back_to_userprofile_when_home_is_unset() {
+        let profile_root = fresh_token_dir("new-with-env-profile-only");
+        let _cleanup_profile = TokenDirGuard(profile_root.clone());
+
+        let profile_os = profile_root.clone().into_os_string();
+        let result = ChatGptAgentClient::new_with_env(
+            move |k| match k {
+                "USERPROFILE" => Some(profile_os.clone()),
+                _ => None,
+            },
+            None,
+            InferenceParams::default(),
+            |_, _| panic!("device-code callback must not fire during construction"),
+            None,
+            None,
+        );
+        if let Err(e) = &result {
+            panic!("expected new_with_env to fall back to USERPROFILE when HOME is unset: {e}");
+        }
+
+        let expected_dir = profile_root.join(".rocm").join("data").join("chatgpt-tokens");
+        assert!(
+            expected_dir.is_dir(),
+            "new_with_env must create the token dir under USERPROFILE when HOME is unset: {}",
+            expected_dir.display()
         );
     }
 
@@ -2642,6 +2687,49 @@ mod tests {
             }
             other => panic!("expected ChatApprovalRequired, got {other:?}"),
         }
+    }
+
+    /// Pins that `ChatGptAgentClient::complete`'s own call site forwards
+    /// `&self.params` into `validate_chatgpt_inference_params` and rejects
+    /// before any wire request — `chatgpt_rejects_temperature_and_top_p_together`
+    /// only drives the bare helper function and proves nothing about whether
+    /// `complete()` actually calls it.
+    #[tokio::test]
+    async fn chatgpt_agent_client_complete_rejects_temperature_and_top_p_before_any_wire_request()
+    {
+        use rig::test_utils::RecordingHttpClient;
+
+        let http_client = RecordingHttpClient::new(Vec::new());
+        let chatgpt_client = rig::providers::chatgpt::Client::builder()
+            .api_key("test-access-token")
+            .http_client(http_client.clone())
+            .build()
+            .expect("build client over the recording HTTP double");
+
+        let client = ChatGptAgentClient {
+            client: chatgpt_client,
+            model: "test-model".to_string(),
+            preamble: TEST_PREAMBLE.to_string(),
+            params: InferenceParams {
+                temperature: Some(0.4),
+                top_p: Some(0.5),
+                max_tokens: None,
+            },
+            executor: None,
+            approval_tx: None,
+        };
+
+        let history = [ChatTurn::user("check gpu 0")];
+        let err = client
+            .complete(&history, fixture_snapshot())
+            .await
+            .expect_err("mutually exclusive temperature/top_p must be rejected");
+        assert!(matches!(err, AgentError::Build(_)));
+        assert!(err.to_string().contains("either temperature or top_p"));
+        assert!(
+            http_client.requests().is_empty(),
+            "complete() must reject before sending any request to the wire"
+        );
     }
 
     /// Live round-trip against Anthropic's Claude API. NOT run in CI (network +
