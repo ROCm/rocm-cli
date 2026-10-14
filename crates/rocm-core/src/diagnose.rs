@@ -577,6 +577,19 @@ fn finalize(id: &str, title: &str, score: i32, evidence: Vec<String>, fix: Fix) 
     }
 }
 
+/// Like [`finalize`], for a diagnosis that explains a cause but has no
+/// automated remediation to offer -- `rocm fix` has nothing to run for it, so
+/// `render_report_text` skips the `apply with:` line for it accordingly.
+fn finalize_informational(id: &str, title: &str, score: i32, evidence: Vec<String>) -> Diagnosis {
+    Diagnosis {
+        id: id.to_owned(),
+        title: title.to_owned(),
+        score: score.min(100),
+        evidence,
+        fix: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-misconfiguration checkers (1:1 with diagnose.py)
 //
@@ -1390,27 +1403,40 @@ fn check_13_hip_sdk_missing(e: &Examination, symptom: &str) -> Diagnosis {
     let mut score = 0;
     let mut evidence = Vec::new();
     let sdk_path = &e.hip_sdk_path;
-    if sdk_path.is_empty() {
-        score += 35;
-        evidence.push("No HIP SDK install found under C:\\Program Files\\AMD\\ROCm".to_owned());
-    } else if !e.hipinfo_present {
-        score += 30;
-        evidence.push(format!(
-            "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
-        ));
-    }
-    // Skipped for a managed runtime for the reason this checker's own note
-    // already gives: those wheels bring their own HIP runtime, so a missing
-    // system HIP SDK is not evidence against them.
-    if e.has_amd_gpu
+
+    // A missing or broken HIP SDK is only evidence of a fault when something on
+    // this host actually calls into HIP: an ambient PyTorch HIP build, or a
+    // llama.cpp binary built with GGML_HIP=ON. The CLI's own default --
+    // Lemonade's bundled llama.cpp on Vulkan -- never touches the system HIP
+    // SDK, and a managed-runtime PyTorch wheel brings its own runtime too.
+    // Scoring the SDK's absence unconditionally used to rank this fix first on
+    // exactly those hosts: the ones least likely to need it.
+    let pytorch_is_ambient_hip_build = e.has_amd_gpu
         && e.framework == "pytorch"
         && e.framework_rocm_version.starts_with("hip=")
-        && e.framework_source != "managed-runtime"
-    {
-        score += 25;
-        evidence
-            .push("PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned());
+        && e.framework_source != "managed-runtime";
+    let llama_cpp_is_hip_build =
+        e.has_amd_gpu && e.framework == "llama-cpp" && e.framework_rocm_version == "GGML_HIP=ON";
+    let needs_hip = pytorch_is_ambient_hip_build || llama_cpp_is_hip_build;
+
+    if needs_hip {
+        if sdk_path.is_empty() {
+            score += 35;
+            evidence.push("No HIP SDK install found under C:\\Program Files\\AMD\\ROCm".to_owned());
+        } else if !e.hipinfo_present {
+            score += 30;
+            evidence.push(format!(
+                "HIP SDK at {sdk_path} but hipInfo.exe is missing from its bin directory"
+            ));
+        }
+        if pytorch_is_ambient_hip_build {
+            score += 25;
+            evidence.push(
+                "PyTorch is a HIP build but the HIP SDK is not present on this host".to_owned(),
+            );
+        }
     }
+
     let (kw_score, kw_ev) = keyword_score(symptom, KEYWORDS_HIP_SDK_MISSING);
     score += kw_score;
     evidence.extend(kw_ev);
@@ -2022,6 +2048,46 @@ fn check_19_shm_too_small(e: &Examination, symptom: &str) -> Diagnosis {
     finalize(ID, TITLE, score, evidence, fix)
 }
 
+/// GPU architectures confirmed to have no ROCm/HIP runtime build at all -- not
+/// "not yet detected", but parts ROCm has never shipped support for.
+///
+/// Kept short and explicit rather than inferred from
+/// `host_gpu::normalize_therock_family` returning `None`, because that also
+/// returns `None` for a gfx target this catalog simply doesn't recognize yet.
+/// Conflating "confirmed unsupported" with "unrecognized" would turn a
+/// detection gap into a false claim about the hardware.
+///
+/// This check only sees `gfx90c` at all once `host_gpu`'s PCI-id-to-gfx-target
+/// table maps the Renoir/Lucienne/Cezanne/Barcelo iGPU ids to it (ROCMAI-542);
+/// until then a real one of these hosts reports an empty `gfx_target` and this
+/// check stays silent on it, same as any other undetected GPU.
+const GFX_TARGETS_WITHOUT_ROCM_SUPPORT: &[&str] = &[
+    // Vega iGPU in Renoir / Lucienne / Cezanne / Barcelo (Ryzen 4000-5000 APUs).
+    "gfx90c",
+];
+
+fn check_20_gpu_unsupported_by_rocm(e: &Examination, _symptom: &str) -> Diagnosis {
+    const ID: &str = "info-20-gpu-no-rocm-support";
+    const TITLE: &str = "GPU has no ROCm/HIP support (Vulkan backend still works)";
+
+    let Some(gfx) = amd_gfx_targets(e)
+        .into_iter()
+        .find(|gfx| GFX_TARGETS_WITHOUT_ROCM_SUPPORT.contains(&gfx.as_str()))
+    else {
+        return zero(ID, TITLE);
+    };
+
+    finalize_informational(
+        ID,
+        TITLE,
+        60,
+        vec![format!(
+            "Detected GPU architecture {gfx} has no ROCm/HIP runtime build. \
+             Vulkan-based engines (the default Lemonade backend) still work on it."
+        )],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // WSL2 catalog
 //
@@ -2505,6 +2571,9 @@ const CHECKERS: &[Checker] = &[
     // same 64 MB default a container does, so leaving this tagged `linux` alone
     // would silence it on one of the two platforms most likely to have it.
     (check_19_shm_too_small, &["linux", "wsl"]),
+    // Not "wsl": WSL2 reports no GPU topology (`gpus` is empty), so this check
+    // has nothing to read there and would never fire.
+    (check_20_gpu_unsupported_by_rocm, &["linux", "windows"]),
 ];
 
 const WSL_ONLY: &[&str] = &["wsl"];
@@ -2733,13 +2802,15 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
             if !fix.verify.is_empty() {
                 let _ = writeln!(out, "   verify after fix: {}", fix.verify);
             }
+            // Every finding with a fix carries the command that acts on it.
+            // Previously only the summary at the end named one, and only when
+            // some match cleared HIGH_CONFIDENCE -- so a report of
+            // low-confidence matches showed ids but never said what to run,
+            // which is what sent users guessing at the ordinal. A finding with
+            // no fix (see `finalize_informational`) has nothing to apply, so
+            // it prints evidence only.
+            let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         }
-        // Every finding carries the command that acts on it. Previously only the
-        // summary at the end named one, and only when some match cleared
-        // HIGH_CONFIDENCE -- so a report of low-confidence matches showed ids but
-        // never said what to run, which is what sent users guessing at the
-        // ordinal.
-        let _ = writeln!(out, "   apply with: rocm fix {}", d.id);
         out.push('\n');
     }
 
@@ -2756,7 +2827,15 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
     }
 
     if let Some(high) = report.matched.iter().find(|d| d.score >= HIGH_CONFIDENCE) {
-        let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
+        if high.fix.is_some() {
+            let _ = writeln!(out, "Next step: run `rocm fix {}`.", high.id);
+        } else {
+            let _ = writeln!(
+                out,
+                "Next step: `{}` has no automated fix; see its evidence above.",
+                high.id
+            );
+        }
     } else if let Some(best) = report.matched.first() {
         // Below the threshold the caution still stands, but it is advice about
         // confidence -- not a reason to withhold the command. Ending here was the
@@ -2765,11 +2844,19 @@ pub fn render_report_text(report: &DiagnoseReport, top: usize) -> String {
         out.push_str(
             "Highest-scoring match is below the HIGH_CONFIDENCE threshold. Confirm one more piece of evidence before applying.\n",
         );
-        let _ = writeln!(
-            out,
-            "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
-            best.id
-        );
+        if best.fix.is_some() {
+            let _ = writeln!(
+                out,
+                "When you are ready, run `rocm fix {}` (the highest-scoring match), or use the `apply with:` line of whichever cause fits.",
+                best.id
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "`{}` has no automated fix; see its evidence above.",
+                best.id
+            );
+        }
     }
     out
 }
@@ -2919,10 +3006,11 @@ mod tests {
 
     #[test]
     fn a_managed_runtimes_hip_build_is_not_evidence_of_a_missing_hip_sdk() {
-        // The Windows-shaped sibling of the check_8 gate, and the reason
-        // check_13's own note already gives: TheRock wheels bring their own HIP
-        // runtime, so a HIP-build torch on a host with no system HIP SDK says
-        // nothing when that torch came from a managed runtime.
+        // The Windows-shaped sibling of the check_8 gate: TheRock wheels bring
+        // their own HIP runtime, so a HIP-build torch on a host with no system
+        // HIP SDK says nothing when that torch came from a managed runtime --
+        // not even the base "no system HIP SDK" evidence, since nothing on this
+        // host actually needs one.
         let windows = |source: &str| Examination {
             os_family: "windows".to_owned(),
             has_amd_gpu: true,
@@ -2933,14 +3021,241 @@ mod tests {
         };
 
         let managed = check_13_hip_sdk_missing(&windows("managed-runtime"), "");
+        assert_eq!(
+            managed.score, 0,
+            "a managed runtime's own HIP build is not evidence a system HIP SDK \
+             is missing: {managed:?}"
+        );
+
         let ambient = check_13_hip_sdk_missing(&windows("path"), "");
         assert_eq!(
-            ambient.score - managed.score,
-            25,
-            "the HIP-build clause must apply to the ambient torch and only to it \
-             (managed {}, ambient {})",
-            managed.score,
-            ambient.score
+            ambient.score, 60,
+            "the ambient build needs both the base SDK-missing evidence (35) and \
+             the HIP-build clause (25): {ambient:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence() {
+        // ROCMAI-546: the laptop that opened this ticket. A GPU with no ROCm/HIP
+        // support (gfx90c) served over Lemonade's bundled, Vulkan-built
+        // llama.cpp -- nothing on the host ever calls into HIP, so the absence
+        // of a system HIP SDK must not itself read as a fault.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            gpus: vec![Gpu {
+                name: "AMD Radeon Vega 7".to_owned(),
+                gfx_target: "gfx90c".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            // Lemonade's llama.cpp build advertises Vulkan, not HIP/ROCm.
+            framework_rocm_version: String::new(),
+            ..Examination::default()
+        };
+        let report = diagnose(&e, "");
+        assert!(
+            !report
+                .matched
+                .iter()
+                .any(|d| d.id == "fix-13-hip-sdk-missing"),
+            "fix-13 must not fire with no HIP-based setup configured: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+        let info = report
+            .matched
+            .iter()
+            .find(|d| d.id == "info-20-gpu-no-rocm-support")
+            .expect("the no-ROCm-support diagnosis must appear with the detected gfx target");
+        assert!(
+            info.evidence.iter().any(|ev| ev.contains("gfx90c")),
+            "the diagnosis must name the detected GPU architecture: {info:?}"
+        );
+        assert!(info.fix.is_none(), "this diagnosis offers no fix: {info:?}");
+        assert_eq!(
+            report.matched.first().map(|d| d.id.as_str()),
+            Some("info-20-gpu-no-rocm-support"),
+            "the no-ROCm-support diagnosis, not fix-13, must rank first: {:?}",
+            report
+                .matched
+                .iter()
+                .map(|d| (&d.id, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fix_13_still_fires_for_a_native_rocm_llama_cpp_build() {
+        // Regression guard for the other half of the acceptance criteria: a host
+        // that genuinely runs a HIP-built llama.cpp (e.g. a manual/vLLM build,
+        // as opposed to Lemonade's Vulkan one) with no system HIP SDK still gets
+        // fix-13.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: true,
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            framework_rocm_version: "GGML_HIP=ON".to_owned(),
+            ..Examination::default()
+        };
+        let finding = check_13_hip_sdk_missing(&e, "");
+        assert_eq!(
+            finding.score, 35,
+            "a HIP-built llama.cpp with no system HIP SDK must still score the base \
+             SDK-missing evidence: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn fix_13_does_not_fire_for_a_hip_built_llama_cpp_binary_with_no_amd_gpu() {
+        // A HIP/ROCm-advertising llama.cpp binary on PATH is not, by itself,
+        // evidence this host has AMD hardware to run it on -- the same reasoning
+        // `pytorch_is_ambient_hip_build` already applies. Without it, this host
+        // would get the same spurious fix-13 the Lemonade/Vulkan laptop did.
+        let e = Examination {
+            os_family: "windows".to_owned(),
+            has_amd_gpu: false,
+            framework: "llama-cpp".to_owned(),
+            framework_source: "path".to_owned(),
+            framework_rocm_version: "GGML_HIP=ON".to_owned(),
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_13_hip_sdk_missing(&e, "").score,
+            0,
+            "no AMD GPU means nothing on this host needs the HIP SDK"
+        );
+    }
+
+    #[test]
+    fn rendering_names_a_high_confidence_cause_with_no_automated_fix() {
+        // The HIGH_CONFIDENCE branch has its own fixless arm, distinct from the
+        // below-threshold one `rendering_skips_apply_with_for_a_diagnosis_with_no_fix`
+        // covers -- no catalog entry reaches HIGH_CONFIDENCE without a fix today,
+        // so this pins that arm with a synthetic one rather than leaving it
+        // unexercised.
+        let report = DiagnoseReport {
+            matched: vec![Diagnosis {
+                id: "info-fixture-high-confidence-no-fix".to_owned(),
+                title: "synthetic high-confidence, fixless cause".to_owned(),
+                score: HIGH_CONFIDENCE,
+                evidence: vec!["synthetic evidence".to_owned()],
+                fix: None,
+            }],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: Route {
+                target: "github".to_owned(),
+                url: "https://example.invalid".to_owned(),
+            },
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 5);
+        assert!(
+            out.contains("Next step:") && out.contains("has no automated fix"),
+            "a high-confidence cause with no fix must say so instead of naming a \
+             `rocm fix` command:\n{out}"
+        );
+        assert!(
+            !out.contains("apply with:") && !out.contains("rocm fix info-fixture"),
+            "no command must be offered for a cause with no fix:\n{out}"
+        );
+    }
+
+    #[test]
+    fn check_20_is_silent_without_a_confirmed_unsupported_gpu() {
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&Examination::default(), "").score,
+            0,
+            "a host with no GPUs at all must not match"
+        );
+
+        let supported = Examination {
+            gpus: vec![Gpu {
+                gfx_target: "gfx1100".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        assert_eq!(
+            check_20_gpu_unsupported_by_rocm(&supported, "").score,
+            0,
+            "a gfx target ROCm supports must not match: {:?}",
+            check_20_gpu_unsupported_by_rocm(&supported, "")
+        );
+    }
+
+    #[test]
+    fn check_20_names_the_detected_architecture_and_offers_no_fix() {
+        let e = Examination {
+            gpus: vec![Gpu {
+                gfx_target: "gfx90c".to_owned(),
+                is_amd: true,
+                ..Gpu::default()
+            }],
+            ..Examination::default()
+        };
+        let finding = check_20_gpu_unsupported_by_rocm(&e, "");
+        assert!(
+            finding.score >= MIN_SCORE_FOR_MATCH,
+            "a confirmed-unsupported GPU is a real finding: {finding:?}"
+        );
+        assert!(
+            finding.fix.is_none(),
+            "there is no fix to offer: {finding:?}"
+        );
+        assert!(
+            finding.evidence.iter().any(|ev| ev.contains("gfx90c")),
+            "the evidence must name the architecture: {finding:?}"
+        );
+    }
+
+    #[test]
+    fn rendering_skips_apply_with_for_a_diagnosis_with_no_fix() {
+        let report = DiagnoseReport {
+            matched: vec![check_20_gpu_unsupported_by_rocm(
+                &Examination {
+                    gpus: vec![Gpu {
+                        gfx_target: "gfx90c".to_owned(),
+                        is_amd: true,
+                        ..Gpu::default()
+                    }],
+                    ..Examination::default()
+                },
+                "",
+            )],
+            has_match: true,
+            min_score_for_match: MIN_SCORE_FOR_MATCH,
+            high_confidence_threshold: HIGH_CONFIDENCE,
+            route_when_no_match: Route {
+                target: "github".to_owned(),
+                url: "https://example.invalid".to_owned(),
+            },
+            out_of_scope: None,
+            model: None,
+        };
+        let out = render_report_text(&report, 5);
+        assert!(
+            !out.contains("apply with:"),
+            "a fixless diagnosis must not claim a `rocm fix` command exists:\n{out}"
+        );
+        assert!(
+            out.contains("has no automated fix"),
+            "the summary must say so instead of naming a command:\n{out}"
+        );
+        assert!(
+            out.contains("gfx90c"),
+            "the evidence must still render:\n{out}"
         );
     }
 
@@ -3921,10 +4236,12 @@ mod tests {
                 "{os}: expected at least one diagnosis to compare against the catalog"
             );
             for d in &report.matched {
-                let fix = d
-                    .fix
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("{os}/{}: matched with no fix", d.id));
+                // An informational diagnosis (see `finalize_informational`)
+                // carries no fix to compare against the catalog; this loop
+                // only checks the ones that do.
+                let Some(fix) = d.fix.as_ref() else {
+                    continue;
+                };
                 let catalog = crate::fix::class_on(&fix.fix_id, os)
                     .unwrap_or_else(|| {
                         panic!("{os}/{}: emitted a fix-id not in the catalog", fix.fix_id)
@@ -5520,8 +5837,17 @@ mod tests {
         // widely than its checker answers (a user can reach `rocm fix <id>`
         // directly, without a diagnosis), so this asserts containment rather
         // than equality.
+        //
+        // Checkers that never carry a `Fix` (see `finalize_informational`) are
+        // exempt: `render_report_text` never prints an `apply with:` line for
+        // them, so there is no dead command to guard against, and no recipe for
+        // `rocm fix` to apply.
+        const INFORMATIONAL_ONLY_CHECKER_IDS: &[&str] = &["info-20-gpu-no-rocm-support"];
         for (check, families) in CHECKERS {
             let id = check(&Examination::default(), "").id;
+            if INFORMATIONAL_ONLY_CHECKER_IDS.contains(&id.as_str()) {
+                continue;
+            }
             let applies_on = crate::fix::recipe_applies_on(&id).unwrap_or_else(|| {
                 panic!(
                     "checker id `{id}` has no recipe in the fix catalog, so the \
