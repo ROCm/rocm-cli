@@ -337,7 +337,7 @@ Feature: Interactive dashboard
   # ADOPT_SCENARIO_CHILD's doc comment). The space is in the child's name,
   # not the scenario's own cwd — it exercises the browser's whitespace
   # rendering; a whitespace path through spawn_in itself remains follow-up
-  # work for #500.
+  # work tracked in #693.
   @id:dash-onboarding-adopt-honors-spawn-cwd @requires-os:linux
   Scenario: dash-25 - Adopt existing opens the folder browser rooted at the session's own working directory
     When the user opens the dashboard in a scenario-owned folder
