@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1683,5 +1685,284 @@ async fn assert_stop_hint_clears_the_service(world: &mut E2eWorld) {
         record.get("status").and_then(serde_json::Value::as_str),
         Some("stopped"),
         "the on-disk record must persist the stop, got:\n{record}"
+    );
+}
+
+// ── ROCMAI-541: scripted-engine post-startup death / external stop ─────────
+//
+// Both scenarios below spawn a REAL managed child — the `rocm` binary itself,
+// re-invoked as `__engine-serve-http` — rather than a planted record, but swap
+// out the real Lemonade/vLLM dispatch for a scripted stand-in
+// (`run_scripted_e2e_engine_serve_http` in `apps/rocm/src/main.rs`, armed by
+// `ROCM_E2E_SCRIPTED_ENGINE`) so the child can survive past both platforms'
+// early-startup liveness checks and then either die or run until stopped,
+// without any GPU. Both attach with `--verbose` under piped (non-TTY) stdio,
+// so both exercise `stream_attached_logs_no_tty` and
+// `run_attached_service`'s `AttachOutcome::ServerExited` arm specifically —
+// the ROCMAI-541 B1/B2 code path, not the background-launch readiness wait
+// (covered by unit tests instead: a real HTTP readiness wait never completes
+// early against an engine that never binds a port, so driving that path here
+// would cost the full 45s timeout for no extra coverage).
+
+/// Engine the scripted-engine scenarios launch under. Lemonade specifically:
+/// it is the only built-in engine whose "no active ROCm runtime configured"
+/// guard in `serve_cmd.rs` is unconditionally skipped (it manages its own
+/// runtime), so reaching the scripted dispatch only needs the no-GPU
+/// pre-flight and the self-managed-install call bypassed — not a fake ROCm
+/// runtime too. See `scripted_engine_death` in `serve_cmd.rs`.
+const SCRIPTED_ENGINE: &str = "lemonade";
+/// A short recipe name `resolve_lemonade_model_ref` resolves purely locally
+/// (no network, no GPU) — the same model `serve-18` already relies on this
+/// resolving on the no-GPU lane.
+const SCRIPTED_ENGINE_MODEL: &str = "Qwen3-0.6B-GGUF";
+
+fn scripted_engine_services_dir(world: &E2eWorld) -> PathBuf {
+    world
+        .isolated_root
+        .as_ref()
+        .expect("scenario has no isolated root")
+        .path()
+        .join("data")
+        .join("services")
+}
+
+fn read_json_file(path: &std::path::Path) -> serde_json::Value {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
+
+/// The most recently written [`SCRIPTED_ENGINE`] service record under this
+/// scenario's isolated data dir.
+///
+/// `generate_service_id` embeds a timestamp, so the id can't be known ahead of
+/// the serve; scanning by engine and taking the newest-modified file mirrors
+/// `e2e.rs`'s own `stop_managed_services` scan.
+fn latest_scripted_engine_record(world: &E2eWorld) -> serde_json::Value {
+    let dir = scripted_engine_services_dir(world);
+    let mut matches: Vec<(std::time::SystemTime, serde_json::Value)> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                return None;
+            }
+            let value = read_json_file(&path);
+            if value.get("engine").and_then(serde_json::Value::as_str) != Some(SCRIPTED_ENGINE) {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, value))
+        })
+        .collect();
+    matches.sort_by_key(|(modified, _)| *modified);
+    matches.pop().map(|(_, value)| value).unwrap_or_else(|| {
+        panic!(
+            "no {SCRIPTED_ENGINE} service record under {}",
+            dir.display()
+        )
+    })
+}
+
+/// The scripted engine's service record and its paired engine-state file
+/// (named by the record's own `engine_state_path` field).
+fn scripted_engine_record_and_state(world: &E2eWorld) -> (serde_json::Value, serde_json::Value) {
+    let record = latest_scripted_engine_record(world);
+    let engine_state_path = record
+        .get("engine_state_path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("record has no engine_state_path: {record}"));
+    let engine_state = read_json_file(std::path::Path::new(engine_state_path));
+    (record, engine_state)
+}
+
+/// Guard against a binary built without `rocm/e2e-test-hooks`: without that
+/// feature `ROCM_E2E_SCRIPTED_ENGINE` does not exist, so serving falls through
+/// to the ordinary no-GPU pre-flight refusal instead of reaching the scripted
+/// engine — the same failure mode (and the same guard shape)
+/// `assert_lemonade_preparation_retry_is_bounded` already checks for.
+fn assert_scripted_hook_was_reached(output: &str) {
+    assert!(
+        !output.contains("no usable AMD GPU detected"),
+        "serve stopped at the no-GPU pre-flight, so the binary under test was \
+         built without the `rocm/e2e-test-hooks` feature and never reached the \
+         scripted engine. E2E lanes that pre-build `rocm` and export \
+         ROCM_CLI_BINARY must pass `--features rocm/e2e-test-hooks`, matching \
+         what `cargo xtask e2e` builds for itself:\n{output}"
+    );
+}
+
+#[given("the scripted engine is armed to die shortly after startup")]
+async fn scripted_engine_armed_to_die(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE", "1".into()));
+    // Long enough to clear both platforms' early-startup liveness checks
+    // (~200ms) with margin; short enough that the scenario stays fast.
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE_DEATH_MS", "1500".into()));
+}
+
+#[when("the user serves a model expecting the engine to crash after startup")]
+async fn user_serves_expecting_scripted_crash(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm_with_scenario_env(
+        world,
+        &[
+            "serve",
+            SCRIPTED_ENGINE_MODEL,
+            "--engine",
+            SCRIPTED_ENGINE,
+            "--port",
+            "11483",
+            "--verbose",
+        ],
+    );
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+#[then("serving fails with a non-zero exit and names the crash")]
+async fn assert_scripted_crash_fails(world: &mut E2eWorld) {
+    let rc = world.cli_rc.expect("no serve rc recorded");
+    let output = serve_output(world);
+    assert_scripted_hook_was_reached(&output);
+    assert_ne!(rc, 0, "expected a non-zero exit, got 0:\n{output}");
+    assert!(
+        output.contains("exited unexpectedly"),
+        "expected the crash to be reported as an unexpected exit: {output}"
+    );
+}
+
+#[then("the service record and its engine state both read failed")]
+async fn assert_scripted_crash_marks_failed(world: &mut E2eWorld) {
+    let (record, engine_state) = scripted_engine_record_and_state(world);
+    assert_eq!(record["status"], "failed", "manifest: {record}");
+    assert_eq!(
+        engine_state["status"], "failed",
+        "engine state: {engine_state}"
+    );
+}
+
+#[given("the scripted engine is armed to run until stopped")]
+async fn scripted_engine_armed_to_run(world: &mut E2eWorld) {
+    world
+        .command_env
+        .push(("ROCM_E2E_SCRIPTED_ENGINE", "1".into()));
+}
+
+#[when("the user attaches to the scripted serve in the background")]
+async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
+    let mut cmd = Command::new(crate::rocm_binary());
+    cmd.args([
+        "serve",
+        SCRIPTED_ENGINE_MODEL,
+        "--engine",
+        SCRIPTED_ENGINE,
+        "--port",
+        "11484",
+        "--verbose",
+    ]);
+    world.isolate_cmd(&mut cmd);
+    for (key, value) in std::mem::take(&mut world.command_env) {
+        cmd.env(key, value);
+    }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .expect("failed to spawn the attached scripted serve");
+    world.recorded_process = Some(child);
+
+    // Wait for the service record to name a real, running engine pid — not
+    // merely for the file to exist. `spawn_managed_engine_child` writes the
+    // record twice: once before the child spawns (a placeholder with pid 0,
+    // which `terminate_recorded_service_pids` would silently skip), and again
+    // after, with the real pid and `status: "running"`. Stopping on the first
+    // write's strength would stop nothing and let the scripted engine run to
+    // its own safety ceiling instead.
+    let dir = scripted_engine_services_dir(world);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let is_running = std::fs::read_dir(&dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension().and_then(|e| e.to_str()) == Some("json")
+                    && std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                        .is_some_and(|value| value["status"] == "running")
+            })
+        });
+        if is_running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scripted engine's service record never reached `running` under {}",
+            dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[when("another shell stops that service while it is attached")]
+async fn another_shell_stops_scripted_service(world: &mut E2eWorld) {
+    let record = latest_scripted_engine_record(world);
+    let service_id = record["service_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("record has no service_id: {record}"))
+        .to_owned();
+    let stdout = crate::run_rocm_ok(world, &["services", "stop", &service_id, "--yes"]);
+    assert!(
+        stdout.contains("stopped"),
+        "the stop must report success:\n{stdout}"
+    );
+}
+
+#[then("the attached serve exits zero and reports a stop, not a crash")]
+async fn assert_attached_serve_reports_stop(world: &mut E2eWorld) {
+    let child = world
+        .recorded_process
+        .take()
+        .expect("scenario recorded no attached serve process");
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for the attached serve process");
+    let rc = output.status.code().unwrap_or(-1);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_scripted_hook_was_reached(&combined);
+    assert_eq!(
+        rc, 0,
+        "an externally stopped attach must exit 0, got {rc}:\n{combined}"
+    );
+    assert!(
+        combined.contains("server process exited"),
+        "expected the benign-stop message: {combined}"
+    );
+    assert!(
+        !combined.contains("exited unexpectedly"),
+        "an intentional external stop must not be reported as a crash: {combined}"
+    );
+}
+
+#[then("the service record does not read failed")]
+async fn assert_scripted_stop_not_marked_failed(world: &mut E2eWorld) {
+    let (record, engine_state) = scripted_engine_record_and_state(world);
+    assert_ne!(
+        record["status"], "failed",
+        "manifest wrongly marked failed: {record}"
+    );
+    assert_ne!(
+        engine_state["status"], "failed",
+        "engine state wrongly marked failed: {engine_state}"
     );
 }

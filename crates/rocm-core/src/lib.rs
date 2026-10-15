@@ -119,7 +119,8 @@ pub use proc_lifecycle::{
     process_start_ticks, terminate_verified,
 };
 pub use process::{
-    FileLock, detach_command_session, process_is_running, terminate_process, terminate_process_tree,
+    FileLock, ManagedChildLiveness, detach_command_session, process_is_running, terminate_process,
+    terminate_process_tree,
 };
 #[cfg(windows)]
 pub use process::{

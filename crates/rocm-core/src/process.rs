@@ -363,6 +363,67 @@ pub fn process_is_running(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Confirms whether a managed-service child is still running, using a
+/// platform-appropriate check that can tell a truly running process apart from
+/// one whose exit has not yet been reaped (ROCMAI-541).
+///
+/// On Unix, [`process_is_running`]'s `kill(pid, 0)` succeeds for a zombie — a
+/// process that already exited but whose parent has not yet called `wait()` —
+/// because the kernel keeps its entry around until reaped. The managed engine
+/// is spawned as a *direct* child of the `rocm` process: [`detach_command_session`]
+/// only calls `setsid()` in `pre_exec`, there is no second fork to orphan it to
+/// init. So while `rocm` is still watching it (the launch readiness wait, or the
+/// attached `--verbose` log-streaming loop), a child that dies becomes a zombie
+/// that a signal probe alone would misreport as alive — exactly the original
+/// ROCMAI-541 symptom, on the platform the first round of this fix claimed to
+/// have covered. Retaining the spawned [`std::process::Child`] and calling
+/// `try_wait()` instead reaps it (so the zombie entry is released) and reads
+/// its *real* wait status rather than merely probing whether the pid still
+/// exists.
+///
+/// On Windows there is no equivalent gap: [`process_is_running`] there opens a
+/// fresh handle with `OpenProcess` and reads the actual exit code via
+/// `GetExitCodeProcess`, which needs no parent-side reaping — so the bare pid
+/// is enough, and this variant just defers to it.
+pub enum ManagedChildLiveness {
+    #[cfg(not(windows))]
+    Unix(std::process::Child),
+    #[cfg(windows)]
+    Windows(u32),
+}
+
+impl ManagedChildLiveness {
+    /// Build from the just-spawned child on Unix, where a real `Child` handle
+    /// is available to reap later.
+    #[cfg(not(windows))]
+    pub const fn from_child(child: std::process::Child) -> Self {
+        Self::Unix(child)
+    }
+
+    /// Build from a bare pid on Windows, where [`process_is_running`] already
+    /// reads the real exit code without needing a retained handle.
+    #[cfg(windows)]
+    pub const fn from_pid(pid: u32) -> Self {
+        Self::Windows(pid)
+    }
+
+    /// True while the child is confirmed still running. Reaps it on Unix if it
+    /// has just exited — see the type's doc comment for why that reap (rather
+    /// than a signal probe) is the point of this type. An error from
+    /// `try_wait` (in practice only reachable if the pid had already been
+    /// reaped by something else) is treated as "not running": a failure report
+    /// must never be blocked on being unable to positively confirm the child
+    /// is gone.
+    pub fn is_running(&mut self) -> bool {
+        match self {
+            #[cfg(not(windows))]
+            Self::Unix(child) => matches!(child.try_wait(), Ok(None)),
+            #[cfg(windows)]
+            Self::Windows(pid) => process_is_running(*pid),
+        }
+    }
+}
+
 /// An advisory, cross-process exclusive lock backed by a lock file.
 ///
 /// Wraps the standard-library file lock (`std::fs::File::lock`), so the exclusion
