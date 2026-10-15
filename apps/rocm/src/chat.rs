@@ -7,9 +7,11 @@
 //! `DeterministicModelRecipe`, `DeterministicServiceRow`,
 //! `DeterministicEngineRow`) and its leaf helpers — tool-call argument
 //! normalization and display labels, deterministic tool-output parsing, and
-//! the MCP-result/loopback-port/service-running-state helpers. The types
-//! are read from `main.rs` as return values (`DeterministicServiceRow` and
-//! `DeterministicEngineRow` are never named there directly); the helper
+//! the MCP-result/loopback-port/service-running-state helpers. `main.rs`
+//! constructs `ChatRocmCommandAction` and `CommandCapture` directly; it only
+//! receives `DeterministicModelRecipe` as a parameter and
+//! `DeterministicServiceRow`/`DeterministicEngineRow` as return values
+//! (neither of the latter two is ever named there directly). The helper
 //! functions are `pub(crate)` and called from `main.rs` via qualified
 //! `chat::` paths, except for a handful of private internals used only
 //! within this file; nothing here calls back into `main.rs`.
