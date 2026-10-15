@@ -464,7 +464,7 @@ try:
 except Exception:
     print(json.dumps({"failures": []}))
     raise SystemExit(0)
-for name in ("vllm._C", "vllm._rocm_C"):
+for name in ("vllm._C", "vllm._rocm_C", "vllm._C_stable_libtorch"):
     try:
         importlib.import_module(name)
     except ModuleNotFoundError:
@@ -533,7 +533,8 @@ fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> 
 
 /// Reads the probe's JSON into the guidance a user can act on.
 fn extension_import_problem_from_probe(output: &str, runtime: &VllmRuntime) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(output.lines().rev().find(|line| !line.trim().is_empty())?).ok()?;
     let failures = value.get("failures")?.as_array()?;
     if failures.is_empty() {
         return None;
@@ -1766,54 +1767,89 @@ mod tests {
         );
         Ok(())
     }
+    /// Runs the probe script under `python3` against stub `torch` and `vllm`
+    /// modules, returning its stdout, or `None` when there is no `python3`.
+    #[cfg(unix)]
+    fn run_probe_script(torch: &str, extensions: &[(&str, &str)]) -> Result<Option<String>> {
+        let dir = tempfile::tempdir()?;
+        let vllm = dir.path().join("vllm");
+        fs::create_dir(&vllm)?;
+        fs::write(dir.path().join("torch.py"), torch)?;
+        fs::write(vllm.join("__init__.py"), "")?;
+        for (module, body) in extensions {
+            fs::write(vllm.join(format!("{module}.py")), body)?;
+        }
+        let Ok(output) = ProcessCommand::new("python3")
+            .arg("-c")
+            .arg(VLLM_EXTENSION_PROBE_SCRIPT)
+            .env("PYTHONPATH", dir.path())
+            .output()
+        else {
+            return Ok(None);
+        };
+        assert!(output.status.success(), "{output:?}");
+        Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+    }
     #[cfg(unix)]
     #[test]
-    fn extension_probe_script_reports_only_import_errors_after_torch() -> Result<()> {
-        let run = |torch: &str, with_rocm_c: bool| -> Result<Option<String>> {
-            let dir = tempfile::tempdir()?;
-            let vllm = dir.path().join("vllm");
-            fs::create_dir(&vllm)?;
-            fs::write(dir.path().join("torch.py"), torch)?;
-            fs::write(vllm.join("__init__.py"), "")?;
-            fs::write(
-                vllm.join("_C.py"),
-                "raise ImportError('undefined symbol: boom')",
-            )?;
-            if with_rocm_c {
-                fs::write(vllm.join("_rocm_C.py"), "")?;
-            }
-            let Ok(output) = ProcessCommand::new("python3")
-                .arg("-c")
-                .arg(VLLM_EXTENSION_PROBE_SCRIPT)
-                .env("PYTHONPATH", dir.path())
-                .output()
-            else {
-                return Ok(None);
-            };
-            assert!(output.status.success(), "{output:?}");
-            let runtime = test_vllm_runtime(None, None);
-            Ok(extension_import_problem_from_probe(
-                &String::from_utf8_lossy(&output.stdout),
-                &runtime,
-            ))
-        };
-        if ProcessCommand::new("python3")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return Ok(());
-        }
+    fn extension_probe_script_reports_each_extension_that_fails_to_load() -> Result<()> {
+        let runtime = test_vllm_runtime(None, None);
+        let fails = "raise ImportError('undefined symbol: boom')";
         // `_C` fails to load; a `_rocm_C` that is merely absent is not a mismatch.
-        let problem = run("", false)?.expect("a failing _C is a problem");
+        let Some(out) = run_probe_script("", &[("_C", fails)])? else {
+            return Ok(());
+        };
+        let problem =
+            extension_import_problem_from_probe(&out, &runtime).expect("a failing _C is a problem");
         assert!(
             problem.contains("vllm._C: undefined symbol: boom"),
             "{problem}"
         );
         assert!(!problem.contains("_rocm_C"), "{problem}");
-        // A torch that does not import is a different failure: report nothing.
-        assert_eq!(run("raise ImportError('no torch')", true)?, None);
+        // The ROCm extension, which the issue is about, is probed on its own.
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", fails)])?.expect("python3");
+        let problem = extension_import_problem_from_probe(&out, &runtime)
+            .expect("a failing _rocm_C is a problem");
+        assert!(
+            problem.contains("vllm._rocm_C: undefined symbol: boom"),
+            "{problem}"
+        );
+        // Everything loads.
+        let out = run_probe_script("", &[("_C", ""), ("_rocm_C", "")])?.expect("python3");
+        assert_eq!(extension_import_problem_from_probe(&out, &runtime), None);
         Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_script_stops_at_a_torch_that_does_not_import() -> Result<()> {
+        let fails = "raise ImportError('undefined symbol: boom')";
+        let Some(out) = run_probe_script("raise ImportError('no torch')", &[("_C", fails)])? else {
+            return Ok(());
+        };
+        // Exactly the empty report: the extensions are not tried (and so not blamed).
+        assert_eq!(out.trim(), r#"{"failures": []}"#);
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_runs_with_the_runtimes_sdk_environment() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Reports a failure only when the TheRock environment reached the interpreter.
+        let python = stand_in_python(
+            dir.path(),
+            r#"if [ -n "$ROCM_CLI_THEROCK_RUNTIME_ID" ]; then echo '{"failures": [{"module": "vllm._C", "error": "x"}]}'; else echo '{"failures": []}'; fi"#,
+        )?;
+        let mut runtime = test_vllm_runtime(Some(python), None);
+        runtime.sdk_root = Some(dir.path().to_path_buf());
+        assert!(vllm_extension_import_problem(&runtime).is_some());
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_output_is_read_from_its_last_line() {
+        let runtime = test_vllm_runtime(None, None);
+        let out = "some log line\n{\"failures\": [{\"module\": \"vllm._C\", \"error\": \"x\"}]}\n";
+        assert!(extension_import_problem_from_probe(out, &runtime).is_some());
     }
     #[test]
     fn extension_check_is_silent_without_a_python_executable() {
