@@ -2,12 +2,26 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Process-spawn and -terminate primitives.
+//! Process-spawn, -run and -terminate primitives.
 //!
 //! Hidden-console/detached spawn and exit-wait on Windows, process/process-tree
 //! termination on both platforms, and the exclusive `FileLock` used to
 //! serialize the daemon autostart path, the managed-launch GPU claim, and
 //! `uv` installs across processes.
+//!
+//! [`run_with_timeout`] is the bulk of the file: run a command to completion
+//! with both streams captured and a real time bound. A thread per pipe drains
+//! stdout and stderr from the moment the child starts, so output size cannot
+//! stall a command into its own timeout, and a reader that cannot finish is
+//! abandoned rather than joined, so a grandchild holding the pipe's write end
+//! open cannot outlast the deadline either. The timeout error quotes a bounded
+//! head of the child's own output, because that text reaches persisted
+//! automation logs. `Capture`, `run_captured`, `wait_bounded`, `Waitable` and
+//! `assemble_output` exist to serve it.
+//!
+//! It is not yet the only such helper in the tree; converging the remaining
+//! capture helpers onto it is tracked in
+//! [#623](https://github.com/ROCm/rocm-cli/issues/623).
 
 use anyhow::{Context, Result, bail};
 #[cfg(windows)]
@@ -594,9 +608,16 @@ const READ_CHUNK: usize = 16 * 1024;
 ///
 /// Reaching this means something other than the child still holds the pipe's
 /// write end — a grandchild the child left behind — so there is no EOF coming
-/// and waiting longer would make `timeout` meaningless. A child cannot exit
-/// before writing everything, and the readers run throughout, so a child that
-/// genuinely finished has at most a buffer or two left to collect here.
+/// and waiting longer would make `timeout` meaningless.
+///
+/// For a child that genuinely finished the grace has only the tail to absorb: a
+/// child cannot exit before writing everything, and the readers are started
+/// before the wait loop. What they are not is *scheduled* before it —
+/// `wait_bounded` polls `try_wait` once with no sleep in front of it, so a child
+/// fast enough to exit between spawn and that first poll can be observed exited
+/// while neither reader thread has run a single instruction. So the grace covers
+/// reader start-up as well as the last buffer or two. 200ms absorbs both with
+/// room to spare, including on the no-GPU e2e lane's 64 concurrent scenarios.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 /// How much of a timed-out child's own output the timeout error quotes.
@@ -690,15 +711,24 @@ impl Capture {
                     // Round again rather than break: not the end of anything.
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => {
-                        // Recorded only while someone is still listening: after
-                        // `take()` the failure slot is as unread as the buffer.
+                        // Recorded only while someone is still listening. Once
+                        // `take()` has fully returned this is merely tidy —
+                        // nothing calls `take()` twice, so a failure stored
+                        // afterwards would just sit unread.
                         //
-                        // Checked under `buffer`'s lock, the same one `take()`
-                        // marks `abandoned` under, for the reason the `Ok`
-                        // branch uses it: a bare load can observe `abandoned ==
-                        // false`, have `take()` mark it and drain the failure
-                        // slot in between, and then store a real read error
-                        // where nothing will look for it again.
+                        // It is load-bearing for one window, and that window is
+                        // inside `take()` itself: `take()` marks `abandoned`
+                        // and empties the buffer under `buffer`'s lock, then
+                        // releases it and drains the failure slot under a
+                        // *different* lock. A read error that lands in between
+                        // would otherwise be handed back attached to bytes the
+                        // caller has already been given, and `assemble_output`
+                        // turns any failure on a non-timed-out run into a hard
+                        // `failed to read the output of ...` — a cleanly
+                        // finished command reported as a read failure. Taking
+                        // `buffer`'s lock before the check is what closes it;
+                        // a bare load could pass the check, then have `take()`
+                        // run the whole sequence before the store.
                         let _buffer = sink.lock();
                         if !sink.abandoned.load(Ordering::Acquire) {
                             *sink.failure() = Some(error);
