@@ -45,19 +45,19 @@ use rocm_core::{AppPaths, AutomationRuntimeState, EndpointReadiness, ManagedServ
 use rocm_core::{format_http_base_url, process_is_running};
 use rocm_engine_protocol::{DevicePolicy, EngineRecipeHint, ResolveModelResponse};
 
+#[cfg(not(windows))]
+use crate::apply_app_path_env;
 use crate::endpoint_keys;
 use crate::engines_cmd::env_root_for_service;
 use crate::service_hints;
 use crate::{
     SandboxToolArg, builtin_engine_serve_http_args, device_policy_name,
-    existing_live_managed_service, managed_service_launcher_path, record_cli_audit_event,
-    render_service_action_result, run_internal_sandbox_tool, status_for_readiness,
-    wait_for_service_http_ready_with_progress,
+    existing_live_managed_service, managed_service_launcher_path, read_optional_tail_lines,
+    record_cli_audit_event, render_service_action_result, run_internal_sandbox_tool,
+    status_for_readiness, wait_for_service_http_ready_with_progress,
 };
 #[cfg(windows)]
 use crate::{app_path_env_var_refs, app_path_env_var_values};
-#[cfg(not(windows))]
-use crate::{apply_app_path_env, read_optional_tail_lines};
 
 pub(crate) fn validate_bind_host(host: &str, allow_public_bind: bool) -> Result<()> {
     if !is_loopback_host(host) && !allow_public_bind {
@@ -265,6 +265,77 @@ pub(crate) fn managed_engine_startup_failure_detail(status: ExitStatus, log_path
         recent_lines.join("\n")
     )
 }
+/// Render an unexpected managed-engine exit for the user, when the engine was
+/// already running and then disappeared on its own — unlike
+/// [`managed_engine_startup_failure_detail`], there is no [`ExitStatus`] to
+/// quote here. Nothing in `rocm serve`/`rocm services restart` ever lets a
+/// managed engine stop itself cleanly: every intentional stop (Ctrl-C,
+/// `rocm services stop`) signals the process and takes a different path
+/// (`AttachOutcome::Stop`) that never reaches this detail, so an unexplained
+/// exit always means a crash. The service log is the only record of why,
+/// since the child is detached and writes nowhere else — platform-generic
+/// since ROCMAI-541 attaches it on Windows too (see
+/// `spawn_hidden_console_with_log` above).
+pub(crate) fn managed_engine_exit_failure_detail(service_id: &str, log_path: &Path) -> String {
+    let recent_lines = read_optional_tail_lines(log_path, 80, "service log");
+    if recent_lines.is_empty() {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {}",
+            log_path.display()
+        )
+    } else {
+        format!(
+            "managed engine for service `{service_id}` exited unexpectedly; inspect {} \
+             (or `rocm logs {service_id}`)\n\nrecent service log output:\n{}",
+            log_path.display(),
+            recent_lines.join("\n")
+        )
+    }
+}
+
+/// Decide a managed launch's final status from the HTTP readiness wait and the
+/// child's liveness, and retire a child that died before reaching `Serving` as
+/// a failure rather than quietly reporting whatever lower status the readiness
+/// wait happened to see last.
+///
+/// A readiness wait that only times out (never reaches [`EndpointReadiness::Serving`])
+/// is ambiguous on its own: the process could still be loading a large model, or
+/// it could already be dead (ROCMAI-541 — this was previously indistinguishable,
+/// so `rocm serve` reported `starting` and exited 0 either way). `pid_is_running`
+/// resolves it, and is injected so the dead-child branch is unit-testable without
+/// spawning a real process — mirroring `autostart_spawn_in_flight`'s `pid_alive`
+/// parameter elsewhere in this file. `Serving` always succeeds regardless of the
+/// live check: inference having already answered is a stronger readiness signal
+/// than a liveness check taken afterward, which could itself lose a race against
+/// the same process exiting right after serving the probe.
+///
+/// On the failure branch this also marks the engine's own state file `failed`
+/// (best-effort): the engine process is gone and cannot do it for itself, and
+/// without this the state file can be left reading `starting` indefinitely (see
+/// `run_builtin_engine_serve_http`'s own, primary fix for the common case where
+/// the engine process is alive long enough to run that logic itself).
+fn finalize_managed_launch_readiness(
+    record: &mut ManagedServiceRecord,
+    readiness: EndpointReadiness,
+    child_pid: u32,
+    pid_is_running: impl Fn(u32) -> bool,
+) -> Result<()> {
+    if readiness != EndpointReadiness::Serving && !pid_is_running(child_pid) {
+        record.status = "failed".to_owned();
+        let _ = record.write();
+        let _ = rocm_core::merge_json_state_file(
+            &record.engine_state_path,
+            &serde_json::json!({ "status": "failed" }),
+        );
+        bail!(
+            "{}",
+            managed_engine_exit_failure_detail(&record.service_id, &record.log_path)
+        );
+    }
+    record.status = status_for_readiness(readiness).to_owned();
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub(crate) fn managed_service_process_command(program: &Path, args: &[String]) -> ProcessCommand {
     let mut command = ProcessCommand::new(program);
@@ -488,8 +559,20 @@ fn spawn_managed_engine_child(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to launch managed engine process")?
+        // Attach the child's stdout/stderr to the service log (ROCMAI-541),
+        // mirroring the Unix branch's `attach_background_stdio` below. Without
+        // this, `spawn_detached_no_inherit` leaves the child's output — including
+        // the error chain a failing `__engine-serve-http` prints to stderr —
+        // reaching nothing: the log would stop at the engine's last explicit
+        // progress write, and both `rocm serve --verbose` and `rocm logs` would
+        // never see why it died.
+        rocm_core::spawn_hidden_console_with_log(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            &record.log_path,
+        )
+        .context("failed to launch managed engine process")?
     };
     #[cfg(not(windows))]
     let child_pid = {
@@ -591,8 +674,12 @@ pub(crate) fn start_managed_service(
         Duration::from_secs(45),
         on_wait_tick,
     );
-    let launch_status = status_for_readiness(readiness);
-    record.status = launch_status.to_owned();
+    // A readiness wait that never reaches `Serving` is ambiguous (still loading
+    // vs. already dead) without checking whether the child is still alive — see
+    // `finalize_managed_launch_readiness`'s doc comment (ROCMAI-541). This bails
+    // with a non-zero exit and the service log's tail when it is not.
+    finalize_managed_launch_readiness(&mut record, readiness, child_pid, process_is_running)?;
+    let launch_status = record.status.clone();
     if readiness == EndpointReadiness::Serving {
         // Latch the verification the wait just performed, so the readiness checks
         // behind `services list` and chat read it instead of re-probing.
@@ -614,7 +701,7 @@ pub(crate) fn start_managed_service(
     Ok(ManagedLaunchReport {
         service_id: service_id.to_owned(),
         endpoint_url,
-        status: launch_status.to_owned(),
+        status: launch_status,
         already_running: false,
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
@@ -900,7 +987,7 @@ pub(crate) fn run_attached_service(
     // lock before streaming logs, which blocks for the whole attached session.
     drop(launch_lock);
 
-    let (service_id, log_path, child_pid) = match spawn {
+    let (service_id, log_path, engine_state_path, child_pid) = match spawn {
         // A server for this engine+model is already live. Don't fight it for the
         // port — point the user at the existing one instead of tailing a log we
         // did not start.
@@ -917,9 +1004,12 @@ pub(crate) fn run_attached_service(
             drop_orphaned_endpoint_key_on_already_running(&paths, service_id, endpoint_api_key);
             return Ok(());
         }
-        ManagedSpawn::Spawned { record, child_pid } => {
-            (service_id.to_owned(), record.log_path.clone(), child_pid)
-        }
+        ManagedSpawn::Spawned { record, child_pid } => (
+            service_id.to_owned(),
+            record.log_path.clone(),
+            record.engine_state_path.clone(),
+            child_pid,
+        ),
     };
 
     // The child is a managed service that outlives this session once detached, so
@@ -993,10 +1083,19 @@ pub(crate) fn run_attached_service(
             Ok(())
         }
         AttachOutcome::ServerExited => {
-            println!("server process exited");
-            println!("  service_id: {service_id}");
-            println!("  recent logs: rocm logs {service_id}");
-            Ok(())
+            // Every intentional stop takes the `Stop` arm above instead — nothing
+            // in this path lets the managed engine exit on its own without it
+            // being a crash (ROCMAI-541). Mark the engine state file `failed`
+            // (the engine process is gone and cannot do it for itself) and fail
+            // loudly instead of the previous "server process exited" / exit 0.
+            let _ = rocm_core::merge_json_state_file(
+                &engine_state_path,
+                &serde_json::json!({ "status": "failed" }),
+            );
+            bail!(
+                "{}",
+                managed_engine_exit_failure_detail(&service_id, &log_path)
+            );
         }
     }
 }
@@ -1152,6 +1251,7 @@ fn stream_attached_logs_no_tty(log_path: &Path, child_pid: u32) -> Result<Attach
 mod tests {
     use super::*;
     use crate::tests::test_paths;
+    use std::process::ExitCode;
 
     #[test]
     fn serve_bind_validation_requires_public_ack() {
@@ -1752,5 +1852,175 @@ mod tests {
         fs::write(&path, "not-a-pid").expect("write garbage");
         assert_eq!(read_autostart_claim(&path), None);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541: the service log tail must reach the user, and a missing log
+    /// must still name the service and where to look rather than being silent.
+    #[test]
+    fn exit_failure_detail_quotes_the_service_log_tail_when_present() {
+        let (root, paths) = test_paths("exit-failure-detail-log-present");
+        paths.ensure().expect("ensure paths");
+        let log_path = paths.service_log_path("svc-dead-1");
+        fs::create_dir_all(log_path.parent().expect("log parent")).expect("mkdir log dir");
+        fs::write(
+            &log_path,
+            "Model pulled successfully\nFATAL: HOME is unset\n",
+        )
+        .expect("write log");
+
+        let detail = managed_engine_exit_failure_detail("svc-dead-1", &log_path);
+
+        assert!(detail.contains("svc-dead-1"), "{detail}");
+        assert!(detail.contains("exited unexpectedly"), "{detail}");
+        assert!(detail.contains("FATAL: HOME is unset"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exit_failure_detail_names_the_service_even_without_a_log() {
+        let (root, paths) = test_paths("exit-failure-detail-log-absent");
+        let log_path = paths.service_log_path("svc-dead-2");
+        // Deliberately never created.
+        let detail = managed_engine_exit_failure_detail("svc-dead-2", &log_path);
+        assert!(detail.contains("svc-dead-2"), "{detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// ROCMAI-541 acceptance criterion 2: a managed engine that died before
+    /// ever answering HTTP must fail `rocm serve` with both a non-zero exit
+    /// code and a message naming it, not just the unreadable "starting"
+    /// status the readiness timeout alone used to leave behind. `pid_is_running`
+    /// is injected (`|_| false`) rather than spawning and killing a real
+    /// process, the same seam `autostart_spawn_in_flight` above uses for an
+    /// identical reason: this repo cannot spawn and reap a real child inside a
+    /// `cargo test` run portably across Linux and Windows.
+    #[test]
+    fn finalize_managed_launch_readiness_fails_closed_when_the_child_died() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-dead-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dead-3",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11530,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        fs::create_dir_all(record.log_path.parent().expect("log parent"))?;
+        fs::write(&record.log_path, "Model pulled successfully\n")?;
+        record.status = "running".to_owned();
+        record.write()?;
+
+        let result = finalize_managed_launch_readiness(
+            &mut record,
+            EndpointReadiness::Unreachable,
+            4_242_424,
+            |_| false,
+        );
+
+        let Err(error) = result else {
+            let _ = fs::remove_dir_all(&root);
+            panic!("a dead child must fail the launch, not report `starting`");
+        };
+        // The message and the exit code are asserted together (ROCMAI-541 AC2):
+        // a test that only checked one could pass while the other regressed —
+        // e.g. a message-only check would miss `run()` swallowing the error, and
+        // an exit-code-only check would miss a message pointing at the wrong
+        // service or losing the log tail.
+        let message = error.to_string();
+        assert!(message.contains("svc-dead-3"), "{message}");
+        assert!(message.contains("Model pulled successfully"), "{message}");
+        assert_eq!(crate::exit_code_for(Err(error)), ExitCode::FAILURE);
+
+        // Both the manifest and the engine's own state file must read `failed`
+        // (AC3) — the manifest because this function already held it, and the
+        // engine state file because the engine process that owns it is gone and
+        // cannot write "failed" there itself.
+        assert_eq!(record.status, "failed");
+        let (reread, _) = crate::read_managed_service_manifest(&paths, "svc-dead-3")?;
+        assert_eq!(reread.status, "failed");
+        let engine_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record.engine_state_path)?)?;
+        assert_eq!(engine_state["status"], "failed");
+
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// The same readiness timeout must NOT be treated as a failure while the
+    /// child is still alive — a large model can legitimately take longer than
+    /// the readiness budget to load, and that must keep reporting `starting`
+    /// with exit code 0, not regress into the failure path above.
+    #[test]
+    fn finalize_managed_launch_readiness_keeps_reporting_starting_while_alive() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-alive-child");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-alive-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11531,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &mut record,
+            EndpointReadiness::Unreachable,
+            4_242_425,
+            |_| true,
+        )?;
+
+        assert_eq!(record.status, "starting");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// A readiness wait that already confirmed `Serving` must not be
+    /// second-guessed by a liveness check that could itself lose a race against
+    /// the same process exiting right after answering the probe.
+    #[test]
+    fn finalize_managed_launch_readiness_trusts_a_confirmed_serving_result() -> Result<()> {
+        let (root, paths) = test_paths("finalize-readiness-serving-raced");
+        paths.ensure()?;
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-served-1",
+            "lemonade",
+            "qwen",
+            "qwen-canonical",
+            "127.0.0.1",
+            11532,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            None,
+        );
+        record.write()?;
+
+        finalize_managed_launch_readiness(
+            &mut record,
+            EndpointReadiness::Serving,
+            4_242_426,
+            |_| false,
+        )?;
+
+        assert_eq!(record.status, "ready");
+        let _ = fs::remove_dir_all(&root);
+        Ok(())
     }
 }

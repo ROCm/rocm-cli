@@ -11347,8 +11347,18 @@ fn restart_internal_managed_service_with(
         if let Some(key_file) = endpoint_key_file.as_deref() {
             env_refs.push((rocm_engine_protocol::ENDPOINT_API_KEY_FILE_ENV, key_file));
         }
-        rocm_core::spawn_detached_no_inherit(&current_exe, &serve_args, &env_refs)
-            .context("failed to restart managed engine process")?
+        // Attach the child's stdout/stderr to the service log, mirroring the
+        // Unix branch's `attach_background_stdio` below (ROCMAI-541): without
+        // this, a restarted engine's own output — including the final error
+        // chain a failing `__engine-serve-http` prints to stderr — reaches
+        // nothing and is lost.
+        rocm_core::spawn_hidden_console_with_log(
+            &current_exe,
+            &serve_args,
+            &env_refs,
+            &record.log_path,
+        )
+        .context("failed to restart managed engine process")?
     };
     #[cfg(not(windows))]
     let child_pid = {
@@ -14282,6 +14292,23 @@ fn builtin_engine_available(engine: &str) -> bool {
     matches!(engine, "lemonade" | "vllm")
 }
 
+/// Entry point for the hidden `__engine-serve-http` subcommand: the process
+/// `spawn_managed_engine_child`/`restart_internal_managed_service_with` launch
+/// detached to actually run the engine.
+///
+/// ROCMAI-541: on Windows this process's stdout/stderr reach the service log
+/// only because the parent attached them at spawn time
+/// (`rocm_core::spawn_hidden_console_with_log`); a gap there (or in a future
+/// caller that spawns this subcommand some other way) would otherwise lose an
+/// engine's failure reason completely, since nothing else reads a detached
+/// child's output. So this wrapper does not rely on that attachment alone: on
+/// any error from the engine dispatch below, it appends the full error chain
+/// directly to the service log file named by `--log-path` (the same file
+/// `rocm logs <service_id>` tails) and to this process's own structured log,
+/// and marks the engine state file `failed` — regardless of whether the
+/// engine already did either on this particular error path. A later success
+/// (this function only runs once per process, so there is no later state to
+/// race against) is unaffected; only the error path writes anything here.
 #[allow(clippy::too_many_arguments)]
 fn run_builtin_engine_serve_http(
     engine: &str,
@@ -14297,10 +14324,16 @@ fn run_builtin_engine_serve_http(
     log_path: Option<PathBuf>,
     engine_recipe: Option<EngineRecipeHint>,
 ) -> Result<()> {
-    let parsed_policy = parse_device_policy(Some(device_policy))?;
-    match engine {
+    let parsed_policy = match parse_device_policy(Some(device_policy)) {
+        Ok(policy) => policy,
+        Err(error) => {
+            record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), &error);
+            return Err(error);
+        }
+    };
+    let result = match engine {
         "lemonade" => rocm_engine_lemonade::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -14308,12 +14341,12 @@ fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
         "vllm" => rocm_engine_vllm::builtin_serve_http(
-            service_id,
+            service_id.clone(),
             model_ref,
             host,
             port,
@@ -14321,12 +14354,47 @@ fn run_builtin_engine_serve_http(
             gpu_indices,
             runtime_id,
             env_id,
-            state_path,
-            log_path,
+            state_path.clone(),
+            log_path.clone(),
             engine_recipe,
         ),
-        other => bail!("engine `{other}` is not built into this rocm binary"),
+        other => Err(anyhow::anyhow!(
+            "engine `{other}` is not built into this rocm binary"
+        )),
+    };
+    if let Err(error) = &result {
+        record_engine_serve_http_failure(&service_id, &state_path, log_path.as_deref(), error);
     }
+    result
+}
+
+/// Best-effort, platform-generic failure capture for
+/// [`run_builtin_engine_serve_http`] — see its doc comment for why this exists
+/// alongside the Windows stdio-attach fix rather than instead of it.
+///
+/// Never fails itself: a service already failing must not fail a second time,
+/// less legibly, because its own failure-reporting hit an error.
+fn record_engine_serve_http_failure(
+    service_id: &str,
+    state_path: &Path,
+    log_path: Option<&Path>,
+    error: &anyhow::Error,
+) {
+    let detail = format!("{error:?}");
+    tracing::error!(service_id, %detail, "managed engine serve-http failed");
+    if let Some(log_path) = log_path
+        && let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+    {
+        let _ = writeln!(
+            file,
+            "__engine-serve-http service_id={service_id} failed: {detail}"
+        );
+    }
+    let _ =
+        rocm_core::merge_json_state_file(state_path, &serde_json::json!({ "status": "failed" }));
 }
 
 #[allow(clippy::too_many_arguments)]
