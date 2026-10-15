@@ -1161,6 +1161,14 @@ mod tests {
     /// function's own stdio overrides whatever the caller set, which is what
     /// lets all three callers hand over a bare `Command` and say nothing about
     /// stdin at all.
+    ///
+    /// One thing it does not pin, said plainly rather than left to be
+    /// discovered: `null` against `inherit`. Telling those two apart needs this
+    /// test process's own fd 0 to be something other than EOF, and arranging
+    /// that is a `dup2` racing every other test in the binary. An `inherit`
+    /// mutant was run and does pass here. What is caught is the regression that
+    /// can actually happen -- no stdin setting at all, which is the line this
+    /// function took over from its callers.
     fn assert_the_child_is_given_an_empty_stdin(mut command: Command) {
         let (stdin_reader, stdin_writer) =
             std::io::pipe().expect("failed to create a pipe for the child's stdin");
