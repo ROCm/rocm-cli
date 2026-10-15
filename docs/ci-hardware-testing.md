@@ -261,8 +261,12 @@ otherwise `vllm` is only preferred for the `*-dcgpu` families and
 ## Triggers
 
 The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
-`pull_request`, and `merge_group` when the workflow's own `changes` job's
-`serve` path filter is `true`. `push` fires on `main` and on any `release/**`
+`pull_request`, and `merge_group` (every GPU lane except MI300X, which is not
+required for merging and so is skipped in the merge queue rather than left
+queued behind a single runner after its PR has merged) when the workflow's own
+`changes` job's `serve` path filter is `true`. A new push to a pull request
+cancels that PR's older run; push, `merge_group` and manual runs never cancel
+one another. `push` fires on `main` and on any `release/**`
 branch, so pushing to a release branch runs the full self-hosted matrix ahead
 of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base

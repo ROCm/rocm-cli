@@ -55,12 +55,20 @@ on:
 
 concurrency:
   # Own group, namespaced by this workflow so it is DISTINCT from ci.yml's shared
-  # group — the whole point of the split. Manual dispatches still get a unique
-  # (run_id) group so a stuck dispatch never blocks later dispatches.
+  # group — the whole point of the split. The key also carries the event name, so
+  # a pull_request, push, merge_group and workflow_dispatch run can never share a
+  # group: a PR run is keyed on the PR NUMBER and a new push to that PR
+  # supersedes the older run; push and merge_group runs keep their ref (a
+  # distinct ref per queue entry); manual dispatches get a unique (run_id) group
+  # so a stuck dispatch never blocks later dispatches.
   group: >-
-    ${{ github.workflow }}-${{ github.ref }}-${{
-      github.event_name == 'workflow_dispatch' && github.run_id || 'shared' }}
-  cancel-in-progress: true
+    ${{ github.workflow }}-${{ github.event_name }}-${{
+      github.event_name == 'pull_request' && github.event.pull_request.number
+      || github.event_name == 'workflow_dispatch' && github.run_id
+      || github.ref }}
+  # Supersede only pull_request runs. A push or merge_group run is the record of
+  # a commit that landed, so a later one must not cancel it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -160,9 +168,15 @@ jobs:
     # the rocm binary itself, and this check isn't in the required list (see the
     # file header), so a broken build here still can't block a merge; ci.yml's
     # required build-and-test / mock e2e remain the authoritative build gate.
+    #
+    # Not on merge_group: this check is not required for merging, and the queue
+    # does not wait for it, so with a single MI300X runner the queue entry's job
+    # stayed queued long after its PR merged — an orphaned run that only delays
+    # the PR runs behind it. (The other lanes still run in the merge queue.)
     if: >-
       always()
       && needs.changes.result == 'success'
+      && github.event_name != 'merge_group'
       && (
         (github.event_name != 'workflow_dispatch'
           && needs.changes.outputs.serve == 'true')
@@ -181,12 +195,6 @@ jobs:
       # workflow sets this unconditionally; here it lets a scoped dispatch confirm
       # a single nightly scenario (e.g. the 27B serve) without the full nightly run.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Opt-in @merge-queue serves: the heavy real serves (default-engine +
-      # readiness) run only in the merge queue, where a cheaper per-engine canary
-      # (scenarios 5 vLLM / 7 lemonade) has already guarded the PR. This keeps the
-      # per-PR GPU run short while still exercising the full serve matrix before a
-      # change lands. Only set on the `merge_group` event.
-      E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
