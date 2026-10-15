@@ -636,7 +636,7 @@ mod tests {
     ) -> Option<(&str, usize, (usize, usize))> {
         let bytes = source.as_bytes();
         let mut i = at;
-        if matches!(bytes.get(i), Some(&b'b') | Some(&b'c')) {
+        if matches!(bytes.get(i), Some(&b'b' | &b'c')) {
             i += 1;
         }
         if bytes.get(i) != Some(&b'r') {
@@ -677,7 +677,7 @@ mod tests {
     ) -> Option<(String, usize, (usize, usize))> {
         let bytes = source.as_bytes();
         let mut i = at;
-        if matches!(bytes.get(i), Some(&b'b') | Some(&b'c')) {
+        if matches!(bytes.get(i), Some(&b'b' | &b'c')) {
             i += 1;
         }
         if bytes.get(i) != Some(&b'"') {
@@ -1089,7 +1089,7 @@ mod tests {
         // treated as an item body would swallow anything sharing its line.
         // Only recognising the `use` keeps that line in scope.
         let crowded = "#[cfg(test)] use a::{b, c}; fn f() { let _ = \"\u{2014}\"; }\n";
-        assert_eq!(lines(&crowded).len(), 1, "{:?}", lines(&crowded));
+        assert_eq!(lines(crowded).len(), 1, "{:?}", lines(crowded));
     }
 
     /// The brace-less form of the same trap.
