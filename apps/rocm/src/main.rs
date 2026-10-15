@@ -20528,15 +20528,6 @@ install therock";
     fn chat_tool_result_errors_use_plain_failure_wording() {
         assert_eq!(chat_read_only_tool_status_label(false), "done");
         assert_eq!(chat_read_only_tool_status_label(true), "reported an error");
-        assert_eq!(
-            chat::chat_tool_display_label("examine"),
-            "Checked this computer"
-        );
-        assert_eq!(
-            chat::chat_tool_display_label("gpu_snapshot"),
-            "Checked GPU status"
-        );
-        assert_eq!(chat::chat_tool_display_label("install_sdk"), "Install ROCm");
         assert!(chat::mcp_tool_result_is_error(&serde_json::json!({
             "isError": true
         })));

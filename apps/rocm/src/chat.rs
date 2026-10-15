@@ -86,7 +86,7 @@ pub(crate) fn mcp_tool_result_is_error(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn chat_tool_display_label(name: &str) -> String {
+fn chat_tool_display_label(name: &str) -> String {
     match name {
         "examine" => "Checked this computer".to_owned(),
         "gpu_snapshot" => "Checked GPU status".to_owned(),
@@ -553,6 +553,10 @@ mod tests {
     #[test]
     fn chat_tool_display_label_maps_known_tools_and_humanizes_others() {
         assert_eq!(chat_tool_display_label("examine"), "Checked this computer");
+        assert_eq!(
+            chat_tool_display_label("gpu_snapshot"),
+            "Checked GPU status"
+        );
         assert_eq!(chat_tool_display_label("install_sdk"), "Install ROCm");
         assert_eq!(
             chat_tool_display_label("some_unmapped_tool"),
@@ -581,12 +585,40 @@ mod tests {
             "Checked model recipes"
         );
         assert_eq!(
-            chat_tool_call_display_label(&rocm_command_call(&["engines", "list"])),
+            chat_tool_call_display_label(&rocm_command_call(&["model"])),
+            "Checked model recipes"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["ENGINES", "List"])),
             "Checked local engines"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["services"])),
+            "Checked model servers"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["services", "list", "-a"])),
+            "Checked model servers"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["services", "list", "--all"])),
+            "Checked model servers"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["comfyui"])),
+            "Checked ComfyUI"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["comfyui", "status"])),
+            "Checked ComfyUI"
         );
         assert_eq!(
             chat_tool_call_display_label(&rocm_command_call(&["comfyui", "logs", "-n", "50"])),
             "Read ComfyUI logs"
+        );
+        assert_eq!(
+            chat_tool_call_display_label(&rocm_command_call(&["config", "show"])),
+            "Checked ROCm config"
         );
     }
 
@@ -632,6 +664,14 @@ mod tests {
     #[test]
     fn parse_optional_query_rejects_a_dangling_flag() {
         assert!(parse_optional_query(&["--query".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_optional_query_skips_unknown_flags_to_find_the_positional_value() {
+        assert_eq!(
+            parse_optional_query(&["--unknown-flag".to_owned(), "gpu".to_owned()]).unwrap(),
+            Some("gpu".to_owned())
+        );
     }
 
     #[test]
@@ -696,22 +736,42 @@ vllm: not_installed
     }
 
     #[test]
+    fn parse_deterministic_model_recipes_requires_aliases_bracket_in_header() {
+        let recipes = parse_deterministic_model_recipes(
+            "\
+  NotAHeader task=chat dtype=gguf device=gpu_required min_gpu_mem=4 GiB engines=[lemonade]
+  Qwen/Qwen3.5-4B aliases=[qwen3.5] task=chat dtype=bfloat16 device=gpu_preferred min_gpu_mem=12 GiB engines=[vllm]
+",
+        );
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].canonical_id, "Qwen/Qwen3.5-4B");
+    }
+
+    #[test]
     fn parse_deterministic_service_rows_reads_inline_key_value_form() {
         let rows = parse_deterministic_service_rows(
             "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
         );
         assert_eq!(rows.len(), 1);
-        // Known bug, pinned rather than fixed: the leading "- service_id="
-        // prefix strip consumes the `service_id` key before the per-token
-        // `key=value` loop runs, so the bare id token that's left (`svc-1`)
-        // has no `=` and is silently dropped — service_id ends up empty for
-        // this inline form. Nothing downstream reads `row.service_id` today,
-        // so the field is latent dead data rather than an observed failure.
-        assert_eq!(rows[0].service_id, "");
+        // service_id is not asserted here: see
+        // parse_deterministic_service_rows_reads_inline_service_id_rocmai_577
+        // below for why.
         assert_eq!(rows[0].engine, "vllm");
         assert_eq!(rows[0].status, "ready");
         assert_eq!(rows[0].running_state, "running");
         assert_eq!(rows[0].endpoint, "127.0.0.1:8000");
+    }
+
+    #[test]
+    #[ignore = "ROCMAI-577: the leading \"- service_id=\" prefix strip consumes \
+                the `service_id` key before the per-token `key=value` loop runs, \
+                so the bare id token that's left (`svc-1`) has no `=` and is \
+                silently dropped"]
+    fn parse_deterministic_service_rows_reads_inline_service_id_rocmai_577() {
+        let rows = parse_deterministic_service_rows(
+            "  - service_id=svc-1 engine=vllm model=qwen status=ready running_state=running endpoint=127.0.0.1:8000",
+        );
+        assert_eq!(rows[0].service_id, "svc-1");
     }
 
     #[test]
@@ -727,6 +787,15 @@ endpoint: 127.0.0.1:8001
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].service_id, "svc-2");
+        assert_eq!(rows[0].running_state, "starting");
+    }
+
+    #[test]
+    fn parse_deterministic_service_rows_derives_running_state_for_inline_form_when_absent() {
+        let rows = parse_deterministic_service_rows(
+            "  - service_id=svc-3 engine=vllm model=qwen status=starting endpoint=127.0.0.1:8002",
+        );
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].running_state, "starting");
     }
 
@@ -760,7 +829,12 @@ endpoint: 127.0.0.1:8001
 
     #[test]
     fn normalized_chat_rocm_command_args_rejects_empty_and_control_characters() {
-        assert!(normalized_chat_rocm_command_args(&rocm_command_call(&[])).is_err());
+        assert_eq!(
+            normalized_chat_rocm_command_args(&rocm_command_call(&[]))
+                .unwrap_err()
+                .to_string(),
+            "rocm_command `args` must contain 1 to 64 strings"
+        );
         assert!(normalized_chat_rocm_command_args(&rocm_command_call(&["rocm"])).is_err());
 
         for control_arg in ["engines\nlist", "engines\rlist", "engines\0list"] {
@@ -769,14 +843,46 @@ endpoint: 127.0.0.1:8001
                 name: "rocm_command".to_owned(),
                 arguments: serde_json::json!({"args": [control_arg]}),
             };
-            assert!(normalized_chat_rocm_command_args(&call).is_err());
+            assert_eq!(
+                normalized_chat_rocm_command_args(&call)
+                    .unwrap_err()
+                    .to_string(),
+                "rocm_command arguments must not contain control characters"
+            );
         }
+    }
+
+    #[test]
+    fn normalized_chat_rocm_command_args_accepts_exactly_the_count_and_length_limits() {
+        let max_args = vec!["engines"; 64];
+        assert_eq!(
+            normalized_chat_rocm_command_args(&rocm_command_call(&max_args))
+                .unwrap()
+                .len(),
+            64
+        );
+
+        let max_len_arg = "a".repeat(512);
+        let call = providers::ChatToolCall {
+            id: None,
+            name: "rocm_command".to_owned(),
+            arguments: serde_json::json!({"args": [max_len_arg.as_str()]}),
+        };
+        assert_eq!(
+            normalized_chat_rocm_command_args(&call).unwrap(),
+            vec![max_len_arg]
+        );
     }
 
     #[test]
     fn normalized_chat_rocm_command_args_rejects_over_limit_count_and_length() {
         let too_many_args = vec!["engines"; 65];
-        assert!(normalized_chat_rocm_command_args(&rocm_command_call(&too_many_args)).is_err());
+        assert_eq!(
+            normalized_chat_rocm_command_args(&rocm_command_call(&too_many_args))
+                .unwrap_err()
+                .to_string(),
+            "rocm_command `args` must contain 1 to 64 strings"
+        );
 
         let too_long_arg = "a".repeat(513);
         let call = providers::ChatToolCall {
@@ -784,7 +890,12 @@ endpoint: 127.0.0.1:8001
             name: "rocm_command".to_owned(),
             arguments: serde_json::json!({"args": [too_long_arg]}),
         };
-        assert!(normalized_chat_rocm_command_args(&call).is_err());
+        assert_eq!(
+            normalized_chat_rocm_command_args(&call)
+                .unwrap_err()
+                .to_string(),
+            "rocm_command argument is too long"
+        );
     }
 
     #[test]
