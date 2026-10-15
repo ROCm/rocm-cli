@@ -1714,7 +1714,8 @@ just because no HIP SDK is installed — has **no** end-to-end coverage and cann
 have any. `check_13_hip_sdk_missing` returns early on every non-Windows host, so
 on a Linux lane that early return alone satisfies "no cause tells this user to
 install the HIP SDK"; the assertion would still hold with `check_20` deleted.
-The gate itself is held by unit tests in `diagnose.rs`
+The gate itself is held by unit tests in
+[diagnose.rs](../crates/rocm-core/src/diagnose.rs)
 (`fix_13_does_not_fire_on_a_lemonade_vulkan_host_with_no_hip_evidence` and its
 neighbours) and by the Windows manual check in
 [manual-testing.md](manual-testing.md), in the Ryzen 4000/5000 section.
