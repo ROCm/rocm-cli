@@ -265,8 +265,8 @@ The GPU jobs (in `e2e-selfhosted.yml`) run automatically on `push`,
 required for merging and so is skipped in the merge queue rather than left
 queued behind a single runner after its PR has merged) when the workflow's own
 `changes` job's `serve` path filter is `true`. A new push to a pull request
-cancels that PR's older run; push, `merge_group` and manual runs never cancel
-one another. `push` fires on `main` and on any `release/**`
+cancels that PR's older run; push, `merge_group` and manual runs each get a
+group of their own, so none is cancelled or replaced by another. `push` fires on `main` and on any `release/**`
 branch, so pushing to a release branch runs the full self-hosted matrix ahead
 of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base

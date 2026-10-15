@@ -4463,6 +4463,13 @@ jobs:
             group.contains("github.run_id"),
             "a workflow_dispatch run must keep a unique group (got `{group}`)"
         );
+        // Not the ref: GitHub replaces a still-pending run in a shared group even
+        // with cancel-in-progress off, so two pushes to `main` would drop one.
+        assert!(
+            group.contains("github.sha") && !group.contains("github.ref"),
+            "a push or merge_group run must be keyed on its commit, not the ref \
+             (got `{group}`)"
+        );
         assert_eq!(
             concurrency_cancel_in_progress(&sh),
             "${{ github.event_name == 'pull_request' }}",
@@ -4496,7 +4503,12 @@ jobs:
             !job_block(&sh, "e2e-gpu").contains("E2E_MERGE_QUEUE"),
             "e2e-gpu never runs in the merge queue, so it must not opt into @merge-queue scenarios"
         );
-        for job in ["e2e-gpu-strix-ubuntu", "e2e-gpu-strix-windows", "e2e-wsl"] {
+        for job in [
+            "e2e-gpu-strix-ubuntu",
+            "e2e-gpu-strix-windows",
+            "e2e-wsl",
+            "e2e-gpu-w7900",
+        ] {
             assert!(
                 !gate(job).contains("merge_group"),
                 "`{job}` must keep running in the merge queue"

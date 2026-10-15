@@ -57,17 +57,18 @@ concurrency:
   # Own group, namespaced by this workflow so it is DISTINCT from ci.yml's shared
   # group — the whole point of the split. The key also carries the event name, so
   # a pull_request, push, merge_group and workflow_dispatch run can never share a
-  # group: a PR run is keyed on the PR NUMBER and a new push to that PR
-  # supersedes the older run; push and merge_group runs keep their ref (a
-  # distinct ref per queue entry); manual dispatches get a unique (run_id) group
+  # group. A PR run is keyed on the PR NUMBER, so a new push to that PR
+  # supersedes the older run. A push or merge_group run is keyed on its commit
+  # SHA, unique per run: even with cancel-in-progress off, GitHub replaces a
+  # still-PENDING run in a shared group with a newer one, which would drop the
+  # record of a commit that landed. Manual dispatches get a unique (run_id) group
   # so a stuck dispatch never blocks later dispatches.
   group: >-
     ${{ github.workflow }}-${{ github.event_name }}-${{
       github.event_name == 'pull_request' && github.event.pull_request.number
       || github.event_name == 'workflow_dispatch' && github.run_id
-      || github.ref }}
-  # Supersede only pull_request runs. A push or merge_group run is the record of
-  # a commit that landed, so a later one must not cancel it.
+      || github.sha }}
+  # Supersede only pull_request runs; every other run has a group of its own.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -393,7 +394,7 @@ jobs:
       # Match the MI300X dispatch path: opt into the platform-adaptive large-model
       # scenario only when the manual include_nightly input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -522,7 +523,7 @@ jobs:
       # Match the Linux Strix dispatch path: opt into the platform-adaptive
       # large-model scenario only when the manual input is enabled.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -852,7 +853,7 @@ jobs:
       # Match the other hardware lanes: opt into the platform-adaptive
       # large-model scenario only when the manual include_nightly input is on.
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Heavy @merge-queue serves run only in the merge queue; see e2e-gpu.
+      # Heavy @merge-queue serves run only in the merge queue.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
       # apps/rocm/build.rs falls back to GitHub's own GITHUB_HEAD_REF/
       # GITHUB_REF_NAME when this isn't set, but those never reach the WSL
@@ -1404,7 +1405,7 @@ jobs:
     env:
       E2E_SERVE_TIMEOUT_SECS: "300"
       E2E_INCLUDE_NIGHTLY: "${{ inputs.include_nightly && '1' || '' }}"
-      # Full serve matrix at the merge-queue gate, like every other lane (see e2e-gpu).
+      # Full serve matrix at the merge-queue gate.
       E2E_MERGE_QUEUE: "${{ github.event_name == 'merge_group' && '1' || '' }}"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
