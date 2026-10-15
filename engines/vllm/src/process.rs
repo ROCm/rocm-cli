@@ -228,11 +228,7 @@ the ROCm SDK's bundled numa uses renamed symbol versions and cannot satisfy it, 
         );
     }
 
-    if !cfg!(windows)
-        && let Some(problem) = vllm_extension_import_problem(runtime)
-    {
-        bail!("{problem}");
-    }
+    require_importable_extensions(runtime)?;
 
     if let Some(parent) = request.state_path.parent() {
         fs::create_dir_all(parent)
@@ -474,7 +470,11 @@ except Exception:
 for name in ("vllm._C", "vllm._rocm_C"):
     try:
         importlib.import_module(name)
-    except Exception as error:
+    except ModuleNotFoundError:
+        # Not built into this wheel (`_rocm_C` on a non-ROCm build): vLLM
+        # carries on without it, so it is not a mismatch.
+        continue
+    except ImportError as error:
         failures.append({"module": name, "error": str(error)[:400]})
 print(json.dumps({"failures": failures}))
 "#;
@@ -491,6 +491,21 @@ const VLLM_EXTENSION_PROBE_TIMEOUT: Duration = Duration::from_mins(1);
 /// `AttributeError`. This surfaces the cause up front. Best-effort: any trouble
 /// running the probe yields `None`, never a false alarm.
 pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<String> {
+    extension_import_problem_within(runtime, VLLM_EXTENSION_PROBE_TIMEOUT)
+}
+
+/// `rocm serve` refuses to launch a vLLM that cannot load its extensions.
+fn require_importable_extensions(runtime: &VllmRuntime) -> Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    match vllm_extension_import_problem(runtime) {
+        Some(problem) => bail!("{problem}"),
+        None => Ok(()),
+    }
+}
+
+fn extension_import_problem_within(runtime: &VllmRuntime, timeout: Duration) -> Option<String> {
     let python = runtime.python_executable.as_ref()?;
     let mut command = ProcessCommand::new(python);
     command
@@ -501,7 +516,7 @@ pub(crate) fn vllm_extension_import_problem(runtime: &VllmRuntime) -> Option<Str
         .stderr(Stdio::null());
     apply_therock_env(&mut command, runtime).ok()?;
     let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + VLLM_EXTENSION_PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().ok()? {
             Some(status) if status.success() => break,
@@ -1877,6 +1892,98 @@ WARNING Failed to import from vllm._C with ImportError('libtorch_cuda.so: cannot
         let runtime = test_vllm_runtime(Some(python), None);
         let problem = vllm_extension_import_problem(&runtime).expect("the probe failure surfaces");
         assert!(problem.contains("vllm._rocm_C"), "{problem}");
+        Ok(())
+    }
+    #[cfg(unix)]
+    fn stand_in_python(dir: &Path, body: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let python = dir.join("python");
+        fs::write(&python, format!("#!/bin/sh\n{body}\n"))?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        Ok(python)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn serve_refuses_a_vllm_whose_extensions_do_not_import() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(
+            dir.path(),
+            r#"echo '{"failures": [{"module": "vllm._C", "error": "undefined symbol: x"}]}'"#,
+        )?;
+        let error = require_importable_extensions(&test_vllm_runtime(Some(python), None))
+            .expect_err("a failing extension blocks serve")
+            .to_string();
+        assert!(error.contains("vllm._C"), "{error}");
+
+        let clean = tempfile::tempdir()?;
+        let python = stand_in_python(clean.path(), r#"echo '{"failures": []}'"#)?;
+        require_importable_extensions(&test_vllm_runtime(Some(python), None))?;
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_check_gives_up_on_a_hung_probe() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let python = stand_in_python(dir.path(), "exec sleep 30")?;
+        let started = Instant::now();
+        let problem = extension_import_problem_within(
+            &test_vllm_runtime(Some(python), None),
+            Duration::from_millis(200),
+        );
+        assert_eq!(problem, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the probe was not stopped at its deadline"
+        );
+        Ok(())
+    }
+    #[cfg(unix)]
+    #[test]
+    fn extension_probe_script_reports_only_import_errors_after_torch() -> Result<()> {
+        let run = |torch: &str, with_rocm_c: bool| -> Result<Option<String>> {
+            let dir = tempfile::tempdir()?;
+            let vllm = dir.path().join("vllm");
+            fs::create_dir(&vllm)?;
+            fs::write(dir.path().join("torch.py"), torch)?;
+            fs::write(vllm.join("__init__.py"), "")?;
+            fs::write(
+                vllm.join("_C.py"),
+                "raise ImportError('undefined symbol: boom')",
+            )?;
+            if with_rocm_c {
+                fs::write(vllm.join("_rocm_C.py"), "")?;
+            }
+            let Ok(output) = ProcessCommand::new("python3")
+                .arg("-c")
+                .arg(VLLM_EXTENSION_PROBE_SCRIPT)
+                .env("PYTHONPATH", dir.path())
+                .output()
+            else {
+                return Ok(None);
+            };
+            assert!(output.status.success(), "{output:?}");
+            let runtime = test_vllm_runtime(None, None);
+            Ok(extension_import_problem_from_probe(
+                &String::from_utf8_lossy(&output.stdout),
+                &runtime,
+            ))
+        };
+        if ProcessCommand::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return Ok(());
+        }
+        // `_C` fails to load; a `_rocm_C` that is merely absent is not a mismatch.
+        let problem = run("", false)?.expect("a failing _C is a problem");
+        assert!(
+            problem.contains("vllm._C: undefined symbol: boom"),
+            "{problem}"
+        );
+        assert!(!problem.contains("_rocm_C"), "{problem}");
+        // A torch that does not import is a different failure: report nothing.
+        assert_eq!(run("raise ImportError('no torch')", true)?, None);
         Ok(())
     }
     #[test]
