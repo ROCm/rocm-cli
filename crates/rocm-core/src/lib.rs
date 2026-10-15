@@ -1001,8 +1001,8 @@ pub struct AutomationRuntimeState {
     /// start-time makes a recycled PID detectable ([`identity_state`]).
     ///
     /// `None` on two very different occasions, which callers must not conflate:
-    /// a state file written before this field existed, and a platform without
-    /// `/proc` where [`process_start_ticks`] can never return anything.
+    /// a state file written before this field existed, and a platform where
+    /// [`process_start_ticks`] can never return anything.
     ///
     /// Conflating them is a live hazard, because [`identity_state`] maps a `None`
     /// recorded value to [`IdentityState::Matches`] — the legacy best-effort arm

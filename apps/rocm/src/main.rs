@@ -27880,8 +27880,8 @@ install therock";
 
     #[test]
     fn a_stale_record_whose_old_port_was_reused_does_not_block_uninstall() {
-        // prunes records, and `services remove` is a manual step. If the gate judged
-        // prunes records and there is no `services remove`. If the gate judged
+        // Nothing prunes a stopped record automatically, so an old one stays on
+        // disk until the operator runs `rocm services remove <id> --yes`. If the gate judged
         // those records by their recorded port, any unrelated process that later
         // bound it would fail uninstall deterministically, with no override and
         // no recovery — `rocm services stop` cannot help an already-stopped
@@ -28506,6 +28506,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_forbidden_answer_on_a_stopped_records_port_blocks_like_an_unauthorized_one() {
@@ -28546,6 +28547,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_stored_endpoint_key_reaches_the_identity_probe() {
@@ -28612,6 +28614,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux: drives a real spawned stand-in verified through its start time and zombie-state detection.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_doomed_run_stops_nothing_on_its_way_to_the_abort() {
@@ -28660,6 +28663,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]
     fn serving_the_same_model_again_after_a_stop_does_not_doom_the_uninstall() {
@@ -28788,6 +28792,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_stopped_record_spelled_with_a_wildcard_host_still_waits_for_its_live_partner() {
@@ -28832,6 +28837,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux: drives a real spawned stand-in verified through its start time and zombie-state detection.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_deferred_stopped_record_is_judged_once_its_live_partner_has_stopped() {
@@ -28898,6 +28904,7 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    // Gated to Linux with its siblings: nothing here is Linux-specific (loopback HTTP and an injected stop), but no Windows lane has run it yet.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_failed_live_partner_is_not_named_twice_through_its_stopped_twin() {
@@ -29023,14 +29030,14 @@ install therock";
         // verdict needs nothing this pass stops, so it must land before the live
         // server is touched.
         let endpoint = ServingEndpoint::serving("amd/survivor-model");
-        let server = KillOnDrop(
+        let mut server = KillOnDrop(
             std::process::Command::new("sleep")
                 .arg("60")
                 .spawn()
                 .expect("spawn managed server"),
         );
         let pid = server.0.id();
-        let daemon = KillOnDrop(
+        let mut daemon = KillOnDrop(
             std::process::Command::new("sleep")
                 .arg("60")
                 .spawn()
@@ -29070,11 +29077,11 @@ install therock";
             "nothing may be stopped: {report:?}"
         );
         assert!(
-            rocm_core::process_is_running(pid),
+            server.0.try_wait().expect("poll the server").is_none(),
             "the live server must be left running by a run that aborts anyway"
         );
         assert!(
-            rocm_core::process_is_running(daemon_pid) && !report.helper_stopped,
+            daemon.0.try_wait().expect("poll the daemon").is_none() && !report.helper_stopped,
             "a verified daemon must not be force-killed by a run that aborts anyway: {report:?}"
         );
         assert!(

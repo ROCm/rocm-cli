@@ -1023,7 +1023,7 @@ mod tests {
         assert_eq!(state.daemon_pid, std::process::id());
         let recorded = state
             .daemon_start_ticks
-            .expect("a live daemon must record its own start-time on Linux");
+            .expect("a live daemon must record its own start-time");
         assert_eq!(
             Some(recorded),
             rocm_core::process_start_ticks(std::process::id())

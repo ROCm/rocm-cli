@@ -1349,7 +1349,7 @@ preservation; a Windows loopback-HTTP install; isolated installed-binary
 directory smoke checks (`rocm examine` must read only the isolated
 config/data/cache, never the real user `.rocm` state); full-purge uninstall; uninstall stopping the local server it manages
 (lifecycle-10 and lifecycle-24, Linux and Windows); uninstall stopping the
-background helper (lifecycle-26); a cache-only uninstall leaving the server
+background helper (lifecycle-26); an uninstall that keeps the binaries and data leaving the server
 running and its record in place (lifecycle-27); and uninstall refusing to
 remove anything while a managed service record cannot be read (lifecycle-25); uninstall refusing a live server it cannot prove is ours, with no recorded start time (lifecycle-28); and uninstall refusing while the helper's runtime state cannot be read (lifecycle-29).
 Each scenario generates its own local keys, package, and install root under a

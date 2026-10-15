@@ -645,5 +645,5 @@ managed server again, then:
   written by an older version looks like this). The plan must say the stop
   will be refused, and `rocm uninstall --yes` must exit non-zero naming the
   pid, leave the server running, and remove nothing.
-- **Cache only.** `rocm uninstall --yes --keep-binaries --keep-data` must leave
+- **Keep binaries and data (removes only config and cache).** `rocm uninstall --yes --keep-binaries --keep-data` must leave
   the server and the helper running and say so in the plan.

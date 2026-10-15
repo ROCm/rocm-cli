@@ -1111,18 +1111,12 @@ async fn when_uninstall_keep(world: &mut E2eWorld) {
     st.last_rc = output.status.code().unwrap_or(-1);
 }
 
-#[when("the user uninstalls only the cache from the installed binary")]
+#[when("the user uninstalls keeping binaries and data")]
 async fn when_uninstall_cache_only(world: &mut E2eWorld) {
     let st = state(world);
     let rocm = installed_binary(&st.install_dir, "rocm");
     let mut cmd = Command::new(&rocm);
-    cmd.args([
-        "uninstall",
-        "--yes",
-        "--keep-binaries",
-        "--keep-config",
-        "--keep-data",
-    ]);
+    cmd.args(["uninstall", "--yes", "--keep-binaries", "--keep-data"]);
     apply_smoke_env(&mut cmd, st);
     let output = cmd.output().expect("failed to run uninstall");
     let combined = format!(
@@ -1539,30 +1533,30 @@ async fn then_managed_server_still_running(world: &mut E2eWorld) {
         .managed_server
         .as_mut()
         .expect("no managed server was started");
-    // A cache-only run keeps the tooling that stops servers, so it must leave
+    // A run keeping binaries and data keeps the tooling that stops servers, so it must leave
     // the server alone; give a wrongly-issued stop time to land first.
     std::thread::sleep(std::time::Duration::from_secs(2));
     assert!(
         server.try_wait().expect("failed to poll").is_none(),
-        "a cache-only uninstall stopped the managed server"
+        "an uninstall keeping binaries and data stopped the managed server"
     );
 }
 
-#[then("the cache-only run says the server is left running")]
+#[then("the keep-binaries-and-data run says the server is left running")]
 async fn then_cache_only_says_left_running(world: &mut E2eWorld) {
     let out = &state(world).last_output;
     assert!(
         out.contains("are left running") || out.contains("left running"),
-        "the cache-only run did not say the server is left running:\n{out}"
+        "the keep-binaries-and-data run did not say the server is left running:\n{out}"
     );
     assert_eq!(
         state(world).last_rc,
         0,
-        "the cache-only run exited non-zero:\n{out}"
+        "the keep-binaries-and-data run exited non-zero:\n{out}"
     );
     assert!(
         !out.contains("will refuse to remove anything"),
-        "the cache-only run printed a refusal:\n{out}"
+        "the keep-binaries-and-data run printed a refusal:\n{out}"
     );
 }
 
@@ -1651,17 +1645,17 @@ async fn then_isolated_folders_gone(world: &mut E2eWorld) {
     }
 }
 
-#[then("only the isolated cache folder is gone")]
+#[then("only the isolated config and cache folders are gone")]
 async fn then_only_cache_gone(world: &mut E2eWorld) {
     let st = state(world);
     assert_missing(st.smoke_cache.as_ref().expect("no isolated cache dir"));
-    for dir in [&st.smoke_config, &st.smoke_data].into_iter().flatten() {
-        assert!(
-            dir.exists(),
-            "a cache-only uninstall removed {}",
-            dir.display()
-        );
-    }
+    assert_missing(st.smoke_config.as_ref().expect("no isolated config dir"));
+    let data = st.smoke_data.as_ref().expect("no isolated data dir");
+    assert!(
+        data.exists(),
+        "an uninstall keeping the data removed {}",
+        data.display()
+    );
 }
 
 #[then("the installed rocm and rocmd binaries are still present")]

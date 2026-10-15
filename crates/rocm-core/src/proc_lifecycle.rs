@@ -47,8 +47,9 @@ pub enum KillScope {
 
 /// A spawned process identified in a way that is robust to PID recycling.
 ///
-/// `start_ticks` is the kernel start-time of the process (clock ticks since
-/// boot). It is `None` when the platform cannot read it (or the process is gone), where identity cannot be
+/// `start_ticks` is the kernel start-time of the process (Linux: clock ticks since
+/// boot; Windows: the creation time). It is `None` when the platform cannot read it (or the
+/// process is gone), where identity cannot be
 /// verified and callers fall back to best-effort behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessIdentity {

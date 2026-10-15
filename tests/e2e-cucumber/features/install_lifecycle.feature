@@ -344,21 +344,21 @@ Feature: Release install lifecycle
     And the background helper is no longer running
     And the isolated config, data, and cache folders are gone
 
-  # EAI-8014: a run that removes only the cache keeps `rocm services stop` and the
+  # EAI-8014: a run that keeps the binaries and data (and so removes only config and cache) keeps `rocm services stop` and the
   # service records, so it must not force-stop a server it leaves stoppable.
-  @id:lifecycle-linux-uninstall-cache-only-leaves-server @lifecycle @requires-os:linux
-  Scenario: lifecycle-27 - Linux - a cache-only uninstall leaves the managed server running and stoppable
+  @id:lifecycle-linux-uninstall-keep-binaries-data-leaves-server @lifecycle @requires-os:linux
+  Scenario: lifecycle-27 - Linux - uninstall keeping binaries and data leaves the managed server running and stoppable
     Given a freshly built release tree
     And a generated signing keypair
     And a signed bundle installed with the public key file
     And the installed binary has isolated XDG directories with state
     And a local server this machine manages is running
-    When the user uninstalls only the cache from the installed binary
+    When the user uninstalls keeping binaries and data
     Then the removal is reported as complete
-    And the cache-only run says the server is left running
+    And the keep-binaries-and-data run says the server is left running
     And the local server this machine manages is still running
     And the managed service record is still present
-    And only the isolated cache folder is gone
+    And only the isolated config and cache folders are gone
     And the installed rocm and rocmd binaries are still present
 
   # EAI-8014: a live server whose record has no start time cannot be proven ours,

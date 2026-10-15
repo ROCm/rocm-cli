@@ -586,7 +586,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use crate::tests::assert_stopped_within_grace;
 
-    /// Linux-only: needs a real spawned stand-in and `process_start_ticks`.
+    /// Gated to Linux because it spawns a real stand-in process and relies on the
+    /// zombie-state detection in `terminate_verified`, which is implemented only there.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_cache_only_uninstall_leaves_a_live_server_running() {
@@ -685,7 +686,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Linux-only: relies on `process_start_ticks` (`Some` only on Linux) and on
+    /// Gated to Linux: relies on a spawned stand-in and on
     /// the zombie-state detection in `terminate_verified`.
     #[cfg(target_os = "linux")]
     #[test]
@@ -762,7 +763,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    /// Linux-only for the same reason as the test above: `process_start_ticks`
+    /// Gated to Linux for the same reason as the test above: a spawned stand-in
     /// and zombie-state detection.
     #[cfg(target_os = "linux")]
     #[test]

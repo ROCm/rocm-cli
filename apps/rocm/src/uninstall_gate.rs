@@ -394,9 +394,11 @@ pub(crate) fn daemon_identity_unverified(
             "rocmd (pid {daemon_pid}; state file {})",
             state_file.display()
         ),
-        reason: "the background helper's identity could not be verified, so it was left running \
-                 rather than risk signalling an unrelated process that inherited its pid"
-            .to_owned(),
+        reason:
+            "the background helper's identity could not be verified (no start time was recorded \
+                 for it, or its start time cannot be read now), so it was left running rather \
+                 than risk signalling an unrelated process that inherited its pid"
+                .to_owned(),
         remedy: StopFailureRemedy::ConfirmTheDaemonPid,
     }
 }
