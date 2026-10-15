@@ -360,3 +360,32 @@ Feature: Release install lifecycle
     And the managed service record is still present
     And only the isolated cache folder is gone
     And the installed rocm and rocmd binaries are still present
+
+  # EAI-8014: a live server whose record has no start time cannot be proven ours,
+  # so uninstall refuses and kills nothing instead of signalling an unverified pid.
+  @id:lifecycle-linux-uninstall-refuses-tickless-server @lifecycle @requires-os:linux
+  Scenario: lifecycle-28 - Linux - uninstall refuses a live server it cannot prove is ours
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And a local server this machine manages is running with no recorded start time
+    When the user uninstalls from the installed binary
+    Then the removal is refused because the server cannot be proven ours
+    And the installed rocm binary and manifest are still present
+    And the managed service record is still present
+    And the local server this machine manages is still running
+
+  # EAI-8014: an unreadable helper runtime state means the helper cannot be
+  # confirmed stopped, so uninstall refuses and keeps everything.
+  @id:lifecycle-linux-uninstall-refuses-unreadable-helper-state @lifecycle @requires-os:linux
+  Scenario: lifecycle-29 - Linux - uninstall refuses when the helper runtime state cannot be read
+    Given a freshly built release tree
+    And a generated signing keypair
+    And a signed bundle installed with the public key file
+    And the installed binary has isolated XDG directories with state
+    And the background helper runtime state cannot be parsed
+    When the user uninstalls from the installed binary
+    Then the removal is refused because the helper state cannot be read
+    And the installed rocm binary and manifest are still present
+    And the isolated XDG state is still present

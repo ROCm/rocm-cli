@@ -651,8 +651,10 @@ rocm logs --search error timeout")]
     /// Remove ROCm CLI-managed files from this computer.
     ///
     /// Managed model servers that are still running are stopped first, and so
-    /// is the background helper (`rocmd`), whose whole process tree is
-    /// force-stopped because it would otherwise restart them. If one cannot be
+    /// is the background helper (`rocmd`), which is force-stopped (on Linux its
+    /// whole process tree; on Windows only the recorded process, as
+    /// descendants are not enumerated there) because it would otherwise
+    /// restart them. If one cannot be
     /// stopped, nothing is removed, the command exits non-zero, and it names
     /// what to repair or stop by hand. A server or helper that was recorded by
     /// an older version, with no start time to prove its pid, is refused rather

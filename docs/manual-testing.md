@@ -627,7 +627,7 @@ rocm uninstall --yes
 Expected result:
 
 - The plan warns the server will be stopped before removal. If the background
-  helper (`rocmd`) is running, the plan says it will be force-stopped too.
+  helper (`rocmd`) is running, the plan says it will be force-stopped too (its whole process tree on Linux; only the recorded process on Windows, and the plan says so).
 - The server (and helper) are stopped, then the files are removed and the
   command exits 0.
 

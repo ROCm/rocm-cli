@@ -248,7 +248,7 @@ pub(crate) const HELPER_KILL_SCOPE: rocm_core::KillScope = rocm_core::KillScope:
 /// How much of a process tree the stop signals, in words, for the plan and the
 /// docs: only Linux enumerates descendants (`process_tree_pids` returns just the
 /// root on Windows), so the claim cannot be the same on both.
-pub(crate) fn tree_scope_words() -> &'static str {
+pub(crate) const fn tree_scope_words() -> &'static str {
     if rocm_core::runtime_is_windows() {
         "only the recorded process (descendants are not enumerated on Windows)"
     } else {
@@ -365,11 +365,12 @@ pub(crate) fn background_helper_plan_note(
              the tooling, so it does not check it",
             state_file.display()
         )),
-        (HelperDecision::Unverifiable { pid }, false)
-        | (HelperDecision::Stop { pid, .. }, false) => Some(format!(
-            "the background helper (rocmd, pid {pid}) is running; this removal keeps the \
+        (HelperDecision::Unverifiable { pid } | HelperDecision::Stop { pid, .. }, false) => {
+            Some(format!(
+                "the background helper (rocmd, pid {pid}) is running; this removal keeps the \
                  tooling, so it is left running"
-        )),
+            ))
+        }
         (HelperDecision::Stop { pid, .. }, true) if run_refuses => Some(format!(
             "the background helper (rocmd, pid {pid}) is running; uninstall will refuse (see \
              above) before stopping anything, so it is left running"
@@ -509,7 +510,7 @@ pub(crate) fn stop_background_helper_with(
         ));
     } else {
         report.failed.push(FailedManagedServiceStop {
-            service_id: format!("rocmd (pid {})", pid),
+            service_id: format!("rocmd (pid {pid})"),
             reason: "the background helper was signalled but could not be confirmed stopped (the \
                      servers it supervised may already be down), and it restarts managed \
                      services whose endpoint stops answering"

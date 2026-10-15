@@ -511,6 +511,17 @@ fn spawn_long_lived_child() -> std::process::Child {
 /// termination verifies it against the recorded start time and stops it.
 #[given("a local server this machine manages is running")]
 async fn given_managed_server_running(world: &mut E2eWorld) {
+    plant_managed_server(world, true);
+}
+
+/// A live server whose record carries no start time, as an older version wrote
+/// it: uninstall cannot prove the pid is ours, so it must refuse.
+#[given("a local server this machine manages is running with no recorded start time")]
+async fn given_managed_server_running_tickless(world: &mut E2eWorld) {
+    plant_managed_server(world, false);
+}
+
+fn plant_managed_server(world: &mut E2eWorld, with_start_ticks: bool) {
     let services_dir = state(world)
         .smoke_data
         .as_ref()
@@ -537,6 +548,10 @@ async fn given_managed_server_running(world: &mut E2eWorld) {
     );
     // A record written by a current `rocmd` carries the supervisor's start time;
     // a tick-less live record is refused by uninstall rather than killed.
+    if !with_start_ticks {
+        state_mut(world).managed_server = Some(server);
+        return;
+    }
     let record_path = services_dir.join("e2e-mock.json");
     let mut record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&record_path).expect("failed to read record"))
@@ -577,6 +592,21 @@ async fn given_background_helper_running(world: &mut E2eWorld) {
     )
     .expect("failed to write helper state");
     state_mut(world).background_helper = Some(helper);
+}
+
+/// A runtime-state file the CLI cannot parse: it cannot tell whether a helper
+/// is running, so uninstall must refuse rather than delete the tooling.
+#[given("the background helper runtime state cannot be parsed")]
+async fn given_unparseable_helper_state(world: &mut E2eWorld) {
+    let automations_dir = state(world)
+        .smoke_data
+        .as_ref()
+        .expect("isolated data dir must be seeded before planting helper state")
+        .join("automations");
+    std::fs::create_dir_all(&automations_dir).expect("failed to create automations dir");
+    let path = automations_dir.join("runtime-state.json");
+    std::fs::write(&path, b"{ not json").expect("failed to write unparseable helper state");
+    state_mut(world).broken_record = Some(path);
 }
 
 /// An unparseable `*.json` under the isolated `services/` dir: the CLI cannot
@@ -1076,7 +1106,9 @@ async fn when_uninstall_keep(world: &mut E2eWorld) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    state_mut(world).last_output = combined;
+    let st = state_mut(world);
+    st.last_output = combined;
+    st.last_rc = output.status.code().unwrap_or(-1);
 }
 
 #[when("the user uninstalls only the cache from the installed binary")]
@@ -1352,6 +1384,11 @@ async fn then_examine_isolated(world: &mut E2eWorld) {
 #[then("the removal is reported as complete")]
 async fn then_removal_complete(world: &mut E2eWorld) {
     let out = &state(world).last_output;
+    assert_eq!(
+        state(world).last_rc,
+        0,
+        "uninstall did not exit zero:\n{out}"
+    );
     assert!(
         out.contains("uninstall complete"),
         "uninstall did not report completion:\n{out}"
@@ -1375,6 +1412,47 @@ async fn then_removal_refused(world: &mut E2eWorld) {
         out.contains(&record.display().to_string()),
         "refusal did not name the unreadable record {}:\n{out}",
         record.display()
+    );
+    assert!(
+        !out.contains("uninstall complete"),
+        "refused uninstall still reported completion:\n{out}"
+    );
+}
+
+#[then("the removal is refused because the server cannot be proven ours")]
+async fn then_refused_tickless(world: &mut E2eWorld) {
+    let out = state(world).last_output.clone();
+    assert_ne!(state(world).last_rc, 0, "uninstall succeeded:\n{out}");
+    assert!(
+        out.contains("uninstall will refuse to remove anything")
+            && out.contains("no start time was recorded"),
+        "the plan did not say the removal will be refused for want of a start time:\n{out}"
+    );
+    assert!(
+        !out.contains("uninstall complete"),
+        "refused uninstall still reported completion:\n{out}"
+    );
+    let server = state_mut(world)
+        .managed_server
+        .as_mut()
+        .expect("no managed server was started");
+    assert!(
+        server.try_wait().expect("failed to poll").is_none(),
+        "uninstall killed a pid it could not prove was ours"
+    );
+}
+
+#[then("the removal is refused because the helper state cannot be read")]
+async fn then_refused_helper_state(world: &mut E2eWorld) {
+    let st = state(world);
+    let out = &st.last_output;
+    let path = st.broken_record.as_ref().expect("no broken state planted");
+    assert_ne!(st.last_rc, 0, "uninstall succeeded:\n{out}");
+    assert!(
+        out.contains("uninstall will refuse to remove anything")
+            && out.contains(&path.display().to_string()),
+        "the plan did not name the unreadable helper state {}:\n{out}",
+        path.display()
     );
     assert!(
         !out.contains("uninstall complete"),
@@ -1476,6 +1554,15 @@ async fn then_cache_only_says_left_running(world: &mut E2eWorld) {
     assert!(
         out.contains("are left running") || out.contains("left running"),
         "the cache-only run did not say the server is left running:\n{out}"
+    );
+    assert_eq!(
+        state(world).last_rc,
+        0,
+        "the cache-only run exited non-zero:\n{out}"
+    );
+    assert!(
+        !out.contains("will refuse to remove anything"),
+        "the cache-only run printed a refusal:\n{out}"
     );
 }
 

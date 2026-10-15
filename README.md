@@ -949,8 +949,9 @@ rocm uninstall [--yes] [--dry-run]
 ```
 
 `rocm uninstall` stops any managed model server that is still running before it
-removes anything, and also stops the background helper (`rocmd`), whose whole
-process tree is force-stopped because it would otherwise restart the servers.
+removes anything, and also stops the background helper (`rocmd`), which is
+force-stopped (on Linux its whole process tree, on Windows only the recorded
+process) because it would otherwise restart the servers.
 If a server cannot be stopped (or its service record cannot be read), the
 command exits non-zero, leaves every file in place, and says what to repair or
 stop by hand, so the tooling needed to stop it is never deleted out from under
