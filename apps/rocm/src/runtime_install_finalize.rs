@@ -2082,6 +2082,18 @@ pub(crate) mod tests {
         assert_eq!(preferred_engine_for_sdk_family("gfx120X-all"), None);
     }
 
+    /// The real candidate path/text `real_os_release_ignores_a_simulated_host_root`
+    /// expects, read independently rather than by calling
+    /// `hardware_root::read_os_release` a second time. `Absent` and
+    /// `Unreadable` are not interchangeable: a non-`NotFound` error must
+    /// always report `Unreadable`, never silently fall through to `Absent`.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    enum ExpectedOsRelease {
+        Found(&'static str, String),
+        Absent,
+        Unreadable(&'static str),
+    }
+
     /// The package-manager plans run against the real machine, so a simulated
     /// host root must not change the distro they are built for: under a root
     /// whose `/etc/os-release` names a different distro, `real_os_release`
@@ -2122,32 +2134,37 @@ pub(crate) mod tests {
         // the exact same helper with the same identity resolver `real_os_release`
         // wraps one line away (which would pass even if its `.context(...)`
         // call or resolver closure broke), read both candidate paths directly
-        // and apply the same existence-only fallback rule inline. Where
-        // neither candidate is cleanly readable on this box (a minimal or
-        // sandboxed CI image), assert only the shape (`Absent`/`Unreadable`)
-        // rather than exact text — this test's job is "did it ignore the
-        // simulated root", not "what exactly is on this machine".
+        // and apply the same existence-only fallback rule inline. This mirrors
+        // which variant is correct for each case, rather than accepting
+        // `Absent` or `Unreadable` interchangeably — see `ExpectedOsRelease`'s
+        // own doc comment for why that distinction matters.
         let expected = match fs::read_to_string("/etc/os-release") {
-            Ok(text) => Some(("/etc/os-release", text)),
+            Ok(text) => ExpectedOsRelease::Found("/etc/os-release", text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                fs::read_to_string("/usr/lib/os-release")
-                    .ok()
-                    .map(|text| ("/usr/lib/os-release", text))
+                match fs::read_to_string("/usr/lib/os-release") {
+                    Ok(text) => ExpectedOsRelease::Found("/usr/lib/os-release", text),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        ExpectedOsRelease::Absent
+                    }
+                    Err(_) => ExpectedOsRelease::Unreadable("/usr/lib/os-release"),
+                }
             }
-            Err(_) => None,
+            Err(_) => ExpectedOsRelease::Unreadable("/etc/os-release"),
         };
         match expected {
-            Some((path, text)) => {
+            ExpectedOsRelease::Found(path, text) => {
                 assert_eq!((read.path(), read.text()), (path, text.as_str()));
             }
-            None => assert!(
+            ExpectedOsRelease::Absent => assert!(
+                matches!(&read, rocm_core::hardware_root::OsRelease::Absent),
+                "expected Absent, got {read:?}"
+            ),
+            ExpectedOsRelease::Unreadable(path) => assert!(
                 matches!(
                     &read,
-                    rocm_core::hardware_root::OsRelease::Absent
-                        | rocm_core::hardware_root::OsRelease::Unreadable { .. }
+                    rocm_core::hardware_root::OsRelease::Unreadable { path: p, .. } if *p == path
                 ),
-                "expected Absent or Unreadable when neither candidate is cleanly \
-                 readable, got {read:?}"
+                "expected Unreadable at {path}, got {read:?}"
             ),
         }
     }
