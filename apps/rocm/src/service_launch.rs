@@ -2896,6 +2896,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     #[ignore = "spawned as a child process by abandoned_launch_terminates_the_spawned_child"]
     fn managed_launch_cleanup_sleeper_child() {
         if std::env::var_os("ROCM_TEST_SLEEPER_CHILD").is_none() {
@@ -2905,6 +2906,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn abandoned_launch_terminates_the_spawned_child() -> Result<()> {
         let (root, paths) = test_paths("alloc-abandon-child");
         paths.ensure()?;
