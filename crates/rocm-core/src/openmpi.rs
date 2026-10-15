@@ -1030,7 +1030,11 @@ const LIBNUMA_MANUAL_HINT: &str =
 pub fn install_hint() -> InstallHint {
     #[cfg(target_os = "linux")]
     {
-        install_hint_for_read(&real_os_release(), build_openmpi_install_plan, OPENMPI_MANUAL_HINT)
+        install_hint_for_read(
+            &real_os_release(),
+            build_openmpi_install_plan,
+            OPENMPI_MANUAL_HINT,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1337,7 +1341,12 @@ mod tests {
             format!("install it with `sudo apt-get update && sudo apt-get install -y {packages}`")
         };
         assert_eq!(
-            install_hint_for("ID=ubuntu\n", build_openmpi_install_plan, OPENMPI_MANUAL_HINT).text,
+            install_hint_for(
+                "ID=ubuntu\n",
+                build_openmpi_install_plan,
+                OPENMPI_MANUAL_HINT
+            )
+            .text,
             apt("openmpi-bin libopenmpi-dev")
         );
         assert_eq!(
@@ -1350,12 +1359,22 @@ mod tests {
             apt("libatomic1")
         );
         assert_eq!(
-            install_hint_for("ID=ubuntu\n", build_libnuma_install_plan, LIBNUMA_MANUAL_HINT).text,
+            install_hint_for(
+                "ID=ubuntu\n",
+                build_libnuma_install_plan,
+                LIBNUMA_MANUAL_HINT
+            )
+            .text,
             apt("libnuma1")
         );
         // And each one's own manual advice for a distribution it cannot map.
         assert_eq!(
-            install_hint_for("ID=plan9\n", build_openmpi_install_plan, OPENMPI_MANUAL_HINT).text,
+            install_hint_for(
+                "ID=plan9\n",
+                build_openmpi_install_plan,
+                OPENMPI_MANUAL_HINT
+            )
+            .text,
             "install your distribution's OpenMPI runtime package \
              (providing libmpi.so / libmpi_cxx.so and mpirun)"
         );
@@ -1369,7 +1388,12 @@ mod tests {
             "install your distribution's libatomic runtime package (providing libatomic.so.1)"
         );
         assert_eq!(
-            install_hint_for("ID=plan9\n", build_libnuma_install_plan, LIBNUMA_MANUAL_HINT).text,
+            install_hint_for(
+                "ID=plan9\n",
+                build_libnuma_install_plan,
+                LIBNUMA_MANUAL_HINT
+            )
+            .text,
             "install your distribution's numactl runtime package (providing libnuma.so.1)"
         );
     }

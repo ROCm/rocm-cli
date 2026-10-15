@@ -3177,7 +3177,10 @@ mod tests {
         );
         assert_eq!(
             e.probe_failures,
-            vec!["/usr/lib/os-release could not be read: denied; the distro is not reported.".to_owned()]
+            vec![
+                "/usr/lib/os-release could not be read: denied; the distro is not reported."
+                    .to_owned()
+            ]
         );
         assert_eq!((e.distro_id.as_str(), e.distro_version.as_str()), ("", ""));
         assert_eq!(e.compute_status(), "degraded");

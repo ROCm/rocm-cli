@@ -38,12 +38,8 @@ pub(crate) fn install_driver(
     let os_release = read_os_release();
     // The only place the real privilege level is read; every builder below takes
     // it as a parameter so both branches stay testable on any host.
-    let plan = build_driver_install_plan_read(
-        &examine,
-        &os_release,
-        dkms,
-        PrivilegeEscalation::detect(),
-    );
+    let plan =
+        build_driver_install_plan_read(&examine, &os_release, dkms, PrivilegeEscalation::detect());
     let mut output = render_driver_install_plan(&plan, yes, dry_run);
     if !yes || dry_run || !plan.supported || !plan.mutating {
         return Ok(DriverInstallResult {
@@ -814,7 +810,13 @@ fn build_driver_install_plan(
     dkms: bool,
     escalation: PrivilegeEscalation,
 ) -> DriverInstallPlan {
-    build_driver_install_plan_at(examine, "/etc/os-release", os_release_text, dkms, escalation)
+    build_driver_install_plan_at(
+        examine,
+        "/etc/os-release",
+        os_release_text,
+        dkms,
+        escalation,
+    )
 }
 
 /// [`build_driver_install_plan`], naming `os_release_path` instead of always
