@@ -91,7 +91,9 @@ The same output is available in the TUI with `/engine`.
 Installer policy:
 
 - `install.sh` and `install.ps1` update only the rocm-cli binary install
-  directory and its `.rocm-cli-manifest`.
+  directory (its binaries, `.rocm-cli-manifest`, and the `.rocm-cli-path-edit`
+  record of the `PATH` change they made) and that `PATH` change itself: a
+  marked block in the shell profile, or the user `PATH` on Windows.
 - External plugins under the rocm-cli data directory are not touched by
   install or upgrade.
 - `rocm uninstall` removes the data directory by default. Use
