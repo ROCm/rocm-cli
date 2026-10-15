@@ -3004,7 +3004,7 @@ mod tests {
         // A real, long-lived child stands in for an engine process that was
         // spawned but whose record could not be published.
         let mut child = ProcessCommand::new(std::env::current_exe().expect("test binary"))
-            .arg("tests::managed_launch_cleanup_sleeper_child")
+            .arg("service_launch::tests::managed_launch_cleanup_sleeper_child")
             .arg("--exact")
             .arg("--ignored")
             .env("ROCM_TEST_SLEEPER_CHILD", "1")
