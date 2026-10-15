@@ -790,6 +790,10 @@ fn read_chunked_sse_body<R: BufRead>(
         let size = usize::from_str_radix(size_text, 16)
             .with_context(|| format!("invalid local provider chunk size `{size_text}`"))?;
         if size == 0 {
+            // The zero chunk's own CRLF (or a trailer line). Its read result is
+            // deliberately ignored: every event, `[DONE]` included, has been
+            // delivered by now, so an engine that closes or stalls here has
+            // still sent a complete answer, and failing would discard it.
             let mut trailer = String::new();
             let _ = reader.read_line(&mut trailer);
             break;
@@ -2841,7 +2845,9 @@ mod tests {
             let _ = sender.send((result.map_err(|error| format!("{error:#}")), received));
         });
         let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        let served = served_request_within_bound(server);
+        // A client that never returned already fails the test below, so don't
+        // spend a second bound waiting on a server it may never have reached.
+        let served = outcome.is_ok().then(|| served_request_within_bound(server));
         let audit_text = fs::read_to_string(paths.audit_events_path()).unwrap_or_default();
         fs::remove_dir_all(root).ok();
 
@@ -2851,7 +2857,7 @@ mod tests {
         let (result, received) = outcome.map_err(|_| {
             anyhow::anyhow!("chat stream never returned after the engine closed the connection")
         })?;
-        served?;
+        served.transpose()?;
         let error = result.expect_err("a stream cut off before its final chunk is not a success");
         assert!(
             error.contains(LOCAL_STREAM_TRUNCATED),
@@ -2886,7 +2892,9 @@ mod tests {
             let _ = sender.send(crate::serve_summary::run_smoke_test(&paths, "Qwen/Qwen3.5"));
         });
         let outcome = receiver.recv_timeout(TRUNCATED_STREAM_BOUND);
-        let served = served_request_within_bound(server);
+        // A client that never returned already fails the test below, so don't
+        // spend a second bound waiting on a server it may never have reached.
+        let served = outcome.is_ok().then(|| served_request_within_bound(server));
         fs::remove_dir_all(root).ok();
 
         let metrics = outcome.map_err(|_| {
@@ -2897,7 +2905,7 @@ mod tests {
         // Empty metrics are also what a smoke test that never reached the
         // engine returns, so this is what makes the assertion below mean
         // "the engine died mid-answer" rather than "nothing happened".
-        served?;
+        served.transpose()?;
         assert_eq!(metrics, crate::serve_summary::SmokeMetrics::default());
         let rendered =
             crate::serve_summary::render_summary(&crate::serve_summary::DeploymentSummary {

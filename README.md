@@ -278,6 +278,13 @@ the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position.
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
+  only whether it is there. The runtime in `System32` must be 14.40 or newer
+  (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
+  as the llama.cpp server that Lemonade installs, crash with an access
+  violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
+  version it read as `msvc_redist_version`. `rocm fix` only prints the update
+  plan, including a `winget install` line; it never runs the install.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5) — `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of
@@ -353,6 +360,20 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli.
+
+#### GPUs with no ROCm build
+
+Some AMD GPUs are detected but have no ROCm SDK build at all. The Vega iGPU in
+Renoir, Lucienne, Cezanne and Barcelo APUs — the Radeon Vega graphics in Ryzen
+4000 and 5000 mobile and desktop parts, reported as `gfx90c` — is one of them.
+
+For these, `install sdk` stops and says no ROCm SDK build exists for that GPU,
+instead of listing package families to try. It does the same when you name such
+a target yourself with `--family gfx90c`: the request is refused, and no other
+family is substituted for it. `rocm examine` reports the same conclusion on a
+`rocm_support` line (see [Examine](#examine)).
+
+These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
 #### Compiler toolchain (--devel)
 
@@ -688,6 +709,10 @@ rocm services restart <service-id> --yes
 rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
+
+`restart` starts a server again only once its stop has confirmed that every
+recorded process is gone; if the stop cannot confirm that, it says so, starts
+nothing, and leaves the stop request recorded.
 
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,

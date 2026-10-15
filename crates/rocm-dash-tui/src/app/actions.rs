@@ -754,7 +754,7 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
-    use super::super::test_support::press;
+    use super::super::test_support::{press, st};
 
     fn hk(c: KeyCode, tab: ActiveTab) -> KeyAction {
         handle_key(press(c), tab, &Modal::None, ChatKeyCtx::default())
@@ -855,7 +855,7 @@ mod tests {
     #[test]
     fn action_activate_is_two_step_list_then_open() {
         // Serving verb 0 = "Serve a model" → OpenServeWizard.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Serving;
         s.serving_sel = 0;
         assert_eq!(s.pane_focus, PaneFocus::Actions);
@@ -870,7 +870,7 @@ mod tests {
             "detail-focus Enter opens the manager"
         );
         // ROCm verb 2 = "Diagnose (doctor)" → OpenExamine (the other mapping).
-        let mut r = AppState::new("t".into(), "default-dark".into());
+        let mut r = st();
         r.active_tab = ActiveTab::Rocm;
         r.rocm_sel = 2;
         r.pane_focus = PaneFocus::Detail;
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn action_focus_resets_on_move_and_tab_switch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::Move(1));
@@ -898,7 +898,7 @@ mod tests {
         // Esc on Action is intercepted (not the global OpenMenu) so it can back
         // out of the detail pane first.
         assert_eq!(hk(KeyCode::Esc, ActiveTab::Rocm), KeyAction::PaneEscape);
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::PaneEscape);
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn action_select_sets_verb_and_parks_on_list() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.pane_focus = PaneFocus::Detail;
         apply_action(&mut s, KeyAction::PaneSelect(2));
@@ -926,7 +926,7 @@ mod tests {
         // Activating a ROCm verb opens its manager inline (focus stays in
         // Details); `←`/Esc backs out — closing the manager and returning focus
         // to the Actions list. This mirrors the event-loop back-out arm.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Rocm;
         s.rocm_sel = 0; // Set up / Install ROCm → OpenInstall
         apply_action(&mut s, KeyAction::PaneActivate); // → Details
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[test]
     fn opening_an_overlay_closes_the_others() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenServices);
         assert!(s.services.is_some() && s.serve_wizard.is_none() && s.engine_manager.is_none());
         // Opening another overlay (defensive path) clears the prior one.
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_and_activation() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenMenu);
         assert_eq!(s.modal, Modal::Menu);
         // ↓ from Options(0) → Help(1); activate opens the global help.
@@ -1217,7 +1217,7 @@ mod tests {
 
     #[test]
     fn palette_activation_switches_tab() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         apply_action(&mut s, KeyAction::OpenPalette);
         apply_action(&mut s, KeyAction::MenuMove(3)); // Home→ROCm→Serving→Observe
         apply_action(&mut s, KeyAction::MenuActivate);
@@ -1476,7 +1476,7 @@ mod tests {
 
     #[test]
     fn chat_consent_accept_and_decline_transition_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // No endpoint → Unavailable; accept/decline are no-ops.
         s.set_chat_config(None, false);
         assert_eq!(s.chat_consent, ChatConsent::Unavailable);
@@ -1508,7 +1508,7 @@ mod tests {
 
     #[test]
     fn detect_offer_lifecycle_accept_switches_chat() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Chat;
         // Gateway-configured chat, pending consent.
         let gw = crate::llm::LlmConfig {
@@ -1548,7 +1548,7 @@ mod tests {
 
     #[test]
     fn detect_offer_dismiss_keeps_prior_config() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         let gw = crate::llm::LlmConfig {
             base_url: "https://gw/OpenAI".into(),
             model: "gpt-4o-mini".into(),
@@ -1569,7 +1569,7 @@ mod tests {
 
     #[test]
     fn save_detect_offer_accepts_and_raises_persist_edge() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         // Start off-Local so the realignment on accept is observable (Local is
         // the default provider; asserting it without this would be tautological).
         s.active_provider = ChatProvider::Openai;
@@ -1591,7 +1591,7 @@ mod tests {
             Some("http://localhost:13305/v1")
         );
         // No offer → save is a no-op (no edge).
-        let mut s2 = AppState::new("t".into(), "default-dark".into());
+        let mut s2 = st();
         apply_action(&mut s2, KeyAction::ChatDetectSave);
         assert!(!s2.chat_persist_dispatch);
         assert!(s2.chat_endpoint_rebuild.is_none());
@@ -1642,7 +1642,7 @@ mod tests {
 
     #[test]
     fn chat_input_actions_mutate_buffer() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.active_tab = ActiveTab::Chat;
         s.chat_focused = true;
         apply_action(&mut s, KeyAction::ChatInput('h'));
@@ -1658,7 +1658,7 @@ mod tests {
 
     #[test]
     fn chat_submit_pushes_user_turn_and_raises_dispatch() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "what's GPU-2 doing?".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         // Only the user turn is pushed; the agent reply arrives async.
@@ -1672,7 +1672,7 @@ mod tests {
 
     #[test]
     fn chat_submit_ignores_empty_input() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "   ".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat.is_empty());
@@ -1684,7 +1684,7 @@ mod tests {
     fn chat_submit_ignored_while_request_in_flight() {
         // A second submit before the first reply lands must be a no-op — no
         // second user turn, no second spawn (prevents a racing double request).
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "first".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat_sending);
@@ -1710,7 +1710,7 @@ mod tests {
         // emit `ScrollModal` for it (see `detail_modal_j_k_emit_scroll` /
         // `handle_mouse_routes_scroll_by_modal_and_tab`) and the instance
         // Detail modal's body (launch_args/env_vars) can genuinely overflow.
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.modal = Modal::Detail;
         s.instance_detail_max_scroll = 10;
         apply_action(&mut s, KeyAction::ScrollModal(3));
@@ -1724,7 +1724,7 @@ mod tests {
     async fn chat_reply_path_appends_agent_turn_and_clears_sending() {
         // The wired ChatSubmit→reply path using the MockAgentClient (no LLM).
         let agent = crate::agent::MockAgentClient::new("GPU-2: 87% util, 71°C");
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "what's GPU-2 doing?".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         assert!(s.chat_sending);
@@ -1741,7 +1741,7 @@ mod tests {
 
     #[test]
     fn chat_input_handles_unicode_and_long_text() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_focused = true;
         // Multi-byte / emoji chars push as single chars, no panic.
         for c in "héllo 🚀 café ∑".chars() {
@@ -1764,7 +1764,7 @@ mod tests {
 
     #[test]
     fn chat_scroll_clamps_and_updates_follow_state() {
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_max_scroll = 20;
         s.chat_scroll = 20;
         apply_action(&mut s, KeyAction::ChatScroll(-100));
@@ -1805,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn chat_error_path_appends_error_turn_no_panic() {
         let agent = crate::agent::MockAgentClient::failing();
-        let mut s = AppState::new("t".into(), "default-dark".into());
+        let mut s = st();
         s.chat_input = "hi".into();
         apply_action(&mut s, KeyAction::ChatSubmit);
         let snapshot = s.state_snapshot();

@@ -24,6 +24,8 @@ mod install;
 mod process;
 mod runtime_dir;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 // Re-exported so this stays reachable at its pre-split crate-root path —
 // `backend_alignment` is a private module, but this constant was `pub` at

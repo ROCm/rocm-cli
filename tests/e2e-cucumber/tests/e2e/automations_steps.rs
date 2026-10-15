@@ -2,17 +2,22 @@
 //
 // SPDX-License-Identifier: MIT
 
-//! Steps for `rocm automations enable/disable`. Black-box against the isolated
-//! config dir. `automations enable` would otherwise spawn a detached background
-//! daemon (`rocm daemon`) on first enable, which both adds a nondeterministic
-//! `helper:` line and leaks a process past the scenario. To keep the mock lane
-//! hermetic, every scenario first plants an automation runtime-state marking the
-//! daemon already running under THIS test process's (live) pid, so the CLI's
-//! double-spawn guard skips the spawn. Contracts verified against the running
-//! Linux binary (EAI-8072). Scoped to the enable/disable/mode slice; the broader
-//! automations feature is covered separately.
+//! Steps for `rocm automations enable/disable` and `rocm automations` (bare,
+//! which lists the most recent review requests of any status — only the
+//! per-entry approve/reject controls are gated on "pending"). Black-box
+//! against the isolated config dir. `automations enable` would otherwise spawn
+//! a detached background daemon (`rocm daemon`) on first enable, which both
+//! adds a nondeterministic `helper:` line and leaks a process past the
+//! scenario. To keep the mock lane hermetic, every enable/disable scenario
+//! first plants an automation runtime-state marking the daemon already
+//! running under THIS test process's (live) pid, so the CLI's double-spawn
+//! guard skips the spawn. Contracts verified against the running Linux binary
+//! (EAI-8072). Scoped to the enable/disable/mode slice plus the
+//! proposal-history listing's unit formatting; the watcher/daemon trigger
+//! behaviour itself is covered separately.
 
 use cucumber::{given, then, when};
+use rocm_core::{AutomationProposalRecord, append_automation_proposal};
 
 use crate::E2eWorld;
 
@@ -75,6 +80,34 @@ async fn daemon_spawn_in_flight(world: &mut E2eWorld) {
     plant_inflight_autostart_claim(world);
 }
 
+#[given("a pending artifact-download proposal approved for a size just under 1 MiB")]
+async fn pending_artifact_download_proposal(world: &mut E2eWorld) {
+    append_automation_proposal(
+        &world.app_paths(),
+        &AutomationProposalRecord {
+            at_unix_ms: 1_700_000_000_000,
+            proposal_id: String::new(),
+            watcher_id: "cache-warm".to_owned(),
+            action: "queue_prefetch_proposal".to_owned(),
+            title: "queue prefetch proposal".to_owned(),
+            message: "cache warm requested an artifact prefetch".to_owned(),
+            status: "pending".to_owned(),
+            service_id: None,
+            tool: Some("prefetch_artifact".to_owned()),
+            arguments: serde_json::json!({
+                "artifact_ref": "tiny/model#gguf",
+                "allow_artifact_download": true,
+                // One byte under 1 MiB: `{:.1}` rounds it up to a full 1024
+                // KiB, so the approved cap must read as "1.0 MiB", not
+                // "1024.0 KiB" — and in binary units, not "1.0 MB" (#190).
+                "artifact_max_bytes": 1_048_575,
+            }),
+            reviewed_at_unix_ms: None,
+        },
+    )
+    .expect("failed to write automation proposal fixture");
+}
+
 #[given("an enabled automation watcher")]
 async fn enabled_watcher(world: &mut E2eWorld) {
     suppress_daemon_spawn(world);
@@ -107,6 +140,12 @@ async fn enable_propose(world: &mut E2eWorld) {
 #[when("the user disables the watcher")]
 async fn disable_watcher(world: &mut E2eWorld) {
     let (stdout, stderr, rc) = crate::run_rocm(world, &["automations", "disable", WATCHER]);
+    record(world, stdout, stderr, rc);
+}
+
+#[when("the user lists automations")]
+async fn list_automations(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) = crate::run_rocm(world, &["automations"]);
     record(world, stdout, stderr, rc);
 }
 
@@ -172,6 +211,19 @@ async fn confirm_disabled(world: &mut E2eWorld) {
     assert!(
         out.contains("automation watcher disabled") && out.contains(&format!("watcher: {WATCHER}")),
         "expected a disable confirmation for {WATCHER}, got:\n{out}"
+    );
+}
+
+#[then("the CLI reports the approved size in binary units")]
+async fn reports_binary_units(world: &mut E2eWorld) {
+    let out = ok_output(world);
+    assert!(
+        out.contains("download: approved up to 1.0 MiB"),
+        "expected the approved cap in binary (KiB/MiB/GiB) units, got:\n{out}"
+    );
+    assert!(
+        !out.contains("1.0 MB"),
+        "expected a binary MiB label, not a decimal-looking MB one:\n{out}"
     );
 }
 

@@ -37,6 +37,7 @@
   "hipinfo_status": "",
   "adrenalin_version": "",
   "msvc_redist_present": null,
+  "msvc_redist_version": "",
   "framework": "unknown",
   "framework_version": "",
   "framework_rocm_version": "",
