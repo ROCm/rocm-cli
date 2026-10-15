@@ -20,10 +20,12 @@ newer run's merge-required (GitHub-hosted) checks would sit pending forever
 thus their own concurrency group — means an offline runner can only ever stall
 that workflow's own supersession, never `ci.yml`'s required checks. See
 `EAI-7548`. [`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
-`self_hosted_workflow_owns_the_gpu_lanes` test requires `e2e-gpu`,
-`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` to appear as job keys in
-`e2e-selfhosted.yml`, so a PR that moves one of these lanes back into
-`ci.yml` fails CI rather than merging unnoticed.
+`self_hosted_workflow_owns_the_gpu_lanes` test checks that `e2e-gpu`,
+`e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` still appear as job keys in
+`e2e-selfhosted.yml`, while its sibling `ci_yml_schedules_no_self_hosted_job`
+asserts `ci.yml` has no `runs-on` carrying a self-hosted label, so a PR that
+moves one of these lanes back into `ci.yml` fails CI rather than merging
+unnoticed.
 
 ## The three-stage validation ladder
 
@@ -33,9 +35,9 @@ differs is when each runs and what hardware it covers.
 
 | Rung | Workflow | Trigger | Lanes | Blocks a merge/tag? |
 |---|---|---|---|---|
-| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The 4 jobs in the Platforms table below (`e2e-gpu-strix-ubuntu` runs both its `[release, nightly]` channel legs per PR, ROCMAI-125) | No — absent from the required-status-check list |
-| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same 4 platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
-| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same 4 per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
+| Per-PR smoke gate | `e2e-selfhosted.yml` | `push`/`pull_request`/`merge_group` (see "Triggers") | The self-hosted jobs in the Platforms table below (`e2e-gpu-strix-ubuntu` runs both its `[release, nightly]` channel legs per PR, ROCMAI-125) | No — absent from the required-status-check list |
+| Nightly coverage gate | `nightly.yml` | `schedule` (06:00 UTC daily) + `workflow_dispatch` | The same self-hosted platforms plus R9700 (`e2e-gpu-nightly-rad3`) and MI350P (`e2e-gpu-nightly-mi350p`), each run against both the `release` and `nightly` package channel (`strategy.matrix.channel: [release, nightly]`, ROCMAI-429) | No — not part of any PR or push-to-main event |
+| Release-candidate regression gate | `e2e-selfhosted.yml` | `push` to a `release/**` branch (ROCMAI-120/EAI-8761), ahead of cutting the `v*` tag `release.yml` publishes from | The same per-PR lanes | No — same non-required status as the per-PR gate; a hardware signal for whoever cuts the tag, not an automated block |
 
 R9700 and MI350P were dropped from the per-PR gate (ROCMAI-125): still
 covered, but off every PR's critical path, so they moved to the nightly-only
