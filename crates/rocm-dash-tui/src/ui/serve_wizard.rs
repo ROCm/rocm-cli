@@ -1285,6 +1285,21 @@ mod tests {
     }
 
     #[test]
+    fn space_toggles_advanced_only_while_focused() {
+        let mut wiz = Some(ServeWizardState::default());
+        let mut jobs = State::default();
+        // Model has focus: Space must not expand anything.
+        feed(&mut wiz, &mut jobs, &[KeyCode::Char(' ')]);
+        assert!(!wiz.as_ref().unwrap().advanced_expanded);
+
+        focus_field(wiz.as_mut().unwrap(), Field::Advanced);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Char(' ')]);
+        assert!(wiz.as_ref().unwrap().advanced_expanded);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Char(' ')]);
+        assert!(!wiz.as_ref().unwrap().advanced_expanded);
+    }
+
+    #[test]
     fn expanded_focus_order_is_model_advanced_engine_device_host_port_mode_launch() {
         let mut w = ServeWizardState {
             advanced_expanded: true,
@@ -1395,6 +1410,23 @@ mod tests {
         assert_eq!(wiz.as_ref().unwrap().port_mode, PortMode::Custom);
         feed(&mut wiz, &mut jobs, &[KeyCode::Left]);
         assert_eq!(wiz.as_ref().unwrap().port_mode, PortMode::Auto);
+    }
+
+    #[test]
+    fn cycling_port_to_custom_clears_the_outstanding_complaint() {
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            model: "m".into(),
+            host: "localhost".into(),
+            ..Default::default()
+        });
+        wiz.as_mut().unwrap().message = Some(CUSTOM_HOST_NEEDS_PORT.to_string());
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Port);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Right]);
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.port_mode, PortMode::Custom);
+        assert!(w.message.is_none(), "the fix it named just happened");
     }
 
     #[test]

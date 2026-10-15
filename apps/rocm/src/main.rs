@@ -7277,10 +7277,7 @@ fn restart_internal_managed_service_with(
         .context("failed to re-read managed services under the launch lock")?
         .into_iter()
         .find(|other| {
-            other.service_id != stopped_record.service_id
-                && other.is_live()
-                && other.host == stopped_record.host
-                && other.port == stopped_record.port
+            other.service_id != stopped_record.service_id && other.blocks_port(stopped_record.port)
         })
     {
         bail!(
@@ -17710,6 +17707,34 @@ pub(crate) mod tests {
             finished.expect_err("a live competitor on the same port must refuse the restart");
         assert!(error.contains("svc-fresh-launch"), "{error}");
         assert!(error.contains("claimed that port"), "{error}");
+        Ok(())
+    }
+
+    /// The disk re-check above only catches a recorded competitor. Something
+    /// bound to the exact port without ever publishing a manifest for it — a
+    /// stray process, a one-off `nc -l` — would sail through that check; only
+    /// the loopback lease actually binding the port catches it. A real
+    /// listener held on the port is what proves that lease ran, not just a
+    /// record on disk.
+    #[test]
+    fn restart_refuses_a_port_something_is_actually_bound_to() -> Result<()> {
+        let (root, paths) = test_paths("restart-port-actually-bound");
+        paths.ensure()?;
+        let service_id = "svc-restart-port-actually-bound";
+        let record = stop_test_record(&paths, service_id);
+        let port = record.port;
+        record.write()?;
+
+        let _blocker = std::net::TcpListener::bind(("127.0.0.1", port))?;
+
+        let result =
+            restart_internal_managed_service_with(&paths, service_id, None, |_| (Vec::new(), true));
+
+        let _ = fs::remove_dir_all(root);
+        let error =
+            result.expect_err("a port actually bound by someone else must refuse the restart");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("its port is in use"), "{rendered}");
         Ok(())
     }
 
