@@ -1991,7 +1991,7 @@ pub(crate) fn detect_distro_name() -> Option<String> {
 /// reported as itself, distinctly from a bad line it never reached.
 fn distro_name_from_os_release(read: &hardware_root::OsRelease) -> String {
     if let hardware_root::OsRelease::Unreadable { path, error } = read {
-        return format!("Linux ({path} could not be read: {error})");
+        return format!("Linux ({})", hardware_root::unreadable_prefix(path, error));
     }
     match crate::os_release::parse(read.text()) {
         Ok(mut fields) => fields

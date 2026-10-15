@@ -198,6 +198,17 @@ impl OsRelease {
     }
 }
 
+/// The shared opening every [`OsRelease::Unreadable`] message builds on.
+///
+/// Names the candidate path and the I/O error that made it unreadable. Each
+/// call site appends its own clause describing what that means for it (no
+/// commands planned, a probe failure, an unreported distro, ...), so only
+/// this shared part can drift if changed in one place and not another.
+#[must_use]
+pub fn unreadable_prefix(path: &str, error: &std::io::Error) -> String {
+    format!("{path} could not be read: {error}")
+}
+
 /// Reads `/etc/os-release`, falling back to `/usr/lib/os-release` per
 /// `os-release(5)` when the former is absent.
 ///

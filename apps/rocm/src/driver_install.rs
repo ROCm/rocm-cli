@@ -1029,8 +1029,8 @@ fn build_driver_install_plan_read(
         && let rocm_core::hardware_root::OsRelease::Unreadable { path, error } = read
     {
         return unreadable_os_release_plan(format!(
-            "{path} could not be read: {error}; no driver commands were planned \
-             because the distro cannot be read."
+            "{}; no driver commands were planned because the distro cannot be read.",
+            rocm_core::hardware_root::unreadable_prefix(path, error)
         ));
     }
     build_driver_install_plan_at(examine, read.path(), read.text(), dkms, escalation)

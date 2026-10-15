@@ -882,7 +882,8 @@ pub fn plan_for_os_release_read(
     if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
         let mut plan = build("", "");
         plan.reason = format!(
-            "{path} could not be read: {error}, so the distribution cannot be read. {}",
+            "{}, so the distribution cannot be read. {}",
+            crate::hardware_root::unreadable_prefix(path, error),
             plan.reason
         );
         return plan;
@@ -990,7 +991,8 @@ fn install_hint_for_read(
     if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
         return InstallHint {
             text: format!(
-                "{manual}; {path} could not be read: {error}, so the distribution cannot be read"
+                "{manual}; {}, so the distribution cannot be read",
+                crate::hardware_root::unreadable_prefix(path, error)
             ),
             plan_installs: false,
         };

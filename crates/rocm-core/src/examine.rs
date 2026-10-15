@@ -758,7 +758,8 @@ fn probe_os(e: &mut Examination) {
 fn record_distro(e: &mut Examination, read: &crate::hardware_root::OsRelease) {
     if let crate::hardware_root::OsRelease::Unreadable { path, error } = read {
         e.probe_failures.push(format!(
-            "{path} could not be read: {error}; the distro is not reported."
+            "{}; the distro is not reported.",
+            crate::hardware_root::unreadable_prefix(path, error)
         ));
         return;
     }
