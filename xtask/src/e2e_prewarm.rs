@@ -442,12 +442,19 @@ pub fn dangling_active_runtime(runtimes_list_report: &str) -> Option<&str> {
 /// digits, silently serving the wrong channel's SDK. Since this listing has no
 /// channel field to key off at all, the guard is the same `{channel}-` prefix
 /// `decide()` falls back to for its own degraded, channel-less lines.
+///
+/// Read-only (adopted/imported) entries are excluded for the same reason
+/// `activation_candidates` excludes them: a matching entry here becomes
+/// `Decision::Reuse{activate: Some(key)}`, which `run()` turns straight into
+/// `rocm runtimes activate <key>` — quietly making someone's externally-owned
+/// install the shared tree's default for every later GPU scenario, the exact
+/// outcome `activation_candidates`'s own filter exists to prevent.
 fn find_pinned_runtime_entry(listing: &str, channel: &str, pin: &str) -> Option<RuntimeEntry> {
     let channel_prefix = format!("{channel}-");
     listing
         .lines()
         .filter_map(RuntimeEntry::parse)
-        .filter(|entry| entry.runtime_key.starts_with(&channel_prefix))
+        .filter(|entry| !entry.read_only && entry.runtime_key.starts_with(&channel_prefix))
         .find(|entry| key_matches_pin(&entry.runtime_key, pin))
 }
 
@@ -1382,6 +1389,28 @@ registered ROCm runtimes
     fn pinned_runtime_entry_is_none_when_the_tree_is_empty() {
         assert!(find_pinned_runtime_entry(NO_RUNTIMES, "release", "7.13.0").is_none());
         assert!(find_pinned_runtime_entry("", "release", "7.13.0").is_none());
+    }
+
+    #[test]
+    fn pinned_runtime_entry_does_not_match_a_read_only_adopted_runtime() {
+        // A `release`-channel pin whose only on-disk match is an adopted,
+        // read-only entry must miss, not "find" it — the caller turns a hit
+        // into `rocm runtimes activate <key>`, which would silently make
+        // somebody's externally-owned install the shared tree's default.
+        let text = "\
+registered ROCm runtimes
+  active_runtime_id: <unset>
+  active_runtime_key: <unset>
+  previous_runtime_key: <unset>
+  registry: /w/e2e-prewarm/data/runtimes/registry
+  marker: /w/e2e-prewarm/data/runtimes/active.json
+  installed:
+    legend: * = active, - = rollback target
+
+    release-wheel-gfx94x-dcgpu-7-13-0 runtime_id=external-adopted version=7.13.0 format=wheel family=gfx94X-dcgpu mode=read-only status=usable
+      install_root: /opt/external-rocm
+";
+        assert!(find_pinned_runtime_entry(text, "release", "7.13.0").is_none());
     }
 
     #[test]
