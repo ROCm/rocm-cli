@@ -1867,6 +1867,25 @@ fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
     }
 }
 
+/// Escapes a value for embedding inside a PowerShell single-quoted string
+/// literal. PowerShell single-quoted strings are literal, and the
+/// language's own convention for including a literal `'` in one is to
+/// double it (`''`) -- an unescaped `'` instead ends the literal early, so
+/// whatever follows on the line is parsed as separate PowerShell tokens.
+///
+/// This matters here because the value embedded into
+/// `path_export_windows`'s write script (`new_path`, built by
+/// [`windows_path_prepend`] from `bin_dir` and the real existing User PATH
+/// read back from the host) is filesystem/environment-origin data, not a
+/// literal this code controls. A path containing an apostrophe --
+/// `C:\Users\O'Brien\bin` on the real PATH, or an install root with one in
+/// `bin_dir` -- is an ordinary Windows path, not a contrived edge case, and
+/// without this escape it would split the generated `-Command` script
+/// mid-statement.
+fn ps_single_quote_escape(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Does the read/plan/write work for [`run_path_export_windows`], with the
 /// User-scope PATH read taken as an injected closure rather than calling
 /// `ps_env_scope` directly. That's what makes the "read failed" branch
@@ -1894,8 +1913,14 @@ fn path_export_windows(
         return 0;
     }
     let new_path = windows_path_prepend(bin_dir, &user_path);
+    // Escaped once here, before either the printed preview or the real
+    // write script embeds it, so the two can never disagree about what
+    // actually gets executed (same reasoning as `windows_path_prepend`
+    // being shared, above) -- see `ps_single_quote_escape`'s doc comment
+    // for why this escape is required at all.
+    let escaped_new_path = ps_single_quote_escape(&new_path);
     println!("Plan: prepend {bin_dir} to your User PATH:");
-    println!("  [Environment]::SetEnvironmentVariable('PATH', '{new_path}', 'User')");
+    println!("  [Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     if opts.dry_run {
         println!("(dry-run; not executed)");
         return 0;
@@ -1906,7 +1931,8 @@ fn path_export_windows(
     // PowerShell's SetEnvironmentVariable, not `setx`: `setx` silently
     // truncates values past 1024 characters while still exiting 0, which a
     // normal-length PATH can hit even when the read above succeeded.
-    let script = format!("[Environment]::SetEnvironmentVariable('PATH', '{new_path}', 'User')");
+    let script =
+        format!("[Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
     let (rc, out, err) = run(
         "powershell",
         &["-NoProfile", "-Command", &script],
@@ -3212,6 +3238,76 @@ mod tests {
             new_path.starts_with(bin_dir),
             "a prepend must start with bin_dir, not end with it: got {new_path:?}"
         );
+    }
+
+    /// `ps_single_quote_escape` must double every embedded `'`, per
+    /// PowerShell's own single-quoted-string escaping convention.
+    #[test]
+    fn ps_single_quote_escape_doubles_every_embedded_quote() {
+        assert_eq!(ps_single_quote_escape("plain"), "plain");
+        assert_eq!(ps_single_quote_escape("O'Brien"), "O''Brien");
+        assert_eq!(
+            ps_single_quote_escape("'leading and trailing'"),
+            "''leading and trailing''"
+        );
+        assert_eq!(ps_single_quote_escape("a'b'c"), "a''b''c");
+    }
+
+    /// Round 2 of ROCMAI-449: an apostrophe anywhere in the real User PATH
+    /// (e.g. `C:\Users\O'Brien\bin`, an ordinary Windows path, not a
+    /// contrived edge case) must not be able to split the generated
+    /// PowerShell `-Command` script mid-statement. Before this fix, the
+    /// write script was built as
+    /// `format!("...SetEnvironmentVariable('PATH', '{new_path}', 'User')")`
+    /// with `new_path` interpolated raw: an unescaped `'` in it would end
+    /// the literal early, and the remainder of `new_path` plus the trailing
+    /// `, 'User')` would be parsed as separate PowerShell tokens rather than
+    /// staying part of the string value.
+    ///
+    /// This builds the exact script string [`path_export_windows`]'s write
+    /// path constructs and asserts it is well-formed: every single quote in
+    /// it belongs to one of exactly three delimiter pairs (`'PATH'`,
+    /// `'<value>'`, `'User'`), so the embedded value itself must contain
+    /// zero *unescaped* quotes -- i.e. the quote count inside the value
+    /// region is exactly double the number of literal `'` characters the
+    /// unescaped input contained.
+    #[test]
+    fn write_script_escapes_apostrophe_in_real_path_value() {
+        let bin_dir = r"C:\ROCm\bin";
+        let user_path = r"C:\Users\O'Brien\bin;C:\Windows";
+
+        let new_path = windows_path_prepend(bin_dir, user_path);
+        let escaped_new_path = ps_single_quote_escape(&new_path);
+        let script =
+            format!("[Environment]::SetEnvironmentVariable('PATH', '{escaped_new_path}', 'User')");
+
+        // The raw (unescaped) new_path must contain exactly one embedded
+        // apostrophe here (from "O'Brien"), carried over unchanged from
+        // user_path.
+        let raw_quote_count = new_path.matches('\'').count();
+        assert_eq!(raw_quote_count, 1);
+
+        // After escaping, that one embedded quote must have become two
+        // (`''`), so the escaped value contributes 2 quote characters to
+        // the script, on top of the 6 delimiter quotes from the 3
+        // single-quoted literals ('PATH', the value, 'User').
+        let script_quote_count = script.matches('\'').count();
+        assert_eq!(
+            script_quote_count,
+            6 + 2 * raw_quote_count,
+            "every embedded ' must appear as '' in the script, on top of the 3 literals' own delimiters: {script:?}"
+        );
+
+        // Concretely: the value literal must read as a single balanced
+        // '...' token with the embedded quote doubled, not end early at the
+        // first unescaped '.
+        assert!(
+            script.contains(r"'C:\ROCm\bin;C:\Users\O''Brien\bin;C:\Windows'"),
+            "escaped value literal not found intact in script: {script:?}"
+        );
+        // And the trailing ", 'User')" must stay the closing argument list,
+        // not get parsed as stray tokens after a prematurely-closed string.
+        assert!(script.ends_with(", 'User')"));
     }
 
     /// Regression coverage for control flow this change does not touch: an
