@@ -1616,54 +1616,127 @@ and the distro name it prints
 `rocm diagnose --distro` run from Windows, which has the WSL distribution's own
 `sh` source the file and reports what it assigned.
 
+Every one of those readers except the WSL remote probe above goes through
+[`hardware_root::read_os_release`](../crates/rocm-core/src/hardware_root.rs),
+which reads `/etc/os-release` and, if that file does not exist, falls back to
+`/usr/lib/os-release` per `os-release(5)` — a file present but unreadable (the
+line-reporting cases below, and the file-level case further down) does not
+fall back, since a stale fallback could describe the wrong host entirely.
+The two reads it covers: a probe routed through a simulated test root
+(`rocm examine`'s distro fields and distro name) resolves both candidates
+through `host_path`; a package-manager plan (the driver install, and the
+OpenMPI/libatomic/libnuma installs and hints) always resolves both against the
+real machine, for the same reason it never follows a simulated root at all.
+Each production call site is a one-line delegation to this shared reader, so
+it names the candidate it actually read — `/etc/os-release` or
+`/usr/lib/os-release` — rather than always the former, in every message below.
+
 A line that is not a plain assignment makes the whole file unreadable, and
-each reader names that line instead of reporting an unknown distro. Where the
-message asks for a fix, it also says what to change on the line: LF line
-endings, single quotes around the value, or a `NAME=value` line in place of
-anything else.
+each reader names that file and line instead of reporting an unknown distro.
+Where the message asks for a fix, it also says what to change on the line: LF
+line endings, single quotes around the value, or a `NAME=value` line in place
+of anything else.
 
 - `rocm install driver`: policy `unreadable_os_release`, no commands, and a
-  reason naming the line.
-- The OpenMPI, libatomic and libnuma installs: no commands, and the line ahead
-  of the manual-install advice in the plan's reason.
-- The hints naming those installs in vLLM's warnings and errors: the line
-  after the manual-install advice, and no offer of `rocm engines install vllm
-  --yes`, which would plan nothing. That command is offered only when its plan
-  has commands, so it is not offered for an unknown distribution either.
+  reason naming the file and line.
+- The OpenMPI, libatomic and libnuma installs: no commands, and the file and
+  line ahead of the manual-install advice in the plan's reason.
+- The hints naming those installs in vLLM's warnings and errors: the file and
+  line after the manual-install advice, and no offer of `rocm engines install
+  vllm --yes`, which would plan nothing. That command is offered only when its
+  plan has commands, so it is not offered for an unknown distribution either.
 - `rocm examine`: `distro: Linux (/etc/os-release line N is not a plain
   assignment: "…")`; with `--json`, also an empty `distro_id` and
-  `distro_version`, the same line in `probe_failures`, and `status: degraded`
-  on an otherwise healthy GPU host.
+  `distro_version`, the same file and line in `probe_failures`, and `status:
+  degraded` on an otherwise healthy GPU host.
 
 A CRLF file is unreadable too: `sh` would assign `ubuntu\r`.
+
+A candidate that exists but cannot be read at all (permission denied, a
+directory in its place) is reported distinctly from both of the above: not as
+an unknown distribution (which would send the user looking for a support
+matrix for what is a filesystem problem) and not folded into "absent, so fall
+back to the other candidate" (which could silently plan from a stale file that
+may not describe this host). This is `hardware_root::OsRelease`, the fallback
+reader's return type: `Found { path, text }` for a successful read (naming
+whichever candidate it was), `Absent` when neither candidate exists (not a
+failure; a missing file declares nothing), or `Unreadable { path, error }`
+when a candidate exists but could not be read. Every production call site
+above matches on all three: `rocm install driver` via
+`build_driver_install_plan_read`, the OpenMPI/libatomic/libnuma installs and
+hints via `plan_for_os_release_read`/`install_hint_for_read`, and `rocm
+examine`'s distro fields and distro name via `record_distro` and
+`distro_name_from_os_release`, which both take the whole `OsRelease` directly.
+The three `_read`-suffixed functions are the one seam the real call site
+hands its result to, and each delegates to the matching `_at` function with
+the path it actually read. `install_hint_for`/`build_driver_install_plan`
+are bare-text siblings of `_at` — not something `_read` delegates through —
+kept only for the unit tests below, which fixture text directly and have no
+`OsRelease` of their own to construct.
 
 ```bash
 cargo test -p rocm-core --lib os_release
 cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
 cargo test -p rocm-core --lib openmpi::tests
 cargo test -p rocm --bin rocm os_release
-cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root
+cargo test -p rocm --bin rocm -- a_fallback_read_plans an_unreadable_file_plans_nothing_and_names_itself
+cargo test -p rocm-core --lib hardware_root::tests::read_os_release
+cargo test -p rocm-core --lib -- a_fallback_read_plans an_unreadable_file_is_reported_as_itself distro_name_names_an_unreadable_file an_unreadable_file_names_itself
+cargo test -p rocm-core --lib --features e2e-test-hooks -- os_release_reads_follow_the_simulated_host_root os_release_reads_fall_back_to_usr_lib_when_etc_is_absent try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable
 ```
 
-The parser tests that compare against `/bin/sh` itself are Linux-only. The last
-command plants a file under the simulated host root and checks that both
-`rocm examine` reads answer from it through the shared parser; the feature it
-needs is enabled only by its own CI step.
+The parser tests that compare against `/bin/sh` itself are Linux-only. The
+`hardware_root::tests::read_os_release*` tests check the fallback itself
+(primary found, primary absent, neither found, and each candidate existing but
+erroring for a reason other than absence) against an injected temp directory
+rather than the real host. The `a_fallback_read_plans*`/
+`an_unreadable_file*`/`distro_name_names_an_unreadable_file` tests in
+`rocm-core` and `rocm` construct an `OsRelease` directly — bypassing the real
+read entirely, since the production functions that do it
+(`openmpi::real_os_release`, `runtime_install_finalize::real_os_release`)
+read the real machine
+unconditionally and cannot honour a simulated root — to pin that a
+fallback-sourced read plans and hints identically to a primary-sourced one
+with the same text, and that a file which exists but cannot be read is named
+as itself rather than silently treated as an unknown distribution. The two
+`--features e2e-test-hooks` os-release tests plant a file under the simulated
+host root and check that both `rocm examine` reads answer from it through the
+shared parser: the first at `/etc/os-release`, the second with only
+`/usr/lib/os-release` present, so the fallback is exercised through the real
+`host_path`-routed call sites, not just the helper in isolation; the feature
+they need is enabled only by its own CI step. The
+`try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable`
+test runs the WSL remote probe's own shell fallback for real under `/bin/sh`
+against a primary that exists but cannot be sourced (a directory in its
+place) — proving existence is not readability, the same claim the Rust-side
+`hardware_root` tests make for the two in-process readers, but **not** the
+same failure mode: a genuinely permission-denied primary aborts the whole
+shell probe instead of merely leaving `$ID` unset, which this test does not
+exercise — see its own doc comment for why, and for the known limitation
+this leaves.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios
-`examine-20` to `examine-23` in
-[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
-`examine-23` also plants a GPU in the kernel topology and puts an `lspci`
-listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
-lane, with or without a GPU:
+`examine-20` to `examine-23` and `examine-27` to `examine-28` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one
+(`examine-24` to `examine-26` are unrelated amd-smi telemetry scenarios that
+share this file's numbering). `examine-23` also plants a GPU in the kernel
+topology and puts an `lspci` listing an empty bus on `PATH`, so `status:
+degraded` is checked on every Linux lane, with or without a GPU. `examine-27`
+plants only `/usr/lib/os-release`, with no `/etc/os-release` present, to check
+the `os-release(5)` fallback. `examine-28` plants a directory in place of
+`/etc/os-release` (reusing `examine-23`'s GPU fixtures) to check the degraded
+verdict and failure message a present-but-unreadable release file now gets,
+distinctly from both a malformed line and an unknown distribution:
 
 ```bash
-RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] |examine-2[7-8] '
 ```
 
 The install plans deliberately read the real file, so no scenario plants one
-for them; their parsing is covered by the unit tests above.
+for them, including for the fallback; their parsing is covered by the unit
+tests above, and the fallback itself by `hardware_root`'s own unit tests,
+since both now read through the same helper with an identity resolver.
 
 ## Windows Runtime Preflight
 
