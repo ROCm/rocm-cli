@@ -4,14 +4,15 @@
 
 //! `ManagedServiceRecord`: the on-disk manifest for a managed inference service.
 //!
-//! Identity, endpoint, process-identity (PID + start-ticks for restart
-//! safety), and inference-readiness bookkeeping.
+//! Identity, endpoint, process-identity (PID + start-ticks for safe stop /
+//! PID-reuse protection), and inference-readiness bookkeeping.
 //!
-//! Used by `apps/rocm` and `apps/rocmd`; `rocm-dash-daemon` also depends on
-//! it, but only in a single cross-crate serde test, and
-//! `rocm-engine-protocol` mentions it solely in a doc comment —
-//! `rocm-dash-core` and `rocm-dash-collectors` do not depend on
-//! `rocm-core` at all.
+//! Used by `apps/rocm` and `apps/rocmd`; `rocm-dash-daemon` also reads this
+//! on-disk format at runtime, through its own `ServiceRecord` mirror struct
+//! in `registry.rs` rather than this type, and the serde test guards that
+//! contract. `rocm-engine-protocol` mentions `ManagedServiceRecord` solely in
+//! a doc comment — `rocm-dash-core` and `rocm-dash-collectors` do not depend
+//! on `rocm-core` at all.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
