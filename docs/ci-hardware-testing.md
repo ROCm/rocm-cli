@@ -367,10 +367,9 @@ Pre-warm then:
 - prunes with `rocm storage remove-old-installs` after any install, update, or
   repair, so the multi-version cache stays bounded.
 
-`e2e-prewarm` has no `--version`/`--build-date` pin at HEAD — the unpinned
-invocation above is what every lane in this tree runs today. See "The
-three-stage validation ladder" above for the pending SDK-version-pin work
-(ROCMAI-430).
+The invocation above is what every lane in this tree runs today; see "The
+three-stage validation ladder" above for the pin status and the pending
+SDK-version-pin work (ROCMAI-430).
 
 The runtime is always installed **in place**: `install sdk` bakes absolute paths
 into the runtime manifest, so a tree that is moved after installation leaves every
