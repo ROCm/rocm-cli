@@ -19,7 +19,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::runtime::{
-    VllmRuntime, runtime_bin_paths, runtime_has_discover_build, therock_library_path_entries,
+    VllmRuntime, runtime_bin_paths, runtime_has_discover_build,
+    therock_library_path_entries_for_launch,
 };
 use crate::{ServeHttpRequest, engine_recipe_launch_args};
 
@@ -426,11 +427,11 @@ pub(crate) fn apply_therock_env(command: &mut ProcessCommand, runtime: &VllmRunt
         );
     }
     if !cfg!(windows) {
-        crate::runtime::ensure_therock_compat_shims(runtime);
+        let compat_shim = crate::runtime::ensure_therock_compat_shims(runtime);
         command.env(
             "LD_LIBRARY_PATH",
             prepend_path_entries(
-                &therock_library_path_entries(runtime),
+                &therock_library_path_entries_for_launch(runtime, compat_shim),
                 std::env::var_os("LD_LIBRARY_PATH"),
             )?,
         );
@@ -1423,14 +1424,12 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn apply_therock_env_actually_runs_the_compat_shim_step() -> Result<()> {
-        // A mutation that deletes the `ensure_therock_compat_shims` call in
-        // `apply_therock_env` is otherwise invisible to this module's tests:
-        // the mpi_cxx stub it can write depends on build-host and
-        // target-host state (a real `libmpi_cxx.so*` present, or a stub
-        // embedded at compile time), neither of which this test controls.
-        // The stale-numa-shim removal it also performs does not — it always
-        // removes a `libnuma.so.1` symlink it finds — so assert on that
-        // instead, as proof the call actually happened.
+        // The stale-numa-shim removal `ensure_therock_compat_shims` performs
+        // does not depend on host state — it always removes a `libnuma.so.1`
+        // symlink it finds — so assert on that as proof the call actually
+        // happened. See `apply_therock_env_writes_libmpi_cxx_stub_when_needed`
+        // below for the other half of that call, the mpi_cxx stub write,
+        // which does depend on host state and needs its own oracle.
         let env = tempfile::tempdir()?;
         let compat_dir = env.path().join("rocm-cli-lib-compat");
         fs::create_dir_all(&compat_dir)?;
@@ -1457,6 +1456,50 @@ mod tests {
         assert!(
             stale_shim.symlink_metadata().is_err(),
             "ensure_therock_compat_shims must have removed the stale numa shim"
+        );
+        Ok(())
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn apply_therock_env_writes_libmpi_cxx_stub_when_needed() -> Result<()> {
+        // Whether this host needs the `libmpi_cxx.so.40` stub depends on host
+        // state this test does not control: a real `libmpi_cxx.so*` already
+        // present, or no stub embedded at compile time (no C compiler on the
+        // build host). Use `ensure_mpi_cxx_compat` itself as the oracle,
+        // against a throwaway directory so probing does not touch the
+        // directory this test actually asserts on. When it answers `None`
+        // here, `apply_therock_env`'s own call cannot write a stub either, and
+        // there is nothing this test can check on this host.
+        let probe = tempfile::tempdir()?;
+        if rocm_core::openmpi::ensure_mpi_cxx_compat(probe.path()).is_none() {
+            return Ok(());
+        }
+
+        let env = tempfile::tempdir()?;
+        let runtime = VllmRuntime {
+            runtime_id: "therock-release:gfx120X-all".to_owned(),
+            env_id: "external-vllm-therock".to_owned(),
+            command: PathBuf::from("vllm"),
+            python_executable: Some(env.path().join("bin").join("python")),
+            version: None,
+            source: "managed_runtime_manifest:test".to_owned(),
+            sdk_root: Some(env.path().join("sdk")),
+            sdk_bin: None,
+            sdk_bin_paths: Vec::new(),
+            sdk_library_paths: Vec::new(),
+            rocm_sdk_version: None,
+        };
+        let mut command = ProcessCommand::new("vllm");
+
+        apply_therock_env(&mut command, &runtime)?;
+
+        let stub = env
+            .path()
+            .join("rocm-cli-lib-compat")
+            .join("libmpi_cxx.so.40");
+        assert!(
+            stub.is_file(),
+            "ensure_therock_compat_shims must have written the libmpi_cxx stub"
         );
         Ok(())
     }
