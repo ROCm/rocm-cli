@@ -158,7 +158,7 @@ pub(crate) const fn empty_as_unknown(value: &str) -> &str {
 /// `ExamineSummary::gather`'s `distro` field, which does follow a simulated
 /// root.
 pub(crate) fn real_os_release() -> rocm_core::hardware_root::OsRelease {
-    rocm_core::hardware_root::read_os_release(|p| PathBuf::from(p))
+    rocm_core::hardware_root::read_os_release(rocm_core::hardware_root::identity_path_for_str)
 }
 
 /// Run a command given as an argv vector directly, without going through a shell.

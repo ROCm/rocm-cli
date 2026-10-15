@@ -730,7 +730,7 @@ fn probe_os(e: &mut Examination) {
         e.kernel_cmdline = read_host_text("/proc/cmdline").trim().to_owned();
         record_distro(
             e,
-            &crate::hardware_root::read_os_release(|p| crate::host_path(p)),
+            &crate::hardware_root::read_os_release(crate::hardware_root::host_path_for_str),
         );
         if let Some(param) = parse_iommu_param(&e.kernel_cmdline) {
             e.iommu_kernel_param = param;

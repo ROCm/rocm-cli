@@ -1004,7 +1004,7 @@ fn install_hint_for_read(
 /// their distribution.
 #[cfg(target_os = "linux")]
 fn real_os_release() -> crate::hardware_root::OsRelease {
-    crate::hardware_root::read_os_release(|p| std::path::PathBuf::from(p))
+    crate::hardware_root::read_os_release(crate::hardware_root::identity_path_for_str)
 }
 
 const OPENMPI_MANUAL_HINT: &str = "install your distribution's OpenMPI runtime package (providing libmpi.so / libmpi_cxx.so and mpirun)";

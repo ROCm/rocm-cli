@@ -78,6 +78,32 @@ pub fn host_path(path: impl AsRef<Path>) -> PathBuf {
     host_path_under(hardware_root().as_deref(), path.as_ref())
 }
 
+/// [`host_path`], fixed to `&str`.
+///
+/// [`read_os_release`]'s `resolve` parameter needs a concrete
+/// `Fn(&str) -> PathBuf`, which a bare reference to the generic `host_path`
+/// cannot satisfy (the borrow checker rejects it as "not general enough"
+/// over the resolved lifetime), so every probe that must honour a simulated
+/// root passes this instead of `|p| host_path(p)`.
+#[must_use]
+pub fn host_path_for_str(path: &str) -> PathBuf {
+    host_path(path)
+}
+
+/// [`read_os_release`]'s `resolve` parameter for a caller that must always
+/// read the real machine.
+///
+/// Never routed through [`host_path`], because it builds a package-manager
+/// plan or install hint that runs against the real host, so a simulated
+/// host root must not choose its distro (see each caller's own doc comment
+/// for why). A bare `PathBuf::from` is rejected the same way a bare
+/// `host_path` is (see [`host_path_for_str`]), so every such caller passes
+/// this instead of `|p| PathBuf::from(p)`.
+#[must_use]
+pub fn identity_path_for_str(path: &str) -> PathBuf {
+    PathBuf::from(path)
+}
+
 #[cfg(feature = "e2e-test-hooks")]
 fn hardware_root() -> Option<PathBuf> {
     std::env::var_os(TEST_HOST_ROOT_ENV)

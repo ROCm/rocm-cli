@@ -819,6 +819,29 @@ fn build_driver_install_plan(
     )
 }
 
+/// The plan for a release file that cannot be read as a distro at all — a
+/// malformed line ([`build_driver_install_plan_at`]'s own early return) or a
+/// file that exists but could not be read
+/// ([`build_driver_install_plan_read`]'s `Unreadable` branch). Both name
+/// `reason`, never a distro, and differ only in it: shared here so a new
+/// early branch added to one is not silently absent from the other.
+fn unreadable_os_release_plan(repo_version: String, reason: String) -> DriverInstallPlan {
+    DriverInstallPlan {
+        supported: false,
+        mutating: false,
+        policy: "unreadable_os_release".to_owned(),
+        os_id: String::new(),
+        version_id: String::new(),
+        codename: String::new(),
+        repo_version,
+        reason,
+        preflight_checks: Vec::new(),
+        commands: Vec::new(),
+        checks: vec!["rocm examine".to_owned()],
+        reboot_required: false,
+    }
+}
+
 /// [`build_driver_install_plan`], naming `os_release_path` instead of always
 /// `/etc/os-release` in an unreadable-line message.
 fn build_driver_install_plan_at(
@@ -865,24 +888,14 @@ fn build_driver_install_plan_at(
     let os_release = match rocm_core::os_release::parse(os_release_text) {
         Ok(fields) => fields,
         Err(unreadable) => {
-            return DriverInstallPlan {
-                supported: false,
-                mutating: false,
-                policy: "unreadable_os_release".to_owned(),
-                os_id: String::new(),
-                version_id: String::new(),
-                codename: String::new(),
+            return unreadable_os_release_plan(
                 repo_version,
-                reason: format!(
+                format!(
                     "{os_release_path} {unreadable}; no driver commands were planned \
                      because the distro cannot be read. To fix it, {}.",
                     unreadable.fix()
                 ),
-                preflight_checks: Vec::new(),
-                commands: Vec::new(),
-                checks: vec!["rocm examine".to_owned()],
-                reboot_required: false,
-            };
+            );
         }
     };
     let field = |key: &str| os_release.get(key).cloned();
@@ -1017,23 +1030,13 @@ fn build_driver_install_plan_read(
     if reaches_os_release_parse
         && let rocm_core::hardware_root::OsRelease::Unreadable { path, error } = read
     {
-        return DriverInstallPlan {
-            supported: false,
-            mutating: false,
-            policy: "unreadable_os_release".to_owned(),
-            os_id: String::new(),
-            version_id: String::new(),
-            codename: String::new(),
-            repo_version: resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}"),
-            reason: format!(
+        return unreadable_os_release_plan(
+            resolve_shell_default_template("${ROCM_CLI_AMDGPU_VERSION:-7.2.4}"),
+            format!(
                 "{path} could not be read: {error}; no driver commands were planned \
                  because the distro cannot be read."
             ),
-            preflight_checks: Vec::new(),
-            commands: Vec::new(),
-            checks: vec!["rocm examine".to_owned()],
-            reboot_required: false,
-        };
+        );
     }
     build_driver_install_plan_at(examine, read.path(), read.text(), dkms, escalation)
 }

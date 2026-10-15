@@ -1968,7 +1968,7 @@ pub(crate) fn detect_distro_name() -> Option<String> {
     }
 
     if runtime_is_linux() {
-        return match hardware_root::read_os_release(|p| host_path(p)) {
+        return match hardware_root::read_os_release(hardware_root::host_path_for_str) {
             // Absent matches the pre-fallback behaviour this function has
             // always had: no file at all leaves the distro name unknown
             // entirely, rather than reporting "Linux" for a machine that
