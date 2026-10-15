@@ -774,6 +774,7 @@ fn launch_managed_engine_child_locked(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
+    paths: &AppPaths,
     engine: &str,
     service_id: &str,
     requested_model: &str,
@@ -790,9 +791,8 @@ pub(crate) fn start_managed_service(
     require_api_key: bool,
     on_wait_tick: &mut dyn FnMut(Duration),
 ) -> Result<ManagedLaunchReport> {
-    let paths = AppPaths::discover()?;
     let (mut record, child_pid) = match spawn_managed_engine_child(
-        &paths,
+        paths,
         engine,
         service_id,
         requested_model,
@@ -837,7 +837,7 @@ pub(crate) fn start_managed_service(
     record.write()?;
     let endpoint_url = format!("{}/v1", format_http_base_url(host, record.port));
     record_cli_audit_event(
-        &paths,
+        paths,
         "service",
         "managed_service_launch",
         "info",
@@ -855,6 +855,58 @@ pub(crate) fn start_managed_service(
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
         manifest_path: Some(record.manifest_path),
+    })
+}
+
+/// As [`start_managed_service`], but also drops the endpoint key `serve()`
+/// freshly staged for this attempt if the launch fails before any
+/// `ManagedServiceRecord` exists to own it (port reserved/in use, range
+/// exhausted, other bind error) — such a failure returns before
+/// `abandon_failed_managed_launch` ever runs, so nothing else would clear it.
+/// Idempotent with that post-spawn cleanup. This is the real call site
+/// `serve_cmd.rs`'s background launch path uses, so it is what
+/// `failed_port_reservation_leaves_no_orphaned_endpoint_key` drives directly,
+/// mirroring how [`run_attached_service`] is driven directly for the
+/// foreground path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_managed_service_dropping_orphaned_key_on_failure(
+    paths: &AppPaths,
+    engine: &str,
+    service_id: &str,
+    requested_model: &str,
+    resolve: &ResolveModelResponse,
+    host: &str,
+    port_request: serve_port::PortRequest,
+    device_policy: &DevicePolicy,
+    gpu_indices: &[u32],
+    runtime_id: Option<&str>,
+    env_id: Option<&str>,
+    engine_recipe: Option<&EngineRecipeHint>,
+    endpoint_api_key: Option<&str>,
+    launch_lock: rocm_core::FileLock,
+    require_api_key: bool,
+    on_wait_tick: &mut dyn FnMut(Duration),
+) -> Result<ManagedLaunchReport> {
+    start_managed_service(
+        paths,
+        engine,
+        service_id,
+        requested_model,
+        resolve,
+        host,
+        port_request,
+        device_policy,
+        gpu_indices,
+        runtime_id,
+        env_id,
+        engine_recipe,
+        endpoint_api_key,
+        launch_lock,
+        require_api_key,
+        on_wait_tick,
+    )
+    .inspect_err(|_| {
+        drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
     })
 }
 
@@ -1617,7 +1669,7 @@ mod tests {
     fn a_managed_spawn_refuses_an_invalid_key_file_on_a_service_that_requires_one() -> Result<()> {
         // Drives the real call site, not the guard's own arguments. The service
         // was launched with `--require-api-key`, and its key file is present but
-        // empty — so `requires_api_key` is true while `key_present` is false,
+        // invalid — so `requires_api_key` is true while `key_present` is false,
         // which is the only way to reach the first branch. A test calling
         // `ensure_public_service_has_endpoint_key` directly cannot catch a
         // mis-wired call site, which is the defect that has occurred here twice.
@@ -1629,9 +1681,18 @@ mod tests {
         paths.ensure()?;
         fs::create_dir_all(paths.services_dir())?;
 
-        // Empty, so the file exists (requires_api_key = true) but yields no
-        // usable key (key_present = false).
-        endpoint_keys::store_endpoint_api_key(&paths, "lemonade-qwen-3000", "")?;
+        // Non-empty but invalid (embedded CR/LF), so the file exists and is not
+        // merely empty (requires_api_key = true) but yields no usable key
+        // (key_present = false) — `endpoint_api_key_from_file` rejects embedded
+        // control characters. An empty seed here would let the post-condition
+        // below pass even if the real cleanup call never ran, since
+        // `endpoint_api_key` already reads back `None` for an empty file whether
+        // or not it was ever deleted.
+        endpoint_keys::store_endpoint_api_key(
+            &paths,
+            "lemonade-qwen-3000",
+            "bad-key\r\nX-Injected: value",
+        )?;
 
         let resolve = ResolveModelResponse {
             canonical_model_id: "qwen-canonical".to_owned(),
@@ -1676,7 +1737,7 @@ mod tests {
         let manifest_path = paths.service_manifest_path("lemonade-qwen-3000");
         let log_path = paths.service_log_path("lemonade-qwen-3000");
         let engine_state_path = paths.service_engine_state_path("lemonade", "lemonade-qwen-3000");
-        let key = endpoint_keys::endpoint_api_key(&paths, "lemonade-qwen-3000");
+        let key_file_path = endpoint_keys::endpoint_key_file_path(&paths, "lemonade-qwen-3000");
         let live = live_managed_services(&paths);
         let _ = fs::remove_dir_all(root);
 
@@ -1704,9 +1765,10 @@ mod tests {
             !engine_state_path.exists(),
             "a pre-spawn failure must not leave engine state"
         );
-        assert_eq!(
-            key, None,
-            "a pre-spawn failure must not leave the unusable key behind"
+        assert!(
+            !key_file_path.exists(),
+            "a pre-spawn failure must delete the unusable key file from disk, not merely \
+             leave it unreadable as a key"
         );
         assert!(
             live.is_empty(),
@@ -1811,12 +1873,16 @@ mod tests {
     #[test]
     fn failed_port_reservation_leaves_no_orphaned_endpoint_key() -> Result<()> {
         // serve() stores the new attempt's endpoint key before calling
-        // start_managed_service. If spawn_managed_engine_child fails inside
-        // resolve_managed_port_in_transaction (explicit port already reserved
-        // by another live service), it returns before any ManagedServiceRecord
-        // exists for this attempt, so abandon_failed_managed_launch never runs.
-        // The caller's .inspect_err() cleanup (drop_orphaned_endpoint_key_on_already_running)
-        // must be what clears the key.
+        // start_managed_service_dropping_orphaned_key_on_failure. If
+        // spawn_managed_engine_child fails inside resolve_managed_port_in_transaction
+        // (explicit port already reserved by another live service), it returns
+        // before any ManagedServiceRecord exists for this attempt, so
+        // abandon_failed_managed_launch never runs. Driving the real wrapper
+        // function end to end (not a simulated call to
+        // drop_orphaned_endpoint_key_on_already_running) proves serve_cmd.rs's own
+        // call site actually wires the cleanup, mirroring how
+        // attached_launch_failing_before_spawn_leaves_no_orphaned_endpoint_key
+        // drives run_attached_service for the foreground path.
         let (root, paths) = test_paths("orphaned-key-on-reserved-port");
         paths.ensure()?;
         let mut other = ManagedServiceRecord::new(
@@ -1855,8 +1921,9 @@ mod tests {
 
         let service_id = "lemonade-qwen-2000";
         endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
+        let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
 
-        let result = spawn_managed_engine_child(
+        let result = start_managed_service_dropping_orphaned_key_on_failure(
             &paths,
             "lemonade",
             service_id,
@@ -1869,7 +1936,10 @@ mod tests {
             None,
             None,
             None,
+            Some("test-key"),
+            launch_lock,
             false,
+            &mut |_elapsed| {},
         );
         let Err(error) = result else {
             let _ = fs::remove_dir_all(root);
@@ -1882,7 +1952,6 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        drop_orphaned_endpoint_key_on_already_running(&paths, service_id, Some("test-key"));
         assert!(
             endpoint_keys::endpoint_api_key(&paths, service_id).is_none(),
             "cleanup must drop the key this failed attempt staged before launching"

@@ -411,27 +411,35 @@ async fn occupy_default_serve_port(world: &mut E2eWorld) {
     );
 }
 
-/// Plant a live managed-service record on the default serve port, with no real
-/// listener or process behind it. `resolve_serve_port`'s explicit-port check
-/// matches on the record's `port` field alone, before it ever probes the OS
-/// (see `reserved_service_ports`'s "conservative by design" doc comment), so a
-/// live record is enough to make the collision deterministic without a second
-/// real server. `ServiceRecordOptions::default()`'s `supervisor_pid: 0` keeps
-/// this safe for the World's teardown, which runs `rocm services stop <id>
-/// --yes` on every record left in the isolated tree: a real PID here would
-/// point that stop at the test process itself (see
-/// `plant_unauthenticated_lemonade_service`'s doc comment for the same
-/// hazard).
+/// Plant a live managed-service record on the default serve port, backed by a
+/// real mock listener on that exact port.
+///
+/// `ServiceRecordOptions::default()`'s `supervisor_pid: 0` means the CLI's
+/// liveness refresh finds no tracked pid to check; without a real listener
+/// behind the record, the endpoint probe would then come back `Unreachable`
+/// and the record gets demoted to `"stopped"` *before* the explicit-port
+/// collision check ever sees it (`refresh_managed_service_runtime_liveness`
+/// in `apps/rocm/src/main.rs`). Backing the record with a `MockServer` on
+/// `SERVE_PORT` makes `/v1/models` list `other-model`, so the probe reports
+/// `Listing`/`Serving` and the record is left `"ready"` instead — the
+/// scenario needs the collision detected, so the port has to be reserved for
+/// real, not just on paper. `supervisor_pid: 0` still keeps this safe for the
+/// World's teardown, which runs `rocm services stop <id> --yes` on every
+/// record left in the isolated tree: a real PID here would point that stop at
+/// the test process itself (see `plant_unauthenticated_lemonade_service`'s
+/// doc comment for the same hazard).
 #[given("another managed service already reserves the default serve port")]
 async fn reserve_default_serve_port(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let services = root.path().join("data").join("services");
+    let mock = MockServer::start_on_port("other-model", SERVE_PORT).await;
     write_service_record_with(
         &services,
         "other-model",
         SERVE_PORT,
         ServiceRecordOptions::default(),
     );
+    world.mock = Some(mock);
 }
 
 /// The (model, engine, ready-substring) this host should serve for an

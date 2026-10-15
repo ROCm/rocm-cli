@@ -1677,6 +1677,19 @@ impl ManagedServiceRecord {
         )
     }
 
+    /// Whether this live record reserves `port` — the sole collision check
+    /// shared by the CLI's restart re-check and `rocmd`'s recovery re-check, so
+    /// the two can never disagree about who owns a port.
+    ///
+    /// Deliberately host-blind: a `0.0.0.0` (or `localhost`) listener also
+    /// blocks the loopback address a competing bind would target, so comparing
+    /// hosts would under-detect a real collision rather than merely cost one
+    /// skipped candidate.
+    #[must_use]
+    pub fn blocks_port(&self, port: u16) -> bool {
+        self.is_live() && self.port == port
+    }
+
     fn with_storage_paths(&self) -> Self {
         let mut record = self.clone();
         record.manifest_path = normalize_runtime_path_for_storage(&record.manifest_path);

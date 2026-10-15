@@ -1505,8 +1505,7 @@ pub(crate) fn restart_managed_service(
         .context("failed to re-read managed services under the launch lock")?;
     if let Some(collision) = on_disk
         .iter()
-        .find(|other| other.service_id != record.service_id && other.is_live())
-        .filter(|other| other.host == record.host && other.port == record.port)
+        .find(|other| other.service_id != record.service_id && other.blocks_port(record.port))
     {
         anyhow::bail!(
             "cannot recover managed service {} on {}:{}: {} claimed that port while recovery \
@@ -3881,6 +3880,113 @@ mod tests {
         assert_eq!(
             persisted.stop_requested_unix_ms, None,
             "a restart supersedes an earlier stop request"
+        );
+        Ok(())
+    }
+
+    /// If publishing the `recovering` transition fails, nothing has been
+    /// spawned yet: the rollback at that first write must undo the in-memory
+    /// transition and leave the on-disk record exactly as it was, not a
+    /// half-applied `recovering` row. A manifest file made read-only after
+    /// being seeded fails that exact write without ever reaching the spawn.
+    ///
+    /// Unix only and skipped as root, where a read-only mode is not enforced
+    /// and the write would simply succeed.
+    #[cfg(unix)]
+    #[test]
+    fn restart_rolls_back_the_in_memory_record_when_the_first_write_fails() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rocm_core::openmpi::running_as_root() {
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("restart-rollback-first-write");
+        paths.ensure()?;
+        let service_id = "svc-restart-rollback-first-write";
+        let mut record = identity_probe_record(&paths, service_id, 11459);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let manifest_path = paths.service_manifest_path(service_id);
+        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o444))?;
+
+        let result = restart_managed_service(&paths, &mut record);
+
+        // Restore write access so the rest of the write (if any landed) can be
+        // read back, and so cleanup can remove the directory.
+        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let error = result.expect_err("a read-only manifest must fail the first write");
+        assert!(
+            format!("{error:#}").contains("failed to publish the recovering service record"),
+            "{error:#}"
+        );
+        assert_eq!(
+            record.status, "failed",
+            "a failed first write must restore the in-memory record rather than leave it \
+             \"recovering\""
+        );
+        assert_eq!(
+            persisted?.status, "failed",
+            "nothing must reach disk when the first write itself fails"
+        );
+        Ok(())
+    }
+
+    /// The lease branch above proves a bound loopback port refuses recovery;
+    /// the doc comment on `restart_managed_service`'s lease also claims custom
+    /// hosts skip that preflight entirely, relying on the engine's own bind
+    /// error instead. Binding the exact recorded port on a custom host and
+    /// still reaching a spawned supervisor is what proves that claim, rather
+    /// than just trusting the comment.
+    ///
+    /// Linux-only and ignores the restart's own outcome for the same reason as
+    /// `restart_managed_service_persists_the_supervisor_identity_token`: the
+    /// restart re-execs the test binary, which rejects the `supervise`
+    /// arguments and exits at once, so the restart itself still reports
+    /// failure — after writing the supervisor identity this test reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restart_on_a_custom_host_skips_the_loopback_lease() -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-custom-host-skips-lease");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-custom-host";
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            service_id,
+            "llamacpp",
+            "a-model",
+            "a-model",
+            "0.0.0.0",
+            11460,
+            "managed",
+            std::process::id(),
+            None,
+            None,
+            Some("gpu_required".to_owned()),
+        );
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let _blocker = std::net::TcpListener::bind(("0.0.0.0", 11460))?;
+
+        let outcome = restart_managed_service(&paths, &mut record);
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        let message = outcome.err().map(|e| format!("{e:#}")).unwrap_or_default();
+        assert!(
+            !message.contains("its recorded port is in use"),
+            "a custom host must not preflight the port with a loopback lease: {message}"
+        );
+        assert!(
+            persisted?.supervisor_start_ticks.is_some(),
+            "recovery must still reach a spawned supervisor despite the bound port"
         );
         Ok(())
     }

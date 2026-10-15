@@ -269,6 +269,19 @@ Expected result:
 - `rocm services` shows the launched service bound to the port it picked, and
   the deployment summary's endpoint matches it.
 
+With that service still running, try to launch a second one pinned to the
+same port:
+
+```powershell
+rocm serve qwen --engine lemonade --device gpu_required --managed --port <the-port-above>
+```
+
+Expected result:
+
+- The command refuses up front, naming the service already holding that port
+  and how to free it (`rocm services stop <service-id> --yes`), without
+  spawning an engine process or writing a new record.
+
 ## 4. Local Server Records
 
 After a managed or foreground serve attempt, inspect local server records:
