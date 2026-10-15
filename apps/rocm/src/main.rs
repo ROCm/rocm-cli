@@ -7366,7 +7366,10 @@ fn restart_internal_managed_service_with(
             })?;
             bail!(
                 "{}",
-                managed_engine_startup_failure_detail(status, &record.log_path)
+                managed_engine_startup_failure_detail(
+                    &format!(" with status {status}"),
+                    &record.log_path
+                )
             );
         }
         child.id()
