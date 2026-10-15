@@ -1127,8 +1127,9 @@ jobs:
         shell: powershell
         run: |
           # Install the shared runtime in place because its manifest contains
-          # absolute paths. The persistent runner workspace keeps those paths valid
-          # across scenarios and subsequent runs.
+          # absolute paths. On the ephemeral DevLab Dispatch pool this host is
+          # destroyed after the job, so the paths only need to stay valid for
+          # this run's scenarios, not across runs.
           $prewarm = "$env:RUNNER_WORKSPACE\e2e-prewarm-multi-arch-v2"
           $env:E2E_SHARED_RUNTIMES_DIR = "$prewarm\data\runtimes"
 
@@ -1136,9 +1137,10 @@ jobs:
           # isolate_env() derives HF_HOME/PIP_CACHE_DIR/ROCM_CLI_CACHE_DIR from
           # this per scenario. Without it every serve scenario here re-downloads
           # its model checkpoint cold, which raced serve-08's readiness timeout
-          # (EAI-8031 / #260) on every nightly run — this host was never actually
-          # warm for it, since Windows doesn't set HOME by default and the
-          # engine's cache lookup didn't fall back to USERPROFILE.
+          # (EAI-8031 / #260) on every nightly run — on the ephemeral pool there's
+          # no cache carried over from a prior job, so this is cold every
+          # scenario, and Windows doesn't set HOME by default so the engine's
+          # cache lookup didn't fall back to USERPROFILE either.
           $env:E2E_SHARED_CACHE_DIR = "$env:RUNNER_WORKSPACE\e2e-shared"
 
           # See the e2e-gpu lane in e2e-selfhosted.yml for why the
