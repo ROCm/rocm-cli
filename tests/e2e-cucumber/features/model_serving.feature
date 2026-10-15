@@ -118,7 +118,7 @@ Feature: Model serving
   # Readiness contract: when the CLI reports a service ready, inference must work.
   # Engine-agnostic — the served model+engine follow the host (see
   # `a model is being served on GPU`), so this holds the contract on every GPU
-  # platform. Readiness is gated on a real inference probe, which is what makes
+  # platform that runs it (the merge queue skips MI300X). Readiness is gated on a real inference probe, which is what makes
   # this contract hold rather than race the model load.
   @id:serve-readiness-contract @requires-gpu @merge-queue
   Scenario: serve-12 - A service reported ready can immediately serve inference

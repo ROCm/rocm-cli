@@ -18,8 +18,9 @@ separate from the main `ci.yml`. The split is deliberate: a job queued on an
 newer run's merge-required (GitHub-hosted) checks would sit pending forever
 (observed on PR #138). Giving the self-hosted lanes their own workflow — and
 thus their own concurrency group — means an offline runner can only ever stall
-that workflow's own supersession, never `ci.yml`'s required checks. See
-`EAI-7548`. [`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
+that workflow's own supersession, never `ci.yml`'s required checks (only
+pull-request runs are superseded there). See `EAI-7548`.
+[`workflow_contract.rs`](../xtask/src/workflow_contract.rs)'s
 `self_hosted_workflow_owns_the_gpu_lanes` test checks that `e2e-gpu`,
 `e2e-gpu-strix-ubuntu`, and `e2e-gpu-strix-windows` still appear as job keys in
 `e2e-selfhosted.yml`, while its sibling `ci_yml_schedules_no_self_hosted_job`
@@ -267,10 +268,11 @@ queued on limited runner capacity after its PR has merged) when the workflow's
 own `changes` job's `serve` path filter is `true`. A new push to a pull request
 cancels that PR's older run; push, `merge_group` and manual runs each get a
 group of their own, so none is cancelled or replaced by another. The heavy
-`@merge-queue` serves therefore no longer run on MI300X (the vLLM host), only
-on the other lanes; the per-PR vLLM canary is the vLLM serve coverage before a
-change lands. `push` fires on `main` and on any `release/**` branch, so pushing to a release branch runs the full self-hosted matrix ahead
-of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
+`@merge-queue` serves therefore no longer run on MI300X, the only per-PR vLLM
+lane: they run only on the other lanes, and the only vLLM serve before a change
+lands is the per-PR canary (`serve-05`), which runs when the `serve` filter
+matches. `push` fires on `main` and on any `release/**` branch, so pushing to
+a release branch runs the full self-hosted matrix ahead of cutting the `v*` tag that `release.yml` builds/publishes from — this is the
 release-candidate regression gate; `pull_request` fires against any base
 branch. `serve` is narrower than `heavy`: it matches only
 paths that can change serve *behaviour* or the GPU E2E harness (the engines, the

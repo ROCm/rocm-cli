@@ -3639,8 +3639,8 @@ fi
         // Isolation comes from the group KEY differing per workflow. Extract the
         // actual concurrency.group value from each and assert (a) ci.yml keeps
         // supersession (e2e-selfhosted.yml scopes it to pull_request, see
-        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on github.workflow, and (c) the two group
-        // expressions and workflow names differ — so at runtime the groups are
+        // `self_hosted_supersession_is_scoped_to_pull_requests`), (b) both key on
+        // github.workflow, and (c) the two group expressions and workflow names differ — so at runtime the groups are
         // distinct and an offline-runner stall in one can't hold the other.
         let ci = read_workflow("ci.yml");
         let sh = read_workflow("e2e-selfhosted.yml");
@@ -4456,12 +4456,15 @@ jobs:
             "the group must carry the event name so runs of different triggers never \
              share a group (got `{group}`)"
         );
+        let group = normalized_whitespace(&group);
         assert!(
-            group.contains("github.event.pull_request.number"),
+            group.contains(
+                "github.event_name == 'pull_request' && github.event.pull_request.number"
+            ),
             "a pull_request run must be keyed on the PR number (got `{group}`)"
         );
         assert!(
-            group.contains("github.run_id"),
+            group.contains("github.event_name == 'workflow_dispatch' && github.run_id"),
             "a workflow_dispatch run must keep a unique group (got `{group}`)"
         );
         // Ref AND commit: GitHub replaces a still-pending run in a shared group
@@ -4498,8 +4501,10 @@ jobs:
                 .join(" ")
         };
         assert!(
-            normalized_whitespace(&gate("e2e-gpu"))
-                .contains("&& github.event_name != 'merge_group' &&"),
+            normalized_whitespace(&gate("e2e-gpu")).starts_with(
+                "always() && needs.changes.result == 'success' \
+                 && github.event_name != 'merge_group' && ("
+            ),
             "e2e-gpu (MI300X) must not run on merge_group events"
         );
         assert!(
@@ -4512,9 +4517,12 @@ jobs:
             "e2e-wsl",
             "e2e-gpu-w7900",
         ] {
+            // Only the dispatch split may look at the event: any other event
+            // condition could silently keep the lane out of the merge queue.
+            let gate = normalized_whitespace(&gate(job));
             assert!(
-                !gate(job).contains("merge_group"),
-                "`{job}` must keep running in the merge queue"
+                !gate.contains("merge_group") && !gate.contains("'pull_request'"),
+                "`{job}` must keep running in the merge queue (gate: `{gate}`)"
             );
         }
     }
