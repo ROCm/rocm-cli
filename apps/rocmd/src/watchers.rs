@@ -1481,9 +1481,12 @@ fn manifest_service_recovery_reason(
 /// cross-process launch lock a `rocm serve` launch holds (unbounded, via
 /// [`rocm_core::FileLock::acquire`]). The two still can't publish competing
 /// records for this port at the same instant — the lock is exclusive either
-/// way — but a `rocm serve` launch never waits on recovery: if recovery is
-/// mid-transaction when this bounded acquire times out, recovery is deferred
-/// rather than blocking the CLI.
+/// way. A concurrent `rocm serve` launch does still block for as long as
+/// recovery holds the lock; what the bound buys is the other direction —
+/// recovery never waits out an interactive launch indefinitely. If a `rocm
+/// serve` call is already mid-transaction when this bounded acquire times
+/// out, recovery is deferred (not retried in a busy loop) rather than
+/// queuing behind the CLI.
 pub(crate) fn restart_managed_service(
     paths: &AppPaths,
     record: &mut ManagedServiceRecord,
@@ -1523,14 +1526,13 @@ pub(crate) fn restart_managed_service(
     // the existing engine-owned bind behavior — the record transition is still
     // serialized, but the bind is not preflighted.
     let lease = if rocm_core::is_canonical_loopback_host(&record.host) {
-        Some(
-            rocm_core::lease_loopback_port(record.port).with_context(|| {
-                format!(
-                    "cannot recover managed service {} on {}:{}: its recorded port is in use",
-                    record.service_id, record.host, record.port
-                )
-            })?,
-        )
+        Some(rocm_core::lease_loopback_port_or_bind_error(
+            record.port,
+            format_args!(
+                "cannot recover managed service {} on {}:{}: its recorded port is in use",
+                record.service_id, record.host, record.port
+            ),
+        )?)
     } else {
         None
     };
@@ -3933,6 +3935,154 @@ mod tests {
             persisted?.status, "failed",
             "nothing must reach disk when the first write itself fails"
         );
+        Ok(())
+    }
+
+    /// The first-write rollback above covers a failure before anything is
+    /// spawned; this one covers the second write, after the supervisor exists.
+    /// A thread races the restart: as soon as the first write lands
+    /// (`recovering`, no supervisor yet), it corrupts the manifest's content so
+    /// `record_spawned_supervisor`'s read fails. That must kill the spawned
+    /// supervisor and restore the prior record — and the rollback write itself
+    /// must still land, since corrupting *content* leaves the file a writable
+    /// regular file.
+    #[test]
+    fn restart_rolls_back_and_kills_the_supervisor_when_the_second_write_cannot_be_read()
+    -> Result<()> {
+        let (root, paths) = temp_app_paths("restart-rollback-second-write-unreadable");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-rollback-second-write-unreadable";
+        let mut record = identity_probe_record(&paths, service_id, 11461);
+        record.status = "failed".to_owned();
+        record.write()?;
+        let prior = record.clone();
+
+        let manifest_path = paths.service_manifest_path(service_id);
+        let corrupt = thread::spawn(move || -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if let Ok(bytes) = fs::read(&manifest_path)
+                    && let Ok(on_disk) = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
+                    && on_disk.status == "recovering"
+                    && on_disk.supervisor_pid == 0
+                {
+                    let _ = fs::write(&manifest_path, b"not json");
+                    return true;
+                }
+                // Busy-spin: the window this races (between the restart's
+                // first write and its spawned child's own write) is only as
+                // long as a `fork`+`exec`, far shorter than any sleep tick
+                // could reliably catch.
+                std::hint::spin_loop();
+            }
+            false
+        });
+        let outcome = restart_managed_service(&paths, &mut record);
+        let corrupted_in_time = corrupt.join().expect("corrupt thread");
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            corrupted_in_time,
+            "precondition: the race won before the second write ran"
+        );
+        let error = outcome.expect_err("an unreadable second write must fail the restart");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to publish the recovering service record"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("rollback also failed"),
+            "corrupting content, not permissions, leaves the rollback write itself able to \
+             land: {message}"
+        );
+        assert_eq!(
+            record.status, prior.status,
+            "the in-memory record must be restored to what it was before this restart"
+        );
+        let persisted = persisted?;
+        assert_eq!(
+            persisted.status, prior.status,
+            "the rollback write must overwrite the corrupted content with the prior record"
+        );
+        assert_eq!(persisted.supervisor_pid, prior.supervisor_pid);
+        Ok(())
+    }
+
+    /// As above, but the rollback write itself also fails: a manifest made
+    /// read-only after the first write still lets `record_spawned_supervisor`
+    /// *read* it (ownership check passes), but both its write and the
+    /// subsequent rollback write hit the same permission error. That must be
+    /// reported as a rollback failure, not swallowed as the original one.
+    ///
+    /// Unix only and skipped as root, where a read-only mode is not enforced.
+    #[cfg(unix)]
+    #[test]
+    fn restart_reports_when_the_rollback_write_also_fails() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rocm_core::openmpi::running_as_root() {
+            return Ok(());
+        }
+
+        let (root, paths) = temp_app_paths("restart-rollback-also-fails");
+        paths.ensure()?;
+        fs::create_dir_all(paths.services_dir())?;
+
+        let service_id = "svc-restart-rollback-also-fails";
+        let mut record = identity_probe_record(&paths, service_id, 11462);
+        record.status = "failed".to_owned();
+        record.write()?;
+
+        let manifest_path = paths.service_manifest_path(service_id);
+        let lock = {
+            let manifest_path = manifest_path.clone();
+            thread::spawn(move || -> bool {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(bytes) = fs::read(&manifest_path)
+                        && let Ok(on_disk) = serde_json::from_slice::<ManagedServiceRecord>(&bytes)
+                        && on_disk.status == "recovering"
+                        && on_disk.supervisor_pid == 0
+                        && fs::set_permissions(
+                            &manifest_path,
+                            std::fs::Permissions::from_mode(0o444),
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                    std::hint::spin_loop();
+                }
+                false
+            })
+        };
+        let outcome = restart_managed_service(&paths, &mut record);
+        let locked_in_time = lock.join().expect("lock thread");
+        fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o644))?;
+        let persisted = load_service_record(&paths, service_id);
+        fs::remove_dir_all(root).ok();
+
+        assert!(
+            locked_in_time,
+            "precondition: the race won before the second write ran"
+        );
+        let error = outcome.expect_err("a read-only manifest must fail both writes");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("rollback also failed"),
+            "both the second write and its rollback hit the same permission error: {message}"
+        );
+        assert!(
+            message.contains(service_id),
+            "the rollback-also-failed message must name the affected service: {message}"
+        );
+        // Left exactly as the second write's failure found it: `recovering`
+        // with no supervisor, matching the "no supervisor" the error names.
+        assert_eq!(persisted?.status, "recovering");
         Ok(())
     }
 

@@ -582,6 +582,40 @@ pub fn lease_loopback_port(port: u16) -> std::io::Result<LoopbackPortLease> {
     })
 }
 
+/// [`lease_loopback_port`], but mapped to an `anyhow::Error`.
+///
+/// Only uses `in_use_message` for a genuine collision
+/// ([`std::io::ErrorKind::AddrInUse`]). Any other bind failure (permission
+/// denied, address unavailable, ...) gets its own generic message instead —
+/// mislabelling those as "in use" sends the user to stop a service that
+/// isn't the actual problem. Mirrors `rocm serve`'s own
+/// `explicit_bind_error`; shared by the CLI's restart re-check and
+/// `rocmd`'s recovery re-check so neither duplicates (or drifts from) that
+/// distinction.
+pub fn lease_loopback_port_or_bind_error(
+    port: u16,
+    in_use_message: impl std::fmt::Display,
+) -> anyhow::Result<LoopbackPortLease> {
+    lease_loopback_port(port).map_err(|error| bind_error(port, &error, in_use_message))
+}
+
+/// Pure error-mapping half of [`lease_loopback_port_or_bind_error`], split out
+/// so the `AddrInUse`-vs-other-error distinction is tested against a
+/// synthetic `io::Error` rather than needing a real bind failure (a
+/// privileged port, an unavailable address) that is not reliably
+/// reproducible in CI.
+fn bind_error(
+    port: u16,
+    error: &std::io::Error,
+    in_use_message: impl std::fmt::Display,
+) -> anyhow::Error {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        anyhow::anyhow!("{in_use_message}")
+    } else {
+        anyhow::anyhow!("failed to reserve port {port}: {error}")
+    }
+}
+
 impl Drop for FileLock {
     fn drop(&mut self) {
         // Best-effort: an unlock failure only means the OS releases it slightly
@@ -1311,6 +1345,24 @@ mod tests {
 
         assert_eq!(lease.release(), port);
         lease_loopback_port(port).expect("the port is bindable again after release");
+    }
+
+    #[test]
+    fn bind_error_labels_only_a_genuine_collision_as_in_use() {
+        let in_use = bind_error(
+            9000,
+            &std::io::Error::from(std::io::ErrorKind::AddrInUse),
+            "its port is in use",
+        );
+        assert_eq!(in_use.to_string(), "its port is in use");
+
+        let other = bind_error(
+            9000,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            "its port is in use",
+        );
+        assert_ne!(other.to_string(), "its port is in use");
+        assert!(other.to_string().contains("9000"));
     }
 
     #[test]

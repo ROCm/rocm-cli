@@ -14,8 +14,7 @@
 //! `collect_serve_notes` and `validate_pinned_gpu_index` stay in `main.rs`
 //! (no entanglement; a later pass can relocate them). The
 //! managed-service-spawning tail this file calls into —
-//! `start_managed_service_dropping_orphaned_key_on_failure`,
-//! `run_attached_service`, `resolve_endpoint_auth`,
+//! `start_managed_service`, `run_attached_service`, `resolve_endpoint_auth`,
 //! `ensure_public_bind_engine_supported`,
 //! `drop_orphaned_endpoint_key_on_already_running`, `print_managed_launch_plain`,
 //! `validate_bind_host`, `ensure_background_helper_running_quiet` — was relocated
@@ -44,8 +43,7 @@ use crate::serve_summary;
 use crate::service_launch::{
     drop_orphaned_endpoint_key_on_already_running, ensure_background_helper_running_quiet,
     ensure_public_bind_engine_supported, print_managed_launch_plain, resolve_endpoint_auth,
-    run_attached_service, start_managed_service_dropping_orphaned_key_on_failure,
-    validate_bind_host,
+    run_attached_service, start_managed_service, validate_bind_host,
 };
 use crate::{
     cli_progress, collect_serve_notes, detect_gpu_count, device_policy_name, engine_request,
@@ -866,7 +864,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
         let mut spinner =
             cli_progress::Spinner::new(format!("Starting {model} on {selected_engine}…"));
         spinner.tick();
-        let report = start_managed_service_dropping_orphaned_key_on_failure(
+        let report = start_managed_service(
             &paths,
             &selected_engine,
             &service_id,

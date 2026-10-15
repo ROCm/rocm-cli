@@ -331,9 +331,17 @@ enum ManagedPortDecision {
 /// (dead PIDs demote to "stopped" and therefore neither satisfy the duplicate
 /// check nor reserve a port).
 ///
-/// A read failure degrades to "nothing is live": the OS preflight still guards
-/// the port, and refusing to serve because the services directory could not be
-/// listed would be a worse failure than launching.
+/// A read failure degrades to "nothing is live": for an already-`ready`
+/// service the OS preflight still guards its port (the engine holds it), and
+/// refusing to serve because the services directory could not be listed would
+/// be a worse failure than launching. That guard does not cover a `starting`
+/// record: its port is released back to the OS at the end of
+/// [`spawn_managed_engine_child`] (see `lease.release()`) before the new
+/// engine child has actually bound it, so a concurrent launch that hits this
+/// read failure in that narrow window can probe the same port successfully.
+/// Accepted as a known gap — narrower than the general services-dir read
+/// failure case, and only reachable by a second, near-simultaneous I/O
+/// failure on top of one already in flight.
 fn live_managed_services(paths: &AppPaths) -> Vec<ManagedServiceRecord> {
     load_managed_services(paths)
         .unwrap_or_default()
@@ -772,6 +780,14 @@ fn launch_managed_engine_child_locked(
     Ok(child_pid)
 }
 
+/// Drops the endpoint key `serve()` freshly staged for this attempt if the
+/// launch fails before any `ManagedServiceRecord` exists to own it (port
+/// reserved/in use, range exhausted, other bind error) — such a failure
+/// returns before `abandon_failed_managed_launch` ever runs, so nothing else
+/// would clear it. Scoped to the spawn call only, mirroring
+/// [`run_attached_service`]'s identical guard: a later failure (the readiness
+/// wait, `record.write()`) leaves a record a live child actually owns, so it
+/// must not also wipe that key.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_managed_service(
     paths: &AppPaths,
@@ -805,7 +821,10 @@ pub(crate) fn start_managed_service(
         env_id,
         engine_recipe,
         require_api_key,
-    )? {
+    )
+    .inspect_err(|_| {
+        drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
+    })? {
         ManagedSpawn::AlreadyRunning(report) => return Ok(report),
         ManagedSpawn::Spawned { record, child_pid } => (*record, child_pid),
     };
@@ -855,58 +874,6 @@ pub(crate) fn start_managed_service(
         child_pid: Some(child_pid),
         log_path: Some(record.log_path),
         manifest_path: Some(record.manifest_path),
-    })
-}
-
-/// As [`start_managed_service`], but also drops the endpoint key `serve()`
-/// freshly staged for this attempt if the launch fails before any
-/// `ManagedServiceRecord` exists to own it (port reserved/in use, range
-/// exhausted, other bind error) — such a failure returns before
-/// `abandon_failed_managed_launch` ever runs, so nothing else would clear it.
-/// Idempotent with that post-spawn cleanup. This is the real call site
-/// `serve_cmd.rs`'s background launch path uses, so it is what
-/// `failed_port_reservation_leaves_no_orphaned_endpoint_key` drives directly,
-/// mirroring how [`run_attached_service`] is driven directly for the
-/// foreground path.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn start_managed_service_dropping_orphaned_key_on_failure(
-    paths: &AppPaths,
-    engine: &str,
-    service_id: &str,
-    requested_model: &str,
-    resolve: &ResolveModelResponse,
-    host: &str,
-    port_request: serve_port::PortRequest,
-    device_policy: &DevicePolicy,
-    gpu_indices: &[u32],
-    runtime_id: Option<&str>,
-    env_id: Option<&str>,
-    engine_recipe: Option<&EngineRecipeHint>,
-    endpoint_api_key: Option<&str>,
-    launch_lock: rocm_core::FileLock,
-    require_api_key: bool,
-    on_wait_tick: &mut dyn FnMut(Duration),
-) -> Result<ManagedLaunchReport> {
-    start_managed_service(
-        paths,
-        engine,
-        service_id,
-        requested_model,
-        resolve,
-        host,
-        port_request,
-        device_policy,
-        gpu_indices,
-        runtime_id,
-        env_id,
-        engine_recipe,
-        endpoint_api_key,
-        launch_lock,
-        require_api_key,
-        on_wait_tick,
-    )
-    .inspect_err(|_| {
-        drop_orphaned_endpoint_key_on_already_running(paths, service_id, endpoint_api_key);
     })
 }
 
@@ -1790,50 +1757,70 @@ mod tests {
         // `record.engine_pid` — so cleanup must terminate (already-dead) the
         // child, keep the record and log for inspection, mark the record
         // `failed`, and clear only the endpoint key.
-        let (root, paths) = test_paths("managed-spawn-unknown-engine-cleanup");
-        paths.ensure()?;
-        let service_id = "no-such-engine-qwen-4000";
-        endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
+        //
+        // The child always dies near-instantly, but `spawn_managed_engine_child`
+        // only reports that within a fixed startup-check window. On a loaded or
+        // antivirus-scanning Windows CI box, a fresh debug `rocm.exe` can
+        // occasionally be slow enough to start that the window is missed even
+        // though the child is already doomed — so poll by retrying a fresh
+        // attempt (its own service id/port, so no stale manifest collides) up
+        // to a deadline instead of asserting on one race-prone attempt.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut attempt: u16 = 0;
+        let (root, paths, service_id, result) = loop {
+            attempt += 1;
+            let (root, paths) =
+                test_paths(&format!("managed-spawn-unknown-engine-cleanup-{attempt}"));
+            paths.ensure()?;
+            let service_id = format!("no-such-engine-qwen-{}", 4000 + attempt);
+            endpoint_keys::store_endpoint_api_key(&paths, &service_id, "test-key")?;
 
-        let resolve = ResolveModelResponse {
-            canonical_model_id: "qwen-canonical".to_owned(),
-            task: "chat".to_owned(),
-            source: "hf".to_owned(),
-            revision: "main".to_owned(),
-            loader: "llama.cpp".to_owned(),
-            trust_remote_code: false,
-            chat_template_mode: "auto".to_owned(),
-            dtype: "auto".to_owned(),
-            device_policy: DevicePolicy::GpuPreferred,
-            estimated_memory: "unknown".to_owned(),
-            launch_defaults: serde_json::json!({}),
-            engine_recipe: None,
-            warnings: Vec::new(),
+            let resolve = ResolveModelResponse {
+                canonical_model_id: "qwen-canonical".to_owned(),
+                task: "chat".to_owned(),
+                source: "hf".to_owned(),
+                revision: "main".to_owned(),
+                loader: "llama.cpp".to_owned(),
+                trust_remote_code: false,
+                chat_template_mode: "auto".to_owned(),
+                dtype: "auto".to_owned(),
+                device_policy: DevicePolicy::GpuPreferred,
+                estimated_memory: "unknown".to_owned(),
+                launch_defaults: serde_json::json!({}),
+                engine_recipe: None,
+                warnings: Vec::new(),
+            };
+
+            let result = spawn_managed_engine_child(
+                &paths,
+                "no-such-engine",
+                &service_id,
+                "qwen",
+                &resolve,
+                "127.0.0.1",
+                serve_port::PortRequest::Explicit(11_514 + attempt),
+                &resolve.device_policy,
+                &[],
+                None,
+                None,
+                None,
+                false,
+            );
+
+            if result.is_ok() && std::time::Instant::now() < deadline {
+                let _ = fs::remove_dir_all(&root);
+                continue;
+            }
+            break (root, paths, service_id, result);
         };
 
-        let result = spawn_managed_engine_child(
-            &paths,
-            "no-such-engine",
-            service_id,
-            "qwen",
-            &resolve,
-            "127.0.0.1",
-            serve_port::PortRequest::Explicit(11_514),
-            &resolve.device_policy,
-            &[],
-            None,
-            None,
-            None,
-            false,
-        );
-
-        let manifest_path = paths.service_manifest_path(service_id);
-        let log_path = paths.service_log_path(service_id);
+        let manifest_path = paths.service_manifest_path(&service_id);
+        let log_path = paths.service_log_path(&service_id);
         let persisted = load_managed_services(&paths)
             .expect("re-read manifests")
             .into_iter()
             .find(|candidate| candidate.service_id == service_id);
-        let key = endpoint_keys::endpoint_api_key(&paths, service_id);
+        let key = endpoint_keys::endpoint_api_key(&paths, &service_id);
         let live = live_managed_services(&paths);
 
         let Err(error) = result else {
@@ -1873,14 +1860,14 @@ mod tests {
     #[test]
     fn failed_port_reservation_leaves_no_orphaned_endpoint_key() -> Result<()> {
         // serve() stores the new attempt's endpoint key before calling
-        // start_managed_service_dropping_orphaned_key_on_failure. If
-        // spawn_managed_engine_child fails inside resolve_managed_port_in_transaction
-        // (explicit port already reserved by another live service), it returns
-        // before any ManagedServiceRecord exists for this attempt, so
-        // abandon_failed_managed_launch never runs. Driving the real wrapper
-        // function end to end (not a simulated call to
-        // drop_orphaned_endpoint_key_on_already_running) proves serve_cmd.rs's own
-        // call site actually wires the cleanup, mirroring how
+        // start_managed_service. If spawn_managed_engine_child fails inside
+        // resolve_managed_port_in_transaction (explicit port already reserved
+        // by another live service), it returns before any
+        // ManagedServiceRecord exists for this attempt, so
+        // abandon_failed_managed_launch never runs. Driving the real function
+        // end to end (not a simulated call to
+        // drop_orphaned_endpoint_key_on_already_running) proves serve_cmd.rs's
+        // own call site actually wires the cleanup, mirroring how
         // attached_launch_failing_before_spawn_leaves_no_orphaned_endpoint_key
         // drives run_attached_service for the foreground path.
         let (root, paths) = test_paths("orphaned-key-on-reserved-port");
@@ -1923,7 +1910,7 @@ mod tests {
         endpoint_keys::store_endpoint_api_key(&paths, service_id, "test-key")?;
         let launch_lock = rocm_core::FileLock::acquire(paths.managed_launch_lock_path())?;
 
-        let result = start_managed_service_dropping_orphaned_key_on_failure(
+        let result = start_managed_service(
             &paths,
             "lemonade",
             service_id,
