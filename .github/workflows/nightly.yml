@@ -1702,6 +1702,12 @@ jobs:
       - nightly
       - windows-nightly
       - e2e-report-nightly
+      - e2e-gpu-nightly
+      - e2e-gpu-nightly-rad3
+      - e2e-gpu-nightly-mi350p
+      - e2e-gpu-nightly-strix
+      - e2e-gpu-nightly-strix-windows
+      - e2e-wsl-nightly
     if: ${{ !cancelled() }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1724,12 +1730,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p release-readiness
-          since_tag=$(git describe --tags --abbrev=0 --match 'v*')
+          since_tag=$(git describe --tags --abbrev=0 --match 'v*' --exclude 'v*-*')
           cargo xtask release-readiness \
             --since-tag "$since_tag" \
             --e2e-report consolidated/support-matrix.md \
             --nightly-result "${{ needs.nightly.result }}" \
             --windows-result "${{ needs.windows-nightly.result }}" \
+            --e2e-lane-result "MI300X=${{ needs.e2e-gpu-nightly.result }}" \
+            --e2e-lane-result "RAD3=${{ needs.e2e-gpu-nightly-rad3.result }}" \
+            --e2e-lane-result "MI350P=${{ needs.e2e-gpu-nightly-mi350p.result }}" \
+            --e2e-lane-result "Strix-Halo=${{ needs.e2e-gpu-nightly-strix.result }}" \
+            --e2e-lane-result "Strix-Halo-Windows=${{ needs.e2e-gpu-nightly-strix-windows.result }}" \
+            --e2e-lane-result "WSL=${{ needs.e2e-wsl-nightly.result }}" \
             --out release-readiness/facts.json \
             --table-out release-readiness/table.md
           cat release-readiness/table.md >> "$GITHUB_STEP_SUMMARY"
@@ -1797,6 +1809,10 @@ jobs:
 
       - name: Draft narrative
         id: draft
+        # `actions/ai-inference` tags its releases as bare majors (`v3`, not
+        # `v3.0.0`); this SHA is exactly what `v3` points to and predates the
+        # repo's current `main`, so it's a frozen release like any other
+        # pin here, not a moving `vX` alias.
         uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
@@ -1884,7 +1900,10 @@ jobs:
             if [ -f release-readiness/narrative.md ]; then
               echo "## Narrative"
               echo
-              cat release-readiness/narrative.md
+              # The narrative is LLM-drafted from untrusted issue/commit text;
+              # strip markdown links/images so it can't smuggle a redirect or
+              # tracking pixel onto the public wiki page.
+              sed -E 's/!?\[([^]]*)\]\([^)]*\)/\1/g' release-readiness/narrative.md
             else
               echo "_Narrative generation did not complete this run; see the mechanical table above._"
             fi
