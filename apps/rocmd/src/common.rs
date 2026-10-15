@@ -63,14 +63,18 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
             return CodexBridgeGpuSnapshot {
                 // `{error:#}` rather than `to_string()`: the outermost context
                 // alone says "failed to launch amd-smi ...", which names the
-                // wrong thing when what actually happened was a timeout. (Only
-                // the timeout: the non-zero-exit and parse failures below are
-                // their own outermost context and already read correctly.) The
-                // note is the only account of this that reaches the bridge
-                // snapshot and the automation watcher, so it carries the causes
-                // too -- bounded, because it is persisted; see
-                // `run_with_timeout`'s `MAX_QUOTED_OUTPUT_CHARS`. Pinned by
-                // `examine-25`.
+                // wrong thing when what actually happened was a timeout. Two of
+                // the failures below gain their causes this way, both of them
+                // raised inside `run_with_timeout`: the timeout, and the
+                // failure to spawn -- on a host with no amd-smi at all, which
+                // is every no-GPU host, the note now ends ": failed to spawn
+                // process: No such file or directory (os error 2)". (The
+                // non-zero-exit and parse failures below are their own
+                // outermost context and already read correctly.) The note is
+                // the only account of this that reaches the bridge snapshot and
+                // the automation watcher, so it carries the causes too --
+                // bounded, because it is persisted; see `run_with_timeout`'s
+                // `MAX_QUOTED_OUTPUT_CHARS`. Pinned by `examine-25`.
                 amd_smi_available: false,
                 static_snapshot: None,
                 monitor_snapshot: None,
@@ -85,7 +89,10 @@ pub(crate) fn gather_gpu_snapshot() -> CodexBridgeGpuSnapshot {
         Ok(value) => Some(value),
         Err(error) => {
             return CodexBridgeGpuSnapshot {
-                // Same reasoning as the `static` probe above.
+                // Same reasoning as the `static` probe above, but a different
+                // test: examine-25's stalled `static` probe returns before this
+                // branch is ever reached, so reverting this `{error:#}` is
+                // caught by `examine-26` alone. Pinned by `examine-26`.
                 amd_smi_available: true,
                 static_snapshot,
                 monitor_snapshot: None,

@@ -623,8 +623,15 @@ const DRAIN_GRACE: Duration = Duration::from_millis(200);
 /// How much of a timed-out child's own output the timeout error quotes.
 ///
 /// Bounded here rather than at any one caller because the quote is assembled
-/// here, and this is the only place that knows those characters are raw child
-/// output rather than something this crate wrote. All four callers inherit it.
+/// here: the timeout message is this function's own text, and a caller sees it
+/// only as an opaque error, so this is the only place that can still tell which
+/// of its characters came from the child. All four callers inherit it.
+///
+/// It bounds this message and nothing else. A caller that quotes the `Output`
+/// handed back to it is quoting raw child output of its own, unbounded and
+/// persisted the same way -- `capture_amd_smi_json`'s non-zero-exit `bail!` and
+/// the daemon's `parse_sandbox_child_output` both do. Those predate this
+/// constant and are #623's, not its.
 ///
 /// The bound matters because the message does not stop at a terminal. `rocmd`
 /// renders the whole error chain into the bridge snapshot's `note`, and the
@@ -651,10 +658,16 @@ const MAX_QUOTED_OUTPUT_CHARS: usize = 2000;
 /// buffer nobody will read again cannot grow without bound in a daemon that
 /// probes every 60 seconds.
 ///
+/// What that bounds is the memory, and only the memory. The *number* of these
+/// threads is not bounded here: each abandoned capture leaves one parked in
+/// `read` until the grandchild lets go, so every probe that meets one costs two
+/// until it does. The trade is deliberate — a parked reader holds a stack and
+/// no CPU, and the alternative is the one below.
+///
 /// Discarding rather than closing the read end is deliberate. Dropping the pipe
 /// would send the still-writing grandchild `EPIPE`/`SIGPIPE`, which for the
 /// background helpers a sandboxed installer legitimately leaves behind would
-/// turn a leak we can bound into a behaviour change we cannot predict.
+/// turn a leak whose cost we know into a behaviour change we cannot predict.
 #[derive(Clone)]
 struct Capture {
     buffer: Arc<Mutex<Vec<u8>>>,
@@ -816,7 +829,10 @@ impl Capture {
 /// The stdio configuration is this function's own: it sets null stdin and piped
 /// stdout/stderr on `command`, overriding whatever the caller set, because
 /// capturing both streams is the whole contract. Callers need not — and should
-/// not — set them.
+/// not — set them. The stdin half is a promise in its own right rather than
+/// housekeeping: a child that reads from an inherited stdin waits for input
+/// that is never coming, so it is the deadline that ends it. Pinned by
+/// `a_child_that_reads_stdin_is_given_an_empty_one`, on both platforms.
 ///
 /// `label` names the subject in error messages (e.g. `"process"`,
 /// `"sandbox process"`).
@@ -1123,6 +1139,66 @@ mod tests {
         // and skipping it there left the second pipe — the one whose separate
         // reader this function exists to provide — unchecked on that platform.
         assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "oops");
+    }
+
+    /// What a stdin-reading fixture prints when its read reaches EOF.
+    const STDIN_EOF_MARKER: &str = "eof";
+
+    /// The assertions shared by both platforms' empty-stdin cases.
+    ///
+    /// `command` must run a child that reads one line from stdin and prints
+    /// [`STDIN_EOF_MARKER`] if that read reaches EOF instead.
+    ///
+    /// The stdin set on `command` here is the read end of a pipe whose write end
+    /// this function holds open across the whole call, so it never reaches EOF
+    /// of its own accord. That is what makes the assertion two-sided rather than
+    /// a tautology: were `run_with_timeout` to stop setting null stdin, the
+    /// child would sit in `read` until the deadline killed it — exactly how a
+    /// child that prompts behaves against an inherited terminal — and the call
+    /// would come back as a timeout rather than with the marker.
+    ///
+    /// Setting stdin on the caller's side is also the contract under test: this
+    /// function's own stdio overrides whatever the caller set, which is what
+    /// lets all three callers hand over a bare `Command` and say nothing about
+    /// stdin at all.
+    fn assert_the_child_is_given_an_empty_stdin(mut command: Command) {
+        let (stdin_reader, stdin_writer) =
+            std::io::pipe().expect("failed to create a pipe for the child's stdin");
+        command.stdin(Stdio::from(stdin_reader));
+
+        let started = Instant::now();
+        let output = run_with_timeout(command, Duration::from_secs(5), "process").expect(
+            "a child given an empty stdin must read EOF rather than block until the deadline",
+        );
+        let elapsed = started.elapsed();
+        // Dropped only here: releasing the write end any earlier would close the
+        // pipe, so the child would reach EOF through the caller's stdin and the
+        // test would pass whatever this function set.
+        drop(stdin_writer);
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            STDIN_EOF_MARKER,
+            "the child must be given an empty stdin rather than the one the caller set"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the read must hit EOF at once rather than waiting out the deadline, but the call \
+             took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_reads_stdin_is_given_an_empty_one() {
+        // `read` reports EOF by returning non-zero, so the `||` branch is the
+        // one an empty stdin takes. A stdin left open takes neither.
+        let script = format!("read line || echo {STDIN_EOF_MARKER}");
+        let mut command = Command::new("sh");
+        command.args(["-c", script.as_str()]);
+
+        assert_the_child_is_given_an_empty_stdin(command);
     }
 
     #[cfg(unix)]
@@ -1800,28 +1876,38 @@ mod tests {
 
     #[cfg(windows)]
     impl WindowsFixture {
-        /// Write `script` as a batch file next to a `FLOOD_BYTES` payload.
+        /// Write `script` as a batch file in a scratch directory of its own.
         ///
         /// A batch file rather than `cmd /C "<command line>"`: cmd's rules for
         /// stripping the quotes Rust adds around an argument containing spaces
         /// and redirections are subtle enough that the fixture would become the
         /// thing under test. A bare path has none of that, and `%~dp0` inside
-        /// the script resolves the payload without the test passing a path in.
-        fn new(name: &str, script: &str) -> Self {
+        /// the script resolves anything beside it without the test passing a
+        /// path in.
+        fn script(name: &str, script: &str) -> Self {
             let dir = std::env::temp_dir()
                 .join(format!("rocm-cli-process-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("failed to create the fixture directory");
+            std::fs::write(dir.join("fixture.bat"), script).expect("failed to write the script");
+
+            Self { dir }
+        }
+
+        /// A [`Self::script`] fixture with a `FLOOD_BYTES` payload beside it for
+        /// the script to print.
+        fn flooding(name: &str, script: &str) -> Self {
+            let fixture = Self::script(name, script);
 
             let line = format!("{FLOOD_CANARY}\r\n");
             let mut payload = String::with_capacity(FLOOD_BYTES + line.len());
             while payload.len() < FLOOD_BYTES {
                 payload.push_str(&line);
             }
-            std::fs::write(dir.join("payload.txt"), payload).expect("failed to write the payload");
-            std::fs::write(dir.join("fixture.bat"), script).expect("failed to write the script");
+            std::fs::write(fixture.dir.join("payload.txt"), payload)
+                .expect("failed to write the payload");
 
-            Self { dir }
+            fixture
         }
 
         fn command(&self) -> Command {
@@ -1847,7 +1933,7 @@ mod tests {
         // drains stdout to completion before starting on stderr, never lets
         // this child finish. `type` twice is the shell-free equivalent of the
         // unix `yes | head`; cmd has no `yes`.
-        let fixture = WindowsFixture::new(
+        let fixture = WindowsFixture::flooding(
             "flood",
             "@echo off\r\ntype \"%~dp0payload.txt\"\r\ntype \"%~dp0payload.txt\" 1>&2\r\n",
         );
@@ -1879,7 +1965,7 @@ mod tests {
         // and no EOF arrives — an implementation that joins its readers waits
         // the full 29 seconds; and the preceding flood makes the resulting
         // quote large enough for the bound to matter.
-        let fixture = WindowsFixture::new(
+        let fixture = WindowsFixture::flooding(
             "timeout",
             "@echo off\r\ntype \"%~dp0payload.txt\" 1>&2\r\nping -n 30 127.0.0.1\r\n",
         );
@@ -1895,5 +1981,25 @@ mod tests {
             "the call must return at its deadline rather than waiting for an abandoned \
              grandchild to exit, but it took {elapsed:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_child_that_reads_stdin_is_given_an_empty_one() {
+        // `set /p` leaves the variable untouched when its read reaches EOF, so
+        // pre-setting it to the marker is cmd's equivalent of the unix
+        // `read || echo`. A stdin left open blocks in `set /p` instead.
+        //
+        // Both callers in `apps/rocmd/src/common.rs` run on Windows, and
+        // `run_with_timeout` has no `cfg(windows)` branch, so this covers the
+        // same promise with the same two-sidedness as the unix case.
+        let fixture = WindowsFixture::script(
+            "stdin",
+            &format!(
+                "@echo off\r\nset \"LINE={STDIN_EOF_MARKER}\"\r\nset /p LINE=\r\necho %LINE%\r\n"
+            ),
+        );
+
+        assert_the_child_is_given_an_empty_stdin(fixture.command());
     }
 }
