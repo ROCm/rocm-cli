@@ -943,6 +943,10 @@ fn install_hint_for(text: &str, build: InstallPlanBuilder, manual: &str) -> Inst
 
 /// [`install_hint_for`], naming `path` instead of always `/etc/os-release` in
 /// an unreadable-line message.
+///
+/// Off Linux this has no non-test caller either — [`install_hint_for_read`],
+/// its only production caller, is itself dead there for the same reason.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn install_hint_for_at(
     path: &str,
     text: &str,
