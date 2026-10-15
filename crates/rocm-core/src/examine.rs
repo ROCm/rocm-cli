@@ -5619,6 +5619,93 @@ mod tests {
         assert_eq!(e.gpus[0].gfx_target, "gfx1151", "{:?}", e.gpus[0]);
     }
 
+    /// Every target `host_gpu`'s PNP table can return has to be classified by
+    /// `gfx_is_apu_family`, because the Windows GPU probe composes the two.
+    ///
+    /// The per-device tests above each pin one row of that table. This pins the
+    /// *invariant* between the two tables, which is what actually broke: adding
+    /// a PCI id without teaching `gfx_is_apu_family` about its target silently
+    /// gives the part the fallthrough answer — `false`, "discrete" — with no
+    /// test anywhere disagreeing. That is exactly how gfx1033 / gfx1035 /
+    /// gfx1036 came to be labelled "RDNA2 APUs" by one table and discrete by
+    /// the other.
+    #[test]
+    fn pnp_device_id_table_agrees_about_apus() {
+        for (pnp, gfx, integrated) in [
+            // Vega iGPUs: Renoir, Lucienne, Cezanne, Barcelo.
+            ("PCI\\VEN_1002&DEV_1636&SUBSYS_08A71028", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_164C&SUBSYS_380D103C", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_1638&SUBSYS_0A2E1025", "gfx90c", true),
+            ("PCI\\VEN_1002&DEV_15E7&SUBSYS_8A431043", "gfx90c", true),
+            // RDNA2 iGPUs: Van Gogh, Rembrandt / Yellow Carp, Raphael.
+            ("PCI\\VEN_1002&DEV_163F&SUBSYS_11111111", "gfx1033", true),
+            ("PCI\\VEN_1002&DEV_164D&SUBSYS_22222222", "gfx1035", true),
+            ("PCI\\VEN_1002&DEV_1681&SUBSYS_33333333", "gfx1035", true),
+            ("PCI\\VEN_1002&DEV_164E&SUBSYS_44444444", "gfx1036", true),
+            // RDNA3 / RDNA3.5 iGPUs: Phoenix and Strix.
+            ("PCI\\VEN_1002&DEV_15BF&SUBSYS_55555555", "gfx1103", true),
+            ("PCI\\VEN_1002&DEV_1114&SUBSYS_66666666", "gfx1152", true),
+            // Discrete cards through the same door, so a blanket `true` fails
+            // here too: Navi 21 / 22 / 23 / 24 and Navi 48.
+            ("PCI\\VEN_1002&DEV_73A0&SUBSYS_77777777", "gfx1030", false),
+            ("PCI\\VEN_1002&DEV_73C0&SUBSYS_88888888", "gfx1031", false),
+            ("PCI\\VEN_1002&DEV_73E0&SUBSYS_99999999", "gfx1032", false),
+            ("PCI\\VEN_1002&DEV_743F&SUBSYS_AAAAAAAA", "gfx1034", false),
+            ("PCI\\VEN_1002&DEV_7550&SUBSYS_2435148C", "gfx1201", false),
+        ] {
+            assert_eq!(
+                crate::host_gpu::gfx_target_from_pnp_device_id(pnp),
+                Some(gfx),
+                "{pnp}: the PCI-id table moved under this test"
+            );
+            assert_eq!(
+                gfx_is_apu_family(gfx),
+                integrated,
+                "{pnp} -> {gfx}: the two tables disagree about whether this \
+                 part is integrated"
+            );
+        }
+    }
+
+    /// The consequence the misclassification actually had, asserted where it
+    /// lands rather than one step upstream of it.
+    ///
+    /// `fix-9-igpu-dgpu` is gated on `has_apu && has_discrete_amd`
+    /// (`check_9_igpu_dgpu_collision`), and both are derived from `is_apu` by
+    /// `summarise_gpu_categories`. A Rembrandt iGPU reported as discrete does
+    /// not merely carry a wrong field: it turns the gate off on the one host
+    /// shape the check exists for. Note the dGPU's marketing name carries no
+    /// APU keyword either way, so nothing here rests on `APU_KEYWORDS`.
+    #[test]
+    fn a_rembrandt_laptop_with_a_discrete_card_opens_the_igpu_dgpu_gate() {
+        let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\n\
+                   AMD Radeon RX 6600M\t31.0.21012.9\tPCI\\VEN_1002&DEV_73E0&SUBSYS_14F11002&REV_C7";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 2, "{:?}", e.gpus);
+        assert_eq!(e.gpus[0].is_apu, Some(true), "{:?}", e.gpus[0]);
+        assert_eq!(e.gpus[1].is_apu, Some(false), "{:?}", e.gpus[1]);
+        summarise_gpu_categories(&mut e);
+        assert!(
+            e.has_apu && e.has_discrete_amd,
+            "both gate fix-9-igpu-dgpu: has_apu={}, has_discrete_amd={}",
+            e.has_apu,
+            e.has_discrete_amd
+        );
+    }
+
+    /// A gcnArchName feature suffix or upper-casing must not change a gfx103x
+    /// verdict, the same way the gfx110x and gfx90c arms already guarantee.
+    #[test]
+    fn gfx103x_verdict_survives_case_and_a_feature_suffix() {
+        assert!(gfx_is_apu_family("GFX1035"));
+        assert!(gfx_is_apu_family("gfx1035:xnack-"));
+        assert!(!gfx_is_apu_family("GFX1034"));
+        assert!(!gfx_is_apu_family("gfx1032:xnack-"));
+        // Degenerate input never matches: no model digit, no verdict.
+        assert!(!gfx_is_apu_family("gfx103"));
+    }
+
     #[test]
     fn apu_plus_discrete_neighbor_sets_both_category_flags() {
         // A machine with a real APU (gfx1103 Phoenix) and its discrete RDNA3
