@@ -1281,8 +1281,35 @@ that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
 
+The eight native Linux GPU preflights are one script,
+[`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
+with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
+Strix). It applies two gates, because neither sees what the other does: a
+bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
+memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
+so its sensitivity is set by the pool's size rather than by what a serve holds —
+against a ~62 GiB Strix GTT aperture it trips only past ~54 GiB held, and
+against a 192 GiB MI300X only past ~176 GiB, so a leftover `llama-server`
+holding 10–20 GiB clears every lane. The process assertion catches that by
+name. Every external call the script makes is bounded by `timeout 15`, the
+`--assert-clear` scan included: that scan reads `/proc/<pid>/cmdline` for every
+process, and a holder wedged in uninterruptible sleep — the state this gate
+fires on — can block the read. A scan that does not finish **fails** the
+preflight, with its own message, rather than being taken as a clear host; so
+does a scan that could not be run at all — a missing script, a flag the two
+scripts disagree about — which gets a third message rather than being reported
+as a surviving process nobody can then find. The
+floor is kept rather than replaced because the converse is just as
+real and the process check cannot see it: a non-E2E tenant on a shared host can
+exhaust the pool while running nothing the reclaim rules match. The two
+Windows-native blocks remain PowerShell copies with the memory floor only; the
+two WSL blocks remain advisory, warning where these fail.
+
 `reclaim-gpu.sh` frees the GPU from engine processes a killed prior run leaked.
-The self-hosted Linux GPU lanes run it before their GPU preflight; the two
+The self-hosted Linux GPU lanes run it before their GPU preflight, and again
+with `--assert-clear` from inside the preflight once the memory floor is
+satisfied — that mode kills nothing, exits non-zero naming any leaked process
+still running, and reuses the same selection the reclaim itself acts on. The two
 native Windows lanes have no bash and restate the rule in PowerShell instead,
 with their root list pinned to the script's by an `xtask` contract test. The
 WSL lanes skip the proactive reclaim before preflight — they provision a fresh
