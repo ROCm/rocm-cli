@@ -1093,26 +1093,40 @@ fn check_7_stale_repos(e: &Examination, symptom: &str) -> Diagnosis {
     if score <= 0 {
         return zero("fix-7-stale-repos", "Stale ROCm repos");
     }
-    let mut commands =
-        vec!["ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned()];
+    let family = repo_pkg_family(e);
+    let list_cmd = match family {
+        "dnf" => "ls /etc/yum.repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
+        "zypper" => "ls /etc/zypp/repos.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
+        _ => "ls /etc/apt/sources.list.d/ | grep -iE 'rocm|amdgpu|radeon' || true".to_owned(),
+    };
+    let mut commands = vec![list_cmd];
     for r in repos {
         commands.push(format!(
             "# sudo mv {r} {r}.bak     # quarantine, do not delete yet"
         ));
     }
-    commands.push("sudo apt update".to_owned());
+    match family {
+        "dnf" => commands.push("sudo dnf clean all".to_owned()),
+        "zypper" => commands.push("sudo zypper refresh".to_owned()),
+        _ => commands.push("sudo apt update".to_owned()),
+    }
     commands.push(
-        "# If apt now resolves, reinstall the driver only (review the plan, then approve):"
+        "# If the package manager now resolves, reinstall the driver only (review the plan, then approve):"
             .to_owned(),
     );
     commands.push("#   rocm install driver --dkms   # review the plan".to_owned());
     commands.push("#   rocm install driver --dkms --yes   # reinstalls the driver only".to_owned());
+    let verify = match family {
+        "dnf" => "sudo dnf clean all 2>&1 | tail -n 20".to_owned(),
+        "zypper" => "sudo zypper refresh 2>&1 | tail -n 20".to_owned(),
+        _ => "sudo apt update 2>&1 | tail -n 20".to_owned(),
+    };
     let fix = Fix {
-        summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve apt before re-running any installer.".to_owned(),
+        summary: "Quarantine duplicate ROCm/AMDGPU repo files and resolve the package manager before re-running any installer.".to_owned(),
         commands,
         needs_sudo: true,
         fix_id: "fix-7-stale-repos".to_owned(),
-        verify: "sudo apt update 2>&1 | tail -n 20".to_owned(),
+        verify,
         ..Fix::default()
     };
     finalize(
@@ -1414,9 +1428,8 @@ fn check_11_iommu_hang(e: &Examination, symptom: &str) -> Diagnosis {
 /// resolver `openmpi` uses only when no repo file was found -- restricted to
 /// apt/dnf/zypper, the only families this check has remediation for: a
 /// pacman host (which `openmpi`'s resolver can return, for its own,
-/// unrelated library installers) falls back to `"apt"` like any other
-/// unrecognized family, rather than the remediation commands mismatching a
-/// real "pacman" answer.
+/// unrelated library installers) falls back to `"unknown"`, rather than the
+/// remediation commands mismatching a real "pacman" answer.
 fn repo_pkg_family(e: &Examination) -> &'static str {
     if e.rocm_repos_seen.iter().any(|r| r.contains("/etc/apt/")) {
         return "apt";
@@ -6138,6 +6151,35 @@ mod tests {
         let mut e = linux_base();
         e.distro_id = "arch".to_owned();
         assert_eq!(repo_pkg_family(&e), "unknown");
+    }
+
+    #[test]
+    fn stale_repos_on_a_sles_host_gets_zypper_commands_not_apt() {
+        // A SLES host whose repo files now live under /etc/zypp/repos.d/ (the
+        // new zypp scan this diff adds) must not be told to run apt/dpkg
+        // commands: `check_7` must branch on `repo_pkg_family` the same way
+        // `check_12` already does.
+        let mut e = linux_base();
+        e.distro_id = "sles".to_owned();
+        e.rocm_repos_seen = vec![
+            "/etc/zypp/repos.d/amdgpu.repo".to_owned(),
+            "/etc/zypp/repos.d/rocm.repo".to_owned(),
+        ];
+        let report = diagnose(&e, "stale repo conflict");
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-7-stale-repos")
+            .expect("duplicate repo files should be diagnosed");
+        let commands = hit.fix.as_ref().unwrap().commands.join("\n");
+        assert!(
+            commands.contains("/etc/zypp/repos.d/") && commands.contains("sudo zypper refresh"),
+            "a SLES host must get zypper remediation: {commands}"
+        );
+        assert!(
+            !commands.contains("apt") && !commands.contains("dpkg"),
+            "a SLES host must not be told to run apt/dpkg commands: {commands}"
+        );
     }
 
     #[test]

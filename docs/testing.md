@@ -1589,6 +1589,26 @@ rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
 
+## Bare-metal driver install
+
+On Linux bare metal, `rocm install driver` defaults to the floating `latest`
+amdgpu release; `ROCM_CLI_AMDGPU_DRIVER_VERSION` overrides it (replacing the
+retired `ROCM_CLI_AMDGPU_VERSION`/`ROCM_CLI_AMDGPU_PACKAGE_RELEASE` pair). An
+override that isn't a plain version token is refused rather than silently
+falling back, since it is interpolated into privileged shell commands:
+
+```bash
+cargo test -p rocm --bin rocm driver_install
+```
+
+`driver-install-04` in
+[driver_install.feature](../tests/e2e-cucumber/features/driver_install.feature)
+asserts the apt repo file and signing key this plan writes on a real bare-metal
+Linux host. `examine --json`'s `rocm_install_method` also renamed
+`amdgpu-install` to `repo-native` and `tarball-or-other` to
+`runfile-or-tarball`; see `examine-24` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature).
+
 ## /etc/os-release
 
 Every Rust reader of `/etc/os-release` parses it with

@@ -3288,9 +3288,36 @@ mod tests {
         // `crate::diagnose` builds its own apt command list for fix-12 rather
         // than reusing this recipe (it branches per detected package-manager
         // family, which this catalog entry cannot do -- it prints guidance for
-        // every family at once). Pin the three apt lines here so the two
-        // copies cannot drift the way they did before: diagnose.rs ran them as
-        // separate commands while this recipe chained them with `&&`.
+        // every family at once). Drive `diagnose()` itself so a drift between
+        // the two copies actually fails this test, rather than comparing
+        // against a hardcoded literal that can't detect diagnose.rs changing
+        // out from under it.
+        let e = crate::examine::Examination {
+            os_family: "linux".to_owned(),
+            distro_id: "ubuntu".to_owned(),
+            rocm_install_method: "repo-native".to_owned(),
+            ..crate::examine::Examination::default()
+        };
+        let report = crate::diagnose::diagnose(
+            &e,
+            "dpkg: error processing package amdgpu-dkms (half-configured)",
+        );
+        let hit = report
+            .matched
+            .iter()
+            .find(|d| d.id == "fix-12-installer")
+            .expect("repo-native broken state should be diagnosed");
+        let diagnose_apt_commands: Vec<&str> = hit
+            .fix
+            .as_ref()
+            .unwrap()
+            .commands
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !c.trim_start().starts_with('#'))
+            .take(3)
+            .collect();
+
         let recipe = RECIPES
             .iter()
             .find(|r| r.fix_id == "fix-12-installer")
@@ -3303,13 +3330,8 @@ mod tests {
             .take(3)
             .collect();
         assert_eq!(
-            apt_commands_without_trailing_comment,
-            vec![
-                "sudo dpkg --configure -a",
-                "sudo apt-get install -f",
-                "sudo apt-get purge -y amdgpu-dkms",
-            ],
-            "diagnose.rs's apt family emits these three commands in this order for fix-12-installer"
+            apt_commands_without_trailing_comment, diagnose_apt_commands,
+            "this recipe's apt lines must match what diagnose.rs's apt family actually emits for fix-12-installer"
         );
     }
 }

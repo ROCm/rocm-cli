@@ -29,3 +29,17 @@ Feature: Driver installation planning
   Scenario: driver-install-03 - Installing a ROCDXG release with no known digest is refused
     When the user previews driver installation for a ROCDXG release with no known digest
     Then the driver plan refuses rather than installing an unverified package
+
+  # Every bare-metal Linux lane in this repo (the GitHub-hosted mock job and
+  # every self-hosted GPU lane) runs Ubuntu, so this is always the apt plan in
+  # practice -- not the dnf or zypper arms, which have no CI host to run on.
+  # `--dry-run` previews the plan without writing anything, so this is safe on
+  # a shared CI host: it asserts on the real `apt_driver_plan` command text
+  # this binary would use to write /etc/apt/sources.list.d/amdgpu.list and
+  # import AMD's signing key, the same commands the unit fixtures in
+  # `driver_install.rs` exercise with a hand-written os-release rather than a
+  # real one.
+  @id:driver-install-apt-repo-file-and-key-content @requires-os:linux @requires-bare-metal
+  Scenario: driver-install-04 - Previewing the driver install on a real apt host plans the repo file and signing key
+    When the user previews driver installation on this host
+    Then the driver plan writes an apt repo file with AMD's signing key

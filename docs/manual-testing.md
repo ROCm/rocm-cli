@@ -231,6 +231,19 @@ On Windows, a hybrid laptop with both the Vega iGPU and a discrete card must
 still report the discrete card from `rocm examine`; the iGPU is listed first by
 WMI and must not hide it.
 
+## 2b. Bare-Metal Driver Install
+
+On a real apt/dnf/zypper Linux host:
+
+```bash
+rocm install driver --dry-run
+```
+
+Expected result: the plan names the floating `latest` amdgpu release unless
+`ROCM_CLI_AMDGPU_DRIVER_VERSION` is set, in which case it names that version
+instead. A malformed override (e.g. containing a space or `'`) is refused with
+a reason naming `ROCM_CLI_AMDGPU_DRIVER_VERSION`, not silently ignored.
+
 ## 3. Lemonade GPU Verification
 
 Lemonade is the default local assistant/server engine. Serve a small assistant

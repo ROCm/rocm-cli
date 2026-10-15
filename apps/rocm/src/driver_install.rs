@@ -2596,6 +2596,30 @@ VERSION_CODENAME='; touch /tmp/pwned; echo '
     }
 
     #[test]
+    fn driver_plan_falls_back_on_a_malformed_version_id() {
+        let _env = ScopedTestEnv::with_amd_overrides_cleared();
+        let os_release = r#"
+ID=ubuntu
+VERSION_ID="24.04'; touch /tmp/pwned; echo '"
+VERSION_CODENAME=noble
+"#;
+        let plan = build_driver_install_plan(
+            &test_examine("linux", false),
+            os_release,
+            true,
+            PrivilegeEscalation::Sudo,
+        );
+
+        assert_eq!(plan.version_id, "");
+        assert!(!plan.supported);
+        assert!(
+            plan.commands
+                .iter()
+                .all(|command| !command.command.contains("pwned"))
+        );
+    }
+
+    #[test]
     fn driver_reconcile_without_state_gives_non_privileged_guidance() -> Result<()> {
         let (root, paths) = test_paths("driver-reconcile-empty");
 
