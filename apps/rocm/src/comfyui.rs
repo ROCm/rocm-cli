@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT
 
 use crate::cli_progress::AnimatedSpinner;
-use crate::{format_structured_tool_call, runtime_usability_status, therock};
+use crate::runtimes_cmd::runtime_usability_status;
+use crate::{format_structured_tool_call, therock};
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use rocm_core::browser::{Opener, SystemOpener};
@@ -23,6 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime};
+
+mod source_swap;
 
 const APP_ID: &str = "comfyui";
 const APP_NAME: &str = "ComfyUI";
@@ -133,11 +136,88 @@ pub(crate) const fn default_port() -> u16 {
     COMFYUI_DEFAULT_PORT
 }
 
+/// The facts the chat's ComfyUI status answer is built from, read the way
+/// [`render_status`] reads them rather than scraped from its text.
+struct StatusSummary {
+    installed: bool,
+    /// The URL of a ComfyUI that answers, whether or not rocm-cli started it.
+    running_url: Option<String>,
+    starting: bool,
+    /// What `status` and `start` say about a reinstall that stopped part-way.
+    interrupted_reinstall: Option<String>,
+}
+
+fn status_summary(paths: &AppPaths) -> Result<StatusSummary> {
+    let manifest = load_manifest(paths)?;
+    let interrupted_reinstall = manifest
+        .as_ref()
+        .filter(|manifest| source_swap::swap_interrupted(&manifest.source_path))
+        .map(|manifest| interrupted_reinstall_advice(&manifest.runtime_key));
+    let (running_url, starting) = match load_state(paths)? {
+        Some(state) => match evaluate_running_state(&state).state {
+            ComfyUiRunState::Running => (Some(state.url), false),
+            ComfyUiRunState::Starting => (None, true),
+            ComfyUiRunState::Stopped => (None, false),
+        },
+        None => (default_unmanaged_running_url(), false),
+    };
+    Ok(StatusSummary {
+        installed: manifest.is_some(),
+        running_url,
+        starting,
+        interrupted_reinstall,
+    })
+}
+
+/// The chat's answer to "what is ComfyUI's status". It advises `start` only
+/// when nothing is running or starting and `start` would not refuse; it passes
+/// on the interrupted-reinstall note, which names the command to run instead.
+pub(crate) fn render_chat_status_answer(paths: &AppPaths) -> Result<String> {
+    let summary = status_summary(paths)?;
+    let mut output = String::new();
+    writeln!(output, "ComfyUI status")?;
+    writeln!(output)?;
+    if summary.installed {
+        writeln!(output, "ComfyUI: installed")?;
+    } else {
+        writeln!(output, "ComfyUI: not installed yet")?;
+    }
+    if let Some(url) = &summary.running_url {
+        writeln!(output, "Running: yes")?;
+        writeln!(output, "URL: {url}")?;
+    } else if summary.starting {
+        writeln!(output, "Running: starting")?;
+    } else {
+        writeln!(output, "Running: no")?;
+    }
+    if let Some(note) = &summary.interrupted_reinstall {
+        writeln!(output, "Note: {note}.")?;
+    }
+    if !summary.installed {
+        writeln!(
+            output,
+            "To install it, ask `can you setup ComfyUI for me` or run `rocm comfyui install`."
+        )?;
+    } else if summary.running_url.is_none()
+        && !summary.starting
+        && summary.interrupted_reinstall.is_none()
+    {
+        writeln!(
+            output,
+            "To open it, ask `can you start ComfyUI` or run `rocm comfyui start`."
+        )?;
+    }
+    writeln!(output)?;
+    writeln!(output, "Nothing was changed.")?;
+    Ok(output)
+}
+
 pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<String> {
     let mut output = String::new();
     writeln!(output, "{APP_NAME}")?;
     writeln!(output)?;
 
+    let mut interrupted = false;
     if let Some(manifest) = load_manifest(paths)? {
         writeln!(output, "  installed: yes")?;
         writeln!(
@@ -160,6 +240,14 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
                 "failed"
             }
         )?;
+        if source_swap::swap_interrupted(&manifest.source_path) {
+            interrupted = true;
+            writeln!(
+                output,
+                "  note: {}",
+                interrupted_reinstall_advice(&manifest.runtime_key)
+            )?;
+        }
     } else {
         writeln!(output, "  installed: no")?;
         writeln!(output, "  next step: rocm comfyui install")?;
@@ -180,9 +268,12 @@ pub(crate) fn render_status(paths: &AppPaths, config: &RocmCliConfig) -> Result<
             ComfyUiRunState::Starting => {
                 writeln!(output, "  note: starting")?;
             }
-            ComfyUiRunState::Stopped => {
+            // `start` refuses an interrupted reinstall; the note above names
+            // the command to run first.
+            ComfyUiRunState::Stopped if !interrupted => {
                 writeln!(output, "  next step: rocm comfyui start")?;
             }
+            ComfyUiRunState::Stopped => {}
         }
     } else {
         writeln!(output)?;
@@ -303,23 +394,110 @@ pub(crate) fn install(
     writeln!(output, "  folder: {}", source_path.display())?;
     writeln!(output, "  models path: {}", models_folder.display())?;
 
+    // A reinstall that was interrupted part-way through replacing the code is
+    // finished by the next install, with or without `--reinstall`, rather than
+    // left as a half-replaced tree that would be reused as it is.
+    let finishes_interrupted = source_swap::swap_interrupted(&source_path);
+    let replaces_existing = source_path.exists() && (options.reinstall || finishes_interrupted);
     if options.dry_run {
         writeln!(output, "  mode: dry-run")?;
+        if replaces_existing {
+            if finishes_interrupted {
+                writeln!(
+                    output,
+                    "  note: a previous reinstall was interrupted; installing finishes it"
+                )?;
+            }
+            writeln!(
+                output,
+                "  reinstall: replaces the ComfyUI code in {}",
+                source_path.display()
+            )?;
+            // The real run checks the same thing and refuses.
+            let mut warnings = Vec::new();
+            if let Some(state) = running_from(paths, &source_path, &mut warnings) {
+                writeln!(
+                    output,
+                    "  note: {}; a reinstall is refused until then",
+                    running_advice(&source_path, &state)
+                )?;
+            }
+            for warning in warnings {
+                writeln!(output, "  note: {warning}")?;
+            }
+            // The same list the real run reports as `kept:` — read from the
+            // interrupted run's marker when there is one.
+            let keeps = source_swap::planned_kept(&source_path);
+            if !keeps.is_empty() {
+                writeln!(output, "  keeps: {}", keeps.join(", "))?;
+            }
+            // Which entries those are is only known once the new release is
+            // unpacked. `source_swap`'s
+            // `swap_replaces_release_code_and_leaves_everything_else_in_place`,
+            // `user_entry_named_like_new_release_code_is_set_aside` and
+            // `install_from_before_the_record_removes_only_what_the_new_release_ships`
+            // prove these lines; comfyui-05 and comfyui-10 the lines the real
+            // run prints.
+            if source_swap::has_release_record(&source_path) {
+                writeln!(
+                    output,
+                    "  leaves in place: everything else in that folder that the installed release \
+                     did not ship"
+                )?;
+                writeln!(
+                    output,
+                    "  sets aside: anything of yours named like code the new release adds, \
+                     renamed to <name>{}<time>",
+                    source_swap::SET_ASIDE_INFIX
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "  replaces: anything in that folder named like code the new release ships \
+                     (this install has no record of what its release shipped)"
+                )?;
+                writeln!(output, "  leaves in place: everything else in that folder")?;
+            }
+        }
+        let mut command = vec![
+            "comfyui".to_owned(),
+            "install".to_owned(),
+            "--runtime-id".to_owned(),
+            runtime.manifest.runtime_key,
+        ];
+        if options.reinstall {
+            command.push("--reinstall".to_owned());
+        }
         writeln!(
             output,
             "  install command: {}",
-            format_structured_tool_call(
-                "rocm",
-                &[
-                    "comfyui".to_owned(),
-                    "install".to_owned(),
-                    "--runtime-id".to_owned(),
-                    runtime.manifest.runtime_key,
-                ],
-            )
+            format_structured_tool_call("rocm", &command)
         )?;
         return Ok(output);
     }
+
+    // Checked before the download, so a refusal costs nothing, and again
+    // just before the code is replaced, so a `rocm comfyui start` during a
+    // long download is caught. `start` takes no lock, so one that begins
+    // during the swap itself is not; it refuses once the swap's marker exists.
+    if replaces_existing {
+        let mut warnings = Vec::new();
+        let running = running_from(paths, &source_path, &mut warnings);
+        for warning in warnings {
+            println!("Note: {warning}");
+        }
+        refuse_while_running(&source_path, running)?;
+    }
+    let recheck_running = || -> Result<()> {
+        if !replaces_existing {
+            return Ok(());
+        }
+        // Any warning about the saved state was printed above.
+        refuse_while_running(
+            &source_path,
+            running_from(paths, &source_path, &mut Vec::new()),
+        )
+    };
 
     fs::create_dir_all(
         log_path
@@ -332,12 +510,9 @@ pub(crate) fn install(
     writeln!(log, "runtime_key={}", runtime.manifest.runtime_key)?;
     writeln!(log, "python={}", runtime.python.display())?;
 
-    if options.reinstall && source_path.exists() {
-        writeln!(log, "Removing existing ComfyUI folder.")?;
-        fs::remove_dir_all(&source_path)
-            .with_context(|| format!("failed to remove {}", source_path.display()))?;
-    }
-    let source_url = if source_path.exists() {
+    let mut swap = source_swap::SwapReport::default();
+    let mut swapped = false;
+    let source_url = if source_path.exists() && !replaces_existing {
         println!("Using existing ComfyUI source folder...");
         let _ = io::stdout().flush();
         writeln!(
@@ -347,69 +522,129 @@ pub(crate) fn install(
         )?;
         reused_source_url(paths)
     } else {
+        if finishes_interrupted && !options.reinstall {
+            println!("Finishing an interrupted ComfyUI reinstall...");
+        }
         println!("Downloading ComfyUI source...");
         let _ = io::stdout().flush();
-        download_and_extract_source(&app_root, &source_path, &mut log)?
+        // The new source is fully downloaded and unpacked before the existing
+        // folder is touched, so a failed download or a bad archive leaves the
+        // current install as it was. The user's content in it is never moved.
+        let (source_url, report) =
+            download_and_extract_source(&app_root, &source_path, &mut log, &recheck_running)
+                .map_err(|error| {
+                    // Whatever stopped the swap part-way, the install for this
+                    // runtime is what finishes it.
+                    if source_swap::swap_interrupted(&source_path) {
+                        error.context(interrupted_reinstall_advice(&runtime.manifest.runtime_key))
+                    } else {
+                        error
+                    }
+                })?;
+        for warning in &report.warnings {
+            println!("Note: {warning}");
+        }
+        swap = report;
+        swapped = true;
+        source_url
     };
-    fs::create_dir_all(&models_folder)
-        .with_context(|| format!("failed to create {}", models_folder.display()))?;
+    // A failure from here on, after new code was put in place, leaves an
+    // install that is not finished. The error says how to finish it, and
+    // names the entries the swap replaced or set aside, which the success
+    // report would have listed.
+    let finish = || -> Result<ComfyUiProbe> {
+        fs::create_dir_all(&models_folder)
+            .with_context(|| format!("failed to create {}", models_folder.display()))?;
 
-    let packages = filtered_requirement_specs(&requirements_path)?;
-    writeln!(
-        log,
-        "Installing {} ComfyUI dependency specs.",
-        packages.len()
-    )?;
-    if !packages.is_empty() {
-        println!("Installing ComfyUI dependencies...");
-        let _ = io::stdout().flush();
-        let uv = ensure_uv_binary(paths)
-            .context("failed to acquire uv binary for ComfyUI dependency install")?;
-        // Pin the managed runtime's ROCm torch stack to its exact installed
-        // versions so a transitive ComfyUI dependency cannot resolve `torch` (and
-        // its `nvidia-*` CUDA deps) from PyPI and clobber it (EAI-8051). Filtering
-        // torch out of the direct specs is not enough — the resolver reaches it
-        // transitively. A constraint fails loudly on a genuine version conflict,
-        // which leaves the runtime intact rather than silently corrupting it.
-        let constraints = torch_stack_constraints(&runtime.python, Some(&runtime_env), &mut log)?;
-        let constraints_path = write_torch_constraints(&app_root, &constraints, &mut log)?;
-        run_uv_logged_command(
-            paths,
-            &uv,
-            uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
-            Some(&runtime_env),
-            &mut log,
-            &log_path,
-            "install ComfyUI dependencies",
-            "Resolving and installing packages with uv…",
+        let packages = filtered_requirement_specs(&requirements_path)?;
+        writeln!(
+            log,
+            "Installing {} ComfyUI dependency specs.",
+            packages.len()
         )?;
-    }
+        if !packages.is_empty() {
+            println!("Installing ComfyUI dependencies...");
+            let _ = io::stdout().flush();
+            let uv = ensure_uv_binary(paths)
+                .context("failed to acquire uv binary for ComfyUI dependency install")?;
+            // Pin the managed runtime's ROCm torch stack to its exact installed
+            // versions so a transitive ComfyUI dependency cannot resolve `torch` (and
+            // its `nvidia-*` CUDA deps) from PyPI and clobber it (EAI-8051). Filtering
+            // torch out of the direct specs is not enough — the resolver reaches it
+            // transitively. A constraint fails loudly on a genuine version conflict,
+            // which leaves the runtime intact rather than silently corrupting it.
+            let constraints =
+                torch_stack_constraints(&runtime.python, Some(&runtime_env), &mut log)?;
+            let constraints_path = write_torch_constraints(&app_root, &constraints, &mut log)?;
+            run_uv_logged_command(
+                paths,
+                &uv,
+                uv_install_args(&runtime.python, &packages, constraints_path.as_deref()),
+                Some(&runtime_env),
+                &mut log,
+                &log_path,
+                "install ComfyUI dependencies",
+                "Resolving and installing packages with uv…",
+            )?;
+        }
 
-    println!("Checking AMD GPU access for ComfyUI...");
-    let _ = io::stdout().flush();
-    let probe = probe_comfyui(&runtime.python, &source_path, Some(&runtime_env))?;
-    if !probe.torch_cuda_available {
-        bail!("ComfyUI install finished, but the AMD GPU check failed. No CPU mode was used.");
-    }
-    let manifest = ComfyUiManifest {
-        app_id: APP_ID.to_owned(),
-        runtime_key: runtime.manifest.runtime_key.clone(),
-        runtime_id: runtime.manifest.runtime_id.clone(),
-        runtime_version: runtime.manifest.version.clone(),
-        runtime_root: runtime.manifest.install_root.clone(),
-        python_executable: runtime.python.clone(),
-        source_url,
-        source_path: source_path.clone(),
-        requirements_path,
-        pip_cache_dir: None,
-        log_path,
-        torch_version: probe.torch_version.clone(),
-        torch_cuda_available: probe.torch_cuda_available,
-        installed_at_unix_ms: unix_time_millis(),
+        println!("Checking AMD GPU access for ComfyUI...");
+        let _ = io::stdout().flush();
+        let probe = probe_comfyui(&runtime.python, &source_path, Some(&runtime_env))?;
+        if !probe.torch_cuda_available {
+            bail!("ComfyUI install finished, but the AMD GPU check failed. No CPU mode was used.");
+        }
+        let manifest = ComfyUiManifest {
+            app_id: APP_ID.to_owned(),
+            runtime_key: runtime.manifest.runtime_key.clone(),
+            runtime_id: runtime.manifest.runtime_id.clone(),
+            runtime_version: runtime.manifest.version.clone(),
+            runtime_root: runtime.manifest.install_root.clone(),
+            python_executable: runtime.python.clone(),
+            source_url,
+            source_path: source_path.clone(),
+            requirements_path,
+            pip_cache_dir: None,
+            log_path,
+            torch_version: probe.torch_version.clone(),
+            torch_cuda_available: probe.torch_cuda_available,
+            installed_at_unix_ms: unix_time_millis(),
+        };
+        save_manifest(paths, &manifest)?;
+        Ok(probe)
     };
-    save_manifest(paths, &manifest)?;
+    let probe = finish().map_err(|error| {
+        if !swapped {
+            return error;
+        }
+        let changes = swap_changes_summary(&swap)
+            .map(|summary| format!(" ({summary})"))
+            .unwrap_or_default();
+        error.context(format!(
+            "the new ComfyUI code is in place{changes}, but the install did not finish; once \
+             the cause below is fixed, run `rocm comfyui install --runtime-id {}` to finish it",
+            runtime.manifest.runtime_key
+        ))
+    })?;
 
     writeln!(output, "  installed: yes")?;
+    if !swap.kept.is_empty() {
+        writeln!(output, "  kept: {}", swap.kept.join(", "))?;
+    }
+    if !swap.replaced.is_empty() {
+        writeln!(output, "  replaced: {}", swap.replaced.join(", "))?;
+    }
+    if !swap.set_aside.is_empty() {
+        let renamed: Vec<String> = swap
+            .set_aside
+            .iter()
+            .map(|(name, new_name)| format!("{name} (now {new_name})"))
+            .collect();
+        writeln!(output, "  set aside: {}", renamed.join(", "))?;
+    }
+    if !swap.left_in_place.is_empty() {
+        writeln!(output, "  left in place: {}", swap.left_in_place.join(", "))?;
+    }
     writeln!(
         output,
         "  AMD GPU: ready ({} device{})",
@@ -425,12 +660,7 @@ pub(crate) fn install(
 
 pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<String> {
     let manifest = load_manifest(paths)?.context("ComfyUI is not installed yet")?;
-    if !manifest.source_path.join("main.py").is_file() {
-        bail!(
-            "ComfyUI main.py is missing from {}; reinstall ComfyUI",
-            manifest.source_path.display()
-        );
-    }
+    ensure_source_is_startable(&manifest)?;
     let runtime_env = runtime_environment_for_manifest(paths, &manifest)?;
     let models_folder = models_folder_for_manifest(&manifest);
     fs::create_dir_all(&models_folder)
@@ -504,6 +734,101 @@ pub(crate) fn start(paths: &AppPaths, options: ComfyUiStartOptions) -> Result<St
         writeln!(output, "  note: still loading")?;
     }
     Ok(output)
+}
+
+/// The checks `start` makes on the installed folder before launching it.
+fn ensure_source_is_startable(manifest: &ComfyUiManifest) -> Result<()> {
+    if source_swap::swap_interrupted(&manifest.source_path) {
+        bail!(
+            "{}; it would start a half-replaced ComfyUI",
+            interrupted_reinstall_advice(&manifest.runtime_key)
+        );
+    }
+    if !manifest.source_path.join("main.py").is_file() {
+        bail!(
+            "ComfyUI main.py is missing from {}; reinstall ComfyUI",
+            manifest.source_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// What `start` and `status` say about a reinstall that stopped part-way. The
+/// command names the runtime the install belongs to, so it finishes that
+/// install rather than one in whichever runtime is the default now; an install
+/// started there finds the swap's marker and completes it.
+fn interrupted_reinstall_advice(runtime_key: &str) -> String {
+    format!(
+        "a reinstall was interrupted; run `rocm comfyui install --runtime-id {runtime_key}` to \
+         finish it"
+    )
+}
+
+/// The saved state of the ComfyUI this CLI started, when it is still running
+/// from `source_path`: it keeps the old code loaded and keeps writing into the
+/// folder a reinstall changes, so the reinstall waits for it. `rocm comfyui
+/// stop` stops it and removes the saved state this reads, which is what clears
+/// it. A saved state that cannot be read counts as not running, and
+/// `warnings` says so: `stop` cannot read it either, so a refusal would have
+/// nothing to clear it. What a running ComfyUI risks is the code it runs; the
+/// preserved folders are left alone whatever is running.
+fn running_from(
+    paths: &AppPaths,
+    source_path: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<ComfyUiState> {
+    let state = match load_state(paths) {
+        Ok(state) => state?,
+        Err(error) => {
+            warnings.push(format!(
+                "{error:#}; whether a ComfyUI started by rocm-cli is running from {} is unknown, \
+                 so the reinstall is not refused for it",
+                source_path.display()
+            ));
+            return None;
+        }
+    };
+    (same_path_text(&state.source_path, source_path)
+        && evaluate_running_state(&state).state != ComfyUiRunState::Stopped)
+        .then_some(state)
+}
+
+/// The refusal of a reinstall while the ComfyUI [`running_from`] found runs.
+fn refuse_while_running(source_path: &Path, running: Option<ComfyUiState>) -> Result<()> {
+    match running {
+        Some(state) => bail!(
+            "{}, then reinstall. Nothing was changed.",
+            running_advice(source_path, &state)
+        ),
+        None => Ok(()),
+    }
+}
+
+/// What a reinstall says about a ComfyUI found by [`running_from`].
+fn running_advice(source_path: &Path, state: &ComfyUiState) -> String {
+    format!(
+        "ComfyUI is running from {} (process {}, {}). Stop it with `rocm comfyui stop`",
+        source_path.display(),
+        state.pid,
+        state.url
+    )
+}
+
+/// Names the entries a finished swap replaced or set aside, if any.
+fn swap_changes_summary(swap: &source_swap::SwapReport) -> Option<String> {
+    let mut parts = Vec::new();
+    if !swap.replaced.is_empty() {
+        parts.push(format!("replaced: {}", swap.replaced.join(", ")));
+    }
+    if !swap.set_aside.is_empty() {
+        let renamed: Vec<String> = swap
+            .set_aside
+            .iter()
+            .map(|(name, new_name)| format!("{name} (now {new_name})"))
+            .collect();
+        parts.push(format!("set aside: {}", renamed.join(", ")));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 pub(crate) fn stop(paths: &AppPaths) -> Result<String> {
@@ -1407,15 +1732,23 @@ fn same_path_text(left: &Path, right: &Path) -> bool {
     runtime_paths_equivalent(left, right)
 }
 
-/// Downloads (if not already cached) and extracts the ComfyUI source
-/// archive, returning the source URL it resolved — so the caller can record
-/// it on the install manifest without re-resolving
-/// [`comfyui_source_archive_url`] a second time.
+/// Downloads (if not already cached) and unpacks the ComfyUI source archive
+/// into a staging folder, then installs its code at `source_path` with
+/// [`source_swap::install_release_tree`]. Returns the source URL it resolved
+/// — so the caller can record it on the install manifest without re-resolving
+/// [`comfyui_source_archive_url`] a second time — and the swap's report: what
+/// it kept, replaced, set aside and left in place, and its warnings.
+///
+/// Nothing at `source_path` is touched until the new tree is fully unpacked
+/// and `before_swap` has allowed it, so a failed download, a bad archive, one
+/// that is not a ComfyUI release, or a refusal from `before_swap` leaves an
+/// existing install as it was.
 fn download_and_extract_source(
     app_root: &Path,
     source_path: &Path,
     log: &mut fs::File,
-) -> Result<String> {
+    before_swap: &dyn Fn() -> Result<()>,
+) -> Result<(String, source_swap::SwapReport)> {
     let source_url = comfyui_source_archive_url();
     let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
     fs::create_dir_all(
@@ -1442,32 +1775,71 @@ fn download_and_extract_source(
     let extract_root = app_root
         .join("extract")
         .join(format!("source-{}", unix_time_millis()));
-    fs::create_dir_all(&extract_root)
-        .with_context(|| format!("failed to create {}", extract_root.display()))?;
-    let archive = fs::File::open(&archive_path)
-        .with_context(|| format!("failed to open {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(archive);
-    let mut tar = tar::Archive::new(decoder);
-    tar.unpack(&extract_root)
-        .with_context(|| format!("failed to extract {}", archive_path.display()))?;
-    let extracted = first_child_dir(&extract_root)?;
-    if source_path.exists() {
-        fs::remove_dir_all(source_path)
-            .with_context(|| format!("failed to remove {}", source_path.display()))?;
-    }
-    fs::create_dir_all(
-        source_path
-            .parent()
-            .context("ComfyUI source path has no parent directory")?,
-    )?;
-    fs::rename(&extracted, source_path).or_else(|_| {
-        copy_dir_all(&extracted, source_path)?;
-        fs::remove_dir_all(&extracted)?;
-        Ok::<(), anyhow::Error>(())
-    })?;
+    // Replacing an install with something that is not ComfyUI would leave
+    // nothing startable where it was; a first install has nothing to lose.
+    let replaces_an_install = fs::symlink_metadata(source_path).is_ok();
+    let result = unpack_source_archive(&archive_path, &extract_root, replaces_an_install).and_then(
+        |extracted| {
+            before_swap()?;
+            let report = source_swap::install_release_tree(&extracted, source_path)?;
+            writeln!(log, "Installed source at {}.", source_path.display())?;
+            for name in &report.kept {
+                writeln!(log, "Kept {name}.")?;
+            }
+            for name in &report.replaced {
+                writeln!(log, "Replaced {name}.")?;
+            }
+            for (name, new_name) in &report.set_aside {
+                writeln!(log, "Set aside {name} as {new_name}.")?;
+            }
+            for name in &report.left_in_place {
+                writeln!(log, "Left in place {name}.")?;
+            }
+            for warning in &report.warnings {
+                writeln!(log, "Warning: {warning}")?;
+            }
+            Ok(report)
+        },
+    );
     fs::remove_dir_all(&extract_root).ok();
-    writeln!(log, "Installed source at {}.", source_path.display())?;
-    Ok(source_url)
+    Ok((source_url, result?))
+}
+
+/// Unpacks `archive_path` under `extract_root` and returns the archive's
+/// top-level folder. With `require_main_py` (an install is there to be
+/// replaced), an archive that is not a ComfyUI release (no `main.py` in that
+/// folder) is refused. A cached archive that cannot be unpacked, or that is
+/// refused, is dropped, so the next attempt downloads a fresh copy instead of
+/// failing the same way.
+fn unpack_source_archive(
+    archive_path: &Path,
+    extract_root: &Path,
+    require_main_py: bool,
+) -> Result<PathBuf> {
+    fs::create_dir_all(extract_root)
+        .with_context(|| format!("failed to create {}", extract_root.display()))?;
+    let archive = fs::File::open(archive_path)
+        .with_context(|| format!("failed to open {}", archive_path.display()))?;
+    let mut tar = tar::Archive::new(GzDecoder::new(archive));
+    let unpacked = tar
+        .unpack(extract_root)
+        .with_context(|| format!("failed to extract {}", archive_path.display()))
+        .and_then(|()| first_child_dir(extract_root))
+        .and_then(|release| {
+            if !require_main_py || release.join("main.py").is_file() {
+                Ok(release)
+            } else {
+                bail!(
+                    "{} is not a ComfyUI release: it has no main.py in {}",
+                    archive_path.display(),
+                    release.display()
+                )
+            }
+        });
+    if unpacked.is_err() {
+        fs::remove_file(archive_path).ok();
+    }
+    unpacked
 }
 
 fn first_child_dir(root: &Path) -> Result<PathBuf> {
@@ -1479,23 +1851,6 @@ fn first_child_dir(root: &Path) -> Result<PathBuf> {
         }
     }
     bail!("ComfyUI source archive did not contain a directory")
-}
-
-fn copy_dir_all(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to).with_context(|| format!("failed to create {}", to.display()))?;
-    for entry in fs::read_dir(from).with_context(|| format!("failed to read {}", from.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = to.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_all(&path, &target)?;
-        } else {
-            fs::copy(&path, &target).with_context(|| {
-                format!("failed to copy {} to {}", path.display(), target.display())
-            })?;
-        }
-    }
-    Ok(())
 }
 
 fn download_file(
@@ -2025,13 +2380,12 @@ mod tests {
         // `rocm comfyui logs` can still find this run's log via a directory
         // scan even without a saved manifest, but naming the path directly
         // in the error is more precise and needs no second command.
-        use std::os::unix::fs::PermissionsExt;
+        use rocm_core::fake_executable::write_fake_executable;
 
         let paths = test_paths("comfyui-uv-failure");
         fs::create_dir_all(&paths.cache_dir)?;
         let uv_path = paths.cache_dir.join("fake-uv");
-        fs::write(&uv_path, "#!/bin/sh\nexit 1\n")?;
-        fs::set_permissions(&uv_path, fs::Permissions::from_mode(0o755))?;
+        write_fake_executable(&uv_path, "#!/bin/sh\nexit 1\n")?;
 
         let log_path = paths.cache_dir.join("install.log");
         let mut log = fs::File::create(&log_path)?;
@@ -3099,6 +3453,1267 @@ mod tests {
         );
         Ok(())
     }
+
+    /// User content an existing ComfyUI folder holds, keyed by path relative to
+    /// `source/`. Every kept top-level entry appears at least once, so dropping
+    /// any of them from the preserved list turns a reinstall test red.
+    const USER_FILES: [(&str, &str); 10] = [
+        ("models/checkpoints/my-model.safetensors", "user model"),
+        ("user/default/workflows/my-workflow.json", "user workflow"),
+        ("output/ComfyUI_00001_.png", "user image"),
+        ("input/my-upload.png", "user upload"),
+        ("custom_nodes/my-node/__init__.py", "user node"),
+        ("datasets/my-set/0001.png", "user dataset"),
+        ("extra_model_paths.yaml", "user model paths"),
+        // The user's copy of a file the new release also ships wins.
+        ("custom_nodes/websocket_image_save.py", "old sample node"),
+        // No release ships these: left in place.
+        ("styles.csv", "user styles"),
+        ("temp/scratch.png", "scratch"),
+    ];
+
+    /// A ComfyUI install that has been used: release code plus user content.
+    fn plant_used_comfyui_source(source: &Path) -> Result<()> {
+        for (relative, contents) in [
+            ("main.py", "old main"),
+            ("requirements.txt", "torch\n"),
+            ("comfy/removed_upstream.py", "old code"),
+        ]
+        .into_iter()
+        .chain(USER_FILES)
+        {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().context("fixture path has no parent")?)?;
+            fs::write(&path, contents)?;
+        }
+        Ok(())
+    }
+
+    fn assert_user_files_intact(source: &Path) {
+        for (relative, contents) in USER_FILES {
+            let path = source.join(relative);
+            assert_eq!(
+                fs::read_to_string(&path).ok().as_deref(),
+                Some(contents),
+                "a reinstall must keep {}",
+                path.display()
+            );
+        }
+    }
+
+    /// Writes the archive `download_and_extract_source` would otherwise
+    /// download, so a reinstall runs offline. Its top-level folder mirrors
+    /// GitHub's `ComfyUI-master/`. Only the unix-only install tests use it.
+    #[cfg(unix)]
+    fn plant_cached_source_archive(app_root: &Path, files: &[(&str, &str)]) -> Result<()> {
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive_path)?,
+            flate2::Compression::fast(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        for (relative, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(
+                &mut header,
+                format!("ComfyUI-master/{relative}"),
+                contents.as_bytes(),
+            )?;
+        }
+        builder.into_inner()?.finish()?;
+        Ok(())
+    }
+
+    fn reinstall_fixture(name: &str) -> Result<(AppPaths, RocmCliConfig, PathBuf)> {
+        let paths = test_paths(name);
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        write_runtime_manifest(&paths, &runtime)?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(runtime.runtime_key.clone()),
+            ..Default::default()
+        };
+        let app_root = runtime_app_root(&runtime);
+        plant_used_comfyui_source(&source_path_from_app_root(&app_root))?;
+        Ok((paths, config, app_root))
+    }
+
+    fn reinstall_options(dry_run: bool) -> ComfyUiInstallOptions {
+        ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: true,
+            dry_run,
+        }
+    }
+
+    fn remove_test_root(paths: &AppPaths) {
+        if let Some(root) = paths.data_dir.parent() {
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    /// Issue #530: a reinstall whose new source cannot be obtained must leave
+    /// the existing install and every user file exactly as they were. Before
+    /// the fix the source folder was deleted before anything was fetched.
+    #[test]
+    fn reinstall_that_cannot_obtain_new_source_changes_nothing() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-failed-source")?;
+        let source = source_path_from_app_root(&app_root);
+        // A truncated download: not a gzip stream, so unpacking fails.
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("a reinstall with an unreadable source archive must fail");
+
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "unexpected error: {error:#}"
+        );
+        // No swap marker was written, so no interrupted reinstall is
+        // reported and no command is named to finish one.
+        assert!(
+            !format!("{error:#}").contains("rocm comfyui install"),
+            "nothing was changed, so there is nothing to finish: {error:#}"
+        );
+        assert_user_files_intact(&source);
+        assert_eq!(
+            fs::read_to_string(source.join("main.py"))?,
+            "old main",
+            "the existing ComfyUI code must survive a failed reinstall"
+        );
+        assert!(source.join("comfy/removed_upstream.py").is_file());
+        assert!(
+            !archive_path.exists(),
+            "an archive that cannot be unpacked must not be reused by the next attempt"
+        );
+        assert_staging_folder_empty(&app_root)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A downloaded archive that unpacks but is not a ComfyUI release (no
+    /// `main.py` in its top folder) leaves the existing install as it was, and
+    /// is dropped so the next attempt downloads again instead of failing the
+    /// same way.
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_from_an_archive_without_main_py_changes_nothing() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-not-comfyui")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_cached_source_archive(
+            &app_root,
+            &[("README.md", "not comfyui"), ("comfy/x.py", "code")],
+        )?;
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("an archive without main.py must not be installed");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("is not a ComfyUI release"), "{message}");
+        assert!(
+            !message.contains("rocm comfyui install"),
+            "nothing was changed, so there is nothing to finish: {message}"
+        );
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+        assert!(source.join("comfy/removed_upstream.py").is_file());
+        assert!(!source_swap::swap_interrupted(&source));
+        assert_user_files_intact(&source);
+        assert!(
+            !archive_path.exists(),
+            "an archive that is not a ComfyUI release must not be reused"
+        );
+        assert_staging_folder_empty(&app_root)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// Nothing is left behind in the staging folder a release is unpacked to.
+    fn assert_staging_folder_empty(app_root: &Path) -> Result<()> {
+        let extract = app_root.join("extract");
+        let left: Vec<_> = match fs::read_dir(&extract) {
+            Ok(entries) => entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<io::Result<_>>()?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        assert!(
+            left.is_empty(),
+            "the staging folder must be removed: {left:?}"
+        );
+        Ok(())
+    }
+
+    /// Issue #530: a successful reinstall replaces ComfyUI's code but leaves
+    /// the user's models, workflows, outputs, inputs, custom nodes and extra
+    /// model paths in place, and the report names exactly those.
+    #[cfg(unix)]
+    #[test]
+    fn reinstall_replaces_code_and_keeps_user_data() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-keeps-data")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_cached_source_archive(
+            &app_root,
+            &[
+                ("main.py", "new main"),
+                // Torch-stack only, so the dependency install is skipped.
+                ("requirements.txt", "torch\n"),
+                ("comfy/added_upstream.py", "new code"),
+                ("models/checkpoints/put_checkpoints_here", ""),
+                ("models/new_kind/put_new_kind_here", ""),
+                ("custom_nodes/websocket_image_save.py", "new sample node"),
+                ("input/example.png", "release example"),
+                ("output/_output_images_will_be_put_here", ""),
+            ],
+        )?;
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+
+        let rendered = install(&paths, &config, reinstall_options(false))?;
+
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        assert!(source.join("comfy/added_upstream.py").is_file());
+        assert!(
+            !source.join("comfy/removed_upstream.py").exists(),
+            "code the new release no longer ships must not linger"
+        );
+        assert_user_files_intact(&source);
+        // What the release adds inside a kept folder is merged in alongside.
+        assert!(source.join("models/new_kind/put_new_kind_here").is_file());
+        assert!(
+            source
+                .join("models/checkpoints/put_checkpoints_here")
+                .is_file()
+        );
+        assert!(source.join("input/example.png").is_file());
+        assert!(
+            rendered.contains(
+                "  kept: models, user, output, input, custom_nodes, datasets, extra_model_paths.yaml\n"
+            ),
+            "the report must name what was kept: {rendered}"
+        );
+        assert!(
+            rendered.contains("  left in place: styles.csv, temp\n"),
+            "the report must name what it left alone: {rendered}"
+        );
+        // The release was unpacked into a staging folder; nothing of it is
+        // left there once it is installed.
+        assert_staging_folder_empty(&app_root)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// Issue #530: the dry run states what a reinstall replaces and keeps, and
+    /// the command it prints is the one that was asked for. Nothing on disk
+    /// changes.
+    #[test]
+    fn reinstall_dry_run_names_what_is_replaced_and_kept() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-dry-run")?;
+        let source = source_path_from_app_root(&app_root);
+
+        let rendered = install(&paths, &config, reinstall_options(true))?;
+
+        assert!(
+            rendered.contains(&format!(
+                "  reinstall: replaces the ComfyUI code in {}\n",
+                source.display()
+            )),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "  keeps: models, user, output, input, custom_nodes, datasets, extra_model_paths.yaml\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(" --reinstall"),
+            "the printed command must carry --reinstall: {rendered}"
+        );
+        // Nothing was interrupted here, so nothing claims it was.
+        assert!(!rendered.contains("interrupted"), "{rendered}");
+        assert_user_files_intact(&source);
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A plain `install --dry-run` over an existing install previews reusing
+    /// it: no reinstall lines, and the command it prints is the plain install
+    /// that was asked for, not the destructive `--reinstall`.
+    #[test]
+    fn plain_install_dry_run_previews_no_reinstall() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-plain-dry-run")?;
+        let source = source_path_from_app_root(&app_root);
+
+        let rendered = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: None,
+                reinstall: false,
+                dry_run: true,
+            },
+        )?;
+
+        let command = rendered
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("install command: "))
+            .unwrap_or_else(|| panic!("no install command in:\n{rendered}"));
+        assert!(command.contains("comfyui install"), "{command}");
+        assert!(!command.contains("--reinstall"), "{command}");
+        assert!(!rendered.contains("  reinstall:"), "{rendered}");
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// `--reinstall --dry-run` where nothing is installed yet: there is no
+    /// code to replace, so the preview says nothing about replacing or keeping
+    /// anything in a folder that does not exist.
+    #[test]
+    fn reinstall_dry_run_without_an_install_previews_no_replacement() -> Result<()> {
+        let paths = test_paths("comfyui-reinstall-dry-run-no-install");
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        write_runtime_manifest(&paths, &runtime)?;
+        let config = RocmCliConfig {
+            active_runtime_key: Some(runtime.runtime_key.clone()),
+            ..Default::default()
+        };
+        let source = source_path_from_app_root(&runtime_app_root(&runtime));
+        assert!(!source.exists());
+
+        let rendered = install(&paths, &config, reinstall_options(true))?;
+
+        assert!(!rendered.contains("  reinstall:"), "{rendered}");
+        assert!(!rendered.contains("  keeps:"), "{rendered}");
+        assert!(!source.exists(), "a dry run creates nothing");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// The running guard is checked again once the new release is unpacked,
+    /// just before the code is replaced. When it refuses there, the existing
+    /// install is exactly as it was, and the staging folder is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_just_before_the_swap_changes_nothing() -> Result<()> {
+        let (paths, _config, app_root) = reinstall_fixture("comfyui-refused-before-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        fs::create_dir_all(app_root.join("logs"))?;
+        let mut log = fs::File::create(app_root.join("logs").join("install.log"))?;
+
+        let error = download_and_extract_source(&app_root, &source, &mut log, &|| {
+            bail!("ComfyUI started meanwhile")
+        })
+        .expect_err("the refusal must stop the install");
+
+        assert!(
+            format!("{error:#}").contains("ComfyUI started meanwhile"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+        assert!(source.join("comfy/removed_upstream.py").is_file());
+        assert!(!source_swap::swap_interrupted(&source));
+        assert_user_files_intact(&source);
+        assert_staging_folder_empty(&app_root)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// After an interrupted reinstall, a plain `install` finishes the swap
+    /// rather than reusing the half-replaced folder as it is.
+    #[test]
+    fn install_after_an_interrupted_reinstall_finishes_it() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-finish-interrupted")?;
+        let source = source_path_from_app_root(&app_root);
+        fs::write(source.join(source_swap::SWAP_MARKER), "models\n")?;
+        let plain = ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: false,
+            dry_run: true,
+        };
+
+        let rendered = install(&paths, &config, plain.clone())?;
+        assert!(
+            rendered
+                .contains("  note: a previous reinstall was interrupted; installing finishes it\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  reinstall: replaces the ComfyUI code in"),
+            "{rendered}"
+        );
+        // Every preserved folder is present now, but the interrupted run
+        // recorded only `models` as the user's; the dry run must say what the
+        // real run's `kept:` will, which reads the same record.
+        assert!(rendered.contains("  keeps: models\n"), "{rendered}");
+
+        // And the real run does go to fetch new code (stopped here by an
+        // unreadable archive) instead of "Using existing ComfyUI source".
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let error = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                dry_run: false,
+                ..plain
+            },
+        )
+        .expect_err("the planted archive is unreadable");
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "{error:#}"
+        );
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A cached release archive and a runtime Python that passes the GPU
+    /// check, so `install` runs to completion offline.
+    #[cfg(unix)]
+    fn plant_installable_release(paths: &AppPaths, app_root: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        plant_cached_source_archive(
+            app_root,
+            &[
+                ("main.py", "new main"),
+                ("requirements.txt", "torch\n"),
+                ("comfy/added_upstream.py", "new code"),
+            ],
+        )?;
+        let runtime = ready_runtime_manifest(paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": true, \"device_count\": 1, \"devices\": [\"Fake GPU\"]}' > \"$2\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    /// `start` refuses a folder whose reinstall was interrupted, and `status`
+    /// says so. The command both name is then run exactly as printed and
+    /// clears it: the marker is gone and `start`'s checks pass.
+    #[cfg(unix)]
+    #[test]
+    fn start_refuses_an_interrupted_reinstall_until_install_finishes_it() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-start-mid-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        // As an interrupted reinstall leaves it.
+        fs::write(source.join(source_swap::SWAP_MARKER), "models\n")?;
+        fs::remove_file(source.join("main.py"))?;
+        let advice = "a reinstall was interrupted; run `rocm comfyui install --runtime-id reinstall-runtime` to finish it";
+
+        let refused = start(
+            &paths,
+            ComfyUiStartOptions {
+                host: "127.0.0.1".to_owned(),
+                port: unused_local_port()?,
+                no_open_browser: true,
+            },
+        )
+        .expect_err("start must refuse a half-replaced folder");
+        assert!(format!("{refused:#}").contains(advice), "{refused:#}");
+        let status = render_status(&paths, &config)?;
+        assert!(status.contains(&format!("  note: {advice}\n")), "{status}");
+
+        // `rocm comfyui install --runtime-id reinstall-runtime`, as printed.
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        assert!(!source.join(source_swap::SWAP_MARKER).exists());
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        ensure_source_is_startable(&manifest)?;
+        assert!(!render_status(&paths, &config)?.contains("interrupted"));
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// The running guard only stops a reinstall for a ComfyUI that is really
+    /// running from this folder. A saved state whose process is gone and whose
+    /// port is closed (ComfyUI exited without `stop`) does not block it.
+    #[test]
+    fn reinstall_proceeds_over_a_stale_running_state() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-stale-state")?;
+        let source = source_path_from_app_root(&app_root);
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let mut exited = spawn_stand_in_process()?;
+        let dead_pid = exited.id();
+        exited.kill()?;
+        exited.wait()?;
+        save_running_state(&paths, &app_root, &source, dead_pid)?;
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("the planted archive is unreadable");
+
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "a stale state must not block the reinstall: {error:#}"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A ComfyUI running from a different folder (another runtime's install)
+    /// is not affected by replacing this one's code, so it does not block it.
+    #[test]
+    fn reinstall_proceeds_while_a_comfyui_runs_from_another_folder() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-other-folder")?;
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let mut child = spawn_stand_in_process()?;
+        let elsewhere = paths.data_dir.join("other-runtime").join("source");
+        save_running_state(&paths, &app_root, &elsewhere, child.id())?;
+
+        let result = install(&paths, &config, reinstall_options(false));
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let error = result.expect_err("the planted archive is unreadable");
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "a ComfyUI running from another folder must not block the reinstall: {error:#}"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    fn save_running_state(
+        paths: &AppPaths,
+        app_root: &Path,
+        source: &Path,
+        pid: u32,
+    ) -> Result<()> {
+        let port = unused_local_port()?;
+        save_state(
+            paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: format_http_base_url("127.0.0.1", port),
+                host: "127.0.0.1".to_owned(),
+                port,
+                pid,
+                source_path: source.to_path_buf(),
+                python_executable: PathBuf::from("python"),
+                log_path: app_root.join("logs").join("start.log"),
+                started_at_unix_ms: unix_time_millis(),
+            },
+        )
+    }
+
+    /// A long-lived process standing in for a running ComfyUI.
+    fn spawn_stand_in_process() -> Result<std::process::Child> {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("60");
+            command
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn a stand-in process")
+    }
+
+    /// A reinstall is refused while the ComfyUI this CLI started runs from the
+    /// folder it would change, here answering on its port, and nothing
+    /// changes. The remedy the refusal names, `rocm comfyui stop`, is then run
+    /// and does clear it: the same reinstall goes ahead (here as far as the
+    /// planted unreadable archive).
+    #[test]
+    fn reinstall_is_refused_while_comfyui_runs_until_it_is_stopped() -> Result<()> {
+        reinstall_is_refused_until_stopped("comfyui-reinstall-while-running", true)
+    }
+
+    /// The same for a ComfyUI that was started and is still loading: its
+    /// process is alive but nothing answers on its port yet.
+    #[test]
+    fn reinstall_is_refused_while_comfyui_starts_until_it_is_stopped() -> Result<()> {
+        reinstall_is_refused_until_stopped("comfyui-reinstall-while-starting", false)
+    }
+
+    fn reinstall_is_refused_until_stopped(name: &str, answering: bool) -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture(name)?;
+        let source = source_path_from_app_root(&app_root);
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let mut child = spawn_stand_in_process()?;
+        // Held for the test, so the port answers as a running ComfyUI's does.
+        let listener = answering
+            .then(|| std::net::TcpListener::bind("127.0.0.1:0"))
+            .transpose()?;
+        let port = match &listener {
+            Some(listener) => listener.local_addr()?.port(),
+            None => unused_local_port()?,
+        };
+        let state = ComfyUiState {
+            app_id: APP_ID.to_owned(),
+            url: format_http_base_url("127.0.0.1", port),
+            host: "127.0.0.1".to_owned(),
+            port,
+            pid: child.id(),
+            source_path: source.clone(),
+            python_executable: PathBuf::from("python"),
+            log_path: app_root.join("logs").join("start.log"),
+            started_at_unix_ms: unix_time_millis(),
+        };
+        save_state(&paths, &state)?;
+        assert_eq!(
+            evaluate_running_state(&state).state,
+            if answering {
+                ComfyUiRunState::Running
+            } else {
+                ComfyUiRunState::Starting
+            },
+            "the planted ComfyUI must read as the state this test is about"
+        );
+
+        // The dry run says what the real run then does.
+        let preview = install(&paths, &config, reinstall_options(true))?;
+        assert!(
+            preview.contains(&format!(
+                "  note: ComfyUI is running from {} (process {}, {}). Stop it with `rocm \
+                 comfyui stop`; a reinstall is refused until then\n",
+                source.display(),
+                child.id(),
+                format_http_base_url("127.0.0.1", port)
+            )),
+            "{preview}"
+        );
+        let refused = install(&paths, &config, reinstall_options(false))
+            .expect_err("a reinstall must be refused while ComfyUI runs from the folder");
+        let message = format!("{refused:#}");
+        assert!(message.contains("`rocm comfyui stop`"), "{message}");
+        assert!(message.contains("Nothing was changed"), "{message}");
+        assert_user_files_intact(&source);
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+        assert!(
+            archive_path.is_file(),
+            "the refusal must come before the archive is even opened"
+        );
+
+        let stopped = stop(&paths);
+        let _ = child.kill();
+        let _ = child.wait();
+        stopped?;
+
+        let preview = install(&paths, &config, reinstall_options(true))?;
+        assert!(!preview.contains("is running"), "{preview}");
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("the planted archive is unreadable");
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "after `stop` the reinstall must no longer be refused: {error:#}"
+        );
+        drop(listener);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A reinstall stopped by a release entry it cannot remove names the
+    /// install for this runtime (`--runtime-id`), not a bare `rocm comfyui
+    /// install` that would finish whichever runtime is the default. That
+    /// command, run as printed once the entry can be removed, finishes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_reinstall_that_cannot_remove_an_entry_names_the_install_that_finishes_it() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-cannot-remove")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let locked = source.join("comfy");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555))?;
+        if fs::write(locked.join("probe"), "").is_ok() {
+            // Running as root: permissions do not stop removal here. The
+            // advice itself is also covered, for any user, by
+            // `a_reinstall_that_fails_after_the_swap_started_names_the_install_that_finishes_it`.
+            eprintln!("skipped: running as root, so a read-only folder cannot make a removal fail");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+            remove_test_root(&paths);
+            return Ok(());
+        }
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("a release entry that cannot be removed must stop the reinstall");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+        let message = format!("{error:#}");
+
+        assert!(
+            message.starts_with(
+                "a reinstall was interrupted; run `rocm comfyui install --runtime-id \
+                 reinstall-runtime` to finish it: failed to remove "
+            ),
+            "{message}"
+        );
+        assert!(message.contains("close any program using it"), "{message}");
+        assert!(source_swap::swap_interrupted(&source));
+        let command = message
+            .split('`')
+            .nth(1)
+            .context("the message names a command")?;
+        assert_eq!(
+            command,
+            "rocm comfyui install --runtime-id reinstall-runtime"
+        );
+
+        // The named command, as printed.
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        assert!(!source_swap::swap_interrupted(&source));
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        ensure_source_is_startable(&manifest)?;
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// The chat's status answer passes on the interrupted-reinstall note and
+    /// does not advise `start`, which would refuse; `status` drops its
+    /// `start` next step too. Once the named install finishes the swap, both
+    /// advise `start` again.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_names_the_install_that_finishes_an_interrupted_reinstall() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-chat-status-mid-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        // A saved state for a ComfyUI that has exited: status reports it
+        // stopped.
+        let mut exited = spawn_stand_in_process()?;
+        let dead_pid = exited.id();
+        exited.kill()?;
+        exited.wait()?;
+        let port = unused_local_port()?;
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: format!("http://127.0.0.1:{port}"),
+                host: "127.0.0.1".to_owned(),
+                port,
+                pid: dead_pid,
+                source_path: source.clone(),
+                python_executable: paths.data_dir.join("python"),
+                log_path: paths.data_dir.join("start.log"),
+                started_at_unix_ms: 1,
+            },
+        )?;
+        // As an interrupted reinstall leaves it.
+        fs::write(source.join(source_swap::SWAP_MARKER), "models\n")?;
+        fs::remove_file(source.join("main.py"))?;
+        let advice = "a reinstall was interrupted; run `rocm comfyui install --runtime-id reinstall-runtime` to finish it";
+
+        let answer = render_chat_status_answer(&paths)?;
+        assert!(answer.contains("Running: no\n"), "{answer}");
+        assert!(answer.contains(&format!("Note: {advice}.\n")), "{answer}");
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        let status = render_status(&paths, &config)?;
+        assert!(!status.contains("comfyui start"), "{status}");
+        // The summary the assistant answers with after a status tool call
+        // passes the note on too.
+        // Another tool's output ahead of it in the same text keeps its notes.
+        let summary = crate::deterministic_comfyui_tool_summary(&format!(
+            "Engines\n  note: another tool's note\n\n{status}"
+        ))
+        .context("a status summary")?;
+        assert!(summary.contains(&format!("  Note: {advice}.")), "{summary}");
+        assert!(!summary.contains("another tool"), "{summary}");
+        // What the note claims: start refuses until that install runs.
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        assert!(ensure_source_is_startable(&manifest).is_err());
+
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        let answer = render_chat_status_answer(&paths)?;
+        assert!(!answer.contains("interrupted"), "{answer}");
+        assert!(answer.contains("run `rocm comfyui start`"), "{answer}");
+        let summary = crate::deterministic_comfyui_tool_summary(&render_status(&paths, &config)?)
+            .context("a status summary")?;
+        assert!(!summary.contains("Note:"), "{summary}");
+        assert!(render_status(&paths, &config)?.contains("next step: rocm comfyui start"));
+        ensure_source_is_startable(&load_manifest(&paths)?.context("manifest")?)?;
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// Whatever stops a reinstall after its swap has started — here, writing
+    /// the release record, which fails for any user because a folder holds
+    /// its name — the error names the install that finishes it, and that
+    /// command, run as printed once the cause is gone, does.
+    #[cfg(unix)]
+    #[test]
+    fn a_reinstall_that_fails_after_the_swap_started_names_the_install_that_finishes_it()
+    -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-fails-mid-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let blocker = source.join(source_swap::RELEASE_RECORD);
+        fs::create_dir_all(blocker.join("in-the-way"))?;
+
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("the release record cannot be written over a folder");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.starts_with(
+                "a reinstall was interrupted; run `rocm comfyui install --runtime-id \
+                 reinstall-runtime` to finish it: "
+            ),
+            "{message}"
+        );
+        assert!(source_swap::swap_interrupted(&source));
+        assert_user_files_intact(&source);
+        assert_staging_folder_empty(&app_root)?;
+
+        fs::remove_dir_all(&blocker)?;
+        let command = message
+            .split('`')
+            .nth(1)
+            .context("the message names a command")?;
+        assert_eq!(
+            command,
+            "rocm comfyui install --runtime-id reinstall-runtime"
+        );
+        install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+
+        assert!(!source_swap::swap_interrupted(&source));
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// When the install fails after the swap (here the GPU check), the error
+    /// names the entries the swap replaced, since the report that would have
+    /// listed them is never printed, and the command that finishes the
+    /// install, which does once the cause is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_after_the_swap_names_what_it_replaced() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-fails-after-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}' > \"$2\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+
+        let error =
+            install(&paths, &config, reinstall_options(false)).expect_err("the GPU check fails");
+        let message = format!("{error:#}");
+
+        // The install predates the release record, so these were replaced.
+        assert!(
+            message.starts_with(
+                "the new ComfyUI code is in place (replaced: comfy, main.py, requirements.txt), \
+                 but the install did not finish; once the cause below is fixed, run `rocm \
+                 comfyui install --runtime-id reinstall-runtime` to finish it: "
+            ),
+            "{message}"
+        );
+        assert!(message.contains("AMD GPU check failed"), "{message}");
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        assert!(!source.join("comfy/removed_upstream.py").exists());
+        assert_user_files_intact(&source);
+
+        // With the GPU check passing again, the named command, as printed.
+        plant_installable_release(&paths, &app_root)?;
+        let rendered = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                runtime_id: Some("reinstall-runtime".to_owned()),
+                reinstall: false,
+                dry_run: false,
+            },
+        )?;
+        assert!(rendered.contains("  installed: yes\n"), "{rendered}");
+        let manifest = load_manifest(&paths)?.context("manifest")?;
+        assert!(manifest.torch_cuda_available);
+        ensure_source_is_startable(&manifest)?;
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// An install that fails without having put new code in place (here a
+    /// plain install reusing the existing folder) names nothing to finish.
+    /// A first install that fails after its download put the code in place
+    /// says so, with nothing replaced to list, and names the command.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it() -> Result<()>
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (paths, config, app_root) = reinstall_fixture("comfyui-install-fails-no-swap")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let runtime = ready_runtime_manifest(&paths, "reinstall-runtime")?;
+        let python = PathBuf::from(runtime.python_executable.context("runtime has no Python")?);
+        fs::write(
+            &python,
+            "#!/bin/sh\nprintf '%s' '{\"torch_version\": \"2.4.0\", \"torch_cuda_available\": false, \"device_count\": 0, \"devices\": []}' > \"$2\"\n",
+        )?;
+        fs::set_permissions(&python, fs::Permissions::from_mode(0o755))?;
+        let plain = ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: false,
+            dry_run: false,
+        };
+
+        let reused = install(&paths, &config, plain.clone()).expect_err("the GPU check fails");
+        let message = format!("{reused:#}");
+        assert!(message.contains("AMD GPU check failed"), "{message}");
+        assert!(!message.contains("in place"), "{message}");
+        assert!(!message.contains("rocm comfyui install"), "{message}");
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "old main");
+
+        fs::remove_dir_all(&source)?;
+        let fresh = install(&paths, &config, plain).expect_err("the GPU check fails");
+        let message = format!("{fresh:#}");
+        assert!(
+            message.starts_with(
+                "the new ComfyUI code is in place, but the install did not finish; once the \
+                 cause below is fixed, run `rocm comfyui install --runtime-id reinstall-runtime` \
+                 to finish it: "
+            ),
+            "{message}"
+        );
+        assert_eq!(fs::read_to_string(source.join("main.py"))?, "new main");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// What a failure after the swap says it changed: both kinds of change,
+    /// either alone, or nothing to name.
+    #[test]
+    fn swap_changes_summary_names_what_was_replaced_and_set_aside() {
+        let report = |replaced: &[&str], set_aside: &[(&str, &str)]| source_swap::SwapReport {
+            replaced: replaced.iter().map(|name| (*name).to_owned()).collect(),
+            set_aside: set_aside
+                .iter()
+                .map(|(name, new_name)| ((*name).to_owned(), (*new_name).to_owned()))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(swap_changes_summary(&report(&[], &[])), None);
+        assert_eq!(
+            swap_changes_summary(&report(&["comfy", "main.py"], &[])).as_deref(),
+            Some("replaced: comfy, main.py")
+        );
+        assert_eq!(
+            swap_changes_summary(&report(
+                &["main.py"],
+                &[
+                    ("app", "app.rocm-cli-kept-1"),
+                    ("api", "api.rocm-cli-kept-1")
+                ]
+            ))
+            .as_deref(),
+            Some(
+                "replaced: main.py; set aside: app (now app.rocm-cli-kept-1), api (now \
+                 api.rocm-cli-kept-1)"
+            )
+        );
+    }
+
+    /// The running guard only applies to a run that replaces the code: a
+    /// plain install that reuses the existing folder goes ahead while
+    /// ComfyUI runs from it.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_install_is_not_refused_while_comfyui_runs() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-plain-install-while-running")?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        let mut child = spawn_stand_in_process()?;
+        save_running_state(&paths, &app_root, &source, child.id())?;
+        let plain = ComfyUiInstallOptions {
+            runtime_id: None,
+            reinstall: false,
+            dry_run: true,
+        };
+
+        let preview = install(&paths, &config, plain.clone());
+        let result = install(
+            &paths,
+            &config,
+            ComfyUiInstallOptions {
+                dry_run: false,
+                ..plain
+            },
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let preview = preview?;
+        assert!(!preview.contains("is running"), "{preview}");
+        let rendered = result?;
+        assert!(rendered.contains("  installed: yes\n"), "{rendered}");
+        assert_eq!(
+            fs::read_to_string(source.join("main.py"))?,
+            "old main",
+            "a plain install reuses the existing code"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A saved state that cannot be read does not block a reinstall, which
+    /// says so: `stop` cannot read it either, so nothing would clear a
+    /// refusal.
+    #[test]
+    fn a_reinstall_proceeds_over_an_unreadable_saved_state() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-reinstall-corrupt-state")?;
+        let archive_path = app_root.join("downloads").join(COMFYUI_SOURCE_ARCHIVE_NAME);
+        fs::create_dir_all(
+            archive_path
+                .parent()
+                .context("archive path has no parent")?,
+        )?;
+        fs::write(&archive_path, "not a gzip stream")?;
+        let state = state_path(&paths);
+        fs::create_dir_all(state.parent().context("state path has no parent")?)?;
+        fs::write(&state, "{\"app_id\": \"comfy")?;
+        assert!(
+            stop(&paths).is_err(),
+            "the premise: `stop` cannot clear this state"
+        );
+
+        let preview = install(&paths, &config, reinstall_options(true))?;
+        assert!(
+            preview.contains(&format!("  note: failed to parse {}", state.display())),
+            "{preview}"
+        );
+        let error = install(&paths, &config, reinstall_options(false))
+            .expect_err("the planted archive is unreadable");
+        assert!(
+            format!("{error:#}").contains("failed to extract"),
+            "an unreadable state must not block the reinstall: {error:#}"
+        );
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// An installed ComfyUI with a saved state for the given process and
+    /// port, as `start` leaves it.
+    #[cfg(unix)]
+    fn installed_with_state(name: &str, pid: u32, port: u16) -> Result<(AppPaths, String)> {
+        let (paths, config, app_root) = reinstall_fixture(name)?;
+        let source = source_path_from_app_root(&app_root);
+        plant_installable_release(&paths, &app_root)?;
+        install(&paths, &config, reinstall_options(false))?;
+        let url = format_http_base_url("127.0.0.1", port);
+        save_state(
+            &paths,
+            &ComfyUiState {
+                app_id: APP_ID.to_owned(),
+                url: url.clone(),
+                host: "127.0.0.1".to_owned(),
+                port,
+                pid,
+                source_path: source,
+                python_executable: paths.data_dir.join("python"),
+                log_path: paths.data_dir.join("start.log"),
+                started_at_unix_ms: 1,
+            },
+        )?;
+        Ok((paths, url))
+    }
+
+    /// A ComfyUI that answers on its port is reported running, with its URL,
+    /// and `start` is not advised.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_reports_a_running_comfyui_with_its_url() -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        let (paths, url) =
+            installed_with_state("comfyui-chat-status-running", std::process::id(), port)?;
+
+        let answer = render_chat_status_answer(&paths)?;
+
+        assert!(
+            answer.contains(&format!("Running: yes\nURL: {url}\n")),
+            "{answer}"
+        );
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        // What the answer claims: the URL answers.
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        drop(listener);
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// A ComfyUI whose process is up but whose port does not answer yet is
+    /// reported starting, and `start`, which would launch a second one, is
+    /// not advised.
+    #[cfg(unix)]
+    #[test]
+    fn chat_status_answer_reports_a_starting_comfyui() -> Result<()> {
+        let mut child = spawn_stand_in_process()?;
+        let port = unused_local_port()?;
+        let result = installed_with_state("comfyui-chat-status-starting", child.id(), port)
+            .and_then(|(paths, _)| {
+                let status = render_status(&paths, &RocmCliConfig::default())?;
+                Ok((render_chat_status_answer(&paths)?, status, paths))
+            });
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let (answer, status, paths) = result?;
+        assert!(answer.contains("Running: starting\n"), "{answer}");
+        // `status` says `note: starting` under `Running`; the tool summary
+        // sums that up as its running state, not as a note.
+        assert!(status.contains("  note: starting\n"), "{status}");
+        let summary =
+            crate::deterministic_comfyui_tool_summary(&status).context("a status summary")?;
+        assert!(summary.contains("  Running: starting."), "{summary}");
+        assert!(!summary.contains("Note:"), "{summary}");
+        assert!(!answer.contains("URL:"), "{answer}");
+        assert!(!answer.contains("comfyui start"), "{answer}");
+        remove_test_root(&paths);
+        Ok(())
+    }
+
+    /// Without a release record the dry run says that entries named like the
+    /// new release's code are replaced; with one, that they are set aside.
+    /// The lines are pinned here; `source_swap`'s
+    /// `install_from_before_the_record_lists_what_it_replaced` and
+    /// `user_entry_named_like_new_release_code_is_set_aside` prove them.
+    #[test]
+    fn reinstall_dry_run_says_whether_a_colliding_entry_is_replaced_or_set_aside() -> Result<()> {
+        let (paths, config, app_root) = reinstall_fixture("comfyui-dry-run-collisions")?;
+        let source = source_path_from_app_root(&app_root);
+
+        let without_record = install(&paths, &config, reinstall_options(true))?;
+        assert!(
+            without_record.contains(
+                "  replaces: anything in that folder named like code the new release ships \
+                 (this install has no record of what its release shipped)\n"
+            ),
+            "{without_record}"
+        );
+        assert!(
+            without_record.contains("  leaves in place: everything else in that folder\n"),
+            "{without_record}"
+        );
+        assert!(!without_record.contains("sets aside"), "{without_record}");
+
+        fs::write(
+            source.join(source_swap::RELEASE_RECORD),
+            "comfy\nmain.py\nrequirements.txt",
+        )?;
+        let with_record = install(&paths, &config, reinstall_options(true))?;
+        assert!(
+            with_record.contains(&format!(
+                "  sets aside: anything of yours named like code the new release adds, renamed \
+                 to <name>{}<time>\n",
+                source_swap::SET_ASIDE_INFIX
+            )),
+            "{with_record}"
+        );
+        assert!(!with_record.contains("  replaces:"), "{with_record}");
+        assert_user_files_intact(&source);
+        remove_test_root(&paths);
+        Ok(())
+    }
 }
 
 /// Property tests for the ComfyUI source unpack, judged on the filesystem by
@@ -3116,8 +4731,8 @@ mod archive_properties {
     use proptest::prelude::*;
 
     use crate::archive_props::{
-        Entry, Expect, Kind, Layout, Modes, entries, note_mode_scope, run_case, run_property,
-        run_round_trip, tar_gz_bytes,
+        ESCAPES_ONLY, Entry, Expect, Kind, Layout, Modes, entries, note_mode_scope, run_case,
+        run_property, run_round_trip, tar_gz_bytes,
     };
 
     /// The unpack plus the first write `install` makes into the result: the
@@ -3129,9 +4744,41 @@ mod archive_properties {
         fs::copy(archive, &cached)?;
         let mut log = fs::File::create(layout.base.join("install.log"))?;
         let source_path = source_path_from_app_root(app_root);
-        download_and_extract_source(app_root, &source_path, &mut log)?;
+        download_and_extract_source(app_root, &source_path, &mut log, &|| Ok(()))?;
         fs::create_dir_all(models_folder_for_source(&source_path))?;
         Ok(())
+    }
+
+    /// Whether an entry name or link target is absolute in the generator's
+    /// terms: a leading `/`, which [`concretize`](crate::archive_props::concretize)
+    /// re-roots at the case's fake root, or a leading `@`, the `@OUT`
+    /// placeholder it replaces with the absolute `outside/` path. Moving such
+    /// a path under `a/` would change what it names, so both
+    /// [`moved_one_level_down`] and [`entries_without_top_level_symlink`] leave
+    /// it alone.
+    fn is_absolute(path: &[u8]) -> bool {
+        path.starts_with(b"/") || path.starts_with(b"@")
+    }
+
+    /// `entry` moved under `a/`, unless its name is absolute (re-rooted, it
+    /// already lands deep inside the extraction root). A relative symlink
+    /// target resolves from the link's own directory, now one level deeper,
+    /// so it gains exactly one `../`, whatever the link's depth. A target that
+    /// climbed out of the extraction root then lands where it did unmoved:
+    /// `../outside` still escapes rather than stopping at `dest/outside`. One
+    /// that stayed inside still stays inside, though for a nested link not
+    /// always at the same path.
+    fn moved_one_level_down(mut entry: Entry) -> Entry {
+        if is_absolute(&entry.name) {
+            return entry;
+        }
+        entry.name.splice(0..0, *b"a/");
+        if let Kind::Symlink(target) = &mut entry.kind
+            && !is_absolute(target)
+        {
+            target.splice(0..0, *b"../");
+        }
+        entry
     }
 
     /// [`entries`] with every relative name moved one level down, under
@@ -3143,7 +4790,8 @@ mod archive_properties {
     /// left alone: re-rooted, they land deep inside the extraction root.
     /// Moving names down rather than only dropping top-level links keeps
     /// "link, then write through it" in play, one level down where the
-    /// source tree is.
+    /// source tree is; a moved symlink's relative target gains a `../`, so an
+    /// escaping target still escapes, to the same place.
     fn entries_without_top_level_symlink() -> impl Strategy<Value = Vec<Entry>> {
         /// Lexical components, or `None` when the name climbs above the root.
         fn components(name: &[u8]) -> Option<Vec<&[u8]>> {
@@ -3162,20 +4810,9 @@ mod archive_properties {
         entries().prop_map(|entries| {
             let mut links: Vec<Vec<&[u8]>> = Vec::new();
             let mut kept = Vec::new();
-            let moved: Vec<Entry> = entries
-                .into_iter()
-                .map(|mut entry| {
-                    if !entry.name.starts_with(b"/") && !entry.name.starts_with(b"@") {
-                        entry.name.splice(0..0, *b"a/");
-                    }
-                    entry
-                })
-                .collect();
+            let moved: Vec<Entry> = entries.into_iter().map(moved_one_level_down).collect();
             for entry in &moved {
-                if matches!(entry.kind, Kind::Symlink(_))
-                    && !entry.name.starts_with(b"/")
-                    && !entry.name.starts_with(b"@")
-                {
+                if matches!(entry.kind, Kind::Symlink(_)) && !is_absolute(&entry.name) {
                     let Some(parts) = components(&entry.name) else {
                         continue;
                     };
@@ -3188,6 +4825,104 @@ mod archive_properties {
             }
             kept
         })
+    }
+
+    /// Moving an entry down must not change whether its symlink escapes the
+    /// extraction root, or where to: the target, resolved lexically from the
+    /// link's directory, escapes before exactly when it escapes after, and
+    /// then names the same place. A top-level link names the same place
+    /// whether or not it escapes. A nested link is checked too, so the single
+    /// `../` is shown to be enough at any depth. Absolute names and targets,
+    /// in either spelling, are not touched.
+    #[test]
+    fn moving_an_entry_down_keeps_its_symlink_target_in_place() {
+        /// `dir` joined with `target`, `..` applied lexically; a leading `..`
+        /// that climbs above the root is kept.
+        fn resolve(dir: &[u8], target: &[u8]) -> Vec<Vec<u8>> {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            for part in dir
+                .split(|b| *b == b'/')
+                .chain(target.split(|b| *b == b'/'))
+            {
+                match part {
+                    b"" | b"." => {}
+                    b".." if out.last().is_some_and(|last| last != b"..") => {
+                        out.pop();
+                    }
+                    _ => out.push(part.to_vec()),
+                }
+            }
+            out
+        }
+        for (name, dir) in [
+            (&b"l"[..], &b""[..]),
+            (b"sub/l", b"sub"),
+            (b"sub/deeper/l", b"sub/deeper"),
+        ] {
+            for target in [
+                &b"../outside"[..],
+                b"../../outside",
+                b"../../../outside",
+                b"../victim",
+                b".",
+                b"l/../..",
+                b"a",
+            ] {
+                let moved = moved_one_level_down(Entry {
+                    name: name.to_vec(),
+                    kind: Kind::Symlink(target.to_vec()),
+                    mode: 0o777,
+                });
+                assert_eq!(moved.name, [&b"a/"[..], name].concat());
+                let Kind::Symlink(moved_target) = moved.kind else {
+                    panic!("still a symlink");
+                };
+                let label = format!(
+                    "{} -> {} moved to {}",
+                    String::from_utf8_lossy(name),
+                    String::from_utf8_lossy(target),
+                    String::from_utf8_lossy(&moved_target)
+                );
+                // Exactly one `../`, whatever the link's depth: the move adds
+                // one directory level, not one per level already there.
+                assert_eq!(moved_target, [&b"../"[..], target].concat(), "{label}");
+                let before = resolve(dir, target);
+                let after = resolve(&[&b"a/"[..], dir].concat(), &moved_target);
+                let escapes = |path: &[Vec<u8>]| path.first().is_some_and(|part| part == b"..");
+                assert_eq!(escapes(&after), escapes(&before), "{label}");
+                if escapes(&before) || dir.is_empty() {
+                    assert_eq!(after, before, "{label}");
+                }
+            }
+        }
+        // Absolute targets and absolute names are left alone, for both
+        // spellings of absolute: a leading `/` and the `@OUT` placeholder.
+        for target in [&b"@OUT/sentinel"[..], b"/etc/passwd"] {
+            let moved = moved_one_level_down(Entry {
+                name: b"l".to_vec(),
+                kind: Kind::Symlink(target.to_vec()),
+                mode: 0o777,
+            });
+            assert_eq!(moved.name, b"a/l");
+            assert!(
+                matches!(&moved.kind, Kind::Symlink(t) if t == target),
+                "target {} was rewritten",
+                String::from_utf8_lossy(target)
+            );
+        }
+        for name in [&b"/x"[..], b"@OUT/x"] {
+            assert_eq!(
+                moved_one_level_down(Entry {
+                    name: name.to_vec(),
+                    kind: Kind::Dir,
+                    mode: 0o755
+                })
+                .name,
+                name,
+                "name {} was moved",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 
     fn property(
@@ -3221,11 +4956,6 @@ mod archive_properties {
             Ok(())
         })
     }
-
-    const ESCAPES_ONLY: Expect = Expect {
-        modes: Modes::Unchecked,
-        no_outward_links: false,
-    };
 
     /// What holds today: with the #522 shape (a top-level symlink) left out,
     /// the unpack and the first install write stay inside the app root.

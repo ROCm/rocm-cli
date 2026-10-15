@@ -348,7 +348,7 @@ async fn scrape_warning_persists_between_scrape_ticks() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_gpu_detection_does_not_delay_service_discovery() {
-    use std::os::unix::fs::PermissionsExt;
+    use rocm_core::fake_executable::write_fake_executable;
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -356,8 +356,7 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
     // well past the discovery deadline, then emit trivially-valid JSON so both
     // `version` and the `system_info` `--json` calls "succeed".
     let fake = dir.path().join("amd-smi-slow");
-    std::fs::write(&fake, "#!/bin/sh\nsleep 4\necho '{}'\n").unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_fake_executable(&fake, "#!/bin/sh\nsleep 4\necho '{}'\n").unwrap();
 
     // A ready managed vLLM service on disk — the authority `rocm services` reads.
     std::fs::write(
@@ -459,15 +458,14 @@ async fn slow_gpu_detection_does_not_delay_service_discovery() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inaccessibility() {
-    use std::os::unix::fs::PermissionsExt;
+    use rocm_core::fake_executable::write_fake_executable;
 
     let dir = tempfile::tempdir().unwrap();
 
     // Fails immediately, mirroring a real amd-smi's "Drivers not loaded" exit on
     // a WSL host whose GPU ROCDXG can reach but ROCm does not support.
     let fake = dir.path().join("amd-smi-broken");
-    std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_fake_executable(&fake, "#!/bin/sh\nexit 1\n").unwrap();
 
     let (tx, mut rx) = broadcast::channel::<Event>(512);
     let fake_bin = fake.into_os_string();
@@ -545,7 +543,7 @@ async fn gpu_reachable_but_amd_smi_failing_warns_of_the_contradiction_not_inacce
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight() {
-    use std::os::unix::fs::PermissionsExt;
+    use rocm_core::fake_executable::write_fake_executable;
 
     if std::fs::OpenOptions::new()
         .read(true)
@@ -564,12 +562,10 @@ async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight()
     // Succeeds on every subcommand `version`/`metric --json`/`static --json`/
     // `topology --json` all get called; only `metric` needs a real payload.
     let fake = dir.path().join("amd-smi-ok");
-    std::fs::write(
-        &fake,
+    write_fake_executable(&fake,
         "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
     )
     .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let (tx, mut rx) = broadcast::channel::<Event>(512);
     let fake_bin = fake.into_os_string();
@@ -632,7 +628,7 @@ async fn gpu_reachable_without_kfd_lets_amd_smi_run_through_the_real_preflight()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
-    use std::os::unix::fs::PermissionsExt;
+    use rocm_core::fake_executable::write_fake_executable;
 
     if std::fs::OpenOptions::new()
         .read(true)
@@ -648,12 +644,10 @@ async fn gpu_unreachable_without_kfd_never_runs_amd_smi() {
     // Same fake as above: if this ran, it would prove telemetry, but the
     // pre-flight must reject it first since neither OR-condition holds.
     let fake = dir.path().join("amd-smi-ok");
-    std::fs::write(
-        &fake,
+    write_fake_executable(&fake,
         "#!/bin/sh\ncase \"$1\" in\n  metric) echo '{\"gpu_data\":[{\"gpu\":0}]}' ;;\n  *) echo '{}' ;;\nesac\n",
     )
     .unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let (tx, mut rx) = broadcast::channel::<Event>(512);
     let fake_bin = fake.into_os_string();

@@ -32,9 +32,11 @@ for Lemonade and vLLM.
 |---|---|---|
 | Linux (x86_64) | Yes | Ubuntu 24.04 or newer; full support, including the live dashboard and both inference engines |
 | Windows (x86_64) | Yes | CLI and Lemonade serving; no live dashboard or vLLM |
-| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard; see [docs/wsl.md](https://github.com/ROCm/rocm-cli/blob/main/docs/wsl.md) for setup |
+| WSL2 (x86_64) | Yes (Linux binary) | Ubuntu 24.04 or newer; full support, including the live dashboard |
 | macOS | No | No official installer, release, CI, or QA coverage |
 <!-- platform-support-table-end -->
+
+For WSL2 setup and diagnosis, see [docs/wsl.md](docs/wsl.md).
 
 Live dashboard telemetry requires Linux or WSL2 (see
 [Interactive interfaces](#interactive-interfaces)). vLLM serving is Linux or WSL2
@@ -276,14 +278,23 @@ the leading `#1`, `#2` are ranking positions for reading order only — `rocm
 fix` takes the id, not the position.
 
 - `--symptom` takes raw error text to sharpen keyword scoring.
+- On Windows, `diagnose` also checks the age of the Visual C++ runtime, not
+  only whether it is there. The runtime in `System32` must be 14.40 or newer
+  (`fix-21-msvc-redist-outdated`). Programs built with a recent toolset, such
+  as the llama.cpp server that Lemonade installs, crash with an access
+  violation in `MSVCP140.dll` on an older one. `rocm examine --json` shows the
+  version it read as `msvc_redist_version`. `rocm fix` only prints the update
+  plan, including a `winget install` line; it never runs the install.
 - `--top` caps how many matches are shown in the human-readable output
   (default 5) — `--json` always emits the full, untruncated report.
 - `--distro` diagnoses a WSL distribution from the Windows host instead of
   this machine (nothing needs to be installed inside the distribution — name
   it only when more than one is installed). Inspecting remotely this way
   skips checks that need to read the distribution's own environment
-  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) — run
-  `rocm diagnose` inside the distribution for those.
+  (`HSA_OVERRIDE_GFX_VERSION`, `PATH`, the framework/ROCm pairing) and the
+  library and shared-memory checks (`fix-18-comgr-conflict`,
+  `fix-19-shm-too-small`) — run `rocm diagnose` inside the distribution for
+  those.
 - `--report` shows exactly what this machine would contribute to a problem
   report, and sends nothing — there is no transport yet, and there will be no
   automatic one: a report leaves a machine only by its owner's own action. The
@@ -349,6 +360,20 @@ rocm update         [--apply] [--runtime KEY] [--activate] [--dry-run]
 
 `install sdk` downloads TheRock ROCm wheels into a Python environment managed
 by rocm-cli.
+
+#### GPUs with no ROCm build
+
+Some AMD GPUs are detected but have no ROCm SDK build at all. The Vega iGPU in
+Renoir, Lucienne, Cezanne and Barcelo APUs — the Radeon Vega graphics in Ryzen
+4000 and 5000 mobile and desktop parts, reported as `gfx90c` — is one of them.
+
+For these, `install sdk` stops and says no ROCm SDK build exists for that GPU,
+instead of listing package families to try. It does the same when you name such
+a target yourself with `--family gfx90c`: the request is refused, and no other
+family is substituted for it. `rocm examine` reports the same conclusion on a
+`rocm_support` line (see [Examine](#examine)).
+
+These GPUs still work with the Vulkan backend, which needs no ROCm SDK.
 
 #### Compiler toolchain (--devel)
 
@@ -685,6 +710,10 @@ rocm services remove <service-id> --yes
 rocm services prune [--older-than-hours <n> | --any-age] [--dry-run] [--yes]
 ```
 
+`restart` starts a server again only once its stop has confirmed that every
+recorded process is gone; if the stop cannot confirm that, it says so, starts
+nothing, and leaves the stop request recorded.
+
 `remove` deletes one record that is no longer running, together with its log,
 its engine state file, and its endpoint key file; a running server is refused,
 so stop it first. `prune` does the same in bulk, always leaves running servers
@@ -823,6 +852,53 @@ rocm comfyui models-path
 None of `install`, `start`, or `stop` ever prompt for confirmation; `--yes` is
 accepted on each for consistency with other mutating commands but currently
 has no effect.
+
+`install --reinstall` replaces ComfyUI's code in its `source/` folder (the
+folder that contains the `models path:` it prints):
+
+- **Deleted and replaced:** the top-level files and folders the installed
+  ComfyUI release shipped, which rocm-cli records when it installs one, plus
+  `__pycache__/`.
+- **Kept:** `models/` (the folder `models-path` prints), `user/` (saved
+  workflows and settings), `output/`, `input/`, `custom_nodes/`, `datasets/`
+  and `extra_model_paths.yaml`. They are never moved, copied or deleted. Files
+  a new release adds inside them are added alongside yours; where both have a
+  file of the same name, yours is kept, and a folder you replaced with a
+  symlink is not written into.
+- **Set aside:** an entry of yours whose name the new release starts shipping
+  (an `app/` of yours when a release adds `app/`, say) is renamed to
+  `<name>.rocm-cli-kept-<time>` rather than deleted. The reinstall lists it
+  under `set aside:` with its new name.
+- **Left in place:** anything else, such as `.git/`, a `venv/`, `styles.csv`,
+  logs or `temp/`. The reinstall lists these.
+
+An install made before rocm-cli recorded what its release shipped has nothing
+to tell release code from your entries. There, the entries with the names the
+new release ships are deleted and replaced instead, including one of yours of
+the same name, and the reinstall lists them under `replaced:`; everything else
+is left in place. On Windows, names that differ only in case (`readme.md`,
+`README.md`) count as the same entry, as they do on its file systems.
+
+The new copy is unpacked before the existing one is touched, so a failed
+download, or a download that is not a ComfyUI release (no `main.py` at its
+top), leaves the install as it was; such a download is not kept, so the next
+attempt downloads again. `--reinstall --dry-run` names the folder
+whose code would be replaced, which of the kept folders it holds, and whether
+an entry of yours named like the new release's code would be set aside or
+replaced; which entries those are is only known once the new release is
+downloaded. A reinstall is refused while the ComfyUI that `rocm comfyui start`
+launched is running or still starting, and its dry run says so; stop it with
+`rocm comfyui stop` first. This is checked before the download and again just
+before the code is replaced, so a ComfyUI started during the download is
+caught too. If rocm-cli's saved record of that ComfyUI cannot be read, the
+reinstall says so and is not refused, since `stop` cannot read it either. If a
+reinstall is interrupted part-way, or stops part-way (because a file it must
+delete or move is in use, say), `start` refuses to launch the half-replaced
+folder, and `start`, `status`, the answer to
+`rocm "what is the comfyui status"` and the failed reinstall name the
+`rocm comfyui install --runtime-id <key>` command that finishes it. If the
+install fails after the new code is in place (in the GPU check, say), the
+error names that command too, and what was replaced or set aside.
 
 ### Automations
 

@@ -113,6 +113,20 @@ all of which the scan reports nothing for:
   `cfg_attr`. Write `#[cfg(unix)]` above `#[test]` instead, which the scan
   arms on.
 
+### Tests that run a fake executable
+
+Plant a stand-in `python`, `uv`, `amd-smi`, ... with
+`rocm_core::fake_executable::write_fake_executable`, not `std::fs::write`
+followed by `set_permissions(0o755)`. On Linux the plain write makes the first
+run of the fake fail intermittently with `Text file busy (os error 26)`: while
+the write fd is open, a test on another thread can spawn a child, and that child
+keeps a copy of the fd until its own `exec` (`O_CLOEXEC` closes it only then).
+The kernel refuses to execute a file any process still has open for writing, so
+the fake's first run can land in that window. The helper has a short-lived
+child write the file instead, so this process never holds a write fd on it. The
+same applies to E2E steps: scenarios run concurrently in one process, and the
+`rocm` child that runs the shim can be the one refused.
+
 Run the cross-platform smoke test:
 
 ```bash
@@ -404,6 +418,79 @@ selection:
 python scripts/therock_sdk_install_test.py --root .rocm-work/tests/therock-sdk-install --fresh --family gfx120X-all
 ```
 
+### GPU targets with no ROCm build
+
+Some recognized targets have no TheRock package family at all. Today that is
+`gfx90c`, the Vega iGPU in Renoir, Lucienne, Cezanne and Barcelo APUs. For these
+`rocm install sdk` refuses instead of resolving a family, and `rocm examine`
+adds a `rocm_support` line saying the GPU is detected but unsupported.
+
+Two things make this testable without a Ryzen 4000/5000 laptop, and both matter
+when changing it:
+
+- `gfx_target_has_no_rocm_build` in
+  [host_gpu.rs](../crates/rocm-core/src/host_gpu.rs) is deliberately conjoined
+  with `normalize_therock_family` returning `None`. Do not simplify it to a bare
+  target-name check. Every test that drives the refusal does so by naming the
+  target explicitly, and the conjunct is the only reason any of them is also
+  evidence about the mapping: it is what makes the refusal stop firing once the
+  mapping comes back. Were the predicate to carry its own copy of the target
+  name alone, the refusal would keep firing from that copy and those tests
+  would stay green across a reopened catch-all.
+  `no_rocm_build_implies_no_therock_family` pins the conjunct.
+- detection itself has no override — `detect_host_gfx_target` reads real sysfs
+  or WMI — so no lane can fake the host half. The end-to-end coverage is
+  `@id:runtime-install-sdk-refuses-unsupported-gpu-target` (`runtime-19` in
+  [runtime_setup.feature](../tests/e2e-cucumber/features/runtime_setup.feature)),
+  which goes through `--family gfx90c`. It runs on the ordinary E2E lane, with
+  no GPU tag. The detected-GPU wording itself is covered at unit level by
+  `unsupported_gpu_error_names_the_gpu_and_does_not_suggest_families` in
+  [therock.rs](../apps/rocm/src/therock.rs).
+
+The detected-host door — the one a real Ryzen 4000/5000 laptop opens — has no
+end-to-end lane at all, and that gap is stated here rather than papered over.
+`runtime-19` opens the `--family` door. Do not read a green `runtime-19` as
+coverage of host detection.
+
+#### Which mutants each test actually kills
+
+Measured on Linux with `cargo test -p rocm-core -p rocm --all-targets
+--no-fail-fast` followed by `cargo xtask e2e -- -n "runtime-19"`. Re-run them
+rather than trusting this list if you change either function, and confirm the
+edited file really differs first: a mutant that fails to apply is
+indistinguishable from one that survived.
+
+1. **Delete the `gfx90c` arm from `normalize_therock_family`.** `runtime-19`
+   goes **red** — the first `Then` fails because the dry run now succeeds,
+   resolving `gfx90X-dcgpu`. Also red:
+   `gfx_target_has_no_rocm_build_names_only_gfx90c`,
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported`,
+   `windows_display_parser_prefers_a_supported_gpu_over_a_vega_igpu`,
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` and
+   `therock::requesting_gfx90c_by_name_fails_instead_of_installing_another_family`.
+   Note `no_rocm_build_implies_no_therock_family` does *not* fail here: the
+   predicate answers `false`, so the implication it asserts holds vacuously.
+2. **Reduce the predicate to `normalize_therock_family(gfx).is_none()`.**
+   `runtime-19` stays **green** — gfx90c still has no family, so the refusal
+   still fires. Caught at unit level only, by
+   `gfx_target_has_no_rocm_build_names_only_gfx90c` and
+   `examine_render_omits_the_support_note_for_supported_or_missing_gpus`, which
+   pin that the refusal is about gfx90c and not about every unmapped target.
+3. **Reduce the predicate to the bare `starts_with("gfx90c")` check and delete
+   the mapping arm.** `runtime-19` stays **green** through exactly the
+   regression it exists to catch. This is the drift the conjunct forbids, and
+   the only mutant `no_rocm_build_implies_no_therock_family` fires against;
+   `normalize_therock_family_has_no_family_for_gfx90c`,
+   `examine_render_says_a_gpu_without_a_rocm_family_is_unsupported` and
+   `therock::gfx90c_resolves_to_no_family_instead_of_the_datacenter_one` go red
+   with it.
+
+Read 1 and 3 together. `runtime-19` is evidence about the mapping, but only
+transitively, through the conjunct in the predicate — remove the conjunct and
+the scenario stops being evidence about anything but itself. The direct
+evidence about the mapping is the unit tests.
+
 ## ComfyUI TheRock GPU Acceptance
 
 This opt-in test verifies that rocm-cli can install or reuse its managed
@@ -478,6 +565,70 @@ python3 scripts/comfyui_therock_gpu_test.py \
   --temp-state \
   --copy-runtime-state-from /home/$USER/.rocm \
   --generate-cat
+```
+
+## ComfyUI Reinstall
+
+`rocm comfyui install --reinstall` deletes only the top-level entries the
+installed ComfyUI release shipped in its `source/` folder (as recorded when it
+was installed), keeps the preserved ones (`models/`, `user/`, `output/`,
+`input/`, `custom_nodes/`, `datasets/`, `extra_model_paths.yaml`), renames an
+entry of the user's that the new release starts shipping (`set aside:`) and
+leaves anything else in place. An install from before that record replaces
+the entries named like the new release's code and lists them (`replaced:`).
+It leaves the install untouched when the new source cannot be obtained or is
+not a ComfyUI release, or when ComfyUI is found running just before the swap;
+`start` refuses a folder whose swap was interrupted or stopped part-way, and
+the command it names finishes it. The swap is unit-tested directly, without a
+fake Python. Most of those tests also run on Windows: stopping the swap before
+each filesystem change in turn and checking that a re-run converges (with and
+without an entry to set aside), unknown entries and `datasets/` left in place,
+an unreadable or malformed release record or swap marker, an entry that
+cannot be removed, the copy taken when the release cannot be renamed into
+place across filesystems, `main.py` removed first and moved in last, a
+release without `main.py` refused before an existing install changes, and the
+`replaced:` list of an install with no record staying complete when its swap
+is interrupted at any step. The symlink tests (symlinked model folders, links
+inside them, loops, dangling links, copying links without following them), the
+inode/ctime test and a copy that fails part-way are Unix-only; the retry while
+another program holds a file and names that differ only in case are
+Windows-only:
+
+```bash
+cargo test -p rocm --bin rocm comfyui::source_swap
+cargo test -p rocm --bin rocm comfyui::tests
+```
+
+The second filter covers the install-level tests: `reinstall_*`,
+`install_after_an_interrupted_reinstall_finishes_it`,
+`start_refuses_an_interrupted_reinstall_until_install_finishes_it`,
+`a_reinstall_that_*`, `a_reinstall_proceeds_over_an_unreadable_saved_state`,
+`a_failure_after_the_swap_names_what_it_replaced`,
+`only_an_install_that_put_new_code_in_place_names_the_command_that_finishes_it`,
+`swap_changes_summary_names_what_was_replaced_and_set_aside`,
+`a_plain_install_is_not_refused_while_comfyui_runs`,
+`plain_install_dry_run_previews_no_reinstall`,
+`a_refusal_just_before_the_swap_changes_nothing` and `chat_status_answer_*`.
+The running guard is tested against a ComfyUI answering on its port
+(`running`) and one whose process is up but whose port is not answering yet
+(`starting`).
+
+The e2e scenarios `comfyui-05` to `comfyui-13`
+([comfyui.feature](../tests/e2e-cucumber/features/comfyui.feature), Linux, no
+GPU) cover the same through the built binary: what is kept, replaced and left
+in place (also when the saved run state is unreadable), a failed download, the
+dry run, a reinstall refused while ComfyUI runs (which the dry run says
+first, and which is refused before anything is downloaded), `start` refusing a half-replaced folder until the command it names is
+run, the answer to a plain-words status question
+(`rocm "what is the comfyui status"`) while ComfyUI starts and while a
+reinstall is unfinished, a folder of the user's set aside when the new release
+ships one of the same name, a reinstall that fails after the swap naming
+what it replaced and the command that finishes it, a ComfyUI started while
+the reinstall downloads, which the check just before the swap refuses, and a
+download that is not a ComfyUI release, which is neither installed nor kept:
+
+```bash
+cargo xtask e2e -- -n "comfyui-(0[5-9]|1[0-3])"
 ```
 
 ## Runtime Selection And Activation
@@ -879,6 +1030,12 @@ cargo test -p rocmd sandbox_tool_restart_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_requires_service_id_for_stop
 cargo test -p rocmd sandbox_tool_stop_server_reports_missing_service
 cargo test -p rocmd sandbox_tool_stop_server_updates_manifest_and_skips_current_pid
+cargo test -p rocmd sandbox_tool_stop_server_reports_an_unconfirmed_stop
+cargo test -p rocmd mcp_stop_server_reports_an_unconfirmed_stop_as_an_error
+cargo test -p rocmd mcp_stop_server_reports_a_confirmed_stop_as_success
+cargo test -p rocmd the_stop_request_is_recorded_before_any_process_is_signalled
+cargo test -p rocmd a_stop_keeps_what_another_writer_persisted_while_it_ran
+cargo test -p rocmd a_stop_does_not_clear_processes_recorded_while_it_ran
 cargo test -p rocmd sandbox_tool_notify_user_is_read_only
 cargo test -p rocmd sandbox_runner_native_fallback_records_audit
 ```
@@ -890,7 +1047,21 @@ read-only extension. Read-only tools must report `mutating: false`;
 `notify_user` must record a local notification audit event; server restart/stop
 must require an explicit service id; sandbox-run native fallback or Linux
 bubblewrap isolation must still execute only this internal tool API and record
-a sandbox audit event.
+a sandbox audit event. `stop_server` — the sandbox tool and the MCP tool alike —
+reports a stop only once every recorded process is confirmed gone: otherwise
+the sandbox tool reports `status: stop_unconfirmed`, the MCP tool answers with
+`isError: true`, and the manifest keeps its PIDs and endpoint key. The stop
+records the request in the manifest before it signals anything, and applies its
+result to the manifest as it is once the stop ends, so a write made meanwhile is
+kept — and a restart that recorded new processes meanwhile makes the stop
+unconfirmed rather than having its PIDs cleared.
+
+`features/service_stop.feature` (`service-stop-02`, Linux, mock lane)
+drives the real `rocmd sandbox-tool stop_server` against a live recorded
+process and checks the confirmed report against the process, the record and
+the endpoint key file. Run it with
+`ROCM_CLI_BINARY=target/debug/rocm ROCM_CLI_ROCMD_BINARY=target/debug/rocmd
+cargo test -p e2e-cucumber --test e2e -- -n "service-stop-02"`.
 
 Manual restricted-tool smoke:
 
@@ -1110,8 +1281,35 @@ that is then installed as root, and this replaces the self-test that shipped
 with the removed `scripts/wsl_setup_rocdxg.sh`. It needs a POSIX shell and
 `sha256sum`, so it is Unix-only.
 
+The eight native Linux GPU preflights are one script,
+[`gpu-preflight.sh`](../.github/scripts/gpu-preflight.sh), which each lane runs
+with its own `GPU_PREFLIGHT_MIN_FREE_GIB` (16 on the discrete lanes, 8 on
+Strix). It applies two gates, because neither sees what the other does: a
+bounded wait on free memory, and then `reclaim-gpu.sh --assert-clear`. The
+memory floor is a fixed number of GiB against whatever pool `rocm-smi` reports,
+so its sensitivity is set by the pool's size rather than by what a serve holds —
+against a ~62 GiB Strix GTT aperture it trips only past ~54 GiB held, and
+against a 192 GiB MI300X only past ~176 GiB, so a leftover `llama-server`
+holding 10–20 GiB clears every lane. The process assertion catches that by
+name. Every external call the script makes is bounded by `timeout 15`, the
+`--assert-clear` scan included: that scan reads `/proc/<pid>/cmdline` for every
+process, and a holder wedged in uninterruptible sleep — the state this gate
+fires on — can block the read. A scan that does not finish **fails** the
+preflight, with its own message, rather than being taken as a clear host; so
+does a scan that could not be run at all — a missing script, a flag the two
+scripts disagree about — which gets a third message rather than being reported
+as a surviving process nobody can then find. The
+floor is kept rather than replaced because the converse is just as
+real and the process check cannot see it: a non-E2E tenant on a shared host can
+exhaust the pool while running nothing the reclaim rules match. The two
+Windows-native blocks remain PowerShell copies with the memory floor only; the
+two WSL blocks remain advisory, warning where these fail.
+
 `reclaim-gpu.sh` frees the GPU from engine processes a killed prior run leaked.
-The self-hosted Linux GPU lanes run it before their GPU preflight; the two
+The self-hosted Linux GPU lanes run it before their GPU preflight, and again
+with `--assert-clear` from inside the preflight once the memory floor is
+satisfied — that mode kills nothing, exits non-zero naming any leaked process
+still running, and reuses the same selection the reclaim itself acts on. The two
 native Windows lanes have no bash and restate the rule in PowerShell instead,
 with their root list pinned to the script's by an `xtask` contract test. The
 WSL lanes skip the proactive reclaim before preflight — they provision a fresh
@@ -1198,7 +1396,38 @@ cargo test -p rocmd event_collector
 cargo test -p rocmd event_collector_emits_endpoint_recoverable_service_event
 cargo test -p rocmd server_recover_local_webhook_does_not_restart_healthy_service
 cargo test -p rocmd recovery_reason_display_avoids_raw_status_tokens
+cargo test -p rocmd recovery_does_not_restart_a_service_whose_stop_is_unconfirmed
+cargo test -p rocmd recovery_skips_a_failed_service_only_while_its_stop_request_stands
+cargo test -p rocmd restart_managed_service_drops_the_replaced_runs_engine_pid
+cargo test -p rocmd supervisor_exit_write_keeps_a_standing_stop_marker
+cargo test -p rocmd supervisor_exit_write_leaves_a_record_it_no_longer_owns
+cargo test -p rocmd supervise_service_first_write_keeps_a_standing_stop_marker
+cargo test -p rocmd restart_failure_write_keeps_a_stop_marker_set_meanwhile
+cargo test -p rocmd restart_records_its_supervisor_without_erasing_a_stop_marker
+cargo test -p rocmd restart_leaves_a_record_naming_another_supervisor_or_none
+cargo test -p rocm --bin rocm stop_records_its_marker_on_disk_before_any_process_is_signalled
+cargo test -p rocm --bin rocm stop_does_not_confirm_when_a_restart_recorded_new_processes_meanwhile
+cargo test -p rocm --bin rocm stop_final_write_keeps_what_others_wrote_while_it_ran
+cargo test -p rocm --bin rocm restart_does_not_start_an_engine_over_an_unconfirmed_stop
+cargo test -p rocm --bin rocm restart_readiness_write_keeps_a_stop_asked_for_while_it_waited
+cargo test -p rocm --bin rocm restart_readiness_write_leaves_a_stop_that_finished_meanwhile
+cargo test -p rocm --bin rocm restart_reports_a_child_it_could_not_record_and_writes_nothing
+cargo test -p rocm --bin rocm restarted_child_record_names_the_runtime_the_restart_was_pinned_to
 ```
+
+Server recovery never restarts a service with a standing stop request
+(`stop_requested_unix_ms`): one whose stop is in flight, or could not be
+confirmed. Without that, an unconfirmed stop — which leaves the status at
+`ready` — would be undone by the `server-recover` watcher. So both stops
+(`rocmd`'s and `rocm services stop`) persist the marker before signalling
+anything, and the supervisor's and a restart's later writes re-read the
+record and never clear it. Each stop also re-reads the record before its own
+final write, and confirms the stop only if that record still names the
+processes it handled. `rocm services restart` (and the `restart_server`
+sandbox tool) starts a new engine only after its stop is confirmed; otherwise
+it reports the unconfirmed stop and starts nothing. Its own later writes are
+applied to the record as it is on disk, and only while it still reads as the
+restart left it, so a stop asked for during the restart keeps its marker.
 
 Automation GPU-metrics event tests:
 
@@ -1359,6 +1588,97 @@ The install is covered by unit tests over the generated plan (`cargo test -p
 rocm --bin rocm wsl_rocdxg`). Running it end to end needs a WSL2 host with
 `/dev/dxg` and dxcore present, since the plan refuses before installing
 otherwise.
+
+## /etc/os-release
+
+Every Rust reader of `/etc/os-release` parses it with
+[`os_release.rs`](../crates/rocm-core/src/os_release.rs), which returns the
+value `sh` would assign or nothing: the driver plan
+([`driver_install.rs`](../apps/rocm/src/driver_install.rs)), the OpenMPI,
+libatomic and libnuma install plans `rocm` runs before serving and the hints
+naming them ([`openmpi.rs`](../crates/rocm-core/src/openmpi.rs)), `rocm
+examine`'s distro fields ([`examine.rs`](../crates/rocm-core/src/examine.rs)),
+and the distro name it prints
+([`host_gpu.rs`](../crates/rocm-core/src/host_gpu.rs)). The one exception is
+`rocm diagnose --distro` run from Windows, which has the WSL distribution's own
+`sh` source the file and reports what it assigned.
+
+A line that is not a plain assignment makes the whole file unreadable, and
+each reader names that line instead of reporting an unknown distro. Where the
+message asks for a fix, it also says what to change on the line: LF line
+endings, single quotes around the value, or a `NAME=value` line in place of
+anything else.
+
+- `rocm install driver`: policy `unreadable_os_release`, no commands, and a
+  reason naming the line.
+- The OpenMPI, libatomic and libnuma installs: no commands, and the line ahead
+  of the manual-install advice in the plan's reason.
+- The hints naming those installs in vLLM's warnings and errors: the line
+  after the manual-install advice, and no offer of `rocm engines install vllm
+  --yes`, which would plan nothing. That command is offered only when its plan
+  has commands, so it is not offered for an unknown distribution either.
+- `rocm examine`: `distro: Linux (/etc/os-release line N is not a plain
+  assignment: "…")`; with `--json`, also an empty `distro_id` and
+  `distro_version`, the same line in `probe_failures`, and `status: degraded`
+  on an otherwise healthy GPU host.
+
+A CRLF file is unreadable too: `sh` would assign `ubuntu\r`.
+
+```bash
+cargo test -p rocm-core --lib os_release
+cargo test -p rocm-core --lib -- pretty_name_reads_as_sh_reads_it an_unreadable_os_release
+cargo test -p rocm-core --lib openmpi::tests
+cargo test -p rocm --bin rocm os_release
+cargo test -p rocm-core --lib --features e2e-test-hooks os_release_reads_follow_the_simulated_host_root
+```
+
+The parser tests that compare against `/bin/sh` itself are Linux-only. The last
+command plants a file under the simulated host root and checks that both
+`rocm examine` reads answer from it through the shared parser; the feature it
+needs is enabled only by its own CI step.
+
+`rocm examine` reads the file through the simulated host root (see Simulated
+Host Root in [release-trust.md](release-trust.md)), so scenarios
+`examine-20` to `examine-23` in
+[examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
+`examine-23` also plants a GPU in the kernel topology and puts an `lspci`
+listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
+lane, with or without a GPU:
+
+```bash
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-3] '
+```
+
+The install plans deliberately read the real file, so no scenario plants one
+for them; their parsing is covered by the unit tests above.
+
+## Windows Runtime Preflight
+
+On Windows, `rocm diagnose` compares the Visual C++ runtime in `System32`
+with the floor programs built with a recent toolset need, 14.40. The version
+comes from the file version of `msvcp140.dll` and `vcruntime140.dll`, and
+shows in `rocm examine --json` as `msvc_redist_version` (the older of the two,
+empty when neither could be read).
+
+```powershell
+rocm examine --json | ConvertFrom-Json | Select-Object msvc_redist_version
+rocm diagnose
+rocm fix fix-21-msvc-redist-outdated
+```
+
+On a machine whose runtime is older than 14.40, `diagnose` reports
+`fix-21-msvc-redist-outdated` with no symptom text. `rocm fix` prints the plan
+and runs nothing: the update needs the Windows administrator prompt. After the
+update, the plan's verify command prints the new version.
+
+The version comparison and the symptom keywords are covered by unit tests in
+`diagnose.rs`. No end-to-end scenario drives this check, because the e2e suite
+cannot give a Linux host a Windows runtime: the check is gated to Windows. The
+catalog scenarios (`diagnose-12`, `diagnose-34`) and the reference-doc
+scenarios (`skill-catalog-ids-match-cli` and its neighbours) do list and
+compare the new entry on every lane. A
+scenario that runs the check itself would need the Windows lane and a host
+with an old runtime installed.
 
 ## Model Fit Preflight
 

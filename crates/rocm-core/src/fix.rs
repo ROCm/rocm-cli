@@ -571,7 +571,7 @@ const RECIPES: &[FixRecipe] = &[
     FixRecipe {
         fix_id: "fix-15-msvc-redist",
         title: "Install the MSVC 2015-2022 runtime redistributable",
-        rationale: "The HIP SDK's amdhip64_X.dll links against the MSVC 2015-2022 runtime. When vcruntime140.dll / vcruntime140_1.dll aren't on PATH, `import torch` fails with a missing-DLL error that points at vcruntime140_1.dll, not at the HIP runtime itself.",
+        rationale: "Programs built with Visual C++ need the MSVC 2015-2022 runtime. That includes the HIP SDK's amdhip64_X.dll and the llama.cpp server that Lemonade installs. When vcruntime140.dll / vcruntime140_1.dll aren't on PATH, `import torch` fails with a missing-DLL error that points at vcruntime140_1.dll, not at the HIP runtime itself.",
         commands: &[
             "# Download and install (x64):",
             "#   https://aka.ms/vs/17/release/vc_redist.x64.exe",
@@ -582,7 +582,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_relogin: false,
         verify: "where vcruntime140.dll && where vcruntime140_1.dll",
         notes: &[
-            "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix.",
+            "If installing the redistributable still leaves a missing-DLL error, the failing DLL is probably amdhip64_X.dll itself; that points at fix-13-hip-sdk-missing rather than this fix. If the runtime is present but the program crashes with an access violation, see fix-21-msvc-redist-outdated.",
         ],
         doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
         applies_on: PRINT_ON_WINDOWS,
@@ -869,6 +869,35 @@ const RECIPES: &[FixRecipe] = &[
         // amdgpu module, and WSL2 ships the same 64 MB default a container does.
         // Print-only on both because every remedy above needs sudo.
         applies_on: PRINT_ON_LINUX_AND_WSL,
+        runner: None,
+    },
+    // A new id rather than a rename of `fix-15`: that entry means "the runtime is
+    // missing", and a stable id keeps its meaning. This one is "present but too
+    // old", which has a different cause, a different symptom and a different
+    // remedy (update, not install).
+    FixRecipe {
+        fix_id: "fix-21-msvc-redist-outdated",
+        title: "Update the MSVC 2015-2022 runtime redistributable",
+        rationale: "The Visual C++ runtime in System32 is older than 14.40. Programs built with a recent Visual C++ toolset, such as the llama.cpp server that Lemonade installs, need 14.40 or newer. On an older runtime they crash with an access violation (0xC0000005) inside MSVCP140.dll, and nothing says the runtime is the cause. The runtime is present, so there is no missing-DLL error. A copy bundled with another app, such as Python, can still make a presence check pass.",
+        commands: &[
+            "# Update the runtime (x64). This needs the Windows administrator prompt, so",
+            "# the command is shown here and not run for you:",
+            "winget install --id Microsoft.VCRedist.2015+.x64 --exact",
+            "# Or download and run the installer:",
+            "#   https://aka.ms/vs/17/release/vc_redist.x64.exe",
+            "# Then close and restart the program (or Lemonade) so it loads the new runtime.",
+        ],
+        needs_sudo: false,
+        needs_reboot: false,
+        needs_relogin: false,
+        verify: "powershell -NoProfile -Command \"(Get-Item $env:SystemRoot\\System32\\msvcp140.dll).VersionInfo.FileVersion\"",
+        notes: &[
+            "The verify command prints the runtime version. It should read 14.40 or higher.",
+            "`rocm fix` only prints this plan. It does not run the install: the install needs the Windows administrator prompt and your consent.",
+            "14.40 is the first runtime that matches the toolset where the standard library changed. A newer program can still ask for a newer runtime, so install the latest one.",
+        ],
+        doc_url: Some("https://aka.ms/vs/17/release/vc_redist.x64.exe"),
+        applies_on: PRINT_ON_WINDOWS,
         runner: None,
     },
 ];
@@ -2381,10 +2410,43 @@ mod tests {
         let count = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), count, "duplicate fix-id in RECIPES");
-        // 19 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
-        // fix-18-comgr-conflict and fix-19-shm-too-small among them) plus the
-        // 7 WSL ones.
-        assert_eq!(count, 26, "expected 26 catalog entries");
+        // 20 bare-metal/Windows entries (fix-16-vllm-oom, fix-17-torch-dlpack,
+        // fix-18-comgr-conflict, fix-19-shm-too-small and
+        // fix-21-msvc-redist-outdated among them) plus the 7 WSL ones.
+        assert_eq!(count, 27, "expected 27 catalog entries");
+    }
+
+    /// `rocm fix fix-21-msvc-redist-outdated` prints the plan and runs nothing.
+    ///
+    /// The plan includes a `winget install` line, and says the CLI does not run
+    /// it. This is the test that makes that sentence true: no runner, and the
+    /// only platform class is print-only. Letting the CLI run the install would
+    /// need the maintainers' agreement, because it takes the Windows
+    /// administrator prompt.
+    #[test]
+    fn the_outdated_runtime_recipe_is_print_only_on_windows() {
+        let recipe = RECIPES
+            .iter()
+            .find(|r| r.fix_id == "fix-21-msvc-redist-outdated")
+            .expect("the entry exists");
+        assert!(
+            recipe.runner.is_none(),
+            "an install must not be run for the user"
+        );
+        assert_eq!(recipe.applies_on.len(), 1);
+        assert_eq!(recipe.applies_on[0].os, "windows");
+        assert_eq!(recipe.applies_on[0].class, FixClass::PrintOnly);
+        assert!(
+            recipe
+                .commands
+                .contains(&"winget install --id Microsoft.VCRedist.2015+.x64 --exact")
+        );
+        assert!(
+            recipe
+                .notes
+                .iter()
+                .any(|n| n.contains("only prints this plan"))
+        );
     }
 
     /// Restored, not new. This PR made the `wsl` arm of the platform lookup

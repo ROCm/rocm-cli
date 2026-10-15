@@ -1306,3 +1306,205 @@ async fn assert_managed_comgr_copy_reported(world: &mut E2eWorld) {
          find the copy it put there. Reported copies:\n{copies:#?}"
     );
 }
+
+// ── A release file the runner does not have ────────────────────────
+
+/// Plant `body` as `/etc/os-release` under a simulated host root inside the
+/// scenario's isolated tree, and hand that root to the next `rocm` invocation.
+///
+/// The root holds nothing else, so every other re-rooted probe sees an empty
+/// machine; the scenarios here assert only the distribution fields.
+fn plant_os_release(world: &mut E2eWorld, body: &str) {
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .join("host-root");
+    std::fs::create_dir_all(root.join("etc")).expect("failed to create planted /etc");
+    std::fs::write(root.join("etc").join("os-release"), body)
+        .expect("failed to write planted os-release");
+    world
+        .command_env
+        .push(("ROCM_CLI_TEST_HOST_ROOT", root.into_os_string()));
+}
+
+#[given("a machine whose release file quotes every value in single quotes")]
+async fn os_release_single_quoted(world: &mut E2eWorld) {
+    plant_os_release(
+        world,
+        "NAME='Red Hat Enterprise Linux'\nID='rhel'\nID_LIKE='fedora'\nVERSION_ID='9.4'\n\
+         PRETTY_NAME='Red Hat Enterprise Linux 9.4 (Plow)'\n",
+    );
+}
+
+#[given("a machine whose release file names one distribution and then another")]
+async fn os_release_reassigned(world: &mut E2eWorld) {
+    // `sh` keeps the last assignment, so this file describes Rocky Linux 9.5.
+    plant_os_release(
+        world,
+        "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n\
+         ID=rocky\nVERSION_ID=\"9.5\"\nPRETTY_NAME=\"Rocky Linux 9.5 (Blue Onyx)\"\n",
+    );
+}
+
+#[given("a machine whose release file runs a command on line 3")]
+async fn os_release_with_a_command(world: &mut E2eWorld) {
+    // To `sh`, line 3 is a command that changes `ID`, so no value after it can
+    // be trusted: the file is unreadable rather than "Ubuntu".
+    plant_os_release(world, RUNS_A_COMMAND_ON_LINE_3);
+}
+
+/// A release file whose line 3 is a command that changes `ID`.
+const RUNS_A_COMMAND_ON_LINE_3: &str =
+    "ID=ubuntu\nVERSION_ID=\"24.04\"\nexport ID=debian\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n";
+
+#[given("a GPU machine whose release file runs a command on line 3")]
+async fn gpu_machine_with_unreadable_os_release(world: &mut E2eWorld) {
+    plant_os_release(world, RUNS_A_COMMAND_ON_LINE_3);
+    let root = world
+        .isolated_root
+        .as_ref()
+        .expect("no isolated root")
+        .path()
+        .to_owned();
+    // One GPU node in the kernel topology: a gfx1101 with no PCI address, so it
+    // matches no `lspci` entry and is listed from the topology alone.
+    let node = root.join("host-root/sys/class/kfd/kfd/topology/nodes/1");
+    std::fs::create_dir_all(&node).expect("failed to create planted KFD node");
+    std::fs::write(
+        node.join("properties"),
+        "cpu_cores_count 0\nsimd_count 120\ngfx_target_version 110001\n",
+    )
+    .expect("failed to write planted KFD node properties");
+    // An `lspci` that lists an empty bus, ahead of any real one, so the PCI
+    // probe succeeds on every runner without describing the runner's cards.
+    let bin = root.join("fake-bin");
+    std::fs::create_dir_all(&bin).expect("failed to create the fake PATH dir");
+    rocm_core::fake_executable::write_fake_executable(&bin.join("lspci"), "#!/bin/sh\nexit 0\n")
+        .expect("failed to write the fake lspci");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("PATH entries cannot hold a separator");
+    world.command_env.push(("PATH", path));
+}
+
+#[when("the user inspects that machine in machine-readable form")]
+async fn user_inspects_planted_machine(world: &mut E2eWorld) {
+    let (stdout, stderr, rc) =
+        crate::run_rocm_with_scenario_env(world, &["examine", "--framework", "skip", "--json"]);
+    world.cli_output = Some(stdout);
+    world.cli_stderr = Some(stderr);
+    world.cli_rc = Some(rc);
+}
+
+fn inspection_str<'a>(json: &'a serde_json::Value, pointer: &str) -> &'a str {
+    json.pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("`examine --json` has no string at {pointer}:\n{json:#}"))
+}
+
+/// The `probe_failures` entries that are about the release file.
+fn os_release_failures(json: &serde_json::Value) -> Vec<String> {
+    json.get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|failure| failure.contains("/etc/os-release"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[then(expr = "the inspection reports the distribution {string} version {string} named {string}")]
+async fn assert_reported_distribution(
+    world: &mut E2eWorld,
+    id: String,
+    version: String,
+    name: String,
+) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(inspection_str(&json, "/distro_id"), id, "{json:#}");
+    assert_eq!(
+        inspection_str(&json, "/distro_version"),
+        version,
+        "{json:#}"
+    );
+    assert_eq!(inspection_str(&json, "/summary/distro"), name, "{json:#}");
+}
+
+#[then("the inspection reports no trouble reading the release file")]
+async fn assert_os_release_read_cleanly(world: &mut E2eWorld) {
+    let json = parsed_json(world);
+    assert_eq!(os_release_failures(&json), Vec::<String>::new(), "{json:#}");
+}
+
+#[then(
+    expr = "the inspection's verdict is degraded, and its only failure is line {int} of the release file"
+)]
+async fn assert_degraded_by_os_release_alone(world: &mut E2eWorld, line: u32) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    // The GPU is what lets the verdict be `degraded` rather than `no-amd-gpu`.
+    assert_eq!(
+        json.get("has_amd_gpu").and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the planted GPU was not found:\n{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, &format!("/{VERDICT_FIELD}")),
+        "degraded",
+        "{json:#}"
+    );
+    let failures: Vec<&str> = json
+        .get("probe_failures")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("`examine --json` has no probe_failures array:\n{json:#}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        failures,
+        vec![format!(
+            "/etc/os-release line {line} is not a plain assignment: \"export ID=debian\"; \
+             the distro is not reported."
+        )],
+        "{json:#}"
+    );
+}
+
+#[then("the inspection reports no distribution")]
+async fn assert_no_distribution(world: &mut E2eWorld) {
+    assert_eq!(world.cli_rc, Some(0), "`rocm examine --json` failed");
+    let json = parsed_json(world);
+    assert_eq!(inspection_str(&json, "/distro_id"), "", "{json:#}");
+    assert_eq!(inspection_str(&json, "/distro_version"), "", "{json:#}");
+    // Not the "Ubuntu 24.04 LTS" the file assigns before the command.
+    assert!(
+        inspection_str(&json, "/summary/distro").starts_with("Linux ("),
+        "{json:#}"
+    );
+}
+
+#[then(
+    expr = "the inspection says line {int} of the release file is not a plain assignment, in its failures and in the distribution name"
+)]
+async fn assert_os_release_line_reported(world: &mut E2eWorld, line: u32) {
+    let json = parsed_json(world);
+    let reason =
+        format!("/etc/os-release line {line} is not a plain assignment: \"export ID=debian\"");
+    // `probe_failures` is what a tool reads; the distribution name is what the
+    // person reading `rocm examine` sees.
+    assert_eq!(
+        os_release_failures(&json),
+        vec![format!("{reason}; the distro is not reported.")],
+        "{json:#}"
+    );
+    assert_eq!(
+        inspection_str(&json, "/summary/distro"),
+        format!("Linux ({reason})"),
+        "{json:#}"
+    );
+}
