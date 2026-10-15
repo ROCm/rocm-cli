@@ -664,8 +664,12 @@ rocm logs --search error timeout")]
     /// stopped, nothing is removed, the command exits non-zero, and it names
     /// what to repair or stop by hand. A server or helper that was recorded by
     /// an older version, with no start time to prove its pid, is refused rather
-    /// than killed: stop it yourself and re-run. A run that keeps the binaries
-    /// and data (`--keep-binaries --keep-data`) leaves running servers alone.
+    /// than killed: stop it yourself and re-run, as when the helper's runtime
+    /// state cannot be read. If the stop pass aborts after stopping some
+    /// services (or the helper), those stay stopped with their keys dropped;
+    /// the error lists the commands that bring them back. A run that keeps the
+    /// binaries and data (`--keep-binaries --keep-data`) leaves running servers
+    /// alone.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -13729,9 +13733,13 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
     // stop pass runs at all: a run that keeps the tooling does not check.
     let removes_recovery_tooling = plan_removes_recovery_tooling(&plan, paths);
     let mut preflight_refusal: Option<String> = None;
+    let mut preflight_warnings: Vec<String> = Vec::new();
     if removes_recovery_tooling && services_read_error.is_none() {
         match uninstall_gate::uninstall_preflight(paths) {
-            Ok(report) => preflight_refusal = uninstall_gate::preflight_refusal_line(&report),
+            Ok(report) => {
+                preflight_refusal = uninstall_gate::preflight_refusal_line(&report);
+                preflight_warnings = report.warnings;
+            }
             Err(error) => {
                 preflight_refusal = Some(format!(
                     "uninstall will refuse to remove anything, and will stop nothing, until the \
@@ -13741,10 +13749,14 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
             }
         }
     }
-    let run_refuses = preflight_refusal.is_some() || services_read_error.is_some();
+    let refusal_line_present = preflight_refusal.is_some();
+    let run_refuses = refusal_line_present || services_read_error.is_some();
     if let Some(line) = preflight_refusal {
         plan.warnings.push(line);
     }
+    // The fail-open disclosures the stop pass would make, shown while the
+    // operator can still decline rather than only after they have confirmed.
+    plan.warnings.append(&mut preflight_warnings);
 
     if !managed_services.is_empty() {
         // Two independent conditions decide whether a server actually gets
@@ -13785,9 +13797,12 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
 
     // The helper is reported whether or not any service record exists: a live
     // `rocmd` with an empty services directory still gets force-stopped.
-    if let Some(note) =
-        uninstall_gate::background_helper_plan_note(paths, removes_recovery_tooling, run_refuses)
-    {
+    if let Some(note) = uninstall_gate::background_helper_plan_note(
+        paths,
+        removes_recovery_tooling,
+        run_refuses,
+        refusal_line_present,
+    ) {
         plan.warnings.push(note);
     }
 
@@ -27685,6 +27700,7 @@ install therock";
             }],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let error = uninstall_removal_gate(&report)
             .expect_err("a non-empty `failed` must abort uninstall")
@@ -27714,6 +27730,10 @@ install therock";
         // said "No files were removed" would read as "nothing happened".
         let report = ManagedServiceStopReport {
             stopped: vec!["svc-public".to_owned()],
+            relaunch: vec![format!(
+                "svc-public: `{}`",
+                rocm_engine_protocol::relaunch_command("0.0.0.0", true)
+            )],
             failed: vec![FailedManagedServiceStop {
                 service_id: "svc-stuck".to_owned(),
                 reason: "still \"ready\" after the stop attempt".to_owned(),
@@ -27797,6 +27817,7 @@ install therock";
             ],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
 
         let error = uninstall_removal_gate(&report)
@@ -28015,9 +28036,34 @@ install therock";
             require_auth: bool,
             refusal_status: u16,
         ) -> Option<Self> {
+            Self::bind_at(model_id, bind_host, 0, require_auth, refusal_status)
+        }
+
+        /// Both loopback families on ONE port: `v6_model` on `::1` and
+        /// `v4_model` on `127.0.0.1`, so a test about a wildcard record owns
+        /// both halves and no concurrent test can grab the v4 side of its port.
+        /// `None` when this host has no IPv6 loopback.
+        fn bind_loopback_pair(v6_model: &str, v4_model: &str) -> Option<(Self, Self)> {
+            for _ in 0..50 {
+                let v4 = Self::bind(v4_model, "127.0.0.1", false)?;
+                if let Some(v6) = Self::bind_at(v6_model, "::1", v4.port, false, 401) {
+                    return Some((v6, v4));
+                }
+                // The port was free on v4 but taken on v6: try another.
+            }
+            None
+        }
+
+        fn bind_at(
+            model_id: &str,
+            bind_host: &'static str,
+            port: u16,
+            require_auth: bool,
+            refusal_status: u16,
+        ) -> Option<Self> {
             use std::sync::atomic::Ordering;
 
-            let listener = std::net::TcpListener::bind((bind_host, 0)).ok()?;
+            let listener = std::net::TcpListener::bind((bind_host, port)).ok()?;
             let port = listener.local_addr().ok()?.port();
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopping = std::sync::Arc::clone(&shutdown);
@@ -28214,7 +28260,10 @@ install therock";
         // — answers on `::1` and refuses `127.0.0.1`. Probing IPv4 alone reads
         // that live, port-holding engine as gone and removes the tooling anyway,
         // which is EAI-8014 reached through the address family.
-        let Some(endpoint) = ServingEndpoint::bind("amd/v6-model", "::1", false) else {
+        // The v4 half of the same port is held by a listener that names no
+        // models, so no concurrent test can bind it and answer for the engine.
+        let Some((endpoint, v4_holder)) = ServingEndpoint::bind_loopback_pair("amd/v6-model", "")
+        else {
             // No IPv6 on this host: the thing under test cannot be staged. Say
             // so on stderr rather than returning green and silent — a skip that
             // looks identical to a pass is how a lane stops covering something
@@ -28267,6 +28316,60 @@ install therock";
             "the gate must refuse to remove anything"
         );
         drop(endpoint);
+        drop(v4_holder);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stranger_on_one_loopback_family_does_not_hide_the_record_serving_on_the_other() {
+        // `probe_records_for_survivors` used to identity-probe only the FIRST
+        // loopback family that accepted a connection. Here `127.0.0.1` answers
+        // first with another model (proceed), while the record's own model still
+        // serves on `::1`: a first-hit probe waved the removal through.
+        let Some((v6_engine, v4_stranger)) =
+            ServingEndpoint::bind_loopback_pair("amd/dual-model", "amd/someone-elses-model")
+        else {
+            eprintln!(
+                "SKIPPED a_stranger_on_one_loopback_family_does_not_hide_the_record_serving_on_\
+                 the_other: no IPv6 loopback on this host"
+            );
+            return;
+        };
+        let (root, paths) = test_paths("uninstall-dual-family");
+        let mut record = ManagedServiceRecord::new(
+            &paths,
+            "svc-dual",
+            "vllm",
+            "amd/dual-model",
+            "amd/dual-model",
+            "::",
+            v6_engine.port,
+            "managed",
+            0,
+            None,
+            None,
+            None,
+        );
+        record.status = "stopped".to_owned();
+        record.write().expect("write service record");
+
+        let report =
+            stop_managed_services_before_uninstall(&paths).expect("stop pass should succeed");
+
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.service_id == "svc-dual"
+                    && failure.remedy == StopFailureRemedy::StopWhatHoldsThePort),
+            "the record's own model still serving on ::1 must block: {report:?}"
+        );
+        assert!(
+            uninstall_removal_gate(&report).is_err(),
+            "the gate must refuse to remove anything"
+        );
+        drop(v6_engine);
+        drop(v4_stranger);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -29024,6 +29127,7 @@ install therock";
             failed: Vec::new(),
             warnings: Vec::new(),
             helper_stopped: true,
+            ..ManagedServiceStopReport::default()
         };
         assert_eq!(
             uninstall_removal_gate(&report).unwrap().as_deref(),
@@ -29035,6 +29139,10 @@ install therock";
     fn the_stopped_service_advice_names_a_serve_command_that_restores_a_public_bind() {
         let report = ManagedServiceStopReport {
             stopped: vec!["svc-a".to_owned()],
+            relaunch: vec![format!(
+                "svc-a: `{}`",
+                rocm_engine_protocol::relaunch_command("0.0.0.0", true)
+            )],
             failed: vec![FailedManagedServiceStop {
                 service_id: "svc-b".to_owned(),
                 reason: "r".to_owned(),
@@ -29045,15 +29153,15 @@ install therock";
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert!(
-            message.contains("rocm serve <model> --host <host> --port <port>`, adding `--allow-public-bind` for a public host"),
-            "without --host a serve binds loopback and the public service does not return: {message}"
+            message.contains(&format!(
+                "svc-a: `{}`",
+                rocm_engine_protocol::relaunch_command("0.0.0.0", true)
+            )) && message.contains("--allow-public-bind"),
+            "the stopped public service gets the command that restores its bind: {message}"
         );
-        // The same wording the two refusals use, from one builder: a keyed
-        // service needs `--require-api-key`, and the key itself is optional.
-        assert!(
-            message.contains("`--require-api-key` for a keyed one"),
-            "{message}"
-        );
+        // The same builder the two refusals use: a keyed service gets
+        // `--require-api-key`, and the key itself is optional.
+        assert!(message.contains("--require-api-key"), "{message}");
         assert!(
             message.contains(rocm_engine_protocol::RELAUNCH_KEY_CHOICE),
             "{message}"
@@ -29144,6 +29252,7 @@ install therock";
             }],
             warnings: Vec::new(),
             helper_stopped: true,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&failed_after).unwrap_err());
         assert!(
@@ -29160,6 +29269,7 @@ install therock";
             failed: Vec::new(),
             warnings: Vec::new(),
             helper_stopped: true,
+            ..ManagedServiceStopReport::default()
         };
         assert_eq!(
             uninstall_removal_gate(&ok).unwrap().as_deref(),
@@ -29992,6 +30102,238 @@ install therock";
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A live helper whose identity verifies: the one state in which the plan's
+    /// helper line can promise a stop.
+    #[cfg(target_os = "linux")]
+    fn plant_verified_helper(paths: &AppPaths) -> std::process::Child {
+        let helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let mut state = runtime_state(true, helper.id());
+        state.daemon_start_ticks = rocm_core::process_start_ticks(helper.id());
+        state.write(paths).expect("write runtime state");
+        helper
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_verified_helper_is_left_running_by_a_run_that_refuses_on_a_tickless_service() {
+        // The plan is the last thing read before confirming. With a verified live
+        // helper and a service whose live pid has no recorded start time, the run
+        // refuses before stopping anything, so the helper must not be described as
+        // about to be stopped, and the stop pass must leave it alone: no helper
+        // termination, no per-service stop.
+        let mut helper = None;
+        let (root, paths) = test_paths("uninstall-helper-with-refusing-service");
+        helper.replace(plant_verified_helper(&paths));
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a live managed server");
+        let mut record = managed_record_for_pid(&paths, server.id(), None);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let note = plan_warning_containing(&plan, "background helper (rocmd")
+            .expect("the plan names the live helper");
+        assert!(
+            note.contains("left running") && !note.contains("will be stopped"),
+            "the helper line must not promise a stop on a run that refuses: {note}"
+        );
+        assert!(
+            plan_warning_containing(&plan, "will refuse to remove anything").is_some(),
+            "{:?}",
+            plan.warnings
+        );
+
+        let stops = std::sync::atomic::AtomicUsize::new(0);
+        let terminations = std::sync::atomic::AtomicUsize::new(0);
+        let report = stop_managed_services_with_helper_stop(
+            &paths,
+            |_, _| {
+                stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((serde_json::json!({ "status": "stopped" }), true))
+            },
+            |_, _| {
+                terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                rocm_core::TerminationOutcome::Graceful
+            },
+        )
+        .expect("stop pass");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.remedy == StopFailureRemedy::ConfirmTheServicePid),
+            "the run refuses exactly as the plan said: {report:?}"
+        );
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(terminations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!report.helper_stopped, "{report:?}");
+        let mut helper = helper.take().expect("helper");
+        assert!(helper.try_wait().expect("poll").is_none(), "left running");
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_verified_helper_is_left_running_by_a_run_whose_service_records_cannot_be_read() {
+        // A `*.json` entry that is a directory cannot be read, as root or not, so
+        // the plan's own read of the records fails and the stop pass errors. The
+        // helper line must say the same thing the abort does: left running.
+        let (root, paths) = test_paths("uninstall-helper-with-unreadable-records");
+        let mut helper = plant_verified_helper(&paths);
+        fs::create_dir_all(paths.services_dir().join("boom.json"))
+            .expect("plant an unreadable entry");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        assert!(
+            plan_warning_containing(&plan, "could not read the managed service records")
+                .is_some_and(|line| line.contains("will refuse to remove anything")),
+            "{:?}",
+            plan.warnings
+        );
+        let note = plan_warning_containing(&plan, "background helper (rocmd")
+            .expect("the plan names the live helper");
+        assert!(
+            note.contains("left running") && !note.contains("will be stopped"),
+            "the helper line must not promise a stop on a run that aborts: {note}"
+        );
+
+        let terminations = std::sync::atomic::AtomicUsize::new(0);
+        let outcome = stop_managed_services_with_helper_stop(
+            &paths,
+            |_, _| panic!("no service may be stopped"),
+            |_, _| {
+                terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                rocm_core::TerminationOutcome::Graceful
+            },
+        );
+        assert!(outcome.is_err(), "the unreadable records abort the pass");
+        assert_eq!(terminations.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(helper.try_wait().expect("poll").is_none(), "left running");
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_verified_helper_is_stopped_by_a_run_that_proceeds_and_the_plan_says_so() {
+        let (root, paths) = test_paths("uninstall-helper-proceeds");
+        let mut helper = plant_verified_helper(&paths);
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let note = plan_warning_containing(&plan, "background helper (rocmd")
+            .expect("the plan names the live helper");
+        assert!(note.contains("will be stopped before removal"), "{note}");
+        let terminations = std::sync::atomic::AtomicUsize::new(0);
+        let report = stop_managed_services_with_helper_stop(
+            &paths,
+            |_, _| panic!("no services"),
+            |_, _| {
+                terminations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                rocm_core::TerminationOutcome::Graceful
+            },
+        )
+        .expect("stop pass");
+        assert_eq!(terminations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            report.helper_stopped && report.failed.is_empty(),
+            "{report:?}"
+        );
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unverifiable_helper_is_named_by_a_plan_that_also_cannot_read_the_records() {
+        // The records-read error aborts the run before the helper is looked at, so
+        // the pre-flight refusal line is absent; the helper line must still name the
+        // unverifiable helper and promise a refusal, never a stop.
+        let (root, paths) = test_paths("uninstall-unverifiable-helper-and-unreadable");
+        let mut helper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the helper stand-in");
+        let mut state = runtime_state(true, helper.id());
+        state.daemon_start_ticks = None;
+        state.write(&paths).expect("write runtime state");
+        fs::create_dir_all(paths.services_dir().join("boom.json"))
+            .expect("plant an unreadable entry");
+
+        let plan = build_uninstall_plan(&paths, &full_plan_options()).expect("build the plan");
+        let line = plan
+            .warnings
+            .iter()
+            .find(|line| line.contains("rocmd") && line.contains("identity could not be verified"))
+            .unwrap_or_else(|| panic!("the helper is named: {:?}", plan.warnings));
+        assert!(
+            line.contains("will refuse to remove anything") && !line.contains("will be stopped"),
+            "{line}"
+        );
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_helper_that_cannot_be_confirmed_stopped_stops_no_service_after_it() {
+        // The helper is stopped first so it cannot respawn what the services pass
+        // stops; if that stop does not confirm, no service may be stopped, since
+        // each stop drops that service's endpoint key for good.
+        let mut helper = plant_verified_helper(&test_paths("unused").1);
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let (root, paths) = test_paths("uninstall-helper-timeout-stops-no-service");
+        let mut helper = plant_verified_helper(&paths);
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn a live managed server");
+        let ticks = rocm_core::process_start_ticks(server.id());
+        let mut record = managed_record_for_pid(&paths, server.id(), ticks);
+        record.status = "ready".to_owned();
+        record.write().expect("write service record");
+
+        let stops = std::sync::atomic::AtomicUsize::new(0);
+        let report = stop_managed_services_with_helper_stop(
+            &paths,
+            |_, _| {
+                stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((serde_json::json!({ "status": "stopped" }), true))
+            },
+            |_, _| rocm_core::TerminationOutcome::TimedOut,
+        )
+        .expect("stop pass");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|failure| failure.remedy == StopFailureRemedy::StopTheDaemon),
+            "{report:?}"
+        );
+        assert_eq!(
+            stops.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no service may be stopped once the helper stop failed: {report:?}"
+        );
+        assert!(report.stopped.is_empty(), "{report:?}");
+        let _ = helper.kill();
+        let _ = helper.wait();
+        let _ = server.kill();
+        let _ = server.wait();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn a_resolvable_host_with_nothing_listening_is_not_a_fail_open() {
@@ -30119,6 +30461,10 @@ install therock";
     fn the_abort_names_what_the_run_already_stopped_and_the_helper_it_signalled() {
         let report = ManagedServiceStopReport {
             stopped: vec!["svc-down".to_owned()],
+            relaunch: vec![format!(
+                "svc-down: `{}`",
+                rocm_engine_protocol::relaunch_command("0.0.0.0", true)
+            )],
             failed: vec![
                 FailedManagedServiceStop {
                     service_id: "svc-stuck".to_owned(),
@@ -30408,6 +30754,7 @@ install therock";
             failed: Vec::new(),
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let line = uninstall_removal_gate(&report).expect("all stopped must proceed");
         assert_eq!(
@@ -30904,6 +31251,7 @@ install therock";
             failed: vec![failure("svc-a"), failure("svc-b")],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert_eq!(
@@ -30934,6 +31282,7 @@ install therock";
             ],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert_eq!(
@@ -30963,6 +31312,7 @@ install therock";
             ],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert!(
@@ -31025,6 +31375,7 @@ install therock";
             }],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
         assert!(
@@ -31078,6 +31429,7 @@ install therock";
                 }],
                 warnings: Vec::new(),
                 helper_stopped: false,
+                ..ManagedServiceStopReport::default()
             };
             let message = format!("{:#}", uninstall_removal_gate(&report).unwrap_err());
             assert_eq!(
@@ -31099,6 +31451,7 @@ install therock";
             }],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&repair_only).unwrap_err());
         assert!(!message.contains("may still be serving"), "{message}");
@@ -31112,6 +31465,7 @@ install therock";
             }],
             warnings: Vec::new(),
             helper_stopped: false,
+            ..ManagedServiceStopReport::default()
         };
         let message = format!("{:#}", uninstall_removal_gate(&service).unwrap_err());
         assert!(message.contains("may still be serving"), "{message}");

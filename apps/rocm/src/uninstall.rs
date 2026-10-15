@@ -1784,6 +1784,7 @@ mod stop_gate_tests {
                 }],
                 warnings: Vec::new(),
                 helper_stopped: false,
+                ..ManagedServiceStopReport::default()
             })
         })
         .expect_err("an unconfirmed stop must abort uninstall");
@@ -1833,6 +1834,7 @@ mod stop_gate_tests {
                 }],
                 warnings: Vec::new(),
                 helper_stopped: false,
+                ..ManagedServiceStopReport::default()
             })
         })
         .expect_err("an unstopped background helper must abort uninstall");
@@ -1991,6 +1993,7 @@ mod stop_gate_tests {
                 failed: Vec::new(),
                 warnings: Vec::new(),
                 helper_stopped: false,
+                ..ManagedServiceStopReport::default()
             })
         })
         .expect("a confirmed stop must let uninstall proceed");

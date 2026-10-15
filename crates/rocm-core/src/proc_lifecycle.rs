@@ -134,6 +134,11 @@ pub fn identity_state(id: &ProcessIdentity) -> IdentityState {
 /// they were called pin it deterministically instead. They are `FnOnce`
 /// generics, so this costs nothing at runtime — the real call above
 /// monomorphizes back into the same two direct calls.
+///
+/// What the tests pin is THIS function's ordering. That [`identity_state`]
+/// hands it the reading as a closure, not as a value it read first, is the one
+/// line `|| process_start_ticks(id.pid)` there, and no test can see it: a dead
+/// PID reads `None` either way. Keep that line a closure.
 fn identity_state_from_probes(
     id: &ProcessIdentity,
     is_live: impl FnOnce() -> bool,
@@ -540,8 +545,9 @@ mod tests {
     #[test]
     fn windows_start_time_is_none_for_an_unopenable_pid_and_differs_per_process() {
         assert_eq!(process_start_ticks(u32::MAX - 1), None);
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
             .spawn()
             .expect("spawn a child");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -561,12 +567,13 @@ mod tests {
 
     #[test]
     fn a_dead_process_is_never_read_for_a_start_time() {
-        // The ordering this module's safety rests on, pinned rather than
-        // inspected. If the reading is ever hoisted back into argument
-        // position — which reads as a harmless inlining — it happens before the liveness
-        // check, and a PID that exits and is recycled in between comes back
-        // `Matches`: the one verdict that authorises a kill, for a process that
-        // is no longer the recorded one.
+        // The ordering inside `identity_state_from_probes`, pinned rather than
+        // inspected: the reading is taken only after the liveness check passes.
+        // If it were ever read first, a PID that exits and is recycled in between
+        // comes back `Matches`: the one verdict that authorises a kill, for a
+        // process that is no longer the recorded one. This covers the helper
+        // only; `identity_state` passing the reading lazily is not observable
+        // from a test (a dead PID reads `None` either way).
         //
         // The real race is microseconds wide and needs a PID-space wrap, so it
         // cannot be staged. This stages the observable consequence instead: a
@@ -594,8 +601,8 @@ mod tests {
         );
         assert!(
             !read_start_ticks,
-            "the start time must not be read at all once liveness has failed — if it was, the \
-             read is back in argument position and the recycle race is inverted"
+            "`identity_state_from_probes` must not read the start time once liveness has \
+             failed; this pins that helper's ordering only, not how `identity_state` calls it"
         );
     }
 

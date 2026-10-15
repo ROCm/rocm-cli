@@ -27,7 +27,7 @@ use crate::{
 /// The reason is carried rather than discarded so the abort message says what
 /// went wrong — an operator facing "could not stop svc-x" with no cause has
 /// nothing to act on.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct FailedManagedServiceStop {
     pub(crate) service_id: String,
     pub(crate) reason: String,
@@ -232,6 +232,10 @@ pub(crate) struct ManagedServiceStopReport {
     /// disclosure part of this function's answer, and `stderr` the caller's
     /// business.
     pub(crate) warnings: Vec<String>,
+    /// One relaunch command per entry of `stopped`, built from that service's own
+    /// record by the shared `rocm_engine_protocol::relaunch_command`, so the
+    /// abort message names the flags each one needs instead of a generic line.
+    pub(crate) relaunch: Vec<String>,
     /// The background helper (`rocmd`) was stopped by this pass. Kept apart from
     /// `stopped` because it is not a service: it has no endpoint key, and the
     /// consequence of its being down is that nothing supervises or recovers
@@ -347,19 +351,36 @@ fn helper_refusal(paths: &AppPaths, decision: &HelperDecision) -> Option<FailedM
 /// stop that pass then refuses.
 ///
 /// `None` when there is nothing to say: nothing to stop, or a refusal the plan's
-/// consolidated refusal line already names. `run_refuses` is whether that line
-/// is present: a helper that is verified but sits in a run which aborts before
-/// the stop is left running, and saying "will be stopped" would be false.
+/// consolidated refusal line already names. `run_refuses` is whether the run
+/// aborts before stopping anything: a helper that is verified but sits in such a
+/// run is left running, and saying "will be stopped" would be false.
+/// `refusal_line_present` is whether the pre-flight ran and its refusal line is
+/// in the plan; it is absent when the service records could not be read at all,
+/// and then a helper that cannot be verified has to be named here.
 pub(crate) fn background_helper_plan_note(
     paths: &AppPaths,
     removes_recovery_tooling: bool,
     run_refuses: bool,
+    refusal_line_present: bool,
 ) -> Option<String> {
     let state_file = paths.automation_state_path();
-    match (helper_decision(paths), removes_recovery_tooling) {
+    let decision = helper_decision(paths);
+    match (&decision, removes_recovery_tooling) {
         (HelperDecision::NothingToStop, _) => None,
         // Named by the refusal line, which comes from the same decision.
-        (HelperDecision::UnreadableState(_) | HelperDecision::Unverifiable { .. }, true) => None,
+        (HelperDecision::UnreadableState(_) | HelperDecision::Unverifiable { .. }, true)
+            if refusal_line_present =>
+        {
+            None
+        }
+        (HelperDecision::UnreadableState(_) | HelperDecision::Unverifiable { .. }, true) => {
+            helper_refusal(paths, &decision).map(|failure| {
+                format!(
+                    "{} ({}); uninstall will refuse to remove anything until this is resolved",
+                    failure.service_id, failure.reason
+                )
+            })
+        }
         (HelperDecision::UnreadableState(error), false) => Some(format!(
             "could not read the background helper's runtime state {}: {error}. This run keeps \
              the tooling, so it does not check it",
@@ -473,18 +494,10 @@ pub(crate) const fn daemon_identity_outcome(
 /// never-started case, and there is no pid to verify or signal without it — but
 /// it does mean the gate is only as good as the state file. An unreadable one is
 /// the case that aborts; an absent one is the case that proceeds.
-pub(crate) fn stop_background_helper_before_uninstall(
-    paths: &AppPaths,
-    report: &mut ManagedServiceStopReport,
-) {
-    stop_background_helper_with(paths, report, |identity, scope| {
-        rocm_core::terminate_verified(identity, scope, MANAGED_STOP_GRACE, true)
-    });
-}
-
-/// [`stop_background_helper_before_uninstall`] with the verified termination
-/// injectable, so a test can make the stop come back unconfirmed and see the
-/// [`HELPER_KILL_SCOPE`] the production stop asks for.
+///
+/// The verified termination is a parameter, so a test can make the stop come
+/// back unconfirmed and see the [`HELPER_KILL_SCOPE`] the production stop asks
+/// for; production passes `terminate_verified` with `force`.
 pub(crate) fn stop_background_helper_with(
     paths: &AppPaths,
     report: &mut ManagedServiceStopReport,
@@ -615,6 +628,15 @@ fn preflight_with_records(
     paths: &AppPaths,
 ) -> Result<(ManagedServiceStopReport, Vec<ManagedServiceRecord>)> {
     let mut report = ManagedServiceStopReport::default();
+    // One reading of the helper serves the whole pre-flight, and its refusal is
+    // appended to whatever else refuses, so the plan can name it on a run that
+    // already refuses for another reason instead of the operator learning of it
+    // only on the retry.
+    let helper_failure = helper_refusal(paths, &helper_decision(paths));
+    let with_helper = |mut report: ManagedServiceStopReport| {
+        report.failed.extend(helper_failure.clone());
+        report
+    };
     // A manifest that exists but does not parse can describe a live,
     // GPU-holding server; `load_managed_services` skips it silently.
     for manifest in unreadable_service_manifests(paths)? {
@@ -629,7 +651,7 @@ fn preflight_with_records(
         });
     }
     if !report.failed.is_empty() {
-        return Ok((report, Vec::new()));
+        return Ok((with_helper(report), Vec::new()));
     }
     let records = load_managed_services(paths)?;
     // A live record with no recorded start time cannot prove its pid is still the
@@ -653,17 +675,11 @@ fn preflight_with_records(
         }
     }
     if !report.failed.is_empty() {
-        return Ok((report, records));
+        return Ok((with_helper(report), records));
     }
     let partition = partition_records(&records);
     probe_records_for_survivors(paths, &partition.already_stopped, &[], &mut report);
-    if !report.failed.is_empty() {
-        return Ok((report, records));
-    }
-    if let Some(failure) = helper_refusal(paths, &helper_decision(paths)) {
-        report.failed.push(failure);
-    }
-    Ok((report, records))
+    Ok((with_helper(report), records))
 }
 
 /// [`preflight_with_records`] for the plan: the refusals a run would hit and the
@@ -734,6 +750,22 @@ pub(crate) fn stop_managed_services_confirmed_with(
     paths: &AppPaths,
     stop_service: impl Fn(&AppPaths, &str) -> Result<(serde_json::Value, bool)>,
 ) -> Result<ManagedServiceStopReport> {
+    stop_managed_services_with_helper_stop(paths, stop_service, |identity, scope| {
+        rocm_core::terminate_verified(identity, scope, MANAGED_STOP_GRACE, true)
+    })
+}
+
+/// [`stop_managed_services_confirmed_with`] with the helper's termination
+/// injectable too, so a test can make the helper stop come back unconfirmed
+/// and see that no service is stopped after it.
+pub(crate) fn stop_managed_services_with_helper_stop(
+    paths: &AppPaths,
+    stop_service: impl Fn(&AppPaths, &str) -> Result<(serde_json::Value, bool)>,
+    terminate_helper: impl FnOnce(
+        &rocm_core::ProcessIdentity,
+        rocm_core::KillScope,
+    ) -> rocm_core::TerminationOutcome,
+) -> Result<ManagedServiceStopReport> {
     // The refusals are decided before anything is stopped, by the function the
     // plan also calls. Past this point a stop can still fail, the helper can
     // still not die, and a survivor can still answer after the stops, so the
@@ -743,7 +775,7 @@ pub(crate) fn stop_managed_services_confirmed_with(
         return Ok(report);
     }
     let partition = partition_records(&records);
-    stop_background_helper_before_uninstall(paths, &mut report);
+    stop_background_helper_with(paths, &mut report, terminate_helper);
     if !report.failed.is_empty() {
         return Ok(report);
     }
@@ -758,7 +790,14 @@ pub(crate) fn stop_managed_services_confirmed_with(
         // this, an uninstall with a live server reads as a hang.
         println!("stopping managed service {}", record.service_id);
         match stop_service(paths, &record.service_id) {
-            Ok((_, true)) => report.stopped.push(record.service_id.clone()),
+            Ok((_, true)) => {
+                report.stopped.push(record.service_id.clone());
+                report.relaunch.push(format!(
+                    "{}: `{}`",
+                    record.service_id,
+                    rocm_engine_protocol::relaunch_command(&record.host, record.requires_api_key)
+                ));
+            }
             Ok((result, false)) => {
                 let status = result
                     .get("status")
@@ -847,11 +886,12 @@ fn probe_records_for_survivors(
         // the one the identity probe below has to talk to, so keep it rather
         // than re-deriving a single host and guessing the family wrong.
         let candidates = probe_hosts(&record.host);
-        let Some(reachable_host) = candidates
+        let reachable_hosts: Vec<String> = candidates
             .iter()
-            .find(|candidate| loopback_tcp_port_is_reachable(candidate, record.port))
+            .filter(|candidate| loopback_tcp_port_is_reachable(candidate, record.port))
             .cloned()
-        else {
+            .collect();
+        if reachable_hosts.is_empty() {
             // Not reaching the port is the normal, silent case: nothing is
             // listening, which is what a stopped service looks like. But
             // `loopback_tcp_port_is_reachable` returns the same `false` when the
@@ -876,73 +916,96 @@ fn probe_records_for_survivors(
                 ));
             }
             continue;
-        };
+        }
         let stopped_by_this_pass = attempted
             .iter()
             .any(|candidate| candidate.service_id == record.service_id);
         if !stopped_by_this_pass {
             let endpoint_api_key = endpoint_keys::endpoint_api_key(paths, &record.service_id);
-            // Ask the same address the reachability probe just succeeded against.
-            // `record.endpoint_url` is built from the recorded host, so a `0.0.0.0`
-            // or `::` bind would be connected to literally — which does not
-            // resolve, fails the probe, and takes the fail-open branch below,
-            // removing the tooling while a wildcard-bound engine is still
-            // serving. That is the defect this gate exists to close, so the
-            // identity probe gets the normalized host too.
-            let mut probe_record = record.clone();
-            probe_record.endpoint_url =
-                rocm_core::format_http_base_url(&reachable_host, record.port);
-            let probe = rocm_core::managed_service_endpoint_identity(
-                &probe_record,
-                endpoint_api_key.as_deref(),
-                ENDPOINT_IDENTITY_PROBE_TIMEOUT,
-            );
-            // Short-circuits: the extra round trip only happens when the probe
-            // produced no usable listing, which is the only case its answer can
-            // change.
-            let auth_refused = probe.is_err()
-                && endpoint_refused_authorization(
-                    &probe_record.endpoint_url,
+            // A wildcard record is probed on every loopback family that accepts
+            // a connection, and ANY of them blocking blocks the removal: a
+            // stranger answering on `127.0.0.1` must not hide the record's own
+            // model still serving on `::1`. Each probe asks the address the
+            // reachability probe just succeeded against, because
+            // `record.endpoint_url` is built from the recorded host, so a
+            // `0.0.0.0` or `::` bind would be connected to literally — which
+            // does not resolve, fails the probe, and takes a fail-open branch,
+            // removing the tooling while a wildcard-bound engine is serving.
+            let mut blocking: Option<StoppedRecordVerdict> = None;
+            let mut proceeding: Vec<StoppedRecordVerdict> = Vec::new();
+            for reachable_host in &reachable_hosts {
+                let mut probe_record = record.clone();
+                probe_record.endpoint_url =
+                    rocm_core::format_http_base_url(reachable_host, record.port);
+                let probe = rocm_core::managed_service_endpoint_identity(
+                    &probe_record,
                     endpoint_api_key.as_deref(),
+                    ENDPOINT_IDENTITY_PROBE_TIMEOUT,
                 );
-            // Every arm below is decided in `stopped_record_verdict` and pinned
-            // there by `every_identity_answer_maps_to_exactly_one_gate_outcome`,
-            // with `an_endpoint_listing_nothing_does_not_block_uninstall` and
-            // `a_listener_naming_another_model_does_not_block_uninstall` driving
-            // the two proceed-on-a-live-socket arms through this call site. The
-            // tests live in `main.rs`'s `mod tests`, far from here; change an
-            // arm and expect them, not this match, to be what goes red.
-            let verdict = stopped_record_verdict(probe.ok(), auth_refused);
-            if !verdict.blocks() {
+                // Short-circuits: the extra round trip only happens when the
+                // probe produced no usable listing, which is the only case its
+                // answer can change.
+                let auth_refused = probe.is_err()
+                    && endpoint_refused_authorization(
+                        &probe_record.endpoint_url,
+                        endpoint_api_key.as_deref(),
+                    );
+                // Every arm below is decided in `stopped_record_verdict` and
+                // pinned there by
+                // `every_identity_answer_maps_to_exactly_one_gate_outcome`, with
+                // `an_endpoint_listing_nothing_does_not_block_uninstall` and
+                // `a_listener_naming_another_model_does_not_block_uninstall`
+                // driving the two proceed-on-a-live-socket arms through this
+                // call site. The tests live in `main.rs`'s `mod tests`, far from
+                // here; change an arm and expect them, not this loop, to be what
+                // goes red.
+                let verdict = stopped_record_verdict(probe.ok(), auth_refused);
+                if verdict.blocks() {
+                    blocking.get_or_insert(verdict);
+                } else if !proceeding.contains(&verdict) {
+                    proceeding.push(verdict);
+                }
+            }
+            let Some(verdict) = blocking else {
                 // The two fail-open outcomes disclose themselves; only
                 // `ProceedUnrelated` is silent, because a listener that named
                 // its models and did not name ours is the one case that is
                 // actually evidence of a stranger. They go into the report
                 // rather than straight to stderr so the disclosure is a value a
                 // test can assert on — see the field's own comment.
-                match verdict {
-                    StoppedRecordVerdict::ProceedListingNothing => report.warnings.push(format!(
-                        "{}:{} still accepts connections and answered the identity probe with an \
-                         empty model list, so it cannot be told from an unrelated service; {} is \
-                         already recorded stopped — proceeding. An engine still loading or \
-                         unloading looks like this. If that is a server of yours, it has to be \
-                         found and stopped by hand: this uninstall does not wait for you to.",
-                        record.host, record.port, record.service_id
-                    )),
-                    StoppedRecordVerdict::ProceedUnidentified => report.warnings.push(format!(
-                        "{}:{} still accepts connections but did not answer the identity probe \
-                         with a usable model list, and service {} is already recorded stopped — \
-                         proceeding. That can be a wedged engine, an unrelated server on the \
-                         port, or a stale endpoint key. If it is a server of yours, it has to be \
-                         found and stopped by hand: this uninstall does not wait for you to.",
-                        record.host, record.port, record.service_id
-                    )),
-                    StoppedRecordVerdict::ProceedUnrelated => {}
-                    StoppedRecordVerdict::BlockServingOurModel
-                    | StoppedRecordVerdict::BlockAuthRefused => unreachable!("guarded by blocks()"),
+                for verdict in proceeding {
+                    match verdict {
+                        StoppedRecordVerdict::ProceedListingNothing => {
+                            report.warnings.push(format!(
+                                "{}:{} still accepts connections and answered the identity probe \
+                                 with an empty model list, so it cannot be told from an unrelated \
+                                 service; {} is already recorded stopped — proceeding. An engine \
+                                 still loading or unloading looks like this. If that is a server \
+                                 of yours, it has to be found and stopped by hand: this uninstall \
+                                 does not wait for you to.",
+                                record.host, record.port, record.service_id
+                            ));
+                        }
+                        StoppedRecordVerdict::ProceedUnidentified => {
+                            report.warnings.push(format!(
+                                "{}:{} still accepts connections but did not answer the identity \
+                                 probe with a usable model list, and service {} is already \
+                                 recorded stopped — proceeding. That can be a wedged engine, an \
+                                 unrelated server on the port, or a stale endpoint key. If it is \
+                                 a server of yours, it has to be found and stopped by hand: this \
+                                 uninstall does not wait for you to.",
+                                record.host, record.port, record.service_id
+                            ));
+                        }
+                        StoppedRecordVerdict::ProceedUnrelated => {}
+                        StoppedRecordVerdict::BlockServingOurModel
+                        | StoppedRecordVerdict::BlockAuthRefused => {
+                            unreachable!("only non-blocking verdicts are collected")
+                        }
+                    }
                 }
                 continue;
-            }
+            };
             if verdict == StoppedRecordVerdict::BlockAuthRefused {
                 report.failed.push(FailedManagedServiceStop {
                     service_id: record.service_id.clone(),
@@ -962,6 +1025,9 @@ fn probe_records_for_survivors(
         report
             .stopped
             .retain(|stopped| stopped != &record.service_id);
+        report
+            .relaunch
+            .retain(|line| !line.starts_with(&format!("{}: ", record.service_id)));
         report.failed.push(FailedManagedServiceStop {
             service_id: record.service_id.clone(),
             // Two different situations reach here and they need different
@@ -1216,10 +1282,10 @@ pub(crate) fn uninstall_removal_gate(report: &ManagedServiceStopReport) -> Resul
             format!(
                 " These services were stopped during this run and stay stopped: {}. Stopping \
                  them dropped their endpoint keys, so a service that was publicly bound, or \
-                 launched with `--require-api-key`, has to be served again with `rocm serve \
-                 <model> --host <host> --port <port>`, adding `--allow-public-bind` for a public \
-                 host and `--require-api-key` for a keyed one {}.",
+                 launched with `--require-api-key`, has to be served again; the command for \
+                 each, with its own model and port filled in: {} {}.",
                 report.stopped.join(", "),
+                report.relaunch.join("; "),
                 rocm_engine_protocol::RELAUNCH_KEY_CHOICE
             )
         };

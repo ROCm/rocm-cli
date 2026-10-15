@@ -979,8 +979,13 @@ command exits non-zero, leaves every file in place, and says what to repair or
 stop by hand, so the tooling needed to stop it is never deleted out from under
 a running server. A live server or helper recorded without a start time (written
 by an older version) cannot be proven to be ours, so it is refused rather than
-killed: stop it yourself, then re-run. A run that keeps the binaries and data
-(`--keep-binaries --keep-data`) leaves running servers and the helper alone.
+killed: stop it yourself, then re-run. The same refusal applies when the
+helper's runtime state file cannot be read. The plan shows the refusal before
+you confirm it. The stop pass is not atomic: if it aborts after stopping some
+servers (or the helper), those stay stopped and their endpoint keys are gone;
+the error names each one and the `rocm serve` command that brings it back. A
+run that keeps the binaries and data (`--keep-binaries --keep-data`) leaves
+running servers and the helper alone.
 If a removal fails partway, the error lists what was removed and what is left,
 because the binaries and service records may already be gone.
 

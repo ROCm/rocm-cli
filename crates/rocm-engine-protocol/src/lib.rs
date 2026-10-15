@@ -52,10 +52,11 @@ pub fn is_public_bind_host(host: &str) -> bool {
 /// was dropped, for the refusals and the uninstall abort that tell an operator
 /// to launch it again.
 ///
-/// One builder for the three places that print it, so they cannot drift: a
-/// public host needs `--allow-public-bind`, and a service that asked for
-/// authentication needs `--require-api-key` even on loopback. The key itself is
-/// optional ([`RELAUNCH_KEY_CHOICE`]).
+/// One builder for every place that prints it (the `rocm serve` and `rocmd`
+/// refusals and the uninstall abort, one command per stopped service), so they
+/// cannot drift: a public host needs `--allow-public-bind`, and a service that
+/// asked for authentication needs `--require-api-key` even on loopback. The key
+/// itself is optional ([`RELAUNCH_KEY_CHOICE`]).
 #[must_use]
 pub fn relaunch_command(host: &str, require_api_key: bool) -> String {
     let public_flag = if is_public_bind_host(host) {
