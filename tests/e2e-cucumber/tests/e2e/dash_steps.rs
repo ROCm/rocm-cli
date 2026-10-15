@@ -1220,15 +1220,16 @@ async fn existing_folder_browser_shows_scenario_folder(world: &mut E2eWorld) {
 async fn configure_shows_chosen_folder(world: &mut E2eWorld) {
     session(world)
         .wait_for_screen_where(
-            "the Folder row shows a chosen path rather than the unset placeholder",
+            "the Folder row shows a chosen path rather than the unset placeholder, with the install-folder browser closed",
             |screen| {
                 screen.contains("Folder:")
                     && !screen.contains("default managed folder · Tab to browse")
+                    && !screen.contains("Pick an install folder")
             },
             default_timeout(),
         )
         .await
-        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path: {e}"));
+        .unwrap_or_else(|e| panic!("the Folder row never showed a chosen path with the browser closed: {e}"));
 }
 
 #[then("the managed model is displayed")]
