@@ -279,6 +279,15 @@ fn detect_response() -> DetectResponse {
             runtime.source
         ));
     }
+    // Installed is not usable: a vLLM built against another torch resolves and
+    // reports a version, yet cannot start. Say so here rather than at serve time.
+    let extension_problem = runtime
+        .as_ref()
+        .filter(|_| !cfg!(windows))
+        .and_then(crate::process::vllm_extension_import_problem);
+    if let Some(problem) = extension_problem.as_ref() {
+        notes.push(problem.clone());
+    }
 
     DetectResponse {
         installed,
@@ -300,9 +309,11 @@ fn detect_response() -> DetectResponse {
         transformers_version: None,
         available_devices: vec![EngineDeviceAvailability {
             kind: "rocm_gpu".to_owned(),
-            available: installed && !cfg!(windows),
+            available: installed && !cfg!(windows) && extension_problem.is_none(),
             reason: if cfg!(windows) {
                 Some(windows_unsupported_message().to_owned())
+            } else if let Some(problem) = extension_problem {
+                Some(problem)
             } else if installed {
                 None
             } else {
