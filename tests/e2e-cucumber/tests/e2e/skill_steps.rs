@@ -167,7 +167,7 @@ fn parse_reference_catalog(md: &str) -> BTreeMap<String, Remediation> {
         // are rows in this table like any other. Matching `fix-` alone dropped
         // them silently, so the table could disagree with the CLI about them
         // and nothing would say so.
-        if !id.starts_with("fix-") && !id.starts_with("info-") {
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         // Taken verbatim, never normalised. A shorthand like `both` used to be
@@ -263,7 +263,7 @@ fn parse_fix_listing(stdout: &str) -> BTreeMap<String, Remediation> {
         // entry is listed by `rocm fix` like any other, and dropping it from
         // one side of this comparison and not the other would report it as an
         // id the CLI no longer offers.
-        if !id.starts_with("fix-") && !id.starts_with("info-") {
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         out.insert(

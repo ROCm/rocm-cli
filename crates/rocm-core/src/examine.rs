@@ -1195,6 +1195,14 @@ pub fn gfx_is_apu_family(gfx: &str) -> bool {
     if let Some(digit) = gfx_model_digit(&g, "gfx110") {
         return digit >= 3;
     }
+    // gfx103x: non-contiguous, unlike gfx110x's threshold. gfx1033/1035/1036
+    // are the RDNA2 APUs (Van Gogh variant aside, host_gpu's own PCI-id table
+    // maps them as such); gfx1030/1031/1032/1034 are Navi 21-24 desktop/mobile
+    // discrete cards (RX 6000-series, RX 6500 XT). A plain threshold would get
+    // this family wrong in both directions.
+    if let Some(digit) = gfx_model_digit(&g, "gfx103") {
+        return matches!(digit, 3 | 5 | 6);
+    }
     false
 }
 
@@ -2947,6 +2955,13 @@ fn probe_gpus_windows(e: &mut Examination) {
             .push("Win32_VideoController query failed; cannot enumerate GPUs.".to_owned());
         return;
     }
+    parse_gpus_windows_output(&out, e);
+}
+
+/// Split out from [`probe_gpus_windows`] so the parsing can be driven with
+/// synthetic `Win32_VideoController` output -- there is no Windows host to run
+/// the real probe against in this test suite.
+fn parse_gpus_windows_output(out: &str, e: &mut Examination) {
     for line in out.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -2980,7 +2995,9 @@ fn probe_gpus_windows(e: &mut Examination) {
         if !is_amd {
             continue;
         }
-        // The PNP id first, the marketing name only as a fallback.
+        // The PNP id first, the marketing name only as a fallback -- tried in
+        // that order, not computed eagerly and discarded, since the name match
+        // is wasted work whenever the id resolves.
         //
         // `Win32_VideoController` hands us `PCI\VEN_1002&DEV_1636&...` in the
         // same row as the name, and `host_gpu`'s PCI-id table answers for parts
@@ -2990,16 +3007,12 @@ fn probe_gpus_windows(e: &mut Examination) {
         // unless a HIP SDK was installed for `hipInfo` to fill it in: exactly
         // the host that has no HIP SDK to ask. A device id is also the stronger
         // answer where both have one, being the ASIC rather than the brand.
-        let (name_gfx, name_is_apu) = classify_amd_marketing_name(&name);
-        let gfx_target = crate::host_gpu::gfx_target_from_pnp_device_id(&pnp)
-            .map_or(name_gfx, ToOwned::to_owned);
-        // `gfx_is_apu_family` knows the answer whenever the target is known;
-        // the name heuristic only gets the question when nothing identified the
-        // part.
-        let is_apu = if gfx_target.is_empty() {
-            name_is_apu
-        } else {
-            gfx_is_apu_family(&gfx_target)
+        let (gfx_target, is_apu) = match crate::host_gpu::gfx_target_from_pnp_device_id(&pnp) {
+            // `gfx_is_apu_family` knows the answer whenever the id resolved a
+            // target; the name heuristic's `is_apu` guess is only consulted
+            // when nothing identified the part.
+            Some(target) => (target.to_owned(), gfx_is_apu_family(target)),
+            None => classify_amd_marketing_name(&name),
         };
         e.gpus.push(Gpu {
             name,
@@ -5537,6 +5550,73 @@ mod tests {
         assert!(!gfx_is_apu_family("gfx906"));
         assert!(!gfx_is_apu_family("gfx90"));
         assert!(!gfx_is_apu_family(""));
+
+        // gfx103x is non-contiguous, unlike gfx110x's threshold: gfx1033
+        // (Van Gogh) / gfx1035 (Rembrandt/Barcelo-R) / gfx1036 are RDNA2
+        // APUs, while gfx1030/1031/1032 (Navi 21/22/23, RX 6000 series) and
+        // gfx1034 (Navi 24, RX 6500 XT) are discrete. A Rembrandt laptop
+        // misclassified here would report as a discrete GPU and suppress
+        // `fix-9-igpu-dgpu` detection on an iGPU+dGPU host.
+        assert!(gfx_is_apu_family("gfx1033"));
+        assert!(gfx_is_apu_family("gfx1035"));
+        assert!(gfx_is_apu_family("gfx1036"));
+        assert!(!gfx_is_apu_family("gfx1030"));
+        assert!(!gfx_is_apu_family("gfx1031"));
+        assert!(!gfx_is_apu_family("gfx1032"));
+        assert!(!gfx_is_apu_family("gfx1034"));
+    }
+
+    #[test]
+    fn windows_gpu_probe_classifies_a_vega_igpu_through_the_pci_table_not_the_name() {
+        // ROCMAI-546: the real host this ticket was filed against. Windows
+        // reports Renoir/Cezanne's Vega iGPU under the generic marketing name
+        // "AMD Radeon(TM) Graphics", which `classify_amd_marketing_name` does
+        // not recognize (it only maps Phoenix/Strix-and-newer names) -- so
+        // without the PCI-id lookup this host's `gfx_target` stays empty and
+        // `info-20-gpu-no-rocm-support` can never fire on it.
+        let out = "AMD Radeon(TM) Graphics\t31.0.21004.7\tPCI\\VEN_1002&DEV_1636&SUBSYS_12341002&REV_C8\\4&1a2b3c4d&0&0008";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        let gpu = &e.gpus[0];
+        assert_eq!(gpu.gfx_target, "gfx90c", "{gpu:?}");
+        assert!(gpu.is_amd);
+        assert_eq!(gpu.is_apu, Some(true), "gfx90c is an APU family: {gpu:?}");
+    }
+
+    #[test]
+    fn windows_gpu_probe_does_not_misclassify_a_rembrandt_apu_as_discrete() {
+        // Regression: the PNP-id path resolves gfx1035 for a Rembrandt/
+        // Barcelo-R laptop (PNP id 164d), but `gfx_is_apu_family` used to have
+        // no gfx103x arm at all, so a real iGPU reported `is_apu: Some(false)`
+        // -- the opposite of what the marketing-name path ("AMD Radeon 680M")
+        // would have said via `APU_KEYWORDS`. That silently suppressed
+        // `fix-9-igpu-dgpu` detection on exactly the iGPU+dGPU host shape this
+        // PR is otherwise improving detection for.
+        let out = "AMD Radeon 680M\t31.0.21012.9\tPCI\\VEN_1002&DEV_164D&SUBSYS_14F11002&REV_C8\\3&11583659&0&08";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        let gpu = &e.gpus[0];
+        assert_eq!(gpu.gfx_target, "gfx1035", "{gpu:?}");
+        assert_eq!(
+            gpu.is_apu,
+            Some(true),
+            "a Rembrandt/Barcelo-R iGPU must not report as discrete: {gpu:?}"
+        );
+    }
+
+    #[test]
+    fn windows_gpu_probe_prefers_the_pci_id_match_when_one_exists() {
+        // A name `classify_amd_marketing_name` already recognizes must not be
+        // asked at all when the PNP id already resolved a target -- the name
+        // match is wasted work in that case, and if it ever disagreed with the
+        // id, the id must still win (it names the ASIC, not the brand).
+        let out = "AMD Radeon(TM) 8060S Graphics\t32.0.12033.1030\tPCI\\VEN_1002&DEV_1586&SUBSYS_00000000&REV_C1\\3&11583659&0&08";
+        let mut e = Examination::default();
+        parse_gpus_windows_output(out, &mut e);
+        assert_eq!(e.gpus.len(), 1, "{:?}", e.gpus);
+        assert_eq!(e.gpus[0].gfx_target, "gfx1151", "{:?}", e.gpus[0]);
     }
 
     #[test]

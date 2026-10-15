@@ -36,6 +36,7 @@
 use anyhow::{Result, bail};
 use rocm_core::diagnose::DiagnoseReport;
 
+use super::bullets;
 use super::doctor;
 use super::transport::Transport;
 
@@ -193,15 +194,6 @@ fn print_indented(output: &str) {
     for line in output.lines().filter(|line| !line.trim().is_empty()) {
         println!("  {line}");
     }
-}
-
-/// One finding per line, bulleted.
-fn bullets(findings: &[String]) -> String {
-    findings
-        .iter()
-        .map(|finding| format!("  - {finding}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Explain a refusal, including what to run instead.

@@ -59,7 +59,7 @@ fn catalog_rows(md: &str) -> Vec<(String, String, String)> {
         // are rows in this table like any other. Matching `fix-` alone dropped
         // them silently, so the table could disagree with the CLI about them
         // and nothing would say so.
-        if !id.starts_with("fix-") && !id.starts_with("info-") {
+        if !e2e_cucumber::is_catalog_id(id) {
             continue;
         }
         rows.push((
@@ -102,9 +102,7 @@ fn catalog_not_print_only_count(md: &str) -> usize {
             }
             let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
             let id = cells[0].trim_matches('`');
-            cells.len() >= 5
-                && (id.starts_with("fix-") || id.starts_with("info-"))
-                && cells[4] != "print-only"
+            cells.len() >= 5 && e2e_cucumber::is_catalog_id(id) && cells[4] != "print-only"
         })
         .count()
 }
