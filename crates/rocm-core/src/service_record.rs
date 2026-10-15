@@ -340,13 +340,14 @@ impl ManagedServiceRecord {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let storage_record = host_record.with_storage_paths();
-        fs::write(
-            &host_record.manifest_path,
-            serde_json::to_vec_pretty(&storage_record)
-                .context("failed to serialize service record")?,
-        )
-        .with_context(|| format!("failed to write {}", host_record.manifest_path.display()))?;
-        Ok(())
+        let bytes = serde_json::to_vec_pretty(&storage_record)
+            .context("failed to serialize service record")?;
+        crate::write_atomic(&host_record.manifest_path, &bytes, "json").with_context(|| {
+            format!(
+                "failed to write service manifest {}",
+                host_record.manifest_path.display()
+            )
+        })
     }
 }
 
