@@ -5871,9 +5871,24 @@ mod tests {
     /// must not fall through to the `elif` and source the fallback — that
     /// would silently read a file that may not describe this host, matching
     /// `hardware_root::read_os_release`'s own non-absence rule.
+    ///
+    /// This is deliberately a directory, not a permission-denied file: CI
+    /// commonly runs as root, where a `chmod 000` file is still readable, so
+    /// a mode-000 fixture would pass or fail depending on who runs it. A
+    /// directory fails to source for a different, root-safe reason ("is a
+    /// directory"), which is enough to prove this one claim — existence is
+    /// not readability — but is **not** the same failure mode as a genuinely
+    /// unreadable primary. Under `/bin/sh` (`dash` on Debian/Ubuntu),
+    /// sourcing a *permission-denied* file is a fatal shell-level error that
+    /// aborts the whole embedded script immediately, not just this function —
+    /// a materially different outcome than "`$ID` stays unset" and one this
+    /// test does not exercise. That abort-on-unreadable-primary behavior
+    /// predates the `/usr/lib/os-release` fallback this module adds; fixing
+    /// it is out of scope here (tracked as a possible follow-up, not a
+    /// blocker for the fallback itself).
     #[cfg(target_os = "linux")]
     #[test]
-    fn try_os_release_does_not_source_the_fallback_when_the_primary_exists_but_errors() {
+    fn try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let primary = dir.path().join("primary");
         let fallback = dir.path().join("fallback");

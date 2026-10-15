@@ -1641,7 +1641,7 @@ cargo test -p rocm --bin rocm os_release
 cargo test -p rocm --bin rocm -- a_fallback_read_plans an_unreadable_file_plans_nothing_and_names_itself
 cargo test -p rocm-core --lib hardware_root::tests::read_os_release
 cargo test -p rocm-core --lib -- a_fallback_read_plans an_unreadable_file_is_reported_as_itself distro_name_names_an_unreadable_file an_unreadable_file_names_itself
-cargo test -p rocm-core --lib --features e2e-test-hooks -- os_release_reads_follow_the_simulated_host_root os_release_reads_fall_back_to_usr_lib_when_etc_is_absent try_os_release_does_not_source_the_fallback_when_the_primary_exists_but_errors
+cargo test -p rocm-core --lib --features e2e-test-hooks -- os_release_reads_follow_the_simulated_host_root os_release_reads_fall_back_to_usr_lib_when_etc_is_absent try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable
 ```
 
 The parser tests that compare against `/bin/sh` itself are Linux-only. The
@@ -1663,23 +1663,32 @@ host root and check that both `rocm examine` reads answer from it through the
 shared parser: the first at `/etc/os-release`, the second with only
 `/usr/lib/os-release` present, so the fallback is exercised through the real
 `host_path`-routed call sites, not just the helper in isolation; the feature
-they need is enabled only by its own CI step. The `try_os_release_does_not_*`
+they need is enabled only by its own CI step. The
+`try_os_release_does_not_source_the_fallback_when_the_primary_is_not_sourceable`
 test runs the WSL remote probe's own shell fallback for real under `/bin/sh`
-against a primary that exists but errors (a directory in its place), the same
-non-absence case the Rust-side `hardware_root` tests cover for the two
-in-process readers.
+against a primary that exists but cannot be sourced (a directory in its
+place) — proving existence is not readability, the same claim the Rust-side
+`hardware_root` tests make for the two in-process readers, but **not** the
+same failure mode: a genuinely permission-denied primary aborts the whole
+shell probe instead of merely leaving `$ID` unset, which this test does not
+exercise — see its own doc comment for why, and for the known limitation
+this leaves.
 
 `rocm examine` reads the file through the simulated host root (see Simulated
 Host Root in [release-trust.md](release-trust.md)), so scenarios
-`examine-20` to `examine-24` in
+`examine-20` to `examine-25` in
 [examine.feature](../tests/e2e-cucumber/features/examine.feature) plant one.
 `examine-23` also plants a GPU in the kernel topology and puts an `lspci`
 listing an empty bus on `PATH`, so `status: degraded` is checked on every Linux
 lane, with or without a GPU. `examine-24` plants only `/usr/lib/os-release`,
-with no `/etc/os-release` present, to check the `os-release(5)` fallback:
+with no `/etc/os-release` present, to check the `os-release(5)` fallback.
+`examine-25` plants a directory in place of `/etc/os-release` (reusing
+`examine-23`'s GPU fixtures) to check the degraded verdict and failure
+message a present-but-unreadable release file now gets, distinctly from
+both a malformed line and an unknown distribution:
 
 ```bash
-RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-4] '
+RUSTC_WRAPPER= cargo xtask e2e -- -n 'examine-2[0-5] '
 ```
 
 The install plans deliberately read the real file, so no scenario plants one
