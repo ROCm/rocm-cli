@@ -4456,24 +4456,23 @@ jobs:
             "the group must carry the event name so runs of different triggers never \
              share a group (got `{group}`)"
         );
-        let group = normalized_whitespace(&group);
-        assert!(
-            group.contains(
-                "github.event_name == 'pull_request' && github.event.pull_request.number"
-            ),
-            "a pull_request run must be keyed on the PR number (got `{group}`)"
-        );
-        assert!(
-            group.contains("github.event_name == 'workflow_dispatch' && github.run_id"),
-            "a workflow_dispatch run must keep a unique group (got `{group}`)"
-        );
-        // Ref AND commit: GitHub replaces a still-pending run in a shared group
-        // even with cancel-in-progress off, so a ref-only key would let a second
-        // push to `main` drop the first.
-        assert!(
-            group.contains("format('{0}-{1}', github.ref, github.sha)"),
-            "a push or merge_group run must be keyed on its ref and commit \
-             (got `{group}`)"
+        // The key is an `A && x || B && y || z` chain, so the ORDER of the arms
+        // decides behaviour (`format()` is always truthy: moved first, it would
+        // give every PR run a unique group and silently stop supersession).
+        // Pin the whole expression, not each arm, so a reorder fails.
+        // PR number: a new push to the PR supersedes its older run. Dispatch:
+        // unique per run. Ref AND commit for everything else: GitHub replaces a
+        // still-pending run in a shared group even with cancel-in-progress off,
+        // so a ref-only key would let a second push to `main` drop the first.
+        assert_eq!(
+            normalized_whitespace(&group).trim_start_matches(">- "),
+            "${{ github.workflow }}-${{ github.event_name }}-${{ \
+             github.event_name == 'pull_request' && github.event.pull_request.number \
+             || github.event_name == 'workflow_dispatch' && github.run_id \
+             || format('{0}-{1}', github.ref, github.sha) }}",
+            "the concurrency group must be exactly: event name, then PR number \
+             (pull_request), run id (workflow_dispatch), ref and commit (all else), \
+             in that order"
         );
         assert_eq!(
             concurrency_cancel_in_progress(&sh),
