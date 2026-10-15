@@ -746,7 +746,7 @@ const RECIPES: &[FixRecipe] = &[
         needs_sudo: false,
         needs_reboot: false,
         needs_relogin: false,
-        verify: "grep -h VERSION_ID /etc/os-release /usr/lib/os-release 2>/dev/null | head -1",
+        verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1",
         notes: &[
             "Distros install side by side, so the current one can stay until the new one is set up.",
         ],

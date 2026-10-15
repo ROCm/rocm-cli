@@ -2306,7 +2306,7 @@ fn check_wsl_5_distro_too_old(e: &Examination, _symptom: &str) -> Diagnosis {
             "#   wsl --install -d Ubuntu-24.04".to_owned(),
         ],
         fix_id: "fix-wsl-5-distro-too-old".to_owned(),
-        verify: "grep -h VERSION_ID /etc/os-release /usr/lib/os-release 2>/dev/null | head -1"
+        verify: "f=/etc/os-release; [ -e \"$f\" ] || f=/usr/lib/os-release; grep VERSION_ID \"$f\" 2>/dev/null | head -1"
             .to_owned(),
         notes: vec![
             "This is a hard floor, not a recommendation: Ubuntu 22.04 ships glibc 2.35, below the glibc 2.38 / GLIBCXX_3.4.32 that every published Lemonade embeddable is linked against, so the engine cannot start there at all.".to_owned(),
