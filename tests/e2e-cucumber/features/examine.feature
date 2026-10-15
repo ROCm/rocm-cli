@@ -282,7 +282,7 @@ Feature: GPU detection and system inspection
   # `cargo xtask e2e` and every prebuilt full-suite lane use), so they describe a
   # machine other than the runner. The driver plan cannot be exercised this way:
   # `rocm install driver` builds a plan that runs against the real machine, so it
-  # deliberately reads the real `/etc/os-release` (see `read_os_release`); its
+  # deliberately reads the real `/etc/os-release` (see `real_os_release`); its
   # parsing is covered by the unit tests in `driver_install.rs`.
   #
   # The planted distributions are ones no CI runner or developer host here runs,
@@ -336,3 +336,16 @@ Feature: GPU detection and system inspection
     When the user inspects that machine in machine-readable form
     Then the inspection reports the distribution "ubuntu" version "24.04" named "Ubuntu 24.04 LTS"
     And the inspection reports no trouble reading the release file
+
+  # Before this change, a release file that exists but cannot be read (not
+  # absent, so no fallback candidate is tried either) silently produced an
+  # empty, unreported distro with no failure recorded. It now reports the
+  # file as itself, distinctly from both an unknown distribution and a
+  # malformed line it never reached. A directory in place of the file is a
+  # non-`NotFound` read error that needs no root privilege, unlike a
+  # mode-000 file, which CI running as root would read anyway.
+  @id:examine-degrades-on-unreadable-release-file @requires-os:linux
+  Scenario: examine-25 - An unreadable release file degrades the verdict on a machine with a GPU
+    Given a GPU machine whose release file cannot be read
+    When the user inspects that machine in machine-readable form
+    Then the inspection's verdict is degraded, and its only failure says the release file could not be read
