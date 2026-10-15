@@ -801,13 +801,14 @@ impl AppState {
     /// stoppable is currently serving) when the caller should fall through to
     /// that normal resolution instead.
     ///
-    /// The row-finding `position` closure below necessarily re-checks
-    /// `is_serving() && managed_ids.contains(..)` per row (it needs to know
-    /// WHICH row, not just whether one exists), but the short-circuit above
-    /// it calls [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with)
-    /// for real, so the two can't drift on the top-level "is there anything
-    /// to jump to at all" decision — only on the mechanical per-row lookup
-    /// that decision alone can't answer.
+    /// The short-circuit above calls
+    /// [`has_stoppable_managed_instance_with`](Self::has_stoppable_managed_instance_with)
+    /// on exactly the same predicate the row-finding `position` closure below
+    /// re-checks per row (`is_serving() && managed_ids.contains(..)`), so it
+    /// cannot change which outcome this returns — only skip it sooner. Its
+    /// value is avoiding `service_rows`'s allocation and sort on every `s`
+    /// keypress when nothing is stoppable; it is not a correctness guard, and
+    /// there is nothing for the two checks to drift on.
     pub(crate) fn quit_confirm_open_services_key(
         &mut self,
         code: crossterm::event::KeyCode,

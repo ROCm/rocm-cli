@@ -431,7 +431,8 @@ Feature: Interactive dashboard
     And the user tries to quit chat
     Then the dashboard asks whether to quit while a model is still being served
     When the user declines the quit prompt
-    Then the managed model is still listed as running
+    And the user sends a message about GPU health
+    Then the assistant's GPU status response is displayed
     When the user quits interactive chat
     Then interactive chat exits successfully
     And the managed model is still listed as running
@@ -478,15 +479,19 @@ Feature: Interactive dashboard
     Then the launcher exits successfully
     And the managed model is still listed as running
 
-  # README's "Interactive interfaces" section promises `Ctrl-C` always quits
-  # immediately without asking, even while a model is still being served —
-  # unlike `q`/Esc/`/quit`, which all route through the confirm-before-quit
-  # gate (dash-25). dash-20 already covers the keystroke with nothing
-  # serving; this is the "will not happen" half AGENTS.md §3 asks for: with a
-  # model serving, Ctrl-C must still exit on the spot rather than opening the
-  # prompt dash-25 pins. `press_ctrl_c_and_wait` waits for process exit, so a
-  # quit-confirm prompt intercepting the keystroke instead would time this
-  # step out, not silently pass it.
+  # README's "First run" section promises `Ctrl-C` always quits immediately
+  # without asking, even while a model is still being served — unlike
+  # `q`/Esc/`/quit`, which all route through the confirm-before-quit gate
+  # (dash-25). dash-20 already covers the keystroke with nothing serving;
+  # this is the "will not happen" half AGENTS.md §3 asks for: with a model
+  # serving, Ctrl-C must still exit on the spot rather than opening the
+  # prompt dash-25 pins — both before that prompt has been triggered, and
+  # (the production event loop puts the Ctrl-C arm ahead of the quit-confirm
+  # arm in its match, a relationship only re-opening the dashboard and
+  # triggering the prompt first can actually exercise) while it is already
+  # open. `press_ctrl_c_and_wait` waits for process exit, so a quit-confirm
+  # prompt intercepting the keystroke instead would time either half out, not
+  # silently pass it.
   @id:dash-ctrl-c-skips-the-quit-confirm-while-serving @requires-os:linux
   Scenario: dash-31 - Ctrl-C quits immediately even while a model is being served
     Given a running managed model is available locally
@@ -497,3 +502,26 @@ Feature: Interactive dashboard
     Then the dashboard exits from the keystroke with code 130
     And the terminal is restored to the normal screen
     And the managed model is still listed as running
+    When the user opens the dashboard
+    And the user tries to quit the dashboard
+    Then the dashboard asks whether to quit while a model is still being served
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the managed model is still listed as running
+
+  # `quit_and_wait`'s own retry loop answers "y" to any quit-confirm prompt it
+  # sees (`tui_driver.rs`), so every other scenario that quits through it
+  # would silently swallow a regression that opened the prompt when nothing
+  # is being served — a corrupted `AppState::has_live_instance` falsely
+  # reporting live would just get auto-confirmed away. This is the one
+  # scenario that bypasses that helper (`the user tries to quit the
+  # dashboard` sends a bare `q` and resolves nothing) and asserts the
+  # negative directly: with `--demo` serving no model at all, `q` must exit
+  # on the very first keystroke, with the quit-confirm prompt never opening
+  # to be auto-answered.
+  @id:dash-quit-skips-confirm-with-nothing-serving @requires-os:linux
+  Scenario: dash-32 - Quitting with nothing serving exits immediately, without asking
+    When the user opens the dashboard with demo data
+    Then the dashboard home view is displayed
+    When the user tries to quit the dashboard
+    Then the dashboard exits immediately with no quit confirmation

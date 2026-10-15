@@ -669,6 +669,25 @@ async fn try_quit_dashboard(world: &mut E2eWorld) {
         .unwrap_or_else(|e| panic!("failed to send the quit key: {e}"));
 }
 
+/// Deliberately bypasses `quit_and_wait`: that helper's own retry loop
+/// answers "y" to any quit-confirm prompt it finds on screen, so it would
+/// silently paper over a regression that opened the prompt here. `q` with
+/// nothing serving must exit the process outright on the first keystroke; if
+/// the prompt opened instead, nothing resolves it and this times out rather
+/// than passing.
+#[then("the dashboard exits immediately with no quit confirmation")]
+async fn dashboard_exits_without_confirmation(world: &mut E2eWorld) {
+    session(world)
+        .wait_for_exit(default_timeout())
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "`q` with nothing serving must exit immediately, with no \
+                 quit-confirm prompt: {e}"
+            )
+        });
+}
+
 /// Chat counterpart of `try_quit_dashboard`: `/quit` shares the exact same
 /// `request_quit` gate as the dashboard's `q` and the launcher's own `q`
 /// (issue #145) — `rocm chat` is the same dashboard with the Chat tab focused

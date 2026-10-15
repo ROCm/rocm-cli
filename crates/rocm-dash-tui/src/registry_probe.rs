@@ -10,16 +10,15 @@
 //! the bin (`apps/rocm::dash`) and is handed in across this seam, mirroring
 //! `tool_exec::RocmToolExecutor`.
 //!
-//! This replaces the one-shot, launch-time registry read `ResolvedArgs` used
-//! to carry (`startup_has_live_service` / `managed_service_ids`), which never
-//! refreshed for the life of a dashboard session. That froze out two real
-//! cases: a model started mid-session via the Serve wizard (its id was never
-//! in the launch-time snapshot, so it never got a stop command or the
-//! `s`-to-open-Services hint), and a host whose dashboard-embedded daemon
-//! client never connects at all (Windows — `has_received_snapshot` never
-//! flips, so `AppState::instances` stays empty for the life of the session).
-//! A probe called live, at the moment the quit-confirm gate actually needs an
-//! answer, has neither problem — there is no window for it to go stale in.
+//! The probe is read live, at the moment the quit-confirm gate actually needs
+//! an answer, rather than once at launch and cached. A one-shot, launch-time
+//! read would freeze out two real cases: a model started mid-session via the
+//! Serve wizard (its id would never be in a launch-time snapshot, so it would
+//! never get a stop command or the `s`-to-open-Services hint), and a host
+//! whose dashboard-embedded daemon client never connects at all (Windows —
+//! `has_received_snapshot` never flips, so `AppState::instances` stays empty
+//! for the life of the session). A live probe has neither problem — there is
+//! no window for it to go stale in.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -59,11 +58,13 @@ pub struct ManagedRegistrySnapshot {
 /// `Debug`.
 ///
 /// Implementations MUST stay cheap: a local JSON-file read only, never a
-/// daemon round-trip or network I/O. The quit-confirm gate may call
-/// [`snapshot`](Self::snapshot) on every render while the prompt is open, and
-/// — on a host whose dashboard-embedded daemon client never connects (e.g.
-/// Windows; see `AppState::has_live_instance`'s doc comment) — for the entire
-/// life of the session.
+/// daemon round-trip or network I/O. In the dashboard, [`snapshot`](Self::snapshot)
+/// is called only from `request_quit` (on the quit keystroke) and from
+/// `quit_confirm_request`, which calls it on every render while the
+/// quit-confirm prompt is open. The launcher calls `has_live_instance` on
+/// every render too, but through `StaticManagedRegistrySnapshot` — a read
+/// cached once per menu pass — so `snapshot` itself is not called per-frame
+/// there.
 pub trait ManagedRegistryProbe: std::fmt::Debug + Send + Sync {
     /// Read the registry now and classify it from the record's own `status`
     /// field, the same statuses `Instance::status.is_serving()` treats as

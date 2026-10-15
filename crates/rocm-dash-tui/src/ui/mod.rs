@@ -330,9 +330,8 @@ fn quit_confirm_body_with(
         // (-> `managed_ids`) for every record it also counts into `svcs` (->
         // `has_live_service`), so a probe can never report "live" with no id to name.
         // Asserted rather than branched on: a probe that someday broke that pairing
-        // should fail loudly here instead of silently falling back to a sentence that
-        // describes this PR's retired launch-time snapshot, not the live read it
-        // replaced.
+        // should fail loudly here instead of silently falling through with no ids
+        // to list, leaving the "stop it first" guidance below with nothing to name.
         debug_assert!(
             !managed_ids.is_empty(),
             "a live registry snapshot reported serving with no managed id to name"
