@@ -540,7 +540,7 @@ jobs:
 
       - name: Test rocm-core with e2e-test-hooks
         # The simulated-host-root tests (`hardware_root.rs`, and the planted-root
-        # probe test in `examine.rs`) only exist with this feature, which no
+        # probe tests in `examine.rs`) only exist with this feature, which no
         # other unit-test, nextest or clippy invocation enables. Without this
         # step they are not even compiled in CI, so a probe reverted to a raw
         # path would pass everything automated. Runs only when rocm-core is in
@@ -548,12 +548,16 @@ jobs:
         # outside the crate can change these results.
         #
         # This is a sample, not full coverage of the routed reads. The probe
-        # test asserts only the KFD topology (GPU node count and gfx target),
+        # tests assert only the KFD topology (GPU node count and gfx target),
         # `/dev/kfd` via `stat_device`, `/proc/version` and `/dev/dxg` via
-        # `is_wsl_host`, and `/run/.containerenv` and `/proc/1/cgroup` via
-        # `probe_container`. The other routed reads (`/dev/dri`,
-        # `/sys/class/drm`, `/sys/module/amdgpu`, the other `/proc` files, the
-        # modprobe directories, `/etc/os-release`, the `/usr/lib/wsl/lib` and
+        # `is_wsl_host`, `/run/.containerenv` and `/proc/1/cgroup` via
+        # `probe_container`, and both `/etc/os-release` reads (the distro
+        # fields and the distro name, in
+        # `os_release_reads_follow_the_simulated_host_root` and, for the
+        # `/usr/lib/os-release` fallback, in
+        # `os_release_reads_fall_back_to_usr_lib_when_etc_is_absent`). The other routed
+        # reads (`/dev/dri`, `/sys/class/drm`, `/sys/module/amdgpu`, the other
+        # `/proc` files, the modprobe directories, the `/usr/lib/wsl/lib` and
         # ROCDXG checks) have no planted-root unit assertion; they are covered
         # end to end only by the follow-up's simulated-machine scenarios.
         #

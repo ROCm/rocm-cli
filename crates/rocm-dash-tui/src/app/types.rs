@@ -479,6 +479,38 @@ pub enum ScrollTarget {
     InstanceDetail,
 }
 
+impl ScrollTarget {
+    /// Whether this target's displayed position is tail-anchored (its track
+    /// position is the inverse of its stored offset — see `DockLogs`'s doc
+    /// comment). An exhaustive `match`, not an equality check against a
+    /// single variant: the latter would let a future tail-anchored variant
+    /// fall through to the non-inverted branch with no compiler signal.
+    pub(crate) const fn is_tail_anchored(self) -> bool {
+        match self {
+            Self::DockLogs => true,
+            Self::Console | Self::ConsoleH | Self::Chat | Self::InstanceDetail => false,
+        }
+    }
+
+    /// Every variant, in declaration order — the one list a test iterates to
+    /// mean "every `ScrollTarget`" (e.g. `scrollbar.rs`'s
+    /// `scroll_target_variants_round_trip_through_dispatch`), instead of each
+    /// call site re-typing its own copy that can silently drift from this
+    /// enum. Not itself exhaustiveness-checked against the variant list —
+    /// stable Rust has no mechanism for that without a derive macro this
+    /// crate doesn't depend on — so a new variant still needs a manual
+    /// addition here, same as any other list of all variants would.
+    /// `cfg(test)`: no non-test code needs "every target" today.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Console,
+        Self::ConsoleH,
+        Self::DockLogs,
+        Self::Chat,
+        Self::InstanceDetail,
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

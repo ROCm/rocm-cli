@@ -6,11 +6,9 @@ use crate::ARTIFACT_PREFETCH_TIMEOUT;
 use crate::cli::{SandboxToolArg, SandboxToolPolicy};
 use crate::common::{self, CommandCapture};
 use crate::persistence::load_managed_services;
-use crate::service::stop_managed_service;
+use crate::service::{sandbox_stop_server_value, stop_managed_service};
 use crate::watchers::restart_managed_service;
 use anyhow::{Context, Result, bail};
-#[cfg(target_os = "linux")]
-use rocm_core::command_failure_detail;
 use rocm_core::{
     AppPaths, AuditEventRecord, ExamineSummary, ModelRecipeArtifactRecord, append_audit_event,
     model_artifact_cache_status, resolve_model_recipe_artifact, unix_time_millis,
@@ -25,7 +23,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(any(test, target_os = "linux"))]
+// Only the tests still park a thread here; the sandbox spawn now goes through
+// `rocm_core::process::run_with_timeout`, which owns its own reader threads.
+#[cfg(test)]
 use std::thread;
 use std::time::Duration;
 
@@ -117,7 +117,8 @@ fn run_bubblewrap_sandbox(
         policy,
     );
 
-    let output = run_process_with_timeout(command, Duration::from_mins(1))?;
+    let output =
+        rocm_core::process::run_with_timeout(command, Duration::from_mins(1), "sandbox process")?;
     let value = parse_sandbox_child_output(output, "bubblewrap sandbox")?;
     record_sandbox_audit(paths, tool, "bubblewrap", true, service_id.as_deref())?;
     Ok(sandbox_report(tool, "bubblewrap", value))
@@ -223,12 +224,7 @@ pub(crate) fn run_sandbox_tool(
         SandboxToolArg::StopServer => {
             let service_id = service_id.context("stop_server requires `--service-id`")?;
             let stopped = stop_managed_service(paths, &service_id)?;
-            Ok(json!({
-                "tool": tool.as_cli_value(),
-                "status": "stopped",
-                "mutating": true,
-                "result": stopped,
-            }))
+            Ok(sandbox_stop_server_value(stopped))
         }
         SandboxToolArg::PrefetchArtifact => {
             let artifact_ref =
@@ -940,43 +936,6 @@ fn append_sandbox_tool_command_args(
     }
     if let Some(message) = message {
         command.arg("--message").arg(message);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn run_process_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn sandbox process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll sandbox process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect sandbox process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out sandbox process output")?;
-            bail!(
-                "sandbox process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 

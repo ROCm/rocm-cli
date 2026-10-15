@@ -23,17 +23,28 @@ const OPENAI_FIXTURES: &[&str] = &[
     "data:{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"caf\u{e9} \u{6f22}\u{5b57} \u{1f680}\"}}]}\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" \u{4e16}\u{754c}\"}}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":3}}\r\n\r\ndata: [DONE]\r\n\r\n",
 ];
 
-/// The events the emitter produces for `body` delivered in one piece.
-fn events_for_whole_body(body: &[u8]) -> Vec<ProviderStreamEvent> {
+/// The events an emitter produces while `read` feeds it, then finishes it.
+fn collect_events(
+    read: impl FnOnce(&mut OpenAiSseEmitter<'_>) -> Result<()>,
+) -> Result<Vec<ProviderStreamEvent>> {
     let mut events = Vec::new();
     let mut on_event = |event: ProviderStreamEvent| {
         events.push(event);
         Ok(())
     };
     let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-    emitter.push_bytes(body).expect("fixture lines parse");
-    emitter.finish().expect("fixture stream finishes");
-    events
+    read(&mut emitter)?;
+    emitter.finish()?;
+    Ok(events)
+}
+
+/// The events the emitter produces for `body` delivered in one piece.
+fn events_for_whole_body(body: &[u8]) -> Vec<ProviderStreamEvent> {
+    collect_events(|emitter| {
+        emitter.push_bytes(body).expect("fixture lines parse");
+        Ok(())
+    })
+    .expect("fixture stream finishes")
 }
 
 /// Split `bytes` at the given (unsorted, possibly duplicated) offsets.
@@ -105,10 +116,10 @@ impl Read for EofSpinGuard {
     }
 }
 
-/// A reader that fails every `every`-th read with `ErrorKind::Interrupted`
-/// (what a socket read with a receive timeout returns when a signal handler
-/// runs, since Linux does not restart it) and returns at most `max_read` bytes
-/// from the others.
+/// A reader that fails its first read and every `every`-th one after it with
+/// `ErrorKind::Interrupted` (what a socket read with a receive timeout returns
+/// when a signal handler runs, since Linux does not restart it) and returns at
+/// most `max_read` bytes from the others.
 struct InterruptingReader {
     inner: Cursor<Vec<u8>>,
     every: usize,
@@ -116,10 +127,22 @@ struct InterruptingReader {
     max_read: usize,
 }
 
+impl InterruptingReader {
+    fn new(bytes: Vec<u8>, every: usize, max_read: usize) -> Self {
+        Self {
+            inner: Cursor::new(bytes),
+            every,
+            calls: 0,
+            max_read,
+        }
+    }
+}
+
 impl Read for InterruptingReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let call = self.calls;
         self.calls += 1;
-        if self.calls.is_multiple_of(self.every) {
+        if call.is_multiple_of(self.every) {
             return Err(std::io::Error::from(ErrorKind::Interrupted));
         }
         let len = buf.len().min(self.max_read);
@@ -141,43 +164,14 @@ impl Read for StallsAfter {
     }
 }
 
-/// A reader whose first `read` fails with `ErrorKind::Interrupted`.
-struct FirstCallInterrupted(Cursor<Vec<u8>>, bool);
-
-impl Read for FirstCallInterrupted {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if !self.1 {
-            self.1 = true;
-            return Err(std::io::Error::from(ErrorKind::Interrupted));
-        }
-        self.0.read(buf)
-    }
-}
-
 fn chunked_events<R: BufRead>(reader: &mut R) -> Result<Vec<ProviderStreamEvent>> {
-    let mut events = Vec::new();
-    let mut on_event = |event: ProviderStreamEvent| {
-        events.push(event);
-        Ok(())
-    };
-    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-    read_chunked_sse_body(reader, &mut emitter)?;
-    emitter.finish()?;
-    Ok(events)
+    collect_events(|emitter| read_chunked_sse_body(reader, emitter))
 }
 
 /// Read `body` through the same framing dispatch the live client uses, with
 /// `headers` choosing the framing.
 fn framed_events<R: BufRead>(reader: &mut R, headers: &str) -> Result<Vec<ProviderStreamEvent>> {
-    let mut events = Vec::new();
-    let mut on_event = |event: ProviderStreamEvent| {
-        events.push(event);
-        Ok(())
-    };
-    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-    read_sse_body(reader, headers, &mut emitter)?;
-    emitter.finish()?;
-    Ok(events)
+    collect_events(|emitter| read_sse_body(reader, headers, emitter))
 }
 
 const CHUNKED_HEADERS: &str = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -187,15 +181,7 @@ fn content_length_headers(length: usize) -> String {
 }
 
 fn close_delimited_events<R: Read>(reader: &mut R) -> Result<Vec<ProviderStreamEvent>> {
-    let mut events = Vec::new();
-    let mut on_event = |event: ProviderStreamEvent| {
-        events.push(event);
-        Ok(())
-    };
-    let mut emitter = OpenAiSseEmitter::new(&mut on_event);
-    read_close_delimited_sse_body(reader, &mut emitter)?;
-    emitter.finish()?;
-    Ok(events)
+    collect_events(|emitter| read_close_delimited_sse_body(reader, emitter))
 }
 
 proptest! {
@@ -321,20 +307,11 @@ proptest! {
         let body = OPENAI_FIXTURES[fixture].as_bytes();
         let whole = events_for_whole_body(body);
 
-        let mut chunked = BufReader::new(InterruptingReader {
-            inner: Cursor::new(chunk_encode(body, &offsets).0),
-            every,
-            calls: 0,
-            max_read,
-        });
+        let mut chunked =
+            BufReader::new(InterruptingReader::new(chunk_encode(body, &offsets).0, every, max_read));
         prop_assert_eq!(&chunked_events(&mut chunked).unwrap(), &whole);
 
-        let mut close_delimited = InterruptingReader {
-            inner: Cursor::new(body.to_vec()),
-            every,
-            calls: 0,
-            max_read,
-        };
+        let mut close_delimited = InterruptingReader::new(body.to_vec(), every, max_read);
         let result = close_delimited_events(&mut close_delimited);
         prop_assert!(result.is_ok(), "close-delimited read failed: {:#}", result.unwrap_err());
         prop_assert_eq!(result.unwrap(), whole);
@@ -361,7 +338,8 @@ fn chunked_reader_returns_an_error_at_eof_on_a_chunk_boundary() {
 #[test]
 fn close_delimited_reader_retries_one_interrupted_read() {
     let body = OPENAI_FIXTURES[0].as_bytes();
-    let mut reader = FirstCallInterrupted(Cursor::new(body.to_vec()), false);
+    // Only the first read is interrupted.
+    let mut reader = InterruptingReader::new(body.to_vec(), usize::MAX, usize::MAX);
     let events = close_delimited_events(&mut reader).expect("Interrupted must be retried");
     assert_eq!(events, events_for_whole_body(body));
 }
