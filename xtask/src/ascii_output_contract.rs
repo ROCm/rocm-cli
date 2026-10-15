@@ -98,6 +98,18 @@ mod tests {
             "The e2e harness: test code and assertion text, not product output.",
         ),
         (
+            "crates/rocm-core/src/terminal.rs",
+            "A classifier for untrusted terminal output, and the one file in the tree \
+             whose job is to name non-ASCII characters rather than print them. Every \
+             literal here is a `Cf`/`Zl`/`Zp` code point in a `matches!` arm of \
+             `is_control_or_format`/`is_control_or_line_separator`, enumerated so it can \
+             be *removed* from a captured subprocess log before that log is quoted back \
+             at the user. The module emits no text of its own: both public functions \
+             return substrings of their input. Transliterating a code point here would \
+             not change any output, it would stop the stripper recognising the thing it \
+             exists to strip.",
+        ),
+        (
             "apps/rocm/src/cli_progress.rs",
             "Every spinner in this module is hard-gated on `stderr().is_terminal()` \
              and renders nothing at all when that is false, so its bytes reach a \
@@ -175,6 +187,17 @@ mod tests {
         ),
         ("apps/rocm/src/therock.rs", "Downloading {}…", SPINNER_LABEL),
         ("apps/rocm/src/therock.rs", "Extracting {}…", SPINNER_LABEL),
+        ("apps/rocm/src/main.rs", "\\u{feff}", STRIPPED_FROM_INPUT),
+        (
+            "crates/rocm-core/src/crypto.rs",
+            "\\u{feff}",
+            STRIPPED_FROM_INPUT,
+        ),
+        (
+            "crates/rocm-core/src/examine.rs",
+            "(\\u{2122})",
+            STRIPPED_FROM_INPUT,
+        ),
         ("crates/rocm-dash-core/src/state.rs", "⋯", JOB_GLYPH),
         ("crates/rocm-dash-core/src/state.rs", "✓", JOB_GLYPH),
         ("crates/rocm-dash-core/src/state.rs", "✗", JOB_GLYPH),
@@ -184,6 +207,12 @@ mod tests {
     const SPINNER_LABEL: &str = "A `cli_progress::Spinner`/`AnimatedSpinner` label. The spinner is hard-gated on \
          `stderr().is_terminal()` and renders nothing when that is false, so this text \
          reaches a console or nothing at all -- see the `cli_progress.rs` exemption.";
+
+    const STRIPPED_FROM_INPUT: &str = "Matched so it can be taken *out* of text arriving from outside the process -- a \
+         BOM ahead of JSON (`strip_prefix`/`trim_start_matches`) or a `™` in a \
+         vendor marketing name (`replace`). The character is a needle, never \
+         something this code writes; the only way it reaches a stream is if the input \
+         already carried it, which no transliteration here would change.";
 
     const JOB_GLYPH: &str = "`JobStatus::glyph()`. Every caller is in `rocm-dash-tui` (the Home tab activity \
          feed and the job console banner), so these reach the alternate screen only; \
@@ -267,11 +296,14 @@ mod tests {
     /// string/char literal holding a non-ASCII character outside test code.
     ///
     /// Hand-rolled rather than `syn`-based so this guard adds no dependency to
-    /// `xtask`; the same tradeoff `env_mutation_contract` makes. It handles the
-    /// forms that actually appear in this tree: `//` and nested `/* */`
+    /// `xtask`; the same tradeoff `env_mutation_contract` makes. It handles
+    /// every string and char form the language has: `//` and nested `/* */`
     /// comments, `"..."` with escapes and `\`-newline continuations, raw
-    /// strings at any hash count, `b"..."`/`br"..."`, and char literals kept
-    /// apart from lifetimes.
+    /// strings at any hash count, the `b`/`c`/`br`/`cr` prefixes, and char
+    /// literals kept apart from lifetimes. A literal is non-ASCII either
+    /// because its source text is, or -- outside a raw string, which has no
+    /// escapes -- because an escape in it *denotes* a non-ASCII value; see
+    /// [`escape_denotes_non_ascii`].
     ///
     /// Comments are skipped deliberately: a `©` in a licence header or an em
     /// dash in prose explaining the code is not output, and flagging those
@@ -286,6 +318,8 @@ mod tests {
         let mut line = 1usize;
         let mut depth: i32 = 0;
         let mut pending_test = false;
+        let mut attribute_at = 0usize;
+        let mut is_use_item = false;
         let mut open_test: Option<(usize, i32)> = None;
 
         while i < bytes.len() {
@@ -332,17 +366,19 @@ mod tests {
                 continue;
             }
 
-            // Raw strings: an optional `b`, then `r`, then any number of `#`.
+            // Raw strings: an optional `b`/`c`, then `r`, then any number of
+            // `#`. A backslash in a raw string is a backslash, so escapes are
+            // not interpreted.
             if let Some((literal, start_line, next)) = raw_string_at(source, i, line) {
-                record(&mut findings, start_line, literal);
+                record(&mut findings, start_line, literal, Escapes::Literal);
                 line = next.1;
                 i = next.0;
                 continue;
             }
 
-            // Ordinary and byte strings.
+            // Ordinary, byte and C strings.
             if let Some((literal, start_line, next)) = quoted_string_at(source, i, line) {
-                record(&mut findings, start_line, &literal);
+                record(&mut findings, start_line, &literal, Escapes::Interpreted);
                 line = next.1;
                 i = next.0;
                 continue;
@@ -353,7 +389,7 @@ mod tests {
             // discriminator.
             if bytes[i] == b'\'' {
                 if let Some((literal, next)) = char_literal_at(source, i) {
-                    record(&mut findings, line, literal);
+                    record(&mut findings, line, literal, Escapes::Interpreted);
                     i = next;
                     continue;
                 }
@@ -362,14 +398,48 @@ mod tests {
             }
 
             // Test-item tracking, on code bytes only.
-            if bytes[i] == b'#' && starts_test_attribute(rest) {
-                pending_test = true;
+            if bytes[i] == b'#' {
+                if starts_test_attribute(rest) && !pending_test {
+                    pending_test = true;
+                    attribute_at = i;
+                    is_use_item = false;
+                }
                 i += 1;
                 continue;
             }
+
+            // Does this test item say `use`? That is the one word that decides
+            // whether the attribute belongs to an import group (no body to
+            // exempt) or to an item that owns one, and reading it is what
+            // distinguishes `#[cfg(test)] use a::{b, c};` from a
+            // `#[cfg(test)] const X: Foo = Foo { .. };`, which trails the same
+            // `;` after the same closing brace. `use_x` or `Use` are
+            // identifiers in their own right, not this keyword.
+            if pending_test && open_test.is_none() && is_ident_start(bytes[i]) {
+                let end = ident_end(source, i);
+                if &source[i..end] == "use" {
+                    is_use_item = true;
+                }
+                i = end;
+                continue;
+            }
+
+            // A bracket group between a test attribute and its body belongs to
+            // that test item: the `#[cfg(test)]` attribute's own `[..]`, the
+            // `[&str; 2]` of a `#[cfg(test)] static`, or the `[..]` value
+            // after it. Stepping over it keeps the `cfg`/`test` inside the
+            // attribute out of the keyword scan and the `;` inside an array
+            // type from ending the item early.
+            if bytes[i] == b'[' && pending_test && open_test.is_none() {
+                let (end, newlines) = bracket_group_end(source, i);
+                line += newlines;
+                i = end;
+                continue;
+            }
+
             if bytes[i] == b'{' {
                 if pending_test && open_test.is_none() {
-                    open_test = Some((i, depth));
+                    open_test = Some((attribute_at, depth));
                 }
                 depth += 1;
                 i += 1;
@@ -381,30 +451,42 @@ mod tests {
                     && depth == at
                 {
                     // A `#[cfg(test)] use a::{b, c};` brace group is not an
-                    // item body; the `;` right after it gives it away. The
-                    // attribute belonged to that `use` and is now spent --
-                    // carrying `pending_test` forward would make the *next*
-                    // brace in the file, typically a production `fn`, look
-                    // like a test body and silently exempt everything in it.
-                    let tail = source[i + 1..].trim_start();
-                    if tail.starts_with(';') {
-                        open_test = None;
-                        pending_test = false;
-                    } else {
+                    // item body: the attribute belonged to that `use` and is
+                    // now spent. Carrying `pending_test` forward would make
+                    // the *next* brace in the file, typically a production
+                    // `fn`, look like a test body and silently exempt
+                    // everything in it.
+                    //
+                    // The keyword is what tells the two apart, not the `;`
+                    // after the closing brace: `#[cfg(test)] const X: Foo =
+                    // Foo { .. };` trails a `;` exactly as the `use` group
+                    // does, yet it *is* a test item whose literals must be
+                    // skipped.
+                    if !is_use_item {
                         spans.push(TestSpan { start, end: i });
-                        open_test = None;
-                        pending_test = false;
                     }
+                    open_test = None;
+                    pending_test = false;
+                    is_use_item = false;
                 }
                 i += 1;
                 continue;
             }
 
-            // Same reasoning for a brace-less `#[cfg(test)] use a::b;`: the
-            // statement ends, so the attribute cannot still be waiting for an
-            // item body.
+            // A test item with no braces at all: `#[cfg(test)] use a::b;`,
+            // `#[cfg(test)] mod tests;`, or a `#[cfg(test)] static T: [&str;
+            // 2] = [..];`. The statement ends, so the attribute cannot still
+            // be waiting for an item body -- and for everything but `use` the
+            // statement itself was the test item.
             if bytes[i] == b';' && pending_test && open_test.is_none() {
+                if !is_use_item {
+                    spans.push(TestSpan {
+                        start: attribute_at,
+                        end: i,
+                    });
+                }
                 pending_test = false;
+                is_use_item = false;
                 i += 1;
                 continue;
             }
@@ -422,13 +504,79 @@ mod tests {
         findings
     }
 
-    fn record(findings: &mut Vec<Finding>, line: usize, literal: &str) {
-        if !literal.is_ascii() {
+    /// Whether a backslash in the recorded text denotes an escape sequence.
+    /// Raw strings have no escapes; everything else does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Escapes {
+        Interpreted,
+        Literal,
+    }
+
+    fn record(findings: &mut Vec<Finding>, line: usize, literal: &str, escapes: Escapes) {
+        let non_ascii = !literal.is_ascii()
+            || (escapes == Escapes::Interpreted && escape_denotes_non_ascii(literal));
+        if non_ascii {
             findings.push(Finding {
                 line,
                 text: literal.to_owned(),
             });
         }
+    }
+
+    /// Whether any escape sequence in `text` *denotes* a non-ASCII value even
+    /// though the escape is written in ASCII.
+    ///
+    /// `"\u{2014}"` is an em dash the moment it is compiled, and the UTF-8
+    /// bytes it puts on a redirected stream are the same `E2 80 94` that
+    /// ROCMAI-543 is about -- but every byte of the *source* is ASCII, so a
+    /// plain `is_ascii()` on the literal text says nothing is wrong. The same
+    /// holds for `\xNN` above `7F`, which is legal in a byte string (`b"..."`)
+    /// and puts that byte straight on the wire.
+    ///
+    /// Escapes are walked in order rather than searched for, so an escaped
+    /// backslash cannot be misread: in `"\\u{2014}"` the `\\` is consumed as
+    /// one escape and the following `u{2014}` is the ASCII text it really is.
+    ///
+    /// Anything malformed counts as non-ASCII. This scanner is not a Rust
+    /// parser and such a literal would not compile anyway; erring towards a
+    /// finding keeps the failure visible instead of silent.
+    fn escape_denotes_non_ascii(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] != b'\\' {
+                i += 1;
+                continue;
+            }
+            match bytes.get(i + 1) {
+                Some(b'u') if bytes.get(i + 2) == Some(&b'{') => {
+                    // `i + 3` follows three ASCII bytes, so it is a char
+                    // boundary and slicing cannot panic.
+                    let Some(close) = text[i + 3..].find('}') else {
+                        return true;
+                    };
+                    let digits = text[i + 3..i + 3 + close].replace('_', "");
+                    match u32::from_str_radix(&digits, 16) {
+                        Ok(value) if value < 0x80 => {}
+                        _ => return true,
+                    }
+                    i = i + 3 + close + 1;
+                }
+                Some(b'x') => {
+                    match text
+                        .get(i + 2..i + 4)
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                    {
+                        Some(value) if value < 0x80 => {}
+                        _ => return true,
+                    }
+                    i += 4;
+                }
+                Some(_) => i += 2,
+                None => i += 1,
+            }
+        }
+        false
     }
 
     fn starts_test_attribute(rest: &str) -> bool {
@@ -442,6 +590,43 @@ mod tests {
         MARKERS.iter().any(|m| rest.starts_with(m))
     }
 
+    /// `(offset just past the matching `]`, newlines crossed)` for the bracket
+    /// group opening at `at`.
+    fn bracket_group_end(source: &str, at: usize) -> (usize, usize) {
+        let bytes = source.as_bytes();
+        let mut i = at;
+        let mut depth = 0usize;
+        let mut newlines = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (i + 1, newlines);
+                    }
+                }
+                b'\n' => newlines += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        (bytes.len(), newlines)
+    }
+
+    const fn is_ident_start(b: u8) -> bool {
+        b.is_ascii_alphabetic() || b == b'_'
+    }
+
+    fn ident_end(source: &str, at: usize) -> usize {
+        let bytes = source.as_bytes();
+        let mut i = at;
+        while i < bytes.len() && is_ident_byte(bytes[i]) {
+            i += 1;
+        }
+        i
+    }
+
     /// `(literal, start line, (next offset, next line))` if a raw string starts
     /// at `at`.
     fn raw_string_at(
@@ -451,7 +636,7 @@ mod tests {
     ) -> Option<(&str, usize, (usize, usize))> {
         let bytes = source.as_bytes();
         let mut i = at;
-        if bytes.get(i) == Some(&b'b') {
+        if matches!(bytes.get(i), Some(&b'b') | Some(&b'c')) {
             i += 1;
         }
         if bytes.get(i) != Some(&b'r') {
@@ -492,7 +677,7 @@ mod tests {
     ) -> Option<(String, usize, (usize, usize))> {
         let bytes = source.as_bytes();
         let mut i = at;
-        if bytes.get(i) == Some(&b'b') {
+        if matches!(bytes.get(i), Some(&b'b') | Some(&b'c')) {
             i += 1;
         }
         if bytes.get(i) != Some(&b'"') {
@@ -510,9 +695,13 @@ mod tests {
                     if bytes.get(i + 1) == Some(&b'\n') {
                         newlines += 1;
                     }
-                    // Push the escaped byte as written; what matters is only
-                    // whether a non-ASCII character is present, and an escape
-                    // sequence never is.
+                    // Copy `\` plus the escaped byte verbatim and resume
+                    // after it. Only the two bytes are consumed here even for
+                    // a longer escape such as `\u{2014}`: the rest of that
+                    // escape is ASCII and lands in the recorded text as
+                    // written, which is what `escape_denotes_non_ascii` then
+                    // reads. Consuming the `\` with its next byte is what
+                    // keeps `\\` from being mistaken for the start of one.
                     let end = (i + 2).min(bytes.len());
                     literal.push_str(&source[i..end]);
                     i = end;
@@ -539,11 +728,13 @@ mod tests {
         let bytes = source.as_bytes();
         let body_start = at + 1;
         if bytes.get(body_start) == Some(&b'\\') {
-            let close = source[body_start..].find('\'')?;
-            return Some((
-                &source[body_start..body_start + close],
-                body_start + close + 1,
-            ));
+            // Start looking for the closing quote *past* the escaped byte, so
+            // that `'\''` closes on its third quote rather than its second.
+            // The whole escape is handed back, `\u{2014}` included, because
+            // that is what `escape_denotes_non_ascii` needs to see.
+            let after_escape = body_start + 2;
+            let close = after_escape + source.get(after_escape..)?.find('\'')?;
+            return Some((&source[body_start..close], close + 1));
         }
         let ch = source[body_start..].chars().next()?;
         let close = body_start + ch.len_utf8();
@@ -893,6 +1084,12 @@ mod tests {
             "the production literal still counts: {found:?}"
         );
         assert_eq!(found[0].0, 5);
+
+        // A test span is recorded by line, so a `use` group that was wrongly
+        // treated as an item body would swallow anything sharing its line.
+        // Only recognising the `use` keeps that line in scope.
+        let crowded = "#[cfg(test)] use a::{b, c}; fn f() { let _ = \"\u{2014}\"; }\n";
+        assert_eq!(lines(&crowded).len(), 1, "{:?}", lines(&crowded));
     }
 
     /// The brace-less form of the same trap.
@@ -909,12 +1106,124 @@ mod tests {
         assert_eq!(found[0].0, 5);
     }
 
-    /// Escapes are not non-ASCII, however they are spelled.
+    /// An escaped quote does not end the literal, and an escape whose value is
+    /// ASCII is not a finding.
+    ///
+    /// Named for what it checks: an earlier version of this fixture was called
+    /// "escape sequences do not confuse the scanner" while only ever passing
+    /// `\"` and `\u{41}` through it -- both ASCII, so it could not have caught
+    /// the `\u{2014}` hole that
+    /// [`an_escape_denoting_a_non_ascii_character_is_a_finding`] covers.
     #[test]
-    fn escaped_quotes_and_escape_sequences_do_not_confuse_the_scanner() {
-        assert!(lines("fn f() { let _ = \"a \\\" b \\u{41}\"; }\n").is_empty());
+    fn an_escaped_quote_does_not_end_the_literal_and_an_ascii_escape_is_not_a_finding() {
+        assert!(lines("fn f() { let _ = \"a \\\" b \\u{41} \\x41 \\n\"; }\n").is_empty());
         let found = lines("fn f() { let _ = \"a \\\" b\"; let _ = \"\u{2014}\"; }\n");
         assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    /// The hole this fixture exists for: `"\u{2014}"` is an em dash on the
+    /// wire -- the same `E2 80 94` ROCMAI-543 is about -- while every byte of
+    /// its *source* is ASCII. A guard that only calls `is_ascii()` on the
+    /// literal text cannot see it, so a conversion reverted in this spelling
+    /// would have been invisible.
+    #[test]
+    fn an_escape_denoting_a_non_ascii_character_is_a_finding() {
+        let found = lines("fn f() { let _ = \"a \\u{2014} b\"; }\n");
+        assert_eq!(found.len(), 1, "the em dash escape: {found:?}");
+        assert!(
+            found[0].1.contains("\\u{2014}"),
+            "the finding carries the escape as written: {found:?}"
+        );
+        // Every surrounding form, so the fix is not just the one shape.
+        assert_eq!(lines("fn f() { let _ = '\\u{2014}'; }\n").len(), 1);
+        assert_eq!(lines("fn f() { let _ = \"\\u{2_014}\"; }\n").len(), 1);
+        assert_eq!(lines("fn f() { let _ = \"\\u{85}\"; }\n").len(), 1);
+        // `\xNN` above 7F is legal in a byte string and is a non-ASCII byte.
+        assert_eq!(
+            lines("fn f() { let _ = b\"a \\xe2\\x80\\x94 b\"; }\n").len(),
+            1
+        );
+        assert_eq!(lines("fn f() { let _ = c\"a \\u{2014} b\"; }\n").len(), 1);
+    }
+
+    /// The other direction, which is what makes decoding the escape worth the
+    /// code over treating every `\u{...}` as suspect: `\u{1b}`, `\u{7}` and
+    /// `\u{41}` are ASCII and appear all over this tree as terminal control
+    /// bytes. Flagging them would have forced dozens of exemptions that say
+    /// nothing.
+    #[test]
+    fn an_escape_denoting_an_ascii_character_is_not_a_finding() {
+        assert!(lines("fn f() { let _ = \"\\u{1b}[0m\\u{7}\"; }\n").is_empty());
+        assert!(lines("fn f() { let _ = '\\u{0}'; }\n").is_empty());
+        assert!(lines("fn f() { let _ = \"\\x7f\"; }\n").is_empty());
+    }
+
+    /// A backslash is not an escape inside a raw string, so `r"\u{2014}"` is
+    /// the eight ASCII characters it looks like and must not be flagged --
+    /// while a *real* em dash in one still is (see
+    /// [`non_ascii_in_a_raw_string_is_a_finding`]).
+    #[test]
+    fn an_escape_written_in_a_raw_string_is_not_interpreted() {
+        assert!(lines("fn f() { let _ = r\"a \\u{2014} b\"; }\n").is_empty());
+        assert!(lines("fn f() { let _ = r#\"\\xe2\\x80\\x94\"#; }\n").is_empty());
+        // Nor is an escaped backslash in an ordinary string: `\\` is consumed
+        // as one escape, so the `u{2014}` after it is the ASCII text it is.
+        assert!(lines("fn f() { let _ = \"a \\\\u{2014} b\"; }\n").is_empty());
+    }
+
+    /// `'\''` must close on its *third* quote. Closing on the second leaves a
+    /// stray `'` that the next pass reads as the opening of something else --
+    /// in `['\'','\u{2014}']` it pairs that quote with the comma, making a
+    /// char literal `','` whose closing quote is really the em dash literal's
+    /// *opening* one, so the em dash is scanned as code and never recorded.
+    #[test]
+    fn an_escaped_quote_char_literal_is_consumed_whole() {
+        let found = lines("fn f() { let _ = ['\\'','\u{2014}']; }\n");
+        assert_eq!(found.len(), 1, "the em dash after it: {found:?}");
+        assert_eq!(found[0].1, "\u{2014}", "{found:?}");
+    }
+
+    /// `#[cfg(test)] const X: Foo = Foo { .. };` closes its brace group with a
+    /// `;` exactly as a `use` group does, so a rule that reads the trailing
+    /// punctuation instead of the item keyword calls it production code and
+    /// wrongly flags a test-only fixture.
+    #[test]
+    fn a_cfg_test_const_with_a_braced_initialiser_is_a_test_item() {
+        let source = "#[cfg(test)]\nconst X: Foo = Foo { label: \"\u{2014}\" };\n\nfn f() {}\n";
+        assert!(lines(source).is_empty(), "{:?}", lines(source));
+
+        // Same for a visibility-qualified `static`: `pub` is not `use`.
+        let qualified = "#[cfg(test)]\npub(crate) static X: Foo = Foo { label: \"\u{2014}\" };\n";
+        assert!(lines(qualified).is_empty(), "{:?}", lines(qualified));
+    }
+
+    /// The same misclassification with no braces at all: a `const` whose value
+    /// is just a string also ends in `;`, so the item itself has to be
+    /// recorded as a test span rather than the attribute merely marked spent.
+    #[test]
+    fn a_brace_less_cfg_test_const_is_a_test_item() {
+        let source = "#[cfg(test)]\nconst X: &str = \"\u{2014}\";\n\nfn f() {}\n";
+        assert!(lines(source).is_empty(), "{:?}", lines(source));
+    }
+
+    /// ...and one whose type is an array, where the `;` of `[&str; 2]` sits
+    /// inside the item rather than ending it. Reading that `;` as the end
+    /// closes the test span early, and the fixture data after it is reported
+    /// as production output.
+    #[test]
+    fn an_array_type_semicolon_does_not_end_a_test_item_early() {
+        let source = "#[cfg(test)]\nstatic X: [&str; 2] = [\n    \"\u{2014}\",\n    \"b\",\n];\n";
+        assert!(lines(source).is_empty(), "{:?}", lines(source));
+    }
+
+    /// A multi-line test attribute must not throw the line counter off; the
+    /// finding's line number is the only thing that locates it.
+    #[test]
+    fn a_multi_line_test_attribute_keeps_the_line_count_straight() {
+        let source = "#[tokio::test(\n    flavor = \"multi_thread\"\n)]\nasync fn t() {}\n\nfn f() {\n    let _ = \"\u{2014}\";\n}\n";
+        let found = lines(source);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, 7, "line of the production literal: {found:?}");
     }
 
     /// The scan must actually be reaching the tree it claims to cover; a walk

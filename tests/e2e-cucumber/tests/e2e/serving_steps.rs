@@ -1311,7 +1311,7 @@ async fn assert_full_model_name(world: &mut E2eWorld) {
     );
 }
 
-#[then("the model list output contains no non-ASCII punctuation")]
+#[then("the model list output contains only ASCII characters")]
 async fn assert_model_list_is_ascii(world: &mut E2eWorld) {
     let output = world.cli_output.as_ref().expect("no CLI output");
     assert!(
