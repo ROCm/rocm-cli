@@ -1733,50 +1733,13 @@ fn read_json_file(path: &std::path::Path) -> serde_json::Value {
         .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
 }
 
-/// The most recently written [`SCRIPTED_ENGINE`] service record under this
-/// scenario's isolated data dir.
-///
-/// `generate_service_id` embeds a timestamp, so the id can't be known ahead of
-/// the serve; scanning by engine and taking the newest-modified file mirrors
-/// `e2e.rs`'s own `stop_managed_services` scan.
-fn latest_scripted_engine_record(world: &E2eWorld) -> serde_json::Value {
-    let dir = scripted_engine_services_dir(world);
-    let mut matches: Vec<(std::time::SystemTime, serde_json::Value)> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()))
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                return None;
-            }
-            let value = read_json_file(&path);
-            if value.get("engine").and_then(serde_json::Value::as_str) != Some(SCRIPTED_ENGINE) {
-                return None;
-            }
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, value))
-        })
-        .collect();
-    matches.sort_by_key(|(modified, _)| *modified);
-    matches.pop().map(|(_, value)| value).unwrap_or_else(|| {
-        panic!(
-            "no {SCRIPTED_ENGINE} service record under {}",
-            dir.display()
-        )
-    })
-}
-
 /// The scripted engine's service record and its paired engine-state file
 /// (named by the record's own `engine_state_path` field).
-fn scripted_engine_record_and_state(world: &E2eWorld) -> (serde_json::Value, serde_json::Value) {
-    let record = latest_scripted_engine_record(world);
-    record_and_state_from(record)
-}
-
-/// Like [`scripted_engine_record_and_state`], but reads the manifest by its
-/// known `service_id` (`<service_id>.json` — see `AppPaths::service_manifest_path`)
-/// rather than scanning the services dir for "the newest record" (ROCMAI-541
-/// N5): a concurrent recovery mechanism could otherwise make that ambiguous.
+///
+/// Reads the manifest by its known `service_id` (`<service_id>.json` — see
+/// `AppPaths::service_manifest_path`) rather than scanning the services dir
+/// for "the newest record" (ROCMAI-541 N5): a concurrent recovery mechanism
+/// could otherwise make that ambiguous.
 fn scripted_engine_record_and_state_for(
     world: &E2eWorld,
     service_id: &str,
@@ -1941,19 +1904,29 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
     // its own safety ceiling instead.
     let dir = scripted_engine_services_dir(world);
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let is_running = std::fs::read_dir(&dir).is_ok_and(|entries| {
-            entries.flatten().any(|entry| {
+    // Captured here, the moment the record is first seen `running` (ROCMAI-541
+    // N5/N3) — not re-derived later by scanning the services dir for "the
+    // newest record", which a concurrent recovery mechanism could make
+    // ambiguous by the time `another shell stops that service` or the final
+    // `Then` step runs.
+    let found_service_id = loop {
+        let running_service_id = std::fs::read_dir(&dir).ok().and_then(|entries| {
+            entries.flatten().find_map(|entry| {
                 let path = entry.path();
-                path.extension().and_then(|e| e.to_str()) == Some("json")
-                    && std::fs::read(&path)
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                        .is_some_and(|value| value["status"] == "running")
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    return None;
+                }
+                let value = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())?;
+                if value["status"] != "running" {
+                    return None;
+                }
+                value["service_id"].as_str().map(str::to_owned)
             })
         });
-        if is_running {
-            break;
+        if let Some(service_id) = running_service_id {
+            break service_id;
         }
         if Instant::now() >= deadline {
             // Diagnose before the generic timeout panic (ROCMAI-541 N5): a
@@ -1974,16 +1947,20 @@ async fn user_attaches_scripted_serve_in_background(world: &mut E2eWorld) {
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    world.scripted_service_id = Some(found_service_id);
 }
 
 #[when("another shell stops that service while it is attached")]
 async fn another_shell_stops_scripted_service(world: &mut E2eWorld) {
-    let record = latest_scripted_engine_record(world);
-    let service_id = record["service_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("record has no service_id: {record}"))
-        .to_owned();
+    // The id captured when `user_attaches_scripted_serve_in_background` first
+    // saw this exact record `running` (ROCMAI-541 N3) — not re-derived here by
+    // scanning the services dir for "the newest record", which a concurrent
+    // recovery mechanism could make ambiguous.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured while waiting for the attach to come up");
     let stdout = crate::run_rocm_ok(world, &["services", "stop", &service_id, "--yes"]);
     assert!(
         stdout.contains("stopped"),
@@ -2023,7 +2000,13 @@ async fn assert_attached_serve_reports_stop(world: &mut E2eWorld) {
 
 #[then("the service record does not read failed")]
 async fn assert_scripted_stop_not_marked_failed(world: &mut E2eWorld) {
-    let (record, engine_state) = scripted_engine_record_and_state(world);
+    // Read by the id captured at attach time (ROCMAI-541 N3), not by scanning
+    // for "the newest record" — see `another_shell_stops_scripted_service`.
+    let service_id = world
+        .scripted_service_id
+        .clone()
+        .expect("no scripted service_id captured while waiting for the attach to come up");
+    let (record, engine_state) = scripted_engine_record_and_state_for(world, &service_id);
     assert_ne!(
         record["status"], "failed",
         "manifest wrongly marked failed: {record}"

@@ -710,7 +710,24 @@ fn spawn_managed_engine_child(
     record.record_supervisor_identity(child_pid);
     record.record_engine_identity(child_pid);
     record.status = "running".to_owned();
-    record.write()?;
+    // Merge the fields this spawn actually owns, not a whole-file
+    // `record.write()`: `record` is still the in-memory snapshot from
+    // `ManagedServiceRecord::new` (already persisted once above, before this
+    // child was spawned), and writing it back wholesale would erase a
+    // `stop_requested_unix_ms` a concurrent stop could have written to disk
+    // in the narrow window between that first write and this one — the same
+    // hazard the early-death branch above already guards against with its
+    // own merge.
+    rocm_core::merge_json_state_file(
+        &record.manifest_path,
+        &serde_json::json!({
+            "status": record.status,
+            "supervisor_pid": record.supervisor_pid,
+            "supervisor_start_ticks": record.supervisor_start_ticks,
+            "engine_pid": record.engine_pid,
+            "engine_start_ticks": record.engine_start_ticks,
+        }),
+    )?;
 
     Ok(ManagedSpawn::Spawned {
         record: Box::new(record),
@@ -802,7 +819,21 @@ pub(crate) fn start_managed_service(
             // re-probing.
             record.inference_verified_at_unix_ms = Some(rocm_core::unix_time_millis() as u64);
         }
-        record.write()?;
+        // Merge the two fields this readiness result actually owns, not a
+        // whole-file `record.write()`: `record` is still spawn-time state, and
+        // an unconfirmed stop landing during the 45s wait above (marker set,
+        // child still alive at the instant `finalize_managed_launch_readiness`
+        // checked it) or a confirmed stop racing this exact `Serving` probe can
+        // still write `stop_requested_unix_ms` to disk in the gap between that
+        // check and this write — the same hazard its own merge already guards
+        // against for the dead-child case.
+        rocm_core::merge_json_state_file(
+            &record.manifest_path,
+            &serde_json::json!({
+                "status": record.status,
+                "inference_verified_at_unix_ms": record.inference_verified_at_unix_ms,
+            }),
+        )?;
         record_cli_audit_event(
             &paths,
             "service",
@@ -1104,7 +1135,7 @@ pub(crate) fn run_attached_service(
     // lock before streaming logs, which blocks for the whole attached session.
     drop(launch_lock);
 
-    let (service_id, log_path, engine_state_path, child_pid, engine_start_ticks, mut liveness) =
+    let (service_id, log_path, engine_state_path, child_pid, supervisor_start_ticks, mut liveness) =
         match spawn {
             // A server for this engine+model is already live. Don't fight it for the
             // port — point the user at the existing one instead of tailing a log we
@@ -1131,7 +1162,7 @@ pub(crate) fn run_attached_service(
                 record.log_path.clone(),
                 record.engine_state_path.clone(),
                 child_pid,
-                record.engine_start_ticks,
+                record.supervisor_start_ticks,
                 liveness,
             ),
         };
@@ -1238,30 +1269,45 @@ pub(crate) fn run_attached_service(
             // field this crash verdict owns is touched — never a write-back
             // that could clobber a newer record with an older snapshot.
             //
-            // Guarded (ROCMAI-541 N2) on the manifest still naming the exact
-            // engine this session spawned and has been watching — pid and
-            // start-time token both, like `names_same_processes` — so a stale
-            // write from this reaped child can never clobber a manifest a
-            // successful restart has since legitimately replaced. The engine
-            // state file carries no such identity to check, and is left
-            // unguarded like the launch and restart paths' equivalent writes.
-            let manifest_still_names_this_engine =
+            // Guarded on the manifest still naming the exact *supervisor*
+            // process this session spawned and has been watching — `child_pid`
+            // is `supervisor_pid`/`supervisor_start_ticks`'s subject, the
+            // `__engine-serve-http` process this loop's `liveness` tracks and
+            // whose exit is what landed us here. `engine_pid` is the wrong
+            // identity to gate on: `refresh_from_engine_state` overwrites it
+            // with whatever the engine itself reports as `server_pid`, which
+            // for an engine like Lemonade that spawns its own child server is
+            // *that* child's pid, not this loop's `child_pid` — so comparing
+            // on `engine_pid` is false for the exact case this whole fix is
+            // for (a Lemonade-backed server that was running and then died),
+            // and the manifest would never get stamped. `supervisor_pid`/
+            // `supervisor_start_ticks` are never touched by
+            // `refresh_from_engine_state` and ARE rewritten by a legitimate
+            // restart (`record_supervisor_identity` at the top of this same
+            // spawn path), so comparing on them actually distinguishes "this
+            // manifest still names the child we're watching" from "a restart
+            // already replaced it". The engine state file is guarded the same
+            // way: its own `status` is exactly what `refresh_from_engine_state`
+            // reads back into a newer manifest, so leaving this write
+            // unguarded would let the clobber this guard prevents on the
+            // manifest simply round-trip back in through that file instead.
+            let still_watching_this_supervisor =
                 crate::read_managed_service_manifest(&paths, &service_id).is_ok_and(
                     |(current, _)| {
-                        current.engine_pid == Some(child_pid)
-                            && current.engine_start_ticks == engine_start_ticks
+                        current.supervisor_pid == child_pid
+                            && current.supervisor_start_ticks == supervisor_start_ticks
                     },
                 );
-            if manifest_still_names_this_engine {
+            if still_watching_this_supervisor {
                 let _ = rocm_core::merge_json_state_file(
                     &paths.service_manifest_path(&service_id),
                     &serde_json::json!({ "status": "failed" }),
                 );
+                let _ = rocm_core::merge_json_state_file(
+                    &engine_state_path,
+                    &serde_json::json!({ "status": "failed" }),
+                );
             }
-            let _ = rocm_core::merge_json_state_file(
-                &engine_state_path,
-                &serde_json::json!({ "status": "failed" }),
-            );
             bail!(
                 "{}",
                 managed_engine_exit_failure_detail(&service_id, &log_path)

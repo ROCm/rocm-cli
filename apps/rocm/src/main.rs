@@ -14477,8 +14477,9 @@ fn record_engine_serve_http_failure(
 /// ROCMAI-541 (B3) E2E hook, armed by `ROCM_E2E_SCRIPTED_ENGINE`: stands in for
 /// every real engine so a scenario can exercise a managed child dying (or being
 /// stopped) *after* its early-startup window, on a host with no GPU — the gap
-/// the original ROCMAI-541 fix left uncovered (see `serve-scripted-death` and
-/// `serve-scripted-stop` in `model_serving.feature`).
+/// the original ROCMAI-541 fix left uncovered (see
+/// `serve-scripted-death-after-startup` and
+/// `serve-scripted-external-stop-while-attached` in `model_serving.feature`).
 ///
 /// Marks the engine state file `running` (mirroring a real engine reaching
 /// that point) and appends a progress line to the service log — the same two
