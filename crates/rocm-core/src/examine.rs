@@ -246,6 +246,8 @@ pub struct Examination {
     // driver / runtime (Linux)
     pub amdgpu_loaded: Option<bool>,
     pub amdgpu_blacklisted_in: Vec<String>,
+    /// kfd is present: an `amdkfd` module, or the kernel's kfd interfaces
+    /// (`/sys/class/kfd/kfd`, `/dev/kfd`) when kfd is built into the kernel.
     pub amdkfd_loaded: Option<bool>,
     pub secure_boot: String,
     pub iommu_kernel_param: String,
@@ -1824,6 +1826,21 @@ fn summarise_gpu_categories(e: &mut Examination) {
 // Kernel module / device probes (Linux)
 // ---------------------------------------------------------------------------
 
+/// Whether the kernel's kfd is present on this host, however it got there.
+///
+/// kfd is not a module of its own: `HSA_AMD` is a `bool` Kconfig option and
+/// amdkfd is linked into `amdgpu`, so no `amdkfd` line ever appears in the
+/// module list, built in or not. The kernel's own interfaces are the signal:
+/// the `/sys/class/kfd/kfd` class device, or the `/dev/kfd` node.
+fn kfd_present_on_host() -> bool {
+    crate::host_path("/sys/class/kfd/kfd").exists() || crate::host_path("/dev/kfd").exists()
+}
+
+/// `amdkfd_loaded`: an `amdkfd` module in the list, or kfd present on the host.
+fn amdkfd_present(modules: &[&str], kfd_on_host: bool) -> bool {
+    modules.contains(&"amdkfd") || kfd_on_host
+}
+
 fn probe_modules(e: &mut Examination) {
     let (rc, out, _) = run("lsmod", &[], SHORT);
     let module_text = if rc == 0 {
@@ -1832,13 +1849,17 @@ fn probe_modules(e: &mut Examination) {
         let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
     };
+    let kfd_on_host = kfd_present_on_host();
     if let Some(text) = module_text {
         let modules: Vec<&str> = text
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .collect();
         e.amdgpu_loaded = Some(modules.contains(&"amdgpu"));
-        e.amdkfd_loaded = Some(modules.contains(&"amdkfd"));
+        e.amdkfd_loaded = Some(amdkfd_present(&modules, kfd_on_host));
+    } else if kfd_on_host {
+        // No module list to read, but kfd is demonstrably there.
+        e.amdkfd_loaded = Some(true);
     }
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
@@ -6416,6 +6437,59 @@ mod tests {
                 e.os_version
             );
         }
+    }
+
+    #[test]
+    fn amdkfd_is_present_when_listed_as_a_module() {
+        assert!(amdkfd_present(&["amdgpu", "amdkfd"], false));
+    }
+
+    /// kfd built into the kernel never appears in the module list.
+    #[test]
+    fn amdkfd_is_present_when_built_in_and_absent_from_the_module_list() {
+        assert!(amdkfd_present(&["amdgpu", "drm"], true));
+        assert!(amdkfd_present(&[], true));
+    }
+
+    #[test]
+    fn amdkfd_is_absent_with_neither_a_module_nor_kfd_on_the_host() {
+        assert!(!amdkfd_present(&["amdgpu", "drm"], false));
+        assert!(!amdkfd_present(&[], false));
+    }
+
+    /// The host side of the check, against a planted root: the sysfs class
+    /// device alone, the device node alone, and neither.
+    #[cfg(all(feature = "e2e-test-hooks", target_os = "linux"))]
+    #[test]
+    fn kfd_present_on_host_reads_sysfs_and_the_device_node() {
+        use crate::hardware_root::TEST_HOST_ROOT_ENV;
+        use crate::test_env::RestoredEnvVar;
+
+        let root = std::env::temp_dir().join(format!(
+            "rocm-core-kfd-present-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        let (neither, sysfs_only, dev_only) = {
+            let _guard = crate::hardware_root::HOST_ROOT_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _root = RestoredEnvVar::set(TEST_HOST_ROOT_ENV, &root);
+            let neither = kfd_present_on_host();
+            std::fs::create_dir_all(root.join("sys/class/kfd/kfd")).expect("plant sysfs");
+            let sysfs_only = kfd_present_on_host();
+            std::fs::remove_dir_all(root.join("sys")).expect("unplant sysfs");
+            std::fs::create_dir_all(root.join("dev")).expect("plant dev");
+            std::fs::write(root.join("dev/kfd"), "").expect("plant /dev/kfd");
+            (neither, sysfs_only, kfd_present_on_host())
+        };
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!neither, "an empty root has no kfd");
+        assert!(sysfs_only, "/sys/class/kfd/kfd alone counts");
+        assert!(dev_only, "/dev/kfd alone counts");
     }
 
     /// The probes themselves, not just `host_path`, answer from a simulated
