@@ -621,3 +621,27 @@ To turn provider-assisted planning back off:
 ```powershell
 rocm config clear-planner-provider
 ```
+
+## 8. Uninstall
+
+Run this last, on a machine installed with the release installer (not a
+`cargo` build, whose binaries uninstall leaves alone):
+
+```powershell
+rocm uninstall --dry-run
+rocm uninstall
+```
+
+Expected result:
+
+- The dry run lists the binaries (on Windows, `rocm.exe` is marked as deleted
+  as the command exits) and, under
+  `PATH changes from the installer that would be undone:`, the shell profile
+  (Linux) or the user `PATH` entry (Windows). It removes nothing.
+- After confirming, the install folder holds no `rocm`/`rocmd` files, and a new
+  terminal no longer gets the install folder on `PATH` from the installer's
+  change.
+- If another program lives in the install folder, the review instead says
+  `PATH change left in place` and names it, and the `PATH` change stays.
+- With `rocm uninstall --keep-binaries`, the review says the `PATH` change
+  stays too, and it does.
