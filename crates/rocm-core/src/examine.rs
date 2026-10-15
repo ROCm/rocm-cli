@@ -1855,17 +1855,15 @@ fn probe_modules(e: &mut Examination) {
         let txt = read_host_text("/proc/modules");
         if txt.is_empty() { None } else { Some(txt) }
     };
-    let kfd_on_host = kfd_present_on_host();
-    if let Some(text) = module_text {
-        let modules: Vec<&str> = text
-            .lines()
+    let modules: Option<Vec<&str>> = module_text.as_deref().map(|text| {
+        text.lines()
             .filter_map(|line| line.split_whitespace().next())
-            .collect();
+            .collect()
+    });
+    if let Some(modules) = &modules {
         e.amdgpu_loaded = Some(modules.contains(&"amdgpu"));
-        e.amdkfd_loaded = amdkfd_state(Some(&modules), kfd_on_host);
-    } else {
-        e.amdkfd_loaded = amdkfd_state(None, kfd_on_host);
     }
+    e.amdkfd_loaded = amdkfd_state(modules.as_deref(), kfd_present_on_host());
 
     for dir in ["/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"] {
         let Ok(entries) = std::fs::read_dir(crate::host_path(dir)) else {
