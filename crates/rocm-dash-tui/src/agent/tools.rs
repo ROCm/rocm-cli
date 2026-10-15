@@ -592,7 +592,7 @@ rocm_mutating_tool!(
             "model": { "type": "string", "description": "Model id/name to serve." },
             "engine": { "type": "string", "description": "Optional engine, e.g. 'vllm'." },
             "host": { "type": "string", "description": "Loopback host only (e.g. 127.0.0.1)." },
-            "port": { "type": "integer", "description": "Optional TCP port." },
+            "port": { "type": "integer", "description": "TCP port. Required unless host is exactly 127.0.0.1 (localhost/::1 still need one)." },
             "device": { "type": "string", "description": "GPU device selector (CPU is rejected)." }
         },
         "required": ["model"]

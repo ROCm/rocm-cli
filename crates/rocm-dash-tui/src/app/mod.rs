@@ -1491,18 +1491,6 @@ mod tests {
         );
     }
 
-    /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
-    /// enumeration of each manager's nested sub-view fields (documented on
-    /// `OnboardingState`, which lists every struct this covers). Nothing stops
-    /// a future field — a new sub-popup, picker, or prompt — from being added
-    /// to one of these structs without a matching update there, which would
-    /// silently let Esc eject the whole manager instead of deferring to the
-    /// new sub-view.
-    ///
-    /// This exhaustively destructures every one of those structs (no `..`),
-    /// naming every field. Adding a field to any of them without updating
-    /// this test — and, in step, `active_overlay_at_root` — fails to compile
-    /// (E0027), turning the silent-drift risk into a build break.
     #[test]
     fn serve_wizard_editor_handles_escape_before_overlay_back_out() {
         let mut state = AppState::new("t".into(), "default-dark".into());
@@ -1513,7 +1501,6 @@ mod tests {
         };
         wizard.editor = Some(crate::ui::serve_wizard::InlineEditor {
             field: crate::ui::serve_wizard::Field::Host,
-            original: "127.0.0.1".into(),
             value: "localhost".into(),
             cursor: 9,
             selected: false,
@@ -1531,6 +1518,18 @@ mod tests {
         );
     }
 
+    /// `active_overlay_at_root`'s per-manager clauses are a hand-maintained
+    /// enumeration of each manager's nested sub-view fields (documented on
+    /// `OnboardingState`, which lists every struct this covers). Nothing stops
+    /// a future field — a new sub-popup, picker, or prompt — from being added
+    /// to one of these structs without a matching update there, which would
+    /// silently let Esc eject the whole manager instead of deferring to the
+    /// new sub-view.
+    ///
+    /// This exhaustively destructures every one of those structs (no `..`),
+    /// naming every field. Adding a field to any of them without updating
+    /// this test — and, in step, `active_overlay_at_root` — fails to compile
+    /// (E0027), turning the silent-drift risk into a build break.
     #[test]
     fn active_overlay_at_root_enumeration_is_exhaustive() {
         use crate::ui::automations_manager::AutomationsManagerState;

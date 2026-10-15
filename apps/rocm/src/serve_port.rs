@@ -23,6 +23,7 @@
 //! Everything downstream of this module — engine requests, service records,
 //! readiness, supervision, recovery — keeps its concrete `u16` contract.
 
+use crate::service_hints;
 use anyhow::{Result, bail};
 use rocm_core::{DEFAULT_LOCAL_HOST, DEFAULT_LOCAL_PORT, LoopbackPortLease};
 use std::io;
@@ -160,13 +161,19 @@ pub(crate) fn resolve_serve_port(
     match request {
         PortRequest::Explicit(port) => {
             if let Some(owner) = reserved.iter().find(|entry| entry.port == port) {
+                // The "stop it" advice below is proven, not just worded: see
+                // `stopping_the_reserving_record_frees_its_explicit_port_for_reuse`
+                // in `service_launch.rs`, which recreates the exact on-disk status
+                // transition `rocm services stop` performs and confirms the same
+                // explicit port then resolves. A full CLI-level E2E for this needs
+                // a real GPU, since reaching this branch requires a completed
+                // model/engine resolution first.
                 bail!(
                     "{DEFAULT_LOCAL_HOST}:{port} is already reserved by managed service {} \
-                     ({}). Stop it with `rocm services stop {} --yes`, or pass a different \
-                     `--port`.",
+                     ({}). Stop it with `{}`, or pass a different `--port`.",
                     owner.service_id,
                     owner.status,
-                    owner.service_id
+                    service_hints::service_stop_hint(&owner.service_id)
                 );
             }
             probe(port).map_err(|error| explicit_bind_error(port, &error))
@@ -189,8 +196,8 @@ pub(crate) fn resolve_serve_port(
             bail!(
                 "no free TCP port for {DEFAULT_LOCAL_HOST} in {AUTO_PORT_FIRST}–{AUTO_PORT_LAST}; \
                  every candidate is reserved by a live managed service or already in use. Stop an \
-                 unused server with `rocm services stop <service-id> --yes`, or pass an explicit \
-                 `--port`."
+                 unused server with `{}`, or pass an explicit `--port`.",
+                service_hints::service_action_hint("stop", "<service-id>")
             );
         }
     }

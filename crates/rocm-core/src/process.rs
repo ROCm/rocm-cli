@@ -417,8 +417,12 @@ impl FileLock {
     /// blocking forever once `timeout` has elapsed.
     ///
     /// Used where an indefinite wait would be a worse failure mode than a
-    /// clear timeout message — e.g. a managed-serve launch contending with
-    /// `rocmd` recovery over the same lock.
+    /// clear timeout message — e.g. `rocmd`'s automatic recovery, which must
+    /// not hang forever behind a `rocm serve` launch holding the same lock.
+    /// A `rocm serve` launch itself uses the unbounded [`Self::acquire`]: its
+    /// own worst-case hold time (the already-running probe inside the launch
+    /// transaction) can exceed [`MANAGED_LAUNCH_LOCK_TIMEOUT`], so bounding it
+    /// would trade a real, slow-but-working launch for a spurious failure.
     ///
     /// # Errors
     /// Fails when the lock file cannot be created/locked, or when another
@@ -463,10 +467,13 @@ impl FileLock {
 /// Polling interval used while waiting on [`FileLock::acquire_bounded`].
 const FILE_LOCK_BOUNDED_POLL: Duration = Duration::from_millis(25);
 
-/// Total time a managed-serve launch or `rocmd` recovery waits for the launch lock.
+/// Total time `rocmd`'s automatic recovery waits for the launch lock.
 ///
 /// Bounds contention on [`crate::paths::AppPaths::managed_launch_lock_path`] during the
-/// port-allocation window, failing with an actionable error instead of hanging.
+/// port-allocation window, failing with an actionable error instead of hanging. Only
+/// `rocmd`'s recovery/restart path is bounded this way; a `rocm serve` launch holds the
+/// same lock with the unbounded [`FileLock::acquire`] (see its doc comment on
+/// [`FileLock::acquire_bounded`] for why).
 pub const MANAGED_LAUNCH_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -511,6 +518,12 @@ impl LoopbackPortLease {
     }
 
     /// True while this lease still holds the socket open.
+    ///
+    /// No production caller needs this: `release` is the only thing that ever
+    /// changes it, and callers already know whether they called `release`. It
+    /// stays `pub` because downstream crates' tests assert on it directly
+    /// (e.g. `apps/rocm`'s `serve_port` tests), where `#[cfg(test)]` here
+    /// would not apply.
     #[must_use]
     pub const fn is_held(&self) -> bool {
         self.listener.is_some()

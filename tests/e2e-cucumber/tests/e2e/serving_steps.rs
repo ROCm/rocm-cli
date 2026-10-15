@@ -412,21 +412,26 @@ async fn occupy_default_serve_port(world: &mut E2eWorld) {
 }
 
 /// Plant a live managed-service record on the default serve port, with no real
-/// listener behind it. `resolve_serve_port`'s explicit-port check matches on the
-/// record's `port` field alone, before it ever probes the OS (see
-/// `reserved_service_ports`'s "conservative by design" doc comment), so a live
-/// record is enough to make the collision deterministic without a second real
-/// server.
+/// listener or process behind it. `resolve_serve_port`'s explicit-port check
+/// matches on the record's `port` field alone, before it ever probes the OS
+/// (see `reserved_service_ports`'s "conservative by design" doc comment), so a
+/// live record is enough to make the collision deterministic without a second
+/// real server. `ServiceRecordOptions::default()`'s `supervisor_pid: 0` keeps
+/// this safe for the World's teardown, which runs `rocm services stop <id>
+/// --yes` on every record left in the isolated tree: a real PID here would
+/// point that stop at the test process itself (see
+/// `plant_unauthenticated_lemonade_service`'s doc comment for the same
+/// hazard).
 #[given("another managed service already reserves the default serve port")]
 async fn reserve_default_serve_port(world: &mut E2eWorld) {
     let root = world.isolated_root.as_ref().expect("no isolated root");
     let services = root.path().join("data").join("services");
-    let options = ServiceRecordOptions {
-        supervisor_pid: std::process::id(),
-        engine_pid: Some(std::process::id()),
-        ..ServiceRecordOptions::default()
-    };
-    write_service_record_with(&services, "other-model", SERVE_PORT, options);
+    write_service_record_with(
+        &services,
+        "other-model",
+        SERVE_PORT,
+        ServiceRecordOptions::default(),
+    );
 }
 
 /// The (model, engine, ready-substring) this host should serve for an

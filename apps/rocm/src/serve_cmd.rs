@@ -880,7 +880,18 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
             launch_lock,
             require_api_key,
             &mut |_elapsed| spinner.tick(),
-        )?;
+        )
+        // A pre-spawn failure (port reserved/in use, range exhausted, other bind
+        // error) returns before any service record exists, so nothing else clears
+        // the key just stored for this attempt. Idempotent with the post-spawn
+        // cleanup in `abandon_failed_managed_launch`.
+        .inspect_err(|_| {
+            drop_orphaned_endpoint_key_on_already_running(
+                &paths,
+                &service_id,
+                endpoint_auth.as_deref(),
+            );
+        })?;
         ensure_background_helper_running_quiet(summary_mode)?;
 
         // An equivalent service was already running, so nothing was spawned and the
@@ -951,6 +962,7 @@ pub(crate) fn serve(args: ServeArgs) -> Result<()> {
     }
 
     run_attached_service(
+        &paths,
         &selected_engine,
         &service_id,
         &model,
