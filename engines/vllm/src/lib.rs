@@ -307,21 +307,35 @@ fn detect_response() -> DetectResponse {
             .map(|version| format!("vllm {version}")),
         torch_version: None,
         transformers_version: None,
-        available_devices: vec![EngineDeviceAvailability {
-            kind: "rocm_gpu".to_owned(),
-            available: installed && !cfg!(windows) && extension_problem.is_none(),
-            reason: if cfg!(windows) {
-                Some(windows_unsupported_message().to_owned())
-            } else if let Some(problem) = extension_problem {
-                Some(problem)
-            } else if installed {
-                None
-            } else {
-                Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
-            },
-        }],
+        available_devices: vec![rocm_gpu_availability(
+            installed,
+            cfg!(windows),
+            extension_problem,
+        )],
         capabilities: capabilities(),
         notes,
+    }
+}
+
+/// The `rocm_gpu` device entry. An installed vLLM whose compiled extensions
+/// cannot import is not available, and says why.
+fn rocm_gpu_availability(
+    installed: bool,
+    windows: bool,
+    extension_problem: Option<String>,
+) -> EngineDeviceAvailability {
+    EngineDeviceAvailability {
+        kind: "rocm_gpu".to_owned(),
+        available: installed && !windows && extension_problem.is_none(),
+        reason: if windows {
+            Some(windows_unsupported_message().to_owned())
+        } else if let Some(problem) = extension_problem {
+            Some(problem)
+        } else if installed {
+            None
+        } else {
+            Some("vLLM is not installed in a Linux/WSL ROCm Python environment".to_owned())
+        },
     }
 }
 
@@ -360,6 +374,28 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_installed_vllm_with_an_extension_problem_is_not_available() {
+        let ready = rocm_gpu_availability(true, false, None);
+        assert!(ready.available);
+        assert_eq!(ready.reason, None);
+
+        let broken = rocm_gpu_availability(true, false, Some("extensions do not import".into()));
+        assert!(!broken.available);
+        assert_eq!(broken.reason.as_deref(), Some("extensions do not import"));
+
+        let missing = rocm_gpu_availability(false, false, None);
+        assert!(!missing.available);
+        assert!(missing.reason.is_some());
+
+        let windows = rocm_gpu_availability(true, true, Some("ignored".into()));
+        assert!(!windows.available);
+        assert_eq!(
+            windows.reason.as_deref(),
+            Some(windows_unsupported_message())
+        );
+    }
 
     #[test]
     fn stdio_protocol_routes_all_methods_without_side_effects() {

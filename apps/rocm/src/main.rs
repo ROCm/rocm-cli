@@ -25728,6 +25728,19 @@ install therock";
             engine_runtime_status_label("vllm", &detect(false, false, Some("not installed"))),
             "not found"
         );
+        // Only vLLM runs the extension check: another engine stays `ready`, and
+        // an unavailable device with no stated reason is not a vLLM problem.
+        assert_eq!(
+            engine_runtime_status_label(
+                "lemonade",
+                &detect(true, false, Some("compiled extensions do not import"))
+            ),
+            "ready"
+        );
+        assert_eq!(
+            engine_runtime_status_label("vllm", &detect(true, false, None)),
+            "ready"
+        );
     }
     #[test]
     fn record_cli_audit_event_writes_cli_lifecycle_record() -> Result<()> {
