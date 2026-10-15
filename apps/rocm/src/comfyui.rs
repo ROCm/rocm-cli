@@ -4922,6 +4922,19 @@ mod archive_properties {
                 "name {} was moved",
                 String::from_utf8_lossy(name)
             );
+            // An absolute-named symlink is left whole: its relative target
+            // does not gain the `../` a moved link gets.
+            let link = moved_one_level_down(Entry {
+                name: name.to_vec(),
+                kind: Kind::Symlink(b"t".to_vec()),
+                mode: 0o777,
+            });
+            assert_eq!(link.name, name, "name {}", String::from_utf8_lossy(name));
+            assert!(
+                matches!(&link.kind, Kind::Symlink(t) if t == b"t"),
+                "target of {} was rewritten",
+                String::from_utf8_lossy(name)
+            );
         }
     }
 
