@@ -1683,8 +1683,13 @@ fn run_unset_override_windows(opts: &FixOptions) -> i32 {
         println!("Note: clearing it in your Windows env scope does NOT affect this");
         println!("already-open shell -- close and reopen your terminal afterwards.");
     }
-    let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User");
-    let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine");
+    // A failed read here only affects this report-and-clear path, which never
+    // overwrites the whole variable (it only clears it via a dedicated
+    // `setx VAR ""`), so collapsing a failed read to "unset" preserves this
+    // function's existing behavior; it is `path_export_windows`'s
+    // read-then-overwrite-the-whole-value shape that made that collapse unsafe.
+    let user_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "User").unwrap_or_default();
+    let machine_val = ps_env_scope("HSA_OVERRIDE_GFX_VERSION", "Machine").unwrap_or_default();
     report_and_clear_override_windows(opts, &user_val, &machine_val, |prompt| {
         confirm(prompt, opts.yes)
     })
@@ -1839,18 +1844,58 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
         return 3;
     }
     let bin_dir = bin_dir.to_string_lossy().into_owned();
-    let user_path = ps_env_scope("PATH", "User");
+    path_export_windows(opts, &bin_dir, || ps_env_scope("PATH", "User"))
+}
+
+/// The literal value that will replace User-scope PATH on a non-empty
+/// existing value: `bin_dir` first, so whatever else is already on PATH
+/// cannot shadow it with a same-named binary. This matches the Linux
+/// sibling's intent (`run_path_export_linux`'s `export PATH="{bin_dir}:$PATH"`
+/// also puts `bin_dir` first) and the "Plan: prepend..." message
+/// `path_export_windows` prints next to it.
+///
+/// Kept as its own function, called from both the plan message and the
+/// value actually written, so the two can never disagree with each other the
+/// way the unfixed code did (print said "prepend", the write appended)
+/// -- see AGENTS.md section 3 on deriving a printed claim from the same
+/// value the branch acts on.
+fn windows_path_prepend(bin_dir: &str, user_path: &str) -> String {
+    if user_path.is_empty() {
+        bin_dir.to_owned()
+    } else {
+        format!("{bin_dir};{user_path}")
+    }
+}
+
+/// Does the read/plan/write work for [`run_path_export_windows`], with the
+/// User-scope PATH read taken as an injected closure rather than calling
+/// `ps_env_scope` directly. That's what makes the "read failed" branch
+/// testable on any host -- same reason [`report_and_clear_override_windows`]
+/// takes consent as a closure.
+///
+/// A failed read (`None`) must never be treated as "PATH is empty": the
+/// write below replaces the *entire* User PATH value, so collapsing a
+/// PowerShell failure into "nothing there" would wipe the user's real PATH
+/// down to just `bin_dir`. So a failed read aborts here, before the
+/// "Plan: ..." preview and before the write is ever attempted, with a
+/// return code (`4`, matching a write failure) distinct from `0` ("nothing
+/// to do") and from `5` ("user declined").
+fn path_export_windows(
+    opts: &FixOptions,
+    bin_dir: &str,
+    read_user_path: impl FnOnce() -> Option<String>,
+) -> i32 {
+    let Some(user_path) = read_user_path() else {
+        fail!("Could not read the current User PATH; User PATH NOT changed.");
+        return 4;
+    };
     if !user_path.is_empty() && user_path.to_lowercase().contains(&bin_dir.to_lowercase()) {
         println!("User PATH already contains {bin_dir}; no change.");
         return 0;
     }
-    let new_path = if user_path.is_empty() {
-        bin_dir.clone()
-    } else {
-        format!("{user_path};{bin_dir}")
-    };
+    let new_path = windows_path_prepend(bin_dir, &user_path);
     println!("Plan: prepend {bin_dir} to your User PATH:");
-    println!("  setx PATH \"{new_path}\"");
+    println!("  [Environment]::SetEnvironmentVariable('PATH', '{new_path}', 'User')");
     if opts.dry_run {
         println!("(dry-run; not executed)");
         return 0;
@@ -1858,14 +1903,22 @@ fn run_path_export_windows(opts: &FixOptions) -> i32 {
     if !confirm("Update User PATH?", opts.yes) {
         return 5;
     }
-    let (rc, out, err) = run("setx", &["PATH", &new_path], RUN_TIMEOUT);
+    // PowerShell's SetEnvironmentVariable, not `setx`: `setx` silently
+    // truncates values past 1024 characters while still exiting 0, which a
+    // normal-length PATH can hit even when the read above succeeded.
+    let script = format!("[Environment]::SetEnvironmentVariable('PATH', '{new_path}', 'User')");
+    let (rc, out, err) = run(
+        "powershell",
+        &["-NoProfile", "-Command", &script],
+        RUN_TIMEOUT,
+    );
     relay_output(&out, &err);
     if rc != 0 {
-        fail!("setx exited {rc}; User PATH NOT changed.");
+        fail!("PowerShell exited {rc}; User PATH NOT changed.");
         return 4;
     }
     println!(
-        "Added {bin_dir} to your User PATH. setx only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
+        "Added {bin_dir} to your User PATH. This only takes effect in NEW shells -- close this terminal and reopen it before re-running hipInfo."
     );
     0
 }
@@ -1964,7 +2017,11 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
         );
         return 0;
     };
-    let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User");
+    // Out of scope for ROCMAI-449 (that fix is specific to fix-6-path's
+    // read-then-overwrite-the-whole-PATH-value shape): a failed read here
+    // only risks re-running `setx HIP_VISIBLE_DEVICES <idx>`, which sets a
+    // single unrelated variable rather than overwriting PATH.
+    let existing = ps_env_scope("HIP_VISIBLE_DEVICES", "User").unwrap_or_default();
     if !existing.is_empty() {
         println!(
             "User scope already sets HIP_VISIBLE_DEVICES={existing:?}; remove or update it manually rather than overwriting from this command."
@@ -1997,7 +2054,14 @@ fn run_hip_visible_devices_windows(opts: &FixOptions) -> i32 {
 }
 
 /// Read a Windows environment variable from a given scope via PowerShell.
-fn ps_env_scope(var: &str, scope: &str) -> String {
+///
+/// Returns `None` if the read itself failed -- PowerShell missing, blocked by
+/// execution policy, or the query timing out -- which must stay distinguishable
+/// from `Some(String::new())`, meaning the read succeeded and the variable is
+/// genuinely unset/empty in that scope. Collapsing both to `""` is what let a
+/// failed PATH read look like an empty PATH to a caller that then wrote the
+/// "empty" value back out, wiping the real one (ROCMAI-449).
+fn ps_env_scope(var: &str, scope: &str) -> Option<String> {
     let script = format!("[Environment]::GetEnvironmentVariable('{var}','{scope}')");
     let (rc, out, _) = run(
         "powershell",
@@ -2005,9 +2069,9 @@ fn ps_env_scope(var: &str, scope: &str) -> String {
         QUERY_TIMEOUT,
     );
     if rc == 0 {
-        out.trim().to_owned()
+        Some(out.trim().to_owned())
     } else {
-        String::new()
+        None
     }
 }
 
@@ -3077,6 +3141,113 @@ mod tests {
         });
 
         assert_eq!(code, 0);
+    }
+
+    /// ROCMAI-449: a failed PATH read must never be treated as "PATH is
+    /// empty". Against the unfixed code (`ps_env_scope` collapsing any
+    /// failure to `""`), this read would look identical to a genuinely empty
+    /// PATH, and the old `run_path_export_windows` would go on to run
+    /// `setx PATH "<bin_dir>"` -- replacing the user's entire real PATH with
+    /// one entry.
+    ///
+    /// `opts.dry_run = true` is the discriminator, not `opts.yes`: on a host
+    /// without a real `powershell`/`setx` (this Mac included), the actual
+    /// write fails regardless of whether it was ever reached, so asserting
+    /// against a "the write failed" code cannot tell "aborted before the
+    /// write" apart from "attempted the write and the write itself failed"
+    /// -- both land on the same non-zero code by coincidence of this host's
+    /// missing binary. Collapsing the failed read to `""` instead falls
+    /// through to the dry-run short-circuit (which returns `0`, "preview
+    /// printed, nothing to do"), while the fix aborts at the read itself and
+    /// never reaches that branch -- so this is the one assertion that is
+    /// both host-independent and still fails against the unfixed
+    /// collapse-to-empty behavior.
+    #[test]
+    fn windows_path_read_failure_aborts_before_plan_or_write() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", || {
+            None // the read itself failed (PowerShell missing/blocked/timed out)
+        });
+
+        assert_ne!(
+            code, 0,
+            "a failed read must not be silently absorbed by the dry-run preview"
+        );
+        assert_ne!(
+            code, 5,
+            "a failed read was never offered a prompt to decline"
+        );
+    }
+
+    /// A genuinely empty User PATH (the read succeeded and returned `""`,
+    /// not a failure) must still work exactly as before: the new value is
+    /// `bin_dir` alone, with no leading or trailing separator.
+    #[test]
+    fn windows_path_prepend_on_genuinely_empty_path_is_bin_dir_alone() {
+        assert_eq!(windows_path_prepend(r"C:\ROCm\bin", ""), r"C:\ROCm\bin");
+    }
+
+    /// Per AGENTS.md section 3: a claim of outcome ("Plan: prepend...") must
+    /// be asserted together with the resulting state, not pinned as a string
+    /// on its own. `windows_path_prepend` is the single function both the
+    /// printed plan and the real write derive their value from (see its doc
+    /// comment), so calling it directly here pins both at once: the literal
+    /// value a real write would send, which is the same test that would have
+    /// failed against the unfixed `format!("{user_path};{bin_dir}")` -- that
+    /// built `"C:\Windows;C:\Other;C:\ROCm\bin"`, which does NOT start with
+    /// `bin_dir`.
+    #[test]
+    fn windows_path_prepend_on_existing_path_starts_with_bin_dir_not_ends_with_it() {
+        let bin_dir = r"C:\ROCm\bin";
+        let existing = r"C:\Windows;C:\Other";
+
+        let new_path = windows_path_prepend(bin_dir, existing);
+
+        assert_eq!(new_path, format!("{bin_dir};{existing}"));
+        assert!(
+            new_path.starts_with(bin_dir),
+            "a prepend must start with bin_dir, not end with it: got {new_path:?}"
+        );
+    }
+
+    /// Regression coverage for control flow this change does not touch: an
+    /// existing User PATH that already contains `bin_dir` must short-circuit
+    /// to 0 without ever reaching the confirm gate. `FixOptions::default()`
+    /// has `yes: false` and `dry_run: false`, and `confirm()` on a
+    /// non-interactive test process always declines (code `5`), so if this
+    /// short-circuit broke and control fell through to the confirm gate,
+    /// this would observe `5` instead of `0`.
+    #[test]
+    fn windows_path_already_contains_bin_dir_short_circuits_with_no_change() {
+        let bin_dir = r"C:\ROCm\bin";
+        let code = path_export_windows(&FixOptions::default(), bin_dir, || {
+            Some(format!(r"C:\Windows;{bin_dir}"))
+        });
+
+        assert_eq!(
+            code, 0,
+            "already containing bin_dir must short-circuit before the confirm gate"
+        );
+    }
+
+    /// Regression coverage: `--dry-run` must still preview and return 0
+    /// without ever reaching the confirm gate, by the same non-interactive
+    /// discriminator as the test above (a fall-through would decline and
+    /// return 5, not 0).
+    #[test]
+    fn windows_path_dry_run_short_circuits_before_confirm() {
+        let opts = FixOptions {
+            dry_run: true,
+            ..FixOptions::default()
+        };
+
+        let code = path_export_windows(&opts, r"C:\ROCm\bin", || Some(String::new()));
+
+        assert_eq!(code, 0, "a dry-run preview is not a decline");
     }
 
     #[test]
