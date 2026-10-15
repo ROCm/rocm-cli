@@ -1199,10 +1199,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Issue #145 startup-race fix: paired with
-    /// `has_live_instance_trusts_startup_snapshot_before_first_real_one_lands`
-    /// in `rocm-dash-tui` — this is the half that proves the bin side actually
-    /// reads something off the registry rather than always returning `false`.
+    /// Paired with `has_live_instance_trusts_a_live_registry_read_before_first_real_snapshot_lands`
+    /// (`rocm-dash-tui`, `app::mod` tests), which proves the quit-confirm gate
+    /// consults the registry read before trusting an empty `instances` map —
+    /// this is the half that proves the bin side actually reads something off
+    /// the registry rather than always returning `false`.
     #[test]
     fn resolved_args_reports_a_live_managed_service_at_startup() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1794,12 +1795,13 @@ mod tests {
 
     #[test]
     fn launcher_route_hosts_session_is_true_only_for_the_two_escalations() {
-        // Regression guard: `run_launcher`'s hub loop used to pass a bare
-        // `true` literal to `run_chat`/`run` at each escalation arm by hand.
-        // A worker confirmed flipping either literal to `false` left every
-        // unit test green — this test ties `launcher_hosted` to the route
-        // itself instead, so a future route added by copying the nearest
-        // example can't silently carry the wrong value.
+        // `launcher_hosted` must be derived from the route
+        // (`launcher_route_hosts_session`), not a bare `true`/`false` literal
+        // written by hand at each escalation arm: a literal can be flipped
+        // without any other test failing, while deriving it from the route
+        // ties the value to what actually hosts the session, so a future
+        // route added by copying the nearest example can't silently carry
+        // the wrong value.
         assert!(launcher_route_hosts_session(&LauncherRoute::Chat));
         assert!(launcher_route_hosts_session(&LauncherRoute::Dashboard));
         for focus in [Focus::Setup, Focus::Serve, Focus::Examine] {

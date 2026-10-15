@@ -417,10 +417,13 @@ fn quit_confirm_body_with(
 /// Also renders the quit-confirm prompt (issue #145) when open, same as
 /// `draw`'s own arm — dead last, "owns the screen" the same way. No focused
 /// path actually opens it today (`actions::request_quit`'s own doc comment:
-/// unreachable in practice), but round-5 review on PR #595 found this arm
-/// missing was a latent trap for the day one does: `request_quit` has no
-/// focus guard of its own, so a future focused path reaching it would
-/// otherwise open an invisible, key-eating prompt instead of a visible one.
+/// unreachable in practice), but a future one that does needs two things
+/// together, not this arm alone: `open_quit_confirm` closes every manager
+/// overlay, which would otherwise make `AppState::focused_should_exit` fire
+/// on the very next loop iteration and exit silently before this ever drew —
+/// so that gate also exempts a pending quit-confirm (see its own doc
+/// comment). Drawing the prompt here is what makes that exemption show
+/// something instead of merely not exiting.
 /// `offer_stop_action: false` — same reasoning as the launcher's own copy:
 /// a focused host has no live Services overlay of its own to jump to.
 pub fn draw_focused(f: &mut Frame, state: &mut AppState) {
@@ -948,8 +951,8 @@ fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Shared with `app`'s own test module (round-5 review on PR #595: the two
-    // carried byte-identical copies) — see its doc comment.
+    // Shared with `app`'s own test module rather than each carrying its own
+    // byte-identical copy — see its doc comment.
     use crate::app::test_support::with_registry_probe;
 
     #[test]
@@ -1213,8 +1216,8 @@ mod tests {
 
     #[test]
     fn quit_confirm_request_title_and_trailer_are_hedged_once_a_real_snapshot_has_landed() {
-        // Round-5 review (PR #595): `state.instances` looks daemon-verified
-        // once a real snapshot has landed, but isn't — a failed scrape in
+        // `state.instances` looks daemon-verified once a real snapshot has
+        // landed, but isn't — a failed scrape in
         // `rocm-dash-daemon`'s `runner.rs` only logs and leaves the prior
         // status in place, with nothing on this path calling the CLI's own
         // liveness reconcile (`refresh_managed_service_runtime_liveness`,
@@ -1530,10 +1533,10 @@ mod tests {
 
     #[test]
     fn quit_confirm_body_lists_services_sorted_by_container_id() {
-        // Round-5 review (PR #595): the body sorts by `container_id` — the
-        // same key `services_manager::service_rows` sorts by — so the
-        // listing is stable rather than left in whichever order a
-        // `HashMap`'s `values()` happens to yield. This does not mean `s`
+        // The body sorts by `container_id` — the same key
+        // `services_manager::service_rows` sorts by — so the listing is
+        // stable rather than left in whichever order a `HashMap`'s
+        // `values()` happens to yield. This does not mean `s`
         // (`AppState::quit_confirm_open_services_key`) focuses the Nth
         // bullet printed here: it always focuses the FIRST managed,
         // still-serving row in `service_rows`' own order, which can include
@@ -1542,9 +1545,27 @@ mod tests {
         // inserts ids (`svc-0`..`svc-5`) that already sort the same way
         // whether by id or insertion order, so it can't catch a regression
         // here — these ids are deliberately inserted out of sorted order.
+        //
+        // Eight ids, not three: with only 3 ids a `HashMap`'s random
+        // iteration order matches the sorted order by chance often enough to
+        // make this test flaky at catching its own regression — commenting
+        // out the `sort_by` this asserts and re-running 9 times passed 4 and
+        // failed 5. With 8 ids there are 8! = 40320 orderings, so a random
+        // iteration order matching the fully-sorted one by chance is
+        // negligible; a missing/wrong sort now fails reliably.
         use rocm_dash_core::metrics::{Instance, InstanceStatus};
         let mut state = AppState::new("t".into(), "default-dark".into());
-        for id in ["svc-zeta", "svc-alpha", "svc-mu"] {
+        let ids = [
+            "svc-golf",
+            "svc-charlie",
+            "svc-hotel",
+            "svc-alpha",
+            "svc-foxtrot",
+            "svc-delta",
+            "svc-bravo",
+            "svc-echo",
+        ];
+        for id in ids {
             state.instances.insert(
                 id.to_string(),
                 Instance {
@@ -1564,8 +1585,15 @@ mod tests {
             .collect();
         assert_eq!(
             bullets,
-            vec!["• model-svc-alpha", "• model-svc-mu", "• model-svc-zeta"],
-            "bullets must be sorted by container_id, not insertion/HashMap order: {body:?}"
+            vec![
+                "• model-svc-alpha",
+                "• model-svc-bravo",
+                "• model-svc-charlie",
+                "• model-svc-delta",
+                "• model-svc-echo",
+            ],
+            "bullets must be sorted by container_id, not insertion/HashMap order \
+             (capped at 5, so this also exercises the sort ahead of the cap): {body:?}"
         );
     }
 
@@ -2266,11 +2294,13 @@ mod tests {
 
     #[test]
     fn draw_focused_renders_the_quit_confirm_prompt_when_open() {
-        // Round-5 review (PR #595): no focused path opens `quit_confirm`
-        // today (`actions::request_quit`'s own doc comment), but
-        // `draw_focused` must still render it if one ever does — otherwise a
-        // future focused path would open an invisible, key-eating prompt
-        // instead of a visible one. Mirrors `launcher_renders_the_quit_confirm_prompt_when_open`
+        // No focused path opens `quit_confirm` today (`actions::request_quit`'s
+        // own doc comment), but `draw_focused` must still render it if one
+        // ever does — otherwise a future focused path would open an
+        // invisible, key-eating prompt instead of a visible one. Paired with
+        // `focused_should_exit_stays_shut_while_quit_confirm_is_pending`
+        // (`app::event_loop` tests), which covers the exit-gate half of the
+        // same guarantee. Mirrors `launcher_renders_the_quit_confirm_prompt_when_open`
         // in `ui::launcher`, the same regression for that renderer.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;

@@ -30,7 +30,7 @@ use std::sync::Arc;
 pub struct ManagedRegistrySnapshot {
     /// Whether any managed-service record is currently a live scrape target —
     /// the same statuses `Instance::status.is_serving()` treats as "actively
-    /// serving" (`ready`/`running`, including a `running` record still in a
+    /// serving" (`ready`/`running`, excluding a `running` record still in a
     /// recognized `startup_phase` — see `instance_status_for_record`), and
     /// excluding one with no bound port (`port == 0`). An implementation
     /// deriving both fields of this snapshot from one discovery pass (as

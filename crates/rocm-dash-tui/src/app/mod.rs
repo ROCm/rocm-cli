@@ -870,7 +870,8 @@ impl AppState {
     }
 
     /// Focused-host exit gate: `true` when a `focus` is active AND its single
-    /// overlay is closed (no manager is `Some`).
+    /// overlay is closed (no manager is `Some`) AND no quit-confirm prompt is
+    /// pending.
     ///
     /// [`has_open_overlay`](Self::has_open_overlay) stays `true` while a
     /// sub-popup (folder browser / model picker) is open, so this can't fire
@@ -883,8 +884,18 @@ impl AppState {
     /// screen or a terminal job). Always `false` for the normal
     /// (`focus == None`) dashboard, so its loop never self-exits. Pure read →
     /// unit-testable without a live terminal.
+    ///
+    /// The `quit_confirm_pending` exemption matters only if a focused host
+    /// ever calls `actions::request_quit` (none does today): `open_quit_confirm`
+    /// closes every manager overlay via `close_overlays`, which without this
+    /// exemption would make this gate fire on the very next loop iteration —
+    /// before `draw_focused` ever renders the prompt it draws for that case —
+    /// exiting silently instead of showing it. Deliberately NOT folded into
+    /// `has_open_overlay` itself: that predicate also gates unrelated reads
+    /// (`should_pane_back_out`, `active_overlay_at_root`'s callers) where a
+    /// pending quit-confirm must NOT count as an open manager overlay.
     pub(crate) const fn focused_should_exit(&self, focus: Option<Focus>) -> bool {
-        focus.is_some() && !self.has_open_overlay()
+        focus.is_some() && !self.has_open_overlay() && !self.quit_confirm_pending()
     }
 
     /// Whether the open manager (if any) is at its TOP-LEVEL screen — no nested

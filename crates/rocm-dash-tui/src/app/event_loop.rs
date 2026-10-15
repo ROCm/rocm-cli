@@ -227,13 +227,14 @@ fn refresh_update_status(state: &mut AppState) -> Vec<rocm_dash_core::state::Sid
 }
 
 /// Hand off `ResolvedArgs`'s live registry-read seam and launcher-hosted flag
-/// onto `AppState` (issue #145). `run_async` calls this directly (rather than
-/// inlining the two assignments) so the field-assignment logic itself has a
-/// synchronous unit test (`seed_registry_probe_and_hosting_wires_both_fields_onto_state`)
-/// instead of needing to spin up the full async terminal loop to reach it.
+/// onto `AppState` (issue #145). This crate's own `event_loop` calls this
+/// directly (rather than inlining the two assignments) so the
+/// field-assignment logic itself has a synchronous unit test
+/// (`seed_registry_probe_and_hosting_wires_both_fields_onto_state`) instead of
+/// needing to spin up the full async terminal loop to reach it.
 ///
 /// That unit test calls this function directly, so it does **not** cover the
-/// call site at `run_async` dropping the hand-off entirely, or passing the
+/// call site in `run` dropping the hand-off entirely, or passing the
 /// wrong field — `run`/`event_loop` are only reachable through the full async
 /// terminal loop, which only the `@requires-os:linux` e2e lane
 /// (`tests/e2e-cucumber/features/dash.feature`, any scenario that opens a real
@@ -2308,6 +2309,40 @@ mod tests {
         assert!(
             s.focused_should_exit(Some(Focus::Examine)),
             "closed at root → return to the launcher"
+        );
+    }
+
+    #[test]
+    fn focused_should_exit_stays_shut_while_quit_confirm_is_pending() {
+        // `open_quit_confirm` closes every manager overlay via `close_overlays`,
+        // so `has_open_overlay()` goes false the instant it is called. Without
+        // `focused_should_exit` also checking `quit_confirm_pending()`, a
+        // focused host reaching `actions::request_quit` would hit this gate on
+        // the very next loop iteration and exit before `draw_focused` ever drew
+        // the prompt — silently, instead of showing it.
+        let mut s = st();
+        let _ = open_overlay_for_focus(&mut s, Focus::Serve);
+        assert!(s.has_open_overlay());
+
+        s.open_quit_confirm();
+        assert!(
+            !s.has_open_overlay(),
+            "open_quit_confirm closes every manager overlay"
+        );
+        assert!(
+            !s.focused_should_exit(Some(Focus::Serve)),
+            "a pending quit-confirm must hold the focused-exit gate shut"
+        );
+
+        // Decline (Esc cancels) resolves the prompt without exiting.
+        assert_eq!(
+            s.resolve_quit_confirm_key(KeyCode::Esc),
+            Some(false),
+            "Esc cancels the quit-confirm prompt rather than exiting"
+        );
+        assert!(
+            s.focused_should_exit(Some(Focus::Serve)),
+            "once the prompt is resolved and no overlay is open, the gate opens again"
         );
     }
 

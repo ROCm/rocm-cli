@@ -63,7 +63,10 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 /// Esc main menu's "Quit" row, `/quit`/`/exit` (`app::slash`), and the
 /// pre-dashboard launcher's own `q`/Esc (`ui::launcher`) — shares this one
 /// gate rather than each re-deciding (and risking re-deciding wrong) whether
-/// to ask first.
+/// to ask first. `Ctrl-C` is the one quit entry point that does NOT: it
+/// always exits immediately without asking (`event_loop::ctrl_c_should_exit`),
+/// except from a running job's console, where it keeps its "cancel this job"
+/// meaning instead — see the README's "First run" section.
 ///
 /// `launcher_hosted` sessions (`ResolvedArgs::launcher_hosted`'s doc comment)
 /// are the one exception: this session was opened FROM the pre-dashboard
@@ -80,9 +83,10 @@ const fn wrap_cursor(cur: usize, delta: isize, len: usize) -> usize {
 ///
 /// No focused-host entry point (Set up/Serve/Diagnose) calls this today —
 /// unreachable in practice — but if one ever did, the prompt this opens is
-/// rendered regardless: see `ui::draw_focused`'s own `quit_confirm` arm
-/// (round-5 review on PR #595, which found `draw_focused` not rendering it a
-/// latent trap for exactly that case).
+/// both rendered (`ui::draw_focused`'s own `quit_confirm` arm) and able to
+/// hold the focused-exit gate open until it resolves
+/// (`AppState::focused_should_exit`'s `quit_confirm_pending` exemption);
+/// neither alone would be enough.
 pub(crate) fn request_quit(state: &mut AppState) -> bool {
     if state.launcher_hosted {
         return true;

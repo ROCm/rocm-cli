@@ -304,14 +304,15 @@ fn launcher_state(theme_name: &str, serving: Vec<Instance>) -> AppState {
     use crate::registry_probe::{ManagedRegistrySnapshot, StaticManagedRegistrySnapshot};
 
     let mut state = AppState::new(String::new(), theme_name.to_string());
-    // This test-only helper accepts whatever `serving` a caller passes, with
-    // no status filter of its own — unlike the real production caller
-    // (`apps/rocm::dash::launcher_serving_instances`), which already drops a
-    // failed/stopped/unbound-port record via `discover_managed_services`
+    // `run_launcher` (production) calls this with `serving` already filtered
+    // by its own caller (`apps/rocm::dash::launcher_serving_instances`, which
+    // drops a failed/stopped/unbound-port record via
+    // `discover_managed_services`), but tests calling this directly can and
+    // do construct whatever `serving` they like, with no filter of their own
     // (see `launcher_state_does_not_warn_on_a_starting_only_registry` below).
     // So `has_live_service` must still apply the same `is_serving()` filter
     // the live probe (`LiveManagedRegistryProbe::snapshot`) applies, rather
-    // than trust every status this test can construct — otherwise a
+    // than trust every status a caller passes — otherwise a
     // `starting`/`recovering`-only registry would trip the "May still be
     // serving" quit-confirm prompt here but not on the dashboard, which
     // reads the exact same registry through the live probe instead.

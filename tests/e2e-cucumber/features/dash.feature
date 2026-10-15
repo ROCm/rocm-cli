@@ -477,3 +477,23 @@ Feature: Interactive dashboard
     When the user quits the launcher
     Then the launcher exits successfully
     And the managed model is still listed as running
+
+  # README's "Interactive interfaces" section promises `Ctrl-C` always quits
+  # immediately without asking, even while a model is still being served —
+  # unlike `q`/Esc/`/quit`, which all route through the confirm-before-quit
+  # gate (dash-25). dash-20 already covers the keystroke with nothing
+  # serving; this is the "will not happen" half AGENTS.md §3 asks for: with a
+  # model serving, Ctrl-C must still exit on the spot rather than opening the
+  # prompt dash-25 pins. `press_ctrl_c_and_wait` waits for process exit, so a
+  # quit-confirm prompt intercepting the keystroke instead would time this
+  # step out, not silently pass it.
+  @id:dash-ctrl-c-skips-the-quit-confirm-while-serving @requires-os:linux
+  Scenario: dash-31 - Ctrl-C quits immediately even while a model is being served
+    Given a running managed model is available locally
+    When the user opens the dashboard
+    And the user opens the Observe view
+    Then the managed model is displayed
+    When the user presses Ctrl-C in the dashboard
+    Then the dashboard exits from the keystroke with code 130
+    And the terminal is restored to the normal screen
+    And the managed model is still listed as running

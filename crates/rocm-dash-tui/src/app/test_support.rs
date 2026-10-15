@@ -22,8 +22,8 @@ pub(super) fn st() -> AppState {
 /// Install a static live-registry probe on `state` (the test-only stand-in
 /// for the bin-injected seam — see `registry_probe::StaticManagedRegistrySnapshot`),
 /// so a test can exercise the live-read gates without a real registry on
-/// disk. Shared by `app`'s own test module and `ui`'s (round-5 review on PR
-/// #595: the two carried byte-identical copies).
+/// disk. Shared by `app`'s own test module and `ui`'s, rather than each
+/// carrying its own byte-identical copy.
 pub(crate) fn with_registry_probe(
     state: &mut AppState,
     has_live_service: bool,

@@ -1050,9 +1050,9 @@ async fn quit_chat_back_to_launcher(world: &mut E2eWorld) {
     // Same `/quit` route `try_quit_chat` uses (`handle_slash_command` routes
     // it to the shared `request_quit` gate), but unlike that step this one
     // resolves straight through: a launcher-hosted chat session
-    // (`run_chat`'s own `launcher_hosted`, round-5 review on PR #595) must
-    // exit this inner loop unconditionally rather than open a quit-confirm
-    // prompt of its own — see `request_quit`'s doc comment.
+    // (`run_chat`'s own `launcher_hosted`) must exit this inner loop
+    // unconditionally rather than open a quit-confirm prompt of its own —
+    // see `request_quit`'s doc comment.
     //
     // No `i` here, unlike `try_quit_chat`: that step's own comment notes "a
     // fresh session starts unfocused", but `accept_chat_consent` (`app/mod.rs`)

@@ -166,23 +166,25 @@ The one exception is the dashboard's console for a **running** job, where
 that job finishes, `Ctrl-C` quits there too. If a model is still being served
 when you press `q`, it asks first — from the launcher, and from a dashboard or
 chat session you opened directly (`rocm dash` / `rocm chat`). Opening the
-dashboard or chat *from inside the launcher* skips that inner prompt, since
-`q` there just returns you to the launcher menu; the launcher's own `q` is
-what asks before it actually quits. Either way, quitting leaves the model
-running in the background, it just won't happen by surprise. The prompt
-names the model and prints the real `rocm services stop <id> --yes` command
-once the dashboard's own live view has the model's name; on a host whose
-dashboard never connects to its embedded daemon (Windows, for the whole
-session) it instead shows the service id with the same stop command, without
-the model's name. From the dashboard's own copy of that prompt, pressing `s`
-instead jumps straight to the Services overlay, pre-focused on the model, so
-you can stop it there rather than quitting with it left running — offered
-only once the dashboard's own live view has named the model, so it's absent
-on Windows there too, not just from the launcher's copy (which never offers
-this jump, since it has no live Services overlay of its own to jump to — open
-the dashboard first). Unlike `q`, `Ctrl-C` always
-quits immediately without asking — except from a running job's console, where
-it keeps the "cancel this job" meaning described above instead. On a
+dashboard or chat *from inside the launcher* skips that inner prompt, since `q`
+there just returns you to the launcher menu; the launcher's own `q` is what asks
+before it actually quits. Either way, quitting leaves the model running in the
+background, it just won't happen by surprise. The prompt names the model and
+prints the real `rocm services stop <id> --yes` command once the dashboard's own
+live view has the model's name; on a host whose dashboard never connects to its
+embedded daemon (Windows, for the whole session), a dashboard or chat session
+opened directly instead shows the service id with the same stop command, without
+the model's name — the launcher's own copy of the prompt always names the model
+there too, since it reads the managed-service registry directly rather than
+through the dashboard's daemon connection. From the dashboard's own copy of that
+prompt, pressing `s` instead jumps straight to the Services overlay, pre-focused
+on the model, so you can stop it there rather than quitting with it left running
+— offered only once the dashboard's own live view has named the model, so it's
+absent on Windows there too, not just from the launcher's copy (which never
+offers this jump, since it has no live Services overlay of its own to jump to —
+open the dashboard first). Unlike `q`, `Ctrl-C` always quits immediately
+without asking — except from a running job's console, where it keeps the
+"cancel this job" meaning described above instead. On a
 non-interactive terminal (or piped output), `rocm` prints a one-shot status
 summary instead of opening the launcher.
 
