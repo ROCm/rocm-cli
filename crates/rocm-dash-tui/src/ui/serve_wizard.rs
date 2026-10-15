@@ -299,7 +299,8 @@ impl ServeWizardState {
     }
 
     fn cycle(&mut self, delta: isize) {
-        match self.current_field() {
+        let touched = self.current_field();
+        match touched {
             // Advanced is a choice row too: ← collapses, → expands. Only
             // reachable while Advanced owns focus, and Advanced sits at the
             // same index in both orders, so focus is preserved either way.
@@ -317,7 +318,7 @@ impl ServeWizardState {
         // Cycling Port back to Custom can fix the exact complaint an outstanding
         // message is naming (e.g. "set Port to Custom"); without this, that
         // message would sit on screen after the toggle that resolved it.
-        refresh_message(self);
+        restate_or_clear(self, touched);
     }
 
     /// Direct typing only applies to the Model row; Host and the custom port
@@ -353,7 +354,12 @@ impl ServeWizardState {
         if self.port_mode == PortMode::Custom && parse_port(&self.port).is_none() {
             "Customized · port needs attention"
         } else {
-            "Customized"
+            let host = self.host.trim();
+            if host.is_empty() || !is_loopback_host(host) {
+                "Customized · host needs attention"
+            } else {
+                "Customized"
+            }
         }
     }
 
@@ -579,7 +585,7 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
             // The form's host/port are only written on Enter, so discarding
             // the editor here never mutates them.
             w.editor = None;
-            refresh_message(w);
+            recompute_message(w);
         }
         KeyCode::Left | KeyCode::Right => {
             let delta = if code == KeyCode::Left { -1 } else { 1 };
@@ -601,9 +607,15 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
                     let trimmed = value.trim();
                     if trimmed.is_empty() {
                         // Keep the editor open with a plain fix rather than
-                        // silently accepting an unusable host.
+                        // silently accepting an unusable host. Esc discards
+                        // the edit and leaves `w.host` as it was before this
+                        // edit started, which is not always `DEFAULT_HOST` —
+                        // the user may be re-editing an already-custom host.
+                        // Name the value Esc actually restores, not a
+                        // hardcoded default that may not match it.
+                        let current_host = w.host.clone();
                         w.message = Some(format!(
-                            "host cannot be empty; type an address or press Esc to restore {DEFAULT_HOST}"
+                            "host cannot be empty; type an address or press Esc to restore {current_host}"
                         ));
                         return;
                     }
@@ -625,7 +637,7 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
                 }
                 _ => {}
             }
-            refresh_message(w);
+            restate_or_clear(w, field);
             w.editor = None;
         }
         KeyCode::Char(c) => {
@@ -640,12 +652,34 @@ fn editor_key(w: &mut ServeWizardState, code: KeyCode) {
     }
 }
 
-/// Re-evaluate an *outstanding* validation complaint against the current form:
-/// a genuine fix clears it, a still-broken form re-states the reason. Silent
-/// when nothing has been complained about yet, so ordinary edits stay quiet.
-fn refresh_message(w: &mut ServeWizardState) {
+/// Esc discards an edit without ever writing it to the form, so whatever
+/// `validate()` says now was equally true before the editor opened. Safe to
+/// unconditionally re-state (and re-focus, if the complaint has moved) since
+/// nothing new was introduced.
+fn recompute_message(w: &mut ServeWizardState) {
     if w.message.is_some() {
-        w.message = w.validate().err().map(|(_, msg)| msg);
+        match w.validate() {
+            Ok(_) => w.message = None,
+            Err((field, msg)) => {
+                w.focus(field);
+                w.message = Some(msg);
+            }
+        }
+    }
+}
+
+/// An actual edit to `touched` (a committed Enter, or a Port-mode cycle) can
+/// only confirm or deny a complaint about `touched` itself. A complaint about
+/// some other, untouched field would be a surprise the user never triggered
+/// (e.g. fixing a blank host surfacing "model is required"), so clear it
+/// silently instead; `request_launch` still surfaces it if they try to launch.
+fn restate_or_clear(w: &mut ServeWizardState, touched: Field) {
+    if w.message.is_some() {
+        w.message = match w.validate() {
+            Ok(_) => None,
+            Err((field, msg)) if field == touched => Some(msg),
+            Err(_) => None,
+        };
     }
 }
 
@@ -1354,6 +1388,16 @@ mod tests {
     }
 
     #[test]
+    fn invalid_hidden_host_says_it_needs_attention() {
+        let w = ServeWizardState {
+            host: "0.0.0.0".into(),
+            ..Default::default()
+        };
+        assert!(!w.advanced_expanded);
+        assert_eq!(w.advanced_summary(), "Customized · host needs attention");
+    }
+
+    #[test]
     fn invalid_combination_expands_advanced_and_focuses_the_problem() {
         let mut wiz = Some(ServeWizardState {
             model: "m".into(),
@@ -1577,6 +1621,30 @@ mod tests {
     }
 
     #[test]
+    fn blanking_an_already_custom_host_names_that_host_as_the_esc_restore_value() {
+        // The blank-host message names the value Esc actually restores. If
+        // the form's host is already a custom value (not DEFAULT_HOST) before
+        // this edit, the message must name that value, not a hardcoded
+        // default Esc would not actually restore.
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            host: "10.0.0.7".to_string(),
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Host);
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        for k in typed(" ") {
+            on_key(&mut wiz, &mut jobs, &[], k);
+        }
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        let w = wiz.as_ref().unwrap();
+        let msg = w.message.as_deref().unwrap();
+        assert!(msg.contains("restore 10.0.0.7"), "{msg}");
+        assert!(!msg.contains("127.0.0.1"), "{msg}");
+    }
+
+    #[test]
     fn port_editor_accepts_digits_only() {
         let mut wiz = Some(ServeWizardState {
             advanced_expanded: true,
@@ -1662,6 +1730,58 @@ mod tests {
         let w = wiz.as_ref().unwrap();
         assert_eq!(w.host, "localhost");
         assert_eq!(w.message.as_deref(), Some(CUSTOM_HOST_NEEDS_PORT));
+    }
+
+    #[test]
+    fn committing_a_host_edit_that_surfaces_an_unrelated_port_complaint_clears_it_instead() {
+        // An outstanding complaint about the Host row (blank host) is fixed by
+        // typing a loopback host the CLI accepts — but that host also needs a
+        // custom port, a complaint about a field the user never touched in
+        // this edit. Silently clear it rather than surprise the user with a
+        // new complaint about Port; `request_launch` still catches it later.
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            model: "m".into(),
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Host);
+        wiz.as_mut().unwrap().message =
+            Some("host cannot be empty; type an address or restore 127.0.0.1".to_string());
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        for k in typed("localhost") {
+            on_key(&mut wiz, &mut jobs, &[], k);
+        }
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.host, "localhost");
+        assert!(w.message.is_none(), "not the user's business right now");
+        assert_eq!(w.current_field(), Field::Host, "focus stays put");
+    }
+
+    #[test]
+    fn fixing_a_host_complaint_never_surfaces_an_unrelated_model_complaint() {
+        // Regression test for the exact bug reported: a fresh form with an
+        // empty Model and an outstanding blank-host complaint. Fixing Host
+        // must not raise "model is required" — a complaint the user never
+        // triggered by editing Host.
+        let mut wiz = Some(ServeWizardState {
+            advanced_expanded: true,
+            ..Default::default()
+        });
+        let mut jobs = State::default();
+        focus_field(wiz.as_mut().unwrap(), Field::Host);
+        wiz.as_mut().unwrap().message =
+            Some("host cannot be empty; type an address or restore 127.0.0.1".to_string());
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        for k in typed("localhost") {
+            on_key(&mut wiz, &mut jobs, &[], k);
+        }
+        feed(&mut wiz, &mut jobs, &[KeyCode::Enter]);
+        let w = wiz.as_ref().unwrap();
+        assert_eq!(w.host, "localhost");
+        assert!(w.message.is_none(), "model's emptiness is not Host's news");
+        assert_eq!(w.current_field(), Field::Host, "focus stays put");
     }
 
     #[test]
