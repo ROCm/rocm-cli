@@ -96,16 +96,15 @@ use rocm_core::{
     ManagedServiceRecord, ModelRecipeRecord, ModelRecipeRegistry, ModelRecipeRegistrySource,
     PERMISSIONS_MODE_ASK, PERMISSIONS_MODE_FULL_ACCESS, RocmCliConfig, TELEMETRY_MODE_LOCAL,
     TELEMETRY_MODE_OFF, WatcherMode, append_audit_event, builtin_model_recipes, builtin_watcher,
-    builtin_watchers, command_failure_detail, connect_tcp_stream, daemon_binary_path,
-    default_engine_for_platform, detect_host_gfx_target, detect_host_gpu_summary,
-    engine_binary_path, engine_plugin_dirs, format_host_port, format_http_base_url,
-    interactive_terminal, load_model_recipe_registry, load_recent_audit_events,
-    load_recent_automation_events, load_recent_automation_proposals, managed_pip_cache_dir,
-    managed_service_endpoint_readiness, model_artifact_cache_status, model_catalog_platforms,
-    model_recipe_featured, model_recipe_target_platform_label, normalize_therock_family,
-    platform_matches_gfx_family, process_is_running, read_http_response_bounded,
-    resolve_builtin_model_recipe, runtime_install_root_is_protected, uv_cache_source,
-    write_all_tcp_stream,
+    builtin_watchers, connect_tcp_stream, daemon_binary_path, default_engine_for_platform,
+    detect_host_gfx_target, detect_host_gpu_summary, engine_binary_path, engine_plugin_dirs,
+    format_host_port, format_http_base_url, interactive_terminal, load_model_recipe_registry,
+    load_recent_audit_events, load_recent_automation_events, load_recent_automation_proposals,
+    managed_pip_cache_dir, managed_service_endpoint_readiness, model_artifact_cache_status,
+    model_catalog_platforms, model_recipe_featured, model_recipe_target_platform_label,
+    normalize_therock_family, platform_matches_gfx_family, process_is_running,
+    read_http_response_bounded, resolve_builtin_model_recipe, runtime_install_root_is_protected,
+    uv_cache_source, write_all_tcp_stream,
 };
 use rocm_engine_protocol::{
     DEFAULT_LOG_TAIL_LINES, DetectRequest, DetectResponse, DevicePolicy,
@@ -656,6 +655,12 @@ rocm logs --search error timeout")]
         command: BenchCommand,
     },
     /// Remove ROCm CLI-managed files from this computer.
+    ///
+    /// Removes the config, data, and cache directories and the installed
+    /// binaries, including the running rocm.exe on Windows. It also undoes the
+    /// PATH change the installer made (its marked shell-profile block, or the
+    /// user PATH entry it recorded adding on Windows), unless other programs
+    /// share the install folder.
     Uninstall {
         /// Do not ask for interactive confirmation.
         #[arg(long)]
@@ -663,7 +668,7 @@ rocm logs --search error timeout")]
         /// Show what would be removed without deleting anything.
         #[arg(long)]
         dry_run: bool,
-        /// Keep installed rocm-cli binaries.
+        /// Keep installed rocm-cli binaries, and the installer's PATH change.
         #[arg(long)]
         keep_binaries: bool,
         /// Keep saved settings.
@@ -8336,13 +8341,10 @@ fn run_rocm_capture_for_paths(
 ) -> Result<CommandCapture> {
     let rocm_binary = daemon_binary_path()?;
     let mut command = ProcessCommand::new(&rocm_binary);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Stdio left to `run_with_timeout`, which sets it itself.
+    command.args(args);
     apply_app_path_env(&mut command, paths);
-    let output = run_command_with_timeout(command, timeout)
+    let output = rocm_core::process::run_with_timeout(command, timeout, "process")
         .with_context(|| format!("failed to run {}", rocm_binary.display()))?;
     Ok(CommandCapture {
         argv: std::iter::once(rocm_binary.display().to_string())
@@ -8600,37 +8602,6 @@ fn render_install_sdk_dry_run_for_args(paths: &AppPaths, args: &[String]) -> Res
         },
     )?
     .output)
-}
-
-fn run_command_with_timeout(
-    mut command: ProcessCommand,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    let mut child = command.spawn().context("failed to spawn child process")?;
-    let started = std::time::Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process")?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .context("failed to collect child process output");
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let output = child
-                .wait_with_output()
-                .context("failed to collect timed-out child process output")?;
-            bail!(
-                "process exceeded {}s timeout: {}",
-                timeout.as_secs(),
-                command_failure_detail(&output)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn internal_mcp_install_sdk_args(
@@ -13655,38 +13626,24 @@ struct UninstallPlan {
     actions: Vec<UninstallPlanEntry>,
     skipped: Vec<String>,
     warnings: Vec<String>,
+    /// Installer PATH changes `rocm uninstall` undoes.
+    path_edits: Vec<uninstall::PathEdit>,
+    /// The installer's record of its PATH change, removed once that change is
+    /// undone.
+    path_record: Option<PathBuf>,
+    /// The running executable, on Windows, which is deleted as the command exits.
+    self_delete: Option<PathBuf>,
 }
 
 fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<UninstallPlan> {
     let mut plan = UninstallPlan::default();
 
-    if options.keep_binaries {
-        plan.skipped
-            .push("binary removal disabled by --keep-binaries".to_owned());
-    } else {
-        let current_exe =
-            daemon_binary_path().context("failed to discover current rocm executable")?;
-        if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
-            plan.skipped.push(format!(
-                "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
-                current_exe.display()
-            ));
-        } else {
-            for path in collect_installed_binary_candidates(&current_exe)? {
-                if rocm_core::runtime_is_windows() && path == current_exe {
-                    plan.skipped.push(format!(
-                        "skipping running executable on Windows: {}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                plan.actions.push(UninstallPlanEntry {
-                    kind: "binary",
-                    path,
-                });
-            }
-        }
-    }
+    plan_installed_binaries(
+        &mut plan,
+        options,
+        || daemon_binary_path().context("failed to discover current rocm executable"),
+        rocm_core::runtime_home_dir().as_deref(),
+    )?;
 
     for (keep, kind, path) in [
         (options.keep_config, "config", paths.config_dir.clone()),
@@ -13773,6 +13730,76 @@ fn build_uninstall_plan(paths: &AppPaths, options: &UninstallOptions) -> Result<
     Ok(plan)
 }
 
+/// Plan removing the installed binaries beside the running one, which
+/// `current_exe` names, and undoing the installer's PATH change for their
+/// folder. `--keep-binaries` keeps both, and so does a cargo build's folder.
+fn plan_installed_binaries(
+    plan: &mut UninstallPlan,
+    options: &UninstallOptions,
+    current_exe: impl FnOnce() -> Result<PathBuf>,
+    home: Option<&Path>,
+) -> Result<()> {
+    if options.keep_binaries {
+        // The PATH change only serves the binaries, so it stays with them.
+        plan.skipped.push(
+            "binary removal disabled by --keep-binaries, so any PATH change the installer made \
+             stays too"
+                .to_owned(),
+        );
+        return Ok(());
+    }
+    let current_exe = current_exe()?;
+    if is_dev_binary_layout(&current_exe) && !options.force_dev_binaries {
+        plan.skipped.push(format!(
+            "binary removal skipped because {} looks like a cargo target build; pass --force-dev-binaries to remove sibling debug/release binaries",
+            current_exe.display()
+        ));
+        return Ok(());
+    }
+    let binaries = collect_installed_binary_candidates(&current_exe)?;
+    for path in &binaries {
+        // Windows will not unlink a running image; it is deleted as the
+        // command exits instead.
+        if is_running_executable(path, &current_exe, cfg!(windows)) {
+            plan.self_delete = Some(path.clone());
+            continue;
+        }
+        // The PATH record goes only once its change is undone; see
+        // `uninstall::plan_path_edits`.
+        if path.file_name().and_then(|name| name.to_str()) == Some(uninstall::PATH_EDIT_RECORD) {
+            continue;
+        }
+        plan.actions.push(UninstallPlanEntry {
+            kind: "binary",
+            path: path.clone(),
+        });
+    }
+    if let Some(bin_dir) = current_exe.parent() {
+        uninstall::plan_path_edits(plan, bin_dir, &binaries, home);
+    }
+    Ok(())
+}
+
+/// Whether `path`, an entry of the running executable's folder, is the running
+/// executable itself, which only Windows has to treat specially. Windows names
+/// are case-insensitive, and the running image may report its own name in
+/// another case, or in its 8.3 short form (`ROCM.EXE`), than the folder listing
+/// does; missing it would plan an ordinary removal that Windows refuses.
+fn is_running_executable(path: &Path, current_exe: &Path, windows: bool) -> bool {
+    if !windows {
+        return false;
+    }
+    path == current_exe
+        || (path.parent() == current_exe.parent()
+            && path
+                .file_name()
+                .zip(current_exe.file_name())
+                .is_some_and(|(name, exe)| {
+                    name.to_string_lossy()
+                        .eq_ignore_ascii_case(&exe.to_string_lossy())
+                }))
+}
+
 pub(crate) fn render_uninstall_dry_run(paths: &AppPaths) -> Result<String> {
     let options = UninstallOptions {
         dry_run: true,
@@ -13786,14 +13813,16 @@ fn render_uninstall_plan(plan: &UninstallPlan, options: &UninstallOptions) -> St
     let mut output = String::new();
     let _ = writeln!(output, "Uninstall review");
     let _ = writeln!(output);
-    if plan.actions.is_empty() {
+    let removals = uninstall::removal_count(plan);
+    if uninstall::plan_is_empty(plan) {
         let _ = writeln!(output, "Nothing managed by rocm-cli would be removed.");
-    } else {
-        let _ = writeln!(output, "{} item(s) would be removed:", plan.actions.len());
+    } else if removals > 0 {
+        let _ = writeln!(output, "{removals} item(s) would be removed:");
         for entry in &plan.actions {
             let _ = writeln!(output, "  - {}: {}", entry.kind, entry.path.display());
         }
     }
+    uninstall::render_extra_plan(&mut output, plan);
     if !plan.warnings.is_empty() {
         let _ = writeln!(output);
         let _ = writeln!(output, "Please review:");
@@ -13923,7 +13952,7 @@ fn collect_installed_binary_candidates(current_exe: &Path) -> Result<Vec<PathBuf
 }
 
 fn is_rocm_install_entry_name(name: &str) -> bool {
-    if name == ".rocm-cli-manifest" {
+    if name == ".rocm-cli-manifest" || name == uninstall::PATH_EDIT_RECORD {
         return true;
     }
     let normalized = name.strip_suffix(".exe").unwrap_or(name);

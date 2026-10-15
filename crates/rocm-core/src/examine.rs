@@ -313,6 +313,13 @@ pub struct Examination {
     pub hipinfo_status: String,
     pub adrenalin_version: String,
     pub msvc_redist_present: Option<bool>,
+    /// File version of the Visual C++ runtime in `System32`, for example
+    /// `14.29.30133.0`. When `msvcp140.dll` and `vcruntime140.dll` differ, the
+    /// older of the two. Empty when neither could be read, and always empty off
+    /// Windows. Presence alone does not say the runtime is new enough: binaries
+    /// built with a recent toolset crash on a runtime older than 14.40.
+    #[serde(default)]
+    pub msvc_redist_version: String,
 
     // framework
     pub framework: String,
@@ -415,6 +422,7 @@ impl Default for Examination {
             hipinfo_status: String::new(),
             adrenalin_version: String::new(),
             msvc_redist_present: None,
+            msvc_redist_version: String::new(),
             framework: "unknown".to_owned(),
             framework_version: String::new(),
             framework_rocm_version: String::new(),
@@ -2782,7 +2790,12 @@ fn managed_runtime_roots() -> Vec<(std::path::PathBuf, Vec<std::path::PathBuf>)>
 /// Truncate `value` to at most `max_chars` characters, appending a marker when
 /// truncated. Slices on char boundaries (matching Python's `value[:n]`); a byte
 /// slice would panic when the cut lands inside a multibyte character.
-fn truncate_to_chars(value: String, max_chars: usize) -> String {
+///
+/// `pub(crate)` because [`crate::process`] bounds its timeout quote with the
+/// same marker, and a second copy here would be free to drift from it.
+/// (`host_gpu.rs`'s `truncate_diagnostic_line` is a different function with a
+/// different marker — plain `...` — not a third copy of this one.)
+pub(crate) fn truncate_to_chars(value: String, max_chars: usize) -> String {
     if value.chars().count() > max_chars {
         let truncated: String = value.chars().take(max_chars).collect();
         format!("{truncated}...[truncated]")
@@ -3068,6 +3081,52 @@ fn probe_msvc_redist_windows(e: &mut Examination) {
                 || Path::new(dir).join("vcruntime140_1.dll").is_file())
     });
     e.msvc_redist_present = Some(present);
+
+    // Presence says nothing about age. Read the version of the copies in
+    // System32 only: a copy bundled with another app (Python, for example) can
+    // be found on PATH and says nothing about the one Windows loads for
+    // programs that do not ship their own.
+    let script = "foreach ($n in 'msvcp140.dll','vcruntime140.dll') { $f = Join-Path $env:SystemRoot ('System32\\' + $n); if (Test-Path -LiteralPath $f) { (Get-Item -LiteralPath $f).VersionInfo.FileVersion } }";
+    let (rc, out, _) = run("powershell", &["-NoProfile", "-Command", script], MEDIUM);
+    if rc == 0 {
+        e.msvc_redist_version = oldest_runtime_version(&out);
+    }
+}
+
+/// Parse `14.29.30133.0` into `[14, 29, 30133, 0]`.
+///
+/// `None` unless every dot-separated part is a plain number, and unless there
+/// are at least two parts. A caller must treat `None` as "unknown", never as
+/// "old".
+pub(crate) fn parse_dotted_version(text: &str) -> Option<Vec<u32>> {
+    let parts: Option<Vec<u32>> = text
+        .trim()
+        .split('.')
+        .map(|part| {
+            // Digits only: `parse` alone would also accept a leading `+`.
+            if part.bytes().all(|b| b.is_ascii_digit()) {
+                part.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    parts.filter(|p| p.len() >= 2)
+}
+
+/// The oldest parseable version among the lines of `output`, as written, or an
+/// empty string when no line parses.
+///
+/// `FileVersion` is normally `14.29.30133.0`, but some builds append text after
+/// it, so only the first word of a line is read.
+fn oldest_runtime_version(output: &str) -> String {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|word| parse_dotted_version(word).map(|v| (v, word)))
+        .min_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, word)| word.to_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3782,6 +3841,7 @@ mod tests {
             "hipinfo_status",
             "adrenalin_version",
             "msvc_redist_present",
+            "msvc_redist_version",
             "framework",
             "framework_version",
             "framework_rocm_version",
@@ -3814,6 +3874,51 @@ mod tests {
             actual, expected,
             "Examination top-level keys drifted from examine.py"
         );
+    }
+
+    #[test]
+    fn dotted_versions_parse_only_when_every_part_is_a_number() {
+        assert_eq!(
+            parse_dotted_version("14.29.30133.0"),
+            Some(vec![14, 29, 30133, 0])
+        );
+        assert_eq!(parse_dotted_version(" 14.40 "), Some(vec![14, 40]));
+        for bad in [
+            "",
+            "14",
+            "x",
+            "14.x",
+            "14..1",
+            "14.+1",
+            "-1.2",
+            "14.29 beta",
+            "14.99999999999",
+        ] {
+            assert_eq!(parse_dotted_version(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_oldest_runtime_version_is_recorded() {
+        // Two files, the older one wins.
+        assert_eq!(
+            oldest_runtime_version("14.51.36231.0\r\n14.29.30133.0\r\n"),
+            "14.29.30133.0"
+        );
+        assert_eq!(
+            oldest_runtime_version("14.29.30133.0\n14.51.36231.0\n"),
+            "14.29.30133.0"
+        );
+        // Compared as numbers, not text.
+        assert_eq!(oldest_runtime_version("14.100.1.0\n14.9.1.0\n"), "14.9.1.0");
+        // Text after the version is ignored; a line that does not parse is skipped.
+        assert_eq!(
+            oldest_runtime_version("14.44.35211.0 built by: vcwrkspc\nnot a version\n"),
+            "14.44.35211.0"
+        );
+        // Nothing readable is "unknown", never a guess.
+        assert_eq!(oldest_runtime_version(""), "");
+        assert_eq!(oldest_runtime_version("error\n\n"), "");
     }
 
     #[test]
