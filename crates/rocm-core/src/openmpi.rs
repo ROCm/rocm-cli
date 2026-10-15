@@ -827,22 +827,16 @@ pub fn build_libnuma_install_plan(os_id: &str, id_like: &str) -> SystemPackageIn
 /// `ID_LIKE` to the plan that installs one runtime on it.
 pub type InstallPlanBuilder = fn(&str, &str) -> SystemPackageInstallPlan;
 
-/// `build`'s plan for the distribution os-release `text` declares, naming
-/// `/etc/os-release` in any unreadable-line message.
+/// `build`'s plan for the distribution the os-release `text` at `path`
+/// declares, naming `path` instead of always `/etc/os-release` in an
+/// unreadable-line message.
 ///
-/// Delegates to [`plan_for_os_release_at`] with that default path; a caller
-/// that actually read the file — which may have come from the
-/// `/usr/lib/os-release` fallback — uses that function directly so an
-/// unreadable line names the file really read rather than always the
-/// primary. The many unit tests fixturing bare `text` (never the real host)
-/// keep using this one.
-#[must_use]
-pub fn plan_for_os_release(text: &str, build: InstallPlanBuilder) -> SystemPackageInstallPlan {
-    plan_for_os_release_at("/etc/os-release", text, build)
-}
-
-/// [`plan_for_os_release`], naming `path` instead of always `/etc/os-release`
-/// in an unreadable-line message.
+/// Unit tests that fixture bare `text` (never the real host) construct an
+/// [`crate::hardware_root::OsRelease`] with
+/// [`crate::hardware_root::OsRelease::found`] and call
+/// [`plan_for_os_release_read`]; every production call site knows the real
+/// path it read and calls this function or [`plan_for_os_release_read`]
+/// directly.
 ///
 /// An unreadable file (see [`crate::os_release`]) plans nothing, and the
 /// reason names the line that made it unreadable and what to change on it,
@@ -898,7 +892,8 @@ pub fn plan_for_os_release_read(
 /// the advice installs anything.
 ///
 /// `rocm engines install vllm --yes` runs the same plan
-/// ([`plan_for_os_release`] over the same builder and the same real file), so
+/// ([`plan_for_os_release_read`] over the same builder and the same real
+/// file), so
 /// a message may offer that command only when [`InstallHint::plan_installs`]
 /// is true; [`InstallHint::or`] does the offering.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -930,8 +925,8 @@ impl std::fmt::Display for InstallHint {
 }
 
 /// The hint for os-release `text`, naming `/etc/os-release` in any
-/// unreadable-line message: the commands [`plan_for_os_release`] plans with
-/// `build` when it plans any, otherwise `manual` — followed, for an
+/// unreadable-line message: the commands [`plan_for_os_release_at`] plans
+/// with `build` when it plans any, otherwise `manual` — followed, for an
 /// unreadable file, by the line that made it so and what to change on it.
 ///
 /// Delegates to [`install_hint_for_at`]; only the cross-platform unit tests,
@@ -1308,7 +1303,10 @@ mod tests {
                 ("ID=derivative\nID_LIKE=\"rhel fedora\"\n", &dnf),
             ] {
                 assert_eq!(
-                    &plan_for_os_release(text, build),
+                    &plan_for_os_release_read(
+                        &crate::hardware_root::OsRelease::found(text),
+                        build
+                    ),
                     expected,
                     "{label}: {text:?}"
                 );
@@ -1400,8 +1398,8 @@ mod tests {
 
     /// [`install_hint_for_read`] and [`plan_for_os_release_read`] report a
     /// file that exists but could not be read as itself, not as an unknown
-    /// distribution — the gap `install_hint_for`/`plan_for_os_release` alone
-    /// cannot close, since by the time they see `text` the distinction
+    /// distribution — the gap `install_hint_for`/`plan_for_os_release_at`
+    /// alone cannot close, since by the time they see `text` the distinction
     /// between "absent" and "unreadable" is already lost.
     #[test]
     fn an_unreadable_file_is_reported_as_itself_not_an_unknown_distribution() {
@@ -1469,7 +1467,8 @@ mod tests {
     fn an_unreadable_file_plans_nothing_and_names_its_line() {
         let text = "ID=ubuntu\nexport ID=debian\n";
         for (label, build, manual) in BUILDERS {
-            let plan = plan_for_os_release(text, build);
+            let plan =
+                plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build);
             assert!(!plan.supported, "{label}");
             assert_eq!(plan.package_manager, None, "{label}");
             assert!(plan.commands.is_empty(), "{label}");
@@ -1512,7 +1511,8 @@ mod tests {
                 "ID=ubuntu\nNAME=a b\n",
                 "ID=ubuntu\r\n",
             ] {
-                let plan = plan_for_os_release(text, build);
+                let plan =
+                    plan_for_os_release_read(&crate::hardware_root::OsRelease::found(text), build);
                 let hint = install_hint_for(text, build, manual);
                 let offered = hint.or("rerun with --yes");
                 let installs = plan.supported && !plan.commands.is_empty();
